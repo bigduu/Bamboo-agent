@@ -16,21 +16,25 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::config_crypto::{access_device_credential_ref, access_password_credential_ref};
 use crate::credential_store::{CredentialDocumentLkg, CredentialMutation};
 use crate::{
     AccessControlConfig, AnthropicModelMapping, AtomicJsonStore, BrokerClientConfig,
-    ClusterFabricConfig, Config, ConfigStoreResult, ConfigValues, ConnectConfig, CredentialRef,
-    CredentialSource, CredentialStatus, CredentialStore, DefaultWorkAreaConfig, DefaultsConfig,
-    EnvVarEntry, FeatureFlags, GeminiModelMapping, HooksConfig, KeywordMaskingConfig, LiveSection,
-    MemoryConfig, NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
-    RunBudgetConfig, SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig,
-    StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
+    ClusterFabricConfig, Config, ConfigSectionEvent, ConfigStoreResult, ConfigValues,
+    ConnectConfig, CredentialRef, CredentialSource, CredentialStatus, CredentialStore,
+    DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry, FeatureFlags, GeminiModelMapping,
+    HooksConfig, KeywordMaskingConfig, LiveSection, MemoryConfig, NotificationsConfig,
+    PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope,
+    SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig, StreamTimeoutConfig,
+    SubagentsConfig, ToolsConfig,
 };
 
 const SECTION_SCHEMA_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_FILE: &str = "config-sections.json";
 const SECTION_LAYOUT_COMPLETION_VERSION: u32 = 1;
+pub const COPILOT_GITHUB_ACCESS_CREDENTIAL_REF: &str = "copilot.oauth.github_access_token";
+pub const COPILOT_CHAT_CONFIG_CREDENTIAL_REF: &str = "copilot.oauth.chat_config";
 
 /// Stable logical identity for every section in the accepted #597 ADR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -160,6 +164,20 @@ impl SectionId {
             .iter()
             .find(|descriptor| descriptor.id == self)
             .expect("every SectionId has one descriptor")
+    }
+
+    pub fn from_file_name(file_name: &str) -> Option<Self> {
+        SECTION_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.file_name == file_name)
+            .map(|descriptor| descriptor.id)
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        SECTION_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.name == name)
+            .map(|descriptor| descriptor.id)
     }
 }
 
@@ -411,6 +429,8 @@ impl SectionProjection {
         disk.sanitize_env_vars_for_disk();
         disk.sanitize_notifications_for_disk();
         disk.sanitize_cluster_fabric_for_disk();
+        disk.sanitize_connect_credentials_for_disk();
+        disk.sanitize_access_control_for_disk();
 
         let mut providers = disk.providers().clone();
         for reserved in [
@@ -425,6 +445,7 @@ impl SectionProjection {
         macro_rules! clear_provider_ciphertext {
             ($field:ident) => {
                 if let Some(provider) = providers.$field.as_mut() {
+                    provider.api_key.clear();
                     provider.api_key_encrypted = None;
                 }
             };
@@ -433,8 +454,15 @@ impl SectionProjection {
         clear_provider_ciphertext!(anthropic);
         clear_provider_ciphertext!(gemini);
         if let Some(provider) = providers.bodhi.as_mut() {
+            provider.api_key.clear();
             provider.api_key_encrypted = None;
         }
+
+        // `SubagentsConfig::broker` is runtime-only. The migration planner
+        // adopts a user-managed `broker.json` explicitly below; projecting the
+        // live value here would accidentally persist the embedded broker's
+        // ephemeral loopback endpoint on an unrelated compatibility write.
+        let external_broker = None;
 
         // Exhaustive destructuring is intentional: adding a ConfigValues field
         // without assigning it to a section is a compile error.
@@ -499,7 +527,7 @@ impl SectionProjection {
             memory: MemorySection(disk.memory().clone()),
             subagents: SubagentsSection {
                 subagents: disk.subagents().clone(),
-                external_broker: disk.subagents().broker.clone(),
+                external_broker,
             },
             notifications: NotificationsSection { notifications },
             connect: ConnectSection(connect),
@@ -697,9 +725,15 @@ where
         .cloned()
         .unwrap_or_else(|| original.clone());
     let (existing_revision, existing_data) = compatible_section_data(&planning_bytes)?;
-    let revision = existing_revision.checked_add(1).ok_or_else(|| {
-        crate::ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
-    })?;
+    let existing_envelope = serde_json::from_slice::<Value>(&planning_bytes)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|object| {
+            object.contains_key("schema_version")
+                && object.contains_key("revision")
+                && object.contains_key("data")
+        });
+    let has_legacy_raw = legacy_raw.is_some();
     let typed_baseline = serde_json::to_value(value)?;
     let mut merged_data = match legacy_raw {
         Some(mut raw) => {
@@ -708,9 +742,24 @@ where
         }
         None => typed_baseline,
     };
-    if let Some(existing_data) = existing_data {
-        deep_merge_json(&mut merged_data, existing_data);
+    if let Some(existing_data) = existing_data.as_ref() {
+        deep_merge_json(&mut merged_data, existing_data.clone());
     }
+    // A materialized default is still the revision-zero baseline. Preserve an
+    // already-versioned sidecar when migration leaves its data byte-equivalent;
+    // importing legacy data or normalizing a sparse envelope is a real revision
+    // advance.
+    let revision = if !original_present && !has_legacy_raw {
+        0
+    } else if existing_envelope && existing_data.as_ref() == Some(&merged_data) {
+        existing_revision
+    } else {
+        existing_revision.checked_add(1).ok_or_else(|| {
+            crate::ConfigStoreError::Validation(
+                "configuration revision counter exhausted".to_string(),
+            )
+        })?
+    };
     validate_ordinary_section_json(&merged_data)?;
     let typed: T = serde_json::from_value(merged_data.clone())?;
     validate(&typed).map_err(crate::ConfigStoreError::Validation)?;
@@ -1577,7 +1626,7 @@ fn validate_connect(value: &ConnectSection) -> Result<(), String> {
     validate_json_serializable(value)
 }
 
-fn validate_connect_isolated(value: &ConnectConfig) -> Result<(), String> {
+pub(crate) fn validate_connect_isolated(value: &ConnectConfig) -> Result<(), String> {
     for platform in &value.platforms {
         let has_secret = platform
             .token
@@ -1596,13 +1645,35 @@ fn validate_connect_isolated(value: &ConnectConfig) -> Result<(), String> {
                 .as_ref()
                 .is_some_and(|value| !value.trim().is_empty());
         if has_secret {
-            return Err(
-                "connect credentials cannot be persisted until credential references are supported"
-                    .to_string(),
-            );
+            return Err("connect credentials must use credential references".to_string());
         }
         if platform.platform_type.trim().is_empty() {
             return Err("connect platform type must not be empty".to_string());
+        }
+        if platform.token_configured != platform.token_credential_ref.is_some()
+            || platform.app_secret_configured != platform.app_secret_credential_ref.is_some()
+        {
+            return Err("connect credential metadata is inconsistent".to_string());
+        }
+        if platform.token_credential_ref.is_some() || platform.app_secret_credential_ref.is_some() {
+            let id = platform.id.as_deref().ok_or_else(|| {
+                "connect credential references require a stable platform id".to_string()
+            })?;
+            let expected_token = crate::credential_ref("connect", id, "token")
+                .map_err(|_| "connect platform id is invalid".to_string())?;
+            let expected_app_secret = crate::credential_ref("connect", id, "app_secret")
+                .map_err(|_| "connect platform id is invalid".to_string())?;
+            if platform
+                .token_credential_ref
+                .as_ref()
+                .is_some_and(|reference| reference != &expected_token)
+                || platform
+                    .app_secret_credential_ref
+                    .as_ref()
+                    .is_some_and(|reference| reference != &expected_app_secret)
+            {
+                return Err("connect credential reference is not canonical".to_string());
+            }
         }
     }
     Ok(())
@@ -1692,17 +1763,39 @@ fn validate_env(value: &EnvSection) -> Result<(), String> {
 
 fn validate_access_control(value: &AccessControlSection) -> Result<(), String> {
     if let Some(access) = &value.0 {
-        if access.password_hash.is_some() != access.password_salt.is_some()
-            || (access.password_enabled && access.password_hash.is_none())
+        if access.password_hash.is_some()
+            || access.password_salt.is_some()
+            || access.password_configured != access.password_credential_ref.is_some()
+            || (access.password_enabled && !access.password_configured)
         {
-            return Err("access-control password hash metadata is incomplete".to_string());
+            return Err("access-control password verifier metadata is not isolated".to_string());
+        }
+        if access
+            .password_credential_ref
+            .as_ref()
+            .is_some_and(|reference| match access_password_credential_ref() {
+                Ok(expected) => reference != &expected,
+                Err(_) => true,
+            })
+        {
+            return Err("access-control password credential reference is invalid".to_string());
         }
         if access.devices.iter().any(|device| {
             device.device_id.trim().is_empty()
-                || device.token_hash.trim().is_empty()
-                || device.token_salt.trim().is_empty()
+                || !device.token_hash.is_empty()
+                || !device.token_salt.is_empty()
+                || !device.token_configured
+                || device
+                    .token_credential_ref
+                    .as_ref()
+                    .is_none_or(
+                        |reference| match access_device_credential_ref(&device.device_id) {
+                            Ok(expected) => reference != &expected,
+                            Err(_) => true,
+                        },
+                    )
         }) {
-            return Err("access-control device metadata is incomplete".to_string());
+            return Err("access-control device verifier metadata is not isolated".to_string());
         }
     }
     validate_json_serializable(value)
@@ -1852,6 +1945,7 @@ pub(crate) fn preflight_source_names() -> BTreeSet<String> {
         "mcp.json",
         "broker.json",
         "connect.json",
+        "access-control.json",
         "credentials.json",
     ] {
         for suffix in [".bak", ".bak.1", ".bak.2"] {
@@ -2230,6 +2324,22 @@ fn scrub_preflight_cluster_secrets(raw: &mut Value) {
     }
 }
 
+fn scrub_preflight_connect_secrets(raw: &mut Value) {
+    let Some(platforms) = raw.get_mut("platforms").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for platform in platforms.iter_mut().filter_map(Value::as_object_mut) {
+        for key in [
+            "token",
+            "token_encrypted",
+            "app_secret",
+            "app_secret_encrypted",
+        ] {
+            platform.remove(key);
+        }
+    }
+}
+
 fn preflight_legacy_root_sections(
     data_dir: &Path,
     input: &StrictPlanningInput,
@@ -2294,6 +2404,7 @@ fn preflight_legacy_root_sections(
             SectionId::Notifications => scrub_preflight_notification_secrets(&mut data),
             SectionId::Env => scrub_preflight_env_secrets(&mut data),
             SectionId::ClusterFabric => scrub_preflight_cluster_secrets(&mut data),
+            SectionId::Connect => scrub_preflight_connect_secrets(&mut data),
             SectionId::Credentials => unreachable!("credentials were skipped above"),
             _ => {}
         }
@@ -2614,63 +2725,6 @@ fn unwrapped_document_data(value: Value) -> ConfigStoreResult<Value> {
     })
 }
 
-fn preflight_connect_isolation(data_dir: &Path) -> ConfigStoreResult<()> {
-    for name in [
-        "config.json",
-        "config.json.bak",
-        "config.json.bak.1",
-        "config.json.bak.2",
-    ] {
-        let Some(config_bytes) = read_existing_bytes(&data_dir.join(name))? else {
-            continue;
-        };
-        let root: Value = serde_json::from_slice(&config_bytes).map_err(|error| {
-            crate::ConfigStoreError::Validation(format!(
-                "{name} cannot be audited for connect credential isolation: {error}"
-            ))
-        })?;
-        let root = root.as_object().ok_or_else(|| {
-            crate::ConfigStoreError::Validation(
-                "legacy configuration must be an object".to_string(),
-            )
-        })?;
-        if let Some(connect) = root.get("connect") {
-            let connect: ConnectConfig = serde_json::from_value(connect.clone()).map_err(|_| {
-                crate::ConfigStoreError::Validation(
-                    "connect configuration is invalid; modular layout was not changed".to_string(),
-                )
-            })?;
-            validate_connect_isolated(&connect).map_err(crate::ConfigStoreError::Validation)?;
-            validate_ordinary_section_json(root.get("connect").expect("checked above"))?;
-        }
-    }
-
-    for name in [
-        "connect.json",
-        "connect.json.bak",
-        "connect.json.bak.1",
-        "connect.json.bak.2",
-    ] {
-        let Some(connect_bytes) = read_existing_bytes(&data_dir.join(name))? else {
-            continue;
-        };
-        let document: Value = serde_json::from_slice(&connect_bytes).map_err(|error| {
-            crate::ConfigStoreError::Validation(format!(
-                "{name} cannot be audited for credential isolation: {error}"
-            ))
-        })?;
-        let raw = unwrapped_document_data(document)?;
-        let connect: ConnectConfig = serde_json::from_value(raw.clone()).map_err(|_| {
-            crate::ConfigStoreError::Validation(
-                "connect configuration is invalid; modular layout was not changed".to_string(),
-            )
-        })?;
-        validate_connect_isolated(&connect).map_err(crate::ConfigStoreError::Validation)?;
-        validate_ordinary_section_json(&raw)?;
-    }
-    Ok(())
-}
-
 fn preflight_broker_document(data_dir: &Path) -> ConfigStoreResult<bool> {
     let bytes = read_optional_bytes(&data_dir.join("broker.json"))?;
     if bytes.is_empty() {
@@ -2759,7 +2813,6 @@ pub fn migrate_config_facade_layout(
         recovered |= crate::recover_pending_config_transaction(data_dir)?;
         let source_before = preflight_source_hashes(data_dir)?;
         let preflight = (|| {
-            preflight_connect_isolation(data_dir)?;
             let broker_ready = preflight_broker_document(data_dir)?;
             // Decode every planner input now so malformed roots or sidecars
             // fail byte-for-byte unchanged when no committed recovery exists.
@@ -3024,8 +3077,7 @@ fn validate_section_layout_completion_shape(marker: &SectionLayoutMarker) -> Con
         || actual_members != expected_members
         || completion.members.len() != SECTION_DESCRIPTORS.len()
         || completion.members.values().any(|member| {
-            member.revision == 0
-                || member.sha256.len() != 64
+            member.sha256.len() != 64
                 || !member
                     .sha256
                     .bytes()
@@ -3122,14 +3174,11 @@ pub fn section_layout_is_active(data_dir: impl AsRef<Path>) -> ConfigStoreResult
         Ok(completion) => completion,
         Err(_) => return Ok(false),
     };
-    if !crate::credential_migration::section_layout_completion_evidence_matches(
+    crate::credential_migration::section_layout_completion_evidence_matches(
         data_dir,
         &bytes,
         &completion,
-    )? {
-        return Ok(false);
-    }
-    current_members_satisfy_completion(data_dir, &completion)
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3194,32 +3243,9 @@ pub struct CredentialSection {
 }
 
 impl CredentialSection {
-    fn open_from_bytes(data_dir: &Path, bytes: &[u8]) -> ConfigStoreResult<Self> {
+    fn open(data_dir: &Path, migration_lock_held: bool) -> Self {
         let store = CredentialStore::open(data_dir);
-        let (document_lkg, statuses, health) = store.snapshot_from_section_bytes(bytes)?;
-        let snapshot = Arc::new(CredentialSectionSnapshot {
-            data: Arc::new(statuses),
-            revision: health.revision,
-            loaded_at: Utc::now(),
-            source_path: store.path().to_path_buf(),
-            source_kind: health.source,
-            status: health.status,
-            last_error: health.last_error,
-        });
-        Ok(Self {
-            store,
-            operation_lock: Mutex::new(()),
-            document_lkg: RwLock::new(Some(Arc::new(document_lkg))),
-            trusted_lkg: RwLock::new(true),
-            repair_authority: RwLock::new(CredentialRepairAuthority::None),
-            snapshot: RwLock::new(snapshot),
-        })
-    }
-
-    #[cfg(test)]
-    fn open(data_dir: &Path) -> Self {
-        let store = CredentialStore::open(data_dir);
-        let (snapshot, document_lkg) = match load_credential_snapshot(&store, false) {
+        let (snapshot, document_lkg) = match load_credential_snapshot(&store, migration_lock_held) {
             Ok((snapshot, document_lkg)) => (snapshot, Some(Arc::new(document_lkg))),
             Err(error) => (
                 Arc::new(CredentialSectionSnapshot {
@@ -3683,58 +3709,10 @@ pub struct SectionRegistry {
 impl SectionRegistry {
     #[cfg(test)]
     pub(crate) fn open(data_dir: impl AsRef<Path>) -> ConfigStoreResult<Self> {
-        Self::open_configured(data_dir.as_ref())
+        Self::open_configured(data_dir.as_ref(), false)
     }
 
-    fn open_from_layout_bytes(
-        data_dir: &Path,
-        members: &BTreeMap<String, Vec<u8>>,
-    ) -> ConfigStoreResult<Self> {
-        macro_rules! open {
-            ($id:ident, $ty:ty, $validate:expr) => {{
-                let descriptor = SectionId::$id.descriptor();
-                let bytes = members
-                    .get(descriptor.file_name)
-                    .ok_or_else(layout_not_committed)?;
-                Arc::new(LiveSection::open_from_bytes_with_raw_validator(
-                    descriptor.name,
-                    AtomicJsonStore::<$ty>::new(
-                        data_dir.join(descriptor.file_name),
-                        SECTION_SCHEMA_VERSION,
-                    ),
-                    bytes,
-                    $validate,
-                    validate_ordinary_section_raw,
-                )?)
-            }};
-        }
-        let credential_bytes = members
-            .get(SectionId::Credentials.descriptor().file_name)
-            .ok_or_else(layout_not_committed)?;
-        Ok(Self {
-            core: open!(Core, CoreSection, validate_core),
-            providers: open!(Providers, ProvidersSection, validate_providers),
-            mcp: open!(Mcp, McpSection, validate_mcp),
-            tools_skills: open!(ToolsSkills, ToolsSkillsSection, validate_tools_skills),
-            memory: open!(Memory, MemorySection, validate_memory),
-            subagents: open!(Subagents, SubagentsSection, validate_subagents),
-            notifications: open!(Notifications, NotificationsSection, validate_notifications),
-            connect: open!(Connect, ConnectSection, validate_connect),
-            cluster_fabric: open!(ClusterFabric, ClusterFabricSection, validate_cluster_fabric),
-            env: open!(Env, EnvSection, validate_env),
-            access_control: open!(AccessControl, AccessControlSection, validate_access_control),
-            hooks: open!(Hooks, HooksSection, validate_hooks),
-            model_policy: open!(ModelPolicy, ModelPolicySection, validate_model_policy),
-            model_limits: open!(ModelLimits, ModelLimitsSection, validate_model_limits),
-            credentials: Arc::new(CredentialSection::open_from_bytes(
-                data_dir,
-                credential_bytes,
-            )?),
-        })
-    }
-
-    #[cfg(test)]
-    fn open_configured(data_dir: &Path) -> ConfigStoreResult<Self> {
+    fn open_configured(data_dir: &Path, migration_lock_held: bool) -> ConfigStoreResult<Self> {
         macro_rules! open {
             ($id:ident, $ty:ty, $validate:expr) => {{
                 let descriptor = SectionId::$id.descriptor();
@@ -3752,7 +3730,19 @@ impl SectionRegistry {
         }
         Ok(Self {
             core: open!(Core, CoreSection, validate_core),
-            providers: open!(Providers, ProvidersSection, validate_providers),
+            providers: {
+                let descriptor = SectionId::Providers.descriptor();
+                Arc::new(LiveSection::open_with_raw_validator_allowing_unversioned(
+                    descriptor.name,
+                    AtomicJsonStore::<ProvidersSection>::new(
+                        data_dir.join(descriptor.file_name),
+                        SECTION_SCHEMA_VERSION,
+                    ),
+                    ProvidersSection::default(),
+                    validate_providers,
+                    validate_ordinary_section_raw,
+                )?)
+            },
             mcp: open!(Mcp, McpSection, validate_mcp),
             tools_skills: open!(ToolsSkills, ToolsSkillsSection, validate_tools_skills),
             memory: open!(Memory, MemorySection, validate_memory),
@@ -3765,7 +3755,7 @@ impl SectionRegistry {
             hooks: open!(Hooks, HooksSection, validate_hooks),
             model_policy: open!(ModelPolicy, ModelPolicySection, validate_model_policy),
             model_limits: open!(ModelLimits, ModelLimitsSection, validate_model_limits),
-            credentials: Arc::new(CredentialSection::open(data_dir)),
+            credentials: Arc::new(CredentialSection::open(data_dir, migration_lock_held)),
         })
     }
 
@@ -3788,6 +3778,222 @@ impl SectionRegistry {
         ];
         health.push(self.credentials.health());
         Ok(health)
+    }
+
+    /// Return the public, secret-free envelope for one typed authority.
+    pub fn envelope_value(&self, id: SectionId) -> ConfigStoreResult<SectionEnvelope<Value>> {
+        macro_rules! envelope {
+            ($field:ident) => {{
+                let snapshot = self.$field.snapshot();
+                SectionEnvelope {
+                    data: serde_json::to_value(snapshot.data.as_ref())?,
+                    revision: snapshot.revision,
+                    loaded_at: snapshot.loaded_at,
+                    source_path: snapshot.source_path.clone(),
+                    source_kind: snapshot.source_kind,
+                    status: snapshot.status,
+                    last_error: snapshot.last_error.clone(),
+                }
+            }};
+        }
+        Ok(match id {
+            SectionId::Core => envelope!(core),
+            SectionId::Providers => envelope!(providers),
+            SectionId::Mcp => envelope!(mcp),
+            SectionId::ToolsSkills => envelope!(tools_skills),
+            SectionId::Memory => envelope!(memory),
+            SectionId::Subagents => envelope!(subagents),
+            SectionId::Notifications => envelope!(notifications),
+            SectionId::Connect => envelope!(connect),
+            SectionId::ClusterFabric => envelope!(cluster_fabric),
+            SectionId::Env => envelope!(env),
+            SectionId::AccessControl => envelope!(access_control),
+            SectionId::Hooks => envelope!(hooks),
+            SectionId::ModelPolicy => envelope!(model_policy),
+            SectionId::ModelLimits => envelope!(model_limits),
+            SectionId::Credentials => {
+                let snapshot = self.credentials.snapshot();
+                SectionEnvelope {
+                    data: serde_json::to_value(snapshot.data.as_ref())?,
+                    revision: snapshot.revision,
+                    loaded_at: snapshot.loaded_at,
+                    source_path: snapshot.source_path.clone(),
+                    source_kind: snapshot.source_kind,
+                    status: snapshot.status,
+                    last_error: snapshot.last_error.clone(),
+                }
+            }
+        })
+    }
+
+    /// Commit one ordinary section from its public JSON representation.
+    /// Provider and MCP writes are intentionally owned by server adapters that
+    /// stage their replacement runtimes; credential values use their dedicated
+    /// replace/clear API.
+    pub fn commit_value(
+        &self,
+        id: SectionId,
+        expected_revision: u64,
+        candidate: Value,
+    ) -> ConfigStoreResult<ConfigSectionEvent> {
+        validate_ordinary_section_json(&candidate)?;
+        macro_rules! commit {
+            ($field:ident, $ty:ty) => {{
+                let typed: $ty = serde_json::from_value(candidate)?;
+                self.$field.commit(expected_revision, typed)
+            }};
+        }
+        match id {
+            SectionId::Core => commit!(core, CoreSection),
+            SectionId::ToolsSkills => commit!(tools_skills, ToolsSkillsSection),
+            SectionId::Memory => commit!(memory, MemorySection),
+            SectionId::Subagents => commit!(subagents, SubagentsSection),
+            SectionId::Notifications => commit!(notifications, NotificationsSection),
+            SectionId::Connect => commit!(connect, ConnectSection),
+            SectionId::ClusterFabric => commit!(cluster_fabric, ClusterFabricSection),
+            SectionId::Env => commit!(env, EnvSection),
+            SectionId::AccessControl => commit!(access_control, AccessControlSection),
+            SectionId::Hooks => commit!(hooks, HooksSection),
+            SectionId::ModelPolicy => commit!(model_policy, ModelPolicySection),
+            SectionId::ModelLimits => commit!(model_limits, ModelLimitsSection),
+            SectionId::Providers | SectionId::Mcp => Err(crate::ConfigStoreError::Validation(
+                "provider and MCP sections require runtime-staged endpoints".to_string(),
+            )),
+            SectionId::Credentials => Err(crate::ConfigStoreError::Validation(
+                "credentials require the status/replace/clear API".to_string(),
+            )),
+        }
+    }
+
+    /// Reload one watched section into its immutable LKG snapshot. Runtime
+    /// side effects remain the server owner's responsibility; this method only
+    /// publishes typed data/health and returns the corresponding public event.
+    pub fn reload(&self, id: SectionId) -> ConfigSectionEvent {
+        macro_rules! reload {
+            ($field:ident) => {
+                self.$field.reload()
+            };
+        }
+        match id {
+            SectionId::Core => reload!(core),
+            SectionId::Providers => reload!(providers),
+            SectionId::Mcp => reload!(mcp),
+            SectionId::ToolsSkills => reload!(tools_skills),
+            SectionId::Memory => reload!(memory),
+            SectionId::Subagents => reload!(subagents),
+            SectionId::Notifications => reload!(notifications),
+            SectionId::Connect => reload!(connect),
+            SectionId::ClusterFabric => reload!(cluster_fabric),
+            SectionId::Env => reload!(env),
+            SectionId::AccessControl => reload!(access_control),
+            SectionId::Hooks => reload!(hooks),
+            SectionId::ModelPolicy => reload!(model_policy),
+            SectionId::ModelLimits => reload!(model_limits),
+            SectionId::Credentials => {
+                let before = self.credentials.health();
+                let loaded = self.credentials.reload();
+                let after = self.credentials.health();
+                if loaded.is_err() || after.status != SectionStatus::Healthy {
+                    ConfigSectionEvent::Invalid {
+                        section: id.descriptor().name.to_string(),
+                        revision: after.revision,
+                    }
+                } else if before.status != SectionStatus::Healthy {
+                    ConfigSectionEvent::Recovered {
+                        section: id.descriptor().name.to_string(),
+                        revision: after.revision,
+                    }
+                } else {
+                    ConfigSectionEvent::Changed {
+                        section: id.descriptor().name.to_string(),
+                        revision: after.revision,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reload a watcher notification and suppress exact self-write echoes.
+    /// Revision, health and data all participate in the comparison, so an
+    /// invalid/recovered transition is never hidden merely because the LKG
+    /// payload stayed unchanged.
+    pub fn reload_if_changed(&self, id: SectionId) -> Option<ConfigSectionEvent> {
+        let before = self.observation(id);
+        let event = self.reload(id);
+        (self.observation(id) != before).then_some(event)
+    }
+
+    fn observation(
+        &self,
+        id: SectionId,
+    ) -> (u64, SectionStatus, SectionSourceKind, Option<String>, Value) {
+        macro_rules! observe {
+            ($field:ident) => {{
+                let snapshot = self.$field.snapshot();
+                (
+                    snapshot.revision,
+                    snapshot.status,
+                    snapshot.source_kind,
+                    snapshot.last_error.clone(),
+                    serde_json::to_value(snapshot.data.as_ref())
+                        .expect("live section data remains serializable"),
+                )
+            }};
+        }
+        match id {
+            SectionId::Core => observe!(core),
+            SectionId::Providers => observe!(providers),
+            SectionId::Mcp => observe!(mcp),
+            SectionId::ToolsSkills => observe!(tools_skills),
+            SectionId::Memory => observe!(memory),
+            SectionId::Subagents => observe!(subagents),
+            SectionId::Notifications => observe!(notifications),
+            SectionId::Connect => observe!(connect),
+            SectionId::ClusterFabric => observe!(cluster_fabric),
+            SectionId::Env => observe!(env),
+            SectionId::AccessControl => observe!(access_control),
+            SectionId::Hooks => observe!(hooks),
+            SectionId::ModelPolicy => observe!(model_policy),
+            SectionId::ModelLimits => observe!(model_limits),
+            SectionId::Credentials => {
+                let snapshot = self.credentials.snapshot();
+                (
+                    snapshot.revision,
+                    snapshot.status,
+                    snapshot.source_kind,
+                    snapshot.last_error.clone(),
+                    serde_json::to_value(snapshot.data.as_ref())
+                        .expect("credential statuses remain serializable"),
+                )
+            }
+        }
+    }
+
+    /// Attach a runtime-hook failure to a successfully parsed durable section
+    /// without replacing its data or pretending the old runtime was updated.
+    pub fn mark_runtime_degraded(
+        &self,
+        id: SectionId,
+        message: impl Into<String>,
+    ) -> Option<ConfigSectionEvent> {
+        let message = message.into();
+        match id {
+            SectionId::Core => Some(self.core.mark_runtime_degraded(message)),
+            SectionId::Providers => Some(self.providers.mark_runtime_degraded(message)),
+            SectionId::Mcp => Some(self.mcp.mark_runtime_degraded(message)),
+            SectionId::ToolsSkills => Some(self.tools_skills.mark_runtime_degraded(message)),
+            SectionId::Memory => Some(self.memory.mark_runtime_degraded(message)),
+            SectionId::Subagents => Some(self.subagents.mark_runtime_degraded(message)),
+            SectionId::Notifications => Some(self.notifications.mark_runtime_degraded(message)),
+            SectionId::Connect => Some(self.connect.mark_runtime_degraded(message)),
+            SectionId::ClusterFabric => Some(self.cluster_fabric.mark_runtime_degraded(message)),
+            SectionId::Env => Some(self.env.mark_runtime_degraded(message)),
+            SectionId::AccessControl => Some(self.access_control.mark_runtime_degraded(message)),
+            SectionId::Hooks => Some(self.hooks.mark_runtime_degraded(message)),
+            SectionId::ModelPolicy => Some(self.model_policy.mark_runtime_degraded(message)),
+            SectionId::ModelLimits => Some(self.model_limits.mark_runtime_degraded(message)),
+            SectionId::Credentials => None,
+        }
     }
 
     pub fn projection(&self) -> SectionProjection {
@@ -3830,10 +4036,10 @@ impl ConfigFacade {
                 if !section_layout_is_active(data_dir)? {
                     return Err(layout_not_committed());
                 }
-                let before = capture_layout_member_bytes(data_dir)?;
-                let registry = SectionRegistry::open_from_layout_bytes(data_dir, &before)?;
+                let before = capture_layout_member_states(data_dir)?;
+                let registry = SectionRegistry::open_configured(data_dir, true)?;
                 after_registry_open(&registry);
-                let after = capture_layout_member_bytes(data_dir)?;
+                let after = capture_layout_member_states(data_dir)?;
                 if before != after {
                     return Err(crate::ConfigStoreError::Validation(
                         "configuration changed while opening the modular facade".to_string(),
@@ -3842,15 +4048,6 @@ impl ConfigFacade {
                 crate::ensure_provider_mcp_migration_ready(data_dir)?;
                 if !section_layout_is_active(data_dir)? {
                     return Err(layout_not_committed());
-                }
-                if registry
-                    .health()?
-                    .iter()
-                    .any(|health| health.status != SectionStatus::Healthy)
-                {
-                    return Err(crate::ConfigStoreError::Validation(
-                        "modular configuration contains an unhealthy section".to_string(),
-                    ));
                 }
                 Ok(registry)
             })?;
@@ -3861,6 +4058,7 @@ impl ConfigFacade {
 
     pub fn open_or_migrate(data_dir: impl AsRef<Path>) -> ConfigStoreResult<Self> {
         migrate_config_facade_layout(data_dir.as_ref())?;
+        migrate_copilot_oauth_cache(data_dir.as_ref())?;
         Self::open(data_dir)
     }
 
@@ -3873,14 +4071,289 @@ impl ConfigFacade {
     }
 }
 
-fn capture_layout_member_bytes(data_dir: &Path) -> ConfigStoreResult<BTreeMap<String, Vec<u8>>> {
+/// Adopt the two historical plaintext Copilot OAuth caches into the encrypted
+/// credential authority. The credential is committed first and the legacy
+/// source is removed only if its bytes are still unchanged, making retries
+/// safe after a crash at either boundary.
+pub fn migrate_copilot_oauth_cache(data_dir: &Path) -> ConfigStoreResult<()> {
+    for (name, reference, kind) in [
+        (
+            ".token",
+            COPILOT_GITHUB_ACCESS_CREDENTIAL_REF,
+            CopilotCacheKind::AccessToken,
+        ),
+        (
+            ".copilot_token.json",
+            COPILOT_CHAT_CONFIG_CREDENTIAL_REF,
+            CopilotCacheKind::ChatConfig,
+        ),
+        (
+            "copilot_token.json",
+            COPILOT_CHAT_CONFIG_CREDENTIAL_REF,
+            CopilotCacheKind::ChatConfig,
+        ),
+    ] {
+        migrate_one_copilot_cache(data_dir, name, reference, kind)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CopilotCacheKind {
+    AccessToken,
+    ChatConfig,
+}
+
+fn migrate_one_copilot_cache(
+    data_dir: &Path,
+    name: &str,
+    reference: &str,
+    kind: CopilotCacheKind,
+) -> ConfigStoreResult<()> {
+    let path = data_dir.join(name);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(crate::ConfigStoreError::Validation(
+            "Copilot OAuth cache is not a regular file".to_string(),
+        ));
+    }
+    let original = std::fs::read(&path)?;
+    let text = std::str::from_utf8(&original).map_err(|_| {
+        crate::ConfigStoreError::Validation("Copilot OAuth cache is invalid".to_string())
+    })?;
+    let secret = match kind {
+        CopilotCacheKind::AccessToken => {
+            let token = text.trim();
+            if token.is_empty() {
+                return Err(crate::ConfigStoreError::Validation(
+                    "Copilot OAuth cache is empty".to_string(),
+                ));
+            }
+            token.to_string()
+        }
+        CopilotCacheKind::ChatConfig => {
+            let value: Value = serde_json::from_str(text)?;
+            let object = value.as_object().ok_or_else(|| {
+                crate::ConfigStoreError::Validation("Copilot OAuth cache is invalid".to_string())
+            })?;
+            if !object
+                .get("token")
+                .and_then(Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty())
+                || !object.get("expires_at").is_some_and(Value::is_u64)
+            {
+                return Err(crate::ConfigStoreError::Validation(
+                    "Copilot OAuth cache is invalid".to_string(),
+                ));
+            }
+            serde_json::to_string(&value)?
+        }
+    };
+    let reference = CredentialRef::parse(reference.to_string()).map_err(|_| {
+        crate::ConfigStoreError::Validation("Copilot credential reference is invalid".to_string())
+    })?;
+    let store = CredentialStore::open(data_dir);
+    let mut installed = false;
+    for _ in 0..8 {
+        if let Some(existing) = store.resolve(&reference)? {
+            if existing.expose() != secret {
+                return Err(crate::ConfigStoreError::Validation(
+                    "Copilot OAuth cache conflicts with the credential store".to_string(),
+                ));
+            }
+            installed = true;
+            break;
+        }
+        let revision = store.revision()?;
+        match store.replace(
+            reference.clone(),
+            &secret,
+            CredentialSource::Migrated,
+            revision,
+        ) {
+            Ok(_) => {
+                installed = true;
+                break;
+            }
+            Err(crate::ConfigStoreError::Conflict { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if !installed {
+        return Err(crate::ConfigStoreError::Validation(
+            "Copilot credential store remained busy".to_string(),
+        ));
+    }
+    if std::fs::read(&path)? == original {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Persist a compatibility [`Config`] through the active modular authorities.
+///
+/// This is the bridge used by legacy root PATCH/CLI callers during the
+/// compatibility window: `config.json` is never recreated after activation,
+/// and unchanged sections retain their own revisions. All candidates are
+/// validated before the first durable write; each changed member then uses the
+/// section's snapshot-bound CAS so a concurrent process/editor winner is never
+/// silently overwritten.
+pub fn persist_facade_effective_config(
+    data_dir: impl AsRef<Path>,
+    config: &Config,
+) -> ConfigStoreResult<Vec<ConfigSectionEvent>> {
+    let data_dir = data_dir.as_ref();
+    let facade = ConfigFacade::open(data_dir)?;
+    let current = facade.registry.projection();
+    let mut candidate = SectionProjection::from_config(config, current.model_limits.clone())?;
+    // The external broker is owned by broker.json / the migration planner and
+    // is not part of the compatibility Config wire shape. Preserve its current
+    // durable projection across unrelated root writes.
+    candidate.subagents.external_broker = current.subagents.external_broker.clone();
+    validate_projection(&candidate)?;
+
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        if !section_layout_is_active(data_dir)? {
+            return Err(layout_not_committed());
+        }
+        let mut changed = Vec::new();
+        macro_rules! record_change {
+            ($field:ident, $name:literal) => {
+                if serde_json::to_value(facade.registry.$field.snapshot().data.as_ref())?
+                    != serde_json::to_value(&candidate.$field)?
+                {
+                    changed.push($name);
+                }
+            };
+        }
+        record_change!(core, "core");
+        record_change!(providers, "providers");
+        record_change!(mcp, "mcp");
+        record_change!(tools_skills, "tools-skills");
+        record_change!(memory, "memory");
+        record_change!(subagents, "subagents");
+        record_change!(notifications, "notifications");
+        record_change!(connect, "connect");
+        record_change!(cluster_fabric, "cluster-fabric");
+        record_change!(env, "env");
+        record_change!(access_control, "access-control");
+        record_change!(hooks, "hooks");
+        record_change!(model_policy, "model-policy");
+        if changed.len() > 1 {
+            return Err(crate::ConfigStoreError::Validation(format!(
+                "a compatibility write changed multiple sections ({}); split the request",
+                changed.join(", ")
+            )));
+        }
+        let mut events = Vec::new();
+        macro_rules! commit_if_changed {
+            ($field:ident, $candidate:expr) => {{
+                let candidate = $candidate;
+                let snapshot = facade.registry.$field.snapshot();
+                if serde_json::to_value(snapshot.data.as_ref())?
+                    != serde_json::to_value(&candidate)?
+                {
+                    events.push(
+                        facade
+                            .registry
+                            .$field
+                            .commit(snapshot.revision, candidate)?,
+                    );
+                }
+            }};
+        }
+
+        commit_if_changed!(core, candidate.core);
+        commit_if_changed!(providers, candidate.providers);
+        commit_if_changed!(mcp, candidate.mcp);
+        commit_if_changed!(tools_skills, candidate.tools_skills);
+        commit_if_changed!(memory, candidate.memory);
+        commit_if_changed!(subagents, candidate.subagents);
+        commit_if_changed!(notifications, candidate.notifications);
+        commit_if_changed!(connect, candidate.connect);
+        commit_if_changed!(cluster_fabric, candidate.cluster_fabric);
+        commit_if_changed!(env, candidate.env);
+        commit_if_changed!(access_control, candidate.access_control);
+        commit_if_changed!(hooks, candidate.hooks);
+        commit_if_changed!(model_policy, candidate.model_policy);
+        Ok(events)
+    })
+}
+
+/// Compare two effective configs using the same section projection as the
+/// modular persistence facade. Runtime-only hydrated secret fields are
+/// sanitized by the projection and therefore do not create false changes.
+pub fn changed_facade_sections(
+    current: &Config,
+    candidate: &Config,
+) -> ConfigStoreResult<Vec<SectionId>> {
+    let current = SectionProjection::from_config(current, ModelLimitsSection::default())?;
+    let candidate = SectionProjection::from_config(candidate, ModelLimitsSection::default())?;
+    let mut changed = Vec::new();
+    macro_rules! compare {
+        ($id:ident, $field:ident) => {
+            if serde_json::to_value(&current.$field)? != serde_json::to_value(&candidate.$field)? {
+                changed.push(SectionId::$id);
+            }
+        };
+    }
+    compare!(Core, core);
+    compare!(Providers, providers);
+    compare!(Mcp, mcp);
+    compare!(ToolsSkills, tools_skills);
+    compare!(Memory, memory);
+    compare!(Subagents, subagents);
+    compare!(Notifications, notifications);
+    compare!(Connect, connect);
+    compare!(ClusterFabric, cluster_fabric);
+    compare!(Env, env);
+    compare!(AccessControl, access_control);
+    compare!(Hooks, hooks);
+    compare!(ModelPolicy, model_policy);
+    Ok(changed)
+}
+
+pub(crate) fn provider_section_value(config: &Config) -> ConfigStoreResult<Value> {
+    Ok(serde_json::to_value(
+        SectionProjection::from_config(config, ModelLimitsSection::default())?.providers,
+    )?)
+}
+
+fn validate_projection(projection: &SectionProjection) -> ConfigStoreResult<()> {
+    for result in [
+        validate_core(&projection.core),
+        validate_providers(&projection.providers),
+        validate_mcp(&projection.mcp),
+        validate_tools_skills(&projection.tools_skills),
+        validate_memory(&projection.memory),
+        validate_subagents(&projection.subagents),
+        validate_notifications(&projection.notifications),
+        validate_connect(&projection.connect),
+        validate_cluster_fabric(&projection.cluster_fabric),
+        validate_env(&projection.env),
+        validate_access_control(&projection.access_control),
+        validate_hooks(&projection.hooks),
+        validate_model_policy(&projection.model_policy),
+        validate_model_limits(&projection.model_limits),
+    ] {
+        result.map_err(crate::ConfigStoreError::Validation)?;
+    }
+    Ok(())
+}
+
+fn capture_layout_member_states(
+    data_dir: &Path,
+) -> ConfigStoreResult<BTreeMap<String, Option<Vec<u8>>>> {
     SECTION_DESCRIPTORS
         .iter()
         .map(|descriptor| {
             let bytes = crate::credential_migration::read_section_attestation_target(
                 &data_dir.join(descriptor.file_name),
-            )?
-            .ok_or_else(layout_not_committed)?;
+            )?;
             Ok((descriptor.file_name.to_string(), bytes))
         })
         .collect()
@@ -4063,13 +4536,9 @@ mod tests {
             Some("memory-model")
         );
         assert_eq!(round_trip.subagents().max_concurrent, Some(3));
-        assert_eq!(
-            round_trip
-                .subagents()
-                .broker
-                .as_ref()
-                .map(|broker| broker.endpoint.as_str()),
-            Some("ws://broker.test")
+        assert!(
+            round_trip.subagents().broker.is_none(),
+            "runtime broker endpoints must not enter a durable projection"
         );
     }
 
@@ -4152,6 +4621,39 @@ mod tests {
 
         std::fs::write(&path, &original).unwrap();
         assert!(ConfigFacade::open(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn facade_startup_migrates_copilot_oauth_caches_before_runtime_reads() {
+        let _key = crate::encryption::set_test_encryption_key([0x98; 32]);
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".token"), "github-oauth-secret\n").unwrap();
+        write_json(
+            &dir.path().join(".copilot_token.json"),
+            &json!({
+                "token": "copilot-chat-secret",
+                "expires_at": 4_000_000_000u64,
+                "refresh_in": 120
+            }),
+        );
+
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+
+        assert!(!dir.path().join(".token").exists());
+        assert!(!dir.path().join(".copilot_token.json").exists());
+        let store = CredentialStore::open(dir.path());
+        let github =
+            CredentialRef::parse(COPILOT_GITHUB_ACCESS_CREDENTIAL_REF.to_string()).unwrap();
+        let chat = CredentialRef::parse(COPILOT_CHAT_CONFIG_CREDENTIAL_REF.to_string()).unwrap();
+        assert_eq!(
+            store.resolve(&github).unwrap().unwrap().expose(),
+            "github-oauth-secret"
+        );
+        let chat = store.resolve(&chat).unwrap().unwrap();
+        assert!(chat.expose().contains("copilot-chat-secret"));
+        let durable = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
+        assert!(!durable.contains("github-oauth-secret"));
+        assert!(!durable.contains("copilot-chat-secret"));
     }
 
     #[test]
@@ -4317,7 +4819,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_activation_requires_a_complete_attestation_and_monotonic_valid_members() {
+    fn layout_activation_requires_completion_evidence_but_allows_degraded_members() {
         let _key = crate::encryption::set_test_encryption_key([89; 32]);
         let dir = TempDir::new().unwrap();
         write_json(
@@ -4355,7 +4857,7 @@ mod tests {
         let core_path = dir.path().join("core.json");
         let original_core = std::fs::read(&core_path).unwrap();
         std::fs::remove_file(&core_path).unwrap();
-        assert!(!section_layout_is_active(dir.path()).unwrap());
+        assert!(section_layout_is_active(dir.path()).unwrap());
         std::fs::write(&core_path, &original_core).unwrap();
 
         let mut forged_uuid: Value = serde_json::from_slice(&marker_bytes).unwrap();
@@ -4379,11 +4881,11 @@ mod tests {
         let mut same_revision: Value = serde_json::from_slice(&original_core).unwrap();
         same_revision["data"]["future_same_revision"] = json!({"tampered": true});
         write_json(&core_path, &same_revision);
-        assert!(!section_layout_is_active(dir.path()).unwrap());
+        assert!(section_layout_is_active(dir.path()).unwrap());
 
         same_revision["revision"] = json!(attested_revision - 1);
         write_json(&core_path, &same_revision);
-        assert!(!section_layout_is_active(dir.path()).unwrap());
+        assert!(section_layout_is_active(dir.path()).unwrap());
 
         let mut higher: Value = serde_json::from_slice(&original_core).unwrap();
         higher["revision"] = json!(attested_revision + 1);
@@ -4394,7 +4896,7 @@ mod tests {
         higher["revision"] = json!(attested_revision + 2);
         higher["data"]["token"] = json!("must-not-enter-an-ordinary-section");
         write_json(&core_path, &higher);
-        assert!(!section_layout_is_active(dir.path()).unwrap());
+        assert!(section_layout_is_active(dir.path()).unwrap());
 
         std::fs::write(&core_path, &original_core).unwrap();
         let skeleton = SectionLayoutMarker {
@@ -5609,7 +6111,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_backup_secret_is_zero_write_before_compound_migration() {
+    fn connect_backup_secret_is_committed_and_scrubbed_by_compound_migration() {
         let _key = crate::encryption::set_test_encryption_key([114; 32]);
         let dir = TempDir::new().unwrap();
         let root = serde_json::to_vec_pretty(&json!({
@@ -5625,14 +6127,30 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("connect.json.bak"), &connect_backup).unwrap();
 
-        assert!(migrate_config_facade_layout(dir.path()).is_err());
-        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        migrate_config_facade_layout(dir.path()).unwrap();
+        let backup: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("connect.json.bak")).unwrap())
+                .unwrap();
+        let platform = &backup["data"]["platforms"][0];
+        assert!(platform.get("token").is_none());
+        assert!(platform.get("token_encrypted").is_none());
+        let reference = CredentialRef::parse(
+            platform["token_credential_ref"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+        .unwrap();
         assert_eq!(
-            std::fs::read(dir.path().join("connect.json.bak")).unwrap(),
-            connect_backup
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "backup-token"
         );
-        assert!(!dir.path().join("credentials.json").exists());
-        assert!(!dir.path().join(SECTION_LAYOUT_FILE).exists());
+        assert!(dir.path().join("credentials.json").exists());
+        assert!(dir.path().join(SECTION_LAYOUT_FILE).exists());
     }
 
     #[test]
@@ -6219,7 +6737,28 @@ mod tests {
             }),
         ))
         .unwrap();
-        assert!(validate_section_envelope("access-control.json", &verifier_metadata, 1).is_ok());
+        assert!(validate_section_envelope("access-control.json", &verifier_metadata, 1).is_err());
+
+        let isolated_verifier_metadata = serde_json::to_vec(&section_document(
+            1,
+            json!({
+                "password_enabled": true,
+                "password_credential_ref": "access.root.password_verifier",
+                "password_configured": true,
+                "devices": [{
+                    "device_id": "bamboo_device01",
+                    "label": "Phone",
+                    "token_credential_ref": "access.bamboo_device01.device_token_verifier",
+                    "token_configured": true,
+                    "created_at": "2026-07-21T00:00:00Z"
+                }]
+            }),
+        ))
+        .unwrap();
+        assert!(
+            validate_section_envelope("access-control.json", &isolated_verifier_metadata, 1)
+                .is_ok()
+        );
 
         let canonical_broker = serde_json::to_vec(&section_document(
             1,
@@ -6968,7 +7507,7 @@ mod tests {
     fn credential_degraded_backup_reload_retains_newer_live_snapshot() {
         let _key = crate::encryption::set_test_encryption_key([88; 32]);
         let dir = TempDir::new().unwrap();
-        let section = CredentialSection::open(dir.path());
+        let section = CredentialSection::open(dir.path(), false);
         let first = CredentialRef::parse("provider.openai.api_key").unwrap();
         let second = CredentialRef::parse("provider.anthropic.api_key").unwrap();
         section
@@ -6997,7 +7536,7 @@ mod tests {
         let second = CredentialRef::parse("provider.anthropic.api_key").unwrap();
 
         let replace_dir = TempDir::new().unwrap();
-        let replace_section = CredentialSection::open(replace_dir.path());
+        let replace_section = CredentialSection::open(replace_dir.path(), false);
         replace_section
             .replace(first.clone(), "first-secret", CredentialSource::User, 0)
             .unwrap();
@@ -7040,7 +7579,7 @@ mod tests {
         );
 
         let clear_dir = TempDir::new().unwrap();
-        let clear_section = CredentialSection::open(clear_dir.path());
+        let clear_section = CredentialSection::open(clear_dir.path(), false);
         clear_section
             .replace(first.clone(), "first-secret", CredentialSource::User, 0)
             .unwrap();
@@ -7081,7 +7620,7 @@ mod tests {
         let second = CredentialRef::parse("provider.anthropic.api_key").unwrap();
 
         let missing_dir = TempDir::new().unwrap();
-        let missing = CredentialSection::open(missing_dir.path());
+        let missing = CredentialSection::open(missing_dir.path(), false);
         missing
             .replace(first.clone(), "first-secret", CredentialSource::User, 0)
             .unwrap();
@@ -7102,7 +7641,7 @@ mod tests {
         );
 
         let invalid_dir = TempDir::new().unwrap();
-        let invalid = CredentialSection::open(invalid_dir.path());
+        let invalid = CredentialSection::open(invalid_dir.path(), false);
         invalid
             .replace(first.clone(), "first-secret", CredentialSource::User, 0)
             .unwrap();
@@ -7135,7 +7674,7 @@ mod tests {
     fn credential_readiness_failure_preserves_snapshot_and_lkg_authority() {
         let _key = crate::encryption::set_test_encryption_key([106; 32]);
         let dir = TempDir::new().unwrap();
-        let section = CredentialSection::open(dir.path());
+        let section = CredentialSection::open(dir.path(), false);
         let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
         section
             .replace(reference, "first-secret", CredentialSource::User, 0)
@@ -7174,7 +7713,7 @@ mod tests {
     fn credential_nonrepairable_error_then_missing_retains_trusted_lkg() {
         let _key = crate::encryption::set_test_encryption_key([107; 32]);
         let dir = TempDir::new().unwrap();
-        let section = CredentialSection::open(dir.path());
+        let section = CredentialSection::open(dir.path(), false);
         let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
         section
             .replace(reference.clone(), "first-secret", CredentialSource::User, 0)
@@ -7221,7 +7760,7 @@ mod tests {
     fn credential_same_revision_external_edit_conflicts_without_publication() {
         let _key = crate::encryption::set_test_encryption_key([94; 32]);
         let dir = TempDir::new().unwrap();
-        let section = CredentialSection::open(dir.path());
+        let section = CredentialSection::open(dir.path(), false);
         let first = CredentialRef::parse("provider.openai.api_key").unwrap();
         let second = CredentialRef::parse("provider.anthropic.api_key").unwrap();
         let third = CredentialRef::parse("provider.gemini.api_key").unwrap();
@@ -7260,7 +7799,7 @@ mod tests {
     fn credential_durable_success_does_not_reload_before_publication() {
         let _key = crate::encryption::set_test_encryption_key([91; 32]);
         let dir = TempDir::new().unwrap();
-        let section = CredentialSection::open(dir.path());
+        let section = CredentialSection::open(dir.path(), false);
         let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
         let credential_path = section.store.path().to_path_buf();
 
@@ -7283,7 +7822,7 @@ mod tests {
 
         let _key = crate::encryption::set_test_encryption_key([92; 32]);
         let dir = TempDir::new().unwrap();
-        let section = Arc::new(CredentialSection::open(dir.path()));
+        let section = Arc::new(CredentialSection::open(dir.path(), false));
         let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let mut threads = Vec::new();
@@ -7333,7 +7872,7 @@ mod tests {
 
         let _key = crate::encryption::set_test_encryption_key([89; 32]);
         let dir = TempDir::new().unwrap();
-        let section = Arc::new(CredentialSection::open(dir.path()));
+        let section = Arc::new(CredentialSection::open(dir.path(), false));
         let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
         let (durable_tx, durable_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
@@ -7402,7 +7941,7 @@ mod tests {
         let _key = crate::encryption::set_test_encryption_key([88; 32]);
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().to_path_buf();
-        let section = Arc::new(CredentialSection::open(&data_dir));
+        let section = Arc::new(CredentialSection::open(&data_dir, false));
         let first = CredentialRef::parse("provider.openai.api_key").unwrap();
         let second = CredentialRef::parse("provider.anthropic.api_key").unwrap();
         let (durable_tx, durable_rx) = mpsc::sync_channel(0);
@@ -7445,5 +7984,34 @@ mod tests {
         assert_eq!(reloaded.revision, 2);
         assert_eq!(reloaded.status, SectionStatus::Healthy);
         assert_eq!(reloaded.data.len(), 2);
+    }
+
+    #[test]
+    fn compatibility_write_rejects_multiple_sections_before_any_commit() {
+        let _key = crate::encryption::set_test_encryption_key([89; 32]);
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let core_path = dir.path().join("core.json");
+        let tools_path = dir.path().join("tools-skills.json");
+        let core_before = std::fs::read(&core_path).unwrap();
+        let tools_before = std::fs::read(&tools_path).unwrap();
+        let core_revision = facade.registry().core.snapshot().revision;
+        let tools_revision = facade.registry().tools_skills.snapshot().revision;
+
+        let mut candidate = facade.effective_config();
+        candidate.http_proxy = "http://proxy.invalid:8080".to_string();
+        candidate.tools.disabled.push("bash".to_string());
+
+        let error = persist_facade_effective_config(dir.path(), &candidate).unwrap_err();
+        assert!(error.to_string().contains("changed multiple sections"));
+        assert_eq!(std::fs::read(core_path).unwrap(), core_before);
+        assert_eq!(std::fs::read(tools_path).unwrap(), tools_before);
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.registry().core.snapshot().revision, core_revision);
+        assert_eq!(
+            reopened.registry().tools_skills.snapshot().revision,
+            tools_revision
+        );
     }
 }

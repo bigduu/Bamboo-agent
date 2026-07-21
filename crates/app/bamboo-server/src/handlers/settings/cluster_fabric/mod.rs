@@ -136,6 +136,7 @@ fn redact_node_value(node: &Node) -> Value {
 /// hydrated to PLAINTEXT (its `*_encrypted` are `None` — ciphertext is only
 /// materialized on the disk-bound clone). So the source of truth to carry is the
 /// old plaintext; `refresh_cluster_fabric_encrypted` re-encrypts it on save.
+#[cfg(test)]
 fn preserve_node_secrets(existing: &Node, incoming: &mut Node) {
     let (NodePlacement::Ssh(old), NodePlacement::Ssh(new)) =
         (&existing.placement, &mut incoming.placement)
@@ -182,6 +183,7 @@ fn preserve_node_secrets(existing: &Node, incoming: &mut Node) {
 /// node that already owns isolated refs may only receive metadata edits and a
 /// redacted keep round-trip. Accepting a real replacement, auth switch, or
 /// delete here would return success while leaving the old store value behind.
+#[cfg(test)]
 fn ensure_managed_node_secret_unchanged(
     existing: &Node,
     incoming: &NodePlacement,
@@ -221,6 +223,7 @@ fn ensure_managed_node_secret_unchanged(
 /// If `plaintext` is empty or the mask sentinel, replace it with the existing
 /// secret so it survives a redacted round-trip: prefer the old plaintext (what
 /// the hydrated in-memory config holds), else the old ciphertext.
+#[cfg(test)]
 fn preserve_secret(
     plaintext: &mut String,
     encrypted: &mut Option<String>,

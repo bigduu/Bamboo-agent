@@ -949,6 +949,8 @@ mod tests {
                 password_enabled: false,
                 password_hash: None,
                 password_salt: None,
+                password_credential_ref: None,
+                password_configured: false,
                 updated_at: None,
                 devices: vec![cred.clone()],
             });

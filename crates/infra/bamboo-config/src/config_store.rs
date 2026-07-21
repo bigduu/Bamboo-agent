@@ -22,6 +22,15 @@ use uuid::Uuid;
 
 const DEFAULT_BACKUP_GENERATIONS: usize = 3;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicWriteFault {
+    DiskFullDuringWrite,
+    FileSync,
+    Rename,
+    DirectorySync,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigStoreError {
     #[error("configuration I/O failed")]
@@ -57,6 +66,8 @@ pub struct AtomicFileStore {
     path: PathBuf,
     sensitive: bool,
     backup_generations: usize,
+    #[cfg(test)]
+    test_fault: Option<AtomicWriteFault>,
 }
 
 impl AtomicFileStore {
@@ -65,6 +76,8 @@ impl AtomicFileStore {
             path: path.into(),
             sensitive: false,
             backup_generations: DEFAULT_BACKUP_GENERATIONS,
+            #[cfg(test)]
+            test_fault: None,
         }
     }
 
@@ -203,7 +216,13 @@ impl AtomicFileStore {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(lock_path)?;
+            .open(&lock_path)?;
+        #[cfg(windows)]
+        if self.sensitive {
+            if set_sensitive_windows_acl(&lock_path).is_err() {
+                tracing::warn!("failed to harden a sensitive configuration lock ACL");
+            }
+        }
         file.lock_exclusive()?;
         Ok(FileLock(file))
     }
@@ -271,13 +290,37 @@ impl AtomicFileStore {
             options.mode(if self.sensitive { 0o600 } else { 0o666 });
         }
         let mut file = options.open(&temp_path)?;
+        #[cfg(test)]
+        if self.test_fault == Some(AtomicWriteFault::DiskFullDuringWrite) {
+            return Err(std::io::Error::other("injected disk-full write failure").into());
+        }
         file.write_all(bytes)?;
+        #[cfg(test)]
+        if self.test_fault == Some(AtomicWriteFault::FileSync) {
+            return Err(std::io::Error::other("injected file fsync failure").into());
+        }
         file.sync_all()?;
         drop(file);
 
         #[cfg(unix)]
         set_file_mode(&temp_path, self.sensitive, preserved_mode)?;
+        #[cfg(windows)]
+        if self.sensitive && set_sensitive_windows_acl(&temp_path).is_err() {
+            tracing::warn!("failed to harden a sensitive configuration file ACL");
+        }
 
+        #[cfg(test)]
+        if self.test_fault == Some(AtomicWriteFault::Rename) {
+            return Err(std::io::Error::other("injected rename failure").into());
+        }
+        #[cfg(test)]
+        if self.test_fault == Some(AtomicWriteFault::DirectorySync) {
+            return Err(std::io::Error::other("injected parent-directory fsync failure").into());
+        }
+        // Preflight the platform's parent-directory durability operation before
+        // crossing the visible rename commit point. The post-rename sync below
+        // then persists that directory entry.
+        sync_parent(parent)?;
         replace_path(&temp_path, target)?;
         cleanup.0 = None;
         sync_parent(parent)?;
@@ -752,6 +795,28 @@ where
         )
     }
 
+    /// Legacy-compatible live-snapshot CAS. The immutable in-memory snapshot
+    /// remains the content authority while an old editor's raw section shape
+    /// is accepted as revision zero and upgraded by this commit.
+    pub(crate) fn commit_from_live_snapshot_allowing_unversioned<F>(
+        &self,
+        expected_revision: u64,
+        expected_data: &T,
+        candidate: T,
+        validate: F,
+    ) -> ConfigStoreResult<u64>
+    where
+        F: Fn(&T) -> Result<(), String>,
+    {
+        self.commit_validated(
+            expected_revision,
+            candidate,
+            validate,
+            true,
+            CommitAuthority::LiveSnapshot(expected_data),
+        )
+    }
+
     /// Repair a missing or invalid primary from a caller-owned in-memory LKG.
     /// The caller must hold its publication lock and prove that
     /// `expected_revision` is still the currently published trusted snapshot.
@@ -1158,6 +1223,7 @@ impl LiveRepairAuthority {
 pub struct LiveSection<T> {
     name: String,
     store: AtomicJsonStore<T>,
+    allow_unversioned_reload: bool,
     operation_lock: Mutex<()>,
     snapshot: RwLock<Arc<SectionSnapshot<T>>>,
     repair_authority: RwLock<LiveRepairAuthority>,
@@ -1201,14 +1267,14 @@ where
         )
     }
 
-    /// Materialize a live section from bytes captured by a caller-owned
-    /// stable-layout barrier. The same raw and typed validators run, but the
-    /// store is not re-read, so the snapshot is cryptographically bound to the
-    /// caller's captured member rather than a later filesystem epoch.
-    pub(crate) fn open_from_bytes_with_raw_validator<F, R>(
+    /// Open a live section while accepting the legacy unversioned primary
+    /// shape. This is limited to compatibility sections whose public editor
+    /// contract predates revision envelopes; later reloads normalize that
+    /// shape through the same monotonic-revision path.
+    pub fn open_with_raw_validator_allowing_unversioned<F, R>(
         name: impl Into<String>,
         store: AtomicJsonStore<T>,
-        bytes: &[u8],
+        default: T,
         validate: F,
         validate_raw: R,
     ) -> ConfigStoreResult<Self>
@@ -1216,29 +1282,13 @@ where
         F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
         R: Fn(&serde_json::Value) -> Result<(), String> + Send + Sync + 'static,
     {
-        let store = store.with_raw_validator(validate_raw);
-        let validate: Validator<T> = Arc::new(validate);
-        let document = store
-            .decode_document_bytes(bytes)
-            .map_err(DocumentDecodeError::into_store_error)?;
-        validate(&document.data).map_err(ConfigStoreError::Validation)?;
-        let snapshot = SectionSnapshot {
-            data: Arc::new(document.data),
-            revision: document.revision,
-            loaded_at: Utc::now(),
-            source_path: store.path().to_path_buf(),
-            source_kind: SectionSourceKind::File,
-            status: SectionStatus::Healthy,
-            last_error: None,
-        };
-        Ok(Self {
-            name: name.into(),
-            store,
-            operation_lock: Mutex::new(()),
-            snapshot: RwLock::new(Arc::new(snapshot)),
-            repair_authority: RwLock::new(LiveRepairAuthority::None),
+        Self::open_configured_with_compatibility(
+            name,
+            store.with_raw_validator(validate_raw),
+            default,
             validate,
-        })
+            true,
+        )
     }
 
     fn open_configured<F>(
@@ -1250,9 +1300,26 @@ where
     where
         F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
     {
+        Self::open_configured_with_compatibility(name, store, default, validate, false)
+    }
+
+    fn open_configured_with_compatibility<F>(
+        name: impl Into<String>,
+        store: AtomicJsonStore<T>,
+        default: T,
+        validate: F,
+        allow_unversioned_reload: bool,
+    ) -> ConfigStoreResult<Self>
+    where
+        F: Fn(&T) -> Result<(), String> + Send + Sync + 'static,
+    {
         let validate: Validator<T> = Arc::new(validate);
         let (data, revision, source_kind, status, last_error, repair_authority) =
-            match store.load_validated(|value| validate(value)) {
+            match if allow_unversioned_reload {
+                store.load_validated_allowing_unversioned(|value| validate(value))
+            } else {
+                store.load_validated(|value| validate(value))
+            } {
                 Ok(Some(stored)) => {
                     let kind = if stored.recovered_from_backup {
                         SectionSourceKind::Backup
@@ -1310,6 +1377,7 @@ where
         Ok(Self {
             name: name.into(),
             store,
+            allow_unversioned_reload,
             operation_lock: Mutex::new(()),
             snapshot: RwLock::new(Arc::new(snapshot)),
             repair_authority: RwLock::new(repair_authority),
@@ -1361,12 +1429,21 @@ where
                 |value| (self.validate)(value),
             )?
         } else {
-            self.store.commit_from_live_snapshot(
-                expected_revision,
-                current.data.as_ref(),
-                candidate.clone(),
-                |value| (self.validate)(value),
-            )?
+            if self.allow_unversioned_reload {
+                self.store.commit_from_live_snapshot_allowing_unversioned(
+                    expected_revision,
+                    current.data.as_ref(),
+                    candidate.clone(),
+                    |value| (self.validate)(value),
+                )?
+            } else {
+                self.store.commit_from_live_snapshot(
+                    expected_revision,
+                    current.data.as_ref(),
+                    candidate.clone(),
+                    |value| (self.validate)(value),
+                )?
+            }
         };
         before_publish();
         self.publish(
@@ -1396,11 +1473,19 @@ where
         let current_authority = self.repair_authority();
         let has_trusted_lkg =
             current.status == SectionStatus::Healthy || current_authority.can_repair();
-        match self.store.load_validated_for_reload(
-            current.revision,
-            current.data.as_ref(),
-            |value| (self.validate)(value),
-        ) {
+        let loaded = if self.allow_unversioned_reload {
+            self.store.load_validated_for_reload_allowing_unversioned(
+                current.revision,
+                current.data.as_ref(),
+                |value| (self.validate)(value),
+            )
+        } else {
+            self.store
+                .load_validated_for_reload(current.revision, current.data.as_ref(), |value| {
+                    (self.validate)(value)
+                })
+        };
+        match loaded {
             Ok(Some(stored)) => {
                 if stored.recovered_from_backup {
                     let revision = if has_trusted_lkg {
@@ -1493,6 +1578,35 @@ where
                     revision: current.revision,
                 }
             }
+        }
+    }
+
+    /// Mark a structurally valid snapshot degraded when its runtime change
+    /// hook cannot initialize. The immutable data/revision remain the durable
+    /// candidate, while callers keep serving the previous runtime instance.
+    /// A later valid file revision is reported as `config.recovered` by
+    /// [`Self::reload`].
+    pub fn mark_runtime_degraded(&self, message: impl Into<String>) -> ConfigSectionEvent {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.snapshot();
+        self.publish(
+            SectionSnapshot {
+                data: current.data.clone(),
+                revision: current.revision,
+                loaded_at: Utc::now(),
+                source_path: current.source_path.clone(),
+                source_kind: current.source_kind,
+                status: SectionStatus::Degraded,
+                last_error: Some(message.into()),
+            },
+            LiveRepairAuthority::None,
+        );
+        ConfigSectionEvent::Invalid {
+            section: self.name.clone(),
+            revision: current.revision,
         }
     }
 
@@ -1675,9 +1789,68 @@ fn create_dir(path: &Path, sensitive: bool) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if sensitive && set_sensitive_windows_acl(path).is_err() {
+        tracing::warn!("failed to harden a sensitive configuration directory ACL");
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = sensitive;
     Ok(())
+}
+
+/// Best-effort Windows equivalent of owner-only Unix permissions. The DACL is
+/// protected from inherited broad grants and permits full control only to the
+/// object owner and LocalSystem. Some non-NTFS filesystems do not support
+/// persistent ACLs, so callers warn and continue as documented by the ADR.
+#[cfg(windows)]
+fn set_sensitive_windows_acl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // OI/CI lets a sensitive directory pass the same owner/System-only DACL
+    // to its transaction, backup and quarantine children.
+    let sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = std::ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let applied = unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if applied == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn existing_file_mode(path: &Path) -> Option<u32> {
@@ -2525,6 +2698,43 @@ mod tests {
         let after = section.snapshot();
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.data.value, "good");
+    }
+
+    #[test]
+    fn atomic_write_faults_leave_snapshot_and_primary_unchanged_and_clean_temp() {
+        for fault in [
+            AtomicWriteFault::DiskFullDuringWrite,
+            AtomicWriteFault::FileSync,
+            AtomicWriteFault::Rename,
+            AtomicWriteFault::DirectorySync,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("example.json");
+            let mut section = open_example_live_section(&path, 0);
+            section.store.file.test_fault = Some(fault);
+            let before = section.snapshot();
+
+            let error = section
+                .commit(
+                    before.revision,
+                    Example {
+                        value: "candidate".to_string(),
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(error, ConfigStoreError::Io(_)), "{fault:?}");
+            assert!(!path.exists(), "{fault:?}");
+            let after = section.snapshot();
+            assert_eq!(after.revision, before.revision, "{fault:?}");
+            assert_eq!(after.data.as_ref(), before.data.as_ref(), "{fault:?}");
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp.")),
+                "{fault:?}"
+            );
+        }
     }
 
     #[test]

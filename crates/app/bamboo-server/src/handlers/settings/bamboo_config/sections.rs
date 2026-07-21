@@ -25,6 +25,13 @@ pub struct PutMcpSectionRequest {
     pub data: McpConfig,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutTypedSectionRequest {
+    pub expected_revision: u64,
+    pub data: Value,
+}
+
 /// Read-only, secret-free provider section projection. Credential values,
 /// ciphertext, UI masks, request override headers, and forward-compatible
 /// unknown fields are intentionally excluded; callers use the credential
@@ -93,6 +100,73 @@ pub async fn put_mcp_section(
         .await
         .map_err(map_mutation_error)?;
     get_mcp_section(app_state).await
+}
+
+/// Read any non-secret typed section through the process-owned facade. The
+/// provider/MCP names retain their stricter diagnostic projections above.
+pub async fn get_typed_section(
+    app_state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    let id = section_id(&path.into_inner())?;
+    match id {
+        bamboo_config::SectionId::Providers => get_provider_section(app_state).await,
+        bamboo_config::SectionId::Mcp => get_mcp_section(app_state).await,
+        _ => {
+            let _io = app_state.config_io_lock.lock().await;
+            let facade = app_state.config_facade.as_ref().ok_or_else(|| {
+                AppError::BadRequest(
+                    "typed sections require the modular configuration facade".to_string(),
+                )
+            })?;
+            let envelope = facade
+                .registry()
+                .envelope_value(id)
+                .map_err(|error| map_mutation_error(ConfigSectionMutationError::Store(error)))?;
+            Ok(HttpResponse::Ok().json(envelope))
+        }
+    }
+}
+
+/// Replace one typed ordinary section with revision/CAS semantics. Provider,
+/// MCP and credential mutations stay on their runtime-staged or secret-only
+/// endpoints.
+pub async fn put_typed_section(
+    app_state: web::Data<AppState>,
+    path: web::Path<String>,
+    payload: web::Json<PutTypedSectionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let id = section_id(&path.into_inner())?;
+    if matches!(
+        id,
+        bamboo_config::SectionId::Providers
+            | bamboo_config::SectionId::Mcp
+            | bamboo_config::SectionId::Credentials
+    ) {
+        return Err(AppError::BadRequest(
+            "this section requires its dedicated endpoint".to_string(),
+        ));
+    }
+    let payload = payload.into_inner();
+    app_state
+        .put_ordinary_section(id, payload.expected_revision, payload.data)
+        .await
+        .map_err(map_mutation_error)?;
+
+    let _io = app_state.config_io_lock.lock().await;
+    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
+        AppError::BadRequest("typed sections require the modular configuration facade".to_string())
+    })?;
+    let envelope = facade
+        .registry()
+        .envelope_value(id)
+        .map_err(|error| map_mutation_error(ConfigSectionMutationError::Store(error)))?;
+    Ok(HttpResponse::Ok().json(envelope))
+}
+
+fn section_id(name: &str) -> Result<bamboo_config::SectionId, AppError> {
+    bamboo_config::SectionId::from_name(name)
+        .ok_or_else(|| AppError::BadRequest("unknown configuration section".to_string()))
 }
 
 fn map_mutation_error(error: ConfigSectionMutationError) -> AppError {
@@ -669,7 +743,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn provider_put_upgrades_legacy_cas_preserves_secret_and_redacts_response() {
+    async fn provider_put_uses_observed_legacy_cas_preserves_secret_and_redacts_response() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x51; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
@@ -699,6 +773,16 @@ mod tests {
         }
         let raw = serde_json::to_vec_pretty(state.config.read().await.providers()).unwrap();
         std::fs::write(dir.path().join("providers.json"), raw).unwrap();
+        assert!(matches!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .providers
+                .reload(),
+            bamboo_config::ConfigSectionEvent::Changed { revision: 1, .. }
+        ));
         let mut feed = state.account_sink.subscribe();
 
         let app = test::init_service(
@@ -712,7 +796,7 @@ mod tests {
             test::TestRequest::put()
                 .uri("/providers")
                 .set_json(json!({
-                    "expected_revision": 0,
+                    "expected_revision": 1,
                     "data": {"openai": {"model": "new-model"}}
                 }))
                 .to_request(),
@@ -724,7 +808,7 @@ mod tests {
         assert!(!body.contains(secret));
         assert!(!body.contains("api_key_encrypted"));
         let body: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["revision"], 1);
+        assert_eq!(body["revision"], 2);
         assert_eq!(body["data"]["providers"]["openai"]["model"], "new-model");
         assert_eq!(
             state
@@ -742,7 +826,7 @@ mod tests {
         let disk = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
         assert!(!disk.contains(secret));
         let disk: Value = serde_json::from_str(&disk).unwrap();
-        assert_eq!(disk["revision"], 1);
+        assert_eq!(disk["revision"], 2);
         assert!(disk["data"]["openai"]["credential_ref"].is_string());
         assert!(disk["data"]["openai"].get("api_key_encrypted").is_none());
         let first = tokio::time::timeout(Duration::from_secs(2), async {
@@ -752,7 +836,7 @@ mod tests {
                     &event.event,
                     bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
                         | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
-                        if section == "providers" && *revision == 1
+                        if section == "providers" && *revision == 2
                 ) {
                     break;
                 }
@@ -760,11 +844,24 @@ mod tests {
         })
         .await;
         assert!(first.is_ok());
+        let duplicate_provider = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "providers"
+                ) {
+                    break event.event.clone();
+                }
+            }
+        })
+        .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), feed.recv())
-                .await
-                .is_err(),
-            "the watcher echo must not publish a duplicate event"
+            duplicate_provider.is_err(),
+            "the provider watcher echo must not publish a duplicate event: {duplicate_provider:?}"
         );
 
         let stale = test::call_service(
@@ -807,7 +904,7 @@ mod tests {
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
-                if health.status == SectionStatus::Healthy && health.revision == 2 {
+                if health.status == SectionStatus::Healthy && health.revision == 3 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -818,13 +915,13 @@ mod tests {
         let normalized: Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
                 .unwrap();
-        assert_eq!(normalized["revision"], 2);
+        assert_eq!(normalized["revision"], 3);
         let stale_after_external = test::call_service(
             &app,
             test::TestRequest::put()
                 .uri("/providers")
                 .set_json(json!({
-                    "expected_revision": 1,
+                    "expected_revision": 2,
                     "data": {"openai": {"model": "lost-update"}}
                 }))
                 .to_request(),
@@ -840,6 +937,7 @@ mod tests {
     async fn provider_put_rejects_invalid_credential_refs_without_mutating_lkg() {
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let providers_before = std::fs::read(dir.path().join("providers.json")).unwrap();
         state.config.write().await.providers_mut().openai = Some(OpenAIConfig {
             model: Some("lkg-model".to_string()),
             ..Default::default()
@@ -868,7 +966,10 @@ mod tests {
             .await;
             assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
         }
-        assert!(!dir.path().join("providers.json").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("providers.json")).unwrap(),
+            providers_before
+        );
         assert_eq!(
             state
                 .config
@@ -889,6 +990,21 @@ mod tests {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x52; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let health = state
+                    .mcp_config_live_health
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if health.status == SectionStatus::Healthy && health.revision == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial MCP runtime reconciliation completes");
         let secret = "mcp-put-secret-597";
         let env_reference = bamboo_config::credential_ref("mcp", "preserved", "env_TOKEN").unwrap();
         let header_reference =
@@ -1021,11 +1137,24 @@ mod tests {
         })
         .await;
         assert!(first.is_ok());
+        let duplicate_mcp = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "mcp"
+                ) {
+                    break event.event.clone();
+                }
+            }
+        })
+        .await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), feed.recv())
-                .await
-                .is_err(),
-            "the MCP watcher echo must not publish a duplicate event"
+            duplicate_mcp.is_err(),
+            "the MCP watcher echo must not publish a duplicate event: {duplicate_mcp:?}"
         );
         assert_eq!(
             state
@@ -1092,5 +1221,75 @@ mod tests {
             "data": {"server": {"command": "cmd****name"}}
         }))
         .is_ok());
+    }
+
+    #[actix_web::test]
+    async fn ordinary_typed_section_put_is_single_section_cas_and_keeps_refs_server_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/sections/{section}")
+                    .route(web::get().to(get_typed_section))
+                    .route(web::put().to(put_typed_section)),
+            ),
+        )
+        .await;
+
+        let initial: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/sections/core").to_request(),
+        )
+        .await;
+        let revision = initial["revision"].as_u64().unwrap();
+        let mut data = initial["data"].clone();
+        data["headless_auth"] = json!(true);
+        let updated = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/core")
+                .set_json(json!({"expected_revision": revision, "data": data}))
+                .to_request(),
+        )
+        .await;
+        assert!(updated.status().is_success());
+        let updated: Value = test::read_body_json(updated).await;
+        assert_eq!(updated["revision"], revision + 1);
+        assert_eq!(updated["data"]["headless_auth"], true);
+        assert!(state.config.read().await.headless_auth);
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/core")
+                .set_json(json!({
+                    "expected_revision": revision,
+                    "data": updated["data"].clone()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+
+        let mut forged = updated["data"].clone();
+        forged["proxy_auth_credential_ref"] = json!("proxy.default.auth");
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/core")
+                .set_json(json!({
+                    "expected_revision": revision + 1,
+                    "data": forged
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert!(state
+            .config
+            .read()
+            .await
+            .proxy_auth_credential_ref
+            .is_none());
     }
 }

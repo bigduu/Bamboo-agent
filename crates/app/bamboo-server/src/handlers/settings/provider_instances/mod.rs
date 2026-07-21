@@ -629,11 +629,13 @@ mod tests {
             .await
             .expect("unrelated settings save should succeed");
 
-        let config_path = temp_dir.path().join("config.json");
-        let raw = std::fs::read_to_string(&config_path).expect("config.json should exist");
-        let on_disk: Value = serde_json::from_str(&raw).expect("config.json should be valid JSON");
+        let config_path = temp_dir.path().join("providers.json");
+        let raw = std::fs::read_to_string(&config_path).expect("providers.json should exist");
+        let on_disk: Value =
+            serde_json::from_str(&raw).expect("providers.json should be valid JSON");
         let instances = on_disk
-            .get("provider_instances")
+            .get("data")
+            .and_then(|data| data.get("provider_instances"))
             .and_then(|v| v.as_object())
             .expect("provider_instances should be present on disk");
         assert_eq!(instances.len(), 1, "exactly one instance was created");
@@ -701,10 +703,11 @@ mod tests {
             .await
             .expect("unrelated settings save should succeed");
 
-        let config_path = temp_dir.path().join("config.json");
-        let raw = std::fs::read_to_string(&config_path).expect("config.json should exist");
-        let on_disk: Value = serde_json::from_str(&raw).expect("config.json should be valid JSON");
-        let instance = &on_disk["provider_instances"][&instance_id];
+        let config_path = temp_dir.path().join("providers.json");
+        let raw = std::fs::read_to_string(&config_path).expect("providers.json should exist");
+        let on_disk: Value =
+            serde_json::from_str(&raw).expect("providers.json should be valid JSON");
+        let instance = &on_disk["data"]["provider_instances"][&instance_id];
         assert!(instance.get("api_key_encrypted").is_none());
         let reference = bamboo_config::CredentialRef::parse(
             instance["credential_ref"].as_str().expect("credential ref"),

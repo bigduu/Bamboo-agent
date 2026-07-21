@@ -6,13 +6,14 @@
 //! before the commit point, and every reader recovers a committed transaction
 //! before reading any credential transaction member.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::File;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,9 @@ const PROXY_AUTH_DOMAIN_KEYS: [&str; 5] = [
     "https_proxy_auth_encrypted",
     "proxy_auth_credential_ref",
 ];
+
+static PROCESS_MIGRATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CredentialMigrationOutcome {
@@ -117,9 +121,12 @@ struct SectionLayoutCompletionLedger {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ExactTransactionScope {
+    Providers,
     ProxyAuth,
     EnvVars,
     Notifications,
+    Connect,
+    AccessControl,
     ClusterFabric,
 }
 
@@ -269,6 +276,8 @@ struct FacadeRootSecretAuthority {
     provider_instances: bool,
     mcp: bool,
     mcp_servers: BTreeSet<String>,
+    connect_platforms: BTreeSet<String>,
+    access_control: bool,
 }
 
 fn provider_document_authority(bytes: &[u8]) -> ConfigStoreResult<(BTreeSet<String>, bool)> {
@@ -319,6 +328,11 @@ fn discard_shadowed_root_secrets(
             .is_some_and(|provider| authority.providers.contains(provider)),
         ExtractedSecretKind::ProviderInstance => !authority.provider_instances,
         ExtractedSecretKind::Mcp => !authority.mcp,
+        ExtractedSecretKind::Connect => !secret
+            .connect_owner
+            .as_ref()
+            .is_some_and(|platform| authority.connect_platforms.contains(platform)),
+        ExtractedSecretKind::AccessControl => !authority.access_control,
         _ => true,
     });
 }
@@ -337,6 +351,11 @@ fn discard_shadowed_sidecar_backup_secrets(
             .mcp_owner
             .as_ref()
             .is_some_and(|server| authority.mcp_servers.contains(server)),
+        ExtractedSecretKind::Connect => !secret
+            .connect_owner
+            .as_ref()
+            .is_some_and(|platform| authority.connect_platforms.contains(platform)),
+        ExtractedSecretKind::AccessControl => !authority.access_control,
         _ => true,
     });
 }
@@ -503,6 +522,21 @@ pub(crate) fn plan_facade_compound_credentials(
             source_overrides.insert(MCP_FILE.to_string(), section.bytes);
         }
     }
+    if let Some(original) = source_snapshot.bytes(CONNECT_FILE)?.map(ToOwned::to_owned) {
+        primary_authority.connect_platforms = connect_platform_ids(&original)?;
+        if let Some(section) = plan_connect_document(original, &mut primary_extracted, 1)? {
+            source_overrides.insert(CONNECT_FILE.to_string(), section.bytes);
+        }
+    }
+    if let Some(original) = source_snapshot
+        .bytes(ACCESS_CONTROL_FILE)?
+        .map(ToOwned::to_owned)
+    {
+        primary_authority.access_control = true;
+        if let Some(section) = plan_access_control_document(original, &mut primary_extracted, 1)? {
+            source_overrides.insert(ACCESS_CONTROL_FILE.to_string(), section.bytes);
+        }
+    }
 
     if let Some(original) = source_snapshot.bytes(CONFIG_FILE)?.map(ToOwned::to_owned) {
         let mut root_extracted = Vec::new();
@@ -608,6 +642,56 @@ pub(crate) fn plan_facade_compound_credentials(
             }
         }
 
+        let connect_name = format!("{CONNECT_FILE}.{suffix}");
+        if let Some(original) = source_snapshot.bytes(&connect_name)?.map(ToOwned::to_owned) {
+            if serde_json::from_slice::<Value>(&original).is_ok() {
+                let value: Value = serde_json::from_slice(&original)?;
+                let has_platforms = value
+                    .get("platforms")
+                    .or_else(|| value.get("data").and_then(|data| data.get("platforms")))
+                    .is_some();
+                if has_platforms {
+                    let mut connect_extracted = Vec::new();
+                    let planned =
+                        plan_connect_document(original.clone(), &mut connect_extracted, 1)?;
+                    discard_shadowed_sidecar_backup_secrets(
+                        &mut connect_extracted,
+                        &primary_authority,
+                    );
+                    if let Some(section) = planned {
+                        generation_extracted.extend(connect_extracted);
+                        legacy_cleanups.push(PlannedLegacyCleanup {
+                            name: connect_name,
+                            original: source_snapshot
+                                .state(&format!("{CONNECT_FILE}.{suffix}"))?
+                                .clone(),
+                            candidate: FacadeSourceState::Regular(section.bytes),
+                            sensitive: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        let access_name = format!("{ACCESS_CONTROL_FILE}.{suffix}");
+        if let Some(original) = source_snapshot.bytes(&access_name)?.map(ToOwned::to_owned) {
+            if serde_json::from_slice::<Value>(&original).is_ok() {
+                let mut access_extracted = Vec::new();
+                let planned =
+                    plan_access_control_document(original.clone(), &mut access_extracted, 1)?;
+                discard_shadowed_sidecar_backup_secrets(&mut access_extracted, &primary_authority);
+                if let Some(section) = planned {
+                    generation_extracted.extend(access_extracted);
+                    legacy_cleanups.push(PlannedLegacyCleanup {
+                        name: access_name.clone(),
+                        original: source_snapshot.state(&access_name)?.clone(),
+                        candidate: FacadeSourceState::Regular(section.bytes),
+                        sensitive: true,
+                    });
+                }
+            }
+        }
+
         let config_name = format!("{CONFIG_FILE}.{suffix}");
         if let Some(original) = source_snapshot.bytes(&config_name)?.map(ToOwned::to_owned) {
             if serde_json::from_slice::<Value>(&original).is_ok() {
@@ -693,6 +777,7 @@ struct ExtractedSecret {
     env_owner: Option<String>,
     provider_owner: Option<String>,
     mcp_owner: Option<String>,
+    connect_owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,6 +791,8 @@ enum ExtractedSecretKind {
     NotificationNtfy,
     NotificationBark,
     ExternalBroker,
+    Connect,
+    AccessControl,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -736,9 +823,12 @@ enum MigrationFault {
 
 fn authoritative_section_file(scope: ExactTransactionScope) -> &'static str {
     match scope {
+        ExactTransactionScope::Providers => PROVIDERS_FILE,
         ExactTransactionScope::ProxyAuth => CORE_FILE,
         ExactTransactionScope::EnvVars => ENV_FILE,
         ExactTransactionScope::Notifications => NOTIFICATIONS_FILE,
+        ExactTransactionScope::Connect => CONNECT_FILE,
+        ExactTransactionScope::AccessControl => ACCESS_CONTROL_FILE,
         ExactTransactionScope::ClusterFabric => CLUSTER_FABRIC_FILE,
     }
 }
@@ -1383,6 +1473,30 @@ pub(crate) fn with_provider_mcp_migration_lock<T>(
         data_dir
     };
     std::fs::create_dir_all(data_dir)?;
+    // Advisory file locks do not reliably serialize two descriptors owned by
+    // the same process on every supported OS. Pair them with a path-keyed
+    // process mutex so thread-local stores cannot rotate/read the same
+    // credential files concurrently; the file lock still coordinates other
+    // processes.
+    let key = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let process_lock = {
+        let mut locks = PROCESS_MIGRATION_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let _process_guard = process_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let lock = open_migration_lock(&data_dir.join(LOCK_FILE))?;
     lock.lock_exclusive()?;
     let _lock = MigrationLock(lock);
@@ -1547,6 +1661,77 @@ pub fn persist_notification_credential_transaction_at_revision_with_reset(
     )
 }
 
+/// Persist the complete connect platform collection and all explicitly
+/// touched token/app-secret values in one recoverable exact transaction.
+/// Connect credentials are only writable after the modular layout is active;
+/// this prevents a compatibility writer from reviving legacy `connect.json`
+/// ciphertext while the transaction is in flight.
+pub fn persist_connect_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    secret_intents: &crate::patch::ConnectSecretIntents,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    if !crate::section_layout_is_active(data_dir.as_ref())? {
+        return Err(ConfigStoreError::Validation(
+            "connect credential updates require the modular configuration layout".to_string(),
+        ));
+    }
+    persist_exact_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        Some((secret_intents, expected_revision)),
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// Persist access-control metadata and password/device verifier records as one
+/// recoverable exact transaction.
+pub fn persist_access_control_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    password_intent: bool,
+    device_intents: &BTreeSet<String>,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    if !crate::section_layout_is_active(data_dir.as_ref())? {
+        return Err(ConfigStoreError::Validation(
+            "access-control credential updates require the modular configuration layout"
+                .to_string(),
+        ));
+    }
+    persist_exact_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        None,
+        Some((password_intent, device_intents, expected_revision)),
+        #[cfg(test)]
+        None,
+    )
+}
+
 /// Persist node metadata and every explicitly touched SSH credential through
 /// the same recoverable credential/config exact transaction used by the other
 /// root credential domains.
@@ -1569,6 +1754,8 @@ pub fn persist_cluster_fabric_credential_transaction_at_revision(
         false,
         None,
         Some((node_intents, expected_revision)),
+        None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1677,6 +1864,8 @@ fn persist_provider_credential_transaction_with_instances_inner(
         notification_reset,
         notification_expected_revision,
         None,
+        None,
+        None,
         #[cfg(test)]
         fault,
     )
@@ -1696,6 +1885,8 @@ fn persist_exact_credential_transaction_inner(
     notification_reset: bool,
     notification_expected_revision: Option<u64>,
     cluster_transaction: Option<(&BTreeSet<String>, u64)>,
+    connect_transaction: Option<(&crate::patch::ConnectSecretIntents, u64)>,
+    access_transaction: Option<(bool, &BTreeSet<String>, u64)>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
     let proxy_only = provider_intents.len() == 1
@@ -1708,12 +1899,30 @@ fn persist_exact_credential_transaction_inner(
         && provider_instance_intents.is_empty()
         && env_intents.is_empty()
         && notification_transaction
-        && cluster_transaction.is_none();
+        && cluster_transaction.is_none()
+        && connect_transaction.is_none()
+        && access_transaction.is_none();
     let cluster_only = provider_intents.is_empty()
         && provider_instance_intents.is_empty()
         && env_intents.is_empty()
         && !notification_transaction
-        && cluster_transaction.is_some();
+        && cluster_transaction.is_some()
+        && connect_transaction.is_none()
+        && access_transaction.is_none();
+    let connect_only = provider_intents.is_empty()
+        && provider_instance_intents.is_empty()
+        && env_intents.is_empty()
+        && !notification_transaction
+        && cluster_transaction.is_none()
+        && connect_transaction.is_some()
+        && access_transaction.is_none();
+    let access_only = provider_intents.is_empty()
+        && provider_instance_intents.is_empty()
+        && env_intents.is_empty()
+        && !notification_transaction
+        && cluster_transaction.is_none()
+        && connect_transaction.is_none()
+        && access_transaction.is_some();
     if !env_intents.is_empty() && !env_only {
         return Err(ConfigStoreError::Validation(
             "env credentials must be updated in their own transaction".to_string(),
@@ -1727,6 +1936,16 @@ fn persist_exact_credential_transaction_inner(
     if cluster_transaction.is_some() && !cluster_only {
         return Err(ConfigStoreError::Validation(
             "cluster credentials must be updated in their own transaction".to_string(),
+        ));
+    }
+    if connect_transaction.is_some() && !connect_only {
+        return Err(ConfigStoreError::Validation(
+            "connect credentials must be updated in their own transaction".to_string(),
+        ));
+    }
+    if access_transaction.is_some() && !access_only {
+        return Err(ConfigStoreError::Validation(
+            "access-control credentials must be updated in their own transaction".to_string(),
         ));
     }
     std::fs::create_dir_all(data_dir)?;
@@ -1748,8 +1967,14 @@ fn persist_exact_credential_transaction_inner(
         Some(ExactTransactionScope::EnvVars)
     } else if notification_only {
         Some(ExactTransactionScope::Notifications)
+    } else if connect_only {
+        Some(ExactTransactionScope::Connect)
+    } else if access_only {
+        Some(ExactTransactionScope::AccessControl)
     } else if cluster_only {
         Some(ExactTransactionScope::ClusterFabric)
+    } else if crate::section_layout_is_active(data_dir)? {
+        Some(ExactTransactionScope::Providers)
     } else {
         None
     };
@@ -1768,9 +1993,25 @@ fn persist_exact_credential_transaction_inner(
         .as_ref()
         .map(|section| section.legacy_root.as_slice())
         .unwrap_or(config_original.as_slice());
-    let persisted_instance_refs = provider_instance_refs_from_document(&config_original)?;
+    let persisted_instance_refs = provider_instance_refs_from_document(
+        if exact_scope == Some(ExactTransactionScope::Providers) {
+            domain_original
+        } else {
+            &config_original
+        },
+    )?;
     let persisted_env_refs = env_refs_from_document(domain_original)?;
     let persisted_notification_refs = notification_refs_from_document(domain_original)?;
+    let persisted_connect_refs = if connect_only {
+        connect_refs_from_document(domain_original)?
+    } else {
+        BTreeMap::new()
+    };
+    let persisted_access_refs = if access_only {
+        access_refs_from_document(domain_original)?
+    } else {
+        crate::credential_store::PersistedAccessCredentialRefs::default()
+    };
     let persisted_cluster_refs = if cluster_transaction.is_some() {
         cluster_node_refs_from_document(domain_original)?
     } else {
@@ -1824,6 +2065,33 @@ fn persist_exact_credential_transaction_inner(
         }
         ensure_cluster_refs_are_safe(data_dir, &refs, &[])?;
     }
+    if connect_only {
+        for (id, (token_ref, app_secret_ref)) in &persisted_connect_refs {
+            if let Some(reference) = token_ref {
+                ensure_connect_ref_exclusive(data_dir, reference.as_str(), id, "token")?;
+            }
+            if let Some(reference) = app_secret_ref {
+                ensure_connect_ref_exclusive(data_dir, reference.as_str(), id, "app_secret")?;
+            }
+        }
+    }
+    if let Some((password_intent, device_intents, _)) = access_transaction {
+        if let Some(reference) = persisted_access_refs.password.as_ref() {
+            ensure_access_ref_exclusive(data_dir, reference.as_str(), None)?;
+        } else if password_intent {
+            let reference = crate::config_crypto::access_password_credential_ref()?;
+            ensure_access_ref_exclusive(data_dir, reference.as_str(), None)?;
+        }
+        for device_id in device_intents {
+            let reference = persisted_access_refs
+                .devices
+                .get(device_id)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| crate::config_crypto::access_device_credential_ref(device_id))?;
+            ensure_access_ref_exclusive(data_dir, reference.as_str(), Some(device_id))?;
+        }
+    }
     let store = CredentialStore::open(data_dir);
     let prepared = if env_only {
         store.prepare_env_var_intents(config, env_intents, &persisted_env_refs)?
@@ -1836,6 +2104,15 @@ fn persist_exact_credential_transaction_inner(
         )?
     } else if let Some((node_intents, _)) = cluster_transaction {
         store.prepare_cluster_node_intents(config, node_intents, &persisted_cluster_refs)?
+    } else if let Some((connect_intents, _)) = connect_transaction {
+        store.prepare_connect_intents(config, connect_intents, &persisted_connect_refs)?
+    } else if let Some((password_intent, device_intents, _)) = access_transaction {
+        store.prepare_access_control_intents(
+            config,
+            password_intent,
+            device_intents,
+            &persisted_access_refs,
+        )?
     } else {
         store.prepare_provider_api_key_intents(
             config,
@@ -1894,6 +2171,22 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
+    if let Some((_, expected)) = connect_transaction {
+        if prepared.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: prepared.expected_revision,
+            });
+        }
+    }
+    if let Some((_, _, expected)) = access_transaction {
+        if prepared.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: prepared.expected_revision,
+            });
+        }
+    }
     if proxy_only && active_section.is_some() && prepared.required_refs.is_empty() {
         config.proxy_auth_credential_ref = None;
     }
@@ -1917,6 +2210,16 @@ fn persist_exact_credential_transaction_inner(
             prepare_cluster_fabric_config_document(domain_original, config)?,
             providers_original.clone(),
         )
+    } else if connect_only {
+        (
+            prepare_connect_config_document(domain_original, config)?,
+            providers_original.clone(),
+        )
+    } else if access_only {
+        (
+            prepare_access_control_config_document(domain_original, config)?,
+            providers_original.clone(),
+        )
     } else {
         config
             .prepare_provider_transaction_documents(&providers_original)
@@ -1928,7 +2231,34 @@ fn persist_exact_credential_transaction_inner(
         authority_bytes,
         authority_expected_revision,
         active_domain_changed,
-    ) = if let (Some(section), Some(scope)) = (active_section.as_ref(), exact_scope) {
+    ) = if let (Some(section), Some(ExactTransactionScope::Providers)) =
+        (active_section.as_ref(), exact_scope)
+    {
+        let (_, _, original_data) = parse_exact_section_document(section.name, &section.original)?;
+        let candidate_data = crate::section_facade::provider_section_value(config)?;
+        let candidate_revision = section.expected_revision.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("provider section revision counter exhausted".to_string())
+        })?;
+        let mut candidate_envelope: Value = serde_json::from_slice(&section.original)?;
+        let candidate_object = candidate_envelope.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("provider section envelope is invalid".to_string())
+        })?;
+        candidate_object.insert("revision".to_string(), Value::from(candidate_revision));
+        candidate_object.insert("data".to_string(), candidate_data.clone());
+        let provider_section_bytes = serde_json::to_vec_pretty(&candidate_envelope)?;
+        crate::section_facade::validate_section_envelope(
+            section.name,
+            &provider_section_bytes,
+            candidate_revision,
+        )?;
+        (
+            section.name,
+            section.original.as_slice(),
+            provider_section_bytes,
+            Some(section.expected_revision),
+            original_data != candidate_data,
+        )
+    } else if let (Some(section), Some(scope)) = (active_section.as_ref(), exact_scope) {
         let (bytes, changed) =
             prepare_active_exact_section_document(section, scope, &config_bytes)?;
         (
@@ -1952,10 +2282,16 @@ fn persist_exact_credential_transaction_inner(
         notification_only && notification_domain_changed(domain_original, &config_bytes)?;
     let cluster_domain_changed =
         cluster_only && cluster_fabric_domain_changed(domain_original, &config_bytes)?;
+    let connect_domain_changed =
+        connect_only && connect_domain_changed(domain_original, &config_bytes)?;
+    let access_domain_changed =
+        access_only && access_control_domain_changed(domain_original, &config_bytes)?;
     let exact_domain_changed = active_domain_changed
         || env_domain_changed
         || notification_domain_changed
-        || cluster_domain_changed;
+        || cluster_domain_changed
+        || connect_domain_changed
+        || access_domain_changed;
     if exact_domain_changed {
         prepared.advance_revision_for_domain_change()?;
     }
@@ -1968,7 +2304,12 @@ fn persist_exact_credential_transaction_inner(
     // A true env-domain no-op keeps the CAS revision and avoids publishing an
     // event or rewriting either durable member. Any credential or config
     // semantic change advances the one shared revision exactly once.
-    if (env_only || notification_only || cluster_only || active_section.is_some())
+    if (env_only
+        || notification_only
+        || cluster_only
+        || connect_only
+        || access_only
+        || active_section.is_some())
         && !exact_domain_changed
         && prepared.revision == prepared.expected_revision
     {
@@ -2009,7 +2350,7 @@ fn persist_exact_credential_transaction_inner(
         .map(|reference| reference.as_str().to_string())
         .collect();
     credential_file.transaction_base_sha256 = credential_file.original_sha256.clone();
-    if !proxy_only && !env_only && !notification_only && !cluster_only {
+    if exact_scope.is_none() {
         stage_file(
             &stage_dir,
             &backup_dir,
@@ -3083,6 +3424,179 @@ fn contains_notification_credential_reference(value: &Value, expected: &str) -> 
     }
 }
 
+fn ensure_connect_ref_exclusive(
+    data_dir: &Path,
+    reference: &str,
+    platform_id: &str,
+    secret_field: &str,
+) -> ConfigStoreResult<()> {
+    for name in [
+        PROVIDERS_FILE,
+        MCP_FILE,
+        BROKER_FILE,
+        CONFIG_FILE,
+        CONNECT_FILE,
+    ] {
+        for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+            let path = data_dir.join(format!("{name}{suffix}"));
+            let bytes = read_target_or_empty(&path)?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let mut value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) if !suffix.is_empty() => continue,
+                Err(error) if name == CONFIG_FILE || name == CONNECT_FILE => {
+                    return Err(error.into());
+                }
+                Err(_) => continue,
+            };
+            strip_connect_owned_reference(&mut value, reference, platform_id, secret_field);
+            if contains_credential_reference(&value, reference) {
+                return Err(ConfigStoreError::Validation(
+                    "connect credential reference is shared by another consumer".to_string(),
+                ));
+            }
+        }
+    }
+    for descriptor in crate::SECTION_DESCRIPTORS.iter().filter(|descriptor| {
+        descriptor.id != crate::SectionId::Credentials
+            && !matches!(
+                descriptor.file_name,
+                PROVIDERS_FILE | MCP_FILE | CONNECT_FILE
+            )
+    }) {
+        let bytes = read_target_or_empty(&data_dir.join(descriptor.file_name))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&bytes)?;
+        if contains_credential_reference(&value, reference) {
+            return Err(ConfigStoreError::Validation(
+                "connect credential reference is shared by another consumer".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_access_ref_exclusive(
+    data_dir: &Path,
+    reference: &str,
+    owner: Option<&str>,
+) -> ConfigStoreResult<()> {
+    for name in [
+        PROVIDERS_FILE,
+        MCP_FILE,
+        BROKER_FILE,
+        CONFIG_FILE,
+        ACCESS_CONTROL_FILE,
+    ] {
+        for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+            let bytes = read_target_or_empty(&data_dir.join(format!("{name}{suffix}")))?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let mut value: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) if !suffix.is_empty() => continue,
+                Err(error) if name == CONFIG_FILE || name == ACCESS_CONTROL_FILE => {
+                    return Err(error.into());
+                }
+                Err(_) => continue,
+            };
+            strip_access_owned_reference(&mut value, reference, owner);
+            if contains_credential_reference(&value, reference) {
+                return Err(ConfigStoreError::Validation(
+                    "access-control credential reference is shared by another consumer".to_string(),
+                ));
+            }
+        }
+    }
+    for descriptor in crate::SECTION_DESCRIPTORS.iter().filter(|descriptor| {
+        descriptor.id != crate::SectionId::Credentials
+            && !matches!(
+                descriptor.file_name,
+                PROVIDERS_FILE | MCP_FILE | ACCESS_CONTROL_FILE
+            )
+    }) {
+        let bytes = read_target_or_empty(&data_dir.join(descriptor.file_name))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let mut value: Value = serde_json::from_slice(&bytes)?;
+        strip_access_owned_reference(&mut value, reference, owner);
+        if contains_credential_reference(&value, reference) {
+            return Err(ConfigStoreError::Validation(
+                "access-control credential reference is shared by another consumer".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn strip_access_owned_reference(value: &mut Value, reference: &str, owner: Option<&str>) {
+    match value {
+        Value::Object(object) => {
+            if owner.is_none()
+                && object.contains_key("password_enabled")
+                && object
+                    .get("password_credential_ref")
+                    .and_then(Value::as_str)
+                    == Some(reference)
+            {
+                object.remove("password_credential_ref");
+            }
+            if owner.is_some()
+                && object.get("device_id").and_then(Value::as_str) == owner
+                && object.get("token_credential_ref").and_then(Value::as_str) == Some(reference)
+            {
+                object.remove("token_credential_ref");
+            }
+            for child in object.values_mut() {
+                strip_access_owned_reference(child, reference, owner);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_access_owned_reference(child, reference, owner);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn strip_connect_owned_reference(
+    value: &mut Value,
+    reference: &str,
+    platform_id: &str,
+    secret_field: &str,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(platforms) = object.get_mut("platforms").and_then(Value::as_array_mut) {
+                let reference_key = format!("{secret_field}_credential_ref");
+                for platform in platforms.iter_mut().filter_map(Value::as_object_mut) {
+                    if platform.get("id").and_then(Value::as_str) == Some(platform_id)
+                        && platform.get(&reference_key).and_then(Value::as_str) == Some(reference)
+                    {
+                        platform.remove(&reference_key);
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                strip_connect_owned_reference(child, reference, platform_id, secret_field);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                strip_connect_owned_reference(child, reference, platform_id, secret_field);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn ensure_env_ref_exclusive(
     data_dir: &Path,
     reference: &str,
@@ -3370,6 +3884,7 @@ fn migrate_builtin_provider_credentials(
             env_owner: None,
             provider_owner: Some(provider.to_string()),
             mcp_owner: None,
+            connect_owner: None,
         });
         changed = true;
     }
@@ -3419,6 +3934,7 @@ fn migrate_provider_instance_credentials(
             env_owner: None,
             provider_owner: None,
             mcp_owner: None,
+            connect_owner: None,
         });
         changed = true;
     }
@@ -3894,6 +4410,7 @@ fn migrate_cluster_auth_field(
             env_owner: None,
             provider_owner: None,
             mcp_owner: None,
+            connect_owner: None,
         });
     }
     Ok(had_plaintext
@@ -4243,17 +4760,169 @@ fn plan_facade_root_document(
     };
     let cluster = plan_cluster_document(root_mcp_bytes.clone(), extracted, migration_generation)?;
     let cluster_changed = cluster.is_some();
-    if !provider_changed && !root_mcp && !cluster_changed {
+    let cluster_bytes = cluster
+        .as_ref()
+        .map(|section| section.bytes.clone())
+        .unwrap_or(root_mcp_bytes);
+    let mut root_after_cluster: Value = serde_json::from_slice(&cluster_bytes)?;
+    let connect_changed = root_after_cluster
+        .as_object_mut()
+        .and_then(|root| root.get_mut("connect"))
+        .map(|connect| migrate_connect_credentials(connect, extracted, migration_generation))
+        .transpose()?
+        .unwrap_or(false);
+    let access_changed = root_after_cluster
+        .as_object_mut()
+        .and_then(|root| root.get_mut("access_control"))
+        .map(|access| migrate_access_control_credentials(access, extracted, migration_generation))
+        .transpose()?
+        .unwrap_or(false);
+    if !provider_changed && !root_mcp && !cluster_changed && !connect_changed && !access_changed {
         return Ok(None);
     }
     Ok(Some(PlannedSection {
         name: CONFIG_FILE,
-        bytes: cluster
-            .map(|section| section.bytes)
-            .unwrap_or(root_mcp_bytes),
+        bytes: if connect_changed || access_changed {
+            serde_json::to_vec_pretty(&root_after_cluster)?
+        } else {
+            cluster_bytes
+        },
         original,
         migration_generation,
     }))
+}
+
+fn plan_access_control_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let mut root: Value = serde_json::from_slice(&original)?;
+    let (data, revision) = section_data_mut(&mut root)?;
+    let migration_generation = next_revision(revision.unwrap_or(0))?.max(minimum_generation);
+    if !migrate_access_control_credentials(data, extracted, migration_generation)? {
+        return Ok(None);
+    }
+    let access: Option<crate::AccessControlConfig> = serde_json::from_value(data.clone())?;
+    if let Some(access) = access.as_ref() {
+        if access.password_enabled && !access.password_configured {
+            return Err(ConfigStoreError::Validation(
+                "enabled access-control password has no verifier".to_string(),
+            ));
+        }
+        if access.devices.iter().any(|device| !device.token_configured) {
+            return Err(ConfigStoreError::Validation(
+                "access-control device has no token verifier".to_string(),
+            ));
+        }
+    }
+    advance_or_wrap(&mut root, revision.is_some(), migration_generation);
+    Ok(Some(PlannedSection {
+        name: ACCESS_CONTROL_FILE,
+        bytes: serde_json::to_vec_pretty(&root)?,
+        original,
+        migration_generation,
+    }))
+}
+
+fn migrate_access_control_credentials(
+    value: &mut Value,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
+    if value.is_null() {
+        return Ok(false);
+    }
+    let access = value.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("access_control must be an object or null".to_string())
+    })?;
+    let mut changed = false;
+    let password_hash = take_nonempty_string(access, "password_hash")?;
+    let password_salt = take_nonempty_string(access, "password_salt")?;
+    match (password_hash, password_salt) {
+        (Some(hash), Some(salt)) => {
+            let reference = existing_or_generated_ref(
+                access.get("password_credential_ref"),
+                "access",
+                "root",
+                "password_verifier",
+            )?;
+            let value = crate::config_crypto::encode_access_verifier(&hash, &salt)?;
+            access.insert(
+                "password_credential_ref".to_string(),
+                Value::String(reference.as_str().to_string()),
+            );
+            access.insert("password_configured".to_string(), Value::Bool(true));
+            extracted.push(ExtractedSecret {
+                credential_ref: reference,
+                value: LegacySecret::Plaintext(value),
+                migration_generation,
+                kind: ExtractedSecretKind::AccessControl,
+                env_owner: None,
+                provider_owner: None,
+                mcp_owner: None,
+                connect_owner: None,
+            });
+            changed = true;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(ConfigStoreError::Validation(
+                "legacy access-control password verifier is incomplete".to_string(),
+            ));
+        }
+    }
+    if let Some(devices) = access.get_mut("devices").and_then(Value::as_array_mut) {
+        for device in devices {
+            let device = device.as_object_mut().ok_or_else(|| {
+                ConfigStoreError::Validation("access-control device must be an object".to_string())
+            })?;
+            let device_id = device
+                .get("device_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    ConfigStoreError::Validation("access-control device id is missing".to_string())
+                })?
+                .to_string();
+            let token_hash = take_nonempty_string(device, "token_hash")?;
+            let token_salt = take_nonempty_string(device, "token_salt")?;
+            match (token_hash, token_salt) {
+                (Some(hash), Some(salt)) => {
+                    let reference = existing_or_generated_ref(
+                        device.get("token_credential_ref"),
+                        "access",
+                        &device_id,
+                        "device_token_verifier",
+                    )?;
+                    let value = crate::config_crypto::encode_access_verifier(&hash, &salt)?;
+                    device.insert(
+                        "token_credential_ref".to_string(),
+                        Value::String(reference.as_str().to_string()),
+                    );
+                    device.insert("token_configured".to_string(), Value::Bool(true));
+                    extracted.push(ExtractedSecret {
+                        credential_ref: reference,
+                        value: LegacySecret::Plaintext(value),
+                        migration_generation,
+                        kind: ExtractedSecretKind::AccessControl,
+                        env_owner: None,
+                        provider_owner: None,
+                        mcp_owner: None,
+                        connect_owner: None,
+                    });
+                    changed = true;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ConfigStoreError::Validation(format!(
+                        "legacy access-control device '{device_id}' verifier is incomplete"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(changed)
 }
 
 fn migrate_env_vars(
@@ -4329,6 +4998,7 @@ fn migrate_env_vars(
                 env_owner: Some(name.clone()),
                 provider_owner: None,
                 mcp_owner: None,
+                connect_owner: None,
             });
         }
         changed |= had_plaintext_field
@@ -4419,6 +5089,7 @@ fn migrate_notification_credentials(
                 env_owner: None,
                 provider_owner: None,
                 mcp_owner: None,
+                connect_owner: None,
             });
         }
         changed |= had_plaintext
@@ -4427,6 +5098,170 @@ fn migrate_notification_credentials(
             || previous_configured.as_ref() != Some(&Value::Bool(configured));
     }
     Ok(changed)
+}
+
+fn connect_platform_ids(bytes: &[u8]) -> ConfigStoreResult<BTreeSet<String>> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    let (data, _) = section_data_mut(&mut root)?;
+    let platforms = data
+        .get("platforms")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "connect configuration must contain a platforms array".to_string(),
+            )
+        })?;
+    platforms
+        .iter()
+        .filter_map(|platform| platform.get("id").and_then(Value::as_str))
+        .map(|id| {
+            if id.trim().is_empty() {
+                Err(ConfigStoreError::Validation(
+                    "connect platform id must not be empty".to_string(),
+                ))
+            } else {
+                Ok(id.to_string())
+            }
+        })
+        .collect()
+}
+
+fn migrate_connect_credentials(
+    connect: &mut Value,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
+    let platforms = connect
+        .get_mut("platforms")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "connect configuration must contain a platforms array".to_string(),
+            )
+        })?;
+    let mut changed = false;
+    let mut ids = BTreeSet::new();
+    for platform in platforms {
+        let platform = platform.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("connect platform must be an object".to_string())
+        })?;
+        let id = match platform.get("id") {
+            Some(Value::String(id)) if !id.trim().is_empty() => id.clone(),
+            Some(Value::Null) | None => {
+                let id = Uuid::new_v4().to_string();
+                platform.insert("id".to_string(), Value::String(id.clone()));
+                changed = true;
+                id
+            }
+            _ => {
+                return Err(ConfigStoreError::Validation(
+                    "connect platform id is invalid".to_string(),
+                ));
+            }
+        };
+        if !ids.insert(id.clone()) {
+            return Err(ConfigStoreError::Validation(
+                "connect platform ids must be unique".to_string(),
+            ));
+        }
+        for (plaintext_key, ciphertext_key, reference_key, configured_key, field) in [
+            (
+                "token",
+                "token_encrypted",
+                "token_credential_ref",
+                "token_configured",
+                "token",
+            ),
+            (
+                "app_secret",
+                "app_secret_encrypted",
+                "app_secret_credential_ref",
+                "app_secret_configured",
+                "app_secret",
+            ),
+        ] {
+            let had_plaintext = platform.contains_key(plaintext_key);
+            let had_ciphertext = platform.contains_key(ciphertext_key);
+            let previous_ref = platform.get(reference_key).cloned();
+            let previous_configured = platform.get(configured_key).cloned();
+            let secret = take_consistent_legacy_secret(
+                platform,
+                plaintext_key,
+                ciphertext_key,
+                &format!("connect platform '{id}' {field}"),
+            )?;
+            let configured = secret.is_some()
+                || platform
+                    .get(configured_key)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if secret.is_none() && previous_ref.is_none() && !configured {
+                changed |= had_plaintext || had_ciphertext;
+                continue;
+            }
+            let reference =
+                existing_or_generated_ref(platform.get(reference_key), "connect", &id, field)?;
+            let canonical = credential_ref("connect", &id, field)?;
+            if reference != canonical {
+                return Err(ConfigStoreError::Validation(
+                    "connect credential reference is not canonical".to_string(),
+                ));
+            }
+            platform.insert(
+                reference_key.to_string(),
+                Value::String(reference.as_str().to_string()),
+            );
+            platform.insert(configured_key.to_string(), Value::Bool(configured));
+            if let Some(value) = secret {
+                extracted.push(ExtractedSecret {
+                    credential_ref: reference.clone(),
+                    value,
+                    migration_generation,
+                    kind: ExtractedSecretKind::Connect,
+                    env_owner: None,
+                    provider_owner: None,
+                    mcp_owner: None,
+                    connect_owner: Some(id.clone()),
+                });
+            }
+            changed |= had_plaintext
+                || had_ciphertext
+                || previous_ref.as_ref() != Some(&Value::String(reference.as_str().to_string()))
+                || previous_configured.as_ref() != Some(&Value::Bool(configured));
+        }
+    }
+    Ok(changed)
+}
+
+fn plan_connect_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let mut root: Value = serde_json::from_slice(&original)?;
+    let revisioned = root.as_object().is_some_and(|object| {
+        object.contains_key("schema_version")
+            || object.contains_key("revision")
+            || object.contains_key("data")
+    });
+    let (connect, revision) = section_data_mut(&mut root)?;
+    let generation = revision
+        .and_then(|revision| revision.checked_add(1))
+        .unwrap_or(migration_generation)
+        .max(migration_generation);
+    if !migrate_connect_credentials(connect, extracted, generation)? {
+        return Ok(None);
+    }
+    let connect: crate::ConnectConfig = serde_json::from_value(connect.clone())?;
+    crate::section_facade::validate_connect_isolated(&connect)
+        .map_err(ConfigStoreError::Validation)?;
+    advance_or_wrap(&mut root, revisioned, generation);
+    Ok(Some(PlannedSection {
+        name: CONNECT_FILE,
+        bytes: serde_json::to_vec_pretty(&root)?,
+        original,
+        migration_generation: generation,
+    }))
 }
 
 fn migrate_proxy_auth(
@@ -4497,6 +5332,7 @@ fn migrate_proxy_auth(
         env_owner: None,
         provider_owner: None,
         mcp_owner: None,
+        connect_owner: None,
     });
     Ok(true)
 }
@@ -4671,6 +5507,7 @@ fn plan_broker_document(
                 env_owner: None,
                 provider_owner: None,
                 mcp_owner: None,
+                connect_owner: None,
             });
         }
     } else {
@@ -4755,6 +5592,7 @@ fn migrate_mcp_transport(
                 env_owner: None,
                 provider_owner: None,
                 mcp_owner: Some(server_id.to_string()),
+                connect_owner: None,
             });
             changed = true;
         }
@@ -4826,6 +5664,7 @@ fn migrate_named_secret_map(
                 env_owner: None,
                 provider_owner: None,
                 mcp_owner: Some(server_id.to_string()),
+                connect_owner: None,
             });
         }
     }
@@ -5011,8 +5850,12 @@ fn section_data_as_legacy_root(
     data: Value,
 ) -> ConfigStoreResult<Value> {
     let root = match scope {
-        ExactTransactionScope::ProxyAuth | ExactTransactionScope::Notifications => data,
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::ProxyAuth
+        | ExactTransactionScope::Notifications => data,
         ExactTransactionScope::EnvVars => serde_json::json!({ "env_vars": data }),
+        ExactTransactionScope::Connect => serde_json::json!({ "connect": data }),
+        ExactTransactionScope::AccessControl => serde_json::json!({ "access_control": data }),
         ExactTransactionScope::ClusterFabric => serde_json::json!({ "cluster_fabric": data }),
     };
     root.is_object().then_some(root).ok_or_else(|| {
@@ -5040,7 +5883,7 @@ fn load_active_exact_section(
 ) -> ConfigStoreResult<ActiveExactSection> {
     let name = authoritative_section_file(scope);
     let original = read_target_or_empty(&data_dir.join(name))?;
-    let expected_revision = crate::section_facade::validate_section_envelope(name, &original, 1)?;
+    let expected_revision = crate::section_facade::validate_section_envelope(name, &original, 0)?;
     let envelope: Value = serde_json::from_slice(&original)?;
     let data = envelope.get("data").cloned().ok_or_else(|| {
         ConfigStoreError::Validation("authoritative section envelope has no data".to_string())
@@ -5064,13 +5907,21 @@ fn prepare_active_exact_section_document(
         "exact transaction produced an invalid authoritative section",
     )?;
     let mut updated_data = match scope {
-        ExactTransactionScope::ProxyAuth | ExactTransactionScope::Notifications => {
-            Value::Object(updated_root)
-        }
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::ProxyAuth
+        | ExactTransactionScope::Notifications => Value::Object(updated_root),
         ExactTransactionScope::EnvVars => updated_root
             .get("env_vars")
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new())),
+        ExactTransactionScope::Connect => updated_root
+            .get("connect")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new())),
+        ExactTransactionScope::AccessControl => updated_root
+            .get("access_control")
+            .cloned()
+            .unwrap_or(Value::Null),
         ExactTransactionScope::ClusterFabric => updated_root
             .get("cluster_fabric")
             .cloned()
@@ -5108,7 +5959,29 @@ fn prepare_active_exact_section_document(
                 }
             }
         }
-        ExactTransactionScope::ProxyAuth | ExactTransactionScope::ClusterFabric => {}
+        ExactTransactionScope::Connect => {
+            if let Some(platforms) = updated_data
+                .get_mut("platforms")
+                .and_then(Value::as_array_mut)
+            {
+                for platform in platforms.iter_mut().filter_map(Value::as_object_mut) {
+                    if platform.get("token_configured").and_then(Value::as_bool) == Some(false) {
+                        platform.remove("token_credential_ref");
+                    }
+                    if platform
+                        .get("app_secret_configured")
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    {
+                        platform.remove("app_secret_credential_ref");
+                    }
+                }
+            }
+        }
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::ProxyAuth
+        | ExactTransactionScope::ClusterFabric
+        | ExactTransactionScope::AccessControl => {}
     }
     let mut envelope: Value = serde_json::from_slice(&section.original)?;
     let object = envelope.as_object_mut().ok_or_else(|| {
@@ -5183,7 +6056,7 @@ fn prepare_env_var_config_document(
     let mut entries = Vec::with_capacity(candidate.env_vars.len());
     for mut entry in candidate.env_vars.clone() {
         if entry.secret {
-            if entry.credential_ref.is_none() {
+            if entry.configured && entry.credential_ref.is_none() {
                 return Err(ConfigStoreError::Validation(
                     "secret env credential metadata is incomplete".to_string(),
                 ));
@@ -5333,6 +6206,263 @@ fn notification_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreR
         "config.json is invalid during notification credential transaction",
     )?;
     Ok(current.get("notifications") != candidate.get("notifications"))
+}
+
+fn connect_refs_from_document(
+    bytes: &[u8],
+) -> ConfigStoreResult<crate::credential_store::PersistedConnectCredentialRefs> {
+    let root = parse_config_root_object(
+        bytes,
+        "config.json is invalid during connect credential transaction",
+    )?;
+    let Some(platforms) = root
+        .get("connect")
+        .and_then(|connect| connect.get("platforms"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut refs = BTreeMap::new();
+    for platform in platforms {
+        let platform = platform.as_object().ok_or_else(|| {
+            ConfigStoreError::Validation("connect platform metadata must be an object".to_string())
+        })?;
+        let id = platform.get("id").and_then(Value::as_str).ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "connect credential metadata requires a stable platform id".to_string(),
+            )
+        })?;
+        if id.trim().is_empty() || refs.contains_key(id) {
+            return Err(ConfigStoreError::Validation(
+                "connect platform ids must be nonempty and unique".to_string(),
+            ));
+        }
+        let parse = |key: &str| -> ConfigStoreResult<Option<CredentialRef>> {
+            platform
+                .get(key)
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            ConfigStoreError::Validation(
+                                "connect credential reference must be a string".to_string(),
+                            )
+                        })
+                        .and_then(|value| CredentialRef::parse(value.to_string()))
+                })
+                .transpose()
+        };
+        refs.insert(
+            id.to_string(),
+            (
+                parse("token_credential_ref")?,
+                parse("app_secret_credential_ref")?,
+            ),
+        );
+    }
+    Ok(refs)
+}
+
+fn prepare_connect_config_document(
+    current: &[u8],
+    candidate: &crate::Config,
+) -> ConfigStoreResult<Vec<u8>> {
+    let mut root = parse_config_root_object(
+        current,
+        "config.json is invalid during connect credential transaction",
+    )?;
+    let mut candidate = candidate.clone();
+    candidate.sanitize_connect_credentials_for_disk();
+    crate::section_facade::validate_connect_isolated(&candidate.connect)
+        .map_err(ConfigStoreError::Validation)?;
+    let candidate_connect = serde_json::to_value(&candidate.connect)?;
+    let candidate_connect = candidate_connect.as_object().ok_or_else(|| {
+        ConfigStoreError::Validation("connect config transaction document is invalid".to_string())
+    })?;
+    let mut connect = root
+        .remove("connect")
+        .unwrap_or_else(|| Value::Object(Map::new()))
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "connect must be an object during credential transaction".to_string(),
+            )
+        })?;
+    let current_platforms = connect
+        .get("platforms")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|platform| {
+            let platform = platform.as_object()?.clone();
+            let id = platform.get("id")?.as_str()?.to_string();
+            Some((id, platform))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut platforms = Vec::new();
+    for platform in candidate_connect
+        .get("platforms")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let typed = platform.as_object().ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "connect platform config transaction document is invalid".to_string(),
+            )
+        })?;
+        let id = typed.get("id").and_then(Value::as_str).ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "connect credential metadata requires a stable platform id".to_string(),
+            )
+        })?;
+        let mut durable = current_platforms.get(id).cloned().unwrap_or_default();
+        for key in [
+            "id",
+            "type",
+            "token",
+            "token_encrypted",
+            "token_credential_ref",
+            "token_configured",
+            "app_id",
+            "app_secret",
+            "app_secret_encrypted",
+            "app_secret_credential_ref",
+            "app_secret_configured",
+            "domain",
+            "allow_from",
+            "admin_from",
+        ] {
+            durable.remove(key);
+        }
+        durable.extend(typed.clone());
+        platforms.push(Value::Object(durable));
+    }
+    connect.insert("platforms".to_string(), Value::Array(platforms));
+    root.insert("connect".to_string(), Value::Object(connect));
+    let document = Value::Object(root);
+    serde_json::from_value::<crate::Config>(document.clone()).map_err(|_| {
+        ConfigStoreError::Validation(
+            "config.json is invalid during connect credential transaction".to_string(),
+        )
+    })?;
+    Ok(serde_json::to_vec_pretty(&document)?)
+}
+
+fn connect_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult<bool> {
+    let current = parse_config_root_object(
+        current,
+        "config.json is invalid during connect credential transaction",
+    )?;
+    let candidate = parse_config_root_object(
+        candidate,
+        "config.json is invalid during connect credential transaction",
+    )?;
+    Ok(current.get("connect") != candidate.get("connect"))
+}
+
+fn access_refs_from_document(
+    bytes: &[u8],
+) -> ConfigStoreResult<crate::credential_store::PersistedAccessCredentialRefs> {
+    let root = parse_config_root_object(
+        bytes,
+        "config.json is invalid during access-control credential transaction",
+    )?;
+    let Some(access) = root.get("access_control") else {
+        return Ok(Default::default());
+    };
+    if access.is_null() {
+        return Ok(Default::default());
+    }
+    let access = access.as_object().ok_or_else(|| {
+        ConfigStoreError::Validation("access_control must be an object or null".to_string())
+    })?;
+    let parse_ref = |value: Option<&Value>| -> ConfigStoreResult<Option<CredentialRef>> {
+        value
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        ConfigStoreError::Validation(
+                            "access-control credential reference must be a string".to_string(),
+                        )
+                    })
+                    .and_then(|value| CredentialRef::parse(value.to_string()))
+            })
+            .transpose()
+    };
+    let password = parse_ref(access.get("password_credential_ref"))?;
+    let mut devices = BTreeMap::new();
+    for device in access
+        .get("devices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let device = device.as_object().ok_or_else(|| {
+            ConfigStoreError::Validation("access-control device must be an object".to_string())
+        })?;
+        let id = device
+            .get("device_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                ConfigStoreError::Validation("access-control device id is missing".to_string())
+            })?;
+        if let Some(reference) = parse_ref(device.get("token_credential_ref"))? {
+            if devices.insert(id.to_string(), reference).is_some() {
+                return Err(ConfigStoreError::Validation(
+                    "access-control device ids must be unique".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(crate::credential_store::PersistedAccessCredentialRefs { password, devices })
+}
+
+fn prepare_access_control_config_document(
+    current: &[u8],
+    candidate: &crate::Config,
+) -> ConfigStoreResult<Vec<u8>> {
+    let mut root = parse_config_root_object(
+        current,
+        "config.json is invalid during access-control credential transaction",
+    )?;
+    let mut candidate = candidate.clone();
+    candidate.sanitize_access_control_for_disk();
+    let access = crate::AccessControlSection(candidate.access_control.clone());
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "revision": 0,
+        "data": access,
+    });
+    crate::section_facade::validate_section_envelope(
+        ACCESS_CONTROL_FILE,
+        &serde_json::to_vec(&envelope)?,
+        0,
+    )?;
+    match serde_json::to_value(&candidate.access_control)? {
+        Value::Null => {
+            root.remove("access_control");
+        }
+        value => {
+            root.insert("access_control".to_string(), value);
+        }
+    }
+    Ok(serde_json::to_vec_pretty(&Value::Object(root))?)
+}
+
+fn access_control_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult<bool> {
+    let current = parse_config_root_object(
+        current,
+        "config.json is invalid during access-control credential transaction",
+    )?;
+    let candidate = parse_config_root_object(
+        candidate,
+        "config.json is invalid during access-control credential transaction",
+    )?;
+    Ok(current.get("access_control") != candidate.get("access_control"))
 }
 
 fn cluster_node_refs_from_document(
@@ -5650,6 +6780,9 @@ fn rollback_exact_authority_member(
 ) -> ConfigStoreResult<()> {
     match exact_authority_file(manifest) {
         Some(CONFIG_FILE) => match manifest.exact_scope {
+            Some(ExactTransactionScope::Providers) => Err(ConfigStoreError::Validation(
+                "provider exact transaction has no legacy root authority".to_string(),
+            )),
             Some(ExactTransactionScope::ProxyAuth) => {
                 rollback_proxy_config_member(data_dir, manifest)
             }
@@ -5657,6 +6790,12 @@ fn rollback_exact_authority_member(
             Some(ExactTransactionScope::Notifications) => {
                 rollback_notification_config_member(data_dir, manifest)
             }
+            Some(ExactTransactionScope::Connect) => Err(ConfigStoreError::Validation(
+                "connect exact transaction has no active section authority".to_string(),
+            )),
+            Some(ExactTransactionScope::AccessControl) => Err(ConfigStoreError::Validation(
+                "access-control exact transaction has no active section authority".to_string(),
+            )),
             Some(ExactTransactionScope::ClusterFabric) => {
                 rollback_cluster_config_member(data_dir, manifest)
             }
@@ -5952,6 +7091,42 @@ fn abort_notification_exact_transaction(
     sync_dir(data_dir)
 }
 
+fn abort_connect_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::Connect) {
+        return Ok(());
+    }
+    rollback_exact_authority_member(data_dir, manifest)?;
+    rollback_exact_credential_member(data_dir, manifest)?;
+    let mut complete = manifest.clone();
+    complete.state = MigrationState::Complete;
+    write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &complete)?;
+    remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
+    sync_dir(data_dir)
+}
+
+fn abort_access_control_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::AccessControl) {
+        return Ok(());
+    }
+    rollback_exact_authority_member(data_dir, manifest)?;
+    rollback_exact_credential_member(data_dir, manifest)?;
+    let mut complete = manifest.clone();
+    complete.state = MigrationState::Complete;
+    write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &complete)?;
+    remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
+    sync_dir(data_dir)
+}
+
 fn rollback_cluster_config_member(
     data_dir: &Path,
     manifest: &MigrationManifest,
@@ -6025,16 +7200,42 @@ fn abort_cluster_exact_transaction(
 
 fn abort_exact_transaction(data_dir: &Path, manifest: &MigrationManifest) -> ConfigStoreResult<()> {
     match manifest.exact_scope {
+        Some(ExactTransactionScope::Providers) => {
+            abort_active_exact_transaction(data_dir, manifest, ExactTransactionScope::Providers)
+        }
         Some(ExactTransactionScope::ProxyAuth) => abort_proxy_exact_transaction(data_dir, manifest),
         Some(ExactTransactionScope::EnvVars) => abort_env_exact_transaction(data_dir, manifest),
         Some(ExactTransactionScope::Notifications) => {
             abort_notification_exact_transaction(data_dir, manifest)
+        }
+        Some(ExactTransactionScope::Connect) => abort_connect_exact_transaction(data_dir, manifest),
+        Some(ExactTransactionScope::AccessControl) => {
+            abort_access_control_exact_transaction(data_dir, manifest)
         }
         Some(ExactTransactionScope::ClusterFabric) => {
             abort_cluster_exact_transaction(data_dir, manifest)
         }
         None => Ok(()),
     }
+}
+
+fn abort_active_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+    scope: ExactTransactionScope,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(scope) {
+        return Ok(());
+    }
+    rollback_exact_authority_member(data_dir, manifest)?;
+    rollback_exact_credential_member(data_dir, manifest)?;
+    let mut complete = manifest.clone();
+    complete.state = MigrationState::Complete;
+    write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+    cleanup_transaction_dirs(data_dir, &complete)?;
+    remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
+    sync_dir(data_dir)
 }
 
 fn ensure_proxy_consumers_or_abort(
@@ -6172,6 +7373,150 @@ fn ensure_cluster_consumers_or_abort(
     if let Err(error) = ensure_cluster_refs_are_safe(data_dir, &refs, &[]) {
         abort_cluster_exact_transaction(data_dir, manifest)?;
         return Err(error);
+    }
+    Ok(())
+}
+
+fn ensure_connect_consumers_or_abort(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::Connect) {
+        return Ok(());
+    }
+    let credential_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed connect credential transaction is incomplete".to_string(),
+            )
+        })?;
+    let authority = exact_authority_file(manifest).ok_or_else(|| {
+        ConfigStoreError::Validation("connect transaction authority is missing".to_string())
+    })?;
+    let (_, staged_authority) = initial_exact_transaction_member(data_dir, manifest, authority)?;
+    let original_authority =
+        read_encrypted_migration_backup(data_dir, &manifest.transaction_id, authority)?;
+    let staged = exact_authority_as_legacy_bytes(
+        ExactTransactionScope::Connect,
+        authority,
+        &staged_authority,
+    )?;
+    let original = exact_authority_as_legacy_bytes(
+        ExactTransactionScope::Connect,
+        authority,
+        &original_authority,
+    )?;
+    let mut owners = connect_refs_from_document(&original)?;
+    for (id, (token_ref, app_secret_ref)) in connect_refs_from_document(&staged)? {
+        let owner = owners.entry(id).or_default();
+        if token_ref.is_some() {
+            owner.0 = token_ref;
+        }
+        if app_secret_ref.is_some() {
+            owner.1 = app_secret_ref;
+        }
+    }
+    for reference in &credential_file.touched_credential_refs {
+        let owner = owners.iter().find_map(|(id, (token_ref, app_secret_ref))| {
+            token_ref
+                .as_ref()
+                .is_some_and(|candidate| candidate.as_str() == reference)
+                .then_some((id.as_str(), "token"))
+                .or_else(|| {
+                    app_secret_ref
+                        .as_ref()
+                        .is_some_and(|candidate| candidate.as_str() == reference)
+                        .then_some((id.as_str(), "app_secret"))
+                })
+        });
+        let Some((platform_id, field)) = owner else {
+            abort_connect_exact_transaction(data_dir, manifest)?;
+            return Err(ConfigStoreError::Validation(
+                "committed connect credential reference is invalid".to_string(),
+            ));
+        };
+        if let Err(error) = ensure_connect_ref_exclusive(data_dir, reference, platform_id, field) {
+            abort_connect_exact_transaction(data_dir, manifest)?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_access_consumers_or_abort(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::AccessControl) {
+        return Ok(());
+    }
+    let credential_file = manifest
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "committed access-control credential transaction is incomplete".to_string(),
+            )
+        })?;
+    let authority = exact_authority_file(manifest).ok_or_else(|| {
+        ConfigStoreError::Validation("access-control transaction authority is missing".to_string())
+    })?;
+    let (_, staged_authority) = initial_exact_transaction_member(data_dir, manifest, authority)?;
+    let original_authority =
+        read_encrypted_migration_backup(data_dir, &manifest.transaction_id, authority)?;
+    let staged = exact_authority_as_legacy_bytes(
+        ExactTransactionScope::AccessControl,
+        authority,
+        &staged_authority,
+    )?;
+    let original = exact_authority_as_legacy_bytes(
+        ExactTransactionScope::AccessControl,
+        authority,
+        &original_authority,
+    )?;
+    let staged_refs = access_refs_from_document(&staged)?;
+    let original_refs = access_refs_from_document(&original)?;
+    for raw in &credential_file.touched_credential_refs {
+        let owner = if staged_refs
+            .password
+            .as_ref()
+            .is_some_and(|r| r.as_str() == raw)
+            || original_refs
+                .password
+                .as_ref()
+                .is_some_and(|r| r.as_str() == raw)
+        {
+            None
+        } else {
+            staged_refs
+                .devices
+                .iter()
+                .chain(original_refs.devices.iter())
+                .find_map(|(id, reference)| (reference.as_str() == raw).then_some(id.as_str()))
+        };
+        if owner.is_none()
+            && staged_refs
+                .password
+                .as_ref()
+                .is_none_or(|r| r.as_str() != raw)
+            && original_refs
+                .password
+                .as_ref()
+                .is_none_or(|r| r.as_str() != raw)
+        {
+            abort_access_control_exact_transaction(data_dir, manifest)?;
+            return Err(ConfigStoreError::Validation(
+                "committed access-control credential reference is invalid".to_string(),
+            ));
+        }
+        if let Err(error) = ensure_access_ref_exclusive(data_dir, raw, owner) {
+            abort_access_control_exact_transaction(data_dir, manifest)?;
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -6383,11 +7728,6 @@ fn capture_durable_section_split_credentials(
 ) -> ConfigStoreResult<bool> {
     let current = read_target_or_empty(&data_dir.join(CREDENTIALS_FILE))?;
     let revision = CredentialStore::validate_section_document_revision(&current)?;
-    if revision == 0 {
-        return Err(ConfigStoreError::Validation(
-            "credential section was not initialized before layout completion".to_string(),
-        ));
-    }
     let current_hash = sha256(&current);
     let file = manifest.files[file_index].clone();
     if let Some(attested_revision) = file.migration_generation {
@@ -6622,6 +7962,8 @@ fn install_pending(
     }
     ensure_proxy_consumers_or_abort(data_dir, manifest)?;
     ensure_notification_consumers_or_abort(data_dir, manifest)?;
+    ensure_connect_consumers_or_abort(data_dir, manifest)?;
+    ensure_access_consumers_or_abort(data_dir, manifest)?;
     ensure_cluster_consumers_or_abort(data_dir, manifest)?;
     let _stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     let names = manifest
@@ -7014,7 +8356,11 @@ fn merge_active_section_data(
         ExactTransactionScope::ClusterFabric => {
             merge_active_cluster_data(current, original, staged)
         }
-        ExactTransactionScope::ProxyAuth | ExactTransactionScope::Notifications => {
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::ProxyAuth
+        | ExactTransactionScope::Notifications
+        | ExactTransactionScope::Connect
+        | ExactTransactionScope::AccessControl => {
             merge_json_slot_three_way(Some(current), Some(original), Some(staged))
                 .and_then(|value| value.ok_or(()))
         }
@@ -7134,6 +8480,11 @@ fn install_rebased_exact_config_member(
     }
     if manifest.exact_scope == Some(ExactTransactionScope::Notifications) {
         return install_rebased_notification_config_member(data_dir, manifest, file_index);
+    }
+    if manifest.exact_scope == Some(ExactTransactionScope::Connect) {
+        return Err(ConfigStoreError::Validation(
+            "connect exact transaction has no legacy root authority".to_string(),
+        ));
     }
     if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric) {
         return install_rebased_cluster_config_member(data_dir, manifest, file_index);
@@ -7796,6 +9147,7 @@ fn install_exact_credential_member(
         }
         if file.touched_credential_refs.is_empty()
             && manifest.exact_scope != Some(ExactTransactionScope::Notifications)
+            && manifest.exact_scope != Some(ExactTransactionScope::Connect)
             && manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
         {
             return Err(ConfigStoreError::Validation(
@@ -8407,6 +9759,7 @@ fn scrub_broker_credentials_from_backups(data_dir: &Path) -> ConfigStoreResult<u
                 env_owner: None,
                 provider_owner: None,
                 mcp_owner: None,
+                connect_owner: None,
             }],
         )?;
         let prepared = store.prepare_migration(resolved)?;
@@ -8718,6 +10071,7 @@ fn scrub_provider_instance_credentials(
                         env_owner: None,
                         provider_owner: None,
                         mcp_owner: None,
+                        connect_owner: None,
                     });
                 } else {
                     instance.remove("api_key");
@@ -9323,6 +10677,11 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
     };
     let exact_scope_valid = match (exact_transaction, manifest.exact_scope) {
         (false, None) => true,
+        (true, Some(ExactTransactionScope::Providers)) => {
+            manifest.files.len() == 2
+                && unique.contains(CREDENTIALS_FILE)
+                && unique.contains(PROVIDERS_FILE)
+        }
         (true, Some(ExactTransactionScope::ProxyAuth)) => {
             manifest.files.len() == 2
                 && (unique.contains(CONFIG_FILE) ^ unique.contains(CORE_FILE))
@@ -9344,6 +10703,16 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         (true, Some(ExactTransactionScope::Notifications)) => {
             manifest.files.len() == 2
                 && (unique.contains(CONFIG_FILE) ^ unique.contains(NOTIFICATIONS_FILE))
+        }
+        (true, Some(ExactTransactionScope::Connect)) => {
+            manifest.files.len() == 2
+                && unique.contains(CREDENTIALS_FILE)
+                && unique.contains(CONNECT_FILE)
+        }
+        (true, Some(ExactTransactionScope::AccessControl)) => {
+            manifest.files.len() == 2
+                && unique.contains(CREDENTIALS_FILE)
+                && unique.contains(ACCESS_CONTROL_FILE)
         }
         (true, Some(ExactTransactionScope::ClusterFabric)) => {
             manifest.files.len() == 2
@@ -9499,6 +10868,7 @@ fn is_legacy_cleanup_file(name: &str) -> bool {
             MCP_FILE,
             BROKER_FILE,
             CONNECT_FILE,
+            ACCESS_CONTROL_FILE,
         ]
         .into_iter()
         .any(|base| {
@@ -12224,6 +13594,148 @@ mod tests {
             .resolve(&reference)
             .unwrap()
             .is_none());
+        assert_eq!(
+            read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap(),
+            root_before
+        );
+    }
+
+    #[test]
+    fn active_connect_exact_transaction_is_visible_to_fresh_facades_after_set_metadata_and_clear() {
+        let _key = crate::encryption::set_test_encryption_key([0x55; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let root_before = read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap();
+
+        let (mut set, revision) = active_facade_config_and_credential_revision(dir.path());
+        set.connect.platforms.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "telegram-main",
+                "type": "telegram",
+                "token": "active-connect-secret",
+                "allow_from": ["user-1"]
+            }))
+            .unwrap(),
+        );
+        let mut intents = crate::patch::ConnectSecretIntents::default();
+        intents.token.insert(0);
+        persist_connect_credential_transaction_at_revision(
+            dir.path(),
+            &mut set,
+            &intents,
+            revision,
+        )
+        .unwrap();
+        assert_active_exact_manifest(dir.path(), ExactTransactionScope::Connect);
+        let reference = crate::credential_ref("connect", "telegram-main", "token").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "active-connect-secret"
+        );
+
+        let (mut metadata, revision) = active_facade_config_and_credential_revision(dir.path());
+        let platform = &mut metadata.connect.platforms[0];
+        assert!(platform.token_configured);
+        assert_eq!(platform.token_credential_ref.as_ref(), Some(&reference));
+        platform.allow_from.push("user-2".to_string());
+        persist_connect_credential_transaction_at_revision(
+            dir.path(),
+            &mut metadata,
+            &crate::patch::ConnectSecretIntents::default(),
+            revision,
+        )
+        .unwrap();
+        let (mut clear, revision) = active_facade_config_and_credential_revision(dir.path());
+        assert_eq!(
+            clear.connect.platforms[0].allow_from,
+            vec!["user-1".to_string(), "user-2".to_string()]
+        );
+        clear.connect.platforms[0].token = None;
+        let mut clear_intents = crate::patch::ConnectSecretIntents::default();
+        clear_intents.token.insert(0);
+        persist_connect_credential_transaction_at_revision(
+            dir.path(),
+            &mut clear,
+            &clear_intents,
+            revision,
+        )
+        .unwrap();
+        let (fresh, _) = active_facade_config_and_credential_revision(dir.path());
+        assert!(!fresh.connect.platforms[0].token_configured);
+        assert!(fresh.connect.platforms[0].token_credential_ref.is_none());
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&reference)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap(),
+            root_before
+        );
+    }
+
+    #[test]
+    fn active_access_exact_transaction_is_visible_to_fresh_facades() {
+        let _key = crate::encryption::set_test_encryption_key([0x55; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let root_before = read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap();
+
+        let (mut candidate, revision) = active_facade_config_and_credential_revision(dir.path());
+        candidate.access_control = Some(crate::AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some("a".repeat(64)),
+            password_salt: Some("01".repeat(16)),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: vec![crate::DeviceCredential {
+                device_id: "bamboo_access01".to_string(),
+                label: "Phone".to_string(),
+                token_hash: "b".repeat(64),
+                token_salt: "02".repeat(16),
+                token_credential_ref: None,
+                token_configured: false,
+                created_at: "2026-07-21T00:00:00Z".to_string(),
+                last_used_at: None,
+                revoked: false,
+            }],
+        });
+        persist_access_control_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            true,
+            &BTreeSet::from(["bamboo_access01".to_string()]),
+            revision,
+        )
+        .unwrap();
+        assert_active_exact_manifest(dir.path(), ExactTransactionScope::AccessControl);
+        let facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut fresh = facade.effective_config();
+        let access = fresh.access_control.as_ref().unwrap();
+        assert!(access.password_configured);
+        assert!(access.password_hash.is_none());
+        assert!(access.devices[0].token_configured);
+        assert!(access.devices[0].token_hash.is_empty());
+        fresh
+            .hydrate_access_control_credentials_from_store(dir.path())
+            .unwrap();
+        assert_eq!(
+            fresh
+                .access_control
+                .as_ref()
+                .unwrap()
+                .password_hash
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            fresh.access_control.as_ref().unwrap().devices[0].token_hash,
+            "b".repeat(64)
+        );
         assert_eq!(
             read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap(),
             root_before

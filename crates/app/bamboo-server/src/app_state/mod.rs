@@ -165,6 +165,11 @@ pub struct AppState {
     /// Can be reloaded from disk at runtime using `reload_config()`.
     pub config: Arc<RwLock<Config>>,
 
+    /// Process-owned modular configuration authority. Production bootstrap
+    /// always installs one after the recoverable legacy split; injected test
+    /// states may omit it and retain the compatibility-only config path.
+    pub config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
+
     /// Serializes a config WRITE's whole [in-memory mutation + disk persist] with
     /// a `reload_config`'s [disk read + in-memory swap], so a reload can never
     /// observe an in-flight-but-not-yet-persisted update and clobber it with the

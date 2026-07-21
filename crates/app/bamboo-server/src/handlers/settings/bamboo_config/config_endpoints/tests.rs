@@ -14,15 +14,19 @@ use super::reset::remove_config_file_if_exists;
 fn access_control_fixture() -> bamboo_config::AccessControlConfig {
     bamboo_config::AccessControlConfig {
         password_enabled: true,
-        password_hash: Some("password-verifier".to_string()),
-        password_salt: Some("password-salt".to_string()),
+        password_hash: Some("a".repeat(64)),
+        password_salt: Some("00112233445566778899aabbccddeeff".to_string()),
+        password_credential_ref: None,
+        password_configured: false,
         updated_at: Some("2026-07-21T00:00:00Z".to_string()),
         devices: vec![
             bamboo_config::DeviceCredential {
                 device_id: "bamboo_first".to_string(),
                 label: "Phone".to_string(),
-                token_hash: "first-device-verifier".to_string(),
-                token_salt: "first-device-salt".to_string(),
+                token_hash: "b".repeat(64),
+                token_salt: "11223344556677889900aabbccddeeff".to_string(),
+                token_credential_ref: None,
+                token_configured: false,
                 created_at: "2026-07-20T00:00:00Z".to_string(),
                 last_used_at: Some("2026-07-21T00:00:00Z".to_string()),
                 revoked: false,
@@ -30,8 +34,10 @@ fn access_control_fixture() -> bamboo_config::AccessControlConfig {
             bamboo_config::DeviceCredential {
                 device_id: "bamboo_second".to_string(),
                 label: "Laptop".to_string(),
-                token_hash: "second-device-verifier".to_string(),
-                token_salt: "second-device-salt".to_string(),
+                token_hash: "c".repeat(64),
+                token_salt: "22334455667788990011aabbccddeeff".to_string(),
+                token_credential_ref: None,
+                token_configured: false,
                 created_at: "2026-07-19T00:00:00Z".to_string(),
                 last_used_at: None,
                 revoked: true,
@@ -206,18 +212,23 @@ async fn redacted_full_payload_update_preserves_access_control_and_rejects_mutat
         .expect("app state should initialize");
     let data_dir = state.app_data_dir.clone();
     let app_state = web::Data::new(state);
-    let expected_access_control = access_control_fixture();
-    {
-        let mut config = app_state.config.write().await;
-        config.access_control = Some(expected_access_control.clone());
-        config
-            .save_to_dir(data_dir.clone())
-            .expect("access-control fixture should persist");
-    }
-    let persisted_before: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(data_dir.join("config.json")).expect("config should be readable"),
-    )
-    .expect("config should be valid JSON");
+    let fixture = access_control_fixture();
+    let device_intents = fixture
+        .devices
+        .iter()
+        .map(|device| device.device_id.clone())
+        .collect();
+    let expected_revision = app_state.credential_store.revision().unwrap();
+    let (committed, _) = app_state
+        .update_access_control_credentials(expected_revision, true, device_intents, move |config| {
+            config.access_control = Some(fixture);
+            Ok(())
+        })
+        .await
+        .expect("access-control fixture should persist through the exact transaction");
+    let expected_access_control = committed.access_control.clone().unwrap();
+    let access_path = data_dir.join("access-control.json");
+    let persisted_before = std::fs::read(&access_path).expect("section should be readable");
 
     let app = test::init_service(
         App::new()
@@ -267,13 +278,9 @@ async fn redacted_full_payload_update_preserves_access_control_and_rejects_mutat
         app_state.config.read().await.access_control.as_ref(),
         Some(&expected_access_control)
     );
-    let persisted_after: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(data_dir.join("config.json")).expect("config should be readable"),
-    )
-    .expect("config should be valid JSON");
     assert_eq!(
-        persisted_after.get("access_control"),
-        persisted_before.get("access_control"),
+        std::fs::read(access_path).unwrap(),
+        persisted_before,
         "unrelated full-payload update must preserve every access-control verifier"
     );
 
@@ -547,18 +554,32 @@ async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     )
     .await;
 
-    let post = test::TestRequest::post()
+    let config_post = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
-            "model": "gpt-4o",
+            "model": "gpt-4o"
+        }))
+        .to_request();
+    let config_post_resp = test::call_service(&app, config_post).await;
+    assert!(
+        config_post_resp.status().is_success(),
+        "set config should succeed"
+    );
+
+    let limits_post = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
             "model_limits": [
                 { "model_pattern": "gpt-4o", "max_context_tokens": 128000, "max_output_tokens": 16384 },
                 { "model_pattern": "noop", "max_context_tokens": 200000, "max_output_tokens": 64000 }
             ]
         }))
         .to_request();
-    let post_resp = test::call_service(&app, post).await;
-    assert!(post_resp.status().is_success(), "set config should succeed");
+    let limits_post_resp = test::call_service(&app, limits_post).await;
+    assert!(
+        limits_post_resp.status().is_success(),
+        "set model limits should succeed"
+    );
 
     // All overrides survive on disk (no diff-only filtering).
     let on_disk = read_model_limits_file(&data_dir)
@@ -570,15 +591,17 @@ async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     assert_eq!(rows[0]["model_pattern"], "gpt-4o");
     assert_eq!(rows[1]["model_pattern"], "noop");
 
-    // config.json must not carry the model_limits key.
-    let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
+    // The active modular layout never recreates config.json, and the core
+    // section must not carry the model_limits key.
+    assert!(!config_file_path(&data_dir).exists());
+    let config_text = tokio::fs::read_to_string(data_dir.join("core.json"))
         .await
-        .expect("config.json should exist after set");
+        .expect("core.json should exist after set");
     let config_json: serde_json::Value =
         serde_json::from_str(&config_text).expect("config.json should be valid json");
     assert!(
         config_json.get("model_limits").is_none(),
-        "model_limits must be split out of config.json"
+        "model_limits must be split out of core.json"
     );
 
     // GET re-injects model_limits from the dedicated file.
@@ -633,6 +656,10 @@ async fn provider_credential_patch_rejects_changed_sidecars_and_model_limits_wit
     .await;
 
     for (section, extra) in [
+        (
+            "core",
+            serde_json::json!({"http_proxy": "http://proxy.invalid:8080"}),
+        ),
         (
             "memory",
             serde_json::json!({"memory": {"background_model": "memory-model"}}),
@@ -771,6 +798,7 @@ async fn whole_provider_instance_null_clears_credential_and_metadata_transaction
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
+    let legacy_root_before = std::fs::read(temp_dir.path().join("config.json")).ok();
     let app_state = web::Data::new(state);
     let app = test::init_service(
         App::new()
@@ -798,10 +826,17 @@ async fn whole_provider_instance_null_clears_credential_and_metadata_transaction
         .resolve(&reference)
         .unwrap()
         .is_none());
-    let root: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(temp_dir.path().join("config.json")).unwrap())
+    let providers: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp_dir.path().join("providers.json")).unwrap())
             .unwrap();
-    assert!(root["provider_instances"].get("work").is_none());
+    assert!(providers["data"]["provider_instances"]
+        .get("work")
+        .is_none());
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("config.json")).ok(),
+        legacy_root_before,
+        "active provider credential transaction must not rewrite the legacy root"
+    );
 }
 
 #[actix_web::test]
@@ -841,7 +876,12 @@ async fn provider_credential_full_payload_allows_unchanged_sidecars() {
         .set_json(payload)
         .to_request();
     let response = test::call_service(&app, request).await;
-    assert!(response.status().is_success());
+    let status = response.status();
+    let response_body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+    assert!(
+        status.is_success(),
+        "provider update failed with {status}: {response_body}"
+    );
     let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
     assert_eq!(
         app_state
@@ -853,6 +893,23 @@ async fn provider_credential_full_payload_allows_unchanged_sidecars() {
         "sk-full-payload"
     );
     assert!(data_dir.join("credentials.json").exists());
+    assert!(!data_dir.join("config.json").exists());
+    let providers: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(data_dir.join("providers.json")).expect("providers section should exist"),
+    )
+    .unwrap();
+    assert_eq!(providers["data"]["provider"], "openai");
+    assert_eq!(
+        providers["data"]["openai"]["credential_ref"],
+        reference.as_str()
+    );
+    assert_eq!(providers["data"]["openai"]["model"], "gpt-test");
+    let facade = app_state.config_facade.as_ref().unwrap();
+    assert_eq!(
+        facade.registry().providers.snapshot().revision,
+        providers["revision"].as_u64().unwrap(),
+        "API completion must publish the process-owned facade snapshot"
+    );
 }
 
 #[actix_web::test]
@@ -937,9 +994,11 @@ async fn redacted_full_payload_provider_update_preserves_notification_credential
             .expose(),
         "full-payload-notification-secret"
     );
-    let root = std::fs::read_to_string(temp_dir.path().join("config.json")).unwrap();
-    assert!(!root.contains("full-payload-notification-secret"));
-    assert!(!root.contains("token_encrypted"));
+    assert!(!temp_dir.path().join("config.json").exists());
+    let notifications =
+        std::fs::read_to_string(temp_dir.path().join("notifications.json")).unwrap();
+    assert!(!notifications.contains("full-payload-notification-secret"));
+    assert!(!notifications.contains("token_encrypted"));
 }
 
 /// End-to-end: POST an ntfy token, confirm the GET response masks it, then
@@ -984,11 +1043,11 @@ async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
     let post_resp = test::call_service(&app, post).await;
     assert!(post_resp.status().is_success(), "set config should succeed");
 
-    // The stored config.json holds only isolated-store metadata, never the
+    // The stored notifications section holds only isolated-store metadata, never the
     // plaintext token, legacy ciphertext, or a UI mask.
-    let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
+    let config_text = tokio::fs::read_to_string(data_dir.join("notifications.json"))
         .await
-        .expect("config.json should exist after set");
+        .expect("notifications.json should exist after set");
     assert!(
         config_text.contains("notification.ntfy.token"),
         "ntfy token must persist through a stable credential reference"
@@ -1047,7 +1106,6 @@ async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
 async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves_masked_token() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
-    use bamboo_config::encryption;
 
     // NOTE: deliberately NOT using `encryption::set_test_encryption_key` here —
     // the actual save happens inside `AppState::persist_config_snapshot`'s
@@ -1088,42 +1146,43 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
         }))
         .to_request();
     let post_resp = test::call_service(&app, post).await;
-    assert!(post_resp.status().is_success(), "set config should succeed");
-
-    // config.json must NOT carry the `connect` key at all (#455 split).
-    let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
-        .await
-        .expect("config.json should exist after set");
+    let post_status = post_resp.status();
+    let post_body = test::read_body(post_resp).await;
     assert!(
-        !config_text.contains("\"connect\""),
-        "config.json must not persist the connect key"
-    );
-    assert!(
-        !config_text.contains("tg-real-secret"),
-        "plaintext connect token must never be persisted anywhere"
+        post_status.is_success(),
+        "set config should succeed: {}",
+        String::from_utf8_lossy(&post_body)
     );
 
-    // connect.json holds the platform, encrypted at rest.
+    // The active facade never recreates the legacy root document.
+    assert!(!config_file_path(&data_dir).exists());
+
+    // connect.json holds only metadata and the stable credential reference.
     let connect_path = data_dir.join("connect.json");
     let connect_text = tokio::fs::read_to_string(&connect_path)
         .await
         .expect("connect.json should exist after set");
     assert!(
-        connect_text.contains("token_encrypted"),
-        "connect token must be persisted encrypted in connect.json"
-    );
-    assert!(
         !connect_text.contains("tg-real-secret"),
         "plaintext connect token must never be persisted in connect.json"
     );
+    assert!(!connect_text.contains("token_encrypted"));
     let connect_json: serde_json::Value =
         serde_json::from_str(&connect_text).expect("connect.json should parse");
-    let token_encrypted = connect_json["platforms"][0]["token_encrypted"]
+    let reference = connect_json["data"]["platforms"][0]["token_credential_ref"]
         .as_str()
-        .expect("token_encrypted should be present")
+        .expect("token credential ref should be present")
         .to_string();
     assert_eq!(
-        encryption::decrypt(&token_encrypted).expect("token should decrypt"),
+        connect_json["data"]["platforms"][0]["token_configured"],
+        true
+    );
+    assert_eq!(
+        bamboo_config::CredentialStore::open(&data_dir)
+            .resolve(&bamboo_config::CredentialRef::parse(reference.clone()).unwrap())
+            .unwrap()
+            .unwrap()
+            .expose(),
         "tg-real-secret"
     );
 
@@ -1170,23 +1229,20 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
         .expect("connect.json should still exist");
     let connect_json_after: serde_json::Value =
         serde_json::from_str(&connect_text_after).expect("connect.json should parse");
-    let token_encrypted_after = connect_json_after["platforms"][0]["token_encrypted"]
-        .as_str()
-        .expect("token_encrypted should still be present")
-        .to_string();
     assert_eq!(
-        encryption::decrypt(&token_encrypted_after).expect("token should decrypt"),
+        connect_json_after["data"]["platforms"][0]["token_credential_ref"], reference,
+        "masked round-trip preserves the stable token reference"
+    );
+    assert_eq!(
+        bamboo_config::CredentialStore::open(&data_dir)
+            .resolve(&bamboo_config::CredentialRef::parse(reference).unwrap())
+            .unwrap()
+            .unwrap()
+            .expose(),
         "tg-real-secret",
-        "masked round-trip preserves the real token across the split files"
+        "masked round-trip preserves the real token in the credential store"
     );
-
-    let config_text_after = tokio::fs::read_to_string(config_file_path(&data_dir))
-        .await
-        .expect("config.json should still exist");
-    assert!(
-        !config_text_after.contains("\"connect\""),
-        "config.json must still not carry the connect key after the second PATCH"
-    );
+    assert!(!config_file_path(&data_dir).exists());
 }
 
 /// Feishu adapter config plumbing (epic #447 phase 3, §2a): `app_id`/`domain`
@@ -1197,7 +1253,6 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
 async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_masked_value() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
-    use bamboo_config::encryption;
 
     // See the long NOTE on the Telegram equivalent above for why the
     // process-global (not thread-local) encryption key is relied on here.
@@ -1237,42 +1292,35 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
     let post_resp = test::call_service(&app, post).await;
     assert!(post_resp.status().is_success(), "set config should succeed");
 
-    // config.json must NOT carry the `connect` key at all (#455 split).
-    let config_text = tokio::fs::read_to_string(config_file_path(&data_dir))
-        .await
-        .expect("config.json should exist after set");
-    assert!(
-        !config_text.contains("\"connect\""),
-        "config.json must not persist the connect key"
-    );
-    assert!(
-        !config_text.contains("feishu-real-secret"),
-        "plaintext app_secret must never be persisted anywhere"
-    );
+    assert!(!config_file_path(&data_dir).exists());
 
-    // connect.json holds app_id/domain in plain and app_secret encrypted.
+    // connect.json holds app_id/domain plus isolated credential metadata.
     let connect_path = data_dir.join("connect.json");
     let connect_text = tokio::fs::read_to_string(&connect_path)
         .await
         .expect("connect.json should exist after set");
     assert!(
-        connect_text.contains("app_secret_encrypted"),
-        "app_secret must be persisted encrypted in connect.json"
-    );
-    assert!(
         !connect_text.contains("feishu-real-secret"),
         "plaintext app_secret must never be persisted in connect.json"
     );
+    assert!(!connect_text.contains("app_secret_encrypted"));
     let connect_json: serde_json::Value =
         serde_json::from_str(&connect_text).expect("connect.json should parse");
-    assert_eq!(connect_json["platforms"][0]["app_id"], "cli_real_app_id");
-    assert_eq!(connect_json["platforms"][0]["domain"], "lark");
-    let app_secret_encrypted = connect_json["platforms"][0]["app_secret_encrypted"]
+    assert_eq!(
+        connect_json["data"]["platforms"][0]["app_id"],
+        "cli_real_app_id"
+    );
+    assert_eq!(connect_json["data"]["platforms"][0]["domain"], "lark");
+    let reference = connect_json["data"]["platforms"][0]["app_secret_credential_ref"]
         .as_str()
-        .expect("app_secret_encrypted should be present")
+        .expect("app_secret credential ref should be present")
         .to_string();
     assert_eq!(
-        encryption::decrypt(&app_secret_encrypted).expect("app_secret should decrypt"),
+        bamboo_config::CredentialStore::open(&data_dir)
+            .resolve(&bamboo_config::CredentialRef::parse(reference.clone()).unwrap())
+            .unwrap()
+            .unwrap()
+            .expose(),
         "feishu-real-secret"
     );
 
@@ -1324,14 +1372,18 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
         .expect("connect.json should still exist");
     let connect_json_after: serde_json::Value =
         serde_json::from_str(&connect_text_after).expect("connect.json should parse");
-    let app_secret_encrypted_after = connect_json_after["platforms"][0]["app_secret_encrypted"]
-        .as_str()
-        .expect("app_secret_encrypted should still be present")
-        .to_string();
     assert_eq!(
-        encryption::decrypt(&app_secret_encrypted_after).expect("app_secret should decrypt"),
+        connect_json_after["data"]["platforms"][0]["app_secret_credential_ref"], reference,
+        "masked round-trip preserves the stable app-secret reference"
+    );
+    assert_eq!(
+        bamboo_config::CredentialStore::open(&data_dir)
+            .resolve(&bamboo_config::CredentialRef::parse(reference).unwrap())
+            .unwrap()
+            .unwrap()
+            .expose(),
         "feishu-real-secret",
-        "masked round-trip preserves the real app_secret across the split files"
+        "masked round-trip preserves the real app_secret in the credential store"
     );
 }
 
@@ -1346,7 +1398,6 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
 async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_removed() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
-    use bamboo_config::encryption;
 
     // See the long NOTE on the Telegram test above for why the process-global
     // (not thread-local) encryption key is relied on here.
@@ -1392,6 +1443,11 @@ async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_remov
     assert_eq!(body["connect"]["platforms"][0]["type"], "telegram");
     assert_eq!(body["connect"]["platforms"][1]["type"], "feishu");
     assert_eq!(body["connect"]["platforms"][1]["app_secret"], "****...****");
+    let feishu_id = body["connect"]["platforms"][1]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let feishu_ref = bamboo_config::credential_ref("connect", &feishu_id, "app_secret").unwrap();
 
     // 3) Re-POST with telegram removed — the UI's echoed feishu entry (still
     // masked) now sits at index 0, not index 1 where it was stored.
@@ -1437,25 +1493,34 @@ async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_remov
         .expect("connect.json should still exist");
     let connect_json_after: serde_json::Value =
         serde_json::from_str(&connect_text_after).expect("connect.json should parse");
-    assert_eq!(connect_json_after["platforms"].as_array().unwrap().len(), 1);
-    let app_secret_encrypted_after = connect_json_after["platforms"][0]["app_secret_encrypted"]
-        .as_str()
-        .expect("app_secret_encrypted should still be present")
-        .to_string();
     assert_eq!(
-        encryption::decrypt(&app_secret_encrypted_after).expect("app_secret should decrypt"),
+        connect_json_after["data"]["platforms"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        connect_json_after["data"]["platforms"][0]["app_secret_credential_ref"],
+        feishu_ref.as_str()
+    );
+    assert!(!connect_text_after.contains("app_secret_encrypted"));
+    assert_eq!(
+        bamboo_config::CredentialStore::open(&data_dir)
+            .resolve(&feishu_ref)
+            .unwrap()
+            .unwrap()
+            .expose(),
         "feishu-real-secret",
-        "masked secret must resolve by type after a preceding entry was removed, not be dropped"
+        "masked secret must resolve by stable identity after a preceding entry was removed"
     );
 }
 
-/// #455 gap: a full config reset must also clear `connect.json`, or a
-/// bamboo-connect bot token would silently survive `POST
-/// /bamboo/config/reset` and get re-merged back onto the freshly-defaulted
-/// config on the very next load (`Config::merge_connect_config` adopts
-/// whatever connect.json still has).
+/// The modular facade must reject the legacy full reset before deleting any
+/// member. A multi-section reset needs a recoverable manifest; callers use the
+/// revisioned typed section API until that transaction exists.
 #[actix_web::test]
-async fn reset_bamboo_config_also_deletes_connect_json() {
+async fn reset_bamboo_config_rejects_modular_layout_without_mutation() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -1497,40 +1562,21 @@ async fn reset_bamboo_config_also_deletes_connect_json() {
         "connect.json should exist before reset"
     );
 
-    // Reset.
+    let connect_before = tokio::fs::read(&connect_path).await.unwrap();
     let reset = test::TestRequest::post()
         .uri("/bamboo/config/reset")
         .to_request();
-    assert!(
-        test::call_service(&app, reset).await.status().is_success(),
-        "reset should succeed"
+    assert_eq!(
+        test::call_service(&app, reset).await.status(),
+        actix_web::http::StatusCode::BAD_REQUEST
     );
-
-    assert!(
-        !connect_path.exists(),
-        "connect.json must be deleted by a full config reset"
-    );
-
-    // The in-memory config must also be clear, not silently re-merged.
-    let get = test::TestRequest::get().uri("/bamboo/config").to_request();
-    let body: serde_json::Value = test::call_and_read_body_json(&app, get).await;
-    assert!(
-        body["connect"]["platforms"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(true),
-        "connect config must be empty after reset, not re-adopted from a stale file"
-    );
+    assert_eq!(tokio::fs::read(connect_path).await.unwrap(), connect_before);
 }
 
-/// #457: a full config reset must also clear `connect.json.bak`. Unlike
-/// `config.json.bak` (a low-sensitivity config snapshot intentionally left
-/// alone by reset, for recovery), connect.json(.bak) holds an encrypted IM
-/// bot token — an immediately-usable remote-control credential — that must
-/// not stay recoverable straight off disk after the user asks for a full
-/// reset.
+/// Rejection must also preserve the encrypted backup; no transaction member
+/// may be partially removed.
 #[actix_web::test]
-async fn reset_bamboo_config_also_deletes_connect_json_bak() {
+async fn reset_bamboo_config_rejection_preserves_connect_backup() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -1581,23 +1627,19 @@ async fn reset_bamboo_config_also_deletes_connect_json_bak() {
         "connect.json.bak should exist before reset (written by the second save)"
     );
 
-    // Reset.
+    let connect_before = tokio::fs::read(&connect_path).await.unwrap();
+    let backup_before = tokio::fs::read(&connect_backup_path).await.unwrap();
     let reset = test::TestRequest::post()
         .uri("/bamboo/config/reset")
         .to_request();
-    assert!(
-        test::call_service(&app, reset).await.status().is_success(),
-        "reset should succeed"
+    assert_eq!(
+        test::call_service(&app, reset).await.status(),
+        actix_web::http::StatusCode::BAD_REQUEST
     );
-
-    assert!(
-        !connect_path.exists(),
-        "connect.json must be deleted by a full config reset"
-    );
-    assert!(
-        !connect_backup_path.exists(),
-        "connect.json.bak must also be deleted by a full config reset — it holds \
-         a live, immediately-usable bot token"
+    assert_eq!(tokio::fs::read(connect_path).await.unwrap(), connect_before);
+    assert_eq!(
+        tokio::fs::read(connect_backup_path).await.unwrap(),
+        backup_before
     );
 }
 

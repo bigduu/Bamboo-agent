@@ -8,7 +8,9 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
 use super::super::super::redaction::redact_config_for_api;
-use super::common::{redacted_config_json, take_model_limits_patch, write_model_limits_file};
+use super::common::{
+    read_model_limits_file, redacted_config_json, take_model_limits_patch, write_model_limits_file,
+};
 
 /// Updates the Bamboo application configuration.
 pub async fn set_bamboo_config(
@@ -35,26 +37,37 @@ pub async fn set_bamboo_config(
         // transaction or letting it rewrite notification state.
         patch_obj.remove("notifications");
     }
+    if patch_obj.contains_key("connect") {
+        let has_other_domain = patch_obj
+            .keys()
+            .any(|key| !matches!(key.as_str(), "connect" | "expected_revision"));
+        if !has_other_domain || !connect_payload_is_unchanged(&app_state, &patch_obj).await? {
+            return set_connect_config(app_state, patch_obj).await;
+        }
+        patch_obj.remove("connect");
+    }
     if patch_obj.remove("expected_revision").is_some() {
         return Err(AppError::BadRequest(
             "expected_revision is only valid for a dedicated revisioned config domain".to_string(),
         ));
     }
-    let model_limits_patch = take_model_limits_patch(&mut patch_obj);
+    let mut model_limits_patch = take_model_limits_patch(&mut patch_obj);
     config_manager::sanitize_root_patch(&mut patch_obj);
+    if model_limits_patch.is_some() && !patch_obj.is_empty() {
+        let current = read_model_limits_file(&app_state.app_data_dir).await?;
+        if current.as_ref() == model_limits_patch.as_ref() {
+            model_limits_patch = None;
+        } else {
+            return Err(AppError::BadRequest(
+                "model_limits changes cannot be combined with another config section; split the request"
+                    .to_string(),
+            ));
+        }
+    }
     let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
     let effects = config_manager::effects_for_root_patch(&patch_obj);
     let provider_credential_intents = api_key_intents.providers.clone();
     let provider_instance_credential_intents = api_key_intents.provider_instances.clone();
-    if (!provider_credential_intents.is_empty() || !provider_instance_credential_intents.is_empty())
-        && model_limits_patch.is_some()
-    {
-        return Err(AppError::BadRequest(
-            "provider credential updates cannot be combined with model_limits changes; split the request"
-                .to_string(),
-        ));
-    }
-
     // Apply the patch under the config write lock to avoid clobbering concurrent updates.
     let new_config = app_state
         .update_config_with_provider_credentials(
@@ -74,6 +87,12 @@ pub async fn set_bamboo_config(
                 config_manager::preserve_masked_notification_secrets(&mut patch_obj, &current);
                 config_manager::preserve_masked_connect_secrets(&mut patch_obj, &current);
                 let mut new_config = config_manager::build_merged_config(&current, patch_obj)?;
+                // Compatibility serialization intentionally omits access
+                // verifier material. This path rejects all access-control
+                // mutations, so carry the hydrated runtime verifier records
+                // from the lock-time authority instead of losing them in the
+                // JSON merge round-trip.
+                new_config.access_control = current.access_control.clone();
                 new_config.cluster_fabric.prune_orphaned_credential_refs();
                 new_config.extra.remove("model_limits");
                 config_manager::sync_provider_api_keys_encrypted_for_patch(
@@ -296,6 +315,184 @@ async fn set_notification_config(
     Ok(HttpResponse::Ok().json(redacted_config_json(&new_config, &app_state.app_data_dir).await?))
 }
 
+async fn connect_payload_is_unchanged(
+    app_state: &AppState,
+    patch_obj: &serde_json::Map<String, Value>,
+) -> Result<bool, AppError> {
+    if patch_obj.get("connect").is_some_and(Value::is_null) {
+        return Ok(false);
+    }
+    let current = app_state.config.read().await.clone();
+    let mut connect_patch = serde_json::Map::new();
+    connect_patch.insert(
+        "connect".to_string(),
+        patch_obj
+            .get("connect")
+            .cloned()
+            .expect("caller checked connect"),
+    );
+    config_manager::preserve_masked_connect_secrets(&mut connect_patch, &current);
+    let merged = config_manager::build_merged_config(&current, connect_patch)?;
+    Ok(merged.connect == current.connect)
+}
+
+async fn set_connect_config(
+    app_state: web::Data<AppState>,
+    mut patch_obj: serde_json::Map<String, Value>,
+) -> Result<HttpResponse, AppError> {
+    let explicit_revision = patch_obj.contains_key("expected_revision");
+    let expected_revision = match patch_obj.remove("expected_revision") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            AppError::BadRequest(
+                "connect expected_revision must be an unsigned integer".to_string(),
+            )
+        })?,
+        None => app_state
+            .credential_store
+            .revision()
+            .map_err(super::super::credentials::map_store_read_error)?,
+    };
+    if patch_obj.len() != 1 {
+        return Err(AppError::BadRequest(
+            "connect updates cannot be combined with other config domains; split the request"
+                .to_string(),
+        ));
+    }
+    let reset_domain = patch_obj.get("connect").is_some_and(Value::is_null);
+    let mut secret_intents = bamboo_config::patch::ConnectSecretIntents::default();
+    if !reset_domain {
+        let connect = patch_obj
+            .get("connect")
+            .and_then(Value::as_object)
+            .ok_or_else(|| AppError::BadRequest("connect must be an object or null".to_string()))?;
+        let platforms = connect
+            .get("platforms")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AppError::BadRequest("connect.platforms must be an array".to_string())
+            })?;
+        for (index, platform) in platforms.iter().enumerate() {
+            let platform = platform.as_object().ok_or_else(|| {
+                AppError::BadRequest("connect platform must be an object".to_string())
+            })?;
+            for forbidden in [
+                "token_encrypted",
+                "token_credential_ref",
+                "token_configured",
+                "app_secret_encrypted",
+                "app_secret_credential_ref",
+                "app_secret_configured",
+            ] {
+                if platform.contains_key(forbidden) {
+                    return Err(AppError::BadRequest(
+                        "connect credential metadata is server-managed".to_string(),
+                    ));
+                }
+            }
+            for (field, intents) in [
+                ("token", &mut secret_intents.token),
+                ("app_secret", &mut secret_intents.app_secret),
+            ] {
+                let Some(value) = platform.get(field) else {
+                    continue;
+                };
+                match value {
+                    Value::Null => {
+                        intents.insert(index);
+                    }
+                    Value::String(value) => {
+                        if bamboo_config::patch::is_masked_api_key(value) {
+                            if explicit_revision {
+                                return Err(AppError::BadRequest(
+                                    "connect credential value must not be a mask; omit it to keep the existing value"
+                                        .to_string(),
+                                ));
+                            }
+                        } else {
+                            intents.insert(index);
+                        }
+                    }
+                    _ => {
+                        return Err(AppError::BadRequest(
+                            "connect credential value must be a string or null".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    config_manager::sanitize_root_patch(&mut patch_obj);
+    let patch_for_update = patch_obj;
+    let intents_for_update = secret_intents.clone();
+    let (new_config, _) = app_state
+        .update_connect_credentials(expected_revision, secret_intents, move |config| {
+            let current = config.clone();
+            let mut patch = patch_for_update;
+            config_manager::preserve_masked_connect_secrets(&mut patch, &current);
+            let mut merged = config_manager::build_merged_config(&current, patch)?;
+            if reset_domain {
+                merged.connect = bamboo_config::ConnectConfig::default();
+            }
+            preserve_connect_runtime_authority(&current, &mut merged, &intents_for_update);
+            *config = merged;
+            Ok(())
+        })
+        .await?;
+    Ok(HttpResponse::Ok().json(redacted_config_json(&new_config, &app_state.app_data_dir).await?))
+}
+
+fn preserve_connect_runtime_authority(
+    current: &bamboo_llm::Config,
+    candidate: &mut bamboo_llm::Config,
+    intents: &bamboo_config::patch::ConnectSecretIntents,
+) {
+    for (index, platform) in candidate.connect.platforms.iter_mut().enumerate() {
+        let current_platform = platform
+            .id
+            .as_deref()
+            .and_then(|id| {
+                current
+                    .connect
+                    .platforms
+                    .iter()
+                    .find(|existing| existing.id.as_deref() == Some(id))
+            })
+            .or_else(|| {
+                current
+                    .connect
+                    .platforms
+                    .get(index)
+                    .filter(|existing| existing.platform_type == platform.platform_type)
+            })
+            .or_else(|| {
+                let mut matches = current
+                    .connect
+                    .platforms
+                    .iter()
+                    .filter(|existing| existing.platform_type == platform.platform_type);
+                let first = matches.next();
+                first.filter(|_| matches.next().is_none())
+            });
+        let Some(existing) = current_platform else {
+            continue;
+        };
+        if platform.id.is_none() {
+            platform.id = existing.id.clone();
+        }
+        if !intents.token.contains(&index) {
+            platform.token = existing.token.clone();
+            platform.token_credential_ref = existing.token_credential_ref.clone();
+            platform.token_configured = existing.token_configured;
+        }
+        if !intents.app_secret.contains(&index) {
+            platform.app_secret = existing.app_secret.clone();
+            platform.app_secret_credential_ref = existing.app_secret_credential_ref.clone();
+            platform.app_secret_configured = existing.app_secret_configured;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,7 +562,7 @@ mod tests {
         assert!(!body.contains("bark-api-secret"));
         assert!(!body.contains("token_encrypted"));
         assert!(!body.contains("device_key_encrypted"));
-        let root = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let root = std::fs::read_to_string(dir.path().join("notifications.json")).unwrap();
         assert!(!root.contains("ntfy-api-secret"));
         assert!(!root.contains("bark-api-secret"));
         assert!(!root.contains("token_encrypted"));
@@ -538,7 +735,7 @@ mod tests {
             loaded.notifications,
             bamboo_config::NotificationsConfig::default()
         );
-        let disk = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let disk = std::fs::read_to_string(dir.path().join("notifications.json")).unwrap();
         assert!(!disk.contains("reset-ntfy-secret"));
         assert!(!disk.contains("reset-bark-secret"));
     }

@@ -55,8 +55,38 @@ impl AppState {
         // directory as the server runtime.
         bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
 
-        // Load config from the specified data directory
-        let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
+        // Complete the recoverable legacy split before any runtime component
+        // reads configuration, then keep this facade as the process authority.
+        // A malformed legacy document or an unrecoverable pending legacy
+        // transaction must not make the server exit: retain the compatibility
+        // loader's recovered/LKG view for this process so the recovery API can
+        // still repair or confirm it. Healthy layouts never take that fallback.
+        let (config, config_facade) = match bamboo_config::ConfigFacade::open_or_migrate(
+            &bamboo_home_dir,
+        ) {
+            Ok(facade) => {
+                let facade = Arc::new(facade);
+                let config =
+                    super::config_runtime::load_facade_effective_config(&facade, &bamboo_home_dir);
+                (config, Some(facade))
+            }
+            Err(error) => {
+                if bamboo_config::section_layout_is_active(&bamboo_home_dir).unwrap_or(false) {
+                    return Err(AppError::InternalError(anyhow::anyhow!(
+                        "modular configuration authority is unavailable: {error}"
+                    )));
+                }
+                tracing::warn!(
+                    error = %error,
+                    "modular configuration facade is unavailable; retaining recovered legacy authority"
+                );
+                (
+                    Config::from_data_dir_without_publish(Some(bamboo_home_dir.clone())),
+                    None,
+                )
+            }
+        };
+        config.publish_env_vars();
 
         // Loud, unmissable startup signal: `plugin_trust.enforcement: off`
         // silently affects EVERY future `bamboo plugin install`/`update`
@@ -106,7 +136,7 @@ impl AppState {
             Arc::new(UnconfiguredProvider { message }) as Arc<dyn LLMProvider>
         });
 
-        Self::new_with_provider(bamboo_home_dir, config, provider).await
+        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, config_facade).await
     }
 
     /// Create unified app state with a specific provider
@@ -127,6 +157,15 @@ impl AppState {
         bamboo_home_dir: PathBuf,
         config: Config,
         provider: Arc<dyn LLMProvider>,
+    ) -> Result<Self, AppError> {
+        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, None).await
+    }
+
+    async fn new_with_provider_and_facade(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+        config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
     ) -> Result<Self, AppError> {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
@@ -781,6 +820,7 @@ impl AppState {
             super::config_runtime::ConfigWatcherRuntime::start(
                 bamboo_home_dir.clone(),
                 config.clone(),
+                config_facade.clone(),
                 config_io_lock.clone(),
                 provider_registry.clone(),
                 provider_lock.clone(),
@@ -792,6 +832,7 @@ impl AppState {
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
+            config_facade,
             config_io_lock,
             config_live_health,
             mcp_config_live_health,

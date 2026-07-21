@@ -224,12 +224,20 @@ pub struct AccessControlConfig {
     /// Whether password protection is enabled.
     #[serde(default)]
     pub password_enabled: bool,
-    /// Password hash (hex-encoded). Never expose via API.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime-only password verifier hash. Legacy documents may still
+    /// deserialize it for migration, but ordinary section serialization never
+    /// writes verifier material.
+    #[serde(default, skip_serializing)]
     pub password_hash: Option<String>,
-    /// Salt used for hashing (hex-encoded). Never expose via API.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime-only password verifier salt.
+    #[serde(default, skip_serializing)]
     pub password_salt: Option<String>,
+    /// Stable reference to the encrypted verifier record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_credential_ref: Option<crate::CredentialRef>,
+    /// Durable configured metadata for redacted clients/runtime readiness.
+    #[serde(default)]
+    pub password_configured: bool,
     /// Last update timestamp for auditing / debugging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -252,10 +260,18 @@ pub struct DeviceCredential {
     pub device_id: String,
     /// Human-readable label, e.g. "iPhone 15".
     pub label: String,
-    /// `SHA-256(hex_decode(token_salt) || token)`, hex-encoded.
+    /// Runtime-only `SHA-256(hex_decode(token_salt) || token)`, hex-encoded.
+    #[serde(default, skip_serializing)]
     pub token_hash: String,
-    /// Per-device salt (hex-encoded).
+    /// Runtime-only per-device salt (hex-encoded).
+    #[serde(default, skip_serializing)]
     pub token_salt: String,
+    /// Stable reference to the encrypted device-token verifier record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_credential_ref: Option<crate::CredentialRef>,
+    /// Durable configured metadata for runtime readiness.
+    #[serde(default)]
+    pub token_configured: bool,
     /// RFC3339 creation timestamp.
     pub created_at: String,
     /// RFC3339 last-used timestamp (deferred stamping; see PR).
@@ -971,6 +987,12 @@ pub struct ConnectPlatformConfig {
     /// Encrypted ciphertext of `token` (the at-rest representation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_encrypted: Option<String>,
+    /// Stable reference to the isolated token credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_credential_ref: Option<crate::CredentialRef>,
+    /// Durable metadata used by redacted clients without exposing a value.
+    #[serde(default)]
+    pub token_configured: bool,
     /// Platform app id (Feishu `app_id`). Not a secret — serialized normally.
     /// Unused by the Telegram adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -985,6 +1007,12 @@ pub struct ConnectPlatformConfig {
     /// Encrypted ciphertext of `app_secret` (the at-rest representation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_secret_encrypted: Option<String>,
+    /// Stable reference to the isolated app-secret credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_secret_credential_ref: Option<crate::CredentialRef>,
+    /// Durable metadata used by redacted clients without exposing a value.
+    #[serde(default)]
+    pub app_secret_configured: bool,
     /// Platform domain/base-URL selector (Feishu-only today). Not a secret —
     /// serialized normally. `None`/`"feishu"` -> open.feishu.cn, `"lark"` ->
     /// open.larksuite.com, an `https://` value -> a private-deployment base
@@ -3032,6 +3060,23 @@ impl Config {
         scrub_legacy_connect_from_config_backups(&data_dir);
         // Decrypt encrypted bamboo-connect platform tokens into in-memory plaintext.
         config.hydrate_connect_platform_tokens_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_connect_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "connect credential hydration unavailable");
+                for platform in &mut config.connect.platforms {
+                    platform.token = None;
+                    platform.app_secret = None;
+                }
+            }
+        }
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_access_control_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "access-control credential hydration unavailable");
+                config.clear_access_control_runtime_verifiers();
+            }
+        } else {
+            config.clear_access_control_runtime_verifiers();
+        }
         config.normalize_tool_settings();
         config.normalize_skill_settings();
         config.normalize_plugin_trust_settings();
@@ -3141,6 +3186,14 @@ impl Config {
                 gemini.api_key_from_env = true;
             }
         }
+    }
+
+    /// Apply runtime-only `BAMBOO_*` overrides to a config assembled by the
+    /// modular facade. Facade callers use this after durable section snapshots
+    /// and credential references have been materialized; one-shot writers keep
+    /// using the no-env load path so overrides are never persisted.
+    pub fn apply_runtime_env_overrides(&mut self) {
+        self.apply_env_overrides();
     }
 
     /// Load config from disk AND publish its env vars to the process-global cache
@@ -4061,6 +4114,14 @@ impl Config {
             anyhow::bail!(
                 "notification secrets require the isolated credential transaction before persistence"
             );
+        }
+
+        if crate::section_layout_is_active(&data_dir)
+            .context("Failed to inspect modular configuration layout")?
+        {
+            crate::persist_facade_effective_config(&data_dir, self)
+                .context("Failed to persist modular configuration sections")?;
+            return Ok(());
         }
 
         let path = data_dir.join("config.json");
@@ -5007,6 +5068,8 @@ mod tests {
             password_enabled: true,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         };
@@ -5025,6 +5088,8 @@ mod tests {
             label: "iPhone 15".to_string(),
             token_hash: "abcd".to_string(),
             token_salt: "ef01".to_string(),
+            token_credential_ref: None,
+            token_configured: false,
             created_at: "2026-06-23T00:00:00Z".to_string(),
             last_used_at: None,
             revoked: false,
@@ -5033,13 +5098,19 @@ mod tests {
             password_enabled: true,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: vec![device.clone()],
         };
         let value = serde_json::to_value(&access).expect("serialize");
         assert!(value.as_object().unwrap().contains_key("devices"));
+        assert!(value["devices"][0].get("token_hash").is_none());
+        assert!(value["devices"][0].get("token_salt").is_none());
         let back: AccessControlConfig = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(back.devices, vec![device]);
+        assert_eq!(back.devices[0].device_id, device.device_id);
+        assert!(back.devices[0].token_hash.is_empty());
+        assert!(back.devices[0].token_salt.is_empty());
     }
 
     #[test]
@@ -5918,9 +5989,13 @@ mod tests {
             platform_type: platform_type.to_string(),
             token: None,
             token_encrypted: Some(token_encrypted.to_string()),
+            token_credential_ref: None,
+            token_configured: false,
             app_id: None,
             app_secret: None,
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: None,
             allow_from: vec!["user-1".to_string()],
             admin_from: Vec::new(),
@@ -6082,12 +6157,14 @@ mod tests {
 
     #[test]
     fn load_merges_connect_json_into_config() {
+        let _key = crate::encryption::set_test_encryption_key([0x71; 32]);
         let temp = TempHome::new();
+        let ciphertext = crate::encryption::encrypt("connect-secret").unwrap();
         std::fs::write(
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "cipher-abc", "allow_from": ["u1"] }
+                    { "type": "telegram", "token_encrypted": ciphertext, "allow_from": ["u1"] }
                 ]
             })
             .to_string(),
@@ -6098,9 +6175,10 @@ mod tests {
         assert_eq!(config.connect.platforms.len(), 1);
         assert_eq!(config.connect.platforms[0].platform_type, "telegram");
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("cipher-abc")
+            config.connect.platforms[0].token.as_deref(),
+            Some("connect-secret")
         );
+        assert!(config.connect.platforms[0].token_encrypted.is_none());
     }
 
     #[test]
@@ -6121,14 +6199,17 @@ mod tests {
 
     #[test]
     fn migration_adopts_legacy_connect_key_and_writes_both_files() {
+        let _key = crate::encryption::set_test_encryption_key([0x72; 32]);
         let temp = TempHome::new();
+        let legacy_cipher = crate::encryption::encrypt("legacy-connect-secret").unwrap();
+        let legacy_cipher_for_assert = legacy_cipher.clone();
         // Legacy state (#453): connect lives inline in config.json, no connect.json yet.
         temp.set_config_json(
             &serde_json::json!({
                 "http_proxy": "http://keep-me",
                 "connect": {
                     "platforms": [
-                        { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                        { "type": "telegram", "token_encrypted": legacy_cipher, "allow_from": ["u1"] }
                     ]
                 }
             })
@@ -6140,8 +6221,8 @@ mod tests {
         // In-memory: legacy value adopted.
         assert_eq!(config.connect.platforms.len(), 1);
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("legacy-cipher")
+            config.connect.platforms[0].token.as_deref(),
+            Some("legacy-connect-secret")
         );
         // An unrelated field from the same load survives the migration rewrite.
         assert_eq!(config.http_proxy, "http://keep-me");
@@ -6155,8 +6236,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
                 .unwrap();
         assert_eq!(
-            connect_json["platforms"][0]["token_encrypted"], "legacy-cipher",
-            "the encrypted value is preserved (encrypted form intact) by the migration"
+            connect_json["platforms"][0]["token_encrypted"],
+            legacy_cipher_for_assert
         );
 
         // ...and config.json was rewritten without the `connect` key.
@@ -6230,12 +6311,15 @@ mod tests {
 
     #[test]
     fn both_files_present_connect_json_wins() {
+        let _key = crate::encryption::set_test_encryption_key([0x73; 32]);
         let temp = TempHome::new();
+        let stale = crate::encryption::encrypt("stale-secret").unwrap();
+        let authoritative = crate::encryption::encrypt("authoritative-secret").unwrap();
         temp.set_config_json(
             &serde_json::json!({
                 "connect": {
                     "platforms": [
-                        { "type": "telegram", "token_encrypted": "stale-config-json-cipher" }
+                        { "type": "telegram", "token_encrypted": stale }
                     ]
                 }
             })
@@ -6245,7 +6329,7 @@ mod tests {
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "authoritative-cipher" }
+                    { "type": "telegram", "token_encrypted": authoritative }
                 ]
             })
             .to_string(),
@@ -6254,8 +6338,8 @@ mod tests {
 
         let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("authoritative-cipher"),
+            config.connect.platforms[0].token.as_deref(),
+            Some("authoritative-secret"),
             "connect.json wins over a stale legacy config.json key"
         );
     }
@@ -6266,13 +6350,16 @@ mod tests {
     /// files for longer than necessary.
     #[test]
     fn both_files_present_strips_stale_legacy_key_from_config_json_immediately() {
+        let _key = crate::encryption::set_test_encryption_key([0x74; 32]);
         let temp = TempHome::new();
+        let stale = crate::encryption::encrypt("stale-secret").unwrap();
+        let authoritative = crate::encryption::encrypt("authoritative-secret").unwrap();
         temp.set_config_json(
             &serde_json::json!({
                 "http_proxy": "http://keep-me",
                 "connect": {
                     "platforms": [
-                        { "type": "telegram", "token_encrypted": "stale-config-json-cipher" }
+                        { "type": "telegram", "token_encrypted": stale }
                     ]
                 }
             })
@@ -6282,7 +6369,7 @@ mod tests {
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "authoritative-cipher" }
+                    { "type": "telegram", "token_encrypted": authoritative }
                 ]
             })
             .to_string(),
@@ -6291,8 +6378,8 @@ mod tests {
 
         let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("authoritative-cipher")
+            config.connect.platforms[0].token.as_deref(),
+            Some("authoritative-secret")
         );
         // Unrelated field survives the strip.
         assert_eq!(config.http_proxy, "http://keep-me");
@@ -6641,9 +6728,13 @@ mod tests {
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
+            token_credential_ref: None,
+            token_configured: false,
             app_id: Some("cli_real_app_id".to_string()),
             app_secret: Some("plain-app-secret".to_string()),
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: vec!["ou_1".to_string()],
             admin_from: Vec::new(),
@@ -6682,9 +6773,13 @@ mod tests {
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
+            token_credential_ref: None,
+            token_configured: false,
             app_id: Some("cli_real_app_id".to_string()),
             app_secret: Some("plain-app-secret".to_string()),
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: vec!["ou_1".to_string()],
             admin_from: Vec::new(),
@@ -6712,12 +6807,14 @@ mod tests {
 
     #[test]
     fn legacy_telegram_only_connect_entry_without_feishu_fields_still_deserializes() {
+        let _key = crate::encryption::set_test_encryption_key([0x75; 32]);
         let temp = TempHome::new();
+        let ciphertext = crate::encryption::encrypt("legacy-telegram-secret").unwrap();
         std::fs::write(
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                    { "type": "telegram", "token_encrypted": ciphertext, "allow_from": ["u1"] }
                 ]
             })
             .to_string(),
@@ -6729,8 +6826,8 @@ mod tests {
         assert_eq!(config.connect.platforms.len(), 1);
         assert_eq!(config.connect.platforms[0].platform_type, "telegram");
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("legacy-cipher")
+            config.connect.platforms[0].token.as_deref(),
+            Some("legacy-telegram-secret")
         );
         assert_eq!(
             config.connect.platforms[0].app_id, None,

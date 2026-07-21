@@ -53,18 +53,15 @@ thread_local! {
 /// Priority: environment variable, machine-derived key, then random fallback.
 pub fn get_encryption_key() -> Vec<u8> {
     #[cfg(not(any(test, feature = "test-utils")))]
-    if let Some(key) = KEY_CACHE.get() {
-        return key.clone();
-    }
-
-    let key = get_encryption_key_uncached();
-
-    #[cfg(not(any(test, feature = "test-utils")))]
     {
-        let _ = KEY_CACHE.set(key.clone());
+        // Initialize inside OnceLock so concurrent first users cannot each
+        // return a different freshly generated key while only one wins the
+        // cache race.
+        KEY_CACHE.get_or_init(get_encryption_key_uncached).clone()
     }
 
-    key
+    #[cfg(any(test, feature = "test-utils"))]
+    get_encryption_key_uncached()
 }
 
 fn get_encryption_key_uncached() -> Vec<u8> {

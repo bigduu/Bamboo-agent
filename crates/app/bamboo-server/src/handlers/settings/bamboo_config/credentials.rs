@@ -313,8 +313,8 @@ mod tests {
             .to_request();
         let missing: serde_json::Value = test::call_and_read_body_json(&app, missing).await;
         assert_eq!(missing["revision"], 0);
-        assert_eq!(missing["status"], "missing");
-        assert_eq!(missing["source"], "default");
+        assert_eq!(missing["status"], "healthy");
+        assert_eq!(missing["source"], "file");
 
         let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
         state

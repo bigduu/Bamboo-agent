@@ -44,7 +44,18 @@ pub(super) async fn read_model_limits_file(app_data_dir: &Path) -> Result<Option
             let content = tokio::fs::read_to_string(&path)
                 .await
                 .map_err(AppError::StorageError)?;
-            let limits: Vec<ModelLimit> = serde_json::from_str(&content)?;
+            let value: Value = serde_json::from_str(&content)?;
+            let data = value
+                .as_object()
+                .filter(|object| {
+                    object.contains_key("schema_version")
+                        && object.contains_key("revision")
+                        && object.contains_key("data")
+                })
+                .and_then(|object| object.get("data"))
+                .cloned()
+                .unwrap_or(value);
+            let limits: Vec<ModelLimit> = serde_json::from_value(data)?;
             Ok(Some(serde_json::to_value(limits)?))
         }
         Err(error) => Err(AppError::StorageError(error)),
@@ -56,6 +67,38 @@ pub(super) async fn write_model_limits_file(
     value: Option<&Value>,
 ) -> Result<(), AppError> {
     let path = model_limits_file_path(app_data_dir);
+    if bamboo_config::section_layout_is_active(app_data_dir).map_err(map_config_store_error)? {
+        let rows = match value {
+            Some(value) => {
+                let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
+                serde_json::to_value(limits)?
+                    .as_array()
+                    .cloned()
+                    .expect("model limits serialize as an array")
+            }
+            None => Vec::new(),
+        };
+        let data_dir = app_data_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let facade = bamboo_config::ConfigFacade::open(&data_dir)?;
+            let snapshot = facade.registry().model_limits.snapshot();
+            if snapshot.data.0 != rows {
+                facade
+                    .registry()
+                    .model_limits
+                    .commit(snapshot.revision, bamboo_config::ModelLimitsSection(rows))?;
+            }
+            Ok::<_, bamboo_config::ConfigStoreError>(())
+        })
+        .await
+        .map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "model limits persistence task failed: {error}"
+            ))
+        })?
+        .map_err(map_config_store_error)?;
+        return Ok(());
+    }
     match value {
         None => remove_file_if_exists(&path).await,
         Some(value) => {
@@ -73,6 +116,22 @@ pub(super) async fn write_model_limits_file(
 
             let content = serde_json::to_string_pretty(&limits)?;
             atomic_write(&path, content.as_bytes()).await
+        }
+    }
+}
+
+fn map_config_store_error(error: bamboo_config::ConfigStoreError) -> AppError {
+    match error {
+        bamboo_config::ConfigStoreError::Conflict { expected, actual } => {
+            AppError::ConfigConflict { expected, actual }
+        }
+        bamboo_config::ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+        bamboo_config::ConfigStoreError::Io(error) => AppError::StorageError(error),
+        bamboo_config::ConfigStoreError::Json(_) => {
+            AppError::BadRequest("configuration document is invalid".to_string())
+        }
+        bamboo_config::ConfigStoreError::Watch(error) => {
+            AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
         }
     }
 }

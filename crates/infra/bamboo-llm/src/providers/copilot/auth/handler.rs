@@ -41,9 +41,9 @@
 //!
 //! The handler implements a multi-level token caching strategy:
 //!
-//! 1. **Copilot Token Cache**: Checks `.copilot_token.json` for valid tokens
+//! 1. **Copilot Token Cache**: Resolves the encrypted credential-store cache
 //! 2. **Environment Variable**: Falls back to `COPILOT_API_KEY` if set
-//! 3. **Access Token Cache**: Uses cached GitHub access token to request new Copilot token
+//! 3. **Access Token Cache**: Resolves the encrypted GitHub access-token credential
 //! 4. **Interactive Flow**: Only triggers device flow if all silent methods fail
 //!
 //! # Token Validation
@@ -56,11 +56,9 @@ use anyhow::anyhow;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::{
-    fs::{read_to_string, File},
-    io::Write,
+    fs::read_to_string,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -186,11 +184,15 @@ mod tests {
     #[test]
     fn read_access_token_trims() {
         let dir = tempdir().expect("tempdir");
+        let handler = CopilotAuthHandler::new(test_http_client(), dir.path().to_path_buf(), false);
         let token_path = dir.path().join(".token");
         std::fs::write(&token_path, "  token-value \n").expect("write token");
 
-        let token = CopilotAuthHandler::read_access_token(&token_path);
+        let token = handler.read_access_token(&token_path);
         assert_eq!(token.as_deref(), Some("token-value"));
+        assert!(!token_path.exists());
+        let credentials = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
+        assert!(!credentials.contains("token-value"));
     }
 
     /// Tests that CopilotConfig can be written to and read from cache.
@@ -281,6 +283,7 @@ mod tests {
     /// parses cleanly and no temp files are orphaned.
     #[test]
     fn concurrent_writes_never_corrupt_cache() {
+        let _key = bamboo_config::encryption::get_encryption_key();
         let dir = tempdir().expect("tempdir");
         let handler = Arc::new(CopilotAuthHandler::new(
             test_http_client(),
@@ -417,7 +420,7 @@ static CHAT_TOKEN_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 // Monotonic sequence used only to give each atomic cache write a unique temp
 // filename (combined with the process id), so overlapping writers never share a
 // temp path.
-static CACHE_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+pub use bamboo_config::{COPILOT_CHAT_CONFIG_CREDENTIAL_REF, COPILOT_GITHUB_ACCESS_CREDENTIAL_REF};
 
 /// Handler for GitHub Copilot authentication.
 ///
@@ -641,17 +644,26 @@ impl CopilotAuthHandler {
     ///
     /// - `Some(token)` if the file exists and contains non-whitespace content
     /// - `None` if the file doesn't exist or is empty/whitespace only
-    fn read_access_token(token_path: &PathBuf) -> Option<String> {
-        if !token_path.exists() {
-            return None;
+    fn read_access_token(&self, token_path: &PathBuf) -> Option<String> {
+        if let Some(secret) = self.resolve_cached_secret(COPILOT_GITHUB_ACCESS_CREDENTIAL_REF) {
+            let trimmed = secret.trim();
+            return (!trimmed.is_empty()).then(|| trimmed.to_string());
         }
         let access_token_str = read_to_string(token_path).ok()?;
         let trimmed = access_token_str.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+        if trimmed.is_empty()
+            || self
+                .persist_cached_secret(
+                    COPILOT_GITHUB_ACCESS_CREDENTIAL_REF,
+                    trimmed,
+                    bamboo_config::CredentialSource::Migrated,
+                )
+                .is_err()
+        {
+            return None;
         }
+        let _ = std::fs::remove_file(token_path);
+        Some(trimmed.to_string())
     }
 
     /// Reads a cached Copilot configuration from a file.
@@ -668,8 +680,23 @@ impl CopilotAuthHandler {
     /// - `Some(config)` if the file exists and contains valid JSON
     /// - `None` if the file doesn't exist or has invalid JSON
     fn read_cached_copilot_config(&self, token_path: &PathBuf) -> Option<CopilotConfig> {
-        let cached_str = read_to_string(token_path).ok()?;
-        serde_json::from_str::<CopilotConfig>(&cached_str).ok()
+        if let Some(cached) = self.resolve_cached_secret(COPILOT_CHAT_CONFIG_CREDENTIAL_REF) {
+            return serde_json::from_str::<CopilotConfig>(&cached).ok();
+        }
+        let cached = read_to_string(token_path).ok()?;
+        let parsed = serde_json::from_str::<CopilotConfig>(&cached).ok()?;
+        if self
+            .persist_cached_secret(
+                COPILOT_CHAT_CONFIG_CREDENTIAL_REF,
+                &cached,
+                bamboo_config::CredentialSource::Migrated,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let _ = std::fs::remove_file(token_path);
+        Some(parsed)
     }
 
     /// Writes a Copilot configuration to a cache file.
@@ -689,40 +716,63 @@ impl CopilotAuthHandler {
     /// - Writing to file fails
     fn write_cached_copilot_config(
         &self,
-        token_path: &PathBuf,
+        _token_path: &PathBuf,
         copilot_config: &CopilotConfig,
     ) -> anyhow::Result<()> {
         let serialized = serde_json::to_string(copilot_config)?;
+        self.persist_cached_secret(
+            COPILOT_CHAT_CONFIG_CREDENTIAL_REF,
+            &serialized,
+            bamboo_config::CredentialSource::User,
+        )
+    }
 
-        // Atomic write: serialize into a uniquely-named temp file in the same
-        // directory, flush it, then rename over the target. A concurrent reader
-        // then always observes either the old or the new COMPLETE file, never a
-        // torn/partial one. The previous `File::create` truncated-then-wrote in
-        // place, so a reader could parse a half-written file, fail, and trigger a
-        // spurious re-exchange. (#237)
-        let dir = token_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let tmp_path = dir.join(format!(
-            ".copilot_token.{}.{}.tmp",
-            std::process::id(),
-            CACHE_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+    fn resolve_cached_secret(&self, reference: &str) -> Option<String> {
+        let reference = bamboo_config::CredentialRef::parse(reference.to_string()).ok()?;
+        bamboo_config::CredentialStore::open(&self.app_data_dir)
+            .resolve(&reference)
+            .ok()
+            .flatten()
+            .map(|secret| secret.expose().to_string())
+    }
 
-        let write_tmp = || -> std::io::Result<()> {
-            let mut file = File::create(&tmp_path)?;
-            file.write_all(serialized.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        };
-        if let Err(e) = write_tmp() {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, token_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
+    fn persist_cached_secret(
+        &self,
+        reference: &str,
+        secret: &str,
+        source: bamboo_config::CredentialSource,
+    ) -> anyhow::Result<()> {
+        let reference = bamboo_config::CredentialRef::parse(reference.to_string())
+            .map_err(|_| anyhow!("Copilot credential reference is invalid"))?;
+        let store = bamboo_config::CredentialStore::open(&self.app_data_dir);
+        store
+            .replace_system_managed(reference, secret, source)
+            .map(|_| ())
+            .map_err(|error| anyhow!("Copilot credential store update failed: {error}"))
+    }
+
+    fn clear_cached_secret(&self, reference: &str) -> anyhow::Result<()> {
+        let reference = bamboo_config::CredentialRef::parse(reference.to_string())
+            .map_err(|_| anyhow!("Copilot credential reference is invalid"))?;
+        let store = bamboo_config::CredentialStore::open(&self.app_data_dir);
+        store
+            .clear_system_managed(&reference)
+            .map(|_| ())
+            .map_err(|error| anyhow!("Copilot credential store update failed: {error}"))
+    }
+
+    pub fn cached_copilot_config(&self) -> Option<CopilotConfig> {
+        self.read_cached_copilot_config(&self.app_data_dir.join(".copilot_token.json"))
+    }
+
+    pub fn clear_cached_credentials(&self) -> anyhow::Result<()> {
+        self.clear_cached_secret(COPILOT_GITHUB_ACCESS_CREDENTIAL_REF)?;
+        self.clear_cached_secret(COPILOT_CHAT_CONFIG_CREDENTIAL_REF)?;
+        for legacy in [".token", ".copilot_token.json", "copilot_token.json"] {
+            let path = self.app_data_dir.join(legacy);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
         }
         Ok(())
     }
@@ -926,16 +976,18 @@ impl CopilotAuthHandler {
 
         let copilot_config = self.get_copilot_token(access_token).await?;
 
-        // Write tokens to disk
+        // Commit both tokens to the encrypted credential authority. The legacy
+        // filenames remain read-only migration inputs.
         let token_path = self.app_data_dir.join(".token");
         let copilot_token_path = self.app_data_dir.join(".copilot_token.json");
-
-        // Write access token
-        let mut file = File::create(&token_path)?;
-        file.write_all(access_token_str.as_bytes())?;
-
-        // Write copilot config
+        self.persist_cached_secret(
+            COPILOT_GITHUB_ACCESS_CREDENTIAL_REF,
+            &access_token_str,
+            bamboo_config::CredentialSource::User,
+        )?;
         self.write_cached_copilot_config(&copilot_token_path, &copilot_config)?;
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(copilot_token_path);
 
         Ok(copilot_config)
     }
@@ -1003,7 +1055,7 @@ impl CopilotAuthHandler {
 
         // Check access token file and try to exchange
         let token_path = self.app_data_dir.join(".token");
-        if let Some(access_token_str) = Self::read_access_token(&token_path) {
+        if let Some(access_token_str) = self.read_access_token(&token_path) {
             let access_token = AccessTokenResponse::from_token(access_token_str);
             match self.get_copilot_token(access_token).await {
                 Ok(copilot_config) => {
@@ -1015,6 +1067,7 @@ impl CopilotAuthHandler {
                     // Copilot tokens are short-lived; the GitHub OAuth access token should be
                     // long-lived, so removing it on transient failures causes unnecessary re-auth.
                     if Self::should_discard_access_token(&e) {
+                        let _ = self.clear_cached_secret(COPILOT_GITHUB_ACCESS_CREDENTIAL_REF);
                         let _ = std::fs::remove_file(&token_path);
                     }
                 }
@@ -1060,7 +1113,7 @@ impl CopilotAuthHandler {
         }
 
         let token_path = self.app_data_dir.join(".token");
-        let Some(access_token_str) = Self::read_access_token(&token_path) else {
+        let Some(access_token_str) = self.read_access_token(&token_path) else {
             return Ok(None);
         };
 
@@ -1072,6 +1125,7 @@ impl CopilotAuthHandler {
             }
             Err(e) => {
                 if Self::should_discard_access_token(&e) {
+                    let _ = self.clear_cached_secret(COPILOT_GITHUB_ACCESS_CREDENTIAL_REF);
                     let _ = std::fs::remove_file(&token_path);
                 }
                 Err(e)

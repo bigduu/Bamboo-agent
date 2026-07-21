@@ -283,15 +283,24 @@ mod tests {
         let metadata: serde_json::Value = test::read_body_json(metadata).await;
         assert_eq!(metadata["revision"], 2);
         assert_eq!(metadata["entries"][0]["configured"], true);
-        let metadata_event =
-            tokio::time::timeout(std::time::Duration::from_secs(2), metadata_feed.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let metadata_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = metadata_feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, revision: 2 }
+                        if section == "env"
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert!(matches!(
             metadata_event.event,
             bamboo_agent_core::AgentEvent::ConfigChanged { ref section, revision: 2 }
-                if section == "env_vars"
+                if section == "env"
         ));
 
         let mut no_op_feed = state.account_sink.subscribe();
@@ -311,11 +320,24 @@ mod tests {
         assert_eq!(no_op.status(), StatusCode::OK);
         let no_op: serde_json::Value = test::read_body_json(no_op).await;
         assert_eq!(no_op["revision"], 2);
+        let duplicate_env = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                let event = no_op_feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "env"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), no_op_feed.recv())
-                .await
-                .is_err(),
-            "a semantic no-op must not emit ConfigChanged"
+            duplicate_env.is_err(),
+            "a semantic no-op must not emit an env ConfigChanged"
         );
 
         for value in [None, Some("plain loser")] {
@@ -447,8 +469,13 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(non_secret_create.status(), StatusCode::OK);
+        let non_secret_status = non_secret_create.status();
         let non_secret_create: serde_json::Value = test::read_body_json(non_secret_create).await;
+        assert_eq!(
+            non_secret_status,
+            StatusCode::OK,
+            "unexpected response: {non_secret_create}"
+        );
         assert_eq!(non_secret_create["revision"], 5);
 
         let non_secret_update = test::call_service(
@@ -468,7 +495,7 @@ mod tests {
         let non_secret_update: serde_json::Value = test::read_body_json(non_secret_update).await;
         assert_eq!(non_secret_update["revision"], 6);
 
-        let root = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let root = std::fs::read_to_string(dir.path().join("env.json")).unwrap();
         assert!(!root.contains("super-secret-value"));
         assert!(!root.contains("value_encrypted"));
         assert!(!root.contains("****...****"));
@@ -511,14 +538,24 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(state.credential_store.revision().unwrap(), 1);
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), feed.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, revision: 1 }
+                        if section == "env"
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert!(matches!(
             event.event,
             bamboo_agent_core::AgentEvent::ConfigChanged { ref section, revision: 1 }
-                if section == "env_vars"
+                if section == "env"
         ));
         let reference = bamboo_config::credential_ref("env", "TOKEN", "value").unwrap();
         assert_eq!(

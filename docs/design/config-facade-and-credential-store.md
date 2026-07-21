@@ -1,8 +1,8 @@
 # ADR: Modular live configuration and credential isolation
 
-- Status: accepted; foundation and first server integration implemented
+- Status: accepted and implemented
 - Issue: #597
-- Date: 2026-07-19
+- Date: 2026-07-21
 
 ## Decision
 
@@ -30,9 +30,10 @@ ciphertext, or a UI mask.
 | memory | `memory.json` | memory and background-maintenance settings |
 | subagents/broker metadata | `subagents.json` | limits, broker discovery/placement metadata; no bearer token |
 | notifications | `notifications.json` | channel settings and credential refs |
+| connect | `connect.json` | chat-platform settings, allowlists and credential refs |
 | cluster fabric | `cluster-fabric.json` | hosts, paths and credential refs |
 | environment variables | `env.json` | non-secret values; secret entries carry a credential ref |
-| access control | `access-control.json` | enabled state and verifier records only |
+| access control | `access-control.json` | enabled state and credential refs/configured metadata only |
 | hooks | `hooks.json` | hook definitions and policy |
 | keyword/model mappings | `model-policy.json` | masking and Anthropic/Gemini mappings |
 | model limits | `model_limits.json` | existing model limit records |
@@ -74,11 +75,10 @@ and keep the old runtime if construction fails, marking the section degraded.
 The shared store uses a same-directory UUID temp file, write-all, file fsync,
 atomic rename, parent-directory fsync on Unix, cleanup-on-error, rotating
 schema-valid backups, and an inter-process advisory lock. Sensitive stores enforce
-directory `0700` and file `0600` on Unix; Windows uses the platform's file security
-and is a best-effort follow-up for explicit ACL hardening. Ordinary new files honor
-the process umask, while replacements preserve an existing stricter Unix mode.
-Backup replacement remains atomic on Unix and uses remove-then-rename only as the
-Windows fallback when the platform refuses to rename over an existing generation.
+directory `0700` and file `0600` on Unix. Windows applies a protected DACL granting
+full access only to the owner and SYSTEM on sensitive directories, data files and
+lock files, and uses write-through replace semantics. Ordinary new files honor the
+process umask, while replacements preserve an existing stricter Unix mode.
 
 The required ordering is:
 
@@ -121,9 +121,11 @@ content-derived value in the quarantine filename.
 | ntfy token | `notification.ntfy.token` |
 | Bark device key | `notification.bark.device_key` |
 | cluster password/private key/passphrase | `cluster.<node-id>.<field>`; ordinary config stores these refs and configured metadata in `cluster_fabric.credential_refs` |
+| connect platform token/app secret | `connect.<stable-platform-id>.<field>` |
 | external broker bearer token | `broker.external.bearer_token` |
-| access password/device token | verifier only; plaintext is never persisted |
-| Copilot OAuth cache | stays in its existing OAuth cache until a platform keychain adapter exists; it must not migrate into ordinary config |
+| access password/device token | `access_control.<stable-rule-id>.<field>`; ordinary config stores refs/configured metadata only |
+| Copilot GitHub OAuth access token | `copilot.oauth.github_access_token` |
+| Copilot chat token cache | `copilot.oauth.chat_config` |
 
 The store reuses Bamboo's existing AES-GCM encryption key and records a key
 version for future rotation. Its public status APIs return only reference,
@@ -150,8 +152,9 @@ Migration must be idempotent and manifest-gated:
 6. on restart, discard an uncommitted stage or resume from the manifest; never
    infer completion from the presence of one section file.
 
-Provider, provider-instance, MCP, proxy, secret env, notification and external
-broker credentials now use the shared manifest-gated migration protocol. The
+Provider, provider-instance, MCP, proxy, secret env, notification, connect,
+cluster-fabric, access-control and external-broker credentials use the shared
+manifest-gated migration protocol. The
 main and broker planners run independently under the same lock, stage and fsync
 `credentials.json` plus only their affected members, install a pending manifest
 as the commit point, and finish or resume any committed domain before runtime
@@ -206,30 +209,22 @@ back to an embedded broker instead of dialing an external endpoint without its
 bearer. Generic credential status/replace/clear APIs retain revision/CAS semantics;
 the ordinary broker file remains metadata-only.
 
-This is intentionally not the full legacy-root migration. Cluster secrets and
-the remaining section split still require the broader inventory
-transaction. Compatibility PATCH and dot-path operations must not claim that all
-secrets have moved.
+The two historical Copilot plaintext cache files are adopted at facade startup:
+the complete credential value is committed to the encrypted store before the
+unchanged legacy file is removed. A crash between those boundaries is retry-safe,
+and all subsequent Copilot reads/writes use the credential authority.
 
 ## Server integration status
 
-The first server-owned integration watches the already extracted
-`providers.json` sidecar for external edits. It validates the file, constructs a
-complete candidate provider registry, and requires the candidate default provider
-to initialize before atomically publishing the config/registry/provider handles.
-Failures retain the prior runtime, mark the provider health envelope degraded,
-and publish `config.invalid`; a valid follow-up publishes `config.recovered`.
-Watching legacy `config.json` is intentionally deferred because applying its full
-projection without provider/MCP/notification/cluster side effects would create a
-split runtime.
-
-The same server-owned watcher now applies the shared `AtomicJsonStore` revisioned
-`mcp.json` envelope, including a sidecar already present at process start. It
-parses and validates the complete candidate, stages every added or changed MCP
-client through connect, initialize and tool discovery, and only then replaces
-runtime-map/tool-index entries and the effective MCP snapshot. A failure discards
-all staged clients, leaves working runtimes and tool aliases intact, keeps the
-last-known-good revision, marks MCP health degraded and publishes
+The server owns one `ConfigFacade` for the process and watches every modular
+section. Ordinary section changes publish an immutable snapshot and update only
+their corresponding live effective-config field. Provider and MCP candidates
+have stronger runtime gates: provider candidates must construct the replacement
+registry/default provider before publication, while MCP candidates stage every
+added or changed client through connect, initialize and tool discovery before
+replacing runtime-map/tool-index entries and the effective MCP snapshot. A
+failure discards all staged clients, leaves working runtimes and tool aliases
+intact, keeps the last-known-good revision, marks health degraded and publishes
 `config.invalid`; repair publishes `config.recovered`. Directory debouncing and
 missing-file retries cover editor temp-write/rename bursts.
 
@@ -249,6 +244,15 @@ metadata-only sidecars. Runtime construction hydrates references from
 `CredentialStore`; a missing or corrupt referenced credential rejects the
 candidate with a redacted degraded/invalid transition and retains the
 last-known-good runtime.
+
+The typed section API exposes GET envelopes and revisioned PUT mutations for all
+ordinary sections; provider, MCP and credentials retain their dedicated validated
+transactions. Server-owned credential-reference fields are preserved and cannot
+be replaced through an ordinary DTO. Compatibility writes are preflighted against
+the facade projection and rejected before the first durable write if they change
+more than one section. `model_limits` cannot be combined with another section.
+The legacy full-reset endpoint is likewise rejected for an active modular layout
+until it has a recoverable multi-file manifest; callers reset sections separately.
 
 Omitted or empty reference metadata preserves an existing binding (clearing is a
 separate credential operation); an explicit replacement reference must parse and

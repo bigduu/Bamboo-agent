@@ -139,6 +139,15 @@ pub(crate) struct PreparedProviderCredentialUpdate {
     pub required_refs: Vec<CredentialRef>,
 }
 
+pub(crate) type PersistedConnectCredentialRefs =
+    BTreeMap<String, (Option<CredentialRef>, Option<CredentialRef>)>;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PersistedAccessCredentialRefs {
+    pub password: Option<CredentialRef>,
+    pub devices: BTreeMap<String, CredentialRef>,
+}
+
 impl PreparedProviderCredentialUpdate {
     pub(crate) fn advance_revision_for_domain_change(&mut self) -> ConfigStoreResult<()> {
         if self.revision != self.expected_revision {
@@ -334,27 +343,6 @@ impl CredentialStore {
         Ok((lkg, statuses, health))
     }
 
-    pub(crate) fn snapshot_from_section_bytes(
-        &self,
-        bytes: &[u8],
-    ) -> ConfigStoreResult<(
-        CredentialDocumentLkg,
-        Vec<CredentialStatus>,
-        CredentialStoreHealth,
-    )> {
-        let envelope = Self::parse_transaction_document(bytes, false)?;
-        let statuses = credential_statuses(&envelope.data);
-        let health = CredentialStoreHealth::committed(envelope.revision);
-        Ok((
-            CredentialDocumentLkg {
-                revision: envelope.revision,
-                document: envelope.data,
-            },
-            statuses,
-            health,
-        ))
-    }
-
     pub fn replace(
         &self,
         credential_ref: CredentialRef,
@@ -364,6 +352,23 @@ impl CredentialStore {
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
         self.with_transaction_lock(|| {
             self.replace_unchecked(credential_ref, secret, source, expected_revision)
+        })
+    }
+
+    /// Replace an internally managed rotating credential at the latest durable
+    /// revision. This is not an HTTP/client mutation primitive: external
+    /// callers must continue to use [`Self::replace`] with explicit CAS. The
+    /// migration lock makes the revision read and write one cross-process
+    /// operation for caches such as Copilot OAuth.
+    pub fn replace_system_managed(
+        &self,
+        credential_ref: CredentialRef,
+        secret: &str,
+        source: CredentialSource,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.with_transaction_lock(|| {
+            let revision = self.revision_unchecked()?;
+            self.replace_unchecked(credential_ref, secret, source, revision)
         })
     }
 
@@ -489,6 +494,18 @@ impl CredentialStore {
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
         self.with_transaction_lock(|| self.clear_unchecked(credential_ref, expected_revision))
+    }
+
+    /// Clear an internally managed rotating credential at the latest durable
+    /// revision. Client-facing clears remain explicit-CAS via [`Self::clear`].
+    pub fn clear_system_managed(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.with_transaction_lock(|| {
+            let revision = self.revision_unchecked()?;
+            self.clear_unchecked(credential_ref, revision)
+        })
     }
 
     pub(crate) fn clear_unchecked(
@@ -1187,6 +1204,451 @@ impl CredentialStore {
         }))
     }
 
+    /// Prepare a complete connect metadata replacement plus the explicitly
+    /// touched token/app-secret values. Platform ids are the durable identity;
+    /// storage refs/configured flags are server-owned and are reconstructed
+    /// from the committed connect section rather than trusted from a client.
+    pub(crate) fn prepare_connect_intents(
+        &self,
+        config: &mut crate::Config,
+        secret_intents: &crate::patch::ConnectSecretIntents,
+        persisted_refs: &PersistedConnectCredentialRefs,
+    ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
+        let mut ids = BTreeSet::new();
+        if config.connect.platforms.iter().any(|platform| {
+            platform
+                .id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty() || !ids.insert(id.to_string()))
+        }) {
+            return Err(ConfigStoreError::Validation(
+                "connect platform ids must be nonempty and unique".to_string(),
+            ));
+        }
+        if secret_intents
+            .token
+            .iter()
+            .chain(secret_intents.app_secret.iter())
+            .any(|index| *index >= config.connect.platforms.len())
+        {
+            return Err(ConfigStoreError::Validation(
+                "connect credential intent is invalid".to_string(),
+            ));
+        }
+
+        let candidate_counts = config_credential_ref_counts(config)?;
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for connect update".to_string(),
+            ));
+        }
+        let mut touched_refs = BTreeSet::new();
+        let mut required_refs = BTreeSet::new();
+        let mut changed = false;
+
+        // A full-array connect replacement deletes any platform id absent from
+        // the candidate. Clear its credentials unless another durable consumer
+        // still references the same (legacy/shared) ref.
+        for (id, (token_ref, app_secret_ref)) in persisted_refs {
+            if ids.contains(id) {
+                continue;
+            }
+            for reference in token_ref.iter().chain(app_secret_ref.iter()) {
+                touched_refs.insert(reference.clone());
+                if candidate_counts.get(reference).copied().unwrap_or(0) == 0 {
+                    changed |= document.entries.remove(reference).is_some();
+                }
+            }
+        }
+
+        for (index, platform) in config.connect.platforms.iter_mut().enumerate() {
+            let id = platform
+                .id
+                .as_deref()
+                .expect("validated connect platform id")
+                .to_string();
+            let persisted = persisted_refs.get(&id).cloned().unwrap_or_default();
+            let canonical_token = crate::credential_ref("connect", &id, "token")?;
+            let canonical_app_secret = crate::credential_ref("connect", &id, "app_secret")?;
+
+            for (candidate, existing) in [
+                (platform.token_credential_ref.as_ref(), persisted.0.as_ref()),
+                (
+                    platform.app_secret_credential_ref.as_ref(),
+                    persisted.1.as_ref(),
+                ),
+            ] {
+                if candidate.is_some() && candidate != existing {
+                    return Err(ConfigStoreError::Validation(
+                        "connect credential references are server-managed".to_string(),
+                    ));
+                }
+            }
+
+            let fields = [
+                (
+                    secret_intents.token.contains(&index),
+                    &mut platform.token,
+                    &mut platform.token_encrypted,
+                    &mut platform.token_credential_ref,
+                    &mut platform.token_configured,
+                    persisted.0,
+                    canonical_token,
+                ),
+                (
+                    secret_intents.app_secret.contains(&index),
+                    &mut platform.app_secret,
+                    &mut platform.app_secret_encrypted,
+                    &mut platform.app_secret_credential_ref,
+                    &mut platform.app_secret_configured,
+                    persisted.1,
+                    canonical_app_secret,
+                ),
+            ];
+
+            for (
+                intent,
+                plaintext,
+                ciphertext,
+                metadata_ref,
+                configured,
+                existing_ref,
+                canonical,
+            ) in fields
+            {
+                let reference = existing_ref.clone().unwrap_or(canonical);
+                let self_consumer = usize::from(metadata_ref.as_ref() == Some(&reference));
+                let other_consumers = candidate_counts
+                    .get(&reference)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(self_consumer);
+                if existing_ref.is_none()
+                    && intent
+                    && (document.entries.contains_key(&reference) || other_consumers > 0)
+                {
+                    return Err(ConfigStoreError::Validation(
+                        "canonical connect credential reference is already in use".to_string(),
+                    ));
+                }
+
+                if intent {
+                    touched_refs.insert(reference.clone());
+                    let secret = plaintext
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    if let Some(secret) = secret {
+                        if crate::patch::is_masked_api_key(secret) {
+                            return Err(ConfigStoreError::Validation(
+                                "connect credential value must not be a mask".to_string(),
+                            ));
+                        }
+                        let encrypted = crate::encryption::encrypt(secret).map_err(|_| {
+                            ConfigStoreError::Validation("credential encryption failed".to_string())
+                        })?;
+                        document.entries.insert(
+                            reference.clone(),
+                            CredentialEntry {
+                                ciphertext: encrypted,
+                                source: CredentialSource::User,
+                                updated_at: Utc::now(),
+                                key_version: ENCRYPTION_KEY_VERSION,
+                                migration_generation: None,
+                            },
+                        );
+                        changed = true;
+                        *metadata_ref = Some(reference.clone());
+                        *configured = true;
+                        required_refs.insert(reference);
+                    } else {
+                        if other_consumers == 0 {
+                            changed |= document.entries.remove(&reference).is_some();
+                        }
+                        *metadata_ref = None;
+                        *configured = false;
+                    }
+                } else if let Some(existing_ref) = existing_ref {
+                    if !document.entries.contains_key(&existing_ref) {
+                        return Err(ConfigStoreError::Validation(
+                            "configured connect credential is unavailable".to_string(),
+                        ));
+                    }
+                    *metadata_ref = Some(existing_ref.clone());
+                    *configured = true;
+                    required_refs.insert(existing_ref);
+                } else {
+                    *metadata_ref = None;
+                    *configured = false;
+                }
+                *plaintext = None;
+                *ciphertext = None;
+            }
+        }
+
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(
+            &document,
+            &required_refs.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        let touched_refs = touched_refs.into_iter().collect::<Vec<_>>();
+        let required_refs = required_refs
+            .into_iter()
+            .filter(|reference| touched_refs.contains(reference))
+            .collect();
+        Ok(Some(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            revision,
+            touched_refs,
+            required_refs,
+        }))
+    }
+
+    /// Prepare access-control password/device verifier mutations. Verifiers are
+    /// encoded records in the encrypted store; ordinary access-control config
+    /// retains only canonical references and configured metadata.
+    pub(crate) fn prepare_access_control_intents(
+        &self,
+        config: &mut crate::Config,
+        password_intent: bool,
+        device_intents: &BTreeSet<String>,
+        persisted: &PersistedAccessCredentialRefs,
+    ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
+        let candidate_counts = config_credential_ref_counts(config)?;
+        let access = config.access_control.get_or_insert_with(Default::default);
+        let mut device_ids = BTreeSet::new();
+        if access.devices.iter().any(|device| {
+            device.device_id.trim().is_empty() || !device_ids.insert(device.device_id.clone())
+        }) {
+            return Err(ConfigStoreError::Validation(
+                "access-control device ids must be nonempty and unique".to_string(),
+            ));
+        }
+        if device_intents
+            .iter()
+            .any(|id| !device_ids.contains(id) && !persisted.devices.contains_key(id))
+        {
+            return Err(ConfigStoreError::Validation(
+                "access-control credential intent is invalid".to_string(),
+            ));
+        }
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for access-control update".to_string(),
+            ));
+        }
+        let mut touched_refs = BTreeSet::new();
+        let mut required_refs = BTreeSet::new();
+        let mut changed = false;
+
+        let password_ref = persisted
+            .password
+            .clone()
+            .unwrap_or(crate::config_crypto::access_password_credential_ref()?);
+        if access.password_credential_ref.is_some()
+            && access.password_credential_ref.as_ref() != persisted.password.as_ref()
+        {
+            return Err(ConfigStoreError::Validation(
+                "access-control password credential reference is server-managed".to_string(),
+            ));
+        }
+        let password_intent = password_intent
+            || (persisted.password.is_none()
+                && access.password_hash.is_some()
+                && access.password_salt.is_some());
+        if password_intent {
+            touched_refs.insert(password_ref.clone());
+            match (&access.password_hash, &access.password_salt) {
+                (Some(hash), Some(salt)) => {
+                    let encoded = crate::config_crypto::encode_access_verifier(hash, salt)?;
+                    let same = document.entries.get(&password_ref).is_some_and(|entry| {
+                        crate::encryption::decrypt(&entry.ciphertext)
+                            .is_ok_and(|current| current == encoded)
+                    });
+                    if !same {
+                        let ciphertext = crate::encryption::encrypt(&encoded).map_err(|_| {
+                            ConfigStoreError::Validation("credential encryption failed".to_string())
+                        })?;
+                        document.entries.insert(
+                            password_ref.clone(),
+                            CredentialEntry {
+                                ciphertext,
+                                source: CredentialSource::User,
+                                updated_at: Utc::now(),
+                                key_version: ENCRYPTION_KEY_VERSION,
+                                migration_generation: None,
+                            },
+                        );
+                        changed = true;
+                    }
+                    access.password_credential_ref = Some(password_ref.clone());
+                    access.password_configured = true;
+                    required_refs.insert(password_ref.clone());
+                }
+                (None, None) if !access.password_enabled => {
+                    let self_consumers =
+                        usize::from(access.password_credential_ref.as_ref() == Some(&password_ref));
+                    if candidate_counts
+                        .get(&password_ref)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_sub(self_consumers)
+                        == 0
+                    {
+                        changed |= document.entries.remove(&password_ref).is_some();
+                    }
+                    access.password_credential_ref = None;
+                    access.password_configured = false;
+                }
+                _ => {
+                    return Err(ConfigStoreError::Validation(
+                        "access-control password verifier is incomplete".to_string(),
+                    ));
+                }
+            }
+        } else if let Some(reference) = persisted.password.as_ref() {
+            if !document.entries.contains_key(reference) {
+                return Err(ConfigStoreError::Validation(
+                    "configured access-control password verifier is unavailable".to_string(),
+                ));
+            }
+            access.password_credential_ref = Some(reference.clone());
+            access.password_configured = true;
+            required_refs.insert(reference.clone());
+        } else {
+            access.password_credential_ref = None;
+            access.password_configured = false;
+        }
+        access.password_hash = None;
+        access.password_salt = None;
+
+        for removed_id in persisted
+            .devices
+            .keys()
+            .filter(|id| !device_ids.contains(*id))
+        {
+            let reference = persisted.devices.get(removed_id).expect("known access ref");
+            touched_refs.insert(reference.clone());
+            if candidate_counts.get(reference).copied().unwrap_or(0) == 0 {
+                changed |= document.entries.remove(reference).is_some();
+            }
+        }
+        for device in &mut access.devices {
+            let existing = persisted.devices.get(&device.device_id).cloned();
+            if device.token_credential_ref.is_some()
+                && device.token_credential_ref.as_ref() != existing.as_ref()
+            {
+                return Err(ConfigStoreError::Validation(
+                    "access-control device credential reference is server-managed".to_string(),
+                ));
+            }
+            let reference =
+                existing
+                    .clone()
+                    .unwrap_or(crate::config_crypto::access_device_credential_ref(
+                        &device.device_id,
+                    )?);
+            let verifier_intent = device_intents.contains(&device.device_id)
+                || (existing.is_none()
+                    && !device.token_hash.is_empty()
+                    && !device.token_salt.is_empty());
+            if verifier_intent {
+                touched_refs.insert(reference.clone());
+                if device.token_hash.is_empty() || device.token_salt.is_empty() {
+                    return Err(ConfigStoreError::Validation(
+                        "access-control device verifier is incomplete".to_string(),
+                    ));
+                }
+                if existing.is_none()
+                    && (document.entries.contains_key(&reference)
+                        || candidate_counts.get(&reference).copied().unwrap_or(0) > 0)
+                {
+                    return Err(ConfigStoreError::Validation(
+                        "canonical access-control credential reference is already in use"
+                            .to_string(),
+                    ));
+                }
+                let encoded = crate::config_crypto::encode_access_verifier(
+                    &device.token_hash,
+                    &device.token_salt,
+                )?;
+                let same = document.entries.get(&reference).is_some_and(|entry| {
+                    crate::encryption::decrypt(&entry.ciphertext)
+                        .is_ok_and(|current| current == encoded)
+                });
+                if !same {
+                    let ciphertext = crate::encryption::encrypt(&encoded).map_err(|_| {
+                        ConfigStoreError::Validation("credential encryption failed".to_string())
+                    })?;
+                    document.entries.insert(
+                        reference.clone(),
+                        CredentialEntry {
+                            ciphertext,
+                            source: CredentialSource::User,
+                            updated_at: Utc::now(),
+                            key_version: ENCRYPTION_KEY_VERSION,
+                            migration_generation: None,
+                        },
+                    );
+                    changed = true;
+                }
+            } else if !document.entries.contains_key(&reference) {
+                return Err(ConfigStoreError::Validation(
+                    "configured access-control device verifier is unavailable".to_string(),
+                ));
+            }
+            device.token_credential_ref = Some(reference.clone());
+            device.token_configured = true;
+            device.token_hash.clear();
+            device.token_salt.clear();
+            required_refs.insert(reference);
+        }
+
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(
+            &document,
+            &required_refs.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        let touched_refs = touched_refs.into_iter().collect::<Vec<_>>();
+        Ok(Some(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            revision,
+            touched_refs: touched_refs.clone(),
+            required_refs: required_refs
+                .into_iter()
+                .filter(|reference| touched_refs.contains(reference))
+                .collect(),
+        }))
+    }
+
     /// Prepare one or more node credential mutations without publishing them.
     /// The caller commits the returned credential envelope together with the
     /// narrowed `cluster_fabric` root domain through the exact transaction
@@ -1729,10 +2191,21 @@ impl CredentialStore {
         if health.status != SectionStatus::Missing {
             return Ok(());
         }
-        match self.store.commit(0, document, validate_document) {
-            Ok(_) => Ok(()),
-            Err(ConfigStoreError::Conflict { .. }) => Ok(()),
-            Err(error) => Err(error),
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": 0,
+            "data": document,
+        }))?;
+        if crate::config_store::AtomicFileStore::new(self.path())
+            .sensitive(true)
+            .write_bytes_if_state(None, &bytes)?
+        {
+            Ok(())
+        } else {
+            // Another credential writer won after the missing-state read. Its
+            // durable document is authoritative and already initialized.
+            Ok(())
         }
     }
 
@@ -2029,6 +2502,24 @@ pub(crate) fn config_credential_ref_counts(
     }
     if let Some(reference) = config.notifications.bark.credential_ref.as_ref() {
         add(reference);
+    }
+    for platform in &config.connect.platforms {
+        if let Some(reference) = platform.token_credential_ref.as_ref() {
+            add(reference);
+        }
+        if let Some(reference) = platform.app_secret_credential_ref.as_ref() {
+            add(reference);
+        }
+    }
+    if let Some(access) = config.access_control.as_ref() {
+        if let Some(reference) = access.password_credential_ref.as_ref() {
+            add(reference);
+        }
+        for device in &access.devices {
+            if let Some(reference) = device.token_credential_ref.as_ref() {
+                add(reference);
+            }
+        }
     }
     for server in &config.mcp.servers {
         match &server.transport {

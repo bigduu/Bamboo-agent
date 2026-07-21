@@ -44,7 +44,7 @@ const COPILOT_MODELS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 ///
 /// Token sources (in order of priority):
 /// 1. Direct API key via constructor
-/// 2. Cached token (app_data_dir/.copilot_token.json)
+/// 2. Cached token from the encrypted credential store
 /// 3. Environment variable COPILOT_API_KEY
 /// 4. Interactive device code flow
 pub struct CopilotProvider {
@@ -242,20 +242,9 @@ impl CopilotProvider {
     /// Logout - delete cached tokens
     pub async fn logout(&mut self) -> std::result::Result<(), LLMError> {
         if let Some(handler) = &self.auth_handler {
-            // Delete token files
-            let token_path = handler.app_data_dir().join(".token");
-            let copilot_token_path = handler.app_data_dir().join(".copilot_token.json");
-
-            if token_path.exists() {
-                std::fs::remove_file(&token_path)
-                    .map_err(|e| LLMError::Auth(format!("Failed to delete .token: {}", e)))?;
-            }
-
-            if copilot_token_path.exists() {
-                std::fs::remove_file(&copilot_token_path).map_err(|e| {
-                    LLMError::Auth(format!("Failed to delete .copilot_token.json: {}", e))
-                })?;
-            }
+            handler
+                .clear_cached_credentials()
+                .map_err(|_| LLMError::Auth("Failed to clear Copilot credentials".to_string()))?;
         }
 
         self.token = None;

@@ -11,6 +11,12 @@ use super::common::{
 
 /// Resets (deletes) the Bamboo configuration file.
 pub async fn reset_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
+    if app_state.config_facade.is_some() {
+        return Err(AppError::BadRequest(
+            "full config reset spans multiple revisioned sections and is disabled without a recoverable manifest; reset sections individually through the typed section API"
+                .to_string(),
+        ));
+    }
     remove_config_file_if_exists(&config_file_path(&app_state.app_data_dir)).await?;
     remove_config_file_if_exists(&model_limits_file_path(&app_state.app_data_dir)).await?;
     // #455: connect.json is a sibling of config.json now, not an inline key —

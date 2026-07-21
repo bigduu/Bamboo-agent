@@ -54,6 +54,7 @@ mod tests {
     #[test]
     fn test_route_missing_provider() {
         let config = Config::default();
+        let app_data_dir = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -61,7 +62,7 @@ mod tests {
         let registry = rt
             .block_on(ProviderRegistry::from_config(
                 &config,
-                std::path::PathBuf::new(),
+                app_data_dir.path().to_path_buf(),
             ))
             .unwrap();
         let router = ProviderModelRouter::new(Arc::new(registry));

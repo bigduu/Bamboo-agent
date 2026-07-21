@@ -5,8 +5,58 @@
 //! before persisting to disk.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use super::{Config, ProxyAuth};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AccessVerifierRecord {
+    pub hash: String,
+    pub salt: String,
+}
+
+pub fn access_password_credential_ref() -> crate::ConfigStoreResult<crate::CredentialRef> {
+    crate::credential_ref("access", "root", "password_verifier")
+}
+
+pub fn access_device_credential_ref(
+    device_id: &str,
+) -> crate::ConfigStoreResult<crate::CredentialRef> {
+    crate::credential_ref("access", device_id, "device_token_verifier")
+}
+
+pub(crate) fn encode_access_verifier(hash: &str, salt: &str) -> crate::ConfigStoreResult<String> {
+    validate_access_verifier(hash, salt)?;
+    serde_json::to_string(&AccessVerifierRecord {
+        hash: hash.to_string(),
+        salt: salt.to_string(),
+    })
+    .map_err(Into::into)
+}
+
+fn validate_access_verifier(hash: &str, salt: &str) -> crate::ConfigStoreResult<()> {
+    if hash.len() != 64
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || salt.is_empty()
+        || salt.len() % 2 != 0
+        || !salt.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(crate::ConfigStoreError::Validation(
+            "access-control verifier is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_access_verifier(secret: &str) -> crate::ConfigStoreResult<AccessVerifierRecord> {
+    let record: AccessVerifierRecord = serde_json::from_str(secret).map_err(|_| {
+        crate::ConfigStoreError::Validation(
+            "access-control verifier credential is invalid".to_string(),
+        )
+    })?;
+    validate_access_verifier(&record.hash, &record.salt)?;
+    Ok(record)
+}
 
 fn hydrate_header_credentials(
     store: &crate::CredentialStore,
@@ -921,6 +971,115 @@ impl Config {
         }
     }
 
+    /// Resolve bamboo-connect token/app-secret references from the isolated
+    /// credential store. A configured reference is fail-closed: publishing an
+    /// empty credential would make the bridge appear live while authentication
+    /// is guaranteed to fail.
+    pub fn hydrate_connect_credentials_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> crate::ConfigStoreResult<()> {
+        let store = crate::CredentialStore::open(data_dir);
+        let allow_legacy_runtime_value = !crate::section_layout_is_active(data_dir)?;
+        for platform in &mut self.connect.platforms {
+            hydrate_optional_connect_secret(
+                &store,
+                platform.token_credential_ref.as_ref(),
+                platform.token_configured,
+                &mut platform.token,
+                allow_legacy_runtime_value,
+            )?;
+            hydrate_optional_connect_secret(
+                &store,
+                platform.app_secret_credential_ref.as_ref(),
+                platform.app_secret_configured,
+                &mut platform.app_secret,
+                allow_legacy_runtime_value,
+            )?;
+            platform.token_encrypted = None;
+            platform.app_secret_encrypted = None;
+        }
+        Ok(())
+    }
+
+    /// Resolve password/device verifier records from the isolated credential
+    /// store. Any configured-but-unavailable record fails closed for the whole
+    /// access domain so middleware never silently weakens authentication.
+    pub fn hydrate_access_control_credentials_from_store(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> crate::ConfigStoreResult<()> {
+        let Some(access) = self.access_control.as_mut() else {
+            return Ok(());
+        };
+        let store = crate::CredentialStore::open(data_dir);
+        match access.password_credential_ref.as_ref() {
+            Some(reference) => {
+                if reference != &access_password_credential_ref()? || !access.password_configured {
+                    return Err(crate::ConfigStoreError::Validation(
+                        "access-control password credential metadata is invalid".to_string(),
+                    ));
+                }
+                let secret = store.resolve(reference)?.ok_or_else(|| {
+                    crate::ConfigStoreError::Validation(
+                        "access-control password verifier is unavailable".to_string(),
+                    )
+                })?;
+                let record = decode_access_verifier(secret.expose())?;
+                access.password_hash = Some(record.hash);
+                access.password_salt = Some(record.salt);
+            }
+            None if access.password_configured || access.password_enabled => {
+                return Err(crate::ConfigStoreError::Validation(
+                    "access-control password verifier metadata is incomplete".to_string(),
+                ));
+            }
+            None => {
+                access.password_hash = None;
+                access.password_salt = None;
+            }
+        }
+        for device in &mut access.devices {
+            let reference = device.token_credential_ref.as_ref().ok_or_else(|| {
+                crate::ConfigStoreError::Validation(
+                    "access-control device verifier metadata is incomplete".to_string(),
+                )
+            })?;
+            if reference != &access_device_credential_ref(&device.device_id)?
+                || !device.token_configured
+            {
+                return Err(crate::ConfigStoreError::Validation(
+                    "access-control device credential metadata is invalid".to_string(),
+                ));
+            }
+            let secret = store.resolve(reference)?.ok_or_else(|| {
+                crate::ConfigStoreError::Validation(
+                    "access-control device verifier is unavailable".to_string(),
+                )
+            })?;
+            let record = decode_access_verifier(secret.expose())?;
+            device.token_hash = record.hash;
+            device.token_salt = record.salt;
+        }
+        Ok(())
+    }
+
+    pub fn clear_access_control_runtime_verifiers(&mut self) {
+        if let Some(access) = self.access_control.as_mut() {
+            access.password_hash = None;
+            access.password_salt = None;
+            for device in &mut access.devices {
+                device.token_hash.clear();
+                device.token_salt.clear();
+            }
+        }
+    }
+
+    /// Remove runtime verifier material from the durable access projection.
+    pub fn sanitize_access_control_for_disk(&mut self) {
+        self.clear_access_control_runtime_verifiers();
+    }
+
     /// Re-encrypt every configured platform's token (and Feishu `app_secret`)
     /// from current in-memory plaintext before persisting to disk. Mirrors
     /// [`Config::refresh_notifications_encrypted`]: an empty/absent plaintext
@@ -928,8 +1087,11 @@ impl Config {
     /// client never re-sent the secret keeps it).
     pub fn refresh_connect_platform_tokens_encrypted(&mut self) -> Result<()> {
         for platform in &mut self.connect.platforms {
+            if platform.token_credential_ref.is_some() {
+                platform.token_encrypted = None;
+            }
             let token = platform.token.as_deref().unwrap_or("").trim();
-            if !token.is_empty() {
+            if platform.token_credential_ref.is_none() && !token.is_empty() {
                 platform.token_encrypted =
                     Some(crate::encryption::encrypt(token).with_context(|| {
                         format!(
@@ -939,8 +1101,11 @@ impl Config {
                     })?);
             }
 
+            if platform.app_secret_credential_ref.is_some() {
+                platform.app_secret_encrypted = None;
+            }
             let app_secret = platform.app_secret.as_deref().unwrap_or("").trim();
-            if !app_secret.is_empty() {
+            if platform.app_secret_credential_ref.is_none() && !app_secret.is_empty() {
                 platform.app_secret_encrypted =
                     Some(crate::encryption::encrypt(app_secret).with_context(|| {
                         format!(
@@ -951,6 +1116,17 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Remove runtime plaintext and legacy ciphertext from the durable connect
+    /// projection. Only stable refs and configured metadata remain.
+    pub fn sanitize_connect_credentials_for_disk(&mut self) {
+        for platform in &mut self.connect.platforms {
+            platform.token = None;
+            platform.token_encrypted = None;
+            platform.app_secret = None;
+            platform.app_secret_encrypted = None;
+        }
     }
 
     /// Restore env-sourced provider `api_key`s that a serde round-trip dropped.
@@ -1009,4 +1185,32 @@ impl Config {
         self.refresh_connect_platform_tokens_encrypted()?;
         Ok(())
     }
+}
+
+fn hydrate_optional_connect_secret(
+    store: &crate::CredentialStore,
+    reference: Option<&crate::CredentialRef>,
+    configured: bool,
+    target: &mut Option<String>,
+    allow_legacy_runtime_value: bool,
+) -> crate::ConfigStoreResult<()> {
+    match reference {
+        Some(reference) => match store.resolve(reference)? {
+            Some(secret) => *target = Some(secret.expose().to_string()),
+            None if configured => {
+                return Err(crate::ConfigStoreError::Validation(
+                    "referenced connect credential is unavailable".to_string(),
+                ));
+            }
+            None => *target = None,
+        },
+        None if configured => {
+            return Err(crate::ConfigStoreError::Validation(
+                "connect credential metadata is inconsistent".to_string(),
+            ));
+        }
+        None if allow_legacy_runtime_value && target.is_some() => {}
+        None => *target = None,
+    }
+    Ok(())
 }

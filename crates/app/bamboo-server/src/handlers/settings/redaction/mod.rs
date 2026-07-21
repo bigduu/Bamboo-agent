@@ -197,6 +197,8 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false)
                         || p.token_encrypted.is_some()
+                        || p.token_configured
+                        || p.token_credential_ref.is_some()
                 })
                 .unwrap_or(false);
             if configured {
@@ -221,6 +223,8 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false)
                         || p.app_secret_encrypted.is_some()
+                        || p.app_secret_configured
+                        || p.app_secret_credential_ref.is_some()
                 })
                 .unwrap_or(false);
             if app_secret_configured {
