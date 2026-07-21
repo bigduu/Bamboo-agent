@@ -200,6 +200,10 @@ pub fn build_merged_config(
     // key would vanish from config.json on the next persist. Carry unpatched
     // keys forward from the live config. #515/#516.
     preserve_unpatched_provider_secrets(&mut new_config, current, &api_key_intents);
+    // Explicit instance preserve path for #633: carry untouched instance
+    // plaintext keys (including instances created before first persist) from
+    // current to merged when the merge consumed the merge-time plaintext.
+    new_config.preserve_provider_instance_plaintext_keys(current, &api_key_intents);
     new_config.normalize_tool_settings();
     new_config.normalize_skill_settings();
     new_config.normalize_plugin_trust_settings();
@@ -358,6 +362,48 @@ mod tests {
         assert_eq!(
             instance.api_key, "sk-instance-live",
             "an unrelated settings PATCH must not lose the instance key (#516)"
+        );
+    }
+
+    #[test]
+    fn unrelated_patch_preserves_fresh_instance_plaintext_key() {
+        let current = config_with_plaintext_only_instance("sk-instance-fresh");
+
+        let patch: Map<String, Value> = serde_json::from_str(
+            r#"{"defaults":{"chat":{"provider":"openai","model":"gpt-4o-mini","temperature":1}}}"#,
+        )
+        .unwrap();
+        let intents = provider_api_key_intents(&patch);
+        assert!(intents.provider_instances.is_empty());
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = merged.provider_instances.get("uuid-1").expect("instance");
+        assert_eq!(instance.api_key, "sk-instance-fresh");
+    }
+
+    #[test]
+    fn explicit_instance_key_in_patch_wins_over_preserved_key() {
+        let current = config_with_plaintext_only_instance("sk-instance-live");
+        let patch: Map<String, Value> = serde_json::from_str(
+            r#"{"provider_instances":{"uuid-1":{"api_key":"sk-instance-updated"}}}"#,
+        )
+        .unwrap();
+        let intents = provider_api_key_intents(&patch);
+        assert!(intents.provider_instances.contains("uuid-1"));
+
+        let mut merged = build_merged_config(&current, patch).expect("merge");
+        sync_provider_api_keys_encrypted_for_patch(&mut merged, &intents).expect("sync");
+
+        let instance = merged.provider_instances.get("uuid-1").expect("instance");
+        assert_eq!(instance.api_key, "sk-instance-updated");
+        assert!(
+            instance
+                .api_key_encrypted
+                .as_deref()
+                .is_some_and(|cipher| !cipher.is_empty()),
+            "explicit instance key must be encrypted after sync"
         );
     }
 
