@@ -22,13 +22,9 @@ use bamboo_config::cluster_fabric::{
 use crate::app_state::{AppState, ConfigUpdateEffects};
 use crate::error::AppError;
 
-mod deploy;
+use super::redaction::masked_secret_marker;
 
-/// The sentinel a redacted secret is replaced with (matches the rest of the
-/// settings redaction). An update that re-sends this value means "keep current".
-// This is a public redaction marker, not a password or cryptographic value.
-// codeql[rust/hard-coded-cryptographic-value]
-const SECRET_MASK: &str = "****...****";
+mod deploy;
 
 // ─── Request / response types ──────────────────────────────────────────
 
@@ -121,7 +117,10 @@ fn redact_node_value(node: &Node) -> Value {
     {
         for field in ["password", "private_key", "passphrase"] {
             if auth.get(field).and_then(|v| v.as_str()).is_some() {
-                auth.insert(field.to_string(), Value::String(SECRET_MASK.to_string()));
+                auth.insert(
+                    field.to_string(),
+                    Value::String(masked_secret_marker().to_string()),
+                );
             }
             // Never expose ciphertext over the API.
             auth.remove(&format!("{field}_encrypted"));
@@ -194,7 +193,7 @@ fn ensure_managed_node_secret_unchanged(
         (NodePlacement::Ssh(old), NodePlacement::Ssh(new)) => match (&old.auth, &new.auth) {
             (SshAuth::SystemSshConfig, SshAuth::SystemSshConfig) => true,
             (SshAuth::Password { .. }, SshAuth::Password { password, .. }) => {
-                password.trim().is_empty() || password == SECRET_MASK
+                password.trim().is_empty() || password == masked_secret_marker()
             }
             (
                 SshAuth::PrivateKey { .. },
@@ -204,8 +203,8 @@ fn ensure_managed_node_secret_unchanged(
                     ..
                 },
             ) => {
-                (private_key.trim().is_empty() || private_key == SECRET_MASK)
-                    && (passphrase.trim().is_empty() || passphrase == SECRET_MASK)
+                (private_key.trim().is_empty() || private_key == masked_secret_marker())
+                    && (passphrase.trim().is_empty() || passphrase == masked_secret_marker())
             }
             _ => false,
         },
@@ -232,7 +231,7 @@ fn preserve_secret(
     old_plaintext: &str,
     old_encrypted: &Option<String>,
 ) {
-    let keep = plaintext.trim().is_empty() || plaintext == SECRET_MASK;
+    let keep = plaintext.trim().is_empty() || plaintext == masked_secret_marker();
     if !keep {
         return;
     }
@@ -613,7 +612,7 @@ mod tests {
         let node = pw_node("hunter2", Some("ciphertext"));
         let v = redact_node_value(&node);
         let auth = &v["placement"]["auth"];
-        assert_eq!(auth["password"], SECRET_MASK);
+        assert_eq!(auth["password"], masked_secret_marker());
         assert!(auth.get("password_encrypted").is_none());
     }
 
@@ -635,7 +634,7 @@ mod tests {
     #[test]
     fn update_with_mask_preserves_existing_ciphertext() {
         let existing = pw_node("", Some("stored-cipher"));
-        let mut incoming = pw_node(SECRET_MASK, None);
+        let mut incoming = pw_node(masked_secret_marker(), None);
         preserve_node_secrets(&existing, &mut incoming);
         let NodePlacement::Ssh(t) = &incoming.placement else {
             panic!()
@@ -661,7 +660,7 @@ mod tests {
         // was hydrated on load); its ciphertext is None. A masked update must
         // carry the plaintext forward so refresh can re-encrypt it on save.
         let existing = pw_node("s3cr3t", None);
-        let mut incoming = pw_node(SECRET_MASK, None);
+        let mut incoming = pw_node(masked_secret_marker(), None);
         preserve_node_secrets(&existing, &mut incoming);
         let NodePlacement::Ssh(t) = &incoming.placement else {
             panic!()
@@ -717,7 +716,7 @@ mod tests {
     fn isolated_password_update_accepts_only_redacted_keep() {
         let stored_secret = Uuid::new_v4().to_string();
         let existing = pw_node(&stored_secret, None);
-        let masked = pw_node(SECRET_MASK, None);
+        let masked = pw_node(masked_secret_marker(), None);
         ensure_managed_node_secret_unchanged(&existing, &masked.placement).unwrap();
         let empty_secret = String::new();
         let empty = pw_node(&empty_secret, None);
@@ -747,7 +746,8 @@ mod tests {
     #[test]
     fn node_validation_rejects_client_ciphertext() {
         let client_ciphertext = Uuid::new_v4().to_string();
-        let node = pw_node("", Some(&client_ciphertext));
+        let empty_password = String::new();
+        let node = pw_node(&empty_password, Some(&client_ciphertext));
         let request = NodeUpsertRequest {
             expected_revision: 0,
             label: node.label,

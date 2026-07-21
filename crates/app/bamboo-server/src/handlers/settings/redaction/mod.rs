@@ -5,6 +5,11 @@ mod constants;
 mod mcp;
 mod provider;
 
+/// Return the public marker used in place of secrets in API responses.
+pub(super) fn masked_secret_marker() -> &'static str {
+    constants::MASKED_SECRET
+}
+
 #[cfg(test)]
 mod tests;
 
