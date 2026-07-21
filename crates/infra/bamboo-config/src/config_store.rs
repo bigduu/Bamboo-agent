@@ -101,7 +101,9 @@ impl AtomicFileStore {
 
     /// Install bytes only when the current file still matches the caller's
     /// staged base. The comparison and atomic replacement share the file's
-    /// advisory lock, closing the editor/API lost-update window.
+    /// advisory lock, serializing Bamboo/API/CLI writers. Raw editors do not
+    /// participate in that lock; callers that import editor writes must also
+    /// use watcher/snapshot conflict handling.
     pub fn write_bytes_if_hash(
         &self,
         expected_sha256: &str,
@@ -114,6 +116,36 @@ impl AtomicFileStore {
             Err(error) => return Err(error.into()),
         };
         if hex::encode(Sha256::digest(&current)) != expected_sha256 {
+            return Ok(false);
+        }
+        self.install_bytes(bytes)?;
+        Ok(true)
+    }
+
+    /// Presence-aware CAS used by the facade compound migration. `None`
+    /// means the target must still be absent; `Some(hash)` means it must be a
+    /// regular file with exactly that content hash. Unlike the legacy hash
+    /// helper, an absent file is never equivalent to an existing empty file.
+    /// The guarantee is bounded by the advisory-lock protocol: an unrelated
+    /// writer that ignores the lock is observed only if it wins before this
+    /// comparison or writes after the atomic replacement.
+    pub(crate) fn write_bytes_if_state(
+        &self,
+        expected_sha256: Option<&str>,
+        bytes: &[u8],
+    ) -> ConfigStoreResult<bool> {
+        let _lock = self.lock()?;
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let matches = match (expected_sha256, current.as_deref()) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => hex::encode(Sha256::digest(current)) == expected,
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !matches {
             return Ok(false);
         }
         self.install_bytes(bytes)?;

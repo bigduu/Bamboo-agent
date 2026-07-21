@@ -80,7 +80,16 @@ struct MigrationManifest {
     exact_scope: Option<ExactTransactionScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migration_scope: Option<MigrationScope>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    source_attestation: BTreeMap<String, FacadeSourceBase>,
     files: Vec<StagedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum FacadeSourceBase {
+    Missing,
+    Regular { sha256: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,8 +104,14 @@ enum MigrationState {
 struct SectionLayoutCompletionLedger {
     version: u32,
     state: MigrationState,
+    #[serde(default)]
+    facade_compound: bool,
     marker_sha256: String,
     completion: crate::section_facade::SectionLayoutCompletion,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    legacy_cleanup: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    legacy_source_guards: BTreeMap<String, FacadeSourceBase>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +129,14 @@ enum MigrationScope {
     ClusterFabric,
     ProviderFacade,
     SectionSplit,
+    FacadeCompound,
+}
+
+fn is_section_layout_scope(scope: Option<MigrationScope>) -> bool {
+    matches!(
+        scope,
+        Some(MigrationScope::SectionSplit | MigrationScope::FacadeCompound)
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +146,10 @@ struct StagedFile {
     sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_sha256: Option<String>,
+    /// Distinguishes a missing base from an existing empty regular file.
+    /// `None` is reserved for manifests written before presence-aware CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_present: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migration_generation: Option<u64>,
     sensitive: bool,
@@ -152,6 +179,8 @@ enum InstallMode {
     #[default]
     Migration,
     Exact,
+    LegacyCleanup,
+    SourceGuard,
 }
 
 #[derive(Debug)]
@@ -160,6 +189,493 @@ struct PlannedSection {
     bytes: Vec<u8>,
     original: Vec<u8>,
     migration_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FacadeSourceState {
+    Missing,
+    Regular(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FacadeSourceSnapshot {
+    files: BTreeMap<String, FacadeSourceState>,
+}
+
+impl FacadeSourceSnapshot {
+    pub(crate) fn capture(data_dir: &Path) -> ConfigStoreResult<Self> {
+        let mut files = BTreeMap::new();
+        for name in crate::section_facade::preflight_source_names() {
+            let state = match read_optional_target(&data_dir.join(&name))? {
+                Some(bytes) => FacadeSourceState::Regular(bytes),
+                None => FacadeSourceState::Missing,
+            };
+            files.insert(name, state);
+        }
+        Ok(Self { files })
+    }
+
+    pub(crate) fn state(&self, name: &str) -> ConfigStoreResult<&FacadeSourceState> {
+        self.files.get(name).ok_or_else(|| {
+            ConfigStoreError::Validation(format!(
+                "facade source snapshot is missing allowlisted member '{name}'"
+            ))
+        })
+    }
+
+    pub(crate) fn bytes(&self, name: &str) -> ConfigStoreResult<Option<&[u8]>> {
+        Ok(match self.state(name)? {
+            FacadeSourceState::Missing => None,
+            FacadeSourceState::Regular(bytes) => Some(bytes),
+        })
+    }
+
+    fn attestation(&self) -> BTreeMap<String, FacadeSourceBase> {
+        self.files
+            .iter()
+            .map(|(name, state)| {
+                let base = match state {
+                    FacadeSourceState::Missing => FacadeSourceBase::Missing,
+                    FacadeSourceState::Regular(bytes) => FacadeSourceBase::Regular {
+                        sha256: sha256(bytes),
+                    },
+                };
+                (name.clone(), base)
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedLegacyCleanup {
+    pub name: String,
+    pub original: FacadeSourceState,
+    pub candidate: FacadeSourceState,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FacadeCredentialPlan {
+    pub source_snapshot: FacadeSourceSnapshot,
+    pub credential_original: FacadeSourceState,
+    pub credential_candidate: Vec<u8>,
+    pub source_overrides: BTreeMap<String, Vec<u8>>,
+    pub legacy_cleanups: Vec<PlannedLegacyCleanup>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FacadeRootSecretAuthority {
+    providers: BTreeSet<String>,
+    provider_instances: bool,
+    mcp: bool,
+    mcp_servers: BTreeSet<String>,
+}
+
+fn provider_document_authority(bytes: &[u8]) -> ConfigStoreResult<(BTreeSet<String>, bool)> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    let (data, _) = section_data_mut(&mut root)?;
+    let object = data.as_object().ok_or_else(|| {
+        ConfigStoreError::Validation("provider section must be an object".to_string())
+    })?;
+    let providers = ["openai", "anthropic", "gemini", "bodhi"]
+        .into_iter()
+        .filter(|provider| object.contains_key(*provider))
+        .map(str::to_string)
+        .collect();
+    Ok((providers, object.contains_key("provider_instances")))
+}
+
+fn mcp_document_server_ids(bytes: &[u8]) -> ConfigStoreResult<BTreeSet<String>> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    let (data, _) = section_data_mut(&mut root)?;
+    if let Some(servers) = data.get("servers").and_then(Value::as_array) {
+        return servers
+            .iter()
+            .map(|server| {
+                server
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        ConfigStoreError::Validation("MCP server id is missing".to_string())
+                    })
+            })
+            .collect();
+    }
+    let servers = data
+        .as_object()
+        .ok_or_else(|| ConfigStoreError::Validation("MCP section must be an object".to_string()))?;
+    Ok(servers.keys().cloned().collect())
+}
+
+fn discard_shadowed_root_secrets(
+    extracted: &mut Vec<ExtractedSecret>,
+    authority: &FacadeRootSecretAuthority,
+) {
+    extracted.retain(|secret| match secret.kind {
+        ExtractedSecretKind::ProviderBuiltin => !secret
+            .provider_owner
+            .as_ref()
+            .is_some_and(|provider| authority.providers.contains(provider)),
+        ExtractedSecretKind::ProviderInstance => !authority.provider_instances,
+        ExtractedSecretKind::Mcp => !authority.mcp,
+        _ => true,
+    });
+}
+
+fn discard_shadowed_sidecar_backup_secrets(
+    extracted: &mut Vec<ExtractedSecret>,
+    authority: &FacadeRootSecretAuthority,
+) {
+    extracted.retain(|secret| match secret.kind {
+        ExtractedSecretKind::ProviderBuiltin => !secret
+            .provider_owner
+            .as_ref()
+            .is_some_and(|provider| authority.providers.contains(provider)),
+        ExtractedSecretKind::ProviderInstance => !authority.provider_instances,
+        ExtractedSecretKind::Mcp => !secret
+            .mcp_owner
+            .as_ref()
+            .is_some_and(|server| authority.mcp_servers.contains(server)),
+        _ => true,
+    });
+}
+
+fn scrub_mcp_credential_metadata(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = object.remove("env_credential_refs").is_some()
+        | object.remove("header_credential_refs").is_some();
+    if let Some(headers) = object.get_mut("headers").and_then(Value::as_array_mut) {
+        for header in headers.iter_mut().filter_map(Value::as_object_mut) {
+            changed |= header.remove("credential_ref").is_some();
+            changed |= header.remove("configured").is_some();
+        }
+    }
+    if let Some(transport) = object.get_mut("transport") {
+        changed |= scrub_mcp_credential_metadata(transport);
+    }
+    changed
+}
+
+fn scrub_shadowed_provider_document_metadata(
+    bytes: &mut Vec<u8>,
+    authority: &FacadeRootSecretAuthority,
+) -> ConfigStoreResult<bool> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    let (data, _) = section_data_mut(&mut root)?;
+    let object = data.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("provider section must be an object".to_string())
+    })?;
+    let mut changed = false;
+    for provider in &authority.providers {
+        if let Some(config) = object.get_mut(provider).and_then(Value::as_object_mut) {
+            changed |= config.remove("credential_ref").is_some();
+            changed |= config.remove("configured").is_some();
+        }
+    }
+    if authority.provider_instances {
+        if let Some(instances) = object
+            .get_mut("provider_instances")
+            .and_then(Value::as_object_mut)
+        {
+            for instance in instances.values_mut().filter_map(Value::as_object_mut) {
+                changed |= instance.remove("credential_ref").is_some();
+                changed |= instance.remove("configured").is_some();
+            }
+        }
+    }
+    if changed {
+        *bytes = serde_json::to_vec_pretty(&root)?;
+    }
+    Ok(changed)
+}
+
+fn scrub_shadowed_mcp_document_metadata(
+    bytes: &mut Vec<u8>,
+    authority: &FacadeRootSecretAuthority,
+) -> ConfigStoreResult<bool> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    let (data, _) = section_data_mut(&mut root)?;
+    let mut changed = false;
+    if let Some(servers) = data.get_mut("servers").and_then(Value::as_array_mut) {
+        for server in servers {
+            if server
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| authority.mcp_servers.contains(id))
+            {
+                changed |= scrub_mcp_credential_metadata(server);
+            }
+        }
+    } else if let Some(servers) = data.as_object_mut() {
+        for (id, server) in servers {
+            if authority.mcp_servers.contains(id) {
+                changed |= scrub_mcp_credential_metadata(server);
+            }
+        }
+    }
+    if changed {
+        *bytes = serde_json::to_vec_pretty(&root)?;
+    }
+    Ok(changed)
+}
+
+fn scrub_shadowed_root_credential_metadata(
+    bytes: &mut Vec<u8>,
+    authority: &FacadeRootSecretAuthority,
+) -> ConfigStoreResult<bool> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    let object = root.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("root configuration must be an object".to_string())
+    })?;
+    let mut changed = false;
+    if let Some(providers) = object.get_mut("providers").and_then(Value::as_object_mut) {
+        for provider in &authority.providers {
+            if let Some(config) = providers.get_mut(provider).and_then(Value::as_object_mut) {
+                changed |= config.remove("credential_ref").is_some();
+                changed |= config.remove("configured").is_some();
+            }
+        }
+    }
+    if authority.provider_instances {
+        if let Some(instances) = object
+            .get_mut("provider_instances")
+            .and_then(Value::as_object_mut)
+        {
+            for instance in instances.values_mut().filter_map(Value::as_object_mut) {
+                changed |= instance.remove("credential_ref").is_some();
+                changed |= instance.remove("configured").is_some();
+            }
+        }
+    }
+    if authority.mcp {
+        let mcp = if object.contains_key("mcpServers") {
+            object.get_mut("mcpServers")
+        } else {
+            object.get_mut("mcp")
+        };
+        if let Some(mcp) = mcp {
+            if let Some(servers) = mcp.get_mut("servers").and_then(Value::as_array_mut) {
+                for server in servers {
+                    changed |= scrub_mcp_credential_metadata(server);
+                }
+            } else if let Some(servers) = mcp.as_object_mut() {
+                for server in servers.values_mut() {
+                    changed |= scrub_mcp_credential_metadata(server);
+                }
+            }
+        }
+    }
+    if changed {
+        *bytes = serde_json::to_vec_pretty(&root)?;
+    }
+    Ok(changed)
+}
+
+pub(crate) fn plan_facade_compound_credentials(
+    data_dir: &Path,
+    source_snapshot: FacadeSourceSnapshot,
+    broker_ready: bool,
+) -> ConfigStoreResult<FacadeCredentialPlan> {
+    let mut primary_extracted = Vec::new();
+    let mut backup_extractions = Vec::new();
+    let mut source_overrides = BTreeMap::new();
+    let mut legacy_cleanups = Vec::new();
+
+    let mut primary_authority = FacadeRootSecretAuthority::default();
+    if let Some(original) = source_snapshot
+        .bytes(PROVIDERS_FILE)?
+        .map(ToOwned::to_owned)
+    {
+        let (providers, owns_instances) = provider_document_authority(&original)?;
+        primary_authority.providers = providers;
+        primary_authority.provider_instances = owns_instances;
+        if let Some(section) = plan_provider_document(original, &mut primary_extracted, 1)? {
+            source_overrides.insert(PROVIDERS_FILE.to_string(), section.bytes);
+        }
+    }
+    if let Some(original) = source_snapshot.bytes(MCP_FILE)?.map(ToOwned::to_owned) {
+        primary_authority.mcp = true;
+        primary_authority.mcp_servers = mcp_document_server_ids(&original)?;
+        if let Some(section) = plan_mcp_document(original, &mut primary_extracted, 1)? {
+            source_overrides.insert(MCP_FILE.to_string(), section.bytes);
+        }
+    }
+
+    if let Some(original) = source_snapshot.bytes(CONFIG_FILE)?.map(ToOwned::to_owned) {
+        let mut root_extracted = Vec::new();
+        let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1)?;
+        let mut candidate = planned
+            .as_ref()
+            .map(|section| section.bytes.clone())
+            .unwrap_or_else(|| original.clone());
+        let metadata_changed =
+            scrub_shadowed_root_credential_metadata(&mut candidate, &primary_authority)?;
+        discard_shadowed_root_secrets(&mut root_extracted, &primary_authority);
+        if planned.is_some() || metadata_changed {
+            primary_extracted.extend(root_extracted);
+            source_overrides.insert(CONFIG_FILE.to_string(), candidate.clone());
+            legacy_cleanups.push(PlannedLegacyCleanup {
+                name: CONFIG_FILE.to_string(),
+                original: source_snapshot.state(CONFIG_FILE)?.clone(),
+                candidate: FacadeSourceState::Regular(candidate),
+                sensitive: true,
+            });
+        }
+    }
+
+    if broker_ready {
+        let mut broker_extracted = Vec::new();
+        if let Some(original) = source_snapshot.bytes(BROKER_FILE)?.map(ToOwned::to_owned) {
+            if let Some(section) =
+                plan_broker_document(data_dir, original, &mut broker_extracted, 1)?
+            {
+                primary_extracted.extend(broker_extracted);
+                source_overrides.insert(BROKER_FILE.to_string(), section.bytes.clone());
+                legacy_cleanups.push(PlannedLegacyCleanup {
+                    name: BROKER_FILE.to_string(),
+                    original: source_snapshot.state(BROKER_FILE)?.clone(),
+                    candidate: FacadeSourceState::Regular(section.bytes),
+                    sensitive: true,
+                });
+            }
+        }
+    }
+
+    for suffix in ["bak", "bak.1", "bak.2"] {
+        let mut generation_extracted = Vec::new();
+        let providers_name = format!("{PROVIDERS_FILE}.{suffix}");
+        let mut generation_authority = primary_authority.clone();
+        if let Some(original) = source_snapshot
+            .bytes(&providers_name)?
+            .map(ToOwned::to_owned)
+        {
+            if serde_json::from_slice::<Value>(&original).is_ok() {
+                let (providers, owns_instances) = provider_document_authority(&original)?;
+                generation_authority.providers.extend(providers);
+                generation_authority.provider_instances |= owns_instances;
+                let mut provider_extracted = Vec::new();
+                let planned = plan_provider_document(original.clone(), &mut provider_extracted, 1)?;
+                let mut candidate = planned
+                    .as_ref()
+                    .map(|section| section.bytes.clone())
+                    .unwrap_or_else(|| original.clone());
+                let metadata_changed =
+                    scrub_shadowed_provider_document_metadata(&mut candidate, &primary_authority)?;
+                discard_shadowed_sidecar_backup_secrets(
+                    &mut provider_extracted,
+                    &primary_authority,
+                );
+                if planned.is_some() || metadata_changed {
+                    generation_extracted.extend(provider_extracted);
+                    legacy_cleanups.push(PlannedLegacyCleanup {
+                        name: providers_name.clone(),
+                        original: source_snapshot.state(&providers_name)?.clone(),
+                        candidate: FacadeSourceState::Regular(candidate),
+                        sensitive: true,
+                    });
+                }
+            }
+        }
+
+        let mcp_name = format!("{MCP_FILE}.{suffix}");
+        if let Some(original) = source_snapshot.bytes(&mcp_name)?.map(ToOwned::to_owned) {
+            if serde_json::from_slice::<Value>(&original).is_ok() {
+                generation_authority.mcp = true;
+                generation_authority
+                    .mcp_servers
+                    .extend(mcp_document_server_ids(&original)?);
+                let mut mcp_extracted = Vec::new();
+                let planned = plan_mcp_document(original.clone(), &mut mcp_extracted, 1)?;
+                let mut candidate = planned
+                    .as_ref()
+                    .map(|section| section.bytes.clone())
+                    .unwrap_or_else(|| original.clone());
+                let metadata_changed =
+                    scrub_shadowed_mcp_document_metadata(&mut candidate, &primary_authority)?;
+                discard_shadowed_sidecar_backup_secrets(&mut mcp_extracted, &primary_authority);
+                if planned.is_some() || metadata_changed {
+                    generation_extracted.extend(mcp_extracted);
+                    legacy_cleanups.push(PlannedLegacyCleanup {
+                        name: mcp_name.clone(),
+                        original: source_snapshot.state(&mcp_name)?.clone(),
+                        candidate: FacadeSourceState::Regular(candidate),
+                        sensitive: true,
+                    });
+                }
+            }
+        }
+
+        let config_name = format!("{CONFIG_FILE}.{suffix}");
+        if let Some(original) = source_snapshot.bytes(&config_name)?.map(ToOwned::to_owned) {
+            if serde_json::from_slice::<Value>(&original).is_ok() {
+                let mut root_extracted = Vec::new();
+                let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1)?;
+                let mut candidate = planned
+                    .as_ref()
+                    .map(|section| section.bytes.clone())
+                    .unwrap_or_else(|| original.clone());
+                let metadata_changed =
+                    scrub_shadowed_root_credential_metadata(&mut candidate, &generation_authority)?;
+                discard_shadowed_root_secrets(&mut root_extracted, &generation_authority);
+                if planned.is_some() || metadata_changed {
+                    generation_extracted.extend(root_extracted);
+                    legacy_cleanups.push(PlannedLegacyCleanup {
+                        name: config_name.clone(),
+                        original: source_snapshot.state(&config_name)?.clone(),
+                        candidate: FacadeSourceState::Regular(candidate),
+                        sensitive: true,
+                    });
+                }
+            }
+        }
+
+        if broker_ready {
+            let broker_name = format!("{BROKER_FILE}.{suffix}");
+            if let Some(original) = source_snapshot.bytes(&broker_name)?.map(ToOwned::to_owned) {
+                if serde_json::from_slice::<Value>(&original).is_ok() {
+                    let mut broker_extracted = Vec::new();
+                    if let Some(section) =
+                        plan_broker_document(data_dir, original, &mut broker_extracted, 1)?
+                    {
+                        generation_extracted.extend(broker_extracted);
+                        legacy_cleanups.push(PlannedLegacyCleanup {
+                            name: broker_name.clone(),
+                            original: source_snapshot.state(&broker_name)?.clone(),
+                            candidate: FacadeSourceState::Regular(section.bytes),
+                            sensitive: true,
+                        });
+                    }
+                }
+            }
+        }
+        backup_extractions.push(generation_extracted);
+    }
+
+    let credential_primary = source_snapshot.bytes(CREDENTIALS_FILE)?;
+    let credential_backup = source_snapshot.bytes(&format!("{CREDENTIALS_FILE}.bak"))?;
+    let sources =
+        CredentialStore::migration_sources_from_snapshot(credential_primary, credential_backup)?;
+    let resolved = resolve_compound_extracted_secrets_from_sources(
+        &sources,
+        primary_extracted,
+        backup_extractions,
+    )?;
+    let prepared = CredentialStore::prepare_migration_from_snapshot(
+        credential_primary,
+        credential_backup,
+        resolved,
+    )?;
+
+    Ok(FacadeCredentialPlan {
+        credential_original: source_snapshot.state(CREDENTIALS_FILE)?.clone(),
+        credential_candidate: prepared.bytes,
+        source_snapshot,
+        source_overrides,
+        legacy_cleanups,
+    })
 }
 
 #[derive(Debug)]
@@ -175,11 +691,16 @@ struct ExtractedSecret {
     migration_generation: u64,
     kind: ExtractedSecretKind,
     env_owner: Option<String>,
+    provider_owner: Option<String>,
+    mcp_owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExtractedSecretKind {
     Other,
+    ProviderBuiltin,
+    ProviderInstance,
+    Mcp,
     ProxyAuth,
     EnvVar,
     NotificationNtfy,
@@ -299,16 +820,37 @@ pub(crate) fn preflight_provider_mcp_credential_migration(
     data_dir: &Path,
 ) -> ConfigStoreResult<()> {
     let mut extracted = Vec::new();
-    let providers = plan_provider_section(data_dir, &mut extracted, 1)?;
-    let mcp = plan_mcp_section(data_dir, &mut extracted, 1)?;
-    let provider_instances =
-        plan_provider_instance_section(data_dir, &mut extracted, 1, true, true)?;
+    let mut authority = FacadeRootSecretAuthority::default();
+    let providers = match read_optional_target(&data_dir.join(PROVIDERS_FILE))? {
+        Some(original) => {
+            let (providers, owns_instances) = provider_document_authority(&original)?;
+            authority.providers = providers;
+            authority.provider_instances = owns_instances;
+            plan_provider_document(original, &mut extracted, 1)?
+        }
+        None => None,
+    };
+    let mcp = match read_optional_target(&data_dir.join(MCP_FILE))? {
+        Some(original) => {
+            authority.mcp = true;
+            authority.mcp_servers = mcp_document_server_ids(&original)?;
+            plan_mcp_document(original, &mut extracted, 1)?
+        }
+        None => None,
+    };
+    let mut root_extracted = Vec::new();
+    let root = match read_optional_target(&data_dir.join(CONFIG_FILE))? {
+        Some(original) => plan_facade_root_document(original, &mut root_extracted, 1)?,
+        None => None,
+    };
+    discard_shadowed_root_secrets(&mut root_extracted, &authority);
+    extracted.extend(root_extracted);
     let credential_snapshot = credential_snapshot_bytes(data_dir)?;
     let sources = CredentialStore::migration_sources_from_snapshot(
         credential_snapshot.primary.as_deref(),
         credential_snapshot.backup.as_deref(),
     )?;
-    let prospective_documents = [&providers, &mcp, &provider_instances]
+    let prospective_documents = [&providers, &mcp, &root]
         .into_iter()
         .filter_map(Option::as_ref)
         .map(|section| (section.bytes.as_slice(), section.name == CONFIG_FILE))
@@ -423,8 +965,42 @@ pub(crate) fn install_section_split_migration_locked(
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SectionSplitTestFault {
     Staging,
+    Journal,
     Manifest,
     LayoutMarker,
+}
+
+#[cfg(test)]
+type FacadeCompoundTestHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(test)]
+fn facade_compound_test_hooks(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, FacadeCompoundTestHook>> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, FacadeCompoundTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_facade_compound_after_manifest_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce(&Path) + Send + 'static,
+) {
+    facade_compound_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_facade_compound_after_manifest_test_hook(data_dir: &Path) {
+    if let Some(hook) = facade_compound_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(data_dir)
+    {
+        hook(data_dir);
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +1011,7 @@ pub(crate) fn install_section_split_migration_with_fault(
 ) -> ConfigStoreResult<SectionMigrationOutcome> {
     let fault = match fault {
         SectionSplitTestFault::Staging => MigrationFault::AfterStaging,
+        SectionSplitTestFault::Journal => MigrationFault::AfterJournal,
         SectionSplitTestFault::Manifest => MigrationFault::AfterManifest,
         SectionSplitTestFault::LayoutMarker => MigrationFault::AfterSectionLayout,
     };
@@ -478,9 +1055,21 @@ fn install_section_split_migration_locked_inner(
     discard_uncommitted(data_dir)?;
     validate_section_split_plan(data_dir, &plan)?;
 
-    let credential_original = read_optional_target(&data_dir.join(CREDENTIALS_FILE))?;
-    let store = CredentialStore::open(data_dir);
-    let prepared_credentials = store.prepare_migration(Vec::new())?;
+    let (credential_original, credential_candidate) = match plan.credential_plan.as_ref() {
+        Some(compound) => (
+            match &compound.credential_original {
+                FacadeSourceState::Missing => None,
+                FacadeSourceState::Regular(bytes) => Some(bytes.clone()),
+            },
+            compound.credential_candidate.clone(),
+        ),
+        None => {
+            let original = read_optional_target(&data_dir.join(CREDENTIALS_FILE))?;
+            let store = CredentialStore::open(data_dir);
+            let prepared = store.prepare_migration(Vec::new())?;
+            (original, prepared.bytes)
+        }
+    };
     let transaction_id = Uuid::new_v4().to_string();
     let stage_dir_name = format!("{STAGE_PREFIX}{transaction_id}");
     let stage_dir = data_dir.join(&stage_dir_name);
@@ -494,7 +1083,7 @@ fn install_section_split_migration_locked_inner(
         &stage_dir,
         &backup_dir,
         CREDENTIALS_FILE,
-        &prepared_credentials.bytes,
+        &credential_candidate,
         credential_original.as_deref(),
         true,
         None,
@@ -508,7 +1097,7 @@ fn install_section_split_migration_locked_inner(
             &backup_dir,
             file.name,
             &file.candidate,
-            Some(&file.original),
+            file.original_present.then_some(file.original.as_slice()),
             false,
             Some(file.revision),
             InstallMode::Migration,
@@ -516,13 +1105,72 @@ fn install_section_split_migration_locked_inner(
             &mut staged,
         )?;
     }
-    let marker_original = read_target_or_empty(&data_dir.join(crate::SECTION_LAYOUT_FILE))?;
+    if let Some(compound) = plan.credential_plan.as_ref() {
+        for cleanup in &compound.legacy_cleanups {
+            let original = match &cleanup.original {
+                FacadeSourceState::Missing => None,
+                FacadeSourceState::Regular(bytes) => Some(bytes.as_slice()),
+            };
+            let FacadeSourceState::Regular(candidate) = &cleanup.candidate else {
+                return Err(ConfigStoreError::Validation(
+                    "compound cleanup deletion is not implemented".to_string(),
+                ));
+            };
+            stage_file(
+                &stage_dir,
+                &backup_dir,
+                &cleanup.name,
+                candidate,
+                original,
+                cleanup.sensitive,
+                None,
+                InstallMode::LegacyCleanup,
+                None,
+                &mut staged,
+            )?;
+        }
+        let staged_names = staged
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<BTreeSet<_>>();
+        for (name, state) in &compound.source_snapshot.files {
+            if staged_names.contains(name)
+                || is_compound_internal_derivative_source(name)
+                || matches!(
+                    name.as_str(),
+                    MANIFEST_FILE
+                        | JOURNAL_FILE
+                        | SECTION_LAYOUT_COMPLETION_FILE
+                        | crate::SECTION_LAYOUT_FILE
+                )
+            {
+                continue;
+            }
+            let (candidate, original) = match state {
+                FacadeSourceState::Missing => (&[][..], None),
+                FacadeSourceState::Regular(bytes) => (bytes.as_slice(), Some(bytes.as_slice())),
+            };
+            stage_file(
+                &stage_dir,
+                &backup_dir,
+                name,
+                candidate,
+                original,
+                true,
+                None,
+                InstallMode::SourceGuard,
+                None,
+                &mut staged,
+            )?;
+        }
+    }
+    let marker_original = read_optional_target(&data_dir.join(crate::SECTION_LAYOUT_FILE))?;
     stage_file(
         &stage_dir,
         &backup_dir,
         crate::SECTION_LAYOUT_FILE,
         &plan.marker,
-        Some(&marker_original),
+        marker_original.as_deref(),
         false,
         Some(crate::SECTION_LAYOUT_VERSION as u64),
         InstallMode::Migration,
@@ -544,7 +1192,16 @@ fn install_section_split_migration_locked_inner(
         stage_dir: stage_dir_name,
         state: MigrationState::Pending,
         exact_scope: None,
-        migration_scope: Some(MigrationScope::SectionSplit),
+        migration_scope: Some(if plan.credential_plan.is_some() {
+            MigrationScope::FacadeCompound
+        } else {
+            MigrationScope::SectionSplit
+        }),
+        source_attestation: plan
+            .credential_plan
+            .as_ref()
+            .map(|compound| compound.source_snapshot.attestation())
+            .unwrap_or_default(),
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -553,6 +1210,10 @@ fn install_section_split_migration_locked_inner(
         return Err(injected_fault());
     }
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+    #[cfg(test)]
+    if manifest.migration_scope == Some(MigrationScope::FacadeCompound) {
+        run_facade_compound_after_manifest_test_hook(data_dir);
+    }
     #[cfg(test)]
     if fault == MigrationFault::AfterManifest {
         return Err(injected_fault());
@@ -575,6 +1236,13 @@ fn validate_section_split_plan(
     data_dir: &Path,
     plan: &crate::section_facade::SectionSplitPlan,
 ) -> ConfigStoreResult<()> {
+    if let Some(compound) = plan.credential_plan.as_ref() {
+        if FacadeSourceSnapshot::capture(data_dir)? != compound.source_snapshot {
+            return Err(ConfigStoreError::Validation(
+                "facade source changed during compound planning".to_string(),
+            ));
+        }
+    }
     let expected = crate::SECTION_DESCRIPTORS
         .iter()
         .filter(|descriptor| descriptor.id != crate::SectionId::Credentials)
@@ -591,7 +1259,9 @@ fn validate_section_split_plan(
         ));
     }
     for file in &plan.files {
-        if read_target_or_empty(&data_dir.join(file.name))? != file.original {
+        let current = read_optional_target(&data_dir.join(file.name))?;
+        let expected = file.original_present.then_some(file.original.as_slice());
+        if current.as_deref() != expected {
             return Err(ConfigStoreError::Validation(
                 "legacy configuration changed during section planning".to_string(),
             ));
@@ -675,7 +1345,8 @@ pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> Config
 /// starting any new migration. A journal without a manifest is deliberately
 /// left untouched so the original planner remains the only owner allowed to
 /// discard an uncommitted transaction.
-#[allow(dead_code)] // Consumed by the facade preflight once that integration lands.
+// Kept separate from planning so facade startup can resume a committed
+// transaction before validating current source files.
 pub(crate) fn recover_pending_config_transaction(
     data_dir: impl AsRef<Path>,
 ) -> ConfigStoreResult<bool> {
@@ -1386,6 +2057,7 @@ fn persist_exact_credential_transaction_inner(
         state: MigrationState::Pending,
         exact_scope,
         migration_scope: None,
+        source_attestation: BTreeMap::new(),
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -1596,6 +2268,7 @@ fn migrate_broker_locked(
         state: MigrationState::Pending,
         exact_scope: None,
         migration_scope: None,
+        source_attestation: BTreeMap::new(),
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -1708,6 +2381,7 @@ fn migrate_cluster_locked(
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: Some(MigrationScope::ClusterFabric),
+            source_attestation: BTreeMap::new(),
             files: staged,
         };
         write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -1969,6 +2643,7 @@ fn migrate_inner_with_root_builtins_locked(
         } else {
             None
         },
+        source_attestation: BTreeMap::new(),
         files: staged,
     };
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
@@ -2061,6 +2736,91 @@ fn resolve_extracted_secrets_from_sources(
         resolved.push((secret.credential_ref, value, secret.migration_generation));
     }
     Ok(resolved)
+}
+
+fn resolve_compound_extracted_secrets_from_sources(
+    sources: &BTreeMap<CredentialRef, crate::CredentialSource>,
+    primary: Vec<ExtractedSecret>,
+    backup_generations: Vec<Vec<ExtractedSecret>>,
+) -> ConfigStoreResult<Vec<(CredentialRef, String, u64)>> {
+    let mut selected = BTreeMap::<CredentialRef, (String, u64)>::new();
+
+    // A durable credential entry is already authoritative. Otherwise every
+    // live primary participates at the same precedence level: contradictory
+    // copies fail closed instead of silently choosing a file ordering.
+    for secret in primary {
+        if let Some(source) = sources.get(&secret.credential_ref) {
+            if *source != crate::CredentialSource::Migrated {
+                if secret.kind == ExtractedSecretKind::EnvVar {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy env credential target is already user-managed".to_string(),
+                    ));
+                }
+                continue;
+            }
+        }
+        insert_precedence_secret(&mut selected, secret)?;
+    }
+
+    // Rotating backups are historical, not competing authorities. The newest
+    // generation that owns a reference supplies its value; older generations
+    // are still scrubbed by their planned cleanup but cannot overwrite it.
+    let mut claimed = sources.keys().cloned().collect::<BTreeSet<_>>();
+    claimed.extend(selected.keys().cloned());
+    for generation in backup_generations {
+        let mut generation_selected = BTreeMap::<CredentialRef, (String, u64)>::new();
+        for secret in generation {
+            if let Some(source) = sources.get(&secret.credential_ref) {
+                if secret.kind == ExtractedSecretKind::EnvVar
+                    && *source != crate::CredentialSource::Migrated
+                {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy env credential target is already user-managed".to_string(),
+                    ));
+                }
+                continue;
+            }
+            if claimed.contains(&secret.credential_ref) {
+                continue;
+            }
+            insert_precedence_secret(&mut generation_selected, secret)?;
+        }
+        claimed.extend(generation_selected.keys().cloned());
+        selected.extend(generation_selected);
+    }
+
+    Ok(selected
+        .into_iter()
+        .map(|(reference, (secret, generation))| (reference, secret, generation))
+        .collect())
+}
+
+fn insert_precedence_secret(
+    selected: &mut BTreeMap<CredentialRef, (String, u64)>,
+    secret: ExtractedSecret,
+) -> ConfigStoreResult<()> {
+    let value = match secret.value {
+        LegacySecret::Plaintext(value) => value,
+        LegacySecret::Ciphertext(value) => crate::encryption::decrypt(&value).map_err(|_| {
+            ConfigStoreError::Validation(
+                "legacy credential could not be decrypted for migration".to_string(),
+            )
+        })?,
+    };
+    match selected.get_mut(&secret.credential_ref) {
+        Some((existing, generation)) if *existing == value => {
+            *generation = (*generation).max(secret.migration_generation);
+        }
+        Some(_) => {
+            return Err(ConfigStoreError::Validation(
+                "conflicting legacy credentials share a credential reference".to_string(),
+            ));
+        }
+        None => {
+            selected.insert(secret.credential_ref, (value, secret.migration_generation));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_legacy_proxy_extractions_are_safe(
@@ -2606,8 +3366,59 @@ fn migrate_builtin_provider_credentials(
             credential_ref: reference,
             value: secret.expect("one provider credential exists"),
             migration_generation,
-            kind: ExtractedSecretKind::Other,
+            kind: ExtractedSecretKind::ProviderBuiltin,
             env_owner: None,
+            provider_owner: Some(provider.to_string()),
+            mcp_owner: None,
+        });
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn migrate_provider_instance_credentials(
+    object: &mut Map<String, Value>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
+    let Some(instances) = object.get_mut("provider_instances") else {
+        return Ok(false);
+    };
+    let instances = instances.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("provider_instances must be an object".to_string())
+    })?;
+    let mut changed = false;
+    for (instance_id, value) in instances {
+        let instance = value.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("provider instance must be an object".to_string())
+        })?;
+        let secret = take_consistent_legacy_secret(
+            instance,
+            "api_key",
+            "api_key_encrypted",
+            &format!("provider instance '{instance_id}' API key"),
+        )?;
+        if secret.is_none() {
+            continue;
+        }
+        let reference = existing_or_generated_ref(
+            instance.get("credential_ref"),
+            "provider_instance",
+            instance_id,
+            "api_key",
+        )?;
+        instance.insert(
+            "credential_ref".to_string(),
+            Value::String(reference.as_str().to_string()),
+        );
+        extracted.push(ExtractedSecret {
+            credential_ref: reference,
+            value: secret.expect("one provider-instance credential exists"),
+            migration_generation,
+            kind: ExtractedSecretKind::ProviderInstance,
+            env_owner: None,
+            provider_owner: None,
+            mcp_owner: None,
         });
         changed = true;
     }
@@ -2625,13 +3436,23 @@ fn plan_provider_section(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    plan_provider_document(original, extracted, minimum_generation)
+}
+
+fn plan_provider_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
     let mut root: Value = serde_json::from_slice(&original)?;
     let (data, revision) = section_data_mut(&mut root)?;
     let migration_generation = next_revision(revision.unwrap_or(0))?.max(minimum_generation);
     let object = data.as_object_mut().ok_or_else(|| {
         ConfigStoreError::Validation("provider section must be an object".to_string())
     })?;
-    let changed = migrate_builtin_provider_credentials(object, extracted, migration_generation)?;
+    let mut changed =
+        migrate_builtin_provider_credentials(object, extracted, migration_generation)?;
+    changed |= migrate_provider_instance_credentials(object, extracted, migration_generation)?;
     if !changed {
         return Ok(None);
     }
@@ -3071,6 +3892,8 @@ fn migrate_cluster_auth_field(
             migration_generation,
             kind: ExtractedSecretKind::Other,
             env_owner: None,
+            provider_owner: None,
+            mcp_owner: None,
         });
     }
     Ok(had_plaintext
@@ -3372,49 +4195,62 @@ fn plan_provider_instance_document(
                 migrate_builtin_provider_credentials(providers, extracted, migration_generation)?;
         }
     }
-    if let Some(instances) = object.get_mut("provider_instances") {
-        let instances = instances.as_object_mut().ok_or_else(|| {
-            ConfigStoreError::Validation("provider_instances must be an object".to_string())
-        })?;
-        for (instance_id, value) in instances {
-            let instance = value.as_object_mut().ok_or_else(|| {
-                ConfigStoreError::Validation("provider instance must be an object".to_string())
-            })?;
-            let secret = take_consistent_legacy_secret(
-                instance,
-                "api_key",
-                "api_key_encrypted",
-                &format!("provider instance '{instance_id}' API key"),
-            )?;
-            if secret.is_none() {
-                continue;
-            }
-            let reference = existing_or_generated_ref(
-                instance.get("credential_ref"),
-                "provider_instance",
-                instance_id,
-                "api_key",
-            )?;
-            instance.insert(
-                "credential_ref".to_string(),
-                Value::String(reference.as_str().to_string()),
-            );
-            extracted.push(ExtractedSecret {
-                credential_ref: reference.clone(),
-                value: secret.expect("one provider-instance credential exists"),
-                migration_generation,
-                kind: ExtractedSecretKind::Other,
-                env_owner: None,
-            });
-            changed = true;
-        }
-    }
+    changed |= migrate_provider_instance_credentials(object, extracted, migration_generation)?;
     if !changed {
         return Ok(None);
     }
     Ok(Some(PlannedSection {
         name: CONFIG_FILE,
         bytes: serde_json::to_vec_pretty(&root)?,
+        original,
+        migration_generation,
+    }))
+}
+
+fn plan_facade_root_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let provider =
+        plan_provider_instance_document(original.clone(), extracted, migration_generation, true)?;
+    let provider_changed = provider.is_some();
+    let provider_bytes = provider
+        .as_ref()
+        .map(|section| section.bytes.clone())
+        .unwrap_or_else(|| original.clone());
+    let mut root_after_provider: Value = serde_json::from_slice(&provider_bytes)?;
+    let root_object = root_after_provider.as_object_mut().ok_or_else(|| {
+        ConfigStoreError::Validation("root configuration must be an object".to_string())
+    })?;
+    let root_mcp = if let Some(mcp) = if root_object.contains_key("mcpServers") {
+        root_object.get_mut("mcpServers")
+    } else {
+        root_object.get_mut("mcp")
+    } {
+        let changed = migrate_mcp_document_data(mcp, extracted, migration_generation)?;
+        if changed {
+            validate_mcp_data(mcp)?;
+        }
+        changed
+    } else {
+        false
+    };
+    let root_mcp_bytes = if root_mcp {
+        serde_json::to_vec_pretty(&root_after_provider)?
+    } else {
+        provider_bytes
+    };
+    let cluster = plan_cluster_document(root_mcp_bytes.clone(), extracted, migration_generation)?;
+    let cluster_changed = cluster.is_some();
+    if !provider_changed && !root_mcp && !cluster_changed {
+        return Ok(None);
+    }
+    Ok(Some(PlannedSection {
+        name: CONFIG_FILE,
+        bytes: cluster
+            .map(|section| section.bytes)
+            .unwrap_or(root_mcp_bytes),
         original,
         migration_generation,
     }))
@@ -3491,6 +4327,8 @@ fn migrate_env_vars(
                 migration_generation,
                 kind: ExtractedSecretKind::EnvVar,
                 env_owner: Some(name.clone()),
+                provider_owner: None,
+                mcp_owner: None,
             });
         }
         changed |= had_plaintext_field
@@ -3579,6 +4417,8 @@ fn migrate_notification_credentials(
                     ExtractedSecretKind::NotificationBark
                 },
                 env_owner: None,
+                provider_owner: None,
+                mcp_owner: None,
             });
         }
         changed |= had_plaintext
@@ -3655,6 +4495,8 @@ fn migrate_proxy_auth(
         migration_generation,
         kind: ExtractedSecretKind::ProxyAuth,
         env_owner: None,
+        provider_owner: None,
+        mcp_owner: None,
     });
     Ok(true)
 }
@@ -3677,9 +4519,36 @@ fn plan_mcp_section(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    plan_mcp_document(original, extracted, minimum_generation)
+}
+
+fn plan_mcp_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
     let mut root: Value = serde_json::from_slice(&original)?;
     let (data, revision) = section_data_mut(&mut root)?;
     let migration_generation = next_revision(revision.unwrap_or(0))?.max(minimum_generation);
+    let changed = migrate_mcp_document_data(data, extracted, migration_generation)?;
+    if !changed {
+        return Ok(None);
+    }
+    validate_mcp_data(data)?;
+    advance_or_wrap(&mut root, revision.is_some(), migration_generation);
+    Ok(Some(PlannedSection {
+        name: MCP_FILE,
+        bytes: serde_json::to_vec_pretty(&root)?,
+        original,
+        migration_generation,
+    }))
+}
+
+fn migrate_mcp_document_data(
+    data: &mut Value,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+) -> ConfigStoreResult<bool> {
     let mut changed = false;
     if let Some(servers) = data.get_mut("servers").and_then(Value::as_array_mut) {
         for server in servers {
@@ -3711,17 +4580,7 @@ fn plan_mcp_section(
             }
         }
     }
-    if !changed {
-        return Ok(None);
-    }
-    validate_mcp_data(data)?;
-    advance_or_wrap(&mut root, revision.is_some(), migration_generation);
-    Ok(Some(PlannedSection {
-        name: MCP_FILE,
-        bytes: serde_json::to_vec_pretty(&root)?,
-        original,
-        migration_generation,
-    }))
+    Ok(changed)
 }
 
 fn plan_broker_section(
@@ -3735,6 +4594,15 @@ fn plan_broker_section(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    plan_broker_document(data_dir, original, extracted, minimum_generation)
+}
+
+fn plan_broker_document(
+    data_dir: &Path,
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
     let mut root: Value = serde_json::from_slice(&original)?;
     let object = root.as_object_mut().ok_or_else(|| {
         ConfigStoreError::Validation("broker configuration must be an object".to_string())
@@ -3801,6 +4669,8 @@ fn plan_broker_section(
                 migration_generation: minimum_generation,
                 kind: ExtractedSecretKind::ExternalBroker,
                 env_owner: None,
+                provider_owner: None,
+                mcp_owner: None,
             });
         }
     } else {
@@ -3881,8 +4751,10 @@ fn migrate_mcp_transport(
                 credential_ref: reference,
                 value: value.expect("one header credential exists"),
                 migration_generation,
-                kind: ExtractedSecretKind::Other,
+                kind: ExtractedSecretKind::Mcp,
                 env_owner: None,
+                provider_owner: None,
+                mcp_owner: Some(server_id.to_string()),
             });
             changed = true;
         }
@@ -3950,8 +4822,10 @@ fn migrate_named_secret_map(
                 credential_ref: reference,
                 value,
                 migration_generation,
-                kind: ExtractedSecretKind::Other,
+                kind: ExtractedSecretKind::Mcp,
                 env_owner: None,
+                provider_owner: None,
+                mcp_owner: Some(server_id.to_string()),
             });
         }
     }
@@ -4111,6 +4985,7 @@ fn stage_file(
         staged_name: name.to_string(),
         sha256: sha256(candidate),
         original_sha256: original.map(sha256),
+        original_present: Some(original.is_some()),
         migration_generation,
         sensitive,
         install_mode,
@@ -4655,7 +5530,7 @@ fn recover_committed(
     let mut manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&manifest)?;
     if manifest.state == MigrationState::Complete {
-        if manifest.migration_scope == Some(MigrationScope::SectionSplit) {
+        if is_section_layout_scope(manifest.migration_scope) {
             verify_section_split_completion(data_dir, &manifest)?;
             persist_section_layout_completion_ledger(data_dir, &manifest)?;
         }
@@ -5305,11 +6180,13 @@ fn section_split_completion_members(
     manifest: &MigrationManifest,
 ) -> ConfigStoreResult<BTreeMap<String, crate::section_facade::SectionLayoutCompletionMember>> {
     let mut members = BTreeMap::new();
-    for file in manifest
-        .files
-        .iter()
-        .filter(|file| file.name != crate::SECTION_LAYOUT_FILE)
-    {
+    for file in manifest.files.iter().filter(|file| {
+        file.name != crate::SECTION_LAYOUT_FILE
+            && !matches!(
+                file.install_mode,
+                InstallMode::LegacyCleanup | InstallMode::SourceGuard
+            )
+    }) {
         let revision = file.migration_generation.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "section layout completion member has no revision".to_string(),
@@ -5340,7 +6217,7 @@ fn section_split_manifest_matches_completion(
     marker_sha256: &str,
     completion: &crate::section_facade::SectionLayoutCompletion,
 ) -> ConfigStoreResult<bool> {
-    if manifest.migration_scope != Some(MigrationScope::SectionSplit) {
+    if !is_section_layout_scope(manifest.migration_scope) {
         return Ok(false);
     }
     let Some(marker) = manifest
@@ -5360,7 +6237,7 @@ fn persist_section_layout_completion_ledger(
     manifest: &MigrationManifest,
 ) -> ConfigStoreResult<()> {
     if manifest.state != MigrationState::Complete
-        || manifest.migration_scope != Some(MigrationScope::SectionSplit)
+        || !is_section_layout_scope(manifest.migration_scope)
     {
         return Err(ConfigStoreError::Validation(
             "section layout completion ledger requires a complete split transaction".to_string(),
@@ -5377,8 +6254,39 @@ fn persist_section_layout_completion_ledger(
     let ledger = SectionLayoutCompletionLedger {
         version: SECTION_LAYOUT_COMPLETION_LEDGER_VERSION,
         state: MigrationState::Complete,
+        facade_compound: manifest.migration_scope == Some(MigrationScope::FacadeCompound),
         marker_sha256,
         completion,
+        legacy_cleanup: manifest
+            .files
+            .iter()
+            .filter(|file| {
+                file.install_mode == InstallMode::LegacyCleanup
+                    && is_durable_legacy_authority(&file.name)
+            })
+            .map(|file| (file.name.clone(), file.sha256.clone()))
+            .collect(),
+        legacy_source_guards: manifest
+            .files
+            .iter()
+            .filter(|file| {
+                file.install_mode == InstallMode::SourceGuard
+                    && is_durable_legacy_authority(&file.name)
+            })
+            .map(|file| {
+                let base = match file.original_present {
+                    Some(false) => FacadeSourceBase::Missing,
+                    Some(true) => FacadeSourceBase::Regular {
+                        sha256: file
+                            .original_sha256
+                            .clone()
+                            .expect("validated guard has a content hash"),
+                    },
+                    None => unreachable!("compound guards are presence-aware"),
+                };
+                (file.name.clone(), base)
+            })
+            .collect(),
     };
     let bytes = serde_json::to_vec_pretty(&ledger)?;
     if read_optional_migration_file(&data_dir.join(SECTION_LAYOUT_COMPLETION_FILE))?
@@ -5396,20 +6304,25 @@ pub(crate) fn section_layout_completion_evidence_matches(
     completion: &crate::section_facade::SectionLayoutCompletion,
 ) -> ConfigStoreResult<bool> {
     let marker_sha256 = sha256(marker);
-    if let Some(bytes) = read_optional_migration_file(&data_dir.join(MANIFEST_FILE))? {
-        let manifest: MigrationManifest = match serde_json::from_slice(&bytes) {
+    let manifest_scope = if let Some(manifest_bytes) =
+        read_optional_migration_file(&data_dir.join(MANIFEST_FILE))?
+    {
+        let manifest: MigrationManifest = match serde_json::from_slice(&manifest_bytes) {
             Ok(manifest) => manifest,
             Err(_) => return Ok(false),
         };
         if validate_manifest(&manifest).is_err() || manifest.state == MigrationState::Pending {
             return Ok(false);
         }
-        if manifest.migration_scope == Some(MigrationScope::SectionSplit)
+        if is_section_layout_scope(manifest.migration_scope)
             && !section_split_manifest_matches_completion(&manifest, &marker_sha256, completion)?
         {
             return Ok(false);
         }
-    }
+        manifest.migration_scope
+    } else {
+        None
+    };
 
     let Some(bytes) = read_optional_migration_file(&data_dir.join(SECTION_LAYOUT_COMPLETION_FILE))?
     else {
@@ -5419,10 +6332,48 @@ pub(crate) fn section_layout_completion_evidence_matches(
         Ok(ledger) => ledger,
         Err(_) => return Ok(false),
     };
+    let durable_evidence_names = ledger
+        .legacy_cleanup
+        .keys()
+        .chain(ledger.legacy_source_guards.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_durable_names = durable_legacy_authority_names();
+    let durable_evidence_shape_valid = if ledger.facade_compound {
+        durable_evidence_names == expected_durable_names
+            && ledger
+                .legacy_cleanup
+                .keys()
+                .all(|name| !ledger.legacy_source_guards.contains_key(name))
+            && manifest_scope.is_none_or(|scope| scope == MigrationScope::FacadeCompound)
+    } else {
+        durable_evidence_names.is_empty()
+            && manifest_scope.is_none_or(|scope| scope == MigrationScope::SectionSplit)
+    };
     Ok(ledger.version == SECTION_LAYOUT_COMPLETION_LEDGER_VERSION
         && ledger.state == MigrationState::Complete
         && ledger.marker_sha256 == marker_sha256
-        && &ledger.completion == completion)
+        && &ledger.completion == completion
+        && durable_evidence_shape_valid
+        && ledger.legacy_cleanup.iter().all(|(name, expected)| {
+            is_sha256_hex(expected)
+                && read_target_or_empty(&data_dir.join(name))
+                    .map(|bytes| sha256(&bytes) == *expected)
+                    .unwrap_or(false)
+        })
+        && ledger.legacy_source_guards.iter().all(|(name, expected)| {
+            let current = read_optional_target(&data_dir.join(name));
+            match (expected, current) {
+                (FacadeSourceBase::Missing, Ok(None)) => true,
+                (
+                    FacadeSourceBase::Regular {
+                        sha256: expected_hash,
+                    },
+                    Ok(Some(bytes)),
+                ) => is_sha256_hex(expected_hash) && sha256(&bytes) == *expected_hash,
+                _ => false,
+            }
+        }))
 }
 
 fn capture_durable_section_split_credentials(
@@ -5478,10 +6429,22 @@ fn section_split_targets_match_manifest(
         .iter()
         .filter(|file| file.name != crate::SECTION_LAYOUT_FILE)
     {
+        if file.install_mode == InstallMode::SourceGuard {
+            if !source_guard_matches(&data_dir.join(&file.name), file)? {
+                return Ok(false);
+            }
+            continue;
+        }
+        let current = read_target_or_empty(&data_dir.join(&file.name))?;
+        if file.install_mode == InstallMode::LegacyCleanup {
+            if sha256(&current) != file.sha256 {
+                return Ok(false);
+            }
+            continue;
+        }
         let Some(expected_revision) = file.migration_generation else {
             return Ok(false);
         };
-        let current = read_target_or_empty(&data_dir.join(&file.name))?;
         let revision = if file.name == CREDENTIALS_FILE {
             CredentialStore::validate_section_document_revision(&current)?
         } else {
@@ -5498,7 +6461,7 @@ fn finalize_section_split_completion(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
 ) -> ConfigStoreResult<()> {
-    if manifest.migration_scope != Some(MigrationScope::SectionSplit)
+    if !is_section_layout_scope(manifest.migration_scope)
         || manifest.state != MigrationState::Pending
     {
         return Err(ConfigStoreError::Validation(
@@ -5527,6 +6490,29 @@ fn finalize_section_split_completion(
                 if let Err(error) =
                     capture_durable_section_split_credentials(data_dir, manifest, file_index)
                 {
+                    abort_section_split_transaction(data_dir, manifest)?;
+                    return Err(error);
+                }
+                continue;
+            }
+
+            if manifest.files[file_index].install_mode == InstallMode::SourceGuard {
+                if !source_guard_matches(&data_dir.join(&name), &manifest.files[file_index])? {
+                    let error = ConfigStoreError::Validation(
+                        "facade source changed during committed compound migration".to_string(),
+                    );
+                    abort_section_split_transaction(data_dir, manifest)?;
+                    return Err(error);
+                }
+                continue;
+            }
+
+            if manifest.files[file_index].install_mode == InstallMode::LegacyCleanup {
+                let current = read_target_or_empty(&data_dir.join(&name))?;
+                if sha256(&current) != manifest.files[file_index].sha256 {
+                    let error = ConfigStoreError::Validation(
+                        "legacy source changed during committed facade migration".to_string(),
+                    );
                     abort_section_split_transaction(data_dir, manifest)?;
                     return Err(error);
                 }
@@ -5596,7 +6582,7 @@ fn verify_section_split_completion(
     data_dir: &Path,
     manifest: &MigrationManifest,
 ) -> ConfigStoreResult<()> {
-    if manifest.migration_scope != Some(MigrationScope::SectionSplit) {
+    if !is_section_layout_scope(manifest.migration_scope) {
         return Ok(());
     }
     let marker = manifest
@@ -5647,13 +6633,21 @@ fn install_pending(
         let Some(file_index) = manifest.files.iter().position(|file| file.name == name) else {
             continue;
         };
-        if manifest.migration_scope == Some(MigrationScope::SectionSplit)
-            && name == crate::SECTION_LAYOUT_FILE
-        {
+        if is_section_layout_scope(manifest.migration_scope) && name == crate::SECTION_LAYOUT_FILE {
             finalize_section_split_completion(data_dir, manifest)?;
         }
         let file = manifest.files[file_index].clone();
         let target = data_dir.join(&file.name);
+        if file.install_mode == InstallMode::SourceGuard {
+            if !source_guard_matches(&target, &file)? {
+                let error = ConfigStoreError::Validation(
+                    "facade source changed during committed compound migration".to_string(),
+                );
+                abort_section_split_transaction(data_dir, manifest)?;
+                return Err(error);
+            }
+            continue;
+        }
         if file.install_mode == InstallMode::Exact && file.name == CREDENTIALS_FILE {
             install_exact_credential_member(
                 data_dir,
@@ -5707,7 +6701,7 @@ fn install_pending(
         } else if file.name == CREDENTIALS_FILE {
             let store = CredentialStore::open(data_dir);
             store.commit_migration(&staged)?;
-            if manifest.migration_scope == Some(MigrationScope::SectionSplit) {
+            if is_section_layout_scope(manifest.migration_scope) {
                 store.ensure_initialized_for_section_layout()?;
             }
         } else {
@@ -5716,41 +6710,25 @@ fn install_pending(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),
             };
-            if current_hash.as_deref() != Some(file.sha256.as_str()) {
-                let expected = file.original_sha256.as_deref().ok_or_else(|| {
-                    ConfigStoreError::Validation(
-                        "migration section base hash is missing".to_string(),
-                    )
-                })?;
-                if !AtomicFileStore::new(&target)
-                    .sensitive(file.sensitive)
-                    .write_bytes_if_hash(expected, &staged)?
-                {
-                    if !rebase_changed_section(
-                        data_dir,
-                        manifest,
-                        file_index,
-                        #[cfg(test)]
-                        fault,
-                    )? {
-                        continue;
-                    }
-                    let rebased = manifest.files[file_index].clone();
-                    let rebased_bytes =
-                        read_managed_file(data_dir, &manifest.stage_dir, &rebased.staged_name)?;
-                    let expected = rebased.original_sha256.as_deref().ok_or_else(|| {
-                        ConfigStoreError::Validation(
-                            "migration section base hash is missing".to_string(),
-                        )
-                    })?;
-                    if !AtomicFileStore::new(&target)
-                        .sensitive(rebased.sensitive)
-                        .write_bytes_if_hash(expected, &rebased_bytes)?
-                    {
-                        return Err(ConfigStoreError::Validation(
-                            "configuration section changed repeatedly during migration".to_string(),
-                        ));
-                    }
+            if current_hash.as_deref() != Some(file.sha256.as_str())
+                && !install_migration_member_if_base_matches(&target, &file, &staged)?
+            {
+                if !rebase_changed_section(
+                    data_dir,
+                    manifest,
+                    file_index,
+                    #[cfg(test)]
+                    fault,
+                )? {
+                    continue;
+                }
+                let rebased = manifest.files[file_index].clone();
+                let rebased_bytes =
+                    read_managed_file(data_dir, &manifest.stage_dir, &rebased.staged_name)?;
+                if !install_migration_member_if_base_matches(&target, &rebased, &rebased_bytes)? {
+                    return Err(ConfigStoreError::Validation(
+                        "configuration section changed repeatedly during migration".to_string(),
+                    ));
                 }
             }
         }
@@ -5774,13 +6752,47 @@ fn install_pending(
         }
         #[cfg(test)]
         if fault == Some(MigrationFault::AfterSectionLayout)
-            && manifest.migration_scope == Some(MigrationScope::SectionSplit)
+            && is_section_layout_scope(manifest.migration_scope)
             && file.name == crate::SECTION_LAYOUT_FILE
         {
             return Err(injected_fault());
         }
     }
     Ok(())
+}
+
+fn source_guard_matches(target: &Path, file: &StagedFile) -> ConfigStoreResult<bool> {
+    let current = read_optional_target(target)?;
+    Ok(match (file.original_present, current.as_deref()) {
+        (Some(false), None) => true,
+        (Some(true), Some(bytes)) => {
+            file.original_sha256.as_deref() == Some(sha256(bytes).as_str())
+        }
+        _ => false,
+    })
+}
+
+fn install_migration_member_if_base_matches(
+    target: &Path,
+    file: &StagedFile,
+    staged: &[u8],
+) -> ConfigStoreResult<bool> {
+    let store = AtomicFileStore::new(target).sensitive(file.sensitive);
+    match file.original_present {
+        Some(false) => store.write_bytes_if_state(None, staged),
+        Some(true) => {
+            let expected = file.original_sha256.as_deref().ok_or_else(|| {
+                ConfigStoreError::Validation("migration section base hash is missing".to_string())
+            })?;
+            store.write_bytes_if_state(Some(expected), staged)
+        }
+        None => {
+            let expected = file.original_sha256.as_deref().ok_or_else(|| {
+                ConfigStoreError::Validation("migration section base hash is missing".to_string())
+            })?;
+            store.write_bytes_if_hash(expected, staged)
+        }
+    }
 }
 
 fn parse_exact_section_document(
@@ -6093,6 +7105,7 @@ fn install_rebased_active_section_member(
     file.staged_name = staged_name;
     file.sha256 = sha256(&rebased);
     file.original_sha256 = Some(current_hash.clone());
+    file.original_present = Some(true);
     file.expected_revision = Some(current_revision);
     write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
     if sha256(&rebased) != current_hash
@@ -6190,6 +7203,7 @@ fn install_rebased_cluster_config_member(
     file.staged_name = staged_name;
     file.sha256 = sha256(&rebased);
     file.original_sha256 = Some(current_hash.clone());
+    file.original_present = Some(true);
     write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
     if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
         return Err(ConfigStoreError::Validation(
@@ -6255,6 +7269,7 @@ fn install_rebased_notification_config_member(
     file.staged_name = staged_name;
     file.sha256 = sha256(&rebased);
     file.original_sha256 = Some(current_hash.clone());
+    file.original_present = Some(true);
     write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
     if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
         return Err(ConfigStoreError::Validation(
@@ -6408,6 +7423,7 @@ fn install_rebased_env_config_member(
     file.staged_name = staged_name;
     file.sha256 = sha256(&rebased);
     file.original_sha256 = Some(current_hash.clone());
+    file.original_present = Some(true);
     write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
     if !AtomicFileStore::new(&target).write_bytes_if_hash_with_backup(&current_hash, &rebased)? {
         return Err(ConfigStoreError::Validation(
@@ -6577,6 +7593,7 @@ fn install_rebased_proxy_config_member(
     file.staged_name = staged_name;
     file.sha256 = sha256(&rebased);
     file.original_sha256 = Some(current_hash.clone());
+    file.original_present = Some(true);
     write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
     #[cfg(test)]
     if fault == Some(MigrationFault::AfterExactProxyConfigRebaseManifestExternalWrite) {
@@ -6830,6 +7847,7 @@ fn install_exact_credential_member(
         file.staged_name = staged_name;
         file.sha256 = sha256(&rebased);
         file.original_sha256 = Some(current_hash);
+        file.original_present = Some(true);
         file.expected_revision = Some(current_revision);
         file.required_credential_refs = remaining_required_refs;
         write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
@@ -6995,11 +8013,18 @@ fn rebase_changed_section(
     file_index: usize,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<bool> {
-    if manifest.migration_scope == Some(MigrationScope::SectionSplit) {
+    if is_section_layout_scope(manifest.migration_scope) {
         let file = manifest.files[file_index].clone();
         if file.name == crate::SECTION_LAYOUT_FILE || file.name == CREDENTIALS_FILE {
             let error = ConfigStoreError::Validation(
                 "layout transaction metadata changed during committed migration".to_string(),
+            );
+            abort_section_split_transaction(data_dir, manifest)?;
+            return Err(error);
+        }
+        if file.install_mode == InstallMode::LegacyCleanup {
+            let error = ConfigStoreError::Validation(
+                "legacy source changed during committed facade migration".to_string(),
             );
             abort_section_split_transaction(data_dir, manifest)?;
             return Err(error);
@@ -7040,6 +8065,7 @@ fn rebase_changed_section(
         file.staged_name = staged_name;
         file.sha256 = current_hash.clone();
         file.original_sha256 = Some(current_hash);
+        file.original_present = Some(true);
         file.migration_generation = Some(revision);
         write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
         return Ok(false);
@@ -7117,6 +8143,7 @@ fn rebase_changed_section(
     manifest.files[file_index].staged_name = staged_name;
     manifest.files[file_index].sha256 = sha256(&section.bytes);
     manifest.files[file_index].original_sha256 = Some(sha256(&section.original));
+    manifest.files[file_index].original_present = Some(true);
     manifest.files[file_index].migration_generation = Some(section.migration_generation);
     write_manifest(data_dir.join(MANIFEST_FILE), manifest)?;
     #[cfg(test)]
@@ -7130,7 +8157,7 @@ fn abort_section_split_transaction(
     data_dir: &Path,
     manifest: &MigrationManifest,
 ) -> ConfigStoreResult<()> {
-    if manifest.migration_scope != Some(MigrationScope::SectionSplit) {
+    if !is_section_layout_scope(manifest.migration_scope) {
         return Ok(());
     }
     let journal_bytes =
@@ -7145,11 +8172,9 @@ fn abort_section_split_transaction(
             "section migration journal does not match committed manifest".to_string(),
         ));
     }
-    for file in manifest
-        .files
-        .iter()
-        .filter(|file| file.name != CREDENTIALS_FILE)
-    {
+    for file in manifest.files.iter().filter(|file| {
+        file.name != CREDENTIALS_FILE && file.install_mode != InstallMode::SourceGuard
+    }) {
         // Adopted concurrent edits deliberately use base == candidate and must
         // survive a later failure in another member.
         if file.original_sha256.as_deref() == Some(file.sha256.as_str()) {
@@ -7173,6 +8198,14 @@ fn abort_section_split_transaction(
             // Not installed, or changed by an external writer. Preserve it.
             continue;
         }
+        if initial_file.original_present == Some(false) {
+            if !AtomicFileStore::new(&target).remove_if_hash(installed_hash)? {
+                return Err(ConfigStoreError::Validation(
+                    "section changed repeatedly during migration rollback".to_string(),
+                ));
+            }
+            continue;
+        }
         let original =
             read_encrypted_migration_backup(data_dir, &manifest.transaction_id, &file.name)?;
         if initial_file.original_sha256.as_deref() != Some(sha256(&original).as_str()) {
@@ -7180,49 +8213,22 @@ fn abort_section_split_transaction(
                 "section migration backup failed integrity validation".to_string(),
             ));
         }
-        if original.is_empty() {
+        if initial_file.original_present.is_none() && original.is_empty() {
             if !AtomicFileStore::new(&target).remove_if_hash(installed_hash)? {
                 return Err(ConfigStoreError::Validation(
                     "section changed repeatedly during migration rollback".to_string(),
                 ));
             }
-        } else if !AtomicFileStore::new(&target).write_bytes_if_hash(installed_hash, &original)? {
+            continue;
+        }
+        if !AtomicFileStore::new(&target).write_bytes_if_hash(installed_hash, &original)? {
             return Err(ConfigStoreError::Validation(
                 "section changed repeatedly during migration rollback".to_string(),
             ));
         }
     }
 
-    let credential_file = initial
-        .files
-        .iter()
-        .find(|file| file.name == CREDENTIALS_FILE)
-        .ok_or_else(|| {
-            ConfigStoreError::Validation("section migration journal is incomplete".to_string())
-        })?;
-    if credential_file.original_sha256.is_none() {
-        let target = data_dir.join(CREDENTIALS_FILE);
-        let current = read_target_or_empty(&target)?;
-        if !current.is_empty() {
-            let empty_document = serde_json::from_slice::<Value>(&current)
-                .ok()
-                .and_then(|value| value.get("data").cloned())
-                .and_then(|value| value.get("entries").cloned())
-                .and_then(|value| value.as_object().cloned())
-                .is_some_and(|entries| entries.is_empty());
-            if empty_document {
-                let current_hash = sha256(&current);
-                if !AtomicFileStore::new(&target)
-                    .sensitive(true)
-                    .remove_if_hash(&current_hash)?
-                {
-                    return Err(ConfigStoreError::Validation(
-                        "credential section changed during migration rollback".to_string(),
-                    ));
-                }
-            }
-        }
-    }
+    rollback_section_split_credentials(data_dir, &initial)?;
 
     let mut complete = manifest.clone();
     complete.state = MigrationState::Complete;
@@ -7233,8 +8239,76 @@ fn abort_section_split_transaction(
     sync_dir(data_dir)
 }
 
+fn rollback_section_split_credentials(
+    data_dir: &Path,
+    initial: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let credential_file = initial
+        .files
+        .iter()
+        .find(|file| file.name == CREDENTIALS_FILE)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation("section migration journal is incomplete".to_string())
+        })?;
+    let original = match credential_file.original_present {
+        Some(false) => Vec::new(),
+        Some(true) | None if credential_file.original_sha256.is_some() => {
+            read_encrypted_migration_backup(data_dir, &initial.transaction_id, CREDENTIALS_FILE)?
+        }
+        Some(true) => {
+            return Err(ConfigStoreError::Validation(
+                "credential migration backup is missing".to_string(),
+            ));
+        }
+        None => Vec::new(),
+    };
+    let staged = read_managed_file(data_dir, &initial.stage_dir, &credential_file.staged_name)?;
+    let changed_refs = CredentialStore::changed_refs_between_documents(&original, &staged)?;
+    let target = data_dir.join(CREDENTIALS_FILE);
+    for _ in 0..16 {
+        let current = read_target_or_empty(&target)?;
+        if current.is_empty() {
+            return Ok(());
+        }
+        let current_hash = sha256(&current);
+        let (rolled_back, _, changed) = CredentialStore::rollback_exact_transaction_documents(
+            &original,
+            &staged,
+            &current,
+            &changed_refs,
+        )?;
+        if changed
+            && !AtomicFileStore::new(&target)
+                .sensitive(true)
+                .write_bytes_if_hash(&current_hash, &rolled_back)?
+        {
+            continue;
+        }
+        let durable = if changed { rolled_back } else { current };
+        let empty_document = serde_json::from_slice::<Value>(&durable)
+            .ok()
+            .and_then(|value| value.get("data").cloned())
+            .and_then(|value| value.get("entries").cloned())
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|entries| entries.is_empty());
+        if credential_file.original_present == Some(false) && empty_document {
+            let durable_hash = sha256(&durable);
+            if !AtomicFileStore::new(&target)
+                .sensitive(true)
+                .remove_if_hash(&durable_hash)?
+            {
+                continue;
+            }
+        }
+        return Ok(());
+    }
+    Err(ConfigStoreError::Validation(
+        "credential section changed repeatedly during migration rollback".to_string(),
+    ))
+}
+
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
-    let section_split = manifest.migration_scope == Some(MigrationScope::SectionSplit);
+    let section_split = is_section_layout_scope(manifest.migration_scope);
     if section_split {
         verify_section_split_completion(data_dir, &manifest)?;
     }
@@ -7244,7 +8318,8 @@ fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> Confi
         .iter()
         .any(|file| matches!(file.name.as_str(), PROVIDERS_FILE | MCP_FILE | CONFIG_FILE))
         || manifest.exact_scope.is_some();
-    if contains_non_broker_config {
+    let compound = manifest.migration_scope == Some(MigrationScope::FacadeCompound);
+    if contains_non_broker_config && !compound {
         let proxy_clear_tombstones = proxy_clear_tombstones_from_manifest(&manifest);
         let env_clear_tombstones = env_clear_tombstones_from_manifest(&manifest);
         let notification_clear_tombstones = notification_clear_tombstones_from_manifest(&manifest);
@@ -7255,11 +8330,12 @@ fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> Confi
             &notification_clear_tombstones,
         )?;
     }
-    if contains_broker {
+    if contains_broker && !compound {
         scrub_broker_credentials_from_backups(data_dir)?;
     }
-    if manifest.migration_scope == Some(MigrationScope::ClusterFabric)
-        || manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric)
+    if !compound
+        && (manifest.migration_scope == Some(MigrationScope::ClusterFabric)
+            || manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric))
     {
         scrub_cluster_credentials_from_backups(data_dir)?;
     }
@@ -7329,6 +8405,8 @@ fn scrub_broker_credentials_from_backups(data_dir: &Path) -> ConfigStoreResult<u
                 migration_generation: 1,
                 kind: ExtractedSecretKind::ExternalBroker,
                 env_owner: None,
+                provider_owner: None,
+                mcp_owner: None,
             }],
         )?;
         let prepared = store.prepare_migration(resolved)?;
@@ -7638,6 +8716,8 @@ fn scrub_provider_instance_credentials(
                         migration_generation: 1,
                         kind: ExtractedSecretKind::Other,
                         env_owner: None,
+                        provider_owner: None,
+                        mcp_owner: None,
                     });
                 } else {
                     instance.remove("api_key");
@@ -7687,7 +8767,7 @@ fn cleanup_transaction_dirs(
     Ok(())
 }
 
-fn discard_uncommitted(data_dir: &Path) -> ConfigStoreResult<()> {
+pub(crate) fn discard_uncommitted(data_dir: &Path) -> ConfigStoreResult<()> {
     let journal_path = data_dir.join(JOURNAL_FILE);
     let Some(bytes) = read_optional_migration_file(&journal_path)? else {
         return Ok(());
@@ -8104,6 +9184,76 @@ fn invalid_migration_file() -> std::io::Error {
     )
 }
 
+fn facade_source_base_matches_file(base: &FacadeSourceBase, file: &StagedFile) -> bool {
+    match (base, file.original_present, file.original_sha256.as_deref()) {
+        (FacadeSourceBase::Missing, Some(false), None) => true,
+        (FacadeSourceBase::Regular { sha256 }, Some(true), Some(original_sha256)) => {
+            sha256 == original_sha256
+        }
+        _ => false,
+    }
+}
+
+fn facade_source_member_was_rebased(file: &StagedFile) -> bool {
+    file.install_mode == InstallMode::Migration
+        && file.staged_name != file.name
+        && file
+            .staged_name
+            .strip_prefix(&format!("{}.rebase.", file.name))
+            .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
+        && crate::SECTION_DESCRIPTORS
+            .iter()
+            .any(|descriptor| descriptor.file_name == file.name)
+}
+
+fn facade_source_attestation_is_valid(manifest: &MigrationManifest) -> bool {
+    if manifest.migration_scope != Some(MigrationScope::FacadeCompound) {
+        return manifest.source_attestation.is_empty();
+    }
+
+    let expected = crate::section_facade::preflight_source_names();
+    if manifest.source_attestation.len() != expected.len()
+        || expected
+            .iter()
+            .any(|name| !manifest.source_attestation.contains_key(name))
+    {
+        return false;
+    }
+
+    for (name, base) in &manifest.source_attestation {
+        if matches!(base, FacadeSourceBase::Regular { sha256 } if !is_sha256_hex(sha256)) {
+            return false;
+        }
+        if matches!(
+            name.as_str(),
+            MANIFEST_FILE | JOURNAL_FILE | SECTION_LAYOUT_COMPLETION_FILE
+        ) || is_compound_internal_derivative_source(name)
+        {
+            if manifest.files.iter().any(|file| file.name == *name) {
+                return false;
+            }
+            continue;
+        }
+
+        let Some(file) = manifest.files.iter().find(|file| file.name == *name) else {
+            return false;
+        };
+        if !facade_source_base_matches_file(base, file) && !facade_source_member_was_rebased(file) {
+            return false;
+        }
+        if file.install_mode == InstallMode::SourceGuard {
+            let guard_candidate_matches = match base {
+                FacadeSourceBase::Missing => file.sha256 == sha256(&[]),
+                FacadeSourceBase::Regular { sha256 } => file.sha256 == *sha256,
+            };
+            if !guard_candidate_matches {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
     let expected_stage = format!("{STAGE_PREFIX}{}", manifest.transaction_id);
     let unique = manifest
@@ -8148,6 +9298,26 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                 && crate::SECTION_DESCRIPTORS
                     .iter()
                     .all(|descriptor| unique.contains(descriptor.file_name))
+                && manifest
+                    .files
+                    .iter()
+                    .all(|file| file.install_mode != InstallMode::LegacyCleanup)
+        }
+        (false, Some(MigrationScope::FacadeCompound)) => {
+            unique.contains(CREDENTIALS_FILE)
+                && unique.contains(crate::SECTION_LAYOUT_FILE)
+                && manifest
+                    .files
+                    .last()
+                    .is_some_and(|file| file.name == crate::SECTION_LAYOUT_FILE)
+                && crate::SECTION_DESCRIPTORS
+                    .iter()
+                    .all(|descriptor| unique.contains(descriptor.file_name))
+                && manifest.files.iter().all(|file| match file.install_mode {
+                    InstallMode::LegacyCleanup => is_legacy_cleanup_file(&file.name),
+                    InstallMode::SourceGuard => valid_source_guard_name(&file.name),
+                    InstallMode::Migration | InstallMode::Exact => true,
+                })
         }
         (true, Some(_)) => false,
     };
@@ -8184,6 +9354,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         (false, Some(_)) => false,
     };
     let exact_authority = exact_authority_file(manifest);
+    let source_attestation_valid = facade_source_attestation_is_valid(manifest);
     let exact_shape_valid = !exact_transaction
         || ((manifest.files.len() == 2 || manifest.files.len() == 3)
             && manifest
@@ -8214,22 +9385,52 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
         || !migration_scope_valid
         || !exact_scope_valid
         || !exact_shape_valid
+        || !source_attestation_valid
         || manifest.files.iter().any(|file| {
-            !is_allowed_manifest_file(&file.name)
-                || file.sha256.len() != 64
+            !(is_allowed_manifest_file(&file.name)
+                || (manifest.migration_scope == Some(MigrationScope::FacadeCompound)
+                    && file.install_mode == InstallMode::SourceGuard
+                    && valid_source_guard_name(&file.name)))
+                || !is_sha256_hex(&file.sha256)
                 || !valid_staged_name(file)
+                || file
+                    .original_sha256
+                    .as_ref()
+                    .is_some_and(|hash| !is_sha256_hex(hash))
                 || (file.name != CREDENTIALS_FILE
-                    && file
-                        .original_sha256
-                        .as_ref()
-                        .is_none_or(|hash| hash.len() != 64))
+                    && match file.original_present {
+                        Some(false) => file.original_sha256.is_some(),
+                        Some(true) | None => file
+                            .original_sha256
+                            .as_ref()
+                            .is_none_or(|hash| !is_sha256_hex(hash)),
+                    })
                 || (file.install_mode == InstallMode::Exact
                     && file
                         .original_sha256
                         .as_ref()
-                        .is_none_or(|hash| hash.len() != 64))
+                        .is_none_or(|hash| !is_sha256_hex(hash)))
+                || (file.install_mode == InstallMode::LegacyCleanup
+                    && (file.migration_generation.is_some()
+                        || file.expected_revision.is_some()
+                        || file.name == CREDENTIALS_FILE
+                        || file.name == crate::SECTION_LAYOUT_FILE))
+                || (file.install_mode == InstallMode::SourceGuard
+                    && (file.migration_generation.is_some()
+                        || file.expected_revision.is_some()
+                        || file.name == CREDENTIALS_FILE
+                        || file.name == crate::SECTION_LAYOUT_FILE))
                 || (file.name == CREDENTIALS_FILE && !file.sensitive)
-                || (file.name != CREDENTIALS_FILE && file.sensitive)
+                || (file.name != CREDENTIALS_FILE
+                    && file.sensitive
+                    && !matches!(
+                        file.install_mode,
+                        InstallMode::LegacyCleanup | InstallMode::SourceGuard
+                    ))
+                || (matches!(
+                    file.install_mode,
+                    InstallMode::LegacyCleanup | InstallMode::SourceGuard
+                ) && !file.sensitive)
                 || (file.expected_revision.is_some()
                     && file.name != CREDENTIALS_FILE
                     && !(exact_transaction
@@ -8238,7 +9439,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                 || file
                     .transaction_base_sha256
                     .as_ref()
-                    .is_some_and(|hash| hash.len() != 64)
+                    .is_some_and(|hash| !is_sha256_hex(hash))
                 || !valid_credential_ref_metadata(file)
         })
     {
@@ -8270,6 +9471,68 @@ fn is_allowed_manifest_file(name: &str) -> bool {
             | MODEL_POLICY_FILE
             | MODEL_LIMITS_FILE
     ) || name == crate::SECTION_LAYOUT_FILE
+        || is_legacy_cleanup_file(name)
+}
+
+fn valid_source_guard_name(name: &str) -> bool {
+    crate::section_facade::preflight_source_names().contains(name)
+        && !matches!(
+            name,
+            MANIFEST_FILE
+                | JOURNAL_FILE
+                | SECTION_LAYOUT_COMPLETION_FILE
+                | crate::SECTION_LAYOUT_FILE
+        )
+}
+
+fn is_compound_internal_derivative_source(name: &str) -> bool {
+    ["bak", "bak.1", "bak.2"]
+        .into_iter()
+        .any(|suffix| name == format!("{CREDENTIALS_FILE}.{suffix}"))
+}
+
+fn is_legacy_cleanup_file(name: &str) -> bool {
+    matches!(name, CONFIG_FILE | BROKER_FILE)
+        || [
+            CONFIG_FILE,
+            PROVIDERS_FILE,
+            MCP_FILE,
+            BROKER_FILE,
+            CONNECT_FILE,
+        ]
+        .into_iter()
+        .any(|base| {
+            ["bak", "bak.1", "bak.2"]
+                .into_iter()
+                .any(|suffix| name == format!("{base}.{suffix}"))
+        })
+}
+
+/// Legacy root configuration is no longer an active section authority once
+/// the facade marker is published. Keep its scrubbed primary/backups bound to
+/// the completion evidence. Provider/MCP/connect/credential backups remain
+/// active LKG generations and broker.json remains an independently managed
+/// runtime source, so normal post-activation writes must not invalidate the
+/// section layout.
+fn is_durable_legacy_authority(name: &str) -> bool {
+    durable_legacy_authority_names().contains(name)
+}
+
+fn durable_legacy_authority_names() -> BTreeSet<String> {
+    std::iter::once(CONFIG_FILE.to_string())
+        .chain(
+            ["bak", "bak.1", "bak.2"]
+                .into_iter()
+                .map(|suffix| format!("{CONFIG_FILE}.{suffix}")),
+        )
+        .collect()
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_staged_name(file: &StagedFile) -> bool {
@@ -10535,6 +11798,7 @@ mod tests {
             staged_name: CREDENTIALS_FILE.to_string(),
             sha256: "0".repeat(64),
             original_sha256: None,
+            original_present: None,
             migration_generation: None,
             sensitive: true,
             install_mode: InstallMode::Migration,
@@ -10551,9 +11815,25 @@ mod tests {
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: None,
+            source_attestation: BTreeMap::new(),
             files: vec![file.clone()],
         };
         assert!(validate_manifest(&traversal).is_err());
+
+        let invalid_hash = MigrationManifest {
+            version: MIGRATION_VERSION,
+            transaction_id: transaction_id.clone(),
+            stage_dir: format!("{STAGE_PREFIX}{transaction_id}"),
+            state: MigrationState::Pending,
+            exact_scope: None,
+            migration_scope: None,
+            source_attestation: BTreeMap::new(),
+            files: vec![StagedFile {
+                sha256: "G".repeat(64),
+                ..file.clone()
+            }],
+        };
+        assert!(validate_manifest(&invalid_hash).is_err());
 
         let duplicate = MigrationManifest {
             version: MIGRATION_VERSION,
@@ -10562,6 +11842,7 @@ mod tests {
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: None,
+            source_attestation: BTreeMap::new(),
             files: vec![file.clone(), file],
         };
         assert!(validate_manifest(&duplicate).is_err());

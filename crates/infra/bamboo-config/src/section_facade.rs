@@ -353,6 +353,7 @@ pub(crate) struct PlannedSectionFile {
     pub name: &'static str,
     pub candidate: Vec<u8>,
     pub original: Vec<u8>,
+    pub original_present: bool,
     pub revision: u64,
 }
 
@@ -364,6 +365,7 @@ pub(crate) struct SectionSplitPlan {
     /// a compatibility writer cannot be silently overwritten by a stale plan.
     pub source_hashes: Vec<(String, String)>,
     pub marker: Vec<u8>,
+    pub credential_plan: Option<crate::credential_migration::FacadeCredentialPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,7 +613,7 @@ impl SectionProjection {
         data_dir: &Path,
         source_hashes: Vec<(String, String)>,
     ) -> ConfigStoreResult<SectionSplitPlan> {
-        self.into_migration_plan_with_raw(data_dir, source_hashes, BTreeMap::new())
+        self.into_migration_plan_with_raw(data_dir, source_hashes, BTreeMap::new(), None)
     }
 
     fn into_migration_plan_with_raw(
@@ -619,6 +621,7 @@ impl SectionProjection {
         data_dir: &Path,
         source_hashes: Vec<(String, String)>,
         mut legacy_raw: BTreeMap<SectionId, Value>,
+        overrides: Option<&StrictSourceOverrides>,
     ) -> ConfigStoreResult<SectionSplitPlan> {
         // model_limits may still be present as a legacy flattened root key.
         // Its typed target owns it after the layout commit.
@@ -633,6 +636,7 @@ impl SectionProjection {
                     &$value,
                     legacy_raw.remove(&SectionId::$id),
                     $validate,
+                    overrides,
                 )?);
             }};
         }
@@ -668,6 +672,7 @@ impl SectionProjection {
             files,
             source_hashes,
             marker: serde_json::to_vec_pretty(&marker)?,
+            credential_plan: None,
         })
     }
 }
@@ -678,13 +683,20 @@ fn plan_section_file<T>(
     value: &T,
     legacy_raw: Option<Value>,
     validate: fn(&T) -> Result<(), String>,
+    overrides: Option<&StrictSourceOverrides>,
 ) -> ConfigStoreResult<PlannedSectionFile>
 where
     T: Serialize + serde::de::DeserializeOwned,
 {
     let path = data_dir.join(name);
-    let original = read_optional_bytes(&path)?;
-    let (existing_revision, existing_data) = compatible_section_data(&original)?;
+    let original_state = read_existing_bytes(&path)?;
+    let original_present = original_state.is_some();
+    let original = original_state.unwrap_or_default();
+    let planning_bytes = overrides
+        .and_then(|overrides| overrides.get(name))
+        .cloned()
+        .unwrap_or_else(|| original.clone());
+    let (existing_revision, existing_data) = compatible_section_data(&planning_bytes)?;
     let revision = existing_revision.checked_add(1).ok_or_else(|| {
         crate::ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
     })?;
@@ -711,6 +723,7 @@ where
         name,
         candidate,
         original,
+        original_present,
         revision,
     })
 }
@@ -1825,6 +1838,13 @@ fn migration_source_names() -> BTreeSet<String> {
 }
 
 pub(crate) fn preflight_source_hashes(data_dir: &Path) -> ConfigStoreResult<Vec<(String, String)>> {
+    preflight_source_names()
+        .into_iter()
+        .map(|name| Ok((name.clone(), file_hash(&data_dir.join(name))?)))
+        .collect()
+}
+
+pub(crate) fn preflight_source_names() -> BTreeSet<String> {
     let mut names = migration_source_names();
     for base in [
         "config.json",
@@ -1846,9 +1866,6 @@ pub(crate) fn preflight_source_hashes(data_dir: &Path) -> ConfigStoreResult<Vec<
         names.insert(name.to_string());
     }
     names
-        .into_iter()
-        .map(|name| Ok((name.clone(), file_hash(&data_dir.join(name))?)))
-        .collect()
 }
 
 struct StrictPlanningInput {
@@ -1859,6 +1876,8 @@ struct StrictPlanningInput {
     authoritative_sidecars: BTreeSet<SectionId>,
 }
 
+type StrictSourceOverrides = BTreeMap<String, Vec<u8>>;
+
 fn read_existing_bytes(path: &Path) -> ConfigStoreResult<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -1867,8 +1886,22 @@ fn read_existing_bytes(path: &Path) -> ConfigStoreResult<Option<Vec<u8>>> {
     }
 }
 
-fn load_strict_root(data_dir: &Path) -> ConfigStoreResult<(Config, Value)> {
-    let raw = match read_existing_bytes(&data_dir.join("config.json"))? {
+fn read_planning_source(
+    data_dir: &Path,
+    name: &str,
+    overrides: Option<&StrictSourceOverrides>,
+) -> ConfigStoreResult<Option<Vec<u8>>> {
+    if let Some(bytes) = overrides.and_then(|overrides| overrides.get(name)) {
+        return Ok(Some(bytes.clone()));
+    }
+    read_existing_bytes(&data_dir.join(name))
+}
+
+fn load_strict_root(
+    data_dir: &Path,
+    overrides: Option<&StrictSourceOverrides>,
+) -> ConfigStoreResult<(Config, Value)> {
+    let raw = match read_planning_source(data_dir, "config.json", overrides)? {
         Some(bytes) => {
             let value: Value = serde_json::from_slice(&bytes)?;
             if !value.is_object() {
@@ -1884,13 +1917,15 @@ fn load_strict_root(data_dir: &Path) -> ConfigStoreResult<(Config, Value)> {
     let effective_root = effective
         .as_object_mut()
         .expect("strict root shape was checked above");
-    if read_existing_bytes(&data_dir.join("memory.json"))?.is_some() {
+    if read_planning_source(data_dir, "memory.json", overrides)?.is_some() {
         effective_root.remove("memory");
     }
-    if read_existing_bytes(&data_dir.join("subagents.json"))?.is_some() {
+    if read_planning_source(data_dir, "subagents.json", overrides)?.is_some() {
         effective_root.remove("subagents");
     }
-    if let Some(provider_sidecar) = load_strict_sidecar_value(data_dir, "providers.json")? {
+    if let Some(provider_sidecar) =
+        load_strict_sidecar_value_from(data_dir, "providers.json", overrides)?
+    {
         let provider_sidecar = provider_sidecar.as_object().ok_or_else(|| {
             crate::ConfigStoreError::Validation("providers.json must contain an object".to_string())
         })?;
@@ -1916,11 +1951,11 @@ fn load_strict_root(data_dir: &Path) -> ConfigStoreResult<(Config, Value)> {
             }
         }
     }
-    if read_existing_bytes(&data_dir.join("mcp.json"))?.is_some() {
+    if read_planning_source(data_dir, "mcp.json", overrides)?.is_some() {
         effective_root.remove("mcp");
         effective_root.remove("mcpServers");
     }
-    if read_existing_bytes(&data_dir.join("connect.json"))?.is_some() {
+    if read_planning_source(data_dir, "connect.json", overrides)?.is_some() {
         effective_root.remove("connect");
     }
     let config = serde_json::from_value::<Config>(effective).map_err(|error| {
@@ -1932,7 +1967,15 @@ fn load_strict_root(data_dir: &Path) -> ConfigStoreResult<(Config, Value)> {
 }
 
 fn load_strict_sidecar_value(data_dir: &Path, name: &str) -> ConfigStoreResult<Option<Value>> {
-    let Some(bytes) = read_existing_bytes(&data_dir.join(name))? else {
+    load_strict_sidecar_value_from(data_dir, name, None)
+}
+
+fn load_strict_sidecar_value_from(
+    data_dir: &Path,
+    name: &str,
+    overrides: Option<&StrictSourceOverrides>,
+) -> ConfigStoreResult<Option<Value>> {
+    let Some(bytes) = read_planning_source(data_dir, name, overrides)? else {
         return Ok(None);
     };
     if bytes.is_empty() {
@@ -1946,11 +1989,15 @@ fn load_strict_sidecar_value(data_dir: &Path, name: &str) -> ConfigStoreResult<O
     })
 }
 
-fn decode_strict_sidecar<T>(data_dir: &Path, name: &str) -> ConfigStoreResult<Option<(T, Value)>>
+fn decode_strict_sidecar<T>(
+    data_dir: &Path,
+    name: &str,
+    overrides: Option<&StrictSourceOverrides>,
+) -> ConfigStoreResult<Option<(T, Value)>>
 where
     T: serde::de::DeserializeOwned,
 {
-    load_strict_sidecar_value(data_dir, name)?
+    load_strict_sidecar_value_from(data_dir, name, overrides)?
         .map(|raw| {
             let typed = serde_json::from_value(raw.clone()).map_err(|error| {
                 crate::ConfigStoreError::Validation(format!(
@@ -2256,7 +2303,14 @@ fn preflight_legacy_root_sections(
 }
 
 fn load_strict_broker(data_dir: &Path) -> ConfigStoreResult<Option<(BrokerClientConfig, Value)>> {
-    let Some(bytes) = read_existing_bytes(&data_dir.join("broker.json"))? else {
+    load_strict_broker_from(data_dir, None)
+}
+
+fn load_strict_broker_from(
+    data_dir: &Path,
+    overrides: Option<&StrictSourceOverrides>,
+) -> ConfigStoreResult<Option<(BrokerClientConfig, Value)>> {
+    let Some(bytes) = read_planning_source(data_dir, "broker.json", overrides)? else {
         return Ok(None);
     };
     let Ok(document) = serde_json::from_slice(&bytes) else {
@@ -2312,14 +2366,23 @@ fn broker_raw_is_safe_after_known_secret_removal(raw: &Value, typed: &BrokerClie
 /// Config's recovery/salvage/hydration loader and applies legacy sidecar
 /// precedence only after every source document has decoded successfully.
 fn load_strict_planning_input(data_dir: &Path) -> ConfigStoreResult<StrictPlanningInput> {
-    let (mut config, root_raw) = load_strict_root(data_dir)?;
+    load_strict_planning_input_with_overrides(data_dir, None)
+}
+
+fn load_strict_planning_input_with_overrides(
+    data_dir: &Path,
+    overrides: Option<&StrictSourceOverrides>,
+) -> ConfigStoreResult<StrictPlanningInput> {
+    let (mut config, root_raw) = load_strict_root(data_dir, overrides)?;
     let mut authoritative_sidecars = BTreeSet::new();
 
-    if let Some((memory, _)) = decode_strict_sidecar::<MemorySection>(data_dir, "memory.json")? {
+    if let Some((memory, _)) =
+        decode_strict_sidecar::<MemorySection>(data_dir, "memory.json", overrides)?
+    {
         *config.memory_mut() = memory.0;
     }
     if let Some((subagents, _)) =
-        decode_strict_sidecar::<SubagentsSection>(data_dir, "subagents.json")?
+        decode_strict_sidecar::<SubagentsSection>(data_dir, "subagents.json", overrides)?
     {
         let SubagentsSection {
             mut subagents,
@@ -2331,7 +2394,7 @@ fn load_strict_planning_input(data_dir: &Path) -> ConfigStoreResult<StrictPlanni
         *config.subagents_mut() = subagents;
     }
     if let Some((providers, raw)) =
-        decode_strict_sidecar::<ProvidersSection>(data_dir, "providers.json")?
+        decode_strict_sidecar::<ProvidersSection>(data_dir, "providers.json", overrides)?
     {
         let raw = raw.as_object().ok_or_else(|| {
             crate::ConfigStoreError::Validation("providers.json must contain an object".to_string())
@@ -2366,35 +2429,40 @@ fn load_strict_planning_input(data_dir: &Path) -> ConfigStoreResult<StrictPlanni
         }
         *config.providers_mut() = providers;
     }
-    if let Some((mcp, _)) = decode_strict_sidecar::<McpSection>(data_dir, "mcp.json")? {
+    if let Some((mcp, _)) = decode_strict_sidecar::<McpSection>(data_dir, "mcp.json", overrides)? {
         authoritative_sidecars.insert(SectionId::Mcp);
         config.mcp = mcp.0;
     }
-    if let Some((connect, _)) = decode_strict_sidecar::<ConnectSection>(data_dir, "connect.json")? {
+    if let Some((connect, _)) =
+        decode_strict_sidecar::<ConnectSection>(data_dir, "connect.json", overrides)?
+    {
         config.connect = connect.0;
     }
 
-    let model_limits =
-        match decode_strict_sidecar::<ModelLimitsSection>(data_dir, "model_limits.json")? {
-            Some((limits, _)) => limits,
-            None => root_raw
-                .get("model_limits")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|error| {
-                    crate::ConfigStoreError::Validation(format!(
-                        "inline model_limits failed strict decoding: {error}"
-                    ))
-                })?
-                .unwrap_or_default(),
-        };
+    let model_limits = match decode_strict_sidecar::<ModelLimitsSection>(
+        data_dir,
+        "model_limits.json",
+        overrides,
+    )? {
+        Some((limits, _)) => limits,
+        None => root_raw
+            .get("model_limits")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                crate::ConfigStoreError::Validation(format!(
+                    "inline model_limits failed strict decoding: {error}"
+                ))
+            })?
+            .unwrap_or_default(),
+    };
 
     Ok(StrictPlanningInput {
         config,
         root_raw,
         model_limits,
-        broker: load_strict_broker(data_dir)?,
+        broker: load_strict_broker_from(data_dir, overrides)?,
         authoritative_sidecars,
     })
 }
@@ -2547,9 +2615,20 @@ fn unwrapped_document_data(value: Value) -> ConfigStoreResult<Value> {
 }
 
 fn preflight_connect_isolation(data_dir: &Path) -> ConfigStoreResult<()> {
-    let config_bytes = read_optional_bytes(&data_dir.join("config.json"))?;
-    if !config_bytes.is_empty() {
-        let root: Value = serde_json::from_slice(&config_bytes)?;
+    for name in [
+        "config.json",
+        "config.json.bak",
+        "config.json.bak.1",
+        "config.json.bak.2",
+    ] {
+        let Some(config_bytes) = read_existing_bytes(&data_dir.join(name))? else {
+            continue;
+        };
+        let root: Value = serde_json::from_slice(&config_bytes).map_err(|error| {
+            crate::ConfigStoreError::Validation(format!(
+                "{name} cannot be audited for connect credential isolation: {error}"
+            ))
+        })?;
         let root = root.as_object().ok_or_else(|| {
             crate::ConfigStoreError::Validation(
                 "legacy configuration must be an object".to_string(),
@@ -2566,9 +2645,21 @@ fn preflight_connect_isolation(data_dir: &Path) -> ConfigStoreResult<()> {
         }
     }
 
-    let connect_bytes = read_optional_bytes(&data_dir.join("connect.json"))?;
-    if !connect_bytes.is_empty() {
-        let raw = unwrapped_document_data(serde_json::from_slice(&connect_bytes)?)?;
+    for name in [
+        "connect.json",
+        "connect.json.bak",
+        "connect.json.bak.1",
+        "connect.json.bak.2",
+    ] {
+        let Some(connect_bytes) = read_existing_bytes(&data_dir.join(name))? else {
+            continue;
+        };
+        let document: Value = serde_json::from_slice(&connect_bytes).map_err(|error| {
+            crate::ConfigStoreError::Validation(format!(
+                "{name} cannot be audited for credential isolation: {error}"
+            ))
+        })?;
+        let raw = unwrapped_document_data(document)?;
         let connect: ConnectConfig = serde_json::from_value(raw.clone()).map_err(|_| {
             crate::ConfigStoreError::Validation(
                 "connect configuration is invalid; modular layout was not changed".to_string(),
@@ -2692,6 +2783,10 @@ pub fn migrate_config_facade_layout(
         #[cfg(test)]
         run_facade_epoch_test_hook(data_dir);
         let attempt = crate::credential_migration::with_migration_lock(data_dir, || {
+            // An AfterJournal crash has no committed intent. Discard it before
+            // comparing the preflight epoch so this same public call can
+            // observe the change, retry, and build a fresh compound plan.
+            crate::credential_migration::discard_uncommitted(data_dir)?;
             // Bind the complete zero-write preflight to the same exclusive
             // epoch as every credential domain and the final section split.
             // A managed writer cannot enter between these commits; a writer
@@ -2699,45 +2794,50 @@ pub fn migrate_config_facade_layout(
             if preflight_source_hashes(data_dir)? != source_after {
                 return Ok(None);
             }
-            let provider =
-                crate::credential_migration::migrate_provider_mcp_credentials_for_facade_locked(
-                    data_dir,
-                )?;
-            let cluster =
-                crate::credential_migration::migrate_cluster_credentials_locked(data_dir)?;
-            let mut broker_ready = broker_ready;
-            let mut broker_resumed = false;
-            if broker_ready {
-                match crate::credential_migration::migrate_external_broker_credentials_locked(
-                    data_dir,
-                ) {
-                    Ok(outcome) => broker_resumed = outcome.resumed,
-                    Err(
-                        crate::ConfigStoreError::Json(_) | crate::ConfigStoreError::Validation(_),
-                    ) => {
-                        // The optional broker domain is independent from the
-                        // main facade. Leave it untouched and omit it until it
-                        // is repaired.
-                        broker_ready = false;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            let resumed = recovered || provider.resumed || cluster.resumed || broker_resumed;
             if section_layout_is_active(data_dir)? {
+                let provider = crate::credential_migration::
+                    migrate_provider_mcp_credentials_for_facade_locked(data_dir)?;
+                let cluster =
+                    crate::credential_migration::migrate_cluster_credentials_locked(data_dir)?;
+                let mut broker_resumed = false;
                 if broker_ready {
-                    sync_active_external_broker(data_dir)?;
+                    match crate::credential_migration::migrate_external_broker_credentials_locked(
+                        data_dir,
+                    ) {
+                        Ok(outcome) => {
+                            broker_resumed = outcome.resumed;
+                            sync_active_external_broker(data_dir)?;
+                        }
+                        Err(
+                            crate::ConfigStoreError::Json(_)
+                            | crate::ConfigStoreError::Validation(_),
+                        ) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 return Ok(Some(crate::SectionMigrationOutcome {
                     activated: false,
-                    resumed,
+                    resumed: recovered || provider.resumed || cluster.resumed || broker_resumed,
                 }));
             }
-            let plan = plan_config_facade_layout_with_broker(data_dir, broker_ready)?;
+
+            let source_snapshot =
+                crate::credential_migration::FacadeSourceSnapshot::capture(data_dir)?;
+            let credential_plan = crate::credential_migration::plan_facade_compound_credentials(
+                data_dir,
+                source_snapshot.clone(),
+                broker_ready,
+            )?;
+            let plan = plan_config_facade_compound_layout(data_dir, broker_ready, credential_plan)?;
+            if crate::credential_migration::FacadeSourceSnapshot::capture(data_dir)?
+                != source_snapshot
+            {
+                return Ok(None);
+            }
             let mut outcome = crate::credential_migration::install_section_split_migration_locked(
                 data_dir, plan,
             )?;
-            outcome.resumed |= resumed;
+            outcome.resumed |= recovered;
             Ok(Some(outcome))
         })?;
         if let Some(outcome) = attempt {
@@ -2818,6 +2918,7 @@ fn run_facade_planning_test_hook(data_dir: &Path) {
     }
 }
 
+#[cfg(test)]
 fn plan_config_facade_layout_with_broker(
     data_dir: &Path,
     include_broker: bool,
@@ -2848,7 +2949,8 @@ fn plan_config_facade_layout_with_broker(
         }
         let legacy_raw =
             project_legacy_raw_sections(&root_raw, broker_raw, &authoritative_sidecars)?;
-        let plan = projection.into_migration_plan_with_raw(data_dir, after.clone(), legacy_raw)?;
+        let plan =
+            projection.into_migration_plan_with_raw(data_dir, after.clone(), legacy_raw, None)?;
         if migration_source_hashes(data_dir)? != after {
             continue;
         }
@@ -2857,6 +2959,39 @@ fn plan_config_facade_layout_with_broker(
     Err(crate::ConfigStoreError::Validation(
         "legacy configuration changed repeatedly during section planning".to_string(),
     ))
+}
+
+fn plan_config_facade_compound_layout(
+    data_dir: &Path,
+    include_broker: bool,
+    credential_plan: crate::credential_migration::FacadeCredentialPlan,
+) -> ConfigStoreResult<SectionSplitPlan> {
+    let source_hashes = migration_source_hashes(data_dir)?;
+    let overrides = &credential_plan.source_overrides;
+    let StrictPlanningInput {
+        config,
+        root_raw,
+        model_limits,
+        broker,
+        authoritative_sidecars,
+    } = load_strict_planning_input_with_overrides(data_dir, Some(overrides))?;
+    let mut projection = SectionProjection::from_config(&config, model_limits)?;
+    let mut broker_raw = None;
+    if include_broker {
+        if let Some((typed, raw)) = broker {
+            projection.subagents.external_broker = Some(typed);
+            broker_raw = Some(raw);
+        }
+    }
+    let legacy_raw = project_legacy_raw_sections(&root_raw, broker_raw, &authoritative_sidecars)?;
+    let mut plan = projection.into_migration_plan_with_raw(
+        data_dir,
+        source_hashes,
+        legacy_raw,
+        Some(overrides),
+    )?;
+    plan.credential_plan = Some(credential_plan);
+    Ok(plan)
 }
 
 fn expected_section_layout() -> BTreeMap<String, String> {
@@ -4144,6 +4279,44 @@ mod tests {
     }
 
     #[test]
+    fn active_layout_survives_normal_section_and_credential_backup_rotation() {
+        let _key = crate::encryption::set_test_encryption_key([114; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"unknown_root": "preserved"}),
+        );
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+
+        let providers = facade.registry().providers.snapshot();
+        let mut provider_candidate = providers.data.as_ref().clone();
+        provider_candidate.provider = "anthropic".to_string();
+        facade
+            .registry()
+            .providers
+            .commit(providers.revision, provider_candidate)
+            .unwrap();
+        assert!(dir.path().join("providers.json.bak").exists());
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        ConfigFacade::open(dir.path()).unwrap();
+
+        let credentials = facade.registry().credentials.snapshot();
+        facade
+            .registry()
+            .credentials
+            .replace(
+                CredentialRef::parse("provider.test.api_key").unwrap(),
+                "post-activation-secret",
+                CredentialSource::User,
+                credentials.revision,
+            )
+            .unwrap();
+        assert!(dir.path().join("credentials.json.bak").exists());
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        ConfigFacade::open(dir.path()).unwrap();
+    }
+
+    #[test]
     fn layout_activation_requires_a_complete_attestation_and_monotonic_valid_members() {
         let _key = crate::encryption::set_test_encryption_key([89; 32]);
         let dir = TempDir::new().unwrap();
@@ -4354,6 +4527,673 @@ mod tests {
         ] {
             assert!(!dir.path().join(forbidden).exists(), "created {forbidden}");
         }
+    }
+
+    #[test]
+    fn compound_manifest_rolls_back_earlier_domains_when_editor_wins_after_commit() {
+        let _key = crate::encryption::set_test_encryption_key([112; 32]);
+        let dir = TempDir::new().unwrap();
+        let root = serde_json::to_vec_pretty(&json!({
+            "providers": {"openai": {
+                "api_key_encrypted": crate::encryption::encrypt("provider-secret").unwrap()
+            }},
+            "unknown_root": "must-survive"
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("config.json"), &root).unwrap();
+        crate::credential_migration::set_facade_compound_after_manifest_test_hook(
+            dir.path(),
+            |data_dir| {
+                std::fs::write(
+                    data_dir.join("cluster-fabric.json"),
+                    b"{ editor-won-with-invalid-cluster",
+                )
+                .unwrap();
+            },
+        );
+
+        assert!(migrate_config_facade_layout(dir.path()).is_err());
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        assert_eq!(
+            std::fs::read(dir.path().join("cluster-fabric.json")).unwrap(),
+            b"{ editor-won-with-invalid-cluster"
+        );
+        for rolled_back in [
+            "core.json",
+            "providers.json",
+            "mcp.json",
+            "credentials.json",
+            "config-sections.json",
+            "config-credential-migration.json",
+            "config-credential-migration.journal.json",
+        ] {
+            assert!(
+                !dir.path().join(rolled_back).exists(),
+                "transaction member survived rollback: {rolled_back}"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_source_guards_preserve_changed_and_newly_created_editor_files() {
+        for (initial, editor) in [
+            (
+                Some(br#"{"safe":"initial"}"#.as_slice()),
+                br#"{"safe":"editor-won"}"#.as_slice(),
+            ),
+            (None, b"".as_slice()),
+        ] {
+            let _key = crate::encryption::set_test_encryption_key([118; 32]);
+            let dir = TempDir::new().unwrap();
+            write_json(
+                &dir.path().join("config.json"),
+                &json!({"unknown_root": true}),
+            );
+            let guarded_path = dir.path().join("connect.json.bak.1");
+            if let Some(initial) = initial {
+                std::fs::write(&guarded_path, initial).unwrap();
+            }
+            let hook_path = guarded_path.clone();
+            let editor = editor.to_vec();
+            let expected_editor = editor.clone();
+            crate::credential_migration::set_facade_compound_after_manifest_test_hook(
+                dir.path(),
+                move |_| std::fs::write(hook_path, editor).unwrap(),
+            );
+
+            assert!(migrate_config_facade_layout(dir.path()).is_err());
+            assert_eq!(std::fs::read(&guarded_path).unwrap(), expected_editor);
+            assert_no_layout_transaction_artifacts(dir.path());
+        }
+    }
+
+    #[test]
+    fn after_journal_crash_is_discarded_and_replanned_in_one_public_retry() {
+        let _key = crate::encryption::set_test_encryption_key([119; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"unknown_root": true}),
+        );
+        let snapshot =
+            crate::credential_migration::FacadeSourceSnapshot::capture(dir.path()).unwrap();
+        let credentials = crate::credential_migration::plan_facade_compound_credentials(
+            dir.path(),
+            snapshot,
+            true,
+        )
+        .unwrap();
+        let plan = plan_config_facade_compound_layout(dir.path(), true, credentials).unwrap();
+        assert!(
+            crate::credential_migration::install_section_split_migration_with_fault(
+                dir.path(),
+                plan,
+                crate::credential_migration::SectionSplitTestFault::Journal,
+            )
+            .is_err()
+        );
+        assert!(dir
+            .path()
+            .join("config-credential-migration.journal.json")
+            .exists());
+        assert!(!dir.path().join("config-credential-migration.json").exists());
+
+        let outcome = migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(outcome.activated);
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        assert!(!dir
+            .path()
+            .join("config-credential-migration.journal.json")
+            .exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            !name.starts_with(".config-migration-stage-")
+                && !name.starts_with(".config-migration-backup-")
+        }));
+    }
+
+    #[test]
+    fn root_only_mcp_secrets_migrate_before_the_root_is_scrubbed() {
+        let _key = crate::encryption::set_test_encryption_key([120; 32]);
+        let dir = TempDir::new().unwrap();
+        let mut fixture: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/config_migration/mcp-legacy.json"
+        ))
+        .unwrap();
+        fixture["data"]["stdio unsafe/name"]["env_encrypted"]["PRIVATE TOKEN"] =
+            Value::String(crate::encryption::encrypt("root-private-secret").unwrap());
+        let root = json!({"mcpServers": fixture["data"].clone(), "unknown_root": true});
+        write_json(&dir.path().join("config.json"), &root);
+        write_json(&dir.path().join("config.json.bak"), &root);
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        let mcp: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("mcp.json")).unwrap()).unwrap();
+        let data = &mcp["data"];
+        let refs = [
+            (
+                data["stdio unsafe/name"]["env_credential_refs"]["PUBLIC TOKEN"]
+                    .as_str()
+                    .unwrap(),
+                "stdio-plain-secret",
+            ),
+            (
+                data["stdio unsafe/name"]["env_credential_refs"]["PRIVATE TOKEN"]
+                    .as_str()
+                    .unwrap(),
+                "root-private-secret",
+            ),
+            (
+                data["http.server"]["header_credential_refs"]["Authorization"]
+                    .as_str()
+                    .unwrap(),
+                "Bearer mcp-header-secret",
+            ),
+        ];
+        let store = CredentialStore::open(dir.path());
+        for (reference, expected) in refs {
+            assert_eq!(
+                store
+                    .resolve(&CredentialRef::parse(reference).unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                expected
+            );
+        }
+        for name in ["config.json", "config.json.bak", "mcp.json"] {
+            let text = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            for forbidden in [
+                "stdio-plain-secret",
+                "root-private-secret",
+                "Bearer mcp-header-secret",
+                "env_encrypted",
+                "headers_encrypted",
+            ] {
+                assert!(!text.contains(forbidden), "{name} retained {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_secret_authority_is_field_scoped_while_mcp_shadows_the_root_domain() {
+        let _key = crate::encryption::set_test_encryption_key([121; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "providers": {
+                    "openai": {"api_key": "root-stale-provider"},
+                    "anthropic": {"api_key": "unshadowed-root-provider"}
+                },
+                "mcpServers": {
+                    "shared": {
+                        "command": "unused",
+                        "env": {"TOKEN": "root-stale-mcp"},
+                        "request_timeout_ms": 100,
+                        "healthcheck_interval_ms": 100
+                    },
+                    "root-only": {
+                        "command": "unused",
+                        "env": {"ONLY": "shadowed-root-only-mcp"},
+                        "request_timeout_ms": 100,
+                        "healthcheck_interval_ms": 100
+                    }
+                }
+            }),
+        );
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({"openai": {"api_key": "sidecar-provider"}}),
+        );
+        write_json(
+            &dir.path().join("mcp.json"),
+            &json!({"shared": {
+                "command": "unused",
+                "env": {"TOKEN": "sidecar-mcp"},
+                "request_timeout_ms": 100,
+                "healthcheck_interval_ms": 100
+            }}),
+        );
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        assert_eq!(
+            store
+                .resolve(&CredentialRef::parse("provider.openai.api_key").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sidecar-provider"
+        );
+        assert_eq!(
+            store
+                .resolve(&CredentialRef::parse("provider.anthropic.api_key").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "unshadowed-root-provider"
+        );
+        let mcp: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("mcp.json")).unwrap()).unwrap();
+        let shared_ref = mcp["data"]["shared"]["env_credential_refs"]["TOKEN"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve(&CredentialRef::parse(shared_ref).unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sidecar-mcp"
+        );
+        assert!(mcp["data"].get("root-only").is_none());
+        assert!(store
+            .resolve(&CredentialRef::parse("mcp.root-only.env_ONLY").unwrap())
+            .unwrap()
+            .is_none());
+        let root = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        for forbidden in [
+            "root-stale-provider",
+            "unshadowed-root-provider",
+            "root-stale-mcp",
+            "shadowed-root-only-mcp",
+        ] {
+            assert!(!root.contains(forbidden));
+        }
+        assert!(!root.contains("env_credential_refs"));
+    }
+
+    #[test]
+    fn primary_sidecar_keys_tombstone_stale_backups_without_hiding_backup_only_keys() {
+        let _key = crate::encryption::set_test_encryption_key([122; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"unknown_root": true}),
+        );
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({"openai": {"model": "primary-without-secret"}}),
+        );
+        write_json(
+            &dir.path().join("providers.json.bak"),
+            &json!({
+                "openai": {"api_key": "stale-openai-secret"},
+                "anthropic": {"api_key": "backup-only-anthropic"}
+            }),
+        );
+        write_json(
+            &dir.path().join("mcp.json"),
+            &json!({
+                "shared": {
+                    "command": "unused",
+                    "request_timeout_ms": 100,
+                    "healthcheck_interval_ms": 100
+                },
+                "live": {
+                    "command": "unused",
+                    "env": {"TOKEN": "primary-live-mcp"},
+                    "request_timeout_ms": 100,
+                    "healthcheck_interval_ms": 100
+                }
+            }),
+        );
+        write_json(
+            &dir.path().join("mcp.json.bak"),
+            &json!({
+                "shared": {
+                    "command": "unused",
+                    "env": {"TOKEN": "stale-shared-mcp"},
+                    "request_timeout_ms": 100,
+                    "healthcheck_interval_ms": 100
+                },
+                "live": {
+                    "command": "unused",
+                    "env": {"TOKEN": "stale-live-mcp"},
+                    "request_timeout_ms": 100,
+                    "healthcheck_interval_ms": 100
+                },
+                "backup-only": {
+                    "command": "unused",
+                    "env": {"TOKEN": "backup-only-mcp"},
+                    "request_timeout_ms": 100,
+                    "healthcheck_interval_ms": 100
+                }
+            }),
+        );
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        for missing in ["provider.openai.api_key", "mcp.shared.env_TOKEN"] {
+            assert!(store
+                .resolve(&CredentialRef::parse(missing).unwrap())
+                .unwrap()
+                .is_none());
+        }
+        for (reference, expected) in [
+            ("provider.anthropic.api_key", "backup-only-anthropic"),
+            ("mcp.live.env_TOKEN", "primary-live-mcp"),
+            ("mcp.backup-only.env_TOKEN", "backup-only-mcp"),
+        ] {
+            assert_eq!(
+                store
+                    .resolve(&CredentialRef::parse(reference).unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                expected
+            );
+        }
+
+        let provider_backup: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json.bak")).unwrap())
+                .unwrap();
+        assert!(provider_backup["data"]["openai"]
+            .get("credential_ref")
+            .is_none());
+        assert_eq!(
+            provider_backup["data"]["anthropic"]["credential_ref"],
+            "provider.anthropic.api_key"
+        );
+
+        let mcp_backup: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("mcp.json.bak")).unwrap())
+                .unwrap();
+        for tombstoned in ["shared", "live"] {
+            assert!(mcp_backup["data"][tombstoned]
+                .get("env_credential_refs")
+                .is_none());
+        }
+        assert_eq!(
+            mcp_backup["data"]["backup-only"]["env_credential_refs"]["TOKEN"],
+            "mcp.backup-only.env_TOKEN"
+        );
+        for name in ["providers.json.bak", "mcp.json.bak"] {
+            let text = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            for forbidden in [
+                "stale-openai-secret",
+                "backup-only-anthropic",
+                "stale-shared-mcp",
+                "stale-live-mcp",
+                "backup-only-mcp",
+            ] {
+                assert!(!text.contains(forbidden), "{name} retained {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn compound_migration_scrubs_all_valid_legacy_backup_generations() {
+        let _key = crate::encryption::set_test_encryption_key([113; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"unknown_root": true}),
+        );
+        let root_backup = serde_json::to_vec_pretty(&json!({
+            "providers": {"anthropic": {
+                "api_key_encrypted": crate::encryption::encrypt("root-backup-secret").unwrap()
+            }},
+            "cluster_fabric": {"nodes": [{
+                "id": "backup-node",
+                "label": "backup-node",
+                "placement": {
+                    "type": "ssh",
+                    "host": "10.0.0.8",
+                    "username": "deploy",
+                    "auth": {"method": "password", "password": "cluster-backup-secret"}
+                }
+            }]}
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("config.json.bak.2"), root_backup).unwrap();
+        std::fs::write(
+            dir.path().join("providers.json.bak"),
+            include_bytes!("../tests/fixtures/config_migration/providers-legacy.json"),
+        )
+        .unwrap();
+        let mut mcp_backup: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/config_migration/mcp-legacy.json"
+        ))
+        .unwrap();
+        mcp_backup["data"]["stdio unsafe/name"]["env_encrypted"]["PRIVATE TOKEN"] =
+            Value::String(crate::encryption::encrypt("mcp-backup-cipher").unwrap());
+        std::fs::write(
+            dir.path().join("mcp.json.bak.1"),
+            serde_json::to_vec_pretty(&mcp_backup).unwrap(),
+        )
+        .unwrap();
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        for name in ["config.json.bak.2", "providers.json.bak", "mcp.json.bak.1"] {
+            let text = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            for forbidden in [
+                "root-backup-secret",
+                "cluster-backup-secret",
+                "sk-provider-plain",
+                "stdio-plain-secret",
+                "mcp-backup-cipher",
+                "mcp-header-secret",
+                "api_key_encrypted",
+                "password_encrypted",
+                "env_encrypted",
+            ] {
+                assert!(!text.contains(forbidden), "{name} retained {forbidden}");
+            }
+        }
+        let store = CredentialStore::open(dir.path());
+        for (reference, expected) in [
+            ("provider.anthropic.api_key", "root-backup-secret"),
+            ("cluster.backup-node.password", "cluster-backup-secret"),
+            ("provider.openai.api_key", "sk-provider-plain"),
+        ] {
+            let reference = CredentialRef::parse(reference).unwrap();
+            assert_eq!(
+                store.resolve(&reference).unwrap().unwrap().expose(),
+                expected
+            );
+        }
+        let mcp_backup: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("mcp.json.bak.1")).unwrap())
+                .unwrap();
+        for (reference, expected) in [
+            (
+                mcp_backup["data"]["stdio unsafe/name"]["env_credential_refs"]["PUBLIC TOKEN"]
+                    .as_str()
+                    .unwrap(),
+                "stdio-plain-secret",
+            ),
+            (
+                mcp_backup["data"]["stdio unsafe/name"]["env_credential_refs"]["PRIVATE TOKEN"]
+                    .as_str()
+                    .unwrap(),
+                "mcp-backup-cipher",
+            ),
+            (
+                mcp_backup["data"]["http.server"]["header_credential_refs"]["Authorization"]
+                    .as_str()
+                    .unwrap(),
+                "Bearer mcp-header-secret",
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .resolve(&CredentialRef::parse(reference).unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn compound_migration_prefers_store_then_primaries_then_newest_backup() {
+        let _key = crate::encryption::set_test_encryption_key([115; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"unknown_root": true}),
+        );
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({"openai": {"api_key": "provider-primary"}}),
+        );
+        write_json(
+            &dir.path().join("providers.json.bak"),
+            &json!({
+                "openai": {"api_key": "provider-stale"},
+                "anthropic": {"api_key": "anthropic-newest-backup"}
+            }),
+        );
+        write_json(
+            &dir.path().join("providers.json.bak.1"),
+            &json!({"anthropic": {"api_key": "anthropic-older-backup"}}),
+        );
+        write_json(
+            &dir.path().join("broker.json"),
+            &json!({"endpoint": "ws://127.0.0.1:9600", "token": "broker-primary"}),
+        );
+        write_json(
+            &dir.path().join("broker.json.bak"),
+            &json!({"endpoint": "ws://127.0.0.1:9600", "token": "broker-stale"}),
+        );
+
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                CredentialRef::parse("provider.gemini.api_key").unwrap(),
+                "store-authority",
+                CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        write_json(
+            &dir.path().join("config.json.bak"),
+            &json!({"providers": {"gemini": {"api_key": "stale-user-copy"}}}),
+        );
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        for (reference, expected) in [
+            ("provider.gemini.api_key", "store-authority"),
+            ("provider.openai.api_key", "provider-primary"),
+            ("provider.anthropic.api_key", "anthropic-newest-backup"),
+            ("broker.external.bearer_token", "broker-primary"),
+        ] {
+            let reference = CredentialRef::parse(reference).unwrap();
+            assert_eq!(
+                store.resolve(&reference).unwrap().unwrap().expose(),
+                expected
+            );
+        }
+        for name in [
+            "providers.json",
+            "providers.json.bak",
+            "providers.json.bak.1",
+            "config.json.bak",
+            "broker.json",
+            "broker.json.bak",
+        ] {
+            let text = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            for forbidden in [
+                "provider-primary",
+                "provider-stale",
+                "anthropic-newest-backup",
+                "anthropic-older-backup",
+                "stale-user-copy",
+                "broker-primary",
+                "broker-stale",
+            ] {
+                assert!(!text.contains(forbidden), "{name} retained {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn compound_migration_with_existing_credentials_can_rotate_lkg_backups() {
+        let _key = crate::encryption::set_test_encryption_key([116; 32]);
+        let dir = TempDir::new().unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                CredentialRef::parse("user.first.token").unwrap(),
+                "first-user-secret",
+                CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        store
+            .replace(
+                CredentialRef::parse("user.second.token").unwrap(),
+                "second-user-secret",
+                CredentialSource::User,
+                1,
+            )
+            .unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"providers": {"openai": {"api_key": "legacy-provider-secret"}}}),
+        );
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        for (reference, expected) in [
+            ("user.first.token", "first-user-secret"),
+            ("user.second.token", "second-user-secret"),
+            ("provider.openai.api_key", "legacy-provider-secret"),
+        ] {
+            let reference = CredentialRef::parse(reference).unwrap();
+            assert_eq!(
+                store.resolve(&reference).unwrap().unwrap().expose(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn compound_migration_accepts_new_primary_over_an_older_migrated_value() {
+        let _key = crate::encryption::set_test_encryption_key([117; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"unknown_root": true}),
+        );
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({"openai": {"api_key": "old-migrated-value"}}),
+        );
+        crate::migrate_provider_mcp_credentials(dir.path()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        let before_revision = store.revision().unwrap();
+        assert_eq!(
+            store
+                .resolve(&CredentialRef::parse("provider.openai.api_key").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "old-migrated-value"
+        );
+
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({"openai": {"api_key": "new-primary-value"}}),
+        );
+        migrate_config_facade_layout(dir.path()).unwrap();
+
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        assert!(store.revision().unwrap() > before_revision);
+        assert_eq!(
+            store
+                .resolve(&CredentialRef::parse("provider.openai.api_key").unwrap())
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "new-primary-value"
+        );
     }
 
     #[test]
@@ -4766,6 +5606,33 @@ mod tests {
         );
         assert_no_layout_transaction_artifacts(dir.path());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn connect_backup_secret_is_zero_write_before_compound_migration() {
+        let _key = crate::encryption::set_test_encryption_key([114; 32]);
+        let dir = TempDir::new().unwrap();
+        let root = serde_json::to_vec_pretty(&json!({
+            "providers": {"openai": {
+                "api_key_encrypted": crate::encryption::encrypt("provider-secret").unwrap()
+            }}
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("config.json"), &root).unwrap();
+        let connect_backup = serde_json::to_vec_pretty(&json!({
+            "platforms": [{"type": "telegram", "token": "backup-token"}]
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("connect.json.bak"), &connect_backup).unwrap();
+
+        assert!(migrate_config_facade_layout(dir.path()).is_err());
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        assert_eq!(
+            std::fs::read(dir.path().join("connect.json.bak")).unwrap(),
+            connect_backup
+        );
+        assert!(!dir.path().join("credentials.json").exists());
+        assert!(!dir.path().join(SECTION_LAYOUT_FILE).exists());
     }
 
     #[test]
