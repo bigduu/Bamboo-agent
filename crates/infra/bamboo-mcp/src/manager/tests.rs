@@ -16,6 +16,7 @@ fn create_test_server_config(id: &str) -> McpServerConfig {
             cwd: None,
             env: std::collections::HashMap::new(),
             env_encrypted: std::collections::HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5000,
         }),
         request_timeout_ms: 5000,
@@ -532,6 +533,218 @@ fn insert_mock_runtime(
     runtime
 }
 
+async fn connected_mock_client() -> McpProtocolClient {
+    let transport = NotifyingMockTransport::new(&[], &[]);
+    let mut client = McpProtocolClient::new(Box::new(transport));
+    client.connect().await.expect("connect mock runtime");
+    client
+}
+
+fn marker_tool(name: &str) -> McpTool {
+    McpTool {
+        name: name.to_string(),
+        description: format!("{name} marker"),
+        parameters: serde_json::json!({"type": "object"}),
+    }
+}
+
+#[tokio::test]
+async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_index() {
+    let manager = McpServerManager::new();
+    let transport = NotifyingMockTransport::new(&[], &[]);
+    let mut client = McpProtocolClient::new(Box::new(transport));
+    client.connect().await.expect("connect old mock runtime");
+    let old = insert_mock_runtime(&manager, "stable", client);
+    let old_tool = McpTool {
+        name: "still_available".to_string(),
+        description: "old runtime marker".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    };
+    manager
+        .index
+        .register_server_tools("stable", &[old_tool], &[], &[]);
+    let alias = manager.index.generate_alias("stable", "still_available");
+
+    let mut replacement = create_test_server_config("stable");
+    replacement.transport = TransportConfig::Stdio(StdioConfig {
+        command: "definitely-not-a-real-mcp-command-597".to_string(),
+        args: vec![],
+        cwd: None,
+        env: std::collections::HashMap::new(),
+        env_encrypted: std::collections::HashMap::new(),
+        env_credential_refs: std::collections::HashMap::new(),
+        startup_timeout_ms: 100,
+    });
+    let candidate = McpConfig {
+        version: 1,
+        servers: vec![replacement],
+    };
+
+    let error = manager
+        .reconcile_from_config_transactional(&candidate)
+        .await
+        .expect_err("replacement bootstrap must fail");
+    assert!(!error.to_string().is_empty());
+    let live = manager
+        .runtimes
+        .get("stable")
+        .expect("old runtime remains published")
+        .clone();
+    assert!(Arc::ptr_eq(&live, &old));
+    assert!(manager.index.contains(&alias));
+    assert_eq!(
+        manager.index.lookup(&alias).unwrap().original_name,
+        "still_available"
+    );
+    assert_eq!(
+        old.info.read().await.status,
+        ServerStatus::Ready,
+        "failed candidate must not stop or degrade the old runtime"
+    );
+}
+
+#[tokio::test]
+async fn committed_reconcile_publishes_all_removals_before_blocked_cleanup() {
+    use std::sync::atomic::AtomicBool;
+
+    let (event_tx, _event_rx) = mpsc::channel(1);
+    event_tx
+        .send(McpEvent::ToolsChanged {
+            server_id: "blocker".to_string(),
+            tools: Vec::new(),
+        })
+        .await
+        .expect("fill event channel");
+    let manager = McpServerManager::new().with_event_channel(event_tx);
+
+    let first = insert_mock_runtime(&manager, "first", connected_mock_client().await);
+    let second = insert_mock_runtime(&manager, "second", connected_mock_client().await);
+    for id in ["first", "second"] {
+        manager
+            .index
+            .register_server_tools(id, &[marker_tool("old")], &[], &[]);
+    }
+
+    let durable = Arc::new(AtomicBool::new(false));
+    let healthy = Arc::new(AtomicBool::new(false));
+    let durable_at_commit = durable.clone();
+    let healthy_after_reconcile = healthy.clone();
+    tokio::time::timeout(Duration::from_millis(100), async {
+        manager
+            .reconcile_from_config_transactional_after(
+                &McpConfig {
+                    version: 1,
+                    servers: Vec::new(),
+                },
+                || async move {
+                    durable_at_commit.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("committed reconcile is infallible");
+        // Models the section endpoint's post-reconcile health publication.
+        healthy_after_reconcile.store(true, Ordering::SeqCst);
+    })
+    .await
+    .expect("blocked cleanup must not suspend committed publication");
+
+    assert!(durable.load(Ordering::SeqCst));
+    assert!(healthy.load(Ordering::SeqCst));
+    assert!(manager.list_servers().is_empty());
+    assert!(manager.index.all_aliases().is_empty());
+    assert!(first.shutdown.load(Ordering::SeqCst));
+    assert!(second.shutdown.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn detached_refresh_cannot_overwrite_replacement_tool_index() {
+    let manager = McpServerManager::new();
+    let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let replacement = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    manager.index.remove_server_tools("stable");
+    manager
+        .index
+        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[]);
+
+    assert!(
+        !manager
+            .publish_refreshed_tools_if_current("stable", &old, vec![marker_tool("stale_refresh")])
+            .await
+    );
+    assert!(manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "replacement")));
+    assert!(!manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "stale_refresh")));
+    assert!(Arc::ptr_eq(
+        manager.runtimes.get("stable").unwrap().value(),
+        &replacement
+    ));
+}
+
+#[tokio::test]
+async fn detached_reconnect_cannot_overwrite_replacement_tool_index() {
+    let manager = McpServerManager::new();
+    let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let replacement = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    manager.index.remove_server_tools("stable");
+    manager
+        .index
+        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[]);
+
+    assert!(
+        !manager
+            .publish_reconnected_runtime_if_current(
+                "stable",
+                &old,
+                connected_mock_client().await,
+                vec![marker_tool("stale_reconnect")],
+                Some("stale instructions".to_string()),
+                None,
+            )
+            .await
+    );
+    assert!(manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "replacement")));
+    assert!(!manager
+        .index
+        .contains(&manager.index.generate_alias("stable", "stale_reconnect")));
+    assert!(Arc::ptr_eq(
+        manager.runtimes.get("stable").unwrap().value(),
+        &replacement
+    ));
+}
+
+#[tokio::test]
+async fn detached_generation_cannot_publish_health_or_reconnect_status() {
+    let (event_tx, mut event_rx) = mpsc::channel(4);
+    let manager = McpServerManager::new().with_event_channel(event_tx);
+    let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let _replacement = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let initial = old.info.read().await.clone();
+
+    assert_eq!(
+        manager
+            .publish_health_result_if_current(
+                "stable",
+                &old,
+                Err("stale ping failure".to_string()),
+            )
+            .await,
+        None
+    );
+    manager.attempt_reconnection(old.clone()).await.unwrap();
+
+    let after = old.info.read().await;
+    assert_eq!(after.status, initial.status);
+    assert_eq!(after.last_error, initial.last_error);
+    assert!(!old.reconnecting.load(Ordering::SeqCst));
+    assert!(event_rx.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn tools_list_changed_notification_triggers_refresh() {
     // #366 headline capability: a server-initiated `tools/list_changed` reaches the
@@ -560,7 +773,7 @@ async fn tools_list_changed_notification_triggers_refresh() {
         .take_notification_receiver()
         .await
         .expect("notification receiver available exactly once");
-    manager.spawn_notification_drain("srv".to_string(), rx);
+    manager.spawn_notification_drain("srv".to_string(), runtime.clone(), rx);
 
     // The drain observes the notification -> refresh_tools -> ToolsChanged.
     let evt = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
@@ -605,7 +818,7 @@ async fn unhandled_notification_is_drained_without_refresh() {
         .take_notification_receiver()
         .await
         .expect("notification receiver available");
-    manager.spawn_notification_drain("srv".to_string(), rx);
+    manager.spawn_notification_drain("srv".to_string(), runtime.clone(), rx);
 
     // No dispatcher for `notifications/message` -> no ToolsChanged emitted.
     let got = tokio::time::timeout(Duration::from_millis(300), event_rx.recv()).await;

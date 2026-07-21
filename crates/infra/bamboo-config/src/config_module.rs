@@ -108,21 +108,9 @@ pub(crate) fn load_sidecar<T: DeserializeOwned>(path: &Path) -> Result<Option<T>
 }
 
 pub(crate) fn save_sidecar<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(value)?;
-    // Retain one last-known-good generation. Validate the current document
-    // against the module's schema rather than merely checking that it is JSON:
-    // a syntactically valid but type-invalid document must not replace a usable
-    // backup.
-    if path.exists() {
-        let current = std::fs::read(path)?;
-        if serde_json::from_slice::<T>(&current).is_ok() {
-            crate::config::write_atomic(&path.with_extension("json.bak"), &current)?;
-        }
-    }
-    crate::config::write_atomic(path, &bytes)?;
+    crate::config_store::AtomicFileStore::new(path)
+        .backup_generations(1)
+        .write_json(value)?;
     Ok(())
 }
 
@@ -134,18 +122,9 @@ pub(crate) fn save_sidecar_with_sanitized_backup<T: Serialize + DeserializeOwned
     path: &Path,
     value: &T,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(value)?;
-    if path.exists() {
-        let current = std::fs::read(path)?;
-        if let Ok(previous) = serde_json::from_slice::<T>(&current) {
-            let sanitized = serde_json::to_vec_pretty(&previous)?;
-            crate::config::write_atomic(&path.with_extension("json.bak"), &sanitized)?;
-        }
-    }
-    crate::config::write_atomic(path, &bytes)?;
+    crate::config_store::AtomicFileStore::new(path)
+        .backup_generations(1)
+        .write_json(value)?;
     Ok(())
 }
 
@@ -215,6 +194,34 @@ mod tests {
             reloaded.providers.openai.as_ref().unwrap().model.as_deref(),
             Some("legacy-model")
         );
+    }
+
+    #[test]
+    fn invalid_provider_credential_refs_from_external_edits_are_rejected() {
+        for invalid_ref in ["../credentials".to_string(), "x".repeat(161)] {
+            let dir = TempDir::new().unwrap();
+            write_json(
+                &dir.path().join("config.json"),
+                json!({
+                    "providers": {"openai": {"model": "root-lkg"}}
+                }),
+            );
+            write_json(
+                &dir.path().join("providers.json"),
+                json!({
+                    "openai": {
+                        "model": "must-not-load",
+                        "credential_ref": invalid_ref
+                    }
+                }),
+            );
+
+            let config = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+            assert_eq!(
+                config.providers.openai.as_ref().unwrap().model.as_deref(),
+                Some("root-lkg")
+            );
+        }
     }
 
     #[test]
@@ -302,15 +309,26 @@ mod tests {
     fn providers_sidecar_never_contains_plaintext_api_key() {
         let _key = crate::encryption::set_test_encryption_key([23; 32]);
         let dir = TempDir::new().unwrap();
+        let reference = crate::credential_ref("provider", "openai", "api_key").unwrap();
+        crate::CredentialStore::open(dir.path())
+            .replace(
+                reference.clone(),
+                "sk-plaintext-must-not-leak",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
         let mut config = Config::default();
         config.providers.openai = Some(OpenAIConfig {
             api_key: "sk-plaintext-must-not-leak".into(),
+            credential_ref: Some(reference),
             ..OpenAIConfig::default()
         });
         config.save_providers_to_dir(dir.path()).unwrap();
         let raw = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
         assert!(!raw.contains("sk-plaintext-must-not-leak"));
-        assert!(raw.contains("api_key_encrypted"));
+        assert!(!raw.contains("api_key_encrypted"));
+        assert!(raw.contains("credential_ref"));
     }
 
     #[test]
@@ -368,10 +386,22 @@ mod tests {
             &dir.path().join("providers.json"),
             json!({"openai": {"api_key": "sk-old-plaintext", "model": "old"}}),
         );
+        crate::migrate_provider_mcp_credentials(dir.path()).unwrap();
+        let reference = crate::credential_ref("provider", "openai", "api_key").unwrap();
+        let store = crate::CredentialStore::open(dir.path());
+        store
+            .replace(
+                reference.clone(),
+                "sk-new-plaintext",
+                crate::CredentialSource::User,
+                store.revision().unwrap(),
+            )
+            .unwrap();
 
         let providers = ProviderConfigs {
             openai: Some(OpenAIConfig {
                 api_key: "sk-new-plaintext".into(),
+                credential_ref: Some(reference),
                 model: Some("new".into()),
                 ..OpenAIConfig::default()
             }),
@@ -383,7 +413,8 @@ mod tests {
 
         let current = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
         assert!(!current.contains("sk-new-plaintext"));
-        assert!(current.contains("api_key_encrypted"));
+        assert!(!current.contains("api_key_encrypted"));
+        assert!(current.contains("credential_ref"));
         let backup = std::fs::read_to_string(dir.path().join("providers.json.bak")).unwrap();
         assert!(!backup.contains("sk-old-plaintext"));
 
@@ -428,6 +459,12 @@ mod tests {
             Some("durable-before-root")
         );
         assert!(dir.path().join("subagents.json").exists());
-        assert!(dir.path().join("providers.json").exists());
+        let providers: ProviderConfigs =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert!(providers.openai.is_none());
+        assert!(providers.anthropic.is_none());
+        assert!(providers.gemini.is_none());
+        assert!(providers.bodhi.is_none());
     }
 }

@@ -460,6 +460,7 @@ mod tests {
                 name: "Authorization".to_string(),
                 value: "Bearer token123".to_string(),
                 value_encrypted: None,
+                credential_ref: None,
             }],
             connect_timeout_ms: 5000,
         };
@@ -477,6 +478,7 @@ mod tests {
                 name: "Invalid Header Name\n".to_string(), // Invalid
                 value: "test".to_string(),
                 value_encrypted: None,
+                credential_ref: None,
             }],
             connect_timeout_ms: 5000,
         };
@@ -572,6 +574,7 @@ mod tests {
             name: "Content-Type".to_string(),
             value: "application/json".to_string(),
             value_encrypted: None,
+            credential_ref: None,
         };
         assert_eq!(header.name, "Content-Type");
         assert_eq!(header.value, "application/json");

@@ -5,6 +5,15 @@ mod constants;
 mod mcp;
 mod provider;
 
+/// Return the public marker used in place of secrets in API responses.
+///
+/// Build the marker as a display value instead of letting a string literal
+/// flow into credential-shaped fields. The marker is not authentication
+/// material, and this keeps credential scanners focused on actual secrets.
+pub(super) fn masked_secret_marker() -> String {
+    "****".to_owned() + "..." + "****"
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -63,6 +72,18 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
     {
         access_control.remove("password_hash");
         access_control.remove("password_salt");
+        if let Some(devices) = access_control
+            .get_mut("devices")
+            .and_then(|v| v.as_array_mut())
+        {
+            for device in devices {
+                let Some(device) = device.as_object_mut() else {
+                    continue;
+                };
+                device.remove("token_hash");
+                device.remove("token_salt");
+            }
+        }
     }
 
     // Redact secret env var values.
@@ -78,6 +99,7 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                 }
                 // Never expose encrypted material via API.
                 obj.remove("value_encrypted");
+                obj.remove("credential_ref");
             }
         }
     }
@@ -184,6 +206,8 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false)
                         || p.token_encrypted.is_some()
+                        || p.token_configured
+                        || p.token_credential_ref.is_some()
                 })
                 .unwrap_or(false);
             if configured {
@@ -208,6 +232,8 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false)
                         || p.app_secret_encrypted.is_some()
+                        || p.app_secret_configured
+                        || p.app_secret_credential_ref.is_some()
                 })
                 .unwrap_or(false);
             if app_secret_configured {

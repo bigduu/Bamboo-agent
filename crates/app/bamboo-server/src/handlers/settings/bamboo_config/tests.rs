@@ -39,6 +39,7 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
                 api_key: "sk-test".to_string(),
                 api_key_from_env: false,
                 api_key_encrypted: None,
+                credential_ref: None,
                 base_url: None,
                 model: None,
                 fast_model: None,
@@ -59,8 +60,11 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
 
 #[test]
 fn proxy_auth_payload_without_username_disables_proxy_auth() {
-    let payload: ProxyAuthPayload =
-        serde_json::from_value(serde_json::json!({ "password": "secret" })).unwrap();
+    let payload: ProxyAuthPayload = serde_json::from_value(serde_json::json!({
+        "expected_revision": 0,
+        "password": "secret"
+    }))
+    .unwrap();
 
     assert!(payload.into_proxy_auth().is_none());
 }
@@ -68,6 +72,7 @@ fn proxy_auth_payload_without_username_disables_proxy_auth() {
 #[test]
 fn proxy_auth_payload_with_username_creates_proxy_auth() {
     let payload: ProxyAuthPayload = serde_json::from_value(serde_json::json!({
+        "expected_revision": 0,
         "username": "alice",
         "password": "secret"
     }))

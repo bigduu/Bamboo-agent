@@ -1168,6 +1168,8 @@ fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
         value: "hidden-value".to_string(),
         secret: true,
         value_encrypted: None,
+        credential_ref: None,
+        configured: true,
         description: Some("Runtime test token".to_string()),
     }];
     config_with_env.publish_env_vars();
@@ -1266,6 +1268,8 @@ fn prompt_assembly_report_component_values_match_sections() {
         value: "hidden-value".to_string(),
         secret: true,
         value_encrypted: None,
+        credential_ref: None,
+        configured: true,
         description: Some("Runtime test token".to_string()),
     }];
     config_with_env.publish_env_vars();
@@ -1364,6 +1368,8 @@ fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
         value: "hidden-value".to_string(),
         secret: true,
         value_encrypted: None,
+        credential_ref: None,
+        configured: true,
         description: Some("Prompt envelope token".to_string()),
     }];
     config_with_env.publish_env_vars();

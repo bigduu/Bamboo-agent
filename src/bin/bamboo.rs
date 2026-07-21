@@ -2067,7 +2067,6 @@ fn serialize_config_for_cli(
     mut config: Config,
     show_secrets: bool,
 ) -> bamboo_agent::Result<serde_json::Value> {
-    config.refresh_proxy_auth_encrypted()?;
     config.refresh_provider_api_keys_encrypted()?;
     config.refresh_mcp_secrets_encrypted()?;
     config.normalize_tool_settings();
@@ -2154,6 +2153,7 @@ mod tests {
                 api_key: "sk-cli-secret".to_string(),
                 api_key_from_env: false,
                 api_key_encrypted: None,
+                credential_ref: None,
                 base_url: Some("https://api.openai.com/v1".to_string()),
                 model: Some("gpt-4o".to_string()),
                 fast_model: None,
@@ -2176,6 +2176,7 @@ mod tests {
                 cwd: None,
                 env: HashMap::from([("TOKEN".to_string(), "super-secret".to_string())]),
                 env_encrypted: HashMap::new(),
+                env_credential_refs: HashMap::new(),
                 startup_timeout_ms: 5_000,
             }),
             request_timeout_ms: 5_000,
@@ -2212,7 +2213,8 @@ mod tests {
         assert!(value["providers"]["openai"]["api_key_encrypted"]
             .as_str()
             .is_some());
-        assert!(value.get("proxy_auth_encrypted").is_some());
+        assert!(value.get("proxy_auth_encrypted").is_none());
+        assert!(value.get("proxy_auth").is_none());
         assert_eq!(
             value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
             "super-secret"

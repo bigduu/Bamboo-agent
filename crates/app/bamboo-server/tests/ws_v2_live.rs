@@ -363,6 +363,8 @@ fn with_device(config: &mut bamboo_config::Config) -> (DeviceCredential, String)
         label: "test-device".to_string(),
         token_hash,
         token_salt: salt_hex,
+        token_credential_ref: None,
+        token_configured: false,
         created_at: "2024-01-01T00:00:00Z".to_string(),
         last_used_at: None,
         revoked: false,
@@ -371,6 +373,8 @@ fn with_device(config: &mut bamboo_config::Config) -> (DeviceCredential, String)
         password_enabled: false,
         password_hash: None,
         password_salt: None,
+        password_credential_ref: None,
+        password_configured: false,
         updated_at: None,
         devices: vec![cred.clone()],
     });

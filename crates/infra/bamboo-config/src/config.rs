@@ -61,7 +61,6 @@ use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
@@ -179,22 +178,30 @@ impl StreamTimeoutConfig {
 
 /// A user-managed environment variable that is injected into Bash tool processes.
 ///
-/// Secret entries are encrypted at rest: `value` is empty on disk and populated
-/// in memory after hydration from `value_encrypted`.
+/// Secret entries are stored by reference in the isolated credential store:
+/// `value` is runtime-only for those entries, while `credential_ref` and
+/// `configured` are the only secret metadata persisted in ordinary config.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvVarEntry {
     /// Variable name (must match `^[A-Za-z_][A-Za-z0-9_]*$`).
     pub name: String,
     /// Plaintext value – populated in memory after hydration.
     /// For `secret=true` entries this field is empty on disk.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub value: String,
     /// Whether this variable contains sensitive data (token, password, etc.).
     #[serde(default)]
     pub secret: bool,
-    /// Encrypted ciphertext (only present on disk for secret entries).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy inline ciphertext, accepted on read only so startup migration can
+    /// extract it. New serializers never emit this field.
+    #[serde(default, skip_serializing)]
     pub value_encrypted: Option<String>,
+    /// Stable isolated-store reference for secret entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Durable status metadata; never inferred from a public mask.
+    #[serde(default)]
+    pub configured: bool,
     /// Optional human-readable description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -217,12 +224,20 @@ pub struct AccessControlConfig {
     /// Whether password protection is enabled.
     #[serde(default)]
     pub password_enabled: bool,
-    /// Password hash (hex-encoded). Never expose via API.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime-only password verifier hash. Legacy documents may still
+    /// deserialize it for migration, but ordinary section serialization never
+    /// writes verifier material.
+    #[serde(default, skip_serializing)]
     pub password_hash: Option<String>,
-    /// Salt used for hashing (hex-encoded). Never expose via API.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Runtime-only password verifier salt.
+    #[serde(default, skip_serializing)]
     pub password_salt: Option<String>,
+    /// Stable reference to the encrypted verifier record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_credential_ref: Option<crate::CredentialRef>,
+    /// Durable configured metadata for redacted clients/runtime readiness.
+    #[serde(default)]
+    pub password_configured: bool,
     /// Last update timestamp for auditing / debugging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -245,10 +260,18 @@ pub struct DeviceCredential {
     pub device_id: String,
     /// Human-readable label, e.g. "iPhone 15".
     pub label: String,
-    /// `SHA-256(hex_decode(token_salt) || token)`, hex-encoded.
+    /// Runtime-only `SHA-256(hex_decode(token_salt) || token)`, hex-encoded.
+    #[serde(default, skip_serializing)]
     pub token_hash: String,
-    /// Per-device salt (hex-encoded).
+    /// Runtime-only per-device salt (hex-encoded).
+    #[serde(default, skip_serializing)]
     pub token_salt: String,
+    /// Stable reference to the encrypted device-token verifier record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_credential_ref: Option<crate::CredentialRef>,
+    /// Durable configured metadata for runtime readiness.
+    #[serde(default)]
+    pub token_configured: bool,
     /// RFC3339 creation timestamp.
     pub created_at: String,
     /// RFC3339 last-used timestamp (deferred stamping; see PR).
@@ -778,19 +801,38 @@ pub struct RemoteActorPlacement {
 }
 
 /// How to reach the central sub-agent message broker (`bamboo broker serve`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BrokerClientConfig {
     /// Broker WebSocket endpoint, e.g. `ws://broker-host:9600`.
     pub endpoint: String,
     /// Bearer token presented in the broker handshake.
     ///
-    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
-    /// empty on disk and hydrated in memory on load (mirrors [`EnvVarEntry`]).
-    #[serde(default)]
+    /// Runtime-only plaintext hydrated from the isolated credential store.
+    /// Legacy `broker.json` files may still deserialize this field so the
+    /// manifest migration can extract it, but serializers never emit it.
+    #[serde(default, skip_serializing)]
     pub token: String,
-    /// Encrypted ciphertext of `token` (the at-rest representation).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy inline ciphertext accepted only for credential migration.
+    #[serde(default, skip_serializing)]
     pub token_encrypted: Option<String>,
+    /// Stable reference to the external broker bearer token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Durable configured metadata. Runtime hydration still verifies that the
+    /// referenced credential exists and decrypts successfully.
+    #[serde(default)]
+    pub configured: bool,
+}
+
+impl std::fmt::Debug for BrokerClientConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerClientConfig")
+            .field("endpoint", &self.endpoint)
+            .field("credential_ref", &self.credential_ref)
+            .field("configured", &self.configured)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Native desktop (OS-notification) delivery channel.
@@ -821,14 +863,19 @@ pub struct NtfyChannelConfig {
     /// Access token for a protected/self-hosted ntfy instance (public ntfy.sh
     /// topics need none).
     ///
-    /// Secret: encrypted at rest in `token_encrypted`; this plaintext field is
-    /// never serialized and is hydrated in memory on load (mirrors
-    /// [`EnvVarEntry`] / [`BrokerClientConfig::token`]).
+    /// Secret plaintext hydrated in memory from the isolated credential store;
+    /// never serialized in ordinary config.
     #[serde(default, skip_serializing)]
     pub token: Option<String>,
-    /// Encrypted ciphertext of `token` (the at-rest representation).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy encrypted ciphertext accepted only for migration.
+    #[serde(default, skip_serializing)]
     pub token_encrypted: Option<String>,
+    /// Stable isolated credential-store reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Whether the referenced credential is expected to exist.
+    #[serde(default)]
+    pub configured: bool,
 }
 
 impl Default for NtfyChannelConfig {
@@ -839,6 +886,8 @@ impl Default for NtfyChannelConfig {
             topic: String::new(),
             token: None,
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         }
     }
 }
@@ -857,14 +906,19 @@ pub struct BarkChannelConfig {
     pub base_url: String,
     /// Bark device key identifying the target iOS device.
     ///
-    /// Secret: encrypted at rest in `device_key_encrypted`; this plaintext
-    /// field is never serialized and is hydrated in memory on load (mirrors
-    /// [`NtfyChannelConfig::token`]).
+    /// Secret plaintext hydrated in memory from the isolated credential store;
+    /// never serialized in ordinary config.
     #[serde(default, skip_serializing)]
     pub device_key: Option<String>,
-    /// Encrypted ciphertext of `device_key` (the at-rest representation).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy encrypted ciphertext accepted only for migration.
+    #[serde(default, skip_serializing)]
     pub device_key_encrypted: Option<String>,
+    /// Stable isolated credential-store reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
+    /// Whether the referenced credential is expected to exist.
+    #[serde(default)]
+    pub configured: bool,
 }
 
 impl Default for BarkChannelConfig {
@@ -874,6 +928,8 @@ impl Default for BarkChannelConfig {
             base_url: default_bark_base_url(),
             device_key: None,
             device_key_encrypted: None,
+            credential_ref: None,
+            configured: false,
         }
     }
 }
@@ -931,6 +987,12 @@ pub struct ConnectPlatformConfig {
     /// Encrypted ciphertext of `token` (the at-rest representation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_encrypted: Option<String>,
+    /// Stable reference to the isolated token credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_credential_ref: Option<crate::CredentialRef>,
+    /// Durable metadata used by redacted clients without exposing a value.
+    #[serde(default)]
+    pub token_configured: bool,
     /// Platform app id (Feishu `app_id`). Not a secret — serialized normally.
     /// Unused by the Telegram adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -945,6 +1007,12 @@ pub struct ConnectPlatformConfig {
     /// Encrypted ciphertext of `app_secret` (the at-rest representation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_secret_encrypted: Option<String>,
+    /// Stable reference to the isolated app-secret credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_secret_credential_ref: Option<crate::CredentialRef>,
+    /// Durable metadata used by redacted clients without exposing a value.
+    #[serde(default)]
+    pub app_secret_configured: bool,
     /// Platform domain/base-URL selector (Feishu-only today). Not a secret —
     /// serialized normally. `None`/`"feishu"` -> open.feishu.cn, `"lark"` ->
     /// open.larksuite.com, an `https://` value -> a private-deployment base
@@ -1261,15 +1329,15 @@ pub struct ConfigValues {
     pub https_proxy: String,
     /// Proxy authentication credentials
     ///
-    /// Note: this is kept in-memory only. On disk we store `proxy_auth_encrypted`.
+    /// Kept in memory only; ordinary config stores `proxy_auth_credential_ref`.
     #[serde(skip_serializing)]
     pub proxy_auth: Option<ProxyAuth>,
-    /// Encrypted proxy authentication credentials (nonce:ciphertext)
-    ///
-    /// This is the at-rest storage representation. When present, Bamboo will
-    /// decrypt it into `proxy_auth` at load time.
+    /// Legacy encrypted proxy authentication accepted only for migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_auth_encrypted: Option<String>,
+    /// Stable credential-store reference for proxy authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_credential_ref: Option<crate::CredentialRef>,
     /// Deprecated: Use `providers.copilot.headless_auth` instead
     #[serde(default)]
     pub headless_auth: bool,
@@ -1386,9 +1454,8 @@ pub struct ConfigValues {
     pub mcp: bamboo_domain::mcp_config::McpConfig,
 
     /// Notification delivery channels (desktop + push-relay services).
-    /// Secrets (ntfy token, Bark device key) are encrypted at rest — see
-    /// [`Config::hydrate_notifications_from_encrypted`] /
-    /// [`Config::refresh_notifications_encrypted`].
+    /// Secrets (ntfy token, Bark device key) live in the isolated credential
+    /// store; only stable references/configured metadata persist here.
     #[serde(default)]
     pub notifications: NotificationsConfig,
 
@@ -1421,6 +1488,7 @@ impl Default for ConfigValues {
             https_proxy: String::new(),
             proxy_auth: None,
             proxy_auth_encrypted: None,
+            proxy_auth_credential_ref: None,
             headless_auth: false,
             run_budget: RunBudgetConfig::default(),
             stream_timeout: StreamTimeoutConfig::default(),
@@ -1461,6 +1529,8 @@ struct NetworkConfigSection {
     proxy_auth: Option<ProxyAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proxy_auth_encrypted: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_auth_credential_ref: Option<crate::CredentialRef>,
     #[serde(default)]
     headless_auth: bool,
     #[serde(default)]
@@ -1622,6 +1692,7 @@ impl From<ConfigValues> for ConfigRoot {
             https_proxy,
             proxy_auth,
             proxy_auth_encrypted,
+            proxy_auth_credential_ref,
             headless_auth,
             provider,
             defaults,
@@ -1654,6 +1725,7 @@ impl From<ConfigValues> for ConfigRoot {
                 https_proxy,
                 proxy_auth,
                 proxy_auth_encrypted,
+                proxy_auth_credential_ref,
                 headless_auth,
                 server,
             },
@@ -1711,6 +1783,7 @@ impl From<ConfigRoot> for ConfigValues {
             https_proxy,
             proxy_auth,
             proxy_auth_encrypted,
+            proxy_auth_credential_ref,
             headless_auth,
             server,
         } = network;
@@ -1749,6 +1822,7 @@ impl From<ConfigRoot> for ConfigValues {
             https_proxy,
             proxy_auth,
             proxy_auth_encrypted,
+            proxy_auth_credential_ref,
             headless_auth,
             provider,
             defaults,
@@ -2181,6 +2255,9 @@ pub struct OpenAIConfig {
     /// Encrypted OpenAI API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
     /// Such keys are runtime-only and MUST NOT be re-encrypted into
     /// `api_key_encrypted` on save (that would bake the secret into
@@ -2243,6 +2320,9 @@ pub struct AnthropicConfig {
     /// Encrypted Anthropic API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
     /// Such keys are runtime-only and MUST NOT be re-encrypted into
     /// `api_key_encrypted` on save (that would bake the secret into
@@ -2317,6 +2397,9 @@ pub struct GeminiConfig {
     /// Encrypted Google AI API key (nonce:ciphertext).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// True when `api_key` was supplied via a `BAMBOO_*_API_KEY` env var.
     /// Such keys are runtime-only and MUST NOT be re-encrypted into
     /// `api_key_encrypted` on save (that would bake the secret into
@@ -2414,6 +2497,9 @@ pub struct BodhiConfig {
     /// Encrypted form of the API key stored on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
     /// Bodhi server base URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -2485,6 +2571,10 @@ pub struct ProviderInstanceConfig {
     /// `api_key` on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_encrypted: Option<String>,
+
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<crate::CredentialRef>,
 
     /// Custom base URL override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2689,6 +2779,24 @@ impl Config {
         }
     }
 
+    /// Crate-internal seam used by the modular section facade.
+    ///
+    /// Keeping this conversion here lets the facade exhaustively destructure
+    /// [`ConfigValues`] in both directions without exposing the compatibility
+    /// facade's private storage to downstream crates.
+    pub(crate) fn section_values(&self) -> ConfigValues {
+        self.values.clone()
+    }
+
+    pub(crate) fn from_section_parts(
+        values: ConfigValues,
+        memory: Option<MemoryConfig>,
+        subagents: SubagentsConfig,
+        providers: ProviderConfigs,
+    ) -> Self {
+        Self::from_parts(values, memory, subagents, providers)
+    }
+
     /// Compatibility accessor for independently persisted memory settings.
     pub fn memory(&self) -> &Option<MemoryConfig> {
         &self.memory.0
@@ -2774,6 +2882,25 @@ impl Config {
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(default_data_dir);
 
+        // Finish any shared manifest-committed credential extraction before
+        // reading even one member of the transaction, then plan only the
+        // provider/MCP/root domains. The optional broker has its own planner so
+        // malformed broker metadata cannot suppress main configuration loading.
+        let provider_mcp_ready = crate::migrate_provider_mcp_credentials(&data_dir)
+            .and_then(|_| crate::ensure_provider_mcp_migration_ready(&data_dir))
+            .map_err(|error| {
+                tracing::warn!(error = %error, "provider/MCP/root credential migration unavailable");
+                error
+            })
+            .is_ok();
+        let cluster_ready = crate::migrate_cluster_credentials(&data_dir)
+            .and_then(|_| crate::ensure_provider_mcp_migration_ready(&data_dir))
+            .map_err(|error| {
+                tracing::warn!(error = %error, "cluster credential migration unavailable");
+                error
+            })
+            .is_ok();
+
         let config_path = data_dir.join("config.json");
 
         let mut config = if config_path.exists() {
@@ -2841,31 +2968,81 @@ impl Config {
                 "Failed to load subagents.json; using legacy config.json subagents: {error}"
             ),
         }
-        let mut providers_module = config.providers.clone();
-        match providers_module.load_sync(&data_dir) {
-            Ok(true) => config.providers = providers_module,
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                "Failed to load providers.json; using legacy config.json providers: {error}"
-            ),
+        if provider_mcp_ready {
+            let mut providers_module = config.providers.clone();
+            match providers_module.load_sync(&data_dir) {
+                Ok(true) => config.providers = providers_module,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    "Failed to load providers.json; using legacy config.json providers: {error}"
+                ),
+            }
         }
 
         // Decrypt encrypted proxy auth into in-memory plaintext form.
         config.hydrate_proxy_auth_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_proxy_auth_from_store(&data_dir) {
+                tracing::warn!(error = %error, "proxy auth credential hydration unavailable");
+                config.proxy_auth = None;
+            }
+        }
         // Decrypt encrypted provider API keys into in-memory plaintext form.
         config.hydrate_provider_api_keys_from_encrypted();
         // Decrypt encrypted provider-instance API keys into in-memory plaintext form.
         config.hydrate_provider_instance_api_keys_from_encrypted();
         // Decrypt encrypted MCP secrets into in-memory plaintext form.
         config.hydrate_mcp_secrets_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_provider_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "provider credential hydration unavailable");
+            }
+            if let Err(error) = config.hydrate_mcp_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "MCP credential hydration unavailable");
+            }
+        }
         // Decrypt encrypted env vars into in-memory plaintext form.
         config.hydrate_env_vars_from_encrypted();
-        // Decrypt encrypted cluster-fabric SSH secrets into in-memory plaintext.
-        config.hydrate_cluster_fabric_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_env_var_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "env credential hydration unavailable");
+                for entry in &mut config.env_vars {
+                    if entry.secret {
+                        entry.value.clear();
+                    }
+                }
+            }
+        }
+        // Cluster migration is deliberately independent from provider/MCP
+        // readiness. A malformed optional fabric fails only cluster runtime
+        // authentication, while missing/corrupt refs never fall back to legacy
+        // ciphertext or an unauthenticated SSH attempt.
+        if cluster_ready {
+            if let Err(error) = config.hydrate_cluster_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "cluster credential hydration unavailable");
+                config.clear_cluster_runtime_credentials();
+            }
+        } else {
+            config.clear_cluster_runtime_credentials();
+        }
         // Decrypt the encrypted broker token into in-memory plaintext.
         config.hydrate_broker_token_from_encrypted();
         // Decrypt encrypted notification-channel secrets into in-memory plaintext.
         config.hydrate_notifications_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_notification_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "notification credential hydration unavailable");
+                config.notifications.ntfy.token = None;
+                config.notifications.bark.device_key = None;
+            }
+        } else {
+            // A pending or unreadable credential migration means the isolated
+            // store is not authoritative yet. Legacy plaintext/ciphertext may
+            // remain on disk for recovery, but notification sinks must not use
+            // it in this process.
+            config.notifications.ntfy.token = None;
+            config.notifications.bark.device_key = None;
+        }
         // Merge the standalone connect.json (#455) onto `config.connect`,
         // migrating a legacy inline `connect` key from config.json (#453
         // state) when present. MUST run before the token hydration below so
@@ -2883,6 +3060,23 @@ impl Config {
         scrub_legacy_connect_from_config_backups(&data_dir);
         // Decrypt encrypted bamboo-connect platform tokens into in-memory plaintext.
         config.hydrate_connect_platform_tokens_from_encrypted();
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_connect_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "connect credential hydration unavailable");
+                for platform in &mut config.connect.platforms {
+                    platform.token = None;
+                    platform.app_secret = None;
+                }
+            }
+        }
+        if provider_mcp_ready {
+            if let Err(error) = config.hydrate_access_control_credentials_from_store(&data_dir) {
+                tracing::warn!(error = %error, "access-control credential hydration unavailable");
+                config.clear_access_control_runtime_verifiers();
+            }
+        } else {
+            config.clear_access_control_runtime_verifiers();
+        }
         config.normalize_tool_settings();
         config.normalize_skill_settings();
         config.normalize_plugin_trust_settings();
@@ -2992,6 +3186,14 @@ impl Config {
                 gemini.api_key_from_env = true;
             }
         }
+    }
+
+    /// Apply runtime-only `BAMBOO_*` overrides to a config assembled by the
+    /// modular facade. Facade callers use this after durable section snapshots
+    /// and credential references have been materialized; one-shot writers keep
+    /// using the no-env load path so overrides are never persisted.
+    pub fn apply_runtime_env_overrides(&mut self) {
+        self.apply_env_overrides();
     }
 
     /// Load config from disk AND publish its env vars to the process-global cache
@@ -3637,6 +3839,7 @@ impl Config {
                 https_proxy: String::new(),
                 proxy_auth: None,
                 proxy_auth_encrypted: None,
+                proxy_auth_credential_ref: None,
                 headless_auth: false,
                 run_budget: RunBudgetConfig::default(),
                 stream_timeout: StreamTimeoutConfig::default(),
@@ -3694,6 +3897,103 @@ impl Config {
         let mut config = self.clone();
         config.refresh_provider_api_keys_encrypted()?;
         config.providers.save_sync(data_dir)
+    }
+
+    /// Build the metadata-only documents used by a provider credential
+    /// transaction. Nothing is written here: the migration journal owns the
+    /// durable commit and publishes both documents together with credentials.
+    pub(crate) fn prepare_provider_transaction_documents(
+        &self,
+        provider_document: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        if let Some(status) = self.recovery_status.as_ref().filter(|s| !s.confirmed) {
+            anyhow::bail!(
+                "refusing to overwrite config.json: recovery from {:?} is unconfirmed",
+                status.source
+            );
+        }
+
+        let mut to_save = self.clone();
+        to_save.extra.remove("data_dir");
+        to_save.extra.remove("model");
+        to_save.refresh_encrypted_secrets()?;
+        to_save.ensure_provider_instance_credentials_isolated()?;
+        to_save.sanitize_mcp_credential_refs_for_disk();
+        to_save.sanitize_env_vars_for_disk();
+        to_save.sanitize_notifications_for_disk();
+        to_save.sanitize_cluster_fabric_for_disk();
+        to_save.assign_connect_platform_ids();
+        to_save.normalize_tool_settings();
+        to_save.normalize_skill_settings();
+
+        let mut root = serde_json::to_value(ConfigRoot::from(to_save.values.clone()))
+            .context("Failed to serialize root config DTO to JSON")?;
+        if let Some(object) = root.as_object_mut() {
+            object.remove("connect");
+        }
+        let root = serde_json::to_vec_pretty(&root)?;
+
+        let mut providers = to_save.providers.0.clone();
+        macro_rules! sanitize_provider {
+            ($field:ident) => {
+                if let Some(provider) = providers.$field.as_mut() {
+                    if !provider.api_key.trim().is_empty()
+                        && !provider.api_key_from_env
+                        && provider.credential_ref.is_none()
+                    {
+                        anyhow::bail!(
+                            "provider secret requires credential transaction before persistence"
+                        );
+                    }
+                    provider.api_key_encrypted = None;
+                }
+            };
+        }
+        sanitize_provider!(openai);
+        sanitize_provider!(anthropic);
+        sanitize_provider!(gemini);
+        if let Some(provider) = providers.bodhi.as_mut() {
+            if !provider.api_key.trim().is_empty() && provider.credential_ref.is_none() {
+                anyhow::bail!("provider secret requires credential transaction before persistence");
+            }
+            provider.api_key_encrypted = None;
+        }
+
+        let existing_provider_value = if provider_document.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice::<Value>(provider_document)
+                    .context("provider metadata document is invalid")?,
+            )
+        };
+        let provider_value = match existing_provider_value {
+            Some(Value::Object(mut envelope))
+                if envelope.contains_key("schema_version")
+                    || envelope.contains_key("revision")
+                    || envelope.contains_key("data") =>
+            {
+                let revision = envelope
+                    .get("revision")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("provider revision envelope is invalid"))?;
+                let schema_version = envelope
+                    .get("schema_version")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("provider revision envelope is invalid"))?;
+                if schema_version != 1 || !envelope.contains_key("data") {
+                    anyhow::bail!("provider revision envelope is unsupported");
+                }
+                let revision = revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("provider revision counter exhausted"))?;
+                envelope.insert("revision".into(), Value::from(revision));
+                envelope.insert("data".into(), serde_json::to_value(providers)?);
+                Value::Object(envelope)
+            }
+            Some(_) | None => serde_json::to_value(providers)?,
+        };
+        Ok((root, serde_json::to_vec_pretty(&provider_value)?))
     }
 
     /// The pending config-corruption recovery, if `config.json` failed to
@@ -3775,6 +4075,54 @@ impl Config {
                 status.quarantine_path,
             );
         }
+        if self.proxy_auth_credential_ref.is_none()
+            && (self.proxy_auth.is_some() || self.proxy_auth_encrypted.is_some())
+        {
+            anyhow::bail!(
+                "proxy auth requires the isolated credential transaction before persistence"
+            );
+        }
+        if self.env_vars.iter().any(|entry| {
+            entry.secret
+                && entry.credential_ref.is_none()
+                && (entry.configured || !entry.value.is_empty() || entry.value_encrypted.is_some())
+        }) {
+            anyhow::bail!(
+                "secret env vars require the isolated credential transaction before persistence"
+            );
+        }
+        if [
+            (
+                &self.notifications.ntfy.token,
+                &self.notifications.ntfy.token_encrypted,
+                &self.notifications.ntfy.credential_ref,
+            ),
+            (
+                &self.notifications.bark.device_key,
+                &self.notifications.bark.device_key_encrypted,
+                &self.notifications.bark.credential_ref,
+            ),
+        ]
+        .iter()
+        .any(|(plaintext, ciphertext, reference)| {
+            reference.is_none()
+                && (plaintext
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || ciphertext.is_some())
+        }) {
+            anyhow::bail!(
+                "notification secrets require the isolated credential transaction before persistence"
+            );
+        }
+
+        if crate::section_layout_is_active(&data_dir)
+            .context("Failed to inspect modular configuration layout")?
+        {
+            crate::persist_facade_effective_config(&data_dir, self)
+                .context("Failed to persist modular configuration sections")?;
+            return Ok(());
+        }
 
         let path = data_dir.join("config.json");
 
@@ -3791,7 +4139,10 @@ impl Config {
         // `subagents.broker` is `#[serde(skip)]` (runtime-only, lives in its own
         // broker.json / embedded in-process) — nothing to encrypt or persist here.
         to_save.refresh_encrypted_secrets()?;
+        to_save.ensure_provider_instance_credentials_isolated()?;
+        to_save.sanitize_mcp_credential_refs_for_disk();
         to_save.sanitize_env_vars_for_disk();
+        to_save.sanitize_notifications_for_disk();
         to_save.sanitize_cluster_fabric_for_disk();
         to_save.assign_connect_platform_ids();
         to_save.normalize_tool_settings();
@@ -3840,9 +4191,22 @@ impl Config {
             // (parseable) config.json as the freshest .bak. #135.
             rotate_backups(&path, BAK_GENERATIONS);
             let backup = backup_path_for(&path, 0);
-            if let Err(e) = std::fs::copy(&path, &backup) {
+            let backup_result = std::fs::read(&path).and_then(|bytes| {
+                let mut value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                if sanitize_ref_backed_mcp_json(&mut value) {
+                    let sanitized = serde_json::to_vec_pretty(&value).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    write_atomic(&backup, &sanitized)
+                } else {
+                    std::fs::copy(&path, &backup).map(|_| ())
+                }
+            });
+            if let Err(e) = backup_result {
                 tracing::warn!("Failed to back up config.json before save: {}", e);
             }
+            scrub_ref_backed_mcp_from_config_backups(&path);
         }
 
         write_atomic(&path, content.as_bytes())
@@ -3851,6 +4215,118 @@ impl Config {
         save_connect_config(&to_save.connect, &data_dir)?;
 
         Ok(())
+    }
+}
+
+/// Remove credential-ref-backed MCP values from a raw root document without
+/// otherwise normalizing its compatibility shape. This is used for rotated
+/// root backups as well as the typed disk DTO so a pre-fix root cannot keep a
+/// duplicate secret alive for several more saves.
+fn sanitize_ref_backed_mcp_json(root: &mut Value) -> bool {
+    let Some(object) = root.as_object_mut() else {
+        return false;
+    };
+    let Some(mcp) = (if object.contains_key("mcpServers") {
+        object.get_mut("mcpServers")
+    } else {
+        object.get_mut("mcp")
+    }) else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(servers) = mcp.get_mut("servers").and_then(Value::as_array_mut) {
+        for server in servers {
+            if let Some(object) = server.as_object_mut() {
+                if let Some(transport) = object.get_mut("transport").and_then(Value::as_object_mut)
+                {
+                    changed |= sanitize_ref_backed_mcp_transport(transport);
+                }
+            }
+        }
+    } else if let Some(servers) = mcp.as_object_mut() {
+        for server in servers.values_mut() {
+            if let Some(object) = server.as_object_mut() {
+                changed |= sanitize_ref_backed_mcp_transport(object);
+                if let Some(transport) = object.get_mut("transport").and_then(Value::as_object_mut)
+                {
+                    changed |= sanitize_ref_backed_mcp_transport(transport);
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn sanitize_ref_backed_mcp_transport(object: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    let env_names = object
+        .get("env_credential_refs")
+        .and_then(Value::as_object)
+        .map(|refs| refs.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for name in env_names {
+        for field in ["env", "env_encrypted"] {
+            if object
+                .get_mut(field)
+                .and_then(Value::as_object_mut)
+                .and_then(|values| values.remove(&name))
+                .is_some()
+            {
+                changed = true;
+            }
+        }
+    }
+    let header_names = object
+        .get("header_credential_refs")
+        .and_then(Value::as_object)
+        .map(|refs| refs.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for name in header_names {
+        for field in ["headers", "headers_encrypted"] {
+            if object
+                .get_mut(field)
+                .and_then(Value::as_object_mut)
+                .and_then(|values| values.remove(&name))
+                .is_some()
+            {
+                changed = true;
+            }
+        }
+    }
+    if let Some(headers) = object.get_mut("headers").and_then(Value::as_array_mut) {
+        for header in headers {
+            let Some(header) = header.as_object_mut() else {
+                continue;
+            };
+            if header.get("credential_ref").is_some_and(Value::is_string) {
+                changed |= header.remove("value").is_some();
+                changed |= header.remove("value_encrypted").is_some();
+            }
+        }
+    }
+    changed
+}
+
+fn scrub_ref_backed_mcp_from_config_backups(path: &std::path::Path) {
+    for generation in 0..BAK_GENERATIONS {
+        let backup = backup_path_for(path, generation);
+        let Ok(bytes) = std::fs::read(&backup) else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if sanitize_ref_backed_mcp_json(&mut value) {
+            if let Ok(sanitized) = serde_json::to_vec_pretty(&value) {
+                if let Err(error) = write_atomic(&backup, &sanitized) {
+                    tracing::warn!(
+                        "Failed to scrub MCP credentials from {:?}: {}",
+                        backup,
+                        error
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -4193,47 +4669,12 @@ fn rotate_backups(config_path: &std::path::Path, generations: usize) {
 }
 
 pub(crate) fn write_atomic(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return std::fs::write(path, content);
-    };
-
-    std::fs::create_dir_all(parent)?;
-
-    // Write to a temp file in the same directory then rename to ensure atomic replace.
-    // (Rename is atomic on Unix when source/dest are on the same filesystem.)
-    //
-    // The temp name must be unique PER CALL, not just per-process (issue
-    // #486): it used to be derived from `process_id()` alone, which is
-    // IDENTICAL across every thread of the same process. Two `write_atomic`
-    // calls racing on the same directory (observed: two `#[test]` fns in
-    // this file's suite, run concurrently by the default multi-threaded
-    // test harness) therefore computed the exact same `tmp_path`. Whichever
-    // caller's `File::create` ran second truncated the first caller's
-    // in-flight temp file out from under it; whichever caller's `rename`
-    // then lost the race failed with ENOENT (its temp file had already been
-    // renamed away by the other caller) — reproducing
-    // `save_rotates_backup_generations`'s exact CI failure: "Failed to
-    // write config file ... No such file or directory (os error 2)". A
-    // monotonic per-process counter alongside the PID makes every call's
-    // temp file distinct, regardless of how many callers target the same
-    // directory concurrently.
-    static NEXT_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config.json");
-    let tmp_name = format!(".{}.tmp.{}.{}", file_name, std::process::id(), unique);
-    let tmp_path = parent.join(tmp_name);
-
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-    }
-
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    crate::config_store::AtomicFileStore::new(path)
+        .write_bytes_without_backup(content)
+        .map_err(|error| match error {
+            crate::config_store::ConfigStoreError::Io(error) => error,
+            other => std::io::Error::other(other),
+        })
 }
 
 #[cfg(test)]
@@ -4627,6 +5068,8 @@ mod tests {
             password_enabled: true,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         };
@@ -4645,6 +5088,8 @@ mod tests {
             label: "iPhone 15".to_string(),
             token_hash: "abcd".to_string(),
             token_salt: "ef01".to_string(),
+            token_credential_ref: None,
+            token_configured: false,
             created_at: "2026-06-23T00:00:00Z".to_string(),
             last_used_at: None,
             revoked: false,
@@ -4653,13 +5098,19 @@ mod tests {
             password_enabled: true,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: vec![device.clone()],
         };
         let value = serde_json::to_value(&access).expect("serialize");
         assert!(value.as_object().unwrap().contains_key("devices"));
+        assert!(value["devices"][0].get("token_hash").is_none());
+        assert!(value["devices"][0].get("token_salt").is_none());
         let back: AccessControlConfig = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(back.devices, vec![device]);
+        assert_eq!(back.devices[0].device_id, device.device_id);
+        assert!(back.devices[0].token_hash.is_empty());
+        assert!(back.devices[0].token_salt.is_empty());
     }
 
     #[test]
@@ -4873,6 +5324,8 @@ mod tests {
                 value: "top-secret".to_string(),
                 secret: true,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: Some("Service token".to_string()),
             },
             EnvVarEntry {
@@ -4880,6 +5333,8 @@ mod tests {
                 value: "https://internal.example".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: Some("Internal API base".to_string()),
             },
         ]);
@@ -4930,6 +5385,8 @@ mod tests {
             value: "live".to_string(),
             secret: false,
             value_encrypted: None,
+            credential_ref: None,
+            configured: true,
             description: None,
         }]);
         live.publish_env_vars();
@@ -5532,9 +5989,13 @@ mod tests {
             platform_type: platform_type.to_string(),
             token: None,
             token_encrypted: Some(token_encrypted.to_string()),
+            token_credential_ref: None,
+            token_configured: false,
             app_id: None,
             app_secret: None,
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: None,
             allow_from: vec!["user-1".to_string()],
             admin_from: Vec::new(),
@@ -5696,12 +6157,14 @@ mod tests {
 
     #[test]
     fn load_merges_connect_json_into_config() {
+        let _key = crate::encryption::set_test_encryption_key([0x71; 32]);
         let temp = TempHome::new();
+        let ciphertext = crate::encryption::encrypt("connect-secret").unwrap();
         std::fs::write(
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "cipher-abc", "allow_from": ["u1"] }
+                    { "type": "telegram", "token_encrypted": ciphertext, "allow_from": ["u1"] }
                 ]
             })
             .to_string(),
@@ -5712,9 +6175,10 @@ mod tests {
         assert_eq!(config.connect.platforms.len(), 1);
         assert_eq!(config.connect.platforms[0].platform_type, "telegram");
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("cipher-abc")
+            config.connect.platforms[0].token.as_deref(),
+            Some("connect-secret")
         );
+        assert!(config.connect.platforms[0].token_encrypted.is_none());
     }
 
     #[test]
@@ -5735,14 +6199,17 @@ mod tests {
 
     #[test]
     fn migration_adopts_legacy_connect_key_and_writes_both_files() {
+        let _key = crate::encryption::set_test_encryption_key([0x72; 32]);
         let temp = TempHome::new();
+        let legacy_cipher = crate::encryption::encrypt("legacy-connect-secret").unwrap();
+        let legacy_cipher_for_assert = legacy_cipher.clone();
         // Legacy state (#453): connect lives inline in config.json, no connect.json yet.
         temp.set_config_json(
             &serde_json::json!({
                 "http_proxy": "http://keep-me",
                 "connect": {
                     "platforms": [
-                        { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                        { "type": "telegram", "token_encrypted": legacy_cipher, "allow_from": ["u1"] }
                     ]
                 }
             })
@@ -5754,8 +6221,8 @@ mod tests {
         // In-memory: legacy value adopted.
         assert_eq!(config.connect.platforms.len(), 1);
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("legacy-cipher")
+            config.connect.platforms[0].token.as_deref(),
+            Some("legacy-connect-secret")
         );
         // An unrelated field from the same load survives the migration rewrite.
         assert_eq!(config.http_proxy, "http://keep-me");
@@ -5769,8 +6236,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(connect_json_path(&temp)).unwrap())
                 .unwrap();
         assert_eq!(
-            connect_json["platforms"][0]["token_encrypted"], "legacy-cipher",
-            "the encrypted value is preserved (encrypted form intact) by the migration"
+            connect_json["platforms"][0]["token_encrypted"],
+            legacy_cipher_for_assert
         );
 
         // ...and config.json was rewritten without the `connect` key.
@@ -5844,12 +6311,15 @@ mod tests {
 
     #[test]
     fn both_files_present_connect_json_wins() {
+        let _key = crate::encryption::set_test_encryption_key([0x73; 32]);
         let temp = TempHome::new();
+        let stale = crate::encryption::encrypt("stale-secret").unwrap();
+        let authoritative = crate::encryption::encrypt("authoritative-secret").unwrap();
         temp.set_config_json(
             &serde_json::json!({
                 "connect": {
                     "platforms": [
-                        { "type": "telegram", "token_encrypted": "stale-config-json-cipher" }
+                        { "type": "telegram", "token_encrypted": stale }
                     ]
                 }
             })
@@ -5859,7 +6329,7 @@ mod tests {
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "authoritative-cipher" }
+                    { "type": "telegram", "token_encrypted": authoritative }
                 ]
             })
             .to_string(),
@@ -5868,8 +6338,8 @@ mod tests {
 
         let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("authoritative-cipher"),
+            config.connect.platforms[0].token.as_deref(),
+            Some("authoritative-secret"),
             "connect.json wins over a stale legacy config.json key"
         );
     }
@@ -5880,13 +6350,16 @@ mod tests {
     /// files for longer than necessary.
     #[test]
     fn both_files_present_strips_stale_legacy_key_from_config_json_immediately() {
+        let _key = crate::encryption::set_test_encryption_key([0x74; 32]);
         let temp = TempHome::new();
+        let stale = crate::encryption::encrypt("stale-secret").unwrap();
+        let authoritative = crate::encryption::encrypt("authoritative-secret").unwrap();
         temp.set_config_json(
             &serde_json::json!({
                 "http_proxy": "http://keep-me",
                 "connect": {
                     "platforms": [
-                        { "type": "telegram", "token_encrypted": "stale-config-json-cipher" }
+                        { "type": "telegram", "token_encrypted": stale }
                     ]
                 }
             })
@@ -5896,7 +6369,7 @@ mod tests {
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "authoritative-cipher" }
+                    { "type": "telegram", "token_encrypted": authoritative }
                 ]
             })
             .to_string(),
@@ -5905,8 +6378,8 @@ mod tests {
 
         let config = Config::from_data_dir_without_publish(Some(temp.path.clone()));
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("authoritative-cipher")
+            config.connect.platforms[0].token.as_deref(),
+            Some("authoritative-secret")
         );
         // Unrelated field survives the strip.
         assert_eq!(config.http_proxy, "http://keep-me");
@@ -6255,9 +6728,13 @@ mod tests {
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
+            token_credential_ref: None,
+            token_configured: false,
             app_id: Some("cli_real_app_id".to_string()),
             app_secret: Some("plain-app-secret".to_string()),
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: vec!["ou_1".to_string()],
             admin_from: Vec::new(),
@@ -6296,9 +6773,13 @@ mod tests {
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
+            token_credential_ref: None,
+            token_configured: false,
             app_id: Some("cli_real_app_id".to_string()),
             app_secret: Some("plain-app-secret".to_string()),
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: vec!["ou_1".to_string()],
             admin_from: Vec::new(),
@@ -6326,12 +6807,14 @@ mod tests {
 
     #[test]
     fn legacy_telegram_only_connect_entry_without_feishu_fields_still_deserializes() {
+        let _key = crate::encryption::set_test_encryption_key([0x75; 32]);
         let temp = TempHome::new();
+        let ciphertext = crate::encryption::encrypt("legacy-telegram-secret").unwrap();
         std::fs::write(
             connect_json_path(&temp),
             serde_json::json!({
                 "platforms": [
-                    { "type": "telegram", "token_encrypted": "legacy-cipher", "allow_from": ["u1"] }
+                    { "type": "telegram", "token_encrypted": ciphertext, "allow_from": ["u1"] }
                 ]
             })
             .to_string(),
@@ -6343,8 +6826,8 @@ mod tests {
         assert_eq!(config.connect.platforms.len(), 1);
         assert_eq!(config.connect.platforms[0].platform_type, "telegram");
         assert_eq!(
-            config.connect.platforms[0].token_encrypted.as_deref(),
-            Some("legacy-cipher")
+            config.connect.platforms[0].token.as_deref(),
+            Some("legacy-telegram-secret")
         );
         assert_eq!(
             config.connect.platforms[0].app_id, None,
@@ -6402,6 +6885,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-main".to_string()),
             fast_model: Some("gpt-fast".to_string()),
@@ -6432,6 +6916,7 @@ mod tests {
         let openai = |api_key: &str, from_env: bool| OpenAIConfig {
             api_key: api_key.to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: None,
             fast_model: None,
@@ -6483,6 +6968,7 @@ mod tests {
         let openai = |api_key: &str, enc: Option<&str>| OpenAIConfig {
             api_key: api_key.to_string(),
             api_key_encrypted: enc.map(str::to_string),
+            credential_ref: None,
             base_url: None,
             model: None,
             fast_model: None,
@@ -6596,6 +7082,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-main".to_string()),
             fast_model: Some("gpt-fast".to_string()),
@@ -6621,6 +7108,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-main".to_string()),
             fast_model: None,
@@ -7139,7 +7627,7 @@ mod tests {
     }
 
     #[test]
-    fn config_save_encrypts_proxy_auth_and_load_hydrates_plaintext() {
+    fn config_save_refuses_unisolated_proxy_auth_without_writing_ciphertext() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
@@ -7155,33 +7643,55 @@ mod tests {
             username: "user".to_string(),
             password: "pass".to_string(),
         });
-        config
-            .save_to_dir(temp_home.path.clone())
-            .expect("save should encrypt proxy auth");
-
-        let content =
-            std::fs::read_to_string(temp_home.path.join("config.json")).expect("read config.json");
+        let error = config.save_to_dir(temp_home.path.clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("isolated credential transaction"));
+        let path = temp_home.path.join("config.json");
         assert!(
-            content.contains("proxy_auth_encrypted"),
-            "config.json should store encrypted proxy auth"
+            !path.exists(),
+            "a rejected unisolated secret must not create config.json"
         );
-        assert!(
-            !content.contains("\"proxy_auth\""),
-            "config.json should not store plaintext proxy_auth"
-        );
-
-        let loaded = Config::from_data_dir(Some(temp_home.path.clone()));
-        let loaded_auth = loaded
-            .proxy_auth
-            .as_ref()
-            .expect("proxy auth should be hydrated");
-        assert_eq!(loaded_auth.username, "user");
-        assert_eq!(loaded_auth.password, "pass");
         drop(key_guard);
     }
 
     #[test]
-    fn config_save_encrypts_provider_api_keys_and_does_not_persist_plaintext() {
+    fn config_save_refuses_configured_secret_env_without_ref_before_any_write() {
+        let _lock = env_lock_acquire();
+        let temp_home = TempHome::new();
+        let mut config = Config::default();
+        config.env_vars.push(EnvVarEntry {
+            name: "TOKEN".to_string(),
+            value: String::new(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let path = temp_home.path.join("config.json");
+
+        let error = config.save_to_dir(temp_home.path.clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("isolated credential transaction"));
+        assert!(
+            !path.exists(),
+            "a rejected dangling ref must not create config.json"
+        );
+
+        let original = br#"{"preserve":"original"}"#;
+        std::fs::write(&path, original).unwrap();
+        config.save_to_dir(temp_home.path.clone()).unwrap_err();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "a rejected dangling ref must not modify an existing config.json"
+        );
+    }
+
+    #[test]
+    fn config_save_persists_provider_reference_and_isolates_plaintext() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
 
@@ -7192,11 +7702,21 @@ mod tests {
             0x1c, 0x1d, 0x1e, 0x1f,
         ]);
 
+        let reference = crate::credential_ref("provider", "openai", "api_key").unwrap();
+        crate::CredentialStore::open(&temp_home.path)
+            .replace(
+                reference.clone(),
+                "sk-test-provider-key",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
         let mut config = Config::from_data_dir(Some(temp_home.path.clone()));
         config.provider = "openai".to_string();
         config.providers.openai = Some(OpenAIConfig {
             api_key: "sk-test-provider-key".to_string(),
             api_key_encrypted: None,
+            credential_ref: Some(reference),
             base_url: None,
             model: None,
             fast_model: None,
@@ -7210,13 +7730,13 @@ mod tests {
 
         config
             .save_to_dir(temp_home.path.clone())
-            .expect("save should encrypt provider api keys");
+            .expect("save should persist provider reference");
 
         let content = std::fs::read_to_string(temp_home.path.join("providers.json"))
             .expect("read providers.json");
         assert!(
-            content.contains("\"api_key_encrypted\""),
-            "providers.json should store encrypted provider keys"
+            !content.contains("api_key_encrypted"),
+            "providers.json must not store provider ciphertext"
         );
         assert!(
             !content.contains("\"api_key\""),
@@ -7256,6 +7776,7 @@ mod tests {
                         cwd: None,
                         env,
                         env_encrypted: std::collections::HashMap::new(),
+                        env_credential_refs: std::collections::HashMap::new(),
                         startup_timeout_ms: 5000,
                     },
                 ),
@@ -7276,6 +7797,7 @@ mod tests {
                             name: "Authorization".to_string(),
                             value: "Bearer token123".to_string(),
                             value_encrypted: None,
+                            credential_ref: None,
                         }],
                         connect_timeout_ms: 5000,
                     },
@@ -7346,6 +7868,122 @@ mod tests {
         }
     }
 
+    #[test]
+    fn migrated_hydrated_mcp_save_never_duplicates_referenced_secrets_to_root_or_backups() {
+        let _lock = env_lock_acquire();
+        let _key = crate::encryption::set_test_encryption_key([0x6b; 32]);
+        let temp_home = TempHome::new();
+        let env_plaintext = "mcp-root-env-plaintext-597";
+        let header_plaintext = "Bearer mcp-root-header-plaintext-597";
+        let legacy_ciphertext = crate::encryption::encrypt(env_plaintext).unwrap();
+        std::fs::write(
+            temp_home.path.join("config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "features": {"provider_model_ref": true},
+                "mcpServers": {
+                    "stdio-root": {
+                        "command": "unused-disabled-command",
+                        "env": {"TOKEN": env_plaintext},
+                        "env_encrypted": {"TOKEN": legacy_ciphertext.clone()},
+                        "env_credential_refs": {
+                            "TOKEN": "mcp.stdio-root.env_TOKEN"
+                        }
+                    },
+                    "http-root": {
+                        "url": "https://example.test/mcp",
+                        "transport_kind": "streamable_http",
+                        "headers": {"Authorization": header_plaintext},
+                        "header_credential_refs": {
+                            "Authorization": "mcp.http-root.header_Authorization"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp_home.path.join("mcp.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 7,
+                "data": {
+                    "stdio-root": {
+                        "command": "unused-disabled-command",
+                        "enabled": false,
+                        "env_encrypted": {"TOKEN": legacy_ciphertext},
+                        "request_timeout_ms": 100,
+                        "healthcheck_interval_ms": 100
+                    },
+                    "http-root": {
+                        "url": "https://example.test/mcp",
+                        "transport_kind": "streamable_http",
+                        "enabled": false,
+                        "headers": {"Authorization": header_plaintext},
+                        "request_timeout_ms": 100,
+                        "healthcheck_interval_ms": 100
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        crate::migrate_provider_mcp_credentials(&temp_home.path).unwrap();
+        let stored = crate::AtomicJsonStore::<bamboo_domain::mcp_config::McpConfig>::new(
+            temp_home.path.join("mcp.json"),
+            1,
+        )
+        .load()
+        .unwrap()
+        .unwrap();
+        let mut config = Config::from_data_dir_without_env(Some(temp_home.path.clone()));
+        config.mcp = stored.data;
+        config
+            .hydrate_mcp_credentials_from_store(&temp_home.path)
+            .unwrap();
+
+        let public = serde_json::to_value(&config.mcp).unwrap();
+        let rendered_public = public.to_string();
+        assert!(rendered_public.contains(env_plaintext));
+        assert!(rendered_public.contains(header_plaintext));
+        let compatible: bamboo_domain::mcp_config::McpConfig =
+            serde_json::from_value(public).unwrap();
+        assert_eq!(compatible.servers.len(), 2);
+
+        config.features.provider_model_ref = !config.features.provider_model_ref;
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+        config.features.provider_model_ref = !config.features.provider_model_ref;
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+
+        for entry in std::fs::read_dir(&temp_home.path)
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "credentials.json" || entry.path().is_dir() {
+                continue;
+            }
+            if name == "config.json"
+                || name == "mcp.json"
+                || name.contains(".bak")
+                || name.starts_with("config-credential-migration")
+            {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                let content = String::from_utf8_lossy(&bytes);
+                assert!(!content.contains(env_plaintext), "secret leaked to {name}");
+                assert!(
+                    !content.contains(header_plaintext),
+                    "secret leaked to {name}"
+                );
+                assert!(
+                    !content.contains(&legacy_ciphertext),
+                    "legacy ciphertext leaked to {name}"
+                );
+            }
+        }
+    }
+
     // ── Env vars lifecycle tests ──────────────────────────────
 
     #[test]
@@ -7357,6 +7995,8 @@ mod tests {
                 value: "val_a".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7364,6 +8004,8 @@ mod tests {
                 value: "".to_string(), // empty → should be excluded
                 secret: true,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: false,
                 description: None,
             },
             EnvVarEntry {
@@ -7371,6 +8013,8 @@ mod tests {
                 value: "  ".to_string(), // whitespace-only → excluded
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7378,6 +8022,8 @@ mod tests {
                 value: "val_d".to_string(),
                 secret: true,
                 value_encrypted: Some("enc".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: Some("desc".to_string()),
             },
         ]);
@@ -7399,6 +8045,8 @@ mod tests {
                 value: "visible".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7406,6 +8054,8 @@ mod tests {
                 value: "hidden_value".to_string(),
                 secret: true,
                 value_encrypted: Some("enc_data".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
         ]);
@@ -7417,7 +8067,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_env_vars_for_disk_preserves_encrypted() {
+    fn sanitize_env_vars_for_disk_removes_legacy_encrypted() {
         let mut config = Config::default();
         config.env_vars.extend([
             EnvVarEntry {
@@ -7425,6 +8075,8 @@ mod tests {
                 value: "val".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
             EnvVarEntry {
@@ -7432,6 +8084,8 @@ mod tests {
                 value: "real_secret".to_string(),
                 secret: true,
                 value_encrypted: Some("enc".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
         ]);
@@ -7440,53 +8094,132 @@ mod tests {
 
         // Plain value untouched
         assert_eq!(config.env_vars[0].value, "val");
-        // Secret plaintext cleared, but encrypted preserved
+        // Secret plaintext and legacy ciphertext are removed.
         assert_eq!(config.env_vars[1].value, "");
-        assert_eq!(config.env_vars[1].value_encrypted.as_deref(), Some("enc"));
+        assert!(config.env_vars[1].value_encrypted.is_none());
     }
 
     #[test]
-    fn refresh_env_vars_encrypted_round_trip() {
-        let mut config = Config::default();
-        config.env_vars.extend([
-            EnvVarEntry {
-                name: "TOKEN".to_string(),
-                value: "my-secret-token".to_string(),
-                secret: true,
-                value_encrypted: None,
-                description: Some("A token".to_string()),
-            },
-            EnvVarEntry {
-                name: "PLAIN_VAR".to_string(),
-                value: "hello".to_string(),
-                secret: false,
-                value_encrypted: None,
-                description: None,
-            },
-        ]);
-
-        // Encrypt
-        config
-            .refresh_env_vars_encrypted()
-            .expect("encryption should succeed");
-
-        // Secret should now have encrypted value
-        assert!(config.env_vars[0].value_encrypted.is_some());
-        // Plain should have no encrypted value
-        assert!(config.env_vars[1].value_encrypted.is_none());
-
-        // Save encrypted value for later comparison
-        let encrypted = config.env_vars[0].value_encrypted.clone().unwrap();
-        assert_ne!(encrypted, "my-secret-token"); // shouldn't be plaintext
-
-        // Clear plaintext (simulating disk write)
-        config.sanitize_env_vars_for_disk();
-        assert_eq!(config.env_vars[0].value, "");
-
-        // Hydrate (simulating disk read)
+    fn legacy_env_ciphertext_is_read_but_never_serialized() {
+        let ciphertext = crate::encryption::encrypt("my-secret-token").unwrap();
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "env_vars": [{
+                "name": "TOKEN",
+                "secret": true,
+                "value_encrypted": ciphertext
+            }]
+        }))
+        .unwrap();
         config.hydrate_env_vars_from_encrypted();
         assert_eq!(config.env_vars[0].value, "my-secret-token");
-        assert_eq!(config.env_vars[1].value, "hello"); // plain untouched
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized["env_vars"][0].get("value_encrypted").is_none());
+    }
+
+    #[test]
+    fn configured_env_ref_missing_from_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::credential_ref("env", "TOKEN", "value").unwrap();
+        let mut config = Config::default();
+        config.env_vars.push(EnvVarEntry {
+            name: "TOKEN".to_string(),
+            value: String::new(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: Some(reference),
+            configured: true,
+            description: None,
+        });
+        let error = config
+            .hydrate_env_var_credentials_from_store(dir.path())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("referenced env credential is unavailable"));
+        assert!(config.env_vars[0].configured);
+        assert!(config.env_vars[0].value.is_empty());
+    }
+
+    #[test]
+    fn configured_notification_ref_missing_from_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::credential_ref("notification", "ntfy", "token").unwrap();
+        let mut config = Config::default();
+        config.notifications.ntfy.credential_ref = Some(reference);
+        config.notifications.ntfy.configured = true;
+
+        let error = config
+            .hydrate_notification_credentials_from_store(dir.path())
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("referenced ntfy credential is unavailable"));
+        assert!(config.notifications.ntfy.configured);
+        assert!(config.notifications.ntfy.token.is_none());
+    }
+
+    #[test]
+    fn notification_hydration_rejects_shared_ref_but_accepts_exclusive_custom_ref() {
+        let _key = crate::encryption::set_test_encryption_key([0xa5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::CredentialRef::parse("custom.notification.secret").unwrap();
+        crate::CredentialStore::open(dir.path())
+            .replace(
+                reference.clone(),
+                "exclusive-notification-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.notifications.ntfy.credential_ref = Some(reference.clone());
+        config.notifications.ntfy.configured = true;
+        config.proxy_auth_credential_ref = Some(reference.clone());
+        let error = config
+            .hydrate_notification_credentials_from_store(dir.path())
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered
+            .contains("notification credential reference is shared by another config consumer"));
+        assert!(!rendered.contains(reference.as_str()));
+        assert!(config.notifications.ntfy.token.is_none());
+
+        config.proxy_auth_credential_ref = None;
+        config
+            .hydrate_notification_credentials_from_store(dir.path())
+            .unwrap();
+        assert_eq!(
+            config.notifications.ntfy.token.as_deref(),
+            Some("exclusive-notification-secret")
+        );
+    }
+
+    #[test]
+    fn pending_migration_keeps_legacy_notification_bytes_but_fails_runtime_closed() {
+        let _key = crate::encryption::set_test_encryption_key([0xa6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let ntfy = crate::encryption::encrypt("legacy-ntfy-secret").unwrap();
+        let bark = crate::encryption::encrypt("legacy-bark-secret").unwrap();
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "notifications": {
+                "ntfy": { "enabled": true, "token_encrypted": ntfy },
+                "bark": { "enabled": true, "device_key_encrypted": bark }
+            }
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("config.json"), &bytes).unwrap();
+        std::fs::create_dir(dir.path().join("config-credential-migration.json")).unwrap();
+
+        let loaded = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+
+        assert!(loaded.notifications.ntfy.token.is_none());
+        assert!(loaded.notifications.bark.device_key.is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json")).unwrap(),
+            bytes
+        );
     }
 
     #[test]
@@ -7507,6 +8240,8 @@ mod tests {
             value: "pub_value".to_string(),
             secret: false,
             value_encrypted: None,
+            credential_ref: None,
+            configured: true,
             description: None,
         }]);
 
@@ -7526,6 +8261,8 @@ mod tests {
             endpoint: "ws://127.0.0.1:9600".to_string(),
             token: "super-secret-token".to_string(),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         });
 
         // Persist path: encrypt then sanitize (what save_to_dir does).
@@ -7555,6 +8292,8 @@ mod tests {
             endpoint: "ws://h:9600".to_string(),
             token: String::new(),
             token_encrypted: Some("existing-cipher".to_string()),
+            credential_ref: None,
+            configured: false,
         });
         config.refresh_broker_token_encrypted().unwrap();
         assert_eq!(
@@ -7593,9 +8332,12 @@ mod tests {
             topic: "bamboo-alerts".to_string(),
             token: Some("tk_super_secret".to_string()),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         };
 
-        // Persist path: encrypt (what save_to_dir does).
+        // Legacy compatibility path: retain a readable ciphertext until the
+        // credential migration moves the secret into the isolated store.
         config.refresh_notifications_encrypted().unwrap();
         assert!(config.notifications.ntfy.token_encrypted.is_some());
         assert_ne!(
@@ -7603,17 +8345,15 @@ mod tests {
             Some("tk_super_secret")
         );
 
-        // `token` is `#[serde(skip_serializing)]` — never lands on disk, only
-        // the ciphertext does.
+        // Neither plaintext nor legacy ciphertext is serializable.
         let json = serde_json::to_string(&config.notifications.ntfy).unwrap();
         assert!(
             !json.contains("tk_super_secret"),
             "plaintext token must never be serialized"
         );
-        assert!(json.contains("token_encrypted"));
+        assert!(!json.contains("token_encrypted"));
 
-        // Load path: simulate a fresh load (plaintext gone, ciphertext present)
-        // and confirm hydrate restores the plaintext.
+        // Legacy load path restores plaintext for migration.
         config.notifications.ntfy.token = None;
         config.hydrate_notifications_from_encrypted();
         assert_eq!(
@@ -7630,6 +8370,8 @@ mod tests {
             base_url: "https://api.day.app".to_string(),
             device_key: Some("dk_super_secret".to_string()),
             device_key_encrypted: None,
+            credential_ref: None,
+            configured: false,
         };
 
         config.refresh_notifications_encrypted().unwrap();
@@ -7644,7 +8386,7 @@ mod tests {
             !json.contains("dk_super_secret"),
             "plaintext device key must never be serialized"
         );
-        assert!(json.contains("device_key_encrypted"));
+        assert!(!json.contains("device_key_encrypted"));
 
         config.notifications.bark.device_key = None;
         config.hydrate_notifications_from_encrypted();
@@ -7656,8 +8398,8 @@ mod tests {
 
     #[test]
     fn notification_secrets_empty_refresh_preserves_ciphertext() {
-        // A redacted round-trip (plaintext empty/absent) must not wipe the
-        // stored ciphertext for either channel.
+        // The legacy compatibility helper retains already-loaded ciphertext;
+        // ordinary persistence sanitizes it before writing.
         let mut config = Config::default();
         config.notifications.ntfy.token_encrypted = Some("existing-ntfy-cipher".to_string());
         config.notifications.bark.device_key_encrypted = Some("existing-bark-cipher".to_string());
@@ -7682,6 +8424,8 @@ mod tests {
             value: "original".to_string(),
             secret: false,
             value_encrypted: Some("should-be-ignored".to_string()),
+            credential_ref: None,
+            configured: true,
             description: None,
         }]);
 
@@ -7708,6 +8452,8 @@ mod tests {
                 value: "val1".to_string(),
                 secret: false,
                 value_encrypted: None,
+                credential_ref: None,
+                configured: true,
                 description: Some("First key".to_string()),
             },
             EnvVarEntry {
@@ -7715,6 +8461,8 @@ mod tests {
                 value: "".to_string(), // on-disk secret has no plaintext
                 secret: true,
                 value_encrypted: Some("enc123".to_string()),
+                credential_ref: None,
+                configured: true,
                 description: None,
             },
         ]);
@@ -7728,10 +8476,7 @@ mod tests {
         assert!(!restored.env_vars[0].secret);
         assert_eq!(restored.env_vars[1].name, "KEY2");
         assert!(restored.env_vars[1].secret);
-        assert_eq!(
-            restored.env_vars[1].value_encrypted.as_deref(),
-            Some("enc123")
-        );
+        assert!(restored.env_vars[1].value_encrypted.is_none());
     }
 
     // ---- defaults.* model resolution tests ----
@@ -7745,6 +8490,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("legacy-gpt-4o".to_string()),
             fast_model: None,
@@ -7781,6 +8527,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("legacy-gpt-4o".to_string()),
             fast_model: None,
@@ -7817,6 +8564,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("legacy-gpt-4o-mini".to_string()),
@@ -7859,6 +8607,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("legacy-gpt-4o-mini".to_string()),
@@ -7927,6 +8676,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("gpt-4o-mini".to_string()),
@@ -8001,6 +8751,7 @@ mod tests {
         config.providers.openai = Some(OpenAIConfig {
             api_key: "test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: Some("legacy-gpt-4o-mini".to_string()),

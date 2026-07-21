@@ -82,6 +82,7 @@ impl MainstreamServerRequest {
                 cwd: self.cwd,
                 env: self.env,
                 env_encrypted: self.env_encrypted,
+                env_credential_refs: std::collections::HashMap::new(),
                 startup_timeout_ms: self
                     .startup_timeout_ms
                     .unwrap_or(bamboo_mcp::config::default_startup_timeout()),

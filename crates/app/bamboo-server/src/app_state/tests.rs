@@ -44,6 +44,8 @@ async fn test_app_state_creation() {
 
     // Verify basic fields
     assert!(state.sessions.is_empty());
+    assert!(state.config_facade.is_some());
+    assert!(bamboo_config::section_layout_is_active(temp_dir.path()).unwrap());
 }
 
 #[tokio::test]

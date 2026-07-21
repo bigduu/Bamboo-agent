@@ -193,21 +193,97 @@ pub async fn load_permission_checker(
     Ok((checker, section))
 }
 
-/// Initialize MCP server manager with background server initialization.
-pub fn init_mcp_manager(config: Arc<RwLock<Config>>) -> Arc<McpServerManager> {
+/// Initialize MCP server manager. A pre-existing revisioned `mcp.json` is the
+/// sole startup authority and is staged by `ConfigWatcherRuntime`; legacy
+/// inline config is bootstrapped only when no sidecar exists.
+pub fn init_mcp_manager(
+    config: Arc<RwLock<Config>>,
+    data_dir: &Path,
+) -> (Arc<McpServerManager>, Option<tokio::task::JoinHandle<()>>) {
     let mcp_manager = Arc::new(McpServerManager::new_with_config(config.clone()));
 
-    // Initialize MCP servers in the background so the HTTP API is responsive quickly.
-    {
+    let legacy_task = if data_dir.join("mcp.json").exists() {
+        None
+    } else {
         let mcp_manager = mcp_manager.clone();
         let config = config.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mcp_config = config.read().await.mcp.clone();
             mcp_manager.initialize_from_config(&mcp_config).await;
-        });
+        }))
+    };
+
+    (mcp_manager, legacy_task)
+}
+
+#[cfg(test)]
+mod mcp_startup_tests {
+    use super::*;
+    use bamboo_mcp::{McpConfig, McpServerConfig, ReconnectConfig, StdioConfig, TransportConfig};
+
+    fn server(id: &str) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_string(),
+            name: None,
+            enabled: true,
+            transport: TransportConfig::Stdio(StdioConfig {
+                command: "legacy-must-not-start".to_string(),
+                args: vec![],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                env_encrypted: std::collections::HashMap::new(),
+                env_credential_refs: std::collections::HashMap::new(),
+                startup_timeout_ms: 100,
+            }),
+            request_timeout_ms: 100,
+            healthcheck_interval_ms: 100,
+            reconnect: ReconnectConfig::default(),
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        }
     }
 
-    mcp_manager
+    #[tokio::test]
+    async fn preexisting_sidecar_is_authoritative_over_conflicting_legacy_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.mcp = McpConfig {
+            version: 1,
+            servers: vec![server("legacy")],
+        };
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 1,
+                "data": McpConfig {
+                    version: 1,
+                    servers: vec![server("sidecar")],
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (manager, legacy_task) = init_mcp_manager(Arc::new(RwLock::new(config)), dir.path());
+        assert!(
+            legacy_task.is_none(),
+            "legacy bootstrap must not be spawned"
+        );
+        tokio::task::yield_now().await;
+        assert!(manager.list_servers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_bootstrap_remains_enabled_without_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_manager, legacy_task) =
+            init_mcp_manager(Arc::new(RwLock::new(Config::default())), dir.path());
+        legacy_task
+            .expect("legacy bootstrap should be spawned")
+            .await
+            .unwrap();
+    }
 }
 
 /// Initialize metrics service with SQLite backend.

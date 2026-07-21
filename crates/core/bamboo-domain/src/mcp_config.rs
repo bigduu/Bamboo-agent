@@ -71,6 +71,8 @@ struct McpServerConfigFlatDisk {
     #[serde(default)]
     env_encrypted: HashMap<String, String>,
     #[serde(default)]
+    env_credential_refs: HashMap<String, String>,
+    #[serde(default)]
     startup_timeout_ms: Option<u64>,
 
     // sse shape
@@ -79,7 +81,13 @@ struct McpServerConfigFlatDisk {
     #[serde(default, deserialize_with = "deserialize_headers")]
     headers: Vec<HeaderConfig>,
     #[serde(default)]
+    headers_encrypted: HashMap<String, String>,
+    #[serde(default)]
+    header_credential_refs: HashMap<String, String>,
+    #[serde(default)]
     connect_timeout_ms: Option<u64>,
+    #[serde(default)]
+    transport_kind: Option<String>,
 
     // Bamboo extras (optional)
     #[serde(default)]
@@ -113,6 +121,7 @@ where
                 name: name.clone(),
                 value,
                 value_encrypted: None,
+                credential_ref: None,
             });
         }
         return Ok(headers);
@@ -147,17 +156,34 @@ impl McpServerConfigFlatDisk {
                 cwd: self.cwd,
                 env: self.env,
                 env_encrypted: self.env_encrypted,
+                env_credential_refs: self.env_credential_refs,
                 startup_timeout_ms: self
                     .startup_timeout_ms
                     .unwrap_or_else(default_startup_timeout),
             }),
-            (None, Some(url)) => TransportConfig::Sse(SseConfig {
-                url,
-                headers: self.headers,
-                connect_timeout_ms: self
+            (None, Some(url)) => {
+                let headers = merge_header_secrets(
+                    self.headers,
+                    self.headers_encrypted,
+                    self.header_credential_refs,
+                );
+                let connect_timeout_ms = self
                     .connect_timeout_ms
-                    .unwrap_or_else(default_connect_timeout),
-            }),
+                    .unwrap_or_else(default_connect_timeout);
+                if self.transport_kind.as_deref() == Some("streamable_http") {
+                    TransportConfig::StreamableHttp(StreamableHttpConfig {
+                        url,
+                        headers,
+                        connect_timeout_ms,
+                    })
+                } else {
+                    TransportConfig::Sse(SseConfig {
+                        url,
+                        headers,
+                        connect_timeout_ms,
+                    })
+                }
+            }
             (Some(_), Some(_)) => {
                 return Err("MCP server config cannot contain both 'command' and 'url'".to_string())
             }
@@ -183,6 +209,38 @@ impl McpServerConfigFlatDisk {
     }
 }
 
+fn merge_header_secrets(
+    mut headers: Vec<HeaderConfig>,
+    encrypted: HashMap<String, String>,
+    credential_refs: HashMap<String, String>,
+) -> Vec<HeaderConfig> {
+    for (name, value_encrypted) in encrypted {
+        if let Some(header) = headers.iter_mut().find(|header| header.name == name) {
+            header.value_encrypted = Some(value_encrypted);
+        } else {
+            headers.push(HeaderConfig {
+                name,
+                value: String::new(),
+                value_encrypted: Some(value_encrypted),
+                credential_ref: None,
+            });
+        }
+    }
+    for (name, credential_ref) in credential_refs {
+        if let Some(header) = headers.iter_mut().find(|header| header.name == name) {
+            header.credential_ref = Some(credential_ref);
+        } else {
+            headers.push(HeaderConfig {
+                name,
+                value: String::new(),
+                value_encrypted: None,
+                credential_ref: Some(credential_ref),
+            });
+        }
+    }
+    headers
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct McpServerDiskOut {
     // Claude Desktop / mainstream MCP config convention:
@@ -190,6 +248,8 @@ struct McpServerDiskOut {
     // - A server is disabled by setting `"disabled": true`.
     #[serde(default, skip_serializing_if = "is_false")]
     disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 
     // stdio transport shape
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,12 +260,34 @@ struct McpServerDiskOut {
     cwd: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    env_encrypted: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    env_credential_refs: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup_timeout_ms: Option<u64>,
 
     // sse transport shape
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     headers: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    headers_encrypted: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    header_credential_refs: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connect_timeout_ms: Option<u64>,
+
+    request_timeout_ms: u64,
+    healthcheck_interval_ms: u64,
+    reconnect: ReconnectConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    denied_tools: Vec<String>,
 
     // Full transport config for StreamableHttp (and future non-SSE/non-stdio transports).
     // Stdio and SSE are serialized inline (command/url) for Claude Desktop compatibility.
@@ -221,12 +303,25 @@ impl From<&McpServerConfig> for McpServerDiskOut {
     fn from(server: &McpServerConfig) -> Self {
         let mut out = Self {
             disabled: !server.enabled,
+            name: server.name.clone(),
             command: None,
             args: Vec::new(),
             cwd: None,
             env: HashMap::new(),
+            env_encrypted: HashMap::new(),
+            env_credential_refs: HashMap::new(),
+            startup_timeout_ms: None,
             url: None,
             headers: HashMap::new(),
+            headers_encrypted: HashMap::new(),
+            header_credential_refs: HashMap::new(),
+            transport_kind: None,
+            connect_timeout_ms: None,
+            request_timeout_ms: server.request_timeout_ms,
+            healthcheck_interval_ms: server.healthcheck_interval_ms,
+            reconnect: server.reconnect.clone(),
+            allowed_tools: server.allowed_tools.clone(),
+            denied_tools: server.denied_tools.clone(),
             transport: None,
         };
 
@@ -235,19 +330,84 @@ impl From<&McpServerConfig> for McpServerDiskOut {
                 out.command = Some(stdio.command.clone());
                 out.args = stdio.args.clone();
                 out.cwd = stdio.cwd.clone();
-                out.env = stdio.env.clone();
+                out.env = stdio
+                    .env
+                    .iter()
+                    .filter(|(name, value)| {
+                        !stdio.env_encrypted.contains_key(*name) || !value.is_empty()
+                    })
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                out.env_encrypted = stdio.env_encrypted.clone();
+                out.env_credential_refs = stdio.env_credential_refs.clone();
+                out.startup_timeout_ms = Some(stdio.startup_timeout_ms);
             }
             TransportConfig::Sse(sse) => {
                 out.url = Some(sse.url.clone());
                 out.headers = sse
                     .headers
                     .iter()
-                    .filter(|h| !h.name.trim().is_empty())
+                    .filter(|header| {
+                        !header.name.trim().is_empty()
+                            && (header.value_encrypted.is_none() || !header.value.is_empty())
+                    })
                     .map(|h| (h.name.clone(), h.value.clone()))
                     .collect();
+                out.headers_encrypted = sse
+                    .headers
+                    .iter()
+                    .filter_map(|header| {
+                        header
+                            .value_encrypted
+                            .as_ref()
+                            .map(|value| (header.name.clone(), value.clone()))
+                    })
+                    .collect();
+                out.header_credential_refs = sse
+                    .headers
+                    .iter()
+                    .filter_map(|header| {
+                        header
+                            .credential_ref
+                            .as_ref()
+                            .map(|value| (header.name.clone(), value.clone()))
+                    })
+                    .collect();
+                out.connect_timeout_ms = Some(sse.connect_timeout_ms);
             }
             TransportConfig::StreamableHttp(config) => {
-                out.transport = Some(TransportConfig::StreamableHttp(config.clone()));
+                out.url = Some(config.url.clone());
+                out.headers = config
+                    .headers
+                    .iter()
+                    .filter(|header| {
+                        !header.name.trim().is_empty()
+                            && (header.value_encrypted.is_none() || !header.value.is_empty())
+                    })
+                    .map(|header| (header.name.clone(), header.value.clone()))
+                    .collect();
+                out.headers_encrypted = config
+                    .headers
+                    .iter()
+                    .filter_map(|header| {
+                        header
+                            .value_encrypted
+                            .as_ref()
+                            .map(|value| (header.name.clone(), value.clone()))
+                    })
+                    .collect();
+                out.header_credential_refs = config
+                    .headers
+                    .iter()
+                    .filter_map(|header| {
+                        header
+                            .credential_ref
+                            .as_ref()
+                            .map(|value| (header.name.clone(), value.clone()))
+                    })
+                    .collect();
+                out.transport_kind = Some("streamable_http".to_string());
+                out.connect_timeout_ms = Some(config.connect_timeout_ms);
             }
         }
 
@@ -389,11 +549,15 @@ pub struct StdioConfig {
     pub env: HashMap<String, String>,
     /// Encrypted environment variables values (nonce:ciphertext), keyed by env var name.
     ///
-    /// Legacy/back-compat only: older Bamboo builds stored secrets encrypted-at-rest.
-    /// We still accept these values so existing configs keep working, but we no longer
-    /// persist them (standard MCP config stores plaintext env vars).
+    /// Compatibility bridge while #597 migrates MCP secrets to credential refs.
+    /// Revisioned MCP documents persist only this ciphertext metadata (never
+    /// the paired plaintext); a later migration moves it to the credential store.
     #[serde(default, skip_serializing)]
     pub env_encrypted: HashMap<String, String>,
+    /// Stable references for secret environment values stored in the isolated
+    /// credential store. The map key remains visible configuration metadata.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env_credential_refs: HashMap<String, String>,
     /// Startup timeout in milliseconds
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_ms: u64,
@@ -445,11 +609,14 @@ pub struct HeaderConfig {
     pub value: String,
     /// Encrypted header value (nonce:ciphertext).
     ///
-    /// Legacy/back-compat only: older Bamboo builds stored secrets encrypted-at-rest.
-    /// We still accept these values so existing configs keep working, but we no longer
-    /// persist them (standard MCP config stores plaintext headers).
+    /// Compatibility bridge while #597 migrates MCP secrets to credential refs.
+    /// Revisioned MCP documents persist only this ciphertext metadata (never
+    /// the paired plaintext); a later migration moves it to the credential store.
     #[serde(default, skip_serializing)]
     pub value_encrypted: Option<String>,
+    /// Stable reference to the isolated credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 /// Reconnection configuration
@@ -706,6 +873,7 @@ mod tests {
                         name: "Authorization".to_string(),
                         value: "Bearer token".to_string(),
                         value_encrypted: None,
+                        credential_ref: None,
                     }],
                     connect_timeout_ms: 5000,
                 }),
@@ -765,6 +933,7 @@ mod tests {
             name: "Content-Type".to_string(),
             value: "application/json".to_string(),
             value_encrypted: None,
+            credential_ref: None,
         };
         assert_eq!(header.name, "Content-Type");
         assert_eq!(header.value, "application/json");
@@ -839,6 +1008,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     env_encrypted,
+                    env_credential_refs: HashMap::new(),
                     startup_timeout_ms: default_startup_timeout(),
                 }),
                 request_timeout_ms: default_request_timeout(),
@@ -852,6 +1022,119 @@ mod tests {
         let value = serde_json::to_value(&cfg).unwrap();
         assert!(value.get("servers").is_none());
         assert!(value.get("demo").is_some());
+    }
+
+    #[test]
+    fn public_serde_retains_plaintext_alongside_ciphertext() {
+        let server = |id: &str, transport| McpServerConfig {
+            id: id.to_string(),
+            name: None,
+            enabled: true,
+            transport,
+            request_timeout_ms: default_request_timeout(),
+            healthcheck_interval_ms: default_healthcheck_interval(),
+            reconnect: ReconnectConfig::default(),
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+        let cfg = McpConfig {
+            version: 1,
+            servers: vec![
+                server(
+                    "stdio",
+                    TransportConfig::Stdio(StdioConfig {
+                        command: "node".to_string(),
+                        args: vec![],
+                        cwd: None,
+                        env: HashMap::from([("TOKEN".to_string(), "stdio-secret".to_string())]),
+                        env_encrypted: HashMap::from([(
+                            "TOKEN".to_string(),
+                            "stdio-ciphertext".to_string(),
+                        )]),
+                        env_credential_refs: HashMap::new(),
+                        startup_timeout_ms: default_startup_timeout(),
+                    }),
+                ),
+                server(
+                    "sse",
+                    TransportConfig::Sse(SseConfig {
+                        url: "https://example.test/sse".to_string(),
+                        headers: vec![HeaderConfig {
+                            name: "Authorization".to_string(),
+                            value: "sse-secret".to_string(),
+                            value_encrypted: Some("sse-ciphertext".to_string()),
+                            credential_ref: None,
+                        }],
+                        connect_timeout_ms: default_connect_timeout(),
+                    }),
+                ),
+                server(
+                    "http",
+                    TransportConfig::StreamableHttp(StreamableHttpConfig {
+                        url: "https://example.test/mcp".to_string(),
+                        headers: vec![HeaderConfig {
+                            name: "Authorization".to_string(),
+                            value: "http-secret".to_string(),
+                            value_encrypted: Some("http-ciphertext".to_string()),
+                            credential_ref: None,
+                        }],
+                        connect_timeout_ms: default_connect_timeout(),
+                    }),
+                ),
+            ],
+        };
+
+        let value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(value["stdio"]["env"]["TOKEN"], "stdio-secret");
+        assert_eq!(value["stdio"]["env_encrypted"]["TOKEN"], "stdio-ciphertext");
+        assert_eq!(value["sse"]["headers"]["Authorization"], "sse-secret");
+        assert_eq!(
+            value["sse"]["headers_encrypted"]["Authorization"],
+            "sse-ciphertext"
+        );
+        assert_eq!(value["http"]["headers"]["Authorization"], "http-secret");
+        assert_eq!(
+            value["http"]["headers_encrypted"]["Authorization"],
+            "http-ciphertext"
+        );
+
+        let round_trip: McpConfig = serde_json::from_value(value).unwrap();
+        let stdio_server = round_trip
+            .servers
+            .iter()
+            .find(|server| server.id == "stdio")
+            .unwrap();
+        let TransportConfig::Stdio(stdio) = &stdio_server.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(stdio.env["TOKEN"], "stdio-secret");
+        assert_eq!(stdio.env_encrypted["TOKEN"], "stdio-ciphertext");
+        let sse_server = round_trip
+            .servers
+            .iter()
+            .find(|server| server.id == "sse")
+            .unwrap();
+        let TransportConfig::Sse(sse) = &sse_server.transport else {
+            panic!("expected SSE transport");
+        };
+        assert_eq!(sse.headers[0].value, "sse-secret");
+        assert_eq!(
+            sse.headers[0].value_encrypted.as_deref(),
+            Some("sse-ciphertext")
+        );
+        let http_server = round_trip
+            .servers
+            .iter()
+            .find(|server| server.id == "http")
+            .unwrap();
+        let TransportConfig::StreamableHttp(http) = &http_server.transport else {
+            panic!("expected streamable HTTP transport");
+        };
+        assert_eq!(http.headers[0].value, "http-secret");
+        assert_eq!(
+            http.headers[0].value_encrypted.as_deref(),
+            Some("http-ciphertext")
+        );
     }
 
     #[test]

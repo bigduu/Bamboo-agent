@@ -2,7 +2,7 @@ use bamboo_config::encryption::set_test_encryption_key;
 use bamboo_config::{OpenAIConfig, ProviderConfigs};
 use bamboo_llm::Config;
 use bamboo_mcp::{HeaderConfig, McpServerConfig, SseConfig, StdioConfig, TransportConfig};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 fn deep_merge_json(dst: &mut serde_json::Value, src: serde_json::Value) {
     match (dst, src) {
@@ -25,6 +25,7 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
             api_key: "sk-test".to_string(),
             api_key_from_env: false,
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: None,
@@ -48,6 +49,7 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
                 cwd: None,
                 env: HashMap::from([("TOKEN".to_string(), "super-secret".to_string())]),
                 env_encrypted: HashMap::new(),
+                env_credential_refs: std::collections::HashMap::new(),
                 startup_timeout_ms: 5000,
             }),
             request_timeout_ms: 5000,
@@ -66,6 +68,7 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
                     name: "Authorization".to_string(),
                     value: "Bearer super-secret".to_string(),
                     value_encrypted: None,
+                    credential_ref: None,
                 }],
                 connect_timeout_ms: 1000,
             }),
@@ -77,7 +80,14 @@ fn build_config_with_mcp_secrets(temp_dir: &std::path::Path) -> Config {
         },
     ];
 
-    // Ensure encrypted-at-rest blobs exist on disk (what the settings endpoints round-trip).
+    // Route provider plaintext to the isolated store before persisting its
+    // metadata-only sidecar. MCP remains on its transitional ciphertext path.
+    bamboo_config::persist_provider_credential_transaction(
+        temp_dir,
+        &mut cfg,
+        &BTreeSet::from(["openai".to_string()]),
+    )
+    .unwrap();
     cfg.refresh_provider_api_keys_encrypted().unwrap();
     cfg.refresh_mcp_secrets_encrypted().unwrap();
 

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "revision": 11,
+  "data": {
+    "stdio unsafe/name": {
+      "command": "fixture-command",
+      "args": ["--fixture"],
+      "env": {
+        "PUBLIC TOKEN": "stdio-plain-secret"
+      },
+      "env_encrypted": {
+        "PRIVATE TOKEN": "replaced-by-test-ciphertext"
+      },
+      "future_transport_field": "mcp-unknown-kept",
+      "request_timeout_ms": 1000,
+      "healthcheck_interval_ms": 1000,
+      "reconnect": {
+        "enabled": true,
+        "initial_backoff_ms": 10,
+        "max_backoff_ms": 20,
+        "max_attempts": 1
+      }
+    },
+    "http.server": {
+      "url": "https://example.test/mcp",
+      "transport_kind": "streamable_http",
+      "headers": {
+        "Authorization": "Bearer mcp-header-secret"
+      },
+      "request_timeout_ms": 1000,
+      "healthcheck_interval_ms": 1000,
+      "reconnect": {
+        "enabled": true,
+        "initial_backoff_ms": 10,
+        "max_backoff_ms": 20,
+        "max_attempts": 1
+      }
+    }
+  },
+  "future_envelope_field": "mcp-envelope-unknown-kept"
+}

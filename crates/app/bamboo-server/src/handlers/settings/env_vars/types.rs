@@ -2,9 +2,20 @@ use serde::{Deserialize, Serialize};
 
 /// Request payload for creating or updating an environment variable.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpsertEnvVarRequest {
+    pub expected_revision: u64,
+    #[serde(flatten)]
+    pub entry: EnvVarInput,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvVarInput {
     pub name: String,
-    pub value: String,
+    /// Missing keeps an existing value; `""` explicitly clears it.
+    #[serde(default)]
+    pub value: Option<String>,
     #[serde(default)]
     pub secret: bool,
     #[serde(default)]
@@ -13,8 +24,17 @@ pub struct UpsertEnvVarRequest {
 
 /// Request payload for bulk-replacing the entire env vars list.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceEnvVarsRequest {
-    pub entries: Vec<UpsertEnvVarRequest>,
+    pub expected_revision: u64,
+    pub entries: Vec<EnvVarInput>,
+}
+
+/// CAS precondition for DELETE requests.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteEnvVarQuery {
+    pub expected_revision: u64,
 }
 
 /// Single env var in API response (secrets are masked).
@@ -26,6 +46,9 @@ pub struct EnvVarResponse {
     pub secret: bool,
     /// Whether a real value is configured (useful for secret entries where value is masked).
     pub has_value: bool,
+    /// Truthful configured status (kept alongside `has_value` for API
+    /// compatibility).
+    pub configured: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -33,6 +56,8 @@ pub struct EnvVarResponse {
 /// Full list response.
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvVarsListResponse {
+    /// Credential document revision to bind to the next write.
+    pub revision: u64,
     pub entries: Vec<EnvVarResponse>,
 }
 
@@ -40,7 +65,11 @@ const SECRET_MASK: &str = "****...****";
 
 impl EnvVarResponse {
     pub fn from_entry(entry: &bamboo_config::EnvVarEntry) -> Self {
-        let has_value = !entry.value.trim().is_empty();
+        let has_value = if entry.secret {
+            entry.configured
+        } else {
+            !entry.value.is_empty()
+        };
         let display_value = if entry.secret {
             SECRET_MASK.to_string()
         } else {
@@ -51,6 +80,7 @@ impl EnvVarResponse {
             value: display_value,
             secret: entry.secret,
             has_value,
+            configured: has_value,
             description: entry.description.clone(),
         }
     }
@@ -67,6 +97,8 @@ mod tests {
             value: "production".to_string(),
             secret: false,
             value_encrypted: None,
+            credential_ref: None,
+            configured: true,
             description: Some("Node environment".to_string()),
         }
     }
@@ -77,6 +109,8 @@ mod tests {
             value: "sk-real-secret".to_string(),
             secret: true,
             value_encrypted: Some("enc-data".to_string()),
+            credential_ref: Some(bamboo_config::credential_ref("env", "API_KEY", "value").unwrap()),
+            configured: true,
             description: None,
         }
     }
@@ -87,6 +121,10 @@ mod tests {
             value: "".to_string(),
             secret: true,
             value_encrypted: None,
+            credential_ref: Some(
+                bamboo_config::credential_ref("env", "EMPTY_SECRET", "value").unwrap(),
+            ),
+            configured: false,
             description: None,
         }
     }

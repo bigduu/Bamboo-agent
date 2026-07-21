@@ -1195,6 +1195,7 @@ mod tests {
                 api_key: String::new(),
                 api_key_from_env: false,
                 api_key_encrypted: None,
+                credential_ref: None,
                 base_url: None,
                 model: Some("gpt-4o-mini".to_string()),
                 fast_model: None,

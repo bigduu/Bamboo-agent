@@ -18,17 +18,19 @@ pub(super) async fn handle_update_provider_config(
     let mut patch_obj = build_provider_patch(&payload);
     config_manager::sanitize_root_patch(&mut patch_obj);
     let api_key_intents = config_manager::provider_api_key_intents(&patch_obj);
+    let provider_credential_intents = api_key_intents.providers.clone();
 
     let new_config = match app_state
-        .update_config(
+        .update_config_with_provider_credentials(
             move |config| {
                 let current = config.clone();
                 let new_config = apply_provider_patch(&current, patch_obj, &api_key_intents)?;
                 validate_provider_config(&new_config)?;
-
                 *config = new_config;
                 Ok(())
             },
+            provider_credential_intents,
+            std::collections::BTreeSet::new(),
             // Persist first; reload below so we can return a clear provider-reload error.
             ConfigUpdateEffects {
                 reload_provider: false,

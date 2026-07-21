@@ -89,7 +89,10 @@ fn default_label_for_provider_type(provider_type: &str) -> String {
 fn instance_config_to_api(instance: &ProviderInstanceConfig) -> Map<String, Value> {
     let mut config = Map::new();
 
-    if !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some() {
+    if !instance.api_key.trim().is_empty()
+        || instance.api_key_encrypted.is_some()
+        || instance.credential_ref.is_some()
+    {
         config.insert(
             "api_key".to_string(),
             Value::String("****...****".to_string()),
@@ -201,6 +204,8 @@ fn build_instance_from_create(
     validate_provider_type(&payload.provider_type)?;
 
     let mut obj = config_value_as_object(payload.config.clone())?;
+    obj.remove("api_key_encrypted");
+    obj.remove("credential_ref");
     obj.insert(
         "provider_type".to_string(),
         Value::String(payload.provider_type.clone()),
@@ -287,6 +292,7 @@ fn apply_instance_update(
         patch_obj.remove("label");
         patch_obj.remove("enabled");
         patch_obj.remove("api_key_encrypted");
+        patch_obj.remove("credential_ref");
 
         for (key, value) in patch_obj {
             obj.insert(key, value);
@@ -335,9 +341,10 @@ pub async fn create_provider_instance(
 
     let instance_config = build_instance_from_create(&payload)?;
     let instance_id_for_response = instance_id.clone();
+    let instance_id_for_intent = instance_id.clone();
 
     let new_config = app_state
-        .update_config(
+        .update_config_with_provider_credentials(
             move |config| {
                 if config.provider_instances.contains_key(&instance_id) {
                     return Err(AppError::BadRequest(format!(
@@ -358,6 +365,8 @@ pub async fn create_provider_instance(
                 // populated in memory before persist/response.
                 Ok(())
             },
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeSet::from([instance_id_for_intent]),
             ConfigUpdateEffects {
                 reload_provider: true,
                 reconcile_mcp: false,
@@ -388,9 +397,24 @@ pub async fn update_provider_instance(
     validate_instance_id(&instance_id)?;
     let payload_inner = payload.into_inner();
     let instance_id_for_response = instance_id.clone();
+    let has_api_key_intent = payload_inner
+        .config
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("api_key"))
+        .is_some_and(|value| match value {
+            Value::Null => true,
+            Value::String(value) => !config_manager::is_masked_api_key(value),
+            _ => false,
+        });
+    let provider_instance_intents = if has_api_key_intent {
+        std::collections::BTreeSet::from([instance_id.clone()])
+    } else {
+        std::collections::BTreeSet::new()
+    };
 
     let new_config = app_state
-        .update_config(
+        .update_config_with_provider_credentials(
             move |config| {
                 let existing = config
                     .provider_instances
@@ -411,6 +435,8 @@ pub async fn update_provider_instance(
                 // `Config::refresh_encrypted_secrets` (#515/#516).
                 Ok(())
             },
+            std::collections::BTreeSet::new(),
+            provider_instance_intents,
             ConfigUpdateEffects {
                 reload_provider: true,
                 reconcile_mcp: false,
@@ -439,9 +465,10 @@ pub async fn delete_provider_instance(
     let instance_id = path.into_inner();
     validate_instance_id(&instance_id)?;
     let instance_id_for_closure = instance_id.clone();
+    let provider_instance_intents = std::collections::BTreeSet::from([instance_id.clone()]);
 
     let new_config = app_state
-        .update_config(
+        .update_config_with_provider_credentials(
             move |config| {
                 if config
                     .provider_instances
@@ -458,6 +485,8 @@ pub async fn delete_provider_instance(
                 }
                 Ok(())
             },
+            std::collections::BTreeSet::new(),
+            provider_instance_intents,
             ConfigUpdateEffects {
                 reload_provider: true,
                 reconcile_mcp: false,
@@ -535,14 +564,50 @@ mod tests {
         assert_eq!(instance.api_key, "****...****sk-new");
     }
 
-    // #515: creating a provider instance persists `api_key_encrypted` to disk
-    // but (pre-fix) left the LIVE in-memory config's copy at `None`. A later,
-    // completely unrelated settings save (build_merged_config's serde
-    // round-trip drops the `#[serde(skip_serializing)]` plaintext `api_key`)
-    // then persisted neither field, wiping the ciphertext that was already on
-    // disk. This must survive in the same process, without any reload.
+    #[test]
+    fn create_and_update_ignore_client_owned_credential_metadata() {
+        let mut request = create_request("sk-real");
+        request.config["api_key_encrypted"] = Value::String("client-cipher".to_string());
+        request.config["credential_ref"] = Value::String("attacker.chosen.ref".to_string());
+        let instance = build_instance_from_create(&request).unwrap();
+        assert!(instance.api_key_encrypted.is_none());
+        assert!(instance.credential_ref.is_none());
+
+        let updated = apply_instance_update(
+            &instance,
+            &UpdateInstanceRequest {
+                label: None,
+                enabled: None,
+                config: Some(serde_json::json!({
+                    "api_key_encrypted": "replacement-cipher",
+                    "credential_ref": "attacker.replacement.ref",
+                    "model": "gpt-safe"
+                })),
+            },
+        )
+        .unwrap();
+        assert!(updated.api_key_encrypted.is_none());
+        assert!(updated.credential_ref.is_none());
+        assert_eq!(updated.model.as_deref(), Some("gpt-safe"));
+    }
+
+    #[test]
+    fn api_reports_ref_backed_instance_as_configured_without_exposing_ref() {
+        let mut instance = build_instance_from_create(&create_request("sk-real")).unwrap();
+        instance.api_key.clear();
+        instance.credential_ref =
+            Some(bamboo_config::credential_ref("provider_instance", "work", "api_key").unwrap());
+        let api = instance_config_to_api(&instance);
+        assert_eq!(api["api_key"], "****...****");
+        assert!(!api.contains_key("credential_ref"));
+        assert!(!api.contains_key("api_key_encrypted"));
+    }
+
+    // A provider-instance secret is committed to credentials.json before its
+    // ref-backed metadata is published. Later generic saves must retain the ref
+    // without reintroducing ciphertext into config.json.
     #[tokio::test]
-    async fn settings_save_does_not_wipe_instance_encrypted_key_same_session() {
+    async fn settings_save_preserves_instance_credential_ref_same_session() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let state = AppState::new(temp_dir.path().to_path_buf())
             .await
@@ -564,23 +629,29 @@ mod tests {
             .await
             .expect("unrelated settings save should succeed");
 
-        let config_path = temp_dir.path().join("config.json");
-        let raw = std::fs::read_to_string(&config_path).expect("config.json should exist");
-        let on_disk: Value = serde_json::from_str(&raw).expect("config.json should be valid JSON");
+        let config_path = temp_dir.path().join("providers.json");
+        let raw = std::fs::read_to_string(&config_path).expect("providers.json should exist");
+        let on_disk: Value =
+            serde_json::from_str(&raw).expect("providers.json should be valid JSON");
         let instances = on_disk
-            .get("provider_instances")
+            .get("data")
+            .and_then(|data| data.get("provider_instances"))
             .and_then(|v| v.as_object())
             .expect("provider_instances should be present on disk");
         assert_eq!(instances.len(), 1, "exactly one instance was created");
         let (_id, instance) = instances.iter().next().expect("instance present");
-        let encrypted = instance
-            .get("api_key_encrypted")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        assert!(
-            !encrypted.is_empty(),
-            "api_key_encrypted must survive an unrelated settings save, got: {:?}",
-            instance
+        assert!(instance.get("api_key_encrypted").is_none());
+        let reference = bamboo_config::CredentialRef::parse(
+            instance["credential_ref"].as_str().expect("credential ref"),
+        )
+        .unwrap();
+        assert_eq!(
+            bamboo_config::CredentialStore::open(temp_dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-instance-secret"
         );
     }
 
@@ -589,7 +660,7 @@ mod tests {
     // live in-memory ciphertext in sync, so a later unrelated settings save
     // doesn't wipe it either.
     #[tokio::test]
-    async fn settings_save_does_not_wipe_instance_encrypted_key_after_update_same_session() {
+    async fn settings_save_preserves_instance_credential_ref_after_update_same_session() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let state = AppState::new(temp_dir.path().to_path_buf())
             .await
@@ -632,18 +703,23 @@ mod tests {
             .await
             .expect("unrelated settings save should succeed");
 
-        let config_path = temp_dir.path().join("config.json");
-        let raw = std::fs::read_to_string(&config_path).expect("config.json should exist");
-        let on_disk: Value = serde_json::from_str(&raw).expect("config.json should be valid JSON");
-        let instance = &on_disk["provider_instances"][&instance_id];
-        let encrypted = instance
-            .get("api_key_encrypted")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        assert!(
-            !encrypted.is_empty(),
-            "api_key_encrypted must survive update+unrelated settings save, got: {:?}",
-            instance
+        let config_path = temp_dir.path().join("providers.json");
+        let raw = std::fs::read_to_string(&config_path).expect("providers.json should exist");
+        let on_disk: Value =
+            serde_json::from_str(&raw).expect("providers.json should be valid JSON");
+        let instance = &on_disk["data"]["provider_instances"][&instance_id];
+        assert!(instance.get("api_key_encrypted").is_none());
+        let reference = bamboo_config::CredentialRef::parse(
+            instance["credential_ref"].as_str().expect("credential ref"),
+        )
+        .unwrap();
+        assert_eq!(
+            bamboo_config::CredentialStore::open(temp_dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "sk-instance-secret"
         );
         assert_eq!(
             instance.get("label").and_then(|v| v.as_str()),

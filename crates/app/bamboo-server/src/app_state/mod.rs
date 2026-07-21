@@ -165,6 +165,11 @@ pub struct AppState {
     /// Can be reloaded from disk at runtime using `reload_config()`.
     pub config: Arc<RwLock<Config>>,
 
+    /// Process-owned modular configuration authority. Production bootstrap
+    /// always installs one after the recoverable legacy split; injected test
+    /// states may omit it and retain the compatibility-only config path.
+    pub config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
+
     /// Serializes a config WRITE's whole [in-memory mutation + disk persist] with
     /// a `reload_config`'s [disk read + in-memory swap], so a reload can never
     /// observe an in-flight-but-not-yet-persisted update and clobber it with the
@@ -172,6 +177,18 @@ pub struct AppState {
     /// using a separate mutex keeps config READERS (the hot agent-loop path)
     /// unblocked during a write's disk I/O. #126.
     pub config_io_lock: Arc<tokio::sync::Mutex<()>>,
+
+    /// Server-owned live configuration watcher and its health envelope.
+    /// The runtime handle keeps the directory watcher tasks alive.
+    pub config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
+    /// MCP section health is independent from provider health so an invalid or
+    /// degraded MCP candidate cannot make unrelated sections appear unhealthy.
+    pub mcp_config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
+    #[allow(dead_code)]
+    config_watcher: config_runtime::ConfigWatcherRuntime,
+
+    /// Encrypted credential authority exposed only through metadata/replace/clear APIs.
+    pub credential_store: Arc<bamboo_config::CredentialStore>,
 
     /// Shared Remote Cluster Fabric deploy engine (one worker registry across the
     /// HTTP operator handlers and the `cluster` agent tool).
@@ -451,6 +468,8 @@ impl AppState {
 mod agent_session_context;
 mod builder;
 mod config_runtime;
+pub(crate) use config_runtime::ConfigLiveHealth;
+pub(crate) use config_runtime::ConfigSectionMutationError;
 pub mod init;
 pub mod parent_approval_reviewer;
 mod persistence;

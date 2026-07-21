@@ -82,6 +82,10 @@ pub fn provider_api_key_intents(patch_obj: &Map<String, Value>) -> ProviderApiKe
         .and_then(|v| v.as_object())
     {
         for (instance_id, instance_patch) in root.iter() {
+            if instance_patch.is_null() {
+                intents.provider_instances.insert(instance_id.clone());
+                continue;
+            }
             let Some(obj) = instance_patch.as_object() else {
                 continue;
             };
@@ -192,10 +196,43 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
     // Never allow clients to modify proxy auth fields or data_dir via this endpoint.
     patch_obj.remove("proxy_auth");
     patch_obj.remove("proxy_auth_encrypted");
+    patch_obj.remove("proxy_auth_credential_ref");
     // Legacy/compat proxy auth keys (written by older Bodhi/Tauri builds).
     patch_obj.remove("http_proxy_auth_encrypted");
     patch_obj.remove("https_proxy_auth_encrypted");
     patch_obj.remove("data_dir");
+    // Env values and storage metadata are managed by the revisioned env API.
+    // Dropping the whole domain prevents mask/ref/configured spoofing through
+    // the permissive root PATCH surface.
+    patch_obj.remove("env_vars");
+
+    // Cluster credential refs/configured state are server-owned metadata. Keep
+    // ordinary node edits compatible, but refuse client-selected references or
+    // legacy ciphertext injection through the permissive root PATCH surface.
+    if let Some(cluster_fabric) = patch_obj
+        .get_mut("cluster_fabric")
+        .and_then(|value| value.as_object_mut())
+    {
+        cluster_fabric.remove("credential_refs");
+        if let Some(nodes) = cluster_fabric
+            .get_mut("nodes")
+            .and_then(|value| value.as_array_mut())
+        {
+            for node in nodes {
+                let Some(auth) = node
+                    .get_mut("placement")
+                    .and_then(|value| value.as_object_mut())
+                    .and_then(|placement| placement.get_mut("auth"))
+                    .and_then(|value| value.as_object_mut())
+                else {
+                    continue;
+                };
+                auth.remove("password_encrypted");
+                auth.remove("private_key_encrypted");
+                auth.remove("passphrase_encrypted");
+            }
+        }
+    }
 
     // Never allow clients to set encrypted key material directly.
     if let Some(providers) = patch_obj
@@ -219,6 +256,7 @@ pub fn sanitize_root_patch(patch_obj: &mut Map<String, Value>) {
                 continue;
             };
             obj.remove("api_key_encrypted");
+            obj.remove("credential_ref");
         }
     }
 
@@ -533,21 +571,10 @@ pub fn notification_secret_intents(patch_obj: &Map<String, Value>) -> Notificati
     intents
 }
 
-/// Make an explicit `token: ""` / `device_key: ""` clear actually clear.
-///
-/// Generalizes [`clear_provider_ciphertext_for_explicit_clears`] (#521) to
-/// notification-channel secrets: `notifications.ntfy.token_encrypted` /
-/// `notifications.bark.device_key_encrypted` are NOT `skip_serializing` (only
-/// `skip_serializing_if = "Option::is_none"`), so the merge round-trip in
-/// `config_manager::build_merged_config` carries the live config's ciphertext
-/// straight into the merged value even when the patch explicitly cleared the
-/// plaintext. `hydrate_notifications_from_encrypted` would then refill the
-/// plaintext from that ciphertext, and the subsequent
-/// `Config::refresh_notifications_encrypted` (which deliberately preserves
-/// ciphertext when plaintext is empty, #268) would leave it in place —
-/// silently undoing the clear. For every field the patch explicitly touched
-/// whose merged plaintext is empty (a clear, not a set), drop the
-/// round-tripped ciphertext BEFORE hydration so nothing refills it.
+/// Make an explicit `token: ""` / `device_key: ""` clear actually clear when
+/// processing legacy in-memory ciphertext. New writes never serialize those
+/// ciphertext fields, but an old loaded config can still carry them until its
+/// migration completes.
 pub fn clear_notification_ciphertext_for_explicit_clears(
     merged: &mut Config,
     intents: &NotificationSecretIntents,
@@ -576,6 +603,23 @@ pub fn clear_notification_ciphertext_for_explicit_clears(
             .is_empty()
     {
         merged.notifications.bark.device_key_encrypted = None;
+    }
+}
+
+/// Restore store-hydrated notification plaintext after a compatibility JSON
+/// round-trip for fields the patch did not explicitly replace or clear.
+/// Credential references and configured metadata are serialized, but secret
+/// plaintext is deliberately not.
+pub fn preserve_unpatched_notification_secrets(
+    merged: &mut Config,
+    current: &Config,
+    intents: &NotificationSecretIntents,
+) {
+    if !intents.ntfy_token {
+        merged.notifications.ntfy.token = current.notifications.ntfy.token.clone();
+    }
+    if !intents.bark_device_key {
+        merged.notifications.bark.device_key = current.notifications.bark.device_key.clone();
     }
 }
 
@@ -1385,6 +1429,82 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_root_patch_strips_provider_instance_storage_metadata() {
+        let mut patch = json!({
+            "provider_instances": {
+                "work": {
+                    "provider_type": "openai",
+                    "api_key": "sk-user-value",
+                    "api_key_encrypted": "client-ciphertext",
+                    "credential_ref": "attacker.chosen.ref"
+                }
+            }
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+
+        let instance = obj["provider_instances"]["work"].as_object().unwrap();
+        assert_eq!(instance["api_key"], "sk-user-value");
+        assert!(!instance.contains_key("api_key_encrypted"));
+        assert!(!instance.contains_key("credential_ref"));
+    }
+
+    #[test]
+    fn sanitize_root_patch_strips_proxy_credential_metadata() {
+        let mut patch = json!({
+            "http_proxy": "http://proxy.example:8080",
+            "proxy_auth": {"username": "attacker", "password": "secret"},
+            "proxy_auth_encrypted": "client-ciphertext",
+            "proxy_auth_credential_ref": "attacker.chosen.ref"
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+        assert_eq!(obj["http_proxy"], "http://proxy.example:8080");
+        assert!(!obj.contains_key("proxy_auth"));
+        assert!(!obj.contains_key("proxy_auth_encrypted"));
+        assert!(!obj.contains_key("proxy_auth_credential_ref"));
+    }
+
+    #[test]
+    fn sanitize_root_patch_strips_cluster_storage_metadata_and_ciphertext() {
+        let mut patch = json!({
+            "cluster_fabric": {
+                "credential_refs": {
+                    "node-a": {
+                        "password_credential_ref": "attacker.chosen.ref",
+                        "password_configured": true
+                    }
+                },
+                "nodes": [{
+                    "id": "node-a",
+                    "placement": {
+                        "type": "ssh",
+                        "auth": {
+                            "method": "private_key",
+                            "private_key": "new-user-value",
+                            "private_key_encrypted": "client-ciphertext",
+                            "passphrase": "new-passphrase",
+                            "passphrase_encrypted": "client-ciphertext"
+                        }
+                    }
+                }]
+            }
+        });
+        let obj = patch.as_object_mut().unwrap();
+        sanitize_root_patch(obj);
+
+        let cluster = obj["cluster_fabric"].as_object().unwrap();
+        assert!(!cluster.contains_key("credential_refs"));
+        let auth = cluster["nodes"][0]["placement"]["auth"]
+            .as_object()
+            .unwrap();
+        assert_eq!(auth["private_key"], "new-user-value");
+        assert_eq!(auth["passphrase"], "new-passphrase");
+        assert!(!auth.contains_key("private_key_encrypted"));
+        assert!(!auth.contains_key("passphrase_encrypted"));
+    }
+
+    #[test]
     fn preserve_masked_notification_secrets_keeps_existing_plaintext() {
         let mut current = Config::default();
         current.notifications.ntfy.token = Some("existing-ntfy-token".to_string());
@@ -1439,9 +1559,13 @@ mod tests {
             platform_type: platform_type.to_string(),
             token: Some(token.to_string()),
             token_encrypted: None,
+            token_credential_ref: None,
+            token_configured: false,
             app_id: None,
             app_secret: None,
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: None,
             allow_from: Vec::new(),
             admin_from: Vec::new(),
@@ -1848,9 +1972,13 @@ mod tests {
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
+            token_credential_ref: None,
+            token_configured: false,
             app_id: Some("cli_x".to_string()),
             app_secret: Some(app_secret.to_string()),
             app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: Vec::new(),
             admin_from: Vec::new(),
@@ -2252,6 +2380,13 @@ mod tests {
     }
 
     #[test]
+    fn provider_api_key_intents_treats_whole_instance_null_as_delete_intent() {
+        let patch = json!({ "provider_instances": { "uuid-1": null } });
+        let intents = provider_api_key_intents(patch.as_object().unwrap());
+        assert!(intents.provider_instances.contains("uuid-1"));
+    }
+
+    #[test]
     fn provider_api_key_intents_null_and_empty_string_are_equivalent_intents() {
         let null_patch = json!({ "providers": { "openai": { "api_key": null } } });
         let empty_patch = json!({ "providers": { "openai": { "api_key": "" } } });
@@ -2308,11 +2443,9 @@ mod tests {
 
     #[test]
     fn null_ntfy_token_clears_roundtripped_ciphertext_via_clear_intents() {
-        // Full composition: the merge leaves `token_encrypted` behind (only
-        // `token` was null-deleted, not the whole `ntfy` object), so
-        // `clear_notification_ciphertext_for_explicit_clears` must strip it
-        // once the intent is recognized — otherwise hydration would refill
-        // the "deleted" plaintext straight from the stale ciphertext.
+        // Full composition: neither plaintext nor legacy ciphertext survives
+        // the JSON round-trip; the clear-intent pass remains idempotent for a
+        // config loaded from older in-memory state.
         let mut current = Config::default();
         current.notifications.ntfy.token = Some("existing-token".to_string());
         current.notifications.ntfy.token_encrypted = Some("existing-ct".to_string());
@@ -2322,10 +2455,9 @@ mod tests {
         assert!(intents.ntfy_token);
 
         let mut merged = merge_and_deserialize(&current, patch);
-        assert_eq!(
-            merged.notifications.ntfy.token_encrypted.as_deref(),
-            Some("existing-ct"),
-            "the merge alone leaves the round-tripped ciphertext behind"
+        assert!(
+            merged.notifications.ntfy.token_encrypted.is_none(),
+            "legacy notification ciphertext is no longer serialized through the merge"
         );
 
         clear_notification_ciphertext_for_explicit_clears(&mut merged, &intents);

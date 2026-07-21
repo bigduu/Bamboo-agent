@@ -17,3 +17,9 @@ fn read_config_json(path: &std::path::Path) -> serde_json::Value {
     let raw = std::fs::read_to_string(path).expect("config.json should be readable");
     serde_json::from_str(&raw).expect("config.json should be valid JSON")
 }
+
+/// Accept both legacy raw sidecars and revisioned #597 envelopes while a
+/// watcher-driven migration may race the first read in an end-to-end flow.
+fn config_document_data(document: &serde_json::Value) -> &serde_json::Value {
+    document.get("data").unwrap_or(document)
+}

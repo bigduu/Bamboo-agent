@@ -13,6 +13,11 @@ const TOOLS_LIST_CHANGED_METHODS: [&str; 2] =
 impl McpServerManager {
     /// Start a new MCP server connection.
     pub async fn start_server(&self, config: McpServerConfig) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().await;
+        self.start_server_unlocked(config).await
+    }
+
+    pub(super) async fn start_server_unlocked(&self, config: McpServerConfig) -> Result<()> {
         let server_id = config.id.clone();
 
         if self.runtimes.contains_key(&server_id) {
@@ -21,14 +26,26 @@ impl McpServerManager {
 
         info!("Starting MCP server '{}'", server_id);
 
+        let prepared = self.prepare_server_runtime(config, "start").await?;
+        debug_assert_eq!(prepared.runtime.config.id, server_id);
+        let replaced = self.install_prepared_runtime(prepared).await;
+        debug_assert!(replaced.is_none());
+
+        Ok(())
+    }
+
+    pub(super) async fn prepare_server_runtime(
+        &self,
+        config: McpServerConfig,
+        phase: &'static str,
+    ) -> Result<PreparedServerRuntime> {
+        let server_id = config.id.clone();
         let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
         let (client, tools, instructions, notification_rx) = self
-            .bootstrap_server_client(&server_id, &config, "start")
+            .bootstrap_server_client(&server_id, &config, phase)
             .await?;
-
-        // Create runtime
         let runtime = Arc::new(ServerRuntime {
-            config: config.clone(),
+            config,
             client: RwLock::new(client),
             info: RwLock::new(RuntimeInfo {
                 status: ServerStatus::Ready,
@@ -46,8 +63,42 @@ impl McpServerManager {
             qos: McpServerQos::new(McpQosConfig::default()),
             proxy_fingerprint: runtime_proxy_fingerprint,
         });
+        Ok(PreparedServerRuntime {
+            runtime,
+            tools,
+            notification_rx,
+        })
+    }
 
-        // Register tools in index
+    /// Publish a fully initialized runtime. No fallible initialization remains
+    /// in this method, so callers can stage all candidates before committing.
+    pub(super) async fn install_prepared_runtime(
+        &self,
+        prepared: PreparedServerRuntime,
+    ) -> Option<Arc<ServerRuntime>> {
+        let (server_id, tool_names, replaced) = self.publish_prepared_runtime(prepared);
+
+        self.emit_runtime_ready_events(server_id, tool_names).await;
+        replaced
+    }
+
+    /// Publish a fully initialized runtime without suspending. Configuration
+    /// reconciliation uses this after its durable CAS boundary so cancellation
+    /// cannot leave only part of a committed runtime set visible.
+    pub(super) fn publish_prepared_runtime(
+        &self,
+        prepared: PreparedServerRuntime,
+    ) -> (String, Vec<String>, Option<Arc<ServerRuntime>>) {
+        let PreparedServerRuntime {
+            runtime,
+            tools,
+            notification_rx,
+        } = prepared;
+        let config = &runtime.config;
+        let server_id = config.id.clone();
+        let healthcheck_interval_ms = config.healthcheck_interval_ms;
+
+        self.index.remove_server_tools(&server_id);
         let aliases = self.index.register_server_tools(
             &server_id,
             &tools,
@@ -61,17 +112,33 @@ impl McpServerManager {
             server_id
         );
 
-        // Store runtime
-        self.runtimes.insert(server_id.clone(), runtime.clone());
+        // Store runtime only after its client initialized and tools were read.
+        let replaced = self.runtimes.insert(server_id.clone(), runtime.clone());
 
         // Spawn the notification drain only AFTER the runtime is registered, so an
         // immediate `tools/list_changed` resolves via `refresh_tools` instead of
         // racing `ServerNotFound`. (#420)
         if let Some(rx) = notification_rx {
-            self.spawn_notification_drain(server_id.clone(), rx);
+            self.spawn_notification_drain(server_id.clone(), runtime.clone(), rx);
         }
 
-        // Emit event
+        // The new generation's health task and the old generation's shutdown
+        // flag are part of the synchronous publication boundary. Event delivery
+        // and client disconnection may suspend and happen afterward.
+        self.start_health_check(runtime, healthcheck_interval_ms);
+        if let Some(ref old) = replaced {
+            old.shutdown.store(true, Ordering::SeqCst);
+        }
+
+        let tool_names = aliases.into_iter().map(|alias| alias.alias).collect();
+        (server_id, tool_names, replaced)
+    }
+
+    pub(super) async fn emit_runtime_ready_events(
+        &self,
+        server_id: String,
+        tool_names: Vec<String>,
+    ) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx
                 .send(McpEvent::ServerStatusChanged {
@@ -81,7 +148,6 @@ impl McpServerManager {
                 })
                 .await;
 
-            let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
             let _ = tx
                 .send(McpEvent::ToolsChanged {
                     server_id,
@@ -89,51 +155,74 @@ impl McpServerManager {
                 })
                 .await;
         }
-
-        // Start health check task
-        self.start_health_check(runtime, config.healthcheck_interval_ms);
-
-        Ok(())
     }
 
     /// Stop an MCP server connection.
     pub async fn stop_server(&self, server_id: &str) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().await;
+        self.stop_server_unlocked(server_id).await
+    }
+
+    pub(super) async fn stop_server_unlocked(&self, server_id: &str) -> Result<()> {
+        info!("Stopping MCP server '{}'", server_id);
+        let runtime = self.detach_runtime(server_id)?;
+        self.finish_detached_stop(server_id.to_string(), runtime, true)
+            .await;
+        info!("MCP server '{}' stopped", server_id);
+        Ok(())
+    }
+
+    /// Remove a runtime and all of its externally visible tools without
+    /// suspending. The returned client can be disconnected afterward.
+    pub(super) fn detach_runtime(&self, server_id: &str) -> Result<Arc<ServerRuntime>> {
         let (_, runtime) = self
             .runtimes
             .remove(server_id)
             .ok_or_else(|| McpError::NotRunning(server_id.to_string()))?;
-
-        info!("Stopping MCP server '{}'", server_id);
-
         runtime.shutdown.store(true, Ordering::SeqCst);
+        self.index.remove_server_tools(server_id);
+        Ok(runtime)
+    }
 
-        // Disconnect client
-        let mut client = runtime.client.write().await;
-        if let Err(e) = client.disconnect().await {
-            warn!("Error disconnecting MCP server '{}': {}", server_id, e);
+    pub(super) async fn finish_detached_stop(
+        &self,
+        server_id: String,
+        runtime: Arc<ServerRuntime>,
+        emit_stopped: bool,
+    ) {
+        self.shutdown_detached_runtime(&server_id, runtime).await;
+        if emit_stopped {
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx
+                    .send(McpEvent::ServerStatusChanged {
+                        server_id,
+                        status: ServerStatus::Stopped,
+                        error: None,
+                    })
+                    .await;
+            }
         }
+    }
 
-        // Update info
+    /// Stop a runtime that has already been detached/replaced. This deliberately
+    /// does not touch the runtime map or tool index, which now belong to its
+    /// successfully committed replacement.
+    pub(super) async fn shutdown_detached_runtime(
+        &self,
+        server_id: &str,
+        runtime: Arc<ServerRuntime>,
+    ) {
+        runtime.shutdown.store(true, Ordering::SeqCst);
+        let mut client = runtime.client.write().await;
+        if let Err(error) = client.disconnect().await {
+            warn!(
+                "Error disconnecting replaced MCP server '{}': {}",
+                server_id, error
+            );
+        }
         let mut info = runtime.info.write().await;
         info.status = ServerStatus::Stopped;
         info.disconnected_at = Some(Utc::now());
-
-        // Remove tools from index
-        self.index.remove_server_tools(server_id);
-
-        // Emit event
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx
-                .send(McpEvent::ServerStatusChanged {
-                    server_id: server_id.to_string(),
-                    status: ServerStatus::Stopped,
-                    error: None,
-                })
-                .await;
-        }
-
-        info!("MCP server '{}' stopped", server_id);
-        Ok(())
     }
 
     /// Call a tool on a specific server.
@@ -240,6 +329,7 @@ impl McpServerManager {
         let runtime = self
             .runtimes
             .get(server_id)
+            .map(|runtime| runtime.value().clone())
             .ok_or_else(|| McpError::ServerNotFound(server_id.to_string()))?;
 
         info!("Refreshing tools for MCP server '{}'", server_id);
@@ -247,6 +337,32 @@ impl McpServerManager {
         let client = runtime.client.read().await;
         let new_tools = client.list_tools(runtime.config.request_timeout_ms).await?;
         drop(client);
+
+        if !self
+            .publish_refreshed_tools_if_current(server_id, &runtime, new_tools)
+            .await
+        {
+            tracing::debug!(
+                "Discarding tool refresh for detached MCP runtime '{}'",
+                server_id
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) async fn publish_refreshed_tools_if_current(
+        &self,
+        server_id: &str,
+        runtime: &Arc<ServerRuntime>,
+        new_tools: Vec<McpTool>,
+    ) -> bool {
+        // Serialize the generation check with transactional replacement. The
+        // list_tools await above may span a replacement, so checking only when
+        // the refresh starts is insufficient.
+        let _reconcile = self.reconcile_lock.lock().await;
+        if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
+            return false;
+        }
 
         // Update tools
         let mut tools = runtime.tools.write().await;
@@ -283,7 +399,7 @@ impl McpServerManager {
                 .await;
         }
 
-        Ok(())
+        true
     }
 
     fn start_health_check(&self, runtime: Arc<ServerRuntime>, interval_ms: u64) {
@@ -296,7 +412,9 @@ impl McpServerManager {
             loop {
                 interval.tick().await;
 
-                if runtime.shutdown.load(Ordering::SeqCst) {
+                if runtime.shutdown.load(Ordering::SeqCst)
+                    || !manager.is_current_runtime(&server_id, &runtime)
+                {
                     break;
                 }
 
@@ -305,64 +423,92 @@ impl McpServerManager {
                     continue;
                 }
 
-                let client = runtime.client.read().await;
-                match client.ping(runtime.config.request_timeout_ms).await {
-                    Ok(_) => {
-                        let mut info = runtime.info.write().await;
-                        info.last_ping_at = Some(Utc::now());
-                        if info.status == ServerStatus::Degraded {
-                            info.status = ServerStatus::Ready;
-                            // Emit recovery event
-                            if let Some(ref tx) = manager.event_tx {
-                                let _ = tx
-                                    .send(McpEvent::ServerStatusChanged {
-                                        server_id: server_id.clone(),
-                                        status: ServerStatus::Ready,
-                                        error: None,
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Health check failed for MCP server '{}': {}", server_id, e);
+                let ping_result = {
+                    let client = runtime.client.read().await;
+                    client.ping(runtime.config.request_timeout_ms).await
+                };
 
-                        // Drop client lock before attempting reconnection
-                        drop(client);
+                let Some(should_reconnect) = manager
+                    .publish_health_result_if_current(
+                        &server_id,
+                        &runtime,
+                        ping_result.map_err(|error| error.to_string()),
+                    )
+                    .await
+                else {
+                    break;
+                };
 
-                        // Update status to Degraded
-                        {
-                            let mut info = runtime.info.write().await;
-                            info.status = ServerStatus::Degraded;
-                            info.last_error = Some(e.to_string());
-                        }
-
-                        // Emit degraded event
-                        if let Some(ref tx) = manager.event_tx {
-                            let _ = tx
-                                .send(McpEvent::ServerStatusChanged {
-                                    server_id: server_id.clone(),
-                                    status: ServerStatus::Degraded,
-                                    error: Some(e.to_string()),
-                                })
-                                .await;
-                        }
-
-                        // Attempt reconnection if enabled
-                        if runtime.config.reconnect.enabled {
-                            if let Err(reconnect_err) =
-                                manager.attempt_reconnection(runtime.clone()).await
-                            {
-                                error!(
-                                    "Reconnection failed for MCP server '{}': {}",
-                                    server_id, reconnect_err
-                                );
-                            }
-                        }
+                if should_reconnect {
+                    if let Err(reconnect_err) = manager.attempt_reconnection(runtime.clone()).await
+                    {
+                        error!(
+                            "Reconnection failed for MCP server '{}': {}",
+                            server_id, reconnect_err
+                        );
                     }
                 }
             }
         });
+    }
+
+    pub(super) async fn publish_health_result_if_current(
+        &self,
+        server_id: &str,
+        runtime: &Arc<ServerRuntime>,
+        result: std::result::Result<(), String>,
+    ) -> Option<bool> {
+        // A ping may span a transactional replacement. Keep this generation
+        // check and all status/event publication serialized with replacement.
+        let _reconcile = self.reconcile_lock.lock().await;
+        if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
+            return None;
+        }
+
+        match result {
+            Ok(()) => {
+                let mut info = runtime.info.write().await;
+                info.last_ping_at = Some(Utc::now());
+                let recovered = info.status == ServerStatus::Degraded;
+                if recovered {
+                    info.status = ServerStatus::Ready;
+                }
+                drop(info);
+                if recovered {
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx
+                            .send(McpEvent::ServerStatusChanged {
+                                server_id: server_id.to_string(),
+                                status: ServerStatus::Ready,
+                                error: None,
+                            })
+                            .await;
+                    }
+                }
+                Some(false)
+            }
+            Err(error) => {
+                warn!(
+                    "Health check failed for MCP server '{}': {}",
+                    server_id, error
+                );
+                {
+                    let mut info = runtime.info.write().await;
+                    info.status = ServerStatus::Degraded;
+                    info.last_error = Some(error.clone());
+                }
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx
+                        .send(McpEvent::ServerStatusChanged {
+                            server_id: server_id.to_string(),
+                            status: ServerStatus::Degraded,
+                            error: Some(error),
+                        })
+                        .await;
+                }
+                Some(runtime.config.reconnect.enabled)
+            }
+        }
     }
 
     /// Spawns the per-connection task that DRAINS this client's server-notification
@@ -381,11 +527,19 @@ impl McpServerManager {
     pub(super) fn spawn_notification_drain(
         &self,
         server_id: String,
+        expected_runtime: Arc<ServerRuntime>,
         mut receiver: tokio::sync::mpsc::Receiver<JsonRpcNotification>,
     ) {
         let manager = self.clone();
         tokio::spawn(async move {
             while let Some(notification) = receiver.recv().await {
+                let still_current = manager
+                    .runtimes
+                    .get(&server_id)
+                    .is_some_and(|runtime| Arc::ptr_eq(runtime.value(), &expected_runtime));
+                if !still_current {
+                    break;
+                }
                 manager
                     .dispatch_server_notification(&server_id, notification)
                     .await;

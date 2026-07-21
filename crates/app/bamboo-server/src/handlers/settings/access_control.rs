@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -17,11 +18,18 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    app_state::{AppState, ConfigUpdateEffects},
-    error::AppError,
-};
+use crate::{app_state::AppState, error::AppError};
 use bamboo_config::{Config, DeviceCredential};
+
+fn credential_revision(app_state: &AppState) -> Result<u64, AppError> {
+    bamboo_config::CredentialStore::open(&app_state.app_data_dir)
+        .revision()
+        .map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "access-control credential revision unavailable: {error}"
+            ))
+        })
+}
 
 #[derive(Serialize)]
 pub struct AccessStatusResponse {
@@ -317,6 +325,8 @@ pub(crate) fn issue_device_token(label: &str) -> (DeviceCredential, String) {
         label: label.to_string(),
         token_hash,
         token_salt: salt_hex,
+        token_credential_ref: None,
+        token_configured: false,
         created_at,
         last_used_at: None,
         revoked: false,
@@ -665,8 +675,12 @@ pub async fn update_access_password(
     })?;
     let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
 
+    let expected_revision = credential_revision(&app_state)?;
     app_state
-        .update_config(
+        .update_access_control_credentials(
+            expected_revision,
+            true,
+            BTreeSet::new(),
             move |config| {
                 // Mutate in place so an existing `access_control` keeps its paired
                 // `devices` across a root-password change. Replacing the whole
@@ -679,7 +693,6 @@ pub async fn update_access_password(
                 access.updated_at = Some(updated_at.clone());
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
 
@@ -850,8 +863,12 @@ async fn persist_new_device(app_state: &AppState, label: &str) -> Result<HttpRes
     let (credential, token) = issue_device_token(label);
     let device_id = credential.device_id.clone();
 
+    let expected_revision = credential_revision(app_state)?;
     app_state
-        .update_config(
+        .update_access_control_credentials(
+            expected_revision,
+            false,
+            BTreeSet::from([device_id.clone()]),
             move |config| {
                 // Preserve every existing field + already-paired devices: append,
                 // never replace.
@@ -859,7 +876,6 @@ async fn persist_new_device(app_state: &AppState, label: &str) -> Result<HttpRes
                 access.devices.push(credential.clone());
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
 
@@ -1233,8 +1249,12 @@ pub async fn revoke_device(
     }
 
     let target = device_id.clone();
+    let expected_revision = credential_revision(&app_state)?;
     app_state
-        .update_config(
+        .update_access_control_credentials(
+            expected_revision,
+            false,
+            BTreeSet::new(),
             move |config| {
                 if let Some(access) = config.access_control.as_mut() {
                     if let Some(device) = access.devices.iter_mut().find(|d| d.device_id == target)
@@ -1244,7 +1264,6 @@ pub async fn revoke_device(
                 }
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
 
@@ -1283,8 +1302,12 @@ pub async fn rotate_device(
     let (fresh, token) = issue_device_token("");
 
     let target = device_id.clone();
+    let expected_revision = credential_revision(&app_state)?;
     app_state
-        .update_config(
+        .update_access_control_credentials(
+            expected_revision,
+            false,
+            BTreeSet::from([device_id.clone()]),
             move |config| {
                 if let Some(access) = config.access_control.as_mut() {
                     if let Some(device) = access.devices.iter_mut().find(|d| d.device_id == target)
@@ -1297,7 +1320,6 @@ pub async fn rotate_device(
                 }
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
 
@@ -1395,6 +1417,8 @@ mod tests {
                 password_enabled: true,
                 password_hash: Some(hash),
                 password_salt: Some(salt_hex),
+                password_credential_ref: None,
+                password_configured: false,
                 updated_at: None,
                 devices: Vec::new(),
             }),
@@ -1414,6 +1438,8 @@ mod tests {
                 password_enabled: true,
                 password_hash: Some(hash),
                 password_salt: Some(salt_hex),
+                password_credential_ref: None,
+                password_configured: false,
                 updated_at: None,
                 devices: Vec::new(),
             }),
@@ -1516,6 +1542,8 @@ mod tests {
                 password_enabled: false,
                 password_hash: None,
                 password_salt: None,
+                password_credential_ref: None,
+                password_configured: false,
                 updated_at: None,
                 devices: vec![cred],
             }),
@@ -1575,6 +1603,8 @@ mod tests {
                 password_enabled: false,
                 password_hash: None,
                 password_salt: None,
+                password_credential_ref: None,
+                password_configured: false,
                 updated_at: None,
                 devices: vec![cred],
             }),

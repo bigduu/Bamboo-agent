@@ -31,9 +31,9 @@ pub use bamboo_config::patch::{
     clear_provider_ciphertext_for_explicit_clears, connect_secret_intents, deep_merge_json,
     domains_for_root_patch, effects_for_root_patch, is_masked_api_key, notification_secret_intents,
     preserve_masked_connect_secrets, preserve_masked_notification_secrets,
-    preserve_masked_provider_api_keys, preserve_unpatched_provider_secrets,
-    provider_api_key_intents, sanitize_root_patch, ConnectSecretIntents, DomainChanges,
-    NotificationSecretIntents, PatchEffects, ReloadMode,
+    preserve_masked_provider_api_keys, preserve_unpatched_notification_secrets,
+    preserve_unpatched_provider_secrets, provider_api_key_intents, sanitize_root_patch,
+    ConnectSecretIntents, DomainChanges, NotificationSecretIntents, PatchEffects, ReloadMode,
 };
 
 pub fn sync_provider_api_keys_encrypted_for_patch(
@@ -175,11 +175,19 @@ pub fn build_merged_config(
     clear_notification_ciphertext_for_explicit_clears(&mut new_config, &notification_intents);
     clear_connect_ciphertext_for_explicit_clears(&mut new_config, &connect_intents);
     new_config.hydrate_proxy_auth_from_encrypted();
+    // Proxy auth is credential-store backed and intentionally omitted from the
+    // compatibility JSON round-trip. Root PATCH sanitization forbids changing
+    // both the secret and its reference, so preserve the already-hydrated live
+    // value just like the CLI dot-path setter does.
+    if new_config.proxy_auth_credential_ref == current.proxy_auth_credential_ref {
+        new_config.proxy_auth = current.proxy_auth.clone();
+    }
     new_config.hydrate_provider_api_keys_from_encrypted();
     new_config.hydrate_provider_instance_api_keys_from_encrypted();
     new_config.hydrate_mcp_secrets_from_encrypted();
     new_config.hydrate_env_vars_from_encrypted();
     new_config.hydrate_notifications_from_encrypted();
+    preserve_unpatched_notification_secrets(&mut new_config, current, &notification_intents);
     new_config.hydrate_connect_platform_tokens_from_encrypted();
     // The serde round-trip above drops every provider's `#[serde(skip_serializing)]`
     // `api_key`; hydration only restores ciphertext-backed keys, so an env-sourced
@@ -202,7 +210,33 @@ pub fn build_merged_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_config::OpenAIConfig;
+    use bamboo_config::{credential_ref, OpenAIConfig, ProxyAuth};
+
+    #[test]
+    fn unrelated_root_patch_preserves_store_hydrated_proxy_auth() {
+        let mut current = Config::default();
+        current.proxy_auth_credential_ref =
+            Some(credential_ref("proxy", "default", "auth").unwrap());
+        current.proxy_auth = Some(ProxyAuth {
+            username: "proxy-user".to_string(),
+            password: "proxy-password".to_string(),
+        });
+        let patch: Map<String, Value> =
+            serde_json::from_str(r#"{"http_proxy":"http://proxy.example:8080"}"#).unwrap();
+
+        let merged = build_merged_config(&current, patch).expect("merge");
+
+        assert_eq!(
+            merged.proxy_auth_credential_ref,
+            current.proxy_auth_credential_ref
+        );
+        let auth = merged
+            .proxy_auth
+            .as_ref()
+            .expect("live proxy auth must survive");
+        assert_eq!(auth.username, "proxy-user");
+        assert_eq!(auth.password, "proxy-password");
+    }
 
     fn env_sourced_openai_config() -> Config {
         let mut config = Config::default();
@@ -473,12 +507,8 @@ mod tests {
 
     #[test]
     fn unrelated_patch_preserves_notification_secrets() {
-        // NOTE: unlike providers (whose ciphertext is only touched by the
-        // explicit-intent-gated `sync_provider_api_keys_encrypted_for_patch`),
-        // notification ciphertext is unconditionally recomputed by
-        // `refresh_encrypted_secrets` on every write (pre-existing,
-        // out-of-scope-for-#521 design) — so only plaintext survival and
-        // ciphertext presence are asserted, not exact ciphertext bytes.
+        // Compatibility merging must carry store-hydrated plaintext forward
+        // even though it is intentionally absent from serialized JSON.
         let current = config_with_notification_secrets("ntfy-secret", "bark-secret");
 
         let merged =

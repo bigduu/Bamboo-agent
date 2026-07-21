@@ -1,5 +1,6 @@
 use super::fingerprint::{effective_server_config, manager_proxy_fingerprint};
 use super::*;
+use std::collections::HashSet;
 
 impl McpServerManager {
     /// Reconcile running MCP servers with the desired configuration.
@@ -12,76 +13,150 @@ impl McpServerManager {
     /// Secrets are compared by their hydrated plaintext (env/header values), not by the
     /// encrypted-at-rest blobs (which can change on every save due to random nonces).
     pub async fn reconcile_from_config(&self, config: &McpConfig) {
+        if let Err(error) = self.reconcile_from_config_transactional(config).await {
+            error!("Failed to reconcile MCP configuration transactionally: {error}");
+        }
+    }
+
+    /// Reconcile configuration without evicting any working runtime until all
+    /// new and changed servers have completed transport connection, protocol
+    /// initialization, and tool discovery.
+    pub async fn reconcile_from_config_transactional(&self, config: &McpConfig) -> Result<()> {
+        self.reconcile_from_config_transactional_after(config, || async { Ok(()) })
+            .await
+    }
+
+    /// Stage every new/changed runtime, then run `before_publish`, and only
+    /// publish the prepared runtimes when that durable boundary succeeds.
+    /// This lets a section store place its CAS commit exactly between runtime
+    /// validation and runtime/tool-index publication.
+    pub async fn reconcile_from_config_transactional_after<F, Fut>(
+        &self,
+        config: &McpConfig,
+        before_publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let _reconcile = self.reconcile_lock.lock().await;
+        let mut seen = HashSet::new();
+        for server in &config.servers {
+            if server.id.trim().is_empty() {
+                return Err(McpError::InvalidConfig(
+                    "MCP server id cannot be empty".to_string(),
+                ));
+            }
+            if !seen.insert(server.id.clone()) {
+                return Err(McpError::InvalidConfig(format!(
+                    "duplicate MCP server id '{}'",
+                    server.id
+                )));
+            }
+        }
+
         let desired_proxy_fingerprint = manager_proxy_fingerprint(self.config.as_ref()).await;
-
-        // Stop or restart existing runtimes.
-        for running_id in self.list_servers() {
-            let desired = config.servers.iter().find(|s| s.id == running_id);
-
-            let Some(desired) = desired else {
-                info!(
-                    "Stopping MCP server '{}' (removed from configuration)",
-                    running_id
-                );
-                if let Err(e) = self.stop_server(&running_id).await {
-                    warn!("Failed to stop MCP server '{}': {}", running_id, e);
-                }
-                continue;
-            };
-
-            if !desired.enabled {
-                info!("Stopping MCP server '{}' (disabled in config)", running_id);
-                if let Err(e) = self.stop_server(&running_id).await {
-                    warn!("Failed to stop MCP server '{}': {}", running_id, e);
-                }
-                continue;
-            }
-
-            let needs_restart = self
+        let mut replacements = Vec::new();
+        for desired in config.servers.iter().filter(|server| server.enabled) {
+            let needs_replacement = self
                 .runtimes
-                .get(&running_id)
+                .get(&desired.id)
                 .map(|runtime| {
-                    let mut restart = effective_server_config(&runtime.config)
-                        != effective_server_config(desired);
-
-                    // SSE transports are HTTP clients; if proxy settings change we must restart
-                    // to re-create the underlying reqwest client with the new proxy config.
-                    if let TransportConfig::Sse(_) = &runtime.config.transport {
-                        if runtime.proxy_fingerprint != desired_proxy_fingerprint {
-                            restart = true;
-                        }
-                    }
-
-                    restart
+                    effective_server_config(&runtime.config) != effective_server_config(desired)
+                        || matches!(
+                            runtime.config.transport,
+                            TransportConfig::Sse(_) | TransportConfig::StreamableHttp(_)
+                        ) && runtime.proxy_fingerprint != desired_proxy_fingerprint
                 })
-                .unwrap_or(false);
+                .unwrap_or(true);
+            if !needs_replacement {
+                continue;
+            }
 
-            if needs_restart {
-                info!("Restarting MCP server '{}' (config changed)", running_id);
-                let _ = self.stop_server(&running_id).await;
-                if let Err(e) = self.start_server(desired.clone()).await {
-                    error!("Failed to restart MCP server '{}': {}", running_id, e);
+            match self
+                .prepare_server_runtime(desired.clone(), "config reload")
+                .await
+            {
+                Ok(prepared) => replacements.push(prepared),
+                Err(error) => {
+                    for prepared in replacements {
+                        let id = prepared.runtime.config.id.clone();
+                        self.shutdown_detached_runtime(&id, prepared.runtime).await;
+                    }
+                    return Err(error);
                 }
             }
         }
 
-        // Start any enabled servers that are not running.
-        for desired in &config.servers {
-            if !desired.enabled {
-                continue;
-            }
-            if self.is_server_running(&desired.id) {
-                continue;
-            }
+        let desired_enabled: HashSet<&str> = config
+            .servers
+            .iter()
+            .filter(|server| server.enabled)
+            .map(|server| server.id.as_str())
+            .collect();
+        let removals: Vec<String> = self
+            .list_servers()
+            .into_iter()
+            .filter(|id| !desired_enabled.contains(id.as_str()))
+            .collect();
 
-            info!(
-                "Starting MCP server '{}' (enabled in configuration)",
-                desired.id
-            );
-            if let Err(e) = self.start_server(desired.clone()).await {
-                error!("Failed to start MCP server '{}': {}", desired.id, e);
+        if let Err(error) = before_publish().await {
+            for prepared in replacements {
+                let id = prepared.runtime.config.id.clone();
+                self.shutdown_detached_runtime(&id, prepared.runtime).await;
+            }
+            return Err(error);
+        }
+
+        // From the durable boundary through the end of these loops there must
+        // be no suspension point: cancellation must observe either the old
+        // section or every committed runtime/tool-index publication.
+        let mut published = Vec::new();
+        let mut replaced = Vec::new();
+        for prepared in replacements {
+            let (id, tool_names, old) = self.publish_prepared_runtime(prepared);
+            if let Some(old) = old {
+                // publish_prepared_runtime sets shutdown synchronously before
+                // returning, but keep the old generation for deferred cleanup.
+                replaced.push((id.clone(), old));
+            }
+            published.push((id, tool_names));
+        }
+        let mut removed = Vec::new();
+        for id in removals {
+            match self.detach_runtime(&id) {
+                Ok(runtime) => removed.push((id, runtime)),
+                Err(error) => {
+                    // The reconcile lock makes this unreachable for ordinary
+                    // manager callers, but a commit must remain best-effort and
+                    // infallible once replacements are published.
+                    warn!("Failed to detach removed MCP server '{}': {}", id, error);
+                }
             }
         }
+
+        // Event channel backpressure and transport shutdown are post-commit
+        // cleanup. They must never delay section health publication by the
+        // caller or make a committed reconcile cancellable halfway through.
+        for (id, tool_names) in published {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.emit_runtime_ready_events(id, tool_names).await;
+            });
+        }
+        for (id, runtime) in removed {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.finish_detached_stop(id, runtime, true).await;
+            });
+        }
+        for (id, old) in replaced {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                manager.finish_detached_stop(id, old, false).await;
+            });
+        }
+        Ok(())
     }
 
     /// Initialize from configuration.

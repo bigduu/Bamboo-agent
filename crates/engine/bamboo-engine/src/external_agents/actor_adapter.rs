@@ -1581,34 +1581,45 @@ mod tests {
         done: bool,
     }
 
-    struct ApprovalThenTerminalLink {
+    struct ApprovalRoundTripLink {
         step: u8,
+        approval_reply: Option<(String, bool)>,
     }
 
     #[async_trait]
-    impl bamboo_subagent::ChildLink for ApprovalThenTerminalLink {
-        async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+    impl bamboo_subagent::ChildLink for ApprovalRoundTripLink {
+        async fn send(&mut self, frame: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+            if let ParentFrame::ApprovalReply { id, approved } = frame {
+                self.approval_reply = Some((id, approved));
+                self.step = 2;
+            }
             Ok(())
         }
 
         async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
-            self.step += 1;
             match self.step {
-                1 => Ok(Some(ChildFrame::ApprovalRequest {
-                    id: "approval-1".into(),
-                    body: serde_json::json!({
-                        "tool_name": "Bash",
-                        "permission": "execute",
-                        "resource": "rm -rf target",
-                        "permission_request": {"reason_code": "hard_dangerous"}
-                    }),
-                })),
-                2 => Ok(Some(ChildFrame::Terminal {
-                    status: TerminalStatus::Completed,
-                    result: Some("done".into()),
-                    error: None,
-                    transcript: vec![],
-                })),
+                0 => {
+                    self.step = 1;
+                    Ok(Some(ChildFrame::ApprovalRequest {
+                        id: "approval-1".into(),
+                        body: serde_json::json!({
+                            "tool_name": "Bash",
+                            "permission": "execute",
+                            "resource": "rm -rf target",
+                            "permission_request": {"reason_code": "hard_dangerous"}
+                        }),
+                    }))
+                }
+                1 => std::future::pending().await,
+                2 => {
+                    self.step = 3;
+                    Ok(Some(ChildFrame::Terminal {
+                        status: TerminalStatus::Completed,
+                        result: Some("done".into()),
+                        error: None,
+                        transcript: vec![],
+                    }))
+                }
                 _ => std::future::pending().await,
             }
         }
@@ -1622,26 +1633,39 @@ mod tests {
             reviewed: review_tx,
         });
         let cancel = CancellationToken::new();
-        let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
-        let mut link = ApprovalThenTerminalLink { step: 0 };
+        let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let live_guard = crate::external_agents::live::register("child-reviewer", live_tx, 0, None);
+        let mut link = ApprovalRoundTripLink {
+            step: 0,
+            approval_reply: None,
+        };
 
-        let result = drive(
-            &mut link,
-            "parent-reviewer",
-            "child-reviewer",
-            0,
-            None,
-            None,
-            Some(&reviewer),
-            None,
-            &event_tx,
-            &cancel,
-            &mut live_rx,
-            None,
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            drive(
+                &mut link,
+                "parent-reviewer",
+                "child-reviewer",
+                0,
+                None,
+                None,
+                Some(&reviewer),
+                None,
+                &event_tx,
+                &cancel,
+                &mut live_rx,
+                None,
+            ),
         )
-        .await;
+        .await
+        .expect("worker must receive the reviewer verdict before terminating");
 
         assert_eq!(result.ok().flatten().as_deref(), Some("done"));
+        assert_eq!(
+            link.approval_reply,
+            Some(("approval-1".to_string(), true)),
+            "reviewer verdict must traverse the live route back to the worker"
+        );
         let (parent, child, body) = tokio::time::timeout(Duration::from_secs(1), review_rx.recv())
             .await
             .expect("reviewer should be invoked off-loop")
@@ -1657,6 +1681,7 @@ mod tests {
             event_rx.try_recv().is_err(),
             "must not emit a human-review event"
         );
+        drop(live_guard);
     }
     #[async_trait]
     impl bamboo_subagent::ChildLink for InstantTerminalLink {
@@ -1803,6 +1828,130 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingChildSessionPort {
+        saved: std::sync::Mutex<Option<Session>>,
+    }
+
+    impl RecordingChildSessionPort {
+        fn saved_child(&self) -> Session {
+            self.saved
+                .lock()
+                .expect("saved-child fixture lock")
+                .clone()
+                .expect("create_child_action must save the child")
+        }
+    }
+
+    #[async_trait]
+    impl crate::session_app::child_session::ChildSessionPort for RecordingChildSessionPort {
+        async fn load_root_session(
+            &self,
+            _root_id: &str,
+        ) -> Result<Session, crate::session_app::child_session::ChildSessionError> {
+            unreachable!("create_child_action does not load the root")
+        }
+
+        async fn load_child_for_parent(
+            &self,
+            _parent_id: &str,
+            _child_id: &str,
+        ) -> Result<Session, crate::session_app::child_session::ChildSessionError> {
+            unreachable!("create_child_action does not reload the child")
+        }
+
+        async fn save_child_session(
+            &self,
+            child: &mut Session,
+        ) -> Result<(), crate::session_app::child_session::ChildSessionError> {
+            *self.saved.lock().expect("saved-child fixture lock") = Some(child.clone());
+            Ok(())
+        }
+
+        async fn save_child_session_authoritative_flags(
+            &self,
+            _child: &mut Session,
+        ) -> Result<(), crate::session_app::child_session::ChildSessionError> {
+            unreachable!("new-child creation uses the ordinary save")
+        }
+
+        async fn is_child_running(&self, _child_id: &str) -> bool {
+            false
+        }
+
+        async fn list_children(
+            &self,
+            _parent_id: &str,
+        ) -> Vec<crate::session_app::child_session::ChildSessionEntry> {
+            Vec::new()
+        }
+
+        async fn enqueue_child_run(
+            &self,
+            _parent: &Session,
+            _child: &Session,
+        ) -> Result<(), crate::session_app::child_session::ChildSessionError> {
+            unreachable!("fixture creates the child with auto_run=false")
+        }
+
+        async fn cancel_child_run_and_wait(
+            &self,
+            _child_id: &str,
+        ) -> Result<(), crate::session_app::child_session::ChildSessionError> {
+            unreachable!("create_child_action does not cancel")
+        }
+
+        async fn delete_child_session(
+            &self,
+            _parent_id: &str,
+            _child_id: &str,
+        ) -> Result<
+            crate::session_app::child_session::DeleteChildResult,
+            crate::session_app::child_session::ChildSessionError,
+        > {
+            unreachable!("create_child_action does not delete")
+        }
+
+        async fn get_child_runner_info(
+            &self,
+            _child_id: &str,
+        ) -> Option<crate::session_app::child_session::ChildRunnerInfo> {
+            None
+        }
+
+        async fn register_parent_wait_for_child(
+            &self,
+            _parent_session_id: &str,
+            _child_session_id: &str,
+            _tool_call_id: Option<&str>,
+        ) -> Result<(), crate::session_app::child_session::ChildSessionError> {
+            unreachable!("create_child_action does not register a wait")
+        }
+
+        async fn register_parent_wait_for_children(
+            &self,
+            _parent_session_id: &str,
+            _child_session_ids: &[String],
+            _policy: bamboo_domain::session::runtime_state::ChildWaitPolicy,
+        ) -> Result<usize, crate::session_app::child_session::ChildSessionError> {
+            unreachable!("create_child_action does not register a wait")
+        }
+
+        async fn active_child_ids(&self, _parent_session_id: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn find_resident_child(
+            &self,
+            _root_session_id: &str,
+            _resident_name: &str,
+        ) -> Option<String> {
+            None
+        }
+
+        async fn ensure_child_indexed(&self, _child_session_id: &str) {}
+    }
+
     #[test]
     fn build_spec_sets_remote_placement_for_matching_role() {
         let mut placements = HashMap::new();
@@ -1855,6 +2004,63 @@ mod tests {
         let spec = runner.build_spec(&s, &job_for("child-1"));
         assert_eq!(spec.placement, Placement::Local);
         assert!(spec.secrets.worker_auth_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_spec_preserves_inherited_bypass_for_child_worker() {
+        // Exercise the real creation path instead of pre-seeding the child by
+        // hand: a bypassed parent's posture must survive both child creation and
+        // the actor provisioning boundary.
+        let runner = bogus_runner(HashMap::new());
+        let mut parent = Session::new("parent-bypass", "test-model");
+        parent
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .bypass_permissions = true;
+        let workspace = tempfile::tempdir().expect("workspace fixture");
+        let port = RecordingChildSessionPort::default();
+        let child_id = format!("child-bypass-{}", uuid::Uuid::new_v4());
+        crate::session_app::child_session::create_child_action(
+            &port,
+            crate::session_app::child_session::CreateChildInput {
+                parent_session: parent,
+                child_id: child_id.clone(),
+                title: "Bypassed child".to_string(),
+                responsibility: "Run ordinary commands".to_string(),
+                assignment_prompt: "run an ordinary command".to_string(),
+                subagent_type: "explorer".to_string(),
+                workspace: workspace.path().to_string_lossy().into_owned(),
+                model_override: None,
+                model_ref_override: None,
+                runtime_metadata: HashMap::new(),
+                auto_run: false,
+                reasoning_effort: None,
+                lifecycle: None,
+                resident_name: None,
+                resident_context: None,
+                disabled_tools: None,
+                context_fork: None,
+            },
+        )
+        .await
+        .expect("create inherited-bypass child");
+        let child = port.saved_child();
+
+        assert!(
+            child
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| state.bypass_permissions),
+            "create_child_action must inherit bypass from the parent"
+        );
+
+        let spec = runner.build_spec(&child, &job_for(&child_id));
+
+        assert!(spec.capabilities.bypass, "child worker must inherit bypass");
+        assert!(
+            spec.capabilities.enforce_permissions,
+            "forced-ask evaluation must remain active under bypass"
+        );
     }
 
     #[test]

@@ -430,6 +430,8 @@ mod tests {
             endpoint: endpoint.clone(),
             token: "t".into(),
             token_encrypted: None,
+            credential_ref: None,
+            configured: false,
         });
         let cfg = Arc::new(RwLock::new(config));
 

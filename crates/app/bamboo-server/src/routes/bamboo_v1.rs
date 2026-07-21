@@ -122,6 +122,54 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::confirm_config_recovery),
         )
         .route(
+            "/bamboo/config/live-health",
+            web::get().to(settings::get_live_config_health),
+        )
+        .route(
+            "/bamboo/config/sections/providers",
+            web::get().to(settings::get_provider_section),
+        )
+        .route(
+            "/bamboo/config/sections/providers",
+            web::put().to(settings::put_provider_section),
+        )
+        .route(
+            "/bamboo/config/sections/mcp",
+            web::get().to(settings::get_mcp_section),
+        )
+        .route(
+            "/bamboo/config/sections/mcp",
+            web::put().to(settings::put_mcp_section),
+        )
+        .route(
+            "/bamboo/config/sections/{section}",
+            web::get().to(settings::get_typed_section),
+        )
+        .route(
+            "/bamboo/config/sections/{section}",
+            web::put().to(settings::put_typed_section),
+        )
+        .route(
+            "/bamboo/config/credentials",
+            web::get().to(settings::list_credentials),
+        )
+        .route(
+            "/bamboo/config/credentials/{credential_ref}",
+            web::get().to(settings::get_credential_status),
+        )
+        .route(
+            "/bamboo/config/credentials/{credential_ref}",
+            web::put().to(settings::replace_credential),
+        )
+        .route(
+            "/bamboo/config/credentials/{credential_ref}/clear",
+            web::post().to(settings::clear_credential),
+        )
+        .route(
+            "/bamboo/config/notifications",
+            web::get().to(settings::get_notification_config),
+        )
+        .route(
             "/bamboo/proxy-auth",
             web::post().to(settings::set_proxy_auth),
         )

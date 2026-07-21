@@ -22,6 +22,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
                     label: Some("OpenAI".to_string()),
                     api_key: openai.api_key.clone(),
                     api_key_encrypted: openai.api_key_encrypted.clone(),
+                    credential_ref: None,
                     base_url: openai.base_url.clone(),
                     model: openai.model.clone(),
                     fast_model: openai.fast_model.clone(),
@@ -46,6 +47,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
                     label: Some("Anthropic".to_string()),
                     api_key: anthropic.api_key.clone(),
                     api_key_encrypted: anthropic.api_key_encrypted.clone(),
+                    credential_ref: None,
                     base_url: anthropic.base_url.clone(),
                     model: anthropic.model.clone(),
                     fast_model: anthropic.fast_model.clone(),
@@ -70,6 +72,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
                     label: Some("Gemini".to_string()),
                     api_key: gemini.api_key.clone(),
                     api_key_encrypted: gemini.api_key_encrypted.clone(),
+                    credential_ref: None,
                     base_url: gemini.base_url.clone(),
                     model: gemini.model.clone(),
                     fast_model: gemini.fast_model.clone(),
@@ -95,6 +98,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
                     label: Some("GitHub Copilot".to_string()),
                     api_key: String::new(),
                     api_key_encrypted: None,
+                    credential_ref: None,
                     base_url: None,
                     model: config
                         .providers
@@ -144,6 +148,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
                     label: Some("Bodhi".to_string()),
                     api_key: bodhi.api_key.clone(),
                     api_key_encrypted: bodhi.api_key_encrypted.clone(),
+                    credential_ref: None,
                     base_url: bodhi.base_url.clone(),
                     model: None,
                     fast_model: None,
@@ -191,6 +196,7 @@ mod tests {
         config.providers.openai = Some(crate::config::OpenAIConfig {
             api_key: "sk-test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: Some("https://api.openai.com/v1".to_string()),
             model: Some("gpt-4o".to_string()),
             fast_model: Some("gpt-4o-mini".to_string()),
@@ -223,6 +229,7 @@ mod tests {
         config.providers.openai = Some(crate::config::OpenAIConfig {
             api_key: "sk-test".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: Some("gpt-4o".to_string()),
             fast_model: None,
@@ -246,6 +253,7 @@ mod tests {
                 label: Some("Custom OpenAI".to_string()),
                 api_key: "sk-custom".to_string(),
                 api_key_encrypted: None,
+                credential_ref: None,
                 base_url: None,
                 model: Some("gpt-4".to_string()),
                 fast_model: None,

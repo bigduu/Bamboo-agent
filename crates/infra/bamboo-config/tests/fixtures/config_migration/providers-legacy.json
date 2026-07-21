@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "revision": 7,
+  "data": {
+    "openai": {
+      "api_key": "sk-provider-plain",
+      "model": "gpt-test",
+      "future_provider_field": "provider-unknown-kept"
+    },
+    "future_provider": {
+      "enabled": true
+    }
+  },
+  "future_envelope_field": "provider-envelope-unknown-kept"
+}

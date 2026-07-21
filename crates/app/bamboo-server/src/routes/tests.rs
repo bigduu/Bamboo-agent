@@ -196,6 +196,8 @@ async fn remote_unverified_request_is_blocked_by_access_middleware() {
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         });
@@ -222,6 +224,8 @@ async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         });
@@ -264,6 +268,8 @@ async fn plugin_routes_are_blocked_by_the_same_access_middleware() {
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         });
@@ -290,6 +296,8 @@ async fn access_bootstrap_endpoints_remain_public() {
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         });
@@ -323,6 +331,8 @@ async fn verified_cookie_allows_remote_request_through_middleware() {
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         });
@@ -418,6 +428,8 @@ async fn local_request_bypasses_access_middleware() {
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         });
@@ -501,6 +513,8 @@ async fn v2_stream_upgrade_is_open_but_siblings_stay_gated() {
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
             password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
             updated_at: None,
             devices: Vec::new(),
         });
@@ -562,6 +576,8 @@ fn password_access_control() -> AccessControlConfig {
         password_enabled: true,
         password_hash: Some(SECRET_HASH.to_string()),
         password_salt: Some(SECRET_SALT.to_string()),
+        password_credential_ref: None,
+        password_configured: false,
         updated_at: None,
         devices: Vec::new(),
     }

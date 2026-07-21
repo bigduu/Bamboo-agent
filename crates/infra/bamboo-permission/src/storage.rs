@@ -508,7 +508,9 @@ mod tests {
         repaired.ask_rules = vec!["Bash(repaired)".to_string()];
         recovered.commit(1, repaired).unwrap();
 
-        assert_eq!(recovered.snapshot().revision, 2);
+        // Revision 2 belonged to the now-corrupt primary. Repair must allocate
+        // above that observed floor so stale clients cannot match through ABA.
+        assert_eq!(recovered.snapshot().revision, 3);
         assert_eq!(recovered.snapshot().status, SectionStatus::Healthy);
     }
 

@@ -100,6 +100,8 @@ mod tests {
             base_url: "https://bark.example.com".to_string(),
             device_key: Some("dk".to_string()),
             device_key_encrypted: None,
+            credential_ref: None,
+            configured: false,
         };
         let sink = BarkSink::from_config(&config);
         assert_eq!(sink.base_url, "https://bark.example.com");

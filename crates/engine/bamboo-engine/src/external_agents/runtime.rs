@@ -540,6 +540,7 @@ mod extract_provider_credentials_tests {
             label: None,
             api_key: api_key.to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             model: None,
             fast_model: None,
@@ -589,6 +590,7 @@ mod extract_provider_credentials_tests {
         config.providers_mut().bodhi = Some(BodhiConfig {
             api_key: "bhi_sk_legacy".to_string(),
             api_key_encrypted: None,
+            credential_ref: None,
             base_url: None,
             target_provider: None,
             reasoning_effort: None,

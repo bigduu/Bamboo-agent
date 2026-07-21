@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{McpConfig, McpServerConfig, TransportConfig};
 use crate::error::{McpError, Result};
+use crate::protocol::models::JsonRpcNotification;
 use crate::protocol::{McpProtocolClient, McpTransport};
 use crate::tool_index::ToolIndex;
 use crate::transports::{SseTransport, StdioTransport, StreamableHttpTransport};
@@ -154,12 +155,23 @@ struct ServerRuntime {
     proxy_fingerprint: Option<String>,
 }
 
+/// Fully bootstrapped candidate that has not yet been published into the
+/// manager's runtime map or tool index. Configuration reconciliation prepares
+/// every replacement first, so a later bootstrap failure cannot evict a
+/// working runtime.
+struct PreparedServerRuntime {
+    runtime: Arc<ServerRuntime>,
+    tools: Vec<McpTool>,
+    notification_rx: Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
+}
+
 /// Manages MCP server connections and tool execution.
 pub struct McpServerManager {
-    runtimes: DashMap<String, Arc<ServerRuntime>>,
+    runtimes: Arc<DashMap<String, Arc<ServerRuntime>>>,
     index: Arc<ToolIndex>,
     event_tx: Option<tokio::sync::mpsc::Sender<McpEvent>>,
     config: Option<Arc<tokio::sync::RwLock<Config>>>,
+    reconcile_lock: Arc<Mutex<()>>,
 }
 
 impl Clone for McpServerManager {
@@ -169,6 +181,7 @@ impl Clone for McpServerManager {
             index: self.index.clone(),
             event_tx: self.event_tx.clone(),
             config: self.config.clone(),
+            reconcile_lock: self.reconcile_lock.clone(),
         }
     }
 }
@@ -176,20 +189,22 @@ impl Clone for McpServerManager {
 impl McpServerManager {
     pub fn new() -> Self {
         Self {
-            runtimes: DashMap::new(),
+            runtimes: Arc::new(DashMap::new()),
             index: Arc::new(ToolIndex::new()),
             event_tx: None,
             config: None,
+            reconcile_lock: Arc::new(Mutex::new(())),
         }
     }
 
     /// Create a manager that can respect global proxy settings when connecting SSE transports.
     pub fn new_with_config(config: Arc<tokio::sync::RwLock<Config>>) -> Self {
         Self {
-            runtimes: DashMap::new(),
+            runtimes: Arc::new(DashMap::new()),
             index: Arc::new(ToolIndex::new()),
             event_tx: None,
             config: Some(config),
+            reconcile_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -241,6 +256,12 @@ impl McpServerManager {
     /// Check if a server is running.
     pub fn is_server_running(&self, server_id: &str) -> bool {
         self.runtimes.contains_key(server_id)
+    }
+
+    fn is_current_runtime(&self, server_id: &str, expected: &Arc<ServerRuntime>) -> bool {
+        self.runtimes
+            .get(server_id)
+            .is_some_and(|runtime| Arc::ptr_eq(runtime.value(), expected))
     }
 
     /// Shutdown all servers.

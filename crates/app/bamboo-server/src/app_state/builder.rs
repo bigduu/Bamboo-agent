@@ -55,8 +55,38 @@ impl AppState {
         // directory as the server runtime.
         bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
 
-        // Load config from the specified data directory
-        let config = Config::from_data_dir(Some(bamboo_home_dir.clone()));
+        // Complete the recoverable legacy split before any runtime component
+        // reads configuration, then keep this facade as the process authority.
+        // A malformed legacy document or an unrecoverable pending legacy
+        // transaction must not make the server exit: retain the compatibility
+        // loader's recovered/LKG view for this process so the recovery API can
+        // still repair or confirm it. Healthy layouts never take that fallback.
+        let (config, config_facade) = match bamboo_config::ConfigFacade::open_or_migrate(
+            &bamboo_home_dir,
+        ) {
+            Ok(facade) => {
+                let facade = Arc::new(facade);
+                let config =
+                    super::config_runtime::load_facade_effective_config(&facade, &bamboo_home_dir);
+                (config, Some(facade))
+            }
+            Err(error) => {
+                if bamboo_config::section_layout_is_active(&bamboo_home_dir).unwrap_or(false) {
+                    return Err(AppError::InternalError(anyhow::anyhow!(
+                        "modular configuration authority is unavailable: {error}"
+                    )));
+                }
+                tracing::warn!(
+                    error = %error,
+                    "modular configuration facade is unavailable; retaining recovered legacy authority"
+                );
+                (
+                    Config::from_data_dir_without_publish(Some(bamboo_home_dir.clone())),
+                    None,
+                )
+            }
+        };
+        config.publish_env_vars();
 
         // Loud, unmissable startup signal: `plugin_trust.enforcement: off`
         // silently affects EVERY future `bamboo plugin install`/`update`
@@ -106,7 +136,7 @@ impl AppState {
             Arc::new(UnconfiguredProvider { message }) as Arc<dyn LLMProvider>
         });
 
-        Self::new_with_provider(bamboo_home_dir, config, provider).await
+        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, config_facade).await
     }
 
     /// Create unified app state with a specific provider
@@ -127,6 +157,15 @@ impl AppState {
         bamboo_home_dir: PathBuf,
         config: Config,
         provider: Arc<dyn LLMProvider>,
+    ) -> Result<Self, AppError> {
+        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, None).await
+    }
+
+    async fn new_with_provider_and_facade(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+        config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
     ) -> Result<Self, AppError> {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
@@ -197,7 +236,8 @@ impl AppState {
             bamboo_home_dir.join("notification_preferences.json"),
         ));
         let session_watchers = super::watchers::SessionWatchers::new();
-        let mcp_manager = init_mcp_manager(config.clone());
+        let (mcp_manager, _legacy_mcp_bootstrap) =
+            init_mcp_manager(config.clone(), &bamboo_home_dir);
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
 
@@ -776,10 +816,28 @@ impl AppState {
             })
         };
 
+        let (config_watcher, config_live_health, mcp_config_live_health) =
+            super::config_runtime::ConfigWatcherRuntime::start(
+                bamboo_home_dir.clone(),
+                config.clone(),
+                config_facade.clone(),
+                config_io_lock.clone(),
+                provider_registry.clone(),
+                provider_lock.clone(),
+                mcp_manager.clone(),
+                account_sink.clone(),
+            );
+        let credential_store = Arc::new(bamboo_config::CredentialStore::open(&bamboo_home_dir));
+
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
+            config_facade,
             config_io_lock,
+            config_live_health,
+            mcp_config_live_health,
+            config_watcher,
+            credential_store,
             fabric_deployer,
             embedded_broker,
             health_monitor,
@@ -926,6 +984,8 @@ async fn maybe_embed_broker(
         endpoint: format!("ws://127.0.0.1:{port}"),
         token,
         token_encrypted: None,
+        credential_ref: None,
+        configured: false,
     });
     tracing::info!(port, "embedded mailbox bus (broker) started in-process");
     Some(EmbeddedBroker { task, gc_task })
@@ -937,22 +997,48 @@ async fn maybe_embed_broker(
 /// port can never leak into the user's config (the stale-dead-port bug). An
 /// absent file or a parse error yields `None` (embed a fresh in-process broker).
 ///
-/// Format is a plain [`BrokerClientConfig`] JSON object, e.g.:
-/// `{ "endpoint": "wss://broker.example:9600", "token": "…" }`.
+/// Durable format carries only endpoint plus credential metadata. Legacy
+/// plaintext/ciphertext tokens are migrated before this reader proceeds.
 fn load_external_broker(data_dir: &std::path::Path) -> Option<bamboo_config::BrokerClientConfig> {
     let path = data_dir.join("broker.json");
+    if let Err(error) = bamboo_config::migrate_external_broker_credentials(data_dir)
+        .and_then(|_| bamboo_config::ensure_provider_mcp_migration_ready(data_dir))
+    {
+        tracing::warn!(error = %error, "external broker credential migration unavailable");
+        return None;
+    }
     let bytes = std::fs::read(&path).ok()?;
-    match serde_json::from_slice::<bamboo_config::BrokerClientConfig>(&bytes) {
-        Ok(cfg) if !cfg.endpoint.trim().is_empty() => Some(cfg),
-        Ok(_) => {
-            tracing::warn!(?path, "broker.json has an empty endpoint — ignoring");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(?path, "broker.json present but unparseable: {e}");
+    match parse_external_broker_snapshot(&bytes, data_dir) {
+        Ok(cfg) => Some(cfg),
+        Err(error) => {
+            tracing::warn!(?path, %error, "broker.json is unavailable");
             None
         }
     }
+}
+
+fn parse_external_broker_snapshot(
+    bytes: &[u8],
+    data_dir: &std::path::Path,
+) -> bamboo_config::ConfigStoreResult<bamboo_config::BrokerClientConfig> {
+    let mut cfg: bamboo_config::BrokerClientConfig = serde_json::from_slice(bytes)?;
+    if !cfg.token.trim().is_empty()
+        || cfg
+            .token_encrypted
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(bamboo_config::ConfigStoreError::Validation(
+            "legacy broker credential appeared after migration".to_string(),
+        ));
+    }
+    if cfg.endpoint.trim().is_empty() {
+        return Err(bamboo_config::ConfigStoreError::Validation(
+            "broker endpoint is empty".to_string(),
+        ));
+    }
+    cfg.hydrate_credential_from_store(data_dir)?;
+    Ok(cfg)
 }
 
 /// Best-effort TCP reachability probe of a `ws[s]://host:port[/path]` broker
@@ -1020,10 +1106,11 @@ async fn reconcile_fabric_on_boot(
 
 #[cfg(test)]
 mod broker_embed_tests {
-    use super::{broker_endpoint_reachable, load_external_broker};
+    use super::{broker_endpoint_reachable, load_external_broker, parse_external_broker_snapshot};
 
     #[test]
     fn load_external_broker_reads_broker_json_not_config() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x57; 32]);
         let dir = tempfile::tempdir().unwrap();
         // Absent file ⇒ None (embed a fresh in-process broker).
         assert!(load_external_broker(dir.path()).is_none());
@@ -1037,6 +1124,15 @@ mod broker_embed_tests {
         let got = load_external_broker(dir.path()).expect("parsed");
         assert_eq!(got.endpoint, "wss://broker.example:9600");
         assert_eq!(got.token, "t");
+        assert_eq!(
+            got.credential_ref.as_ref().unwrap().as_str(),
+            "broker.external.bearer_token"
+        );
+        assert!(got.configured);
+        let durable = std::fs::read_to_string(dir.path().join("broker.json")).unwrap();
+        assert!(!durable.contains("\"token\""));
+        assert!(!durable.contains("token_encrypted"));
+        assert!(!durable.contains("\"t\""));
 
         // Empty endpoint ⇒ ignored (treated as absent).
         std::fs::write(dir.path().join("broker.json"), r#"{ "endpoint": "  " }"#).unwrap();
@@ -1045,6 +1141,65 @@ mod broker_embed_tests {
         // Garbage ⇒ ignored, never panics.
         std::fs::write(dir.path().join("broker.json"), "not json").unwrap();
         assert!(load_external_broker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn external_broker_reference_fails_closed_and_tracks_generic_cas_updates() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x58; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let reference =
+            bamboo_config::credential_ref("broker", "external", "bearer_token").unwrap();
+        std::fs::write(
+            dir.path().join("broker.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "endpoint": "wss://broker.example:9600",
+                "credential_ref": reference,
+                "configured": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_external_broker(dir.path()).is_none());
+        std::fs::write(
+            dir.path().join("broker.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "endpoint": "wss://broker.example:9600",
+                "credential_ref": reference,
+                "configured": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(load_external_broker(dir.path()).is_none());
+        let store = bamboo_config::CredentialStore::open(dir.path());
+        store
+            .replace(
+                reference.clone(),
+                "replacement-token",
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let hydrated = load_external_broker(dir.path()).unwrap();
+        assert_eq!(hydrated.token, "replacement-token");
+        store.clear(&reference, 1).unwrap();
+        assert!(load_external_broker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn broker_snapshot_with_late_legacy_secret_fails_closed() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x59; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let error = parse_external_broker_snapshot(
+            br#"{
+                "endpoint": "wss://broker.example:9600",
+                "token": "late-legacy-token"
+            }"#,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("appeared after migration"));
     }
 
     #[tokio::test]

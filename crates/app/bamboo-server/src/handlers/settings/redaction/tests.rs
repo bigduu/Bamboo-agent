@@ -27,6 +27,7 @@ fn config_with_openai_key() -> Config {
                 api_key: String::new(),
                 api_key_from_env: false,
                 api_key_encrypted: Some("enc-key".to_string()),
+                credential_ref: None,
                 base_url: None,
                 model: None,
                 fast_model: None,
@@ -65,6 +66,64 @@ fn redact_config_masks_configured_provider_and_removes_proxy_encrypted_keys() {
     assert!(redacted["providers"]["openai"]
         .as_object()
         .is_some_and(|obj| !obj.contains_key("api_key_encrypted")));
+}
+
+#[test]
+fn redact_config_removes_all_access_control_verifiers_but_keeps_safe_device_metadata() {
+    let config = Config::default();
+    let input = json!({
+        "access_control": {
+            "password_enabled": true,
+            "password_hash": "password-verifier",
+            "password_salt": "password-salt",
+            "updated_at": "2026-07-21T00:00:00Z",
+            "devices": [
+                {
+                    "device_id": "bamboo_first",
+                    "label": "Phone",
+                    "token_hash": "first-device-verifier",
+                    "token_salt": "first-device-salt",
+                    "created_at": "2026-07-20T00:00:00Z",
+                    "last_used_at": "2026-07-21T00:00:00Z",
+                    "revoked": false
+                },
+                {
+                    "device_id": "bamboo_second",
+                    "label": "Laptop",
+                    "token_hash": "second-device-verifier",
+                    "token_salt": "second-device-salt",
+                    "created_at": "2026-07-19T00:00:00Z",
+                    "revoked": true
+                }
+            ]
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+    let access = redacted["access_control"]
+        .as_object()
+        .expect("access-control metadata should remain visible");
+    assert!(!access.contains_key("password_hash"));
+    assert!(!access.contains_key("password_salt"));
+    assert_eq!(access["password_enabled"], true);
+    assert_eq!(access["updated_at"], "2026-07-21T00:00:00Z");
+
+    let devices = access["devices"]
+        .as_array()
+        .expect("safe device metadata should remain visible");
+    assert_eq!(devices.len(), 2);
+    for device in devices {
+        let device = device.as_object().expect("device should remain an object");
+        assert!(!device.contains_key("token_hash"));
+        assert!(!device.contains_key("token_salt"));
+    }
+    assert_eq!(devices[0]["device_id"], "bamboo_first");
+    assert_eq!(devices[0]["label"], "Phone");
+    assert_eq!(devices[0]["created_at"], "2026-07-20T00:00:00Z");
+    assert_eq!(devices[0]["last_used_at"], "2026-07-21T00:00:00Z");
+    assert_eq!(devices[0]["revoked"], false);
+    assert_eq!(devices[1]["device_id"], "bamboo_second");
+    assert_eq!(devices[1]["revoked"], true);
 }
 
 #[test]
@@ -156,6 +215,7 @@ fn redact_config_redacts_legacy_mcp_and_falls_back_to_runtime_env_keys() {
             cwd: None,
             env: HashMap::from([("TOKEN".to_string(), "runtime-secret".to_string())]),
             env_encrypted: HashMap::new(),
+            env_credential_refs: std::collections::HashMap::new(),
             startup_timeout_ms: 5_000,
         }),
         request_timeout_ms: 5_000,
@@ -186,6 +246,20 @@ fn redact_config_redacts_legacy_mcp_and_falls_back_to_runtime_env_keys() {
                             }
                         ]
                     }
+                },
+                {
+                    "id": "legacy-http",
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.example/rpc",
+                        "headers": [
+                            {
+                                "name": "Authorization",
+                                "value": "Bearer legacy-http-secret",
+                                "value_encrypted": "legacy-http-ciphertext"
+                            }
+                        ]
+                    }
                 }
             ]
         }
@@ -207,6 +281,12 @@ fn redact_config_redacts_legacy_mcp_and_falls_back_to_runtime_env_keys() {
         .expect("header should be object");
     assert_eq!(sse_header["value"], "****...****");
     assert!(!sse_header.contains_key("value_encrypted"));
+
+    let http_header = servers[2]["transport"]["headers"][0]
+        .as_object()
+        .expect("streamable HTTP header should be object");
+    assert_eq!(http_header["value"], "****...****");
+    assert!(!http_header.contains_key("value_encrypted"));
 }
 
 // ── Env vars redaction tests ──────────────────────────────
@@ -373,9 +453,13 @@ fn redact_config_masks_configured_connect_platform_token() {
         platform_type: "telegram".to_string(),
         token: None,
         token_encrypted: Some("enc-telegram".to_string()),
+        token_credential_ref: None,
+        token_configured: false,
         app_id: None,
         app_secret: None,
         app_secret_encrypted: None,
+        app_secret_credential_ref: None,
+        app_secret_configured: false,
         domain: None,
         allow_from: vec!["123".to_string()],
         admin_from: Vec::new(),
@@ -405,9 +489,13 @@ fn redact_config_omits_unconfigured_connect_platform_token() {
         platform_type: "telegram".to_string(),
         token: None,
         token_encrypted: None,
+        token_credential_ref: None,
+        token_configured: false,
         app_id: None,
         app_secret: None,
         app_secret_encrypted: None,
+        app_secret_credential_ref: None,
+        app_secret_configured: false,
         domain: None,
         allow_from: Vec::new(),
         admin_from: Vec::new(),
@@ -452,9 +540,13 @@ fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_
         platform_type: "feishu".to_string(),
         token: None,
         token_encrypted: None,
+        token_credential_ref: None,
+        token_configured: false,
         app_id: Some("cli_x".to_string()),
         app_secret: None,
         app_secret_encrypted: Some("enc-feishu".to_string()),
+        app_secret_credential_ref: None,
+        app_secret_configured: false,
         domain: Some("lark".to_string()),
         allow_from: vec!["ou_1".to_string()],
         admin_from: Vec::new(),
@@ -490,9 +582,13 @@ fn redact_config_omits_unconfigured_connect_platform_app_secret() {
         platform_type: "feishu".to_string(),
         token: None,
         token_encrypted: None,
+        token_credential_ref: None,
+        token_configured: false,
         app_id: Some("cli_x".to_string()),
         app_secret: None,
         app_secret_encrypted: None,
+        app_secret_credential_ref: None,
+        app_secret_configured: false,
         domain: None,
         allow_from: Vec::new(),
         admin_from: Vec::new(),

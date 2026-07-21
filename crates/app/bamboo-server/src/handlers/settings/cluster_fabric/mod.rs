@@ -22,11 +22,9 @@ use bamboo_config::cluster_fabric::{
 use crate::app_state::{AppState, ConfigUpdateEffects};
 use crate::error::AppError;
 
-mod deploy;
+use super::redaction::masked_secret_marker;
 
-/// The sentinel a redacted secret is replaced with (matches the rest of the
-/// settings redaction). An update that re-sends this value means "keep current".
-const SECRET_MASK: &str = "****...****";
+mod deploy;
 
 // ─── Request / response types ──────────────────────────────────────────
 
@@ -40,6 +38,7 @@ pub struct FabricListResponse {
 /// Create/replace payload for a node. `id`/`state` are server-owned and ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeUpsertRequest {
+    pub expected_revision: u64,
     pub label: String,
     pub placement: NodePlacement,
     #[serde(default)]
@@ -48,6 +47,12 @@ pub struct NodeUpsertRequest {
     pub deploy: DeployProfile,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDeleteQuery {
+    pub expected_revision: u64,
 }
 
 fn default_true() -> bool {
@@ -80,6 +85,22 @@ fn validate_node(req: &NodeUpsertRequest) -> Result<(), AppError> {
         if target.port == 0 {
             return Err(AppError::BadRequest("SSH port must be non-zero".into()));
         }
+        let carries_ciphertext = match &target.auth {
+            SshAuth::SystemSshConfig => false,
+            SshAuth::Password {
+                password_encrypted, ..
+            } => password_encrypted.is_some(),
+            SshAuth::PrivateKey {
+                private_key_encrypted,
+                passphrase_encrypted,
+                ..
+            } => private_key_encrypted.is_some() || passphrase_encrypted.is_some(),
+        };
+        if carries_ciphertext {
+            return Err(AppError::BadRequest(
+                "SSH credential ciphertext is server-managed".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -96,7 +117,7 @@ fn redact_node_value(node: &Node) -> Value {
     {
         for field in ["password", "private_key", "passphrase"] {
             if auth.get(field).and_then(|v| v.as_str()).is_some() {
-                auth.insert(field.to_string(), Value::String(SECRET_MASK.to_string()));
+                auth.insert(field.to_string(), Value::String(masked_secret_marker()));
             }
             // Never expose ciphertext over the API.
             auth.remove(&format!("{field}_encrypted"));
@@ -113,6 +134,7 @@ fn redact_node_value(node: &Node) -> Value {
 /// hydrated to PLAINTEXT (its `*_encrypted` are `None` — ciphertext is only
 /// materialized on the disk-bound clone). So the source of truth to carry is the
 /// old plaintext; `refresh_cluster_fabric_encrypted` re-encrypts it on save.
+#[cfg(test)]
 fn preserve_node_secrets(existing: &Node, incoming: &mut Node) {
     let (NodePlacement::Ssh(old), NodePlacement::Ssh(new)) =
         (&existing.placement, &mut incoming.placement)
@@ -155,16 +177,58 @@ fn preserve_node_secrets(existing: &Node, incoming: &mut Node) {
     }
 }
 
+/// Until node CRUD is backed by the exact credential/config transaction, a
+/// node that already owns isolated refs may only receive metadata edits and a
+/// redacted keep round-trip. Accepting a real replacement, auth switch, or
+/// delete here would return success while leaving the old store value behind.
+#[cfg(test)]
+fn ensure_managed_node_secret_unchanged(
+    existing: &Node,
+    incoming: &NodePlacement,
+) -> Result<(), AppError> {
+    let unchanged = match (&existing.placement, incoming) {
+        (NodePlacement::Ssh(old), NodePlacement::Ssh(new)) => match (&old.auth, &new.auth) {
+            (SshAuth::SystemSshConfig, SshAuth::SystemSshConfig) => true,
+            (SshAuth::Password { .. }, SshAuth::Password { password, .. }) => {
+                password.trim().is_empty() || password == &masked_secret_marker()
+            }
+            (
+                SshAuth::PrivateKey { .. },
+                SshAuth::PrivateKey {
+                    private_key,
+                    passphrase,
+                    ..
+                },
+            ) => {
+                (private_key.trim().is_empty() || private_key == &masked_secret_marker())
+                    && (passphrase.trim().is_empty() || passphrase == &masked_secret_marker())
+            }
+            _ => false,
+        },
+        (NodePlacement::Local, NodePlacement::Local) => true,
+        _ => false,
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(
+            "isolated cluster credentials cannot be changed until the revisioned node credential API is available"
+                .to_string(),
+        ))
+    }
+}
+
 /// If `plaintext` is empty or the mask sentinel, replace it with the existing
 /// secret so it survives a redacted round-trip: prefer the old plaintext (what
 /// the hydrated in-memory config holds), else the old ciphertext.
+#[cfg(test)]
 fn preserve_secret(
     plaintext: &mut String,
     encrypted: &mut Option<String>,
     old_plaintext: &str,
     old_encrypted: &Option<String>,
 ) {
-    let keep = plaintext.trim().is_empty() || plaintext == SECRET_MASK;
+    let keep = plaintext.trim().is_empty() || plaintext == &masked_secret_marker();
     if !keep {
         return;
     }
@@ -217,6 +281,8 @@ pub async fn create_node(
     let req = payload.into_inner();
     validate_node(&req)?;
 
+    let expected_revision = req.expected_revision;
+
     let node = Node {
         id: Uuid::new_v4().to_string(),
         label: req.label,
@@ -229,20 +295,26 @@ pub async fn create_node(
     let node_id = node.id.clone();
 
     let updated = app_state
-        .update_config(
+        .update_cluster_fabric_credentials(
+            expected_revision,
+            std::iter::once(node_id.clone()).collect(),
             move |cfg| {
                 cfg.cluster_fabric.nodes.push(node.clone());
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
+
+    let (updated, revision) = updated;
 
     let created = updated
         .cluster_fabric
         .node(&node_id)
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("created node missing")))?;
-    Ok(HttpResponse::Created().json(redact_node_value(created)))
+    Ok(HttpResponse::Created().json(json!({
+        "revision": revision,
+        "node": redact_node_value(created),
+    })))
 }
 
 /// `PUT /v1/bamboo/settings/nodes/{id}` — update a node (secret-preserving).
@@ -254,18 +326,20 @@ pub async fn update_node(
     let id = path.into_inner();
     let req = payload.into_inner();
     validate_node(&req)?;
+    let expected_revision = req.expected_revision;
     let id_for_response = id.clone();
 
     let updated = app_state
-        .update_config(
+        .update_cluster_fabric_credentials(
+            expected_revision,
+            std::iter::once(id.clone()).collect(),
             move |cfg| {
                 let existing = cfg
                     .cluster_fabric
                     .node(&id)
                     .cloned()
                     .ok_or_else(|| AppError::NotFound(format!("Node '{id}'")))?;
-
-                let mut node = Node {
+                let node = Node {
                     id: existing.id.clone(),
                     label: req.label.clone(),
                     placement: req.placement.clone(),
@@ -274,7 +348,6 @@ pub async fn update_node(
                     state: existing.state.clone(), // engine-owned: preserve
                     enabled: req.enabled,
                 };
-                preserve_node_secrets(&existing, &mut node);
 
                 let slot = cfg
                     .cluster_fabric
@@ -283,26 +356,34 @@ pub async fn update_node(
                 *slot = node;
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
+
+    let (updated, revision) = updated;
 
     let node = updated
         .cluster_fabric
         .node(&id_for_response)
         .ok_or_else(|| AppError::InternalError(anyhow::anyhow!("updated node missing")))?;
-    Ok(HttpResponse::Ok().json(redact_node_value(node)))
+    Ok(HttpResponse::Ok().json(json!({
+        "revision": revision,
+        "node": redact_node_value(node),
+    })))
 }
 
 /// `DELETE /v1/bamboo/settings/nodes/{id}` — remove a node.
 pub async fn delete_node(
     app_state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<NodeDeleteQuery>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
+    let expected_revision = query.expected_revision;
 
-    app_state
-        .update_config(
+    let (_, revision) = app_state
+        .update_cluster_fabric_credentials(
+            expected_revision,
+            std::iter::once(id.clone()).collect(),
             move |cfg| {
                 let before = cfg.cluster_fabric.nodes.len();
                 cfg.cluster_fabric.nodes.retain(|n| n.id != id);
@@ -313,13 +394,13 @@ pub async fn delete_node(
                 for cluster in &mut cfg.cluster_fabric.clusters {
                     cluster.node_ids.retain(|nid| nid != &id);
                 }
+                cfg.cluster_fabric.credential_refs.remove(&id);
                 Ok(())
             },
-            ConfigUpdateEffects::default(),
         )
         .await?;
 
-    Ok(HttpResponse::Ok().json(json!({ "success": true })))
+    Ok(HttpResponse::Ok().json(json!({ "success": true, "revision": revision })))
 }
 
 // ─── Cluster handlers ──────────────────────────────────────────────────
@@ -528,7 +609,7 @@ mod tests {
         let node = pw_node("hunter2", Some("ciphertext"));
         let v = redact_node_value(&node);
         let auth = &v["placement"]["auth"];
-        assert_eq!(auth["password"], SECRET_MASK);
+        assert_eq!(auth["password"], masked_secret_marker());
         assert!(auth.get("password_encrypted").is_none());
     }
 
@@ -550,7 +631,7 @@ mod tests {
     #[test]
     fn update_with_mask_preserves_existing_ciphertext() {
         let existing = pw_node("", Some("stored-cipher"));
-        let mut incoming = pw_node(SECRET_MASK, None);
+        let mut incoming = pw_node(&masked_secret_marker(), None);
         preserve_node_secrets(&existing, &mut incoming);
         let NodePlacement::Ssh(t) = &incoming.placement else {
             panic!()
@@ -576,7 +657,7 @@ mod tests {
         // was hydrated on load); its ciphertext is None. A masked update must
         // carry the plaintext forward so refresh can re-encrypt it on save.
         let existing = pw_node("s3cr3t", None);
-        let mut incoming = pw_node(SECRET_MASK, None);
+        let mut incoming = pw_node(&masked_secret_marker(), None);
         preserve_node_secrets(&existing, &mut incoming);
         let NodePlacement::Ssh(t) = &incoming.placement else {
             panic!()
@@ -626,5 +707,55 @@ mod tests {
             panic!()
         };
         assert!(matches!(t.auth, SshAuth::SystemSshConfig));
+    }
+
+    #[test]
+    fn isolated_password_update_accepts_only_redacted_keep() {
+        let stored_secret = Uuid::new_v4().to_string();
+        let existing = pw_node(&stored_secret, None);
+        let masked = pw_node(&masked_secret_marker(), None);
+        ensure_managed_node_secret_unchanged(&existing, &masked.placement).unwrap();
+        let empty_secret = String::new();
+        let empty = pw_node(&empty_secret, None);
+        ensure_managed_node_secret_unchanged(&existing, &empty.placement).unwrap();
+
+        let replacement_secret = Uuid::new_v4().to_string();
+        let replacement = pw_node(&replacement_secret, None);
+        let error =
+            ensure_managed_node_secret_unchanged(&existing, &replacement.placement).unwrap_err();
+        assert!(error.to_string().contains("cannot be changed"));
+    }
+
+    #[test]
+    fn isolated_password_update_rejects_auth_switch() {
+        let stored_secret = Uuid::new_v4().to_string();
+        let existing = pw_node(&stored_secret, None);
+        let switched = NodePlacement::Ssh(SshTarget {
+            host: "h".into(),
+            port: 22,
+            username: "u".into(),
+            auth: SshAuth::SystemSshConfig,
+            host_key_fingerprint: None,
+        });
+        assert!(ensure_managed_node_secret_unchanged(&existing, &switched).is_err());
+    }
+
+    #[test]
+    fn node_validation_rejects_client_ciphertext() {
+        let client_ciphertext = Uuid::new_v4().to_string();
+        let empty_password = String::new();
+        let node = pw_node(&empty_password, Some(&client_ciphertext));
+        let request = NodeUpsertRequest {
+            expected_revision: 0,
+            label: node.label,
+            placement: node.placement,
+            trust_level: node.trust_level,
+            deploy: node.deploy,
+            enabled: node.enabled,
+        };
+        assert!(validate_node(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("server-managed"));
     }
 }

@@ -70,7 +70,6 @@ async fn test_set_bamboo_config() {
         .uri("/v1/bamboo/config")
         .set_json(json!({
             "provider": "openai",
-            "http_proxy": "http://proxy:8080",
             "providers": {
                 "openai": {
                     "api_key": "sk-test"
@@ -81,6 +80,14 @@ async fn test_set_bamboo_config() {
 
     let set_resp = test::call_service(&app, set_req).await;
     assert!(set_resp.status().is_success());
+    let proxy_req = test::TestRequest::post()
+        .uri("/v1/bamboo/config")
+        .set_json(json!({
+            "http_proxy": "http://proxy:8080"
+        }))
+        .to_request();
+    let proxy_resp = test::call_service(&app, proxy_req).await;
+    assert!(proxy_resp.status().is_success());
 
     let get_req = test::TestRequest::get()
         .uri("/v1/bamboo/config")
@@ -169,6 +176,7 @@ async fn test_set_proxy_auth_does_not_fail_when_provider_unconfigured() {
     let auth_req = test::TestRequest::post()
         .uri("/v1/bamboo/proxy-auth")
         .set_json(json!({
+            "expected_revision": 0,
             "username": "user",
             "password": "pass"
         }))
@@ -199,7 +207,6 @@ async fn test_update_bamboo_config_merges() {
         .uri("/v1/bamboo/config")
         .set_json(json!({
             "provider": "openai",
-            "field1": "value1",
             "providers": {
                 "openai": {
                     "api_key": "sk-test"
@@ -210,12 +217,19 @@ async fn test_update_bamboo_config_merges() {
 
     let set_resp1 = test::call_service(&app, set_req1).await;
     assert!(set_resp1.status().is_success());
+    let field_req1 = test::TestRequest::post()
+        .uri("/v1/bamboo/config")
+        .set_json(json!({"field1": "value1"}))
+        .to_request();
+    assert!(test::call_service(&app, field_req1)
+        .await
+        .status()
+        .is_success());
 
     let set_req2 = test::TestRequest::post()
         .uri("/v1/bamboo/config")
         .set_json(json!({
             "provider": "anthropic",
-            "field2": "value2",
             "providers": {
                 "anthropic": {
                     "api_key": "sk-ant-test"
@@ -226,6 +240,14 @@ async fn test_update_bamboo_config_merges() {
 
     let set_resp2 = test::call_service(&app, set_req2).await;
     assert!(set_resp2.status().is_success());
+    let field_req2 = test::TestRequest::post()
+        .uri("/v1/bamboo/config")
+        .set_json(json!({"field2": "value2"}))
+        .to_request();
+    assert!(test::call_service(&app, field_req2)
+        .await
+        .status()
+        .is_success());
 
     let get_req = test::TestRequest::get()
         .uri("/v1/bamboo/config")

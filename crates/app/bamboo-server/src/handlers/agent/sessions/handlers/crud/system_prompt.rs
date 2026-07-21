@@ -76,6 +76,8 @@ mod tests {
             value: "hidden-value".to_string(),
             secret: true,
             value_encrypted: None,
+            credential_ref: None,
+            configured: true,
             description: Some("Snapshot test token".to_string()),
         }];
         config.publish_env_vars();

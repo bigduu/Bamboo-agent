@@ -683,6 +683,7 @@ mod tests {
     use bamboo_agent_core::ToolExecutionContext;
     use bamboo_domain::tool_names::{normalize_tool_ref, BUILTIN_TOOL_NAMES};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::fs;
     use tokio::sync::mpsc;
@@ -724,6 +725,19 @@ mod tests {
         };
 
         builder.build()
+    }
+
+    struct RecordingApprovalProxy {
+        requests: Arc<AtomicUsize>,
+        approve: bool,
+    }
+
+    #[async_trait]
+    impl crate::approval::ApprovalProxy for RecordingApprovalProxy {
+        async fn request_approval(&self, _ask: crate::approval::ApprovalAsk) -> bool {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            self.approve
+        }
     }
 
     #[test]
@@ -1156,48 +1170,84 @@ mod tests {
 
     #[tokio::test]
     async fn test_bypass_permissions_skips_checker() {
-        // Even with a deny-all checker, a context flagged `bypass_permissions`
-        // must skip the permission check entirely and let the write through.
-        let checker = Arc::new(crate::permission::DenyDangerousPermissionChecker);
-        let executor = make_executor(Some(checker));
+        // Model the worker side of a child whose parent bypass flag was inherited:
+        // a production Bash tool under the production config evaluator must
+        // execute an ordinary command directly. Even though both a parent
+        // approval proxy and a human-event sink are installed, neither path may
+        // be touched.
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(BashTool::new())
+            .expect("register Bash tool")
+            .with_permission_checker(checker)
+            .build();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bypass_allows_write.txt");
-        let path_str = path.to_str().unwrap();
+        let path = dir.path().join("bypass_allows_bash.txt");
+        let command = format!("printf ordinary > {}", path.display());
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(RecordingApprovalProxy {
+            requests: approval_requests.clone(),
+            approve: true,
+        });
+        let (event_tx, mut event_rx) = mpsc::channel(8);
 
-        let call = make_tool_call("Write", json!({"file_path": path_str, "content": "ok"}));
+        let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-bypass"),
             tool_call_id: &call.id,
-            event_tx: None,
+            event_tx: Some(&event_tx),
             available_tool_schemas: None,
             bypass_permissions: true,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
         };
-        let result = executor.execute_with_context(&call, ctx).await;
+        let result = crate::approval::with_approval_proxy(
+            Some(proxy),
+            executor.execute_with_context(&call, ctx),
+        )
+        .await;
 
         assert!(result.is_ok(), "bypass should allow the write: {result:?}");
-        assert_eq!(fs::read_to_string(&path).await.unwrap(), "ok");
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "ordinary");
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            0,
+            "ordinary bypassed child command must not invoke the parent reviewer"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "ordinary bypassed child command must not emit a human approval event"
+        );
     }
 
     #[tokio::test]
     async fn test_forced_ask_rule_overrides_bypass() {
-        // A configured "always ask" rule must force a confirmation even when the
-        // session is in bypass mode. With no event sink the executor fails closed
-        // (approval required) rather than silently writing.
+        // A hard-dangerous Bash command must still traverse the worker's parent
+        // approval proxy under bypass. The returned verdict is authoritative:
+        // deny prevents execution, while approve lets the exact command run.
         let config = Arc::new(crate::permission::PermissionConfig::new());
-        config.set_ask_rules(["Write(/etc/**)".to_string()]);
         let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
-        let executor = make_executor(Some(checker));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(BashTool::new())
+            .expect("register Bash tool")
+            .with_permission_checker(checker)
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        let denied_path = dir.path().join("forced-denied.txt");
+        let denied_command = format!("eval 'printf denied > {}'", denied_path.display());
+        let denied_requests = Arc::new(AtomicUsize::new(0));
+        let deny_proxy: Arc<dyn crate::approval::ApprovalProxy> =
+            Arc::new(RecordingApprovalProxy {
+                requests: denied_requests.clone(),
+                approve: false,
+            });
 
-        let call = make_tool_call(
-            "Write",
-            json!({"file_path": "/etc/forced.conf", "content": "x"}),
-        );
-        let ctx = ToolExecutionContext {
+        let denied_call = make_tool_call("Bash", json!({"command": denied_command}));
+        let denied_ctx = ToolExecutionContext {
             session_id: Some("s-forced"),
-            tool_call_id: &call.id,
+            tool_call_id: &denied_call.id,
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
@@ -1205,13 +1255,50 @@ mod tests {
             bash_completion_sink: None,
             pre_parsed_args: None,
         };
-        let result = executor.execute_with_context(&call, ctx).await;
+        let denied = crate::approval::with_approval_proxy(
+            Some(deny_proxy),
+            executor.execute_with_context(&denied_call, denied_ctx),
+        )
+        .await;
 
         assert!(
-            matches!(result, Err(ToolError::Execution(ref m)) if m.contains("approval required")),
-            "forced ask rule should block under bypass: {result:?}"
+            matches!(denied, Err(ToolError::Execution(ref message)) if message.contains("denied by host")),
+            "parent denial must block forced-ask execution under bypass: {denied:?}"
         );
-        assert!(fs::metadata("/etc/forced.conf").await.is_err());
+        assert_eq!(denied_requests.load(Ordering::SeqCst), 1);
+        assert!(!denied_path.exists(), "denied command must not execute");
+
+        let approved_path = dir.path().join("forced-approved.txt");
+        let approved_command = format!("eval 'printf approved > {}'", approved_path.display());
+        let approved_requests = Arc::new(AtomicUsize::new(0));
+        let approve_proxy: Arc<dyn crate::approval::ApprovalProxy> =
+            Arc::new(RecordingApprovalProxy {
+                requests: approved_requests.clone(),
+                approve: true,
+            });
+        let approved_call = make_tool_call("Bash", json!({"command": approved_command}));
+        let approved_ctx = ToolExecutionContext {
+            session_id: Some("s-forced"),
+            tool_call_id: &approved_call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let approved = crate::approval::with_approval_proxy(
+            Some(approve_proxy),
+            executor.execute_with_context(&approved_call, approved_ctx),
+        )
+        .await;
+
+        assert!(
+            approved.is_ok(),
+            "parent approval must allow forced-ask execution under bypass: {approved:?}"
+        );
+        assert_eq!(approved_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read_to_string(approved_path).await.unwrap(), "approved");
     }
 
     #[tokio::test]

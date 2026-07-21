@@ -59,7 +59,7 @@ default. The full field list of `Config`:
 | Field | Type | Notes |
 |---|---|---|
 | `http_proxy` / `https_proxy` | `String` | Outbound proxy URLs for provider HTTP calls. |
-| `proxy_auth_encrypted` | `Option<String>` | Encrypted proxy credentials; hydrated in memory as `proxy_auth`. |
+| `proxy_auth_credential_ref` | `Option<String>` | Stable reference to isolated proxy credentials (normally `proxy.default.auth`); no proxy plaintext, ciphertext, or mask is stored in ordinary config. |
 | `provider` | `String` | Default provider name. Default `"anthropic"`. |
 | `defaults` | `Option<DefaultsConfig>` | Per-role model routing (`chat`/`fast`/`vision`/`planning`/...); only consulted when `features.provider_model_ref` is on. |
 | `providers` | `ProviderConfigs` | Legacy single-instance-per-type provider configs. See [Providers](#providers). |
@@ -71,7 +71,7 @@ default. The full field list of `Config`:
 | `hooks` | `HooksConfig` | Request preflight hooks; today just `image_fallback` (text-only-model image handling). |
 | `tools` | `ToolsConfig` | `{ disabled: Vec<String> }` — tool names omitted from every session's schema globally. |
 | `skills` | `SkillsConfig` | `{ disabled: Vec<String> }` — skill ids excluded from selection/loading globally. |
-| `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes (`{name, value, secret, value_encrypted}`); `secret: true` entries are encrypted at rest. |
+| `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
 | `features` | `FeatureFlags` | `{ provider_model_ref: bool, dynamic_model_routing: bool }` — incremental rollout toggles, both off by default. |
@@ -84,6 +84,19 @@ default. The full field list of `Config`:
 | `connect` | `ConnectConfig` | **Not actually stored here** — see [connect](#connect--the-im-bridge). |
 | `plugin_trust` | `PluginTrustConfig` | Plugin install trust policy. See below. |
 | `extra` | `BTreeMap<String, Value>` | Catch-all flatten for keys not (yet) promoted to a typed field — `permissions`, `externalAgents`, `subagentRouting`, setup-wizard state, etc. live here. Round-trips losslessly even for fields this version of Bamboo doesn't know about. |
+
+Env variable writes use the dedicated revisioned `/bamboo/env-vars` API. Its
+`revision` is the env-domain CAS revision stored in the credential envelope;
+every semantic env change (including metadata, public values, ordering, and
+deletes) advances it once, while a true no-op keeps it and emits no change
+event. `config.json` participates in the same recoverable manifest transaction
+and is hash-CAS protected. Secret
+inputs use three states: omitted `value` keeps an existing secret, `value: ""`
+explicitly clears it, and a non-empty value replaces it. Masks and client-sent
+`credential_ref`/`configured`/`value_encrypted` fields are rejected. Existing
+Lotus builds do not yet send this revision or omit `value` for metadata-only
+edits; updating that client contract is deferred to the Lotus follow-up and is
+not part of Bamboo Issue #597.
 
 ## Providers
 
@@ -316,8 +329,8 @@ Key `notifications` (`NotificationsConfig`):
 {
   "notifications": {
     "desktop": { "enabled": true },
-    "ntfy": { "enabled": true, "base_url": "https://ntfy.sh", "topic": "my-bamboo-alerts", "token": "..." },
-    "bark": { "enabled": false, "base_url": "https://api.day.app", "device_key": "..." }
+    "ntfy": { "enabled": true, "base_url": "https://ntfy.sh", "topic": "my-bamboo-alerts", "credential_ref": "notification.ntfy.token", "configured": true },
+    "bark": { "enabled": false, "base_url": "https://api.day.app", "credential_ref": "notification.bark.device_key", "configured": false }
   }
 }
 ```
@@ -325,8 +338,25 @@ Key `notifications` (`NotificationsConfig`):
 `desktop.enabled: Option<bool>` — `None` auto-detects (on for a standalone
 `bamboo serve`, off when running under a `--parent-pid` sidecar, since the
 host app usually owns notifications there). `ntfy`/`bark` are push-relay
-channels; `ntfy.token`/`bark.device_key` are secrets, encrypted at rest as
-`token_encrypted`/`device_key_encrypted`. All three channels feed the same
+channels; `ntfy.token`/`bark.device_key` live only in the isolated encrypted
+credential store. Ordinary `config.json` and parseable rotated backups contain
+only stable `credential_ref`/`configured` metadata, never plaintext,
+ciphertext, or a UI mask. Legacy plaintext/ciphertext is migrated idempotently
+through the recoverable config/credential manifest.
+
+`GET /bamboo/config/notifications` returns the current credential revision,
+health, source, channel metadata, and per-channel configured/source/update
+status without a secret slot. Notification updates use `POST /bamboo/config`
+with only `expected_revision` and `notifications` in the request. Omitting a
+secret keeps it, `null` or `""` clears it, and a non-empty string replaces it;
+masks and client-supplied `credential_ref`/`configured`/ciphertext are rejected.
+Notification changes cannot be combined with another root domain in one call.
+`"notifications": null` is an explicit domain reset: both credentials are
+cleared and notification metadata returns to defaults in the same transaction.
+`bamboo config set notifications.ntfy.token ...` and the Bark equivalent route
+through the same manifest transaction.
+
+All three channels feed the same
 `AgentEvent::Notification` category/priority policy — see
 `crates/infra/bamboo-notification`.
 

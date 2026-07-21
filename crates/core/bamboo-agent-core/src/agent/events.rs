@@ -648,6 +648,18 @@ pub enum AgentEvent {
         scope: String,
     },
 
+    /// A configuration section published a new last-known-good snapshot.
+    #[serde(rename = "config.changed")]
+    ConfigChanged { section: String, revision: u64 },
+
+    /// A configuration edit was rejected while the prior runtime stayed live.
+    #[serde(rename = "config.invalid")]
+    ConfigInvalid { section: String, revision: u64 },
+
+    /// A previously invalid configuration section became healthy again.
+    #[serde(rename = "config.recovered")]
+    ConfigRecovered { section: String, revision: u64 },
+
     /// An instruction workflow became the session's fixed active revision.
     WorkflowActivated {
         event_id: String,
@@ -787,6 +799,9 @@ impl AgentEvent {
                 | AgentEvent::Error { .. }
                 | AgentEvent::WorkflowChanged { .. }
                 | AgentEvent::WorkflowInvalid { .. }
+                | AgentEvent::ConfigChanged { .. }
+                | AgentEvent::ConfigInvalid { .. }
+                | AgentEvent::ConfigRecovered { .. }
                 | AgentEvent::WorkflowRecovered { .. }
                 | AgentEvent::WorkflowActivated { .. }
                 | AgentEvent::WorkflowDeactivated { .. }
