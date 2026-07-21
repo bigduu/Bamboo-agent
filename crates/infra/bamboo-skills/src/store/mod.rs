@@ -893,6 +893,10 @@ impl SkillStore {
     /// Returns `SkillError` if the skills directory cannot be read.
     async fn load(&self) -> SkillResult<usize> {
         let _reload_guard = self.reload_lock.lock().await;
+        self.load_locked().await
+    }
+
+    async fn load_locked(&self) -> SkillResult<usize> {
         let dirs = self.discovery_dirs_for_mode(None);
         let mut dirs = dirs;
         let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
@@ -2295,6 +2299,7 @@ impl SkillStore {
     /// ```
     pub async fn reload(&self) -> SkillResult<usize> {
         info!("Reloading skills from disk...");
+        let _reload_guard = self.reload_lock.lock().await;
         let workflows_dir = self
             .config
             .skills_dir
@@ -2317,7 +2322,37 @@ impl SkillStore {
                 tracing::warn!("Legacy YAML migration: {}", diagnostic.message);
             }
         }
-        self.load().await
+        self.load_locked().await
+    }
+
+    /// Remove a legacy workflow source and its generated skill bundle while
+    /// excluding watcher reloads. Without one lock across both files, a watcher
+    /// can observe the still-present source after the bundle is removed and
+    /// immediately re-import the workflow being deleted.
+    pub async fn remove_legacy_workflow(&self, source: &Path, id: &str) -> SkillResult<bool> {
+        let _reload_guard = self.reload_lock.lock().await;
+        let removed =
+            crate::legacy::remove_legacy_markdown_bundle(source, &self.config.skills_dir, id)
+                .await?;
+        if !removed {
+            return Ok(false);
+        }
+        if let Err(error) = tokio::fs::remove_file(source).await {
+            // Restore the owned bundle when the authoritative source could not
+            // be removed, so callers never observe a silent partial deletion.
+            if let Ok(body) = tokio::fs::read_to_string(source).await {
+                let _ = crate::legacy::sync_legacy_markdown_bundle(
+                    source,
+                    &self.config.skills_dir,
+                    id,
+                    &body,
+                )
+                .await;
+            }
+            return Err(error.into());
+        }
+        self.load_locked().await?;
+        Ok(true)
     }
 
     /// List all skills with optional filtering.

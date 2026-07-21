@@ -253,25 +253,17 @@ pub async fn delete_workflow(
         return Err(AppError::NotFound(format!("Workflow '{}'", name)));
     }
 
-    let removed_bundle = bamboo_skills::legacy::remove_legacy_markdown_bundle(
-        &file_path,
-        &app_state.app_data_dir.join("skills"),
-        &skill_id,
-    )
-    .await
-    .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+    let removed_bundle = app_state
+        .skill_manager
+        .store()
+        .remove_legacy_workflow(&file_path, &skill_id)
+        .await
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
     if !removed_bundle {
         return Err(AppError::BadRequest(format!(
             "Workflow '{name}' is not owned by the legacy adapter"
         )));
     }
-    fs::remove_file(&file_path).await?;
-    app_state
-        .skill_manager
-        .store()
-        .reload()
-        .await
-        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
 
     Ok(legacy_response().json(serde_json::json!({ "success": true })))
 }

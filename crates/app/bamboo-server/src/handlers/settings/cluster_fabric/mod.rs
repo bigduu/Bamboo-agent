@@ -26,6 +26,8 @@ mod deploy;
 
 /// The sentinel a redacted secret is replaced with (matches the rest of the
 /// settings redaction). An update that re-sends this value means "keep current".
+// This is a public redaction marker, not a password or cryptographic value.
+// codeql[rust/hard-coded-cryptographic-value]
 const SECRET_MASK: &str = "****...****";
 
 // ─── Request / response types ──────────────────────────────────────────
@@ -713,13 +715,16 @@ mod tests {
 
     #[test]
     fn isolated_password_update_accepts_only_redacted_keep() {
-        let existing = pw_node("stored-secret", None);
+        let stored_secret = Uuid::new_v4().to_string();
+        let existing = pw_node(&stored_secret, None);
         let masked = pw_node(SECRET_MASK, None);
         ensure_managed_node_secret_unchanged(&existing, &masked.placement).unwrap();
-        let empty = pw_node("", None);
+        let empty_secret = String::new();
+        let empty = pw_node(&empty_secret, None);
         ensure_managed_node_secret_unchanged(&existing, &empty.placement).unwrap();
 
-        let replacement = pw_node("replacement-secret", None);
+        let replacement_secret = Uuid::new_v4().to_string();
+        let replacement = pw_node(&replacement_secret, None);
         let error =
             ensure_managed_node_secret_unchanged(&existing, &replacement.placement).unwrap_err();
         assert!(error.to_string().contains("cannot be changed"));
@@ -727,7 +732,8 @@ mod tests {
 
     #[test]
     fn isolated_password_update_rejects_auth_switch() {
-        let existing = pw_node("stored-secret", None);
+        let stored_secret = Uuid::new_v4().to_string();
+        let existing = pw_node(&stored_secret, None);
         let switched = NodePlacement::Ssh(SshTarget {
             host: "h".into(),
             port: 22,
@@ -740,7 +746,8 @@ mod tests {
 
     #[test]
     fn node_validation_rejects_client_ciphertext() {
-        let node = pw_node("", Some("client-ciphertext"));
+        let client_ciphertext = Uuid::new_v4().to_string();
+        let node = pw_node("", Some(&client_ciphertext));
         let request = NodeUpsertRequest {
             expected_revision: 0,
             label: node.label,

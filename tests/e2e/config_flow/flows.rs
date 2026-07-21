@@ -4,7 +4,7 @@ use super::*;
 async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let state = crate::e2e::common::create_test_app().await;
     let data_dir = state.app_data_dir.clone();
-    let config_path = data_dir.join("config.json");
+    let core_path = data_dir.join("core.json");
     let providers_path = data_dir.join("providers.json");
 
     let app = test::init_service(
@@ -14,12 +14,20 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     )
     .await;
 
-    // 1) Setup flow: write proxy config + switch provider to an incomplete provider.
-    // This MUST NOT fail with provider validation errors.
+    // 1) Setup flow: switch provider to an incomplete provider, then update
+    // proxy metadata as a separate section commit. Compatibility writes are
+    // intentionally single-section under the modular facade.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
         .set_json(json!({
-            "provider": "anthropic",
+            "provider": "anthropic"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+    let req = test::TestRequest::post()
+        .uri("/v1/bamboo/config")
+        .set_json(json!({
             "http_proxy": "http://proxy:8080"
         }))
         .to_request();
@@ -50,7 +58,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     assert_eq!(status["configured"], true);
     assert_eq!(status["credential_ref"], "proxy.default.auth");
     assert!(status.get("username").is_none());
-    let root = std::fs::read_to_string(&config_path).unwrap();
+    let root = std::fs::read_to_string(&core_path).unwrap();
     assert!(root.contains("proxy_auth_credential_ref"));
     assert!(!root.contains("proxy_auth_encrypted"));
     assert!(!root.contains("\"username\""));
@@ -185,14 +193,24 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
         .set_json(json!({
-            "https_proxy": "http://proxy:8080",
+            "https_proxy": "http://proxy:8080"
+        }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+    let req = test::TestRequest::post()
+        .uri("/v1/bamboo/config")
+        .set_json(json!({
             "keyword_masking": { "entries": [] }
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    let cfg = read_config_json(&config_path);
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/config")
+        .to_request();
+    let cfg: serde_json::Value = test::call_and_read_body_json(&app, req).await;
     assert_eq!(cfg["provider"], "openai");
     assert_eq!(cfg["http_proxy"], "http://proxy:8080");
     assert_eq!(cfg["https_proxy"], "http://proxy:8080");
@@ -210,7 +228,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
 async fn test_bamboo_config_persists_disabled_skills() {
     let state = crate::e2e::common::create_test_app().await;
     let data_dir = state.app_data_dir.clone();
-    let config_path = data_dir.join("config.json");
+    let config_path = data_dir.join("tools-skills.json");
 
     let app = test::init_service(
         App::new()
@@ -230,6 +248,7 @@ async fn test_bamboo_config_persists_disabled_skills() {
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    let cfg = read_config_json(&config_path);
+    let document = read_config_json(&config_path);
+    let cfg = config_document_data(&document);
     assert_eq!(cfg["skills"]["disabled"], json!(["pdf", "skill-creator"]));
 }
