@@ -7,10 +7,10 @@ use super::{
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::{
-    AgentEvent, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
+    AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
 use bamboo_compression::{BudgetStrategy, TokenBudget};
-use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
+use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, TaskItem, TaskItemStatus, TaskList};
 use bamboo_llm::models::{ContentPart, ImageUrl};
 use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream};
 use bamboo_llm::{LLMChunk, LLMError};
@@ -139,6 +139,44 @@ fn prompt_capture_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<Vec<Message>>>>)
         requests: Arc::clone(&requests),
     });
     (llm, requests)
+}
+
+struct CompressionInstructionHook;
+
+#[async_trait::async_trait]
+impl AgentHook for CompressionInstructionHook {
+    fn point(&self) -> AgentHookPoint {
+        AgentHookPoint::BeforeCompression
+    }
+
+    async fn run(
+        &self,
+        _point: AgentHookPoint,
+        payload: &HookPayload,
+        _session: &Session,
+    ) -> HookResult {
+        assert!(matches!(
+            payload,
+            HookPayload::Compression {
+                estimated_tokens,
+                usage_percent,
+                max_context_tokens: 1_200,
+                trigger_context_tokens: 960,
+                trigger,
+                phase,
+            } if *estimated_tokens > 0
+                && *usage_percent > 0.0
+                && trigger == "manual"
+                && phase == "mid-turn"
+        ));
+        HookResult::InjectContext {
+            text: "Preserve the exact build failure and its file path".to_string(),
+        }
+    }
+
+    fn name(&self) -> &str {
+        "compression_instructions"
+    }
 }
 
 #[tokio::test]
@@ -815,6 +853,12 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
         background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
+    let mut hook_runner = crate::HookRunner::new();
+    hook_runner.register(Arc::new(CompressionInstructionHook));
+    let config = AgentLoopConfig {
+        hook_runner: Arc::new(hook_runner),
+        ..config
+    };
     let (llm, requests) = prompt_capture_llm();
 
     let applied = maybe_apply_host_context_compression(
@@ -850,6 +894,9 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
     assert!(prompt.contains("External Memory (Persistent)"));
     assert!(prompt.contains("Plan Mode State"));
     assert!(prompt.contains("Durable Plan Execution Context"));
+    assert!(prompt.contains("## Custom Compression Instructions"));
+    assert!(prompt.contains("## PreCompact Hook Instructions"));
+    assert!(prompt.contains("Preserve the exact build failure and its file path"));
 }
 
 #[tokio::test]

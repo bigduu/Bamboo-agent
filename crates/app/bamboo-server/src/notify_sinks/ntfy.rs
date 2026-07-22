@@ -106,11 +106,14 @@ mod tests {
 
     fn sample_notification() -> SinkNotification {
         SinkNotification {
+            id: None,
             title: "Approval needed".to_string(),
             body: "please approve".to_string(),
             category: "needs_approval".to_string(),
             priority: "high".to_string(),
             session_id: "sess-1".to_string(),
+            dedup_key: None,
+            created_at: None,
             click_url: None,
         }
     }

@@ -43,7 +43,25 @@ pub enum HookPayload {
     Compression {
         estimated_tokens: u32,
         usage_percent: f64,
+        max_context_tokens: u32,
+        trigger_context_tokens: u32,
+        trigger: String,
         phase: String,
+    },
+    /// A classified, deduplicated notification is being delivered to sinks.
+    Notification {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        category: String,
+        priority: String,
+        title: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dedup_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        click_url: Option<String>,
     },
     /// The run is about to emit its terminal completion event.
     Finalize { stop_hook_active: bool },
@@ -120,6 +138,9 @@ pub enum AgentHookPoint {
     // Context compression
     BeforeCompression,
     AfterCompression,
+
+    // Classified notification delivery
+    AfterNotification,
 }
 
 /// Result of running a hook.
@@ -181,6 +202,7 @@ mod tests {
             AgentHookPoint::AfterMemoryRecall,
             AgentHookPoint::BeforeCompression,
             AgentHookPoint::AfterCompression,
+            AgentHookPoint::AfterNotification,
         ];
         for point in &points {
             let json = serde_json::to_string(point).unwrap();

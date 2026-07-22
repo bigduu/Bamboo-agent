@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
 use bamboo_domain::poison::PoisonRecover;
+use bamboo_domain::{AgentHookPoint, HookPayload, HookToolOutcome};
 
 use crate::execution::{
     create_event_forwarder, finalize_runner, spawn_session_execution, try_reserve_runner,
@@ -936,6 +937,73 @@ fn bash_completion_should_resume(
     loop_suspended_on_bash && all_waited_shells_done
 }
 
+fn background_bash_post_tool_payload(info: &BashCompletionInfo) -> HookPayload {
+    let success = info.status == "completed" && info.exit_code == Some(0);
+    let response = serde_json::json!({
+        "bash_id": info.bash_id,
+        "command": info.command,
+        "exit_code": info.exit_code,
+        "status": info.status,
+        "output_tail": info.output_tail,
+    });
+    HookPayload::ToolResult {
+        tool_name: "Bash".to_string(),
+        tool_call_id: info.bash_id.clone(),
+        outcome: HookToolOutcome {
+            success,
+            result: success.then(|| response.to_string()),
+            error: (!success).then(|| response.to_string()),
+            needs_human: false,
+            duration_ms: 0,
+        },
+    }
+}
+
+fn append_background_bash_hook_feedback(info: &mut BashCompletionInfo, feedback: Vec<String>) {
+    let feedback = feedback
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if feedback.is_empty() {
+        return;
+    }
+    if !info.output_tail.is_empty() {
+        info.output_tail.push_str("\n\n");
+    }
+    info.output_tail.push_str("<post_tool_use_feedback>\n");
+    info.output_tail.push_str(&feedback.join("\n"));
+    info.output_tail.push_str("\n</post_tool_use_feedback>");
+}
+
+async fn run_background_bash_post_tool_hooks(
+    config: &bamboo_config::LifecycleHooksConfig,
+    fallback_cwd: Option<std::path::PathBuf>,
+    session: &Session,
+    info: &mut BashCompletionInfo,
+) -> bool {
+    let runner = crate::HookRunner::new().with_lifecycle_config(config, fallback_cwd);
+    if !runner.has_hooks_for(AgentHookPoint::AfterToolExecution) {
+        return false;
+    }
+
+    let mut runtime_state = session
+        .agent_runtime_state
+        .clone()
+        .unwrap_or_else(|| AgentRuntimeState::new(&session.id));
+    let outcome = runner
+        .run_observer_hooks(
+            AgentHookPoint::AfterToolExecution,
+            &background_bash_post_tool_payload(info),
+            session,
+            &mut runtime_state,
+            None,
+        )
+        .await;
+    append_background_bash_hook_feedback(info, outcome.injected_contexts);
+    true
+}
+
 /// Apply the bash-resume state transition to a loaded session **in place**: clear
 /// the `waiting_for_bash` wait, mark the runtime Idle, drop the suspension +
 /// `runtime.suspend_reason`, and append `resume_message`. Returns `false` (a
@@ -1228,7 +1296,23 @@ impl ChildCompletionCoordinator {
     ///   shells) → **enqueue** the notice as a pending injected message, drained at
     ///   the next round boundary (a live loop) or folded into the eventual resume
     ///   when the last shell finishes.
-    async fn deliver_bash_completion(&self, info: BashCompletionInfo) {
+    async fn deliver_bash_completion(&self, mut info: BashCompletionInfo) {
+        // A background shell completes outside the originating tool call, so
+        // fire its PostToolUse seam here before routing the completion into the
+        // next round/resume message. Do not hold the resume lock while an
+        // arbitrary command hook runs: its configured timeout must never block
+        // the independent liveness backstop.
+        if let Some(hook_session) = self.load_session(&info.session_id).await {
+            let config_snapshot = self.config.read().await.clone();
+            let _ = run_background_bash_post_tool_hooks(
+                &config_snapshot.lifecycle_hooks,
+                Some(self.app_data_dir.clone()),
+                &hook_session,
+                &mut info,
+            )
+            .await;
+        }
+
         let guard = session_resume_lock(&info.session_id);
         let _held = guard.lock().await;
 
@@ -2457,6 +2541,102 @@ mod tests {
         assert!(body.contains("no captured output"), "body: {body}");
         // No output tail section when there is nothing to show.
         assert!(!body.contains("Output tail:"), "body: {body}");
+    }
+
+    #[test]
+    fn background_completion_builds_post_tool_use_payload_and_feedback() {
+        let mut info = BashCompletionInfo {
+            session_id: "s".into(),
+            bash_id: "bg-7".into(),
+            command: "cargo test".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "test result: ok".into(),
+        };
+
+        let payload = background_bash_post_tool_payload(&info);
+        match payload {
+            HookPayload::ToolResult {
+                tool_name,
+                tool_call_id,
+                outcome,
+            } => {
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(tool_call_id, "bg-7");
+                assert!(outcome.success);
+                let response: serde_json::Value =
+                    serde_json::from_str(outcome.result.as_deref().unwrap()).unwrap();
+                assert_eq!(response["command"], "cargo test");
+                assert_eq!(response["exit_code"], 0);
+                assert_eq!(response["status"], "completed");
+                assert_eq!(response["output_tail"], "test result: ok");
+            }
+            other => panic!("expected PostToolUse payload, got {other:?}"),
+        }
+
+        append_background_bash_hook_feedback(
+            &mut info,
+            vec!["Run the formatter before continuing".to_string()],
+        );
+        assert!(info.output_tail.contains("<post_tool_use_feedback>"));
+        assert!(info
+            .output_tail
+            .contains("Run the formatter before continuing"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_completion_fires_configured_post_tool_use_command() {
+        use bamboo_config::{
+            LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType, LifecycleHooksConfig,
+            DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("background-post-tool.json");
+        let command = format!(
+            "cat > '{}'; printf '%s' '{{\"additional_context\":\"inspect the completed build log\"}}'",
+            output.display()
+        );
+        let config = LifecycleHooksConfig {
+            enabled: true,
+            post_tool_use: vec![LifecycleHookGroup {
+                enabled: true,
+                matcher: Some("^Bash$".to_string()),
+                hooks: vec![LifecycleHookCommand {
+                    hook_type: LifecycleHookType::Command,
+                    command,
+                    timeout_ms: DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut session = Session::new("session-bg-hook", "test-model");
+        session.workspace = Some(dir.path().to_string_lossy().into_owned());
+        let mut info = BashCompletionInfo {
+            session_id: session.id.clone(),
+            bash_id: "bg-9".into(),
+            command: "cargo test".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "test result: ok".into(),
+        };
+
+        assert!(run_background_bash_post_tool_hooks(&config, None, &session, &mut info).await);
+        let envelope: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(envelope["hook_event_name"], "PostToolUse");
+        assert_eq!(envelope["tool_name"], "Bash");
+        assert_eq!(envelope["payload"]["tool_call_id"], "bg-9");
+        let response = envelope["tool_response"]["result"]
+            .as_str()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["command"], "cargo test");
+        assert_eq!(response["status"], "completed");
+        assert!(info.output_tail.contains("inspect the completed build log"));
     }
 
     async fn temp_store() -> (tempfile::TempDir, Arc<dyn Storage>, LockedSessionStore) {

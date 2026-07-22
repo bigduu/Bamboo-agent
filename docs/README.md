@@ -12,6 +12,7 @@ Task-oriented, kept current with the shipped codebase.
 |---|---|
 | [`guides/GETTING_STARTED.md`](guides/GETTING_STARTED.md) | Install, configure a provider, run your first turn three ways (CLI/HTTP/SDK). |
 | [`config-reference.md`](config-reference.md) | Every `config.json` key, the sibling config files (`connect.json`, `schedules.json`, `model_limits.json`), every `BAMBOO_*` env var, the secret-masking contract, encryption at rest, and corrupt-config recovery. |
+| [`lifecycle-hooks.md`](lifecycle-hooks.md) | Configure lifecycle shell commands, event payloads, decisions, timeouts, and practical examples. |
 | [`guides/CONNECT.md`](guides/CONNECT.md) | Drive Bamboo from Telegram or Feishu/Lark. |
 | [`guides/PLUGINS.md`](guides/PLUGINS.md) | Install/update/remove plugins, and the three-layer URL trust model. |
 | [`guides/DEPLOY.md`](guides/DEPLOY.md) | Run `bamboo serve` long-lived: bare binary, systemd, Docker, reverse proxy, backups. |

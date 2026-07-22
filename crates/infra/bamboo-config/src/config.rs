@@ -2113,8 +2113,7 @@ fn lifecycle_hook_enabled_is_default(value: &bool) -> bool {
 /// Config-driven agent lifecycle hooks.
 ///
 /// Event names deliberately preserve the user-facing PascalCase protocol.
-/// Server-owned events are represented here even though their invocation
-/// seams are added by follow-up issues; this keeps one stable config schema.
+/// Server-owned events use the same stable schema as engine-owned events.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleHooksConfig {
     #[serde(default)]

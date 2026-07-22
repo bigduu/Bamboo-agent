@@ -52,11 +52,14 @@ pub async fn send_test_notification(state: web::Data<AppState>) -> impl Responde
         format!("Enabled channels: {}.", attempted.join(", "))
     };
     let notification = crate::notify_sinks::SinkNotification {
+        id: None,
         title: "Bamboo test notification".to_string(),
         body,
         category: "custom".to_string(),
         priority: "normal".to_string(),
         session_id: "test".to_string(),
+        dedup_key: None,
+        created_at: None,
         click_url: None,
     };
     crate::notify_sinks::dispatch_to_sinks(&config_snapshot, false, &notification);

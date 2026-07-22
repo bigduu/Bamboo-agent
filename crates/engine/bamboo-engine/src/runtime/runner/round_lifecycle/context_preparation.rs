@@ -173,6 +173,29 @@ fn build_compression_context_blocks(
     blocks
 }
 
+fn merge_compression_instructions(
+    base: Option<String>,
+    hook_contexts: Vec<String>,
+) -> Option<String> {
+    let hook_contexts = hook_contexts
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if hook_contexts.is_empty() {
+        return base;
+    }
+
+    let hook_section = format!(
+        "## PreCompact Hook Instructions\n\n{}",
+        hook_contexts.join("\n\n---\n\n")
+    );
+    Some(match base {
+        Some(base) if !base.trim().is_empty() => format!("{}\n\n{}", base.trim(), hook_section),
+        _ => hook_section,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maybe_apply_host_context_compression_with_budget(
     session: &mut Session,
@@ -280,41 +303,6 @@ async fn maybe_apply_host_context_compression_with_budget(
         CompressionTriggerType::Auto
     };
 
-    if config
-        .hook_runner
-        .has_hooks_for(AgentHookPoint::BeforeCompression)
-    {
-        let payload = HookPayload::Compression {
-            estimated_tokens: exposure.active_tokens,
-            usage_percent,
-            phase: phase_label.to_string(),
-        };
-        let mut hook_runtime_state = session
-            .agent_runtime_state
-            .clone()
-            .unwrap_or_else(|| AgentRuntimeState::new(session_id));
-        let hook_outcome = config
-            .hook_runner
-            .run_hooks(
-                AgentHookPoint::BeforeCompression,
-                &payload,
-                session,
-                &mut hook_runtime_state,
-                event_tx,
-            )
-            .await;
-        let hook_result = crate::runtime::hooks::apply_hook_outcome(
-            AgentHookPoint::BeforeCompression,
-            hook_outcome,
-            session,
-            &mut hook_runtime_state,
-        );
-        session.agent_runtime_state = Some(hook_runtime_state);
-        hook_result?;
-    }
-
-    let start = Instant::now();
-
     let trigger_type_clone = trigger_type.clone();
 
     let messages = summary_source_messages(session);
@@ -347,6 +335,44 @@ async fn maybe_apply_host_context_compression_with_budget(
         return Ok(false);
     };
 
+    let mut hook_compression_instructions = Vec::new();
+    if config
+        .hook_runner
+        .has_hooks_for(AgentHookPoint::BeforeCompression)
+    {
+        let trigger = match &trigger_type {
+            CompressionTriggerType::Manual => "manual",
+            CompressionTriggerType::CriticalOverflow => "forced_overflow_recovery",
+            CompressionTriggerType::Auto => "threshold",
+        };
+        let payload = HookPayload::Compression {
+            estimated_tokens: exposure.active_tokens,
+            usage_percent,
+            max_context_tokens: budget.max_context_tokens,
+            trigger_context_tokens,
+            trigger: trigger.to_string(),
+            phase: phase_label.to_string(),
+        };
+        let mut hook_runtime_state = session
+            .agent_runtime_state
+            .clone()
+            .unwrap_or_else(|| AgentRuntimeState::new(session_id));
+        let hook_outcome = config
+            .hook_runner
+            .run_observer_hooks(
+                AgentHookPoint::BeforeCompression,
+                &payload,
+                session,
+                &mut hook_runtime_state,
+                event_tx,
+            )
+            .await;
+        hook_compression_instructions = hook_outcome.injected_contexts;
+        session.agent_runtime_state = Some(hook_runtime_state);
+    }
+
+    let start = Instant::now();
+
     let existing_summary = session
         .conversation_summary
         .as_ref()
@@ -369,6 +395,8 @@ async fn maybe_apply_host_context_compression_with_budget(
         .filter(|v| !v.trim().is_empty())
         .map(String::from)
         .or(base_instructions);
+    let compression_instructions =
+        merge_compression_instructions(compression_instructions, hook_compression_instructions);
 
     let summary_provider = config
         .summarization_model_provider
