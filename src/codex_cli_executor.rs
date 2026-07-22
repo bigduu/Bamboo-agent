@@ -140,11 +140,17 @@ impl CodexExecutor {
             .arg("--color")
             .arg("never");
 
-        if let Some(workspace) = &self.workspace {
+        let workspace_path = if let Some(workspace) = &self.workspace {
             command.arg("--cd").arg(workspace);
-            if !has_git_metadata(Path::new(workspace)) {
-                command.arg("--skip-git-repo-check");
-            }
+            Some(PathBuf::from(workspace))
+        } else {
+            std::env::current_dir().ok()
+        };
+        if workspace_path
+            .as_deref()
+            .is_some_and(|path| !has_git_metadata(path))
+        {
+            command.arg("--skip-git-repo-check");
         }
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
@@ -307,6 +313,9 @@ impl CodexExecutor {
             } => result,
             _ = cancel.cancelled() => {
                 terminate_child(&mut child).await;
+                events.emit(event_json(AgentEvent::Cancelled {
+                    message: Some("Codex child cancelled".to_string()),
+                }));
                 return ChildOutcome::cancelled();
             }
         };
@@ -867,38 +876,67 @@ async fn spawn_with_etxtbsy_retry(mut build: impl FnMut() -> Command) -> std::io
     Err(last_error.expect("retry loop records ETXTBSY before exhausting"))
 }
 
+#[derive(Clone, Copy)]
 enum ProcessSignal {
     Term,
     Kill,
 }
 
 #[cfg(unix)]
-fn signal_process_group(child: &Child, signal: ProcessSignal) {
-    if let Some(pid) = child.id() {
-        let signal = match signal {
-            ProcessSignal::Term => libc::SIGTERM,
-            ProcessSignal::Kill => libc::SIGKILL,
-        };
-        // SAFETY: the pid is from our child and build_command created a new
-        // process group with that child as leader. ESRCH is harmless.
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), signal);
-        }
+fn signal_process_group(pgid: libc::pid_t, signal: ProcessSignal) {
+    let signal = match signal {
+        ProcessSignal::Term => libc::SIGTERM,
+        ProcessSignal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: the pgid is from our child and build_command created a new
+    // process group with that child as leader. ESRCH is harmless.
+    unsafe {
+        libc::kill(-pgid, signal);
     }
 }
 
-#[cfg(not(unix))]
-fn signal_process_group(_child: &Child, _signal: ProcessSignal) {}
+#[cfg(unix)]
+fn process_group_exists(pgid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only probes whether the process group exists.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
 
+#[cfg(unix)]
 async fn terminate_child(child: &mut Child) {
-    signal_process_group(child, ProcessSignal::Term);
+    let Some(pgid) = child.id().map(|pid| pid as libc::pid_t) else {
+        return;
+    };
+    signal_process_group(pgid, ProcessSignal::Term);
+    let deadline = tokio::time::Instant::now() + SIGTERM_WAIT;
+    loop {
+        // Reap the leader when it exits, but keep tracking the process group:
+        // a descendant may have ignored SIGTERM and outlived that leader.
+        let _ = child.try_wait();
+        if !process_group_exists(pgid) {
+            let _ = child.wait().await;
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    signal_process_group(pgid, ProcessSignal::Kill);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+#[cfg(not(unix))]
+async fn terminate_child(child: &mut Child) {
     if tokio::time::timeout(SIGTERM_WAIT, child.wait())
         .await
         .is_ok()
     {
         return;
     }
-    signal_process_group(child, ProcessSignal::Kill);
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
@@ -1385,7 +1423,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
 DIR=$(cd "$(dirname "$0")" && pwd)
 read -r prompt
 echo '{"type":"thread.started","thread_id":"cancel-thread"}'
-sleep 30 &
+(trap '' TERM; sleep 30) &
 echo $! > "$DIR/grandchild.pid"
 wait
 "#,
