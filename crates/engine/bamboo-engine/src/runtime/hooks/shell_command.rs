@@ -15,7 +15,7 @@ use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tracing::warn;
 
 use super::HookRunner;
@@ -172,6 +172,14 @@ impl ShellCommandHook {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            // Put every hook in its own process group so a timeout kills the
+            // complete command tree. Killing only the shell can leave a child
+            // holding stdout/stderr open and make the nominal timeout wait for
+            // that child to exit.
+            command.process_group(0);
+        }
 
         let mut child = command
             .spawn()
@@ -201,8 +209,7 @@ impl ShellCommandHook {
             Ok(Ok(status)) => (Some(status), false),
             Ok(Err(error)) => return Err(format!("failed waiting for lifecycle hook: {error}")),
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                kill_hook_process_tree(&mut child).await;
                 (None, true)
             }
         };
@@ -303,6 +310,36 @@ impl ShellCommandHook {
             None => result,
         }
     }
+}
+
+#[cfg(unix)]
+async fn kill_hook_process_tree(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: the child was spawned as the leader of its own process group,
+        // so the negative pid targets only that hook and its descendants.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    let _ = child.wait().await;
+}
+
+#[cfg(windows)]
+async fn kill_hook_process_tree(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        let pid = pid.to_string();
+        let mut kill = Command::new("taskkill");
+        hide_window_for_tokio_command(&mut kill);
+        let _ = kill.args(["/F", "/T", "/PID", &pid]).status().await;
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn kill_hook_process_tree(child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 #[async_trait]
