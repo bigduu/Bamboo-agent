@@ -327,9 +327,9 @@ pub(super) async fn execute_tool_call_only(
 }
 
 /// Resolve `HookResult::Ask` without ever opening an unowned/manual approval.
-/// External workers use their ambient parent proxy inline; in-process children
-/// reuse the existing ApprovalDelegate suspension path. Missing parent routes
-/// fail closed.
+/// External workers use their ambient parent proxy inline. Missing or failed
+/// parent routes fail closed; this path never reuses the interactive
+/// clarification/approval flow.
 async fn hook_ask_outcome(
     tool_call: &ToolCall,
     config: &AgentLoopConfig,
@@ -393,32 +393,6 @@ async fn hook_ask_outcome(
             .await;
         return (!approved).then(|| ToolExecutionOutcome {
             result: Err("Tool execution denied by parent agent review".to_string()),
-            needs_human: None,
-            tool_duration: std::time::Duration::ZERO,
-        });
-    }
-
-    if session.parent_session_id.is_some() && config.approval_delegate.is_some() {
-        let question = format!(
-            "Parent-agent approval required for `{}` on `{}`",
-            tool_call.function.name, resource
-        );
-        let payload = serde_json::json!({
-            "status": "awaiting_permission_approval",
-            "question": question,
-            "permission_type": permission_type,
-            "resource": resource,
-            "options": ["Approve", "Deny"],
-            "allow_custom": false,
-            "permission_request": request,
-        });
-        return Some(ToolExecutionOutcome {
-            result: Ok(ToolResult {
-                success: true,
-                result: payload.to_string(),
-                display_preference: Some("request_permissions".to_string()),
-                images: Vec::new(),
-            }),
             needs_human: None,
             tool_duration: std::time::Duration::ZERO,
         });
@@ -724,6 +698,18 @@ mod hook_tests {
         }
     }
 
+    struct PanicLegacyApprovalDelegate;
+
+    #[async_trait]
+    impl crate::runtime::config::ApprovalDelegate for PanicLegacyApprovalDelegate {
+        async fn delegate_child_approval(
+            &self,
+            _request: crate::runtime::config::ChildApprovalRequest,
+        ) -> Result<crate::runtime::config::ChildApprovalOutcome, String> {
+            panic!("Hook Ask must not enter the legacy interactive approval path")
+        }
+    }
+
     #[tokio::test]
     async fn before_tool_hook_denies_without_dispatching_executor() {
         let mut runner = crate::runtime::hooks::HookRunner::new();
@@ -828,11 +814,12 @@ mod hook_tests {
     }
 
     #[tokio::test]
-    async fn ask_hook_without_parent_route_fails_closed_without_manual_prompt() {
+    async fn ask_hook_without_parent_proxy_fails_closed_without_manual_prompt() {
         let mut runner = crate::runtime::hooks::HookRunner::new();
         runner.register(Arc::new(AskToolHook));
         let config = AgentLoopConfig {
             hook_runner: Arc::new(runner),
+            approval_delegate: Some(Arc::new(PanicLegacyApprovalDelegate)),
             ..Default::default()
         };
         let tools = Arc::new(RecordingExecutor(AtomicBool::new(false)));
@@ -847,6 +834,7 @@ mod hook_tests {
             },
         };
         let mut session = Session::new("hook-ask-no-parent", "model");
+        session.parent_session_id = Some("parent-with-legacy-delegate".to_string());
         let session_flags = ToolExecutionSessionFlags::from_session(&session);
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
