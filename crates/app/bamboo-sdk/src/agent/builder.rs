@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::tools::{Tool, ToolExecutor};
-use bamboo_engine::AgentBuilder as EngineAgentBuilder;
+use bamboo_engine::{AgentBuilder as EngineAgentBuilder, HookRunner};
 use bamboo_llm::{create_provider_with_dir, Config, LLMProvider};
 use bamboo_mcp::executor::{CompositeToolExecutor, McpToolExecutor};
 use bamboo_mcp::manager::McpServerManager;
@@ -252,6 +252,14 @@ impl AgentBuilder {
     /// can say what they mean instead of relying on silent default behavior.
     pub fn bypass_permissions(mut self) -> Self {
         self.permission_checker = None;
+        self
+    }
+
+    /// Install the immutable lifecycle-hook registry used by every run of this
+    /// agent. The registry is snapshotted into the sealed loop configuration at
+    /// run start, so one execution cannot observe mid-run registration changes.
+    pub fn hook_runner(mut self, runner: Arc<HookRunner>) -> Self {
+        self.inner = self.inner.hook_runner(runner);
         self
     }
 

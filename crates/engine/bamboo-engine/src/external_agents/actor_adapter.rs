@@ -180,15 +180,13 @@ pub struct ActorChildRunner {
 
 /// Decides how the host answers a child worker's gated-tool approval request
 /// (Phase 2: child → parent approval delegation). Async so an implementation
-/// can consult a policy or defer to a human. With no decider wired the host
-/// replies with a fail-closed DENY.
+/// can consult a policy. With no decider wired the host replies with a
+/// fail-closed DENY.
 ///
 /// NOTE: `decide` is awaited inside the per-child frame pump, so an
-/// implementation must resolve promptly (e.g. a policy lookup). A human-in-the-
-/// loop decision that may block indefinitely should instead be delivered
-/// out-of-band as a `ParentFrame::ApprovalReply` via the live steering channel
-/// (`super::live`), which `drive()` already forwards to the worker without
-/// stalling the pump.
+/// implementation must resolve promptly (e.g. a policy lookup). Model-based
+/// review belongs in [`ChildApprovalReviewer`], which runs off-loop and returns
+/// through the live steering channel without stalling the frame pump.
 #[async_trait]
 pub trait ChildApprovalDecider: Send + Sync {
     /// Decide whether `child_session_id` may perform the gated action described
@@ -209,22 +207,10 @@ async fn decide_child_approval(
     }
 }
 
-/// How long the host waits for a human approval decision before failing the
-/// child's gated tool closed (DENY). Bounds an unanswered request so it can't
-/// hang the worker indefinitely.
+/// How long a chained parent-agent review may take before the child's gated
+/// tool fails closed (DENY). Bounds an unanswered request so it cannot hang the
+/// worker indefinitely.
 const CHILD_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Extract `(tool_name, permission, resource)` from a worker's approval request
-/// body (`{tool_name, permission, resource}`); missing fields default to empty.
-fn approval_request_fields(body: &serde_json::Value) -> (String, String, String) {
-    let field = |k: &str| {
-        body.get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    (field("tool_name"), field("permission"), field("resource"))
-}
 
 /// Off-loop reviewer for a child's gated-tool approval request (Phase 6, Part B).
 ///
@@ -1202,8 +1188,9 @@ async fn drive(
                         } else if let Some(host) = escalation_bridge.clone() {
                             // Non-bypass WORKER: ESCALATE up our own actor link
                             // (re-proxy) so the request chains to our parent — and
-                            // up every level until a bypass level (model-review) or
-                            // the top orchestrator (human) decides. Off-loop so the
+                            // up every level until a bypass level or the top
+                            // orchestrator's model reviewer decides. With no such
+                            // reviewer the top level fails closed. Off-loop so the
                             // pump never blocks; relay the reply down to the child.
                             let child = child_session_id.to_string();
                             let req_id = id.clone();
@@ -1232,98 +1219,27 @@ async fn drive(
                                 );
                             });
                         } else {
-                            // Top orchestrator (no escalation bridge): human-in-the-
-                            // loop. Surface the request on the parent's event stream
-                            // and DEFER — the decision arrives out-of-band via
-                            // `live::deliver_approval(child, request_id, approved)`
-                            // (→ this child's `live_rx` → forwarded to the worker
-                            // above). A timeout denies a never-answered request so
-                            // it can't hang the child forever.
-                            let (tool_name, permission, resource) =
-                                approval_request_fields(&body);
-                            // Register the pending request BEFORE surfacing it so
-                            // the external handler's `deliver_approval_checked` can
-                            // correlate an out-of-band POST against a genuine
-                            // human-loop request (and consume it one-shot).
-                            let (approval_version, approval_created_at) =
-                                super::live::register_pending_approval_observed(
-                                approval_registry,
+                            // There is no parent-agent reviewer or upstream actor
+                            // to own this decision. Never open a manual/UI approval
+                            // path: forced-ask is parent-reviewed or fail-closed.
+                            tracing::warn!(
                                 parent_session_id,
                                 child_session_id,
-                                child_attempt,
-                                &id,
-                                &tool_name,
-                                &permission,
-                                &resource,
-                                event_tx.clone(),
+                                request_id = %id,
+                                "forced-ask request has no parent-agent reviewer; denying"
                             );
-                            if approval_version == 0 {
-                                super::live::deliver_approval_scoped(
-                                    approval_registry,
-                                    child_session_id,
-                                    child_attempt,
-                                    &id,
-                                    false,
-                                );
-                                let _ = event_tx
-                                    .send(AgentEvent::ChildApprovalChanged {
-                                        parent_session_id: parent_session_id.to_string(),
-                                        child_session_id: child_session_id.to_string(),
-                                        child_attempt,
-                                        request_id: id,
-                                        version: 1,
-                                        status: "delivery_failed".to_string(),
-                                        reason: Some("persistence_failed".to_string()),
-                                        tool_name,
-                                        permission,
-                                        resource,
-                                        created_at: approval_created_at,
-                                        resolved_at: Some(chrono::Utc::now().to_rfc3339()),
-                                    })
-                                    .await;
-                                continue;
-                            }
-                            let _ = event_tx.send(AgentEvent::ChildApprovalChanged {
-                                parent_session_id: parent_session_id.to_string(),
-                                child_session_id: child_session_id.to_string(),
-                                child_attempt,
-                                request_id: id.clone(),
-                                version: approval_version,
-                                status: "pending".to_string(),
-                                reason: None,
-                                tool_name: tool_name.clone(),
-                                permission: permission.clone(),
-                                resource: resource.clone(),
-                                created_at: approval_created_at,
-                                resolved_at: None,
-                            }).await;
-                            let _ = event_tx
-                                .send(AgentEvent::ChildApprovalRequested {
-                                    child_session_id: child_session_id.to_string(),
-                                    request_id: id.clone(),
-                                    tool_name,
-                                    permission,
-                                    resource,
+                            if client
+                                .send(ParentFrame::ApprovalReply {
+                                    id,
+                                    approved: false,
                                 })
-                                .await;
-                            let child = child_session_id.to_string();
-                            let approval_registry = approval_registry.cloned();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(CHILD_APPROVAL_TIMEOUT).await;
-                                // Deny only if still pending: a one-shot consume so
-                                // we don't double-deliver if the human already
-                                // answered (the POST took it), and so a late POST
-                                // after this fires finds nothing pending.
-                                if super::live::expire_pending_approval(approval_registry.as_ref(), &child, &id) {
-                                    super::live::deliver_approval_scoped(
-                                        approval_registry.as_ref(),
-                                        &child,
-                                        child_attempt,
-                                        &id,
-                                        false,
-                                    );
-                                }
-                            });
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "failed to send fail-closed approval reply; connection failing"
+                                );
+                            }
                         }
                     }
                     Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
@@ -1683,6 +1599,44 @@ mod tests {
         );
         drop(live_guard);
     }
+
+    #[tokio::test]
+    async fn drive_denies_forced_ask_without_parent_reviewer_or_manual_event() {
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+        let cancel = CancellationToken::new();
+        let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let mut link = ApprovalRoundTripLink {
+            step: 0,
+            approval_reply: None,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            drive(
+                &mut link,
+                "parent-no-reviewer",
+                "child-no-reviewer",
+                0,
+                None,
+                None,
+                None,
+                None,
+                &event_tx,
+                &cancel,
+                &mut live_rx,
+                None,
+            ),
+        )
+        .await
+        .expect("fail-closed reply must unblock the child immediately");
+
+        assert_eq!(result.ok().flatten().as_deref(), Some("done"));
+        assert_eq!(link.approval_reply, Some(("approval-1".to_string(), false)));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "missing parent review must not surface a manual approval event"
+        );
+    }
     #[async_trait]
     impl bamboo_subagent::ChildLink for InstantTerminalLink {
         async fn send(&mut self, _: ParentFrame) -> bamboo_subagent::TransportResult<()> {
@@ -1771,21 +1725,6 @@ mod tests {
         let deny: Arc<dyn ChildApprovalDecider> = Arc::new(StaticDecider(false));
         assert!(decide_child_approval(Some(&approve), "child-1", &body).await);
         assert!(!decide_child_approval(Some(&deny), "child-1", &body).await);
-    }
-
-    #[test]
-    fn approval_request_fields_extracts_and_defaults() {
-        let full = serde_json::json!({"tool_name":"Bash","permission":"run","resource":"ls"});
-        assert_eq!(
-            approval_request_fields(&full),
-            ("Bash".to_string(), "run".to_string(), "ls".to_string())
-        );
-        // Missing fields default to empty strings.
-        let partial = serde_json::json!({"tool_name":"Write"});
-        assert_eq!(
-            approval_request_fields(&partial),
-            ("Write".to_string(), String::new(), String::new())
-        );
     }
 
     // ---- #193: remote placement routing -------------------------------------

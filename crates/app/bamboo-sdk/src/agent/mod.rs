@@ -67,12 +67,14 @@ pub use error::SdkError;
 // Convenience re-exports of commonly used types (single source of truth — these
 // supersede the old duplicate re-export chain, resolving TD-2).
 pub use bamboo_agent_core::{
-    AgentError, AgentEvent, Message, MessageContent, PendingQuestion, Role, Session,
+    AgentError, AgentEvent, AgentHook, Message, MessageContent, PendingQuestion, Role, Session,
     TokenBudgetUsage, TokenUsage,
 };
-pub use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
+pub use bamboo_domain::{
+    AgentHookPoint, HookPayload, HookResult, HookToolOutcome, TaskItem, TaskItemStatus, TaskList,
+};
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
-pub use bamboo_engine::ExecuteRequest;
+pub use bamboo_engine::{ExecuteRequest, HookRunner};
 pub use bamboo_llm::LLMProvider;
 pub use bamboo_mcp::manager::McpServerManager;
 pub use bamboo_mcp::McpServerConfig;

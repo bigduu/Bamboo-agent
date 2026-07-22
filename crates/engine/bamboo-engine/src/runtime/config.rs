@@ -17,6 +17,8 @@ use bamboo_skills::SkillManager;
 use bamboo_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 
+use super::hooks::HookRunner;
+
 #[derive(Clone, Default)]
 pub struct AuxiliaryModelConfig {
     pub fast_model_name: Option<String>,
@@ -468,6 +470,9 @@ pub struct AgentLoopConfig {
     /// to its parent (Phase 2). `None` (the default) leaves child gating on its
     /// legacy path. Wired by the server.
     pub(crate) approval_delegate: Option<Arc<dyn ApprovalDelegate>>,
+    /// Frozen lifecycle-hook registry for this run. The default registry is
+    /// empty, and every seam checks `has_hooks_for` before constructing payloads.
+    pub(crate) hook_runner: Arc<HookRunner>,
     /// Enable dynamic per-round model routing based on task complexity.
     /// When true, the pipeline classifies complexity at each round end and
     /// stores the result in session metadata.
@@ -548,6 +553,7 @@ impl Default for AgentLoopConfig {
             bash_resume_hook: None,
             bash_completion_sink: None,
             approval_delegate: None,
+            hook_runner: Arc::new(HookRunner::new()),
             features_dynamic_model_routing: false,
             auxiliary_model_resolver: None,
             disabled_filter_resolver: None,

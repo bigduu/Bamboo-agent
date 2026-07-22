@@ -131,6 +131,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Install an immutable lifecycle-hook registry for this agent runtime.
+    pub fn hook_runner(mut self, v: Arc<crate::runtime::HookRunner>) -> Self {
+        self.inner = self.inner.hook_runner(v);
+        self
+    }
+
     pub fn build(self) -> Result<Agent, &'static str> {
         let runtime = self.inner.build()?;
         Ok(Agent {

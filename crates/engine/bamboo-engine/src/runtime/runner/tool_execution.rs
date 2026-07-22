@@ -10,6 +10,7 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_config::PermissionMode;
+use bamboo_domain::{AgentHookPoint, AgentRuntimeState};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
@@ -121,11 +122,12 @@ async fn execute_and_apply_single_tool_call(
     // Pre-built per-round snapshot of the executor's full tool-schema list —
     // avoids re-cloning every schema on each tool call.
     available_tool_schemas: &[ToolSchema],
+    runtime_state: &mut AgentRuntimeState,
     task_context: &mut Option<TaskLoopContext>,
     state: &mut RoundExecutionState,
     policy_guard: &mut policy::ToolPolicyGuard,
     reserved_calls: usize,
-) -> SingleToolExecutionControl {
+) -> Result<SingleToolExecutionControl, AgentError> {
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if config.permission_mode == Some(PermissionMode::Plan) {
         let tool_name = tool_call.function.name.trim();
@@ -171,16 +173,17 @@ async fn execute_and_apply_single_tool_call(
                     session,
                     tools,
                     config,
+                    runtime_state,
                     task_context,
                     state,
                 },
                 outcome,
             )
-            .await;
-            return SingleToolExecutionControl {
+            .await?;
+            return Ok(SingleToolExecutionControl {
                 should_break,
                 stop_round: false,
-            };
+            });
         }
     }
 
@@ -202,6 +205,11 @@ async fn execute_and_apply_single_tool_call(
                     tool_duration: std::time::Duration::ZERO,
                 }
             } else {
+                let session_flags =
+                    bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session);
+                let before_tool_hooks = config
+                    .hook_runner
+                    .has_hooks_for(AgentHookPoint::BeforeToolExecution);
                 per_call::execute_tool_call_only(per_call::ToolExecutionOnlyContext {
                     tool_call,
                     event_tx,
@@ -211,11 +219,12 @@ async fn execute_and_apply_single_tool_call(
                     round,
                     tools,
                     config,
-                    session_flags:
-                        bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session),
+                    hook_session: before_tool_hooks.then_some(&mut *session),
+                    hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
+                    session_flags,
                     available_tool_schemas,
                 })
-                .await
+                .await?
             }
         }
         Err(violation) => {
@@ -266,17 +275,18 @@ async fn execute_and_apply_single_tool_call(
             session,
             tools,
             config,
+            runtime_state,
             task_context,
             state,
         },
         outcome,
     )
-    .await;
+    .await?;
 
-    SingleToolExecutionControl {
+    Ok(SingleToolExecutionControl {
         should_break,
         stop_round,
-    }
+    })
 }
 
 /// Check if the most recent tool result is from `compact_context` and set
@@ -401,6 +411,7 @@ pub(crate) async fn execute_round_tool_calls(
     tool_calls: &[ToolCall],
     frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
     session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
     task_context: &mut Option<TaskLoopContext>,
     compression_model_name: Option<&str>,
     compression_model_provider: Option<&Arc<dyn LLMProvider>>,
@@ -437,10 +448,17 @@ pub(crate) async fn execute_round_tool_calls(
     );
 
     // Pre-classify all tool calls to avoid repeated normalization.
-    let scheduling_modes: Vec<ToolSchedulingMode> = tool_calls
-        .iter()
-        .map(|tc| scheduling_mode_for_tool_call(tc, tools))
-        .collect();
+    let scheduling_modes: Vec<ToolSchedulingMode> = if config
+        .hook_runner
+        .has_hooks_for(AgentHookPoint::BeforeToolExecution)
+    {
+        vec![ToolSchedulingMode::Sequential; tool_calls.len()]
+    } else {
+        tool_calls
+            .iter()
+            .map(|tc| scheduling_mode_for_tool_call(tc, tools))
+            .collect()
+    };
 
     let mut next_index = 0usize;
     'tool_calls: while next_index < tool_calls.len() {
@@ -474,12 +492,13 @@ pub(crate) async fn execute_round_tool_calls(
                         tools,
                         config,
                         available_tool_schemas,
+                        runtime_state,
                         task_context,
                         &mut state,
                         &mut policy_guard,
                         0,
                     )
-                    .await;
+                    .await?;
 
                     maybe_apply_mid_turn_context_compression_after_tool(
                         session,
@@ -513,12 +532,13 @@ pub(crate) async fn execute_round_tool_calls(
                     tools,
                     config,
                     available_tool_schemas,
+                    runtime_state,
                     task_context,
                     &mut state,
                     &mut policy_guard,
                     0,
                 )
-                .await;
+                .await?;
 
                 maybe_apply_mid_turn_context_compression_after_tool(
                     session,
@@ -571,20 +591,22 @@ pub(crate) async fn execute_round_tool_calls(
                                 round,
                                 tools,
                                 config,
+                                hook_session: None,
+                                hook_runtime_state: None,
                                 session_flags,
                                 available_tool_schemas,
                             }),
                         )
                         .await
                         .unwrap_or_else(|_| {
-                            per_call::ToolExecutionOutcome {
+                            Ok(per_call::ToolExecutionOutcome {
                                 needs_human: None,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
                                     tool_call.function.name, timeout
                                 )),
                                 tool_duration: timeout,
-                            }
+                            })
                         })
                     }
                 })),
@@ -599,16 +621,21 @@ pub(crate) async fn execute_round_tool_calls(
                 );
                 batch
                     .iter()
-                    .map(|_batch_call| per_call::ToolExecutionOutcome {
-                        needs_human: None,
-                        result: Err(format!(
-                            "Parallel batch timed out after {:?}",
-                            batch_timeout
-                        )),
-                        tool_duration: batch_timeout,
+                    .map(|_batch_call| {
+                        Ok(per_call::ToolExecutionOutcome {
+                            needs_human: None,
+                            result: Err(format!(
+                                "Parallel batch timed out after {:?}",
+                                batch_timeout
+                            )),
+                            tool_duration: batch_timeout,
+                        })
                     })
                     .collect::<Vec<_>>()
             });
+            let outcomes = outcomes
+                .into_iter()
+                .collect::<Result<Vec<_>, AgentError>>()?;
             let parallel_elapsed = parallel_start.elapsed();
 
             // Log individual tool durations to confirm parallelism
@@ -681,12 +708,13 @@ pub(crate) async fn execute_round_tool_calls(
                         session,
                         tools,
                         config,
+                        runtime_state,
                         task_context,
                         state: &mut state,
                     },
                     outcome,
                 )
-                .await;
+                .await?;
 
                 maybe_apply_mid_turn_context_compression_after_tool(
                     session,
@@ -719,12 +747,13 @@ pub(crate) async fn execute_round_tool_calls(
             tools,
             config,
             available_tool_schemas,
+            runtime_state,
             task_context,
             &mut state,
             &mut policy_guard,
             0,
         )
-        .await;
+        .await?;
 
         next_index += 1;
 
@@ -752,6 +781,7 @@ pub(crate) async fn execute_round_tool_calls(
 mod tests {
     use super::{scheduling_mode_for_tool_call, ToolSchedulingMode};
     use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutor};
+    use bamboo_domain::AgentRuntimeState;
     use bamboo_tools::BuiltinToolExecutor;
     use serde_json::json;
     use std::sync::Arc;
@@ -1001,6 +1031,7 @@ mod tests {
         };
 
         let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
 
         let tool_call = tool_call_with_args(
@@ -1019,12 +1050,14 @@ mod tests {
             &tools,
             &config,
             tools.list_tools().as_slice(),
+            &mut runtime_state,
             &mut None,
             &mut state,
             &mut policy_guard,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         // Should not break the round, just block the tool
         assert!(!control.should_break);
@@ -1055,6 +1088,7 @@ mod tests {
         };
 
         let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
 
         let temp_dir = std::env::temp_dir().join("bamboo_plan_mode_read_test");
@@ -1076,12 +1110,14 @@ mod tests {
             &tools,
             &config,
             tools.list_tools().as_slice(),
+            &mut runtime_state,
             &mut None,
             &mut state,
             &mut policy_guard,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(!control.should_break);
         assert!(!control.stop_round);
@@ -1112,6 +1148,7 @@ mod tests {
         };
 
         let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
 
         let tool_call = tool_call_with_args("ExitPlanMode", json!({"plan": "test plan"}));
@@ -1127,12 +1164,14 @@ mod tests {
             &tools,
             &config,
             tools.list_tools().as_slice(),
+            &mut runtime_state,
             &mut None,
             &mut state,
             &mut policy_guard,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(!control.stop_round);
         let last_msg = session.messages.last().expect("should have a tool result");
@@ -1157,6 +1196,7 @@ mod tests {
         let config = crate::runtime::config::AgentLoopConfig::default();
 
         let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
 
         let temp_dir = std::env::temp_dir().join("bamboo_default_mode_test");
@@ -1179,12 +1219,14 @@ mod tests {
             &tools,
             &config,
             tools.list_tools().as_slice(),
+            &mut runtime_state,
             &mut None,
             &mut state,
             &mut policy_guard,
             0,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(!control.stop_round);
         let last_msg = session.messages.last().expect("should have a tool result");

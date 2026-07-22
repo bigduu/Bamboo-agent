@@ -15,7 +15,10 @@ pub mod agent;
 
 // Mirror the public facade re-exports the root crate previously exposed.
 pub use agent::ExecuteRequestBuilder;
-pub use agent::{Agent, AgentBuilder};
+pub use agent::{
+    Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
+    HookToolOutcome,
+};
 
 // Tool catalog surfaced by `agent::mod`.
 pub use agent::{

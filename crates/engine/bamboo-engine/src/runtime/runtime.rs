@@ -26,6 +26,7 @@ use crate::runtime::config::{
     AgentLoopConfig, AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, GoldConfig,
     GuardianConfig, GuardianSpawner, ImageFallbackConfig, PromptMemoryFlags,
 };
+use crate::runtime::hooks::HookRunner;
 use crate::runtime::model_roster::{ModelRoster, RoleModel};
 use crate::runtime::runner::run_agent_loop_with_config;
 use bamboo_domain::RuntimeSessionPersistence;
@@ -54,6 +55,10 @@ pub struct AgentRuntime {
     /// Call sites that need a reduced tool set (child / schedule) pass their
     /// own via `ExecuteRequest::tools`.
     pub default_tools: Arc<dyn ToolExecutor>,
+
+    /// Immutable hook registry shared by runs. Each execute call snapshots the
+    /// `Arc` onto its sealed [`AgentLoopConfig`].
+    pub hook_runner: Arc<HookRunner>,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +84,7 @@ pub struct AgentRuntimeBuilder {
     config: Option<Arc<RwLock<Config>>>,
     provider: Option<Arc<dyn LLMProvider>>,
     default_tools: Option<Arc<dyn ToolExecutor>>,
+    hook_runner: Arc<HookRunner>,
 }
 
 impl AgentRuntimeBuilder {
@@ -92,6 +98,7 @@ impl AgentRuntimeBuilder {
             config: None,
             provider: None,
             default_tools: None,
+            hook_runner: Arc::new(HookRunner::new()),
         }
     }
 
@@ -135,6 +142,12 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Install the lifecycle hook registry used by all runs from this runtime.
+    pub fn hook_runner(mut self, v: Arc<HookRunner>) -> Self {
+        self.hook_runner = v;
+        self
+    }
+
     pub fn build(self) -> Result<AgentRuntime, &'static str> {
         Ok(AgentRuntime {
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
@@ -155,6 +168,7 @@ impl AgentRuntimeBuilder {
             default_tools: self
                 .default_tools
                 .ok_or_else(|| format_missing("default_tools"))?,
+            hook_runner: self.hook_runner,
         })
     }
 }
@@ -717,6 +731,7 @@ impl AgentRuntime {
             guardian_spawner,
             bash_resume_hook,
             bash_completion_sink,
+            hook_runner: self.hook_runner.clone(),
             // Capture the tool executor's server-level guidance (connected MCP
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.

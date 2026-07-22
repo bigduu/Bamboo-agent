@@ -13,6 +13,7 @@ use bamboo_compression::{
     estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,
     PreparedContext, Summarizer, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
+use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload};
 use bamboo_llm::LLMProvider;
 use std::sync::Arc;
 use std::time::Instant;
@@ -278,6 +279,39 @@ async fn maybe_apply_host_context_compression_with_budget(
     } else {
         CompressionTriggerType::Auto
     };
+
+    if config
+        .hook_runner
+        .has_hooks_for(AgentHookPoint::BeforeCompression)
+    {
+        let payload = HookPayload::Compression {
+            estimated_tokens: exposure.active_tokens,
+            usage_percent,
+            phase: phase_label.to_string(),
+        };
+        let mut hook_runtime_state = session
+            .agent_runtime_state
+            .clone()
+            .unwrap_or_else(|| AgentRuntimeState::new(session_id));
+        let hook_outcome = config
+            .hook_runner
+            .run_hooks(
+                AgentHookPoint::BeforeCompression,
+                &payload,
+                session,
+                &mut hook_runtime_state,
+                event_tx,
+            )
+            .await;
+        let hook_result = crate::runtime::hooks::apply_hook_outcome(
+            AgentHookPoint::BeforeCompression,
+            hook_outcome,
+            session,
+            &mut hook_runtime_state,
+        );
+        session.agent_runtime_state = Some(hook_runtime_state);
+        hook_result?;
+    }
 
     let start = Instant::now();
 
