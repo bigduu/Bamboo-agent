@@ -6,7 +6,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use bamboo_agent::codex_cli_executor::CodexExecutor;
+use bamboo_agent::codex_cli_executor::{CodexAuthConfig, CodexExecutor};
 use bamboo_subagent::executor::{ChildExecutor, EventSink, SteerInbox};
 use bamboo_subagent::proto::{RunSpec, TerminalStatus};
 use tokio_util::sync::CancellationToken;
@@ -29,8 +29,8 @@ async fn real_codex_completes_trivial_turn_and_reports_bootstrap_metadata() {
         Some("read-only".to_string()),
         Some(workspace.path().to_string_lossy().into_owned()),
         Some(state.path().to_path_buf()),
-        false,
         Vec::new(),
+        CodexAuthConfig::inherit(),
     )
     .await
     .expect("Codex preflight succeeds");
@@ -43,6 +43,7 @@ async fn real_codex_completes_trivial_turn_and_reports_bootstrap_metadata() {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             },
             sink,
             SteerInbox::disconnected(),

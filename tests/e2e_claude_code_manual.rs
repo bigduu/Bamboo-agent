@@ -35,6 +35,7 @@ fn spec(assignment: &str, messages: Vec<serde_json::Value>) -> RunSpec {
         reasoning_effort: None,
         permission_policy: None,
         messages,
+        secrets: Default::default(),
     }
 }
 

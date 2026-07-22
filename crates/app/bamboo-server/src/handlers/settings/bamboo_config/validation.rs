@@ -47,6 +47,19 @@ pub async fn validate_bamboo_config_patch(
         }));
     }
 
+    let codex_schema_issues = patch_obj
+        .get("subagents")
+        .map(validate_codex_subagents_shape)
+        .unwrap_or_default();
+    if !codex_schema_issues.is_empty() {
+        let mut errors = BTreeMap::new();
+        errors.insert("subagents".to_string(), codex_schema_issues);
+        return Ok(HttpResponse::Ok().json(ValidateConfigResponse {
+            valid: false,
+            errors,
+        }));
+    }
+
     let current = app_state.config.read().await.clone();
     let merged = config_manager::build_merged_config(&current, patch_obj.clone())?;
     let domains = config_manager::domains_for_root_patch(&patch_obj);
@@ -90,10 +103,22 @@ pub async fn validate_bamboo_config_patch(
 
     if domains.lifecycle_hooks {
         for issue in validate_lifecycle_hooks_config(&merged.lifecycle_hooks) {
-            errors
-                .entry("lifecycle_hooks".to_string())
-                .or_default()
-                .push(issue);
+            push_error("lifecycle_hooks", &issue.path, issue.message);
+        }
+    }
+
+    if patch_obj.contains_key("subagents") {
+        if let Err(message) = bamboo_config::validate_codex_subagents_config(merged.subagents()) {
+            let path = if message.contains("base_url") {
+                "subagents.codex_base_url"
+            } else if message.contains("provider_key_ref") {
+                "subagents.codex_provider_key_ref"
+            } else if message.contains("forward_env") || message.contains("OPENAI_API_KEY") {
+                "subagents.codex_forward_env"
+            } else {
+                "subagents.codex_auth_mode"
+            };
+            push_error("subagents", path, message);
         }
     }
 
@@ -106,6 +131,67 @@ fn issue(path: impl Into<String>, message: impl Into<String>) -> ValidationIssue
         path: path.into(),
         message: message.into(),
     }
+}
+
+fn validate_codex_subagents_shape(value: &Value) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let Some(object) = value.as_object() else {
+        issues.push(issue("subagents", "subagents must be a JSON object"));
+        return issues;
+    };
+
+    if let Some(mode) = object.get("codex_auth_mode") {
+        let valid = mode.is_null()
+            || mode
+                .as_str()
+                .is_some_and(|mode| matches!(mode, "inherit" | "api_key" | "custom" | "bamboo"));
+        if !valid {
+            issues.push(issue(
+                "subagents.codex_auth_mode",
+                "codex_auth_mode must be inherit, api_key, custom, or bamboo",
+            ));
+        }
+    }
+    if let Some(wire_api) = object.get("codex_wire_api") {
+        if !(wire_api.is_null() || wire_api.as_str() == Some("responses")) {
+            issues.push(issue(
+                "subagents.codex_wire_api",
+                "codex_wire_api must be responses for Codex CLI >= 0.144",
+            ));
+        }
+    }
+    for field in ["codex_base_url", "codex_provider_key_ref"] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            issues.push(issue(
+                format!("subagents.{field}"),
+                format!("{field} must be a string or null"),
+            ));
+        }
+    }
+    if let Some(reference) = object.get("codex_provider_key_ref").and_then(Value::as_str) {
+        if bamboo_config::CredentialRef::parse(reference.to_string()).is_err() {
+            issues.push(issue(
+                "subagents.codex_provider_key_ref",
+                "codex_provider_key_ref has an invalid format",
+            ));
+        }
+    }
+    if let Some(forward_env) = object.get("codex_forward_env") {
+        let valid = forward_env.is_null()
+            || forward_env
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string));
+        if !valid {
+            issues.push(issue(
+                "subagents.codex_forward_env",
+                "codex_forward_env must be an array of environment variable names",
+            ));
+        }
+    }
+    issues
 }
 
 /// Validate the JSON shape before deserializing the merged config so serde
@@ -342,5 +428,50 @@ fn provider_issue(
         ("provider", fallback_error)
     } else {
         (missing_path, missing_message.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_shape_validation_reports_precise_fields() {
+        let issues = validate_codex_subagents_shape(&serde_json::json!({
+            "codex_auth_mode": "future",
+            "codex_wire_api": "chat",
+            "codex_base_url": 42,
+            "codex_provider_key_ref": "not a credential ref",
+            "codex_forward_env": ["OPENAI_API_KEY", 1]
+        }));
+        let paths = issues
+            .iter()
+            .map(|issue| issue.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for expected in [
+            "subagents.codex_auth_mode",
+            "subagents.codex_wire_api",
+            "subagents.codex_base_url",
+            "subagents.codex_provider_key_ref",
+            "subagents.codex_forward_env",
+        ] {
+            assert!(
+                paths.contains(expected),
+                "missing path {expected}: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_shape_validation_accepts_the_documented_surface() {
+        assert!(validate_codex_subagents_shape(&serde_json::json!({
+            "codex_auth_mode": "custom",
+            "codex_wire_api": "responses",
+            "codex_base_url": "https://provider.example/v1",
+            "codex_provider_key_ref": "provider.openai.api_key",
+            "codex_forward_env": ["LANG"]
+        }))
+        .is_empty());
     }
 }

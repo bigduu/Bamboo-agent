@@ -1582,7 +1582,92 @@ fn validate_subagents(value: &SubagentsSection) -> Result<(), String> {
             return Err("external broker configured metadata is inconsistent".to_string());
         }
     }
+    validate_codex_subagents_config(&value.subagents)?;
     validate_json_serializable(value)
+}
+
+/// Cross-field validation for the Codex auth/provider matrix. Exported so the
+/// root `/bamboo/config/validate` endpoint can return the same rules through its
+/// structured field-error contract.
+pub fn validate_codex_subagents_config(value: &SubagentsConfig) -> Result<(), String> {
+    let codex_fields_present = value.codex_auth_mode.is_some()
+        || value.codex_base_url.is_some()
+        || value.codex_wire_api.is_some()
+        || value.codex_provider_key_ref.is_some()
+        || value.codex_forward_env.is_some();
+    if value.executor.as_deref() != Some("codex") && !codex_fields_present {
+        return Ok(());
+    }
+    let mode = value.codex_auth_mode.unwrap_or_default();
+
+    let forwarded = value.codex_forward_env.as_deref().unwrap_or_default();
+    let mut names = BTreeSet::new();
+    for name in forwarded {
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && name
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric());
+        if !valid || !names.insert(name.as_str()) {
+            return Err("codex_forward_env names must be valid and unique".to_string());
+        }
+        if name.starts_with("CODEX_") || name == "BAMBOO_CODEX_PROVIDER_KEY" {
+            return Err("codex_forward_env may not override reserved Codex variables".to_string());
+        }
+    }
+    let forwards_openai = names.contains("OPENAI_API_KEY");
+    if mode == crate::CodexAuthMode::ApiKey && !forwards_openai {
+        return Err("api_key auth requires OPENAI_API_KEY in codex_forward_env".to_string());
+    }
+    if mode != crate::CodexAuthMode::ApiKey && forwards_openai {
+        return Err("OPENAI_API_KEY may only be forwarded in api_key auth mode".to_string());
+    }
+
+    match mode {
+        crate::CodexAuthMode::Custom => {
+            let raw = value
+                .codex_base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .ok_or_else(|| "custom auth requires codex_base_url".to_string())?;
+            let parsed = url::Url::parse(raw)
+                .map_err(|_| "codex_base_url must be an absolute HTTP(S) URL".to_string())?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err("codex_base_url must be an absolute HTTP(S) URL".to_string());
+            }
+            if !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(
+                    "codex_base_url must not contain credentials, query parameters, or a fragment"
+                        .to_string(),
+                );
+            }
+            if value.codex_provider_key_ref.is_none() {
+                return Err("custom auth requires codex_provider_key_ref".to_string());
+            }
+        }
+        crate::CodexAuthMode::Inherit
+        | crate::CodexAuthMode::ApiKey
+        | crate::CodexAuthMode::Bamboo => {
+            if value
+                .codex_base_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty())
+            {
+                return Err("codex_base_url is only valid in custom auth mode".to_string());
+            }
+            if value.codex_provider_key_ref.is_some() {
+                return Err("codex_provider_key_ref is only valid in custom auth mode".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_external_broker_endpoint(raw: &str) -> Result<(), String> {
@@ -4392,6 +4477,62 @@ mod tests {
 
     fn write_json(path: &Path, value: &Value) {
         std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn codex_auth_mode_matrix_validation_fails_closed() {
+        let dormant_invalid = SubagentsConfig {
+            codex_auth_mode: Some(crate::CodexAuthMode::Custom),
+            codex_base_url: Some("not a URL".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_codex_subagents_config(&dormant_invalid)
+            .unwrap_err()
+            .contains("absolute HTTP(S) URL"));
+
+        let mut config = SubagentsConfig {
+            executor: Some("codex".to_string()),
+            ..Default::default()
+        };
+
+        // Unset means Bamboo-as-provider; it needs no persisted URL or secret.
+        assert!(validate_codex_subagents_config(&config).is_ok());
+
+        config.codex_auth_mode = Some(crate::CodexAuthMode::ApiKey);
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("requires OPENAI_API_KEY"));
+        config.codex_forward_env = Some(vec!["OPENAI_API_KEY".to_string()]);
+        assert!(validate_codex_subagents_config(&config).is_ok());
+
+        config.codex_auth_mode = Some(crate::CodexAuthMode::Inherit);
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("only be forwarded"));
+        config.codex_forward_env = Some(vec!["CODEX_HOME".to_string()]);
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("reserved Codex variables"));
+
+        config.codex_auth_mode = Some(crate::CodexAuthMode::Custom);
+        config.codex_forward_env = None;
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("requires codex_base_url"));
+        config.codex_base_url = Some("https://provider.example/v1".to_string());
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("requires codex_provider_key_ref"));
+        config.codex_provider_key_ref = Some(
+            crate::CredentialRef::parse("provider.codex.api_key")
+                .expect("valid credential reference"),
+        );
+        assert!(validate_codex_subagents_config(&config).is_ok());
+
+        config.codex_base_url = Some("https://user:secret@provider.example/v1?leak=1".to_string());
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("must not contain credentials"));
     }
 
     fn directory_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {

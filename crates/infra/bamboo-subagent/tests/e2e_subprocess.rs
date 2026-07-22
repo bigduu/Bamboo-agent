@@ -46,6 +46,7 @@ async fn spawn_discover_run_stream_terminal() {
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            secrets: Default::default(),
         }))
         .await
         .unwrap();
@@ -115,6 +116,7 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();

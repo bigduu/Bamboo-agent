@@ -3,7 +3,7 @@ mod output;
 mod prepare;
 mod stream;
 
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 
 use crate::{app_state::AppState, error::AppError};
 
@@ -19,17 +19,23 @@ pub(super) struct PreparedResponsesRequest {
     pub(super) parallel_tool_calls: Option<bool>,
     pub(super) responses_options: bamboo_llm::provider::ResponsesRequestOptions,
     pub(super) estimated_prompt_tokens: u64,
+    pub(super) request_session_id: Option<String>,
 }
 
 pub async fn responses_create(
     app_state: web::Data<AppState>,
+    http_request: HttpRequest,
     req: web::Json<ResponsesCreateRequest>,
 ) -> Result<HttpResponse, AppError> {
     let request = req.into_inner();
     let stream = request.stream.unwrap_or(false);
     let forward_id = uuid::Uuid::new_v4().to_string();
 
-    let prepared = prepare::prepare_request(&app_state, request).await?;
+    let mut prepared = prepare::prepare_request(&app_state, request).await?;
+    prepared.request_session_id = http_request
+        .extensions()
+        .get::<crate::codex_run_tokens::CodexRunAuthContext>()
+        .map(|context| context.session_id.clone());
 
     if stream {
         stream::handle_streaming_response(app_state, prepared, forward_id).await

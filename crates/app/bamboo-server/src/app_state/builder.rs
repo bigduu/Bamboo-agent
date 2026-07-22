@@ -557,12 +557,15 @@ impl AppState {
                 provider_router.clone(),
             ),
         );
-        let external_runner = bamboo_engine::external_agents::runtime::build_external_child_runner_with_registry_and_reviewer(
-            &config_snapshot,
-            Some(approval_registry.clone()),
-            Some(parent_approval_reviewer),
-            permission_checker.permission_config(),
-        );
+        let codex_run_tokens = Arc::new(crate::codex_run_tokens::CodexRunTokenRegistry::default());
+        let external_runner =
+            bamboo_engine::external_agents::runtime::build_external_child_runner_with_codex_tokens(
+                &config_snapshot,
+                Some(approval_registry.clone()),
+                Some(parent_approval_reviewer),
+                permission_checker.permission_config(),
+                Some(codex_run_tokens.clone()),
+            );
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
@@ -886,6 +889,7 @@ impl AppState {
             pairing_codes: Arc::new(dashmap::DashMap::new()),
             pairing_code_guard: Arc::new(crate::handlers::settings::PairingCodeGuard::default()),
             root_password_guard: Arc::new(crate::handlers::settings::RootPasswordGuard::default()),
+            codex_run_tokens,
             // remote-actor P2a (#181): empty in-memory agent registry.
         })
     }

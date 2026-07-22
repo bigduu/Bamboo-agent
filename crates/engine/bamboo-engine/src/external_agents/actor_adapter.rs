@@ -57,6 +57,83 @@ const POOLED_IDLE_TIMEOUT_SECS: u64 = 300;
 /// a slow-but-healthy cold start.
 const WORKER_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Plaintext token returned once by the server authority for one Codex run.
+/// `token_id` is non-secret and is the handle used for guaranteed revocation.
+pub struct IssuedCodexRunToken {
+    pub token_id: String,
+    pub token: String,
+}
+
+/// Server-owned authority for Bamboo-as-provider Codex credentials. The engine
+/// only needs mint/revoke; verification remains inside the HTTP server.
+pub trait CodexRunTokenAuthority: Send + Sync + 'static {
+    fn issue(&self, session_id: &str) -> Result<IssuedCodexRunToken, String>;
+    fn revoke(&self, token_id: &str);
+}
+
+struct CodexRunTokenGuard {
+    authority: Arc<dyn CodexRunTokenAuthority>,
+    token_id: String,
+}
+
+impl Drop for CodexRunTokenGuard {
+    fn drop(&mut self) {
+        self.authority.revoke(&self.token_id);
+    }
+}
+
+fn executor_uses_bamboo_codex(executor: &ExecutorSpec) -> bool {
+    matches!(
+        executor,
+        ExecutorSpec::Codex {
+            auth_mode: Some(mode),
+            ..
+        } if mode == "bamboo"
+    ) || matches!(
+        executor,
+        ExecutorSpec::Codex {
+            auth_mode: None,
+            inherit_user_config,
+            ..
+        } if !inherit_user_config.unwrap_or(false)
+    )
+}
+
+fn build_codex_run_secrets(
+    executor: &ExecutorSpec,
+    authority: Option<Arc<dyn CodexRunTokenAuthority>>,
+    child_session_id: &str,
+) -> Result<
+    (
+        bamboo_subagent::proto::RunSecrets,
+        Option<CodexRunTokenGuard>,
+    ),
+    AgentError,
+> {
+    if !executor_uses_bamboo_codex(executor) {
+        return Ok((bamboo_subagent::proto::RunSecrets::default(), None));
+    }
+
+    let authority = authority.ok_or_else(|| {
+        AgentError::LLM(
+            "Codex auth mode 'bamboo' requires the server per-run token authority".to_string(),
+        )
+    })?;
+    let issued = authority
+        .issue(child_session_id)
+        .map_err(|error| AgentError::LLM(format!("mint Codex per-run provider token: {error}")))?;
+    let guard = CodexRunTokenGuard {
+        authority,
+        token_id: issued.token_id,
+    };
+    Ok((
+        bamboo_subagent::proto::RunSecrets {
+            codex_provider_token: Some(bamboo_subagent::proto::SecretValue::new(issued.token)),
+        },
+        Some(guard),
+    ))
+}
+
 /// A warm worker on the mailbox bus, parked for reuse between runs. It stays
 /// dialed-in + subscribed to `mailbox_id`; the next interchangeable child
 /// delivers its `Run` there instead of spawning a fresh process. Dropping it
@@ -176,6 +253,8 @@ pub struct ActorChildRunner {
     /// workers instead of all landing on the first candidate. Best-effort spread,
     /// not a load balancer — the registry's live set can change between picks.
     schedule_cursor: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Optional server authority used only by `Codex` in `bamboo` auth mode.
+    codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -279,6 +358,7 @@ impl ActorChildRunner {
             remote_placements: HashMap::new(),
             schedulable_placements: HashMap::new(),
             schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            codex_run_tokens: None,
         }
     }
 
@@ -316,6 +396,14 @@ impl ActorChildRunner {
 
     pub fn with_approval_reviewer(mut self, reviewer: Arc<dyn ChildApprovalReviewer>) -> Self {
         self.approval_reviewer = Some(reviewer);
+        self
+    }
+
+    pub fn with_codex_run_tokens(
+        mut self,
+        authority: Option<Arc<dyn CodexRunTokenAuthority>>,
+    ) -> Self {
+        self.codex_run_tokens = authority;
         self
     }
 
@@ -490,21 +578,61 @@ impl ActorChildRunner {
                 })
             });
         spec.disabled_tools = job.disabled_tools.clone();
-        // Least-privilege secrets: only the credential for the child's provider.
-        let provider = spec
-            .model
-            .as_ref()
-            .map(|m| m.provider.as_str())
-            .filter(|p| !p.trim().is_empty())
-            .unwrap_or(&self.default_provider);
-        if let Some(cred) = self.credentials.iter().find(|c| c.provider == provider) {
-            spec.secrets.provider_credentials.push(cred.clone());
-        } else {
-            tracing::warn!(
-                "actor child {}: no credential found for provider '{}'",
-                job.child_session_id,
-                provider
-            );
+        match &spec.executor {
+            // Codex auth is independent of the session's normal Bamboo model
+            // provider. Inherit/API-key/Bamboo modes need no credential-store
+            // secret at provisioning; custom mode gets exactly its referenced
+            // key. This prevents an unrelated upstream provider key from
+            // reaching a Codex worker that only needs a per-run bcx1_ token.
+            ExecutorSpec::Codex {
+                auth_mode,
+                provider_key_ref,
+                ..
+            } => {
+                if auth_mode.as_deref() == Some("custom") {
+                    if let Some(reference) = provider_key_ref {
+                        if let Some(credential) = self.credentials.iter().find(|credential| {
+                            credential.credential_ref.as_deref() == Some(reference)
+                        }) {
+                            spec.secrets.provider_credentials.push(credential.clone());
+                        } else {
+                            tracing::warn!(
+                                "actor child {}: custom Codex credential reference '{}' did not resolve",
+                                job.child_session_id,
+                                reference
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "actor child {}: custom Codex executor has no credential reference",
+                            job.child_session_id
+                        );
+                    }
+                }
+            }
+            // Other executors keep the existing least-privilege contract: only
+            // the credential for the child session's selected provider.
+            _ => {
+                let provider = spec
+                    .model
+                    .as_ref()
+                    .map(|model| model.provider.as_str())
+                    .filter(|provider| !provider.trim().is_empty())
+                    .unwrap_or(&self.default_provider);
+                if let Some(credential) = self
+                    .credentials
+                    .iter()
+                    .find(|credential| credential.provider == provider)
+                {
+                    spec.secrets.provider_credentials.push(credential.clone());
+                } else {
+                    tracing::warn!(
+                        "actor child {}: no credential found for provider '{}'",
+                        job.child_session_id,
+                        provider
+                    );
+                }
+            }
         }
         // Phase 6 (direct nested execution): a worker BELOW the depth cap may
         // orchestrate its OWN children — on startup it builds its own spawn
@@ -701,6 +829,18 @@ impl ExternalChildRunner for ActorChildRunner {
             spec.limits.idle_timeout_secs = Some(POOLED_IDLE_TIMEOUT_SECS);
         }
         let pool_key = Self::fingerprint(&spec);
+
+        // The recommended provider URL is deliberately parent-loopback. A
+        // resident remote worker would interpret 127.0.0.1 as itself, not this
+        // server, so reject that ambiguous deployment instead of minting a
+        // credential that can never authenticate to the intended parent.
+        if executor_uses_bamboo_codex(&spec.executor) && !matches!(spec.placement, Placement::Local)
+        {
+            return Err(AgentError::LLM(
+                "Codex auth mode 'bamboo' requires local actor placement; use custom mode with a reachable URL for remote workers"
+                    .to_string(),
+            ));
+        }
         // Rehydration: the child session in the parent's store is the actor's
         // durable state. Ship the full conversation so a reactivation
         // (send_message / update / rerun) carries its history. A reused worker is
@@ -740,6 +880,18 @@ impl ExternalChildRunner for ActorChildRunner {
             .acquire()
             .await
             .map_err(|_| AgentError::LLM("actor concurrency limiter closed".to_string()))?;
+
+        // Bamboo-as-provider credentials are minted at the activation boundary,
+        // after backpressure admits the run and never at worker provisioning.
+        // This is load-bearing for warm workers: a parked process must never
+        // retain a token from its previous run. The guard revokes on every return
+        // path (success, error, cancellation, dispatch failure, or first-frame
+        // retry exhaustion).
+        let (run_secrets, _codex_token_guard) = build_codex_run_secrets(
+            &spec.executor,
+            self.codex_run_tokens.clone(),
+            &job.child_session_id,
+        )?;
 
         // Split LOCAL (spawn + warm-pool) from the two process-less remote paths
         // ONLY at the divergent spots — acquire/connect here and the park/retire at
@@ -920,6 +1072,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     reasoning_effort: None,
                     permission_policy: permission_policy.clone(),
                     messages: messages.clone(),
+                    secrets: run_secrets.clone(),
                 }))
                 .await
             {
@@ -1297,6 +1450,262 @@ fn extract_assignment(session: &Session) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingCodexTokenAuthority {
+        issued_for: std::sync::Mutex<Vec<String>>,
+        revoked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CodexRunTokenAuthority for RecordingCodexTokenAuthority {
+        fn issue(&self, session_id: &str) -> Result<IssuedCodexRunToken, String> {
+            self.issued_for
+                .lock()
+                .expect("issued fixture lock")
+                .push(session_id.to_string());
+            Ok(IssuedCodexRunToken {
+                token_id: format!("id-{session_id}"),
+                token: format!("bcx1_secret-{session_id}"),
+            })
+        }
+
+        fn revoke(&self, token_id: &str) {
+            self.revoked
+                .lock()
+                .expect("revoked fixture lock")
+                .push(token_id.to_string());
+        }
+    }
+
+    fn codex_executor(auth_mode: Option<&str>, inherit_user_config: Option<bool>) -> ExecutorSpec {
+        let bamboo_mode = auth_mode == Some("bamboo")
+            || (auth_mode.is_none() && !inherit_user_config.unwrap_or(false));
+        ExecutorSpec::Codex {
+            binary: None,
+            model: None,
+            sandbox: None,
+            inherit_user_config,
+            auth_mode: auth_mode.map(str::to_string),
+            base_url: bamboo_mode.then(|| "http://127.0.0.1:9562/openai/v1".to_string()),
+            wire_api: Some("responses".to_string()),
+            provider_key_ref: None,
+            forward_env: None,
+        }
+    }
+
+    #[test]
+    fn bamboo_codex_token_is_per_run_redacted_and_revoked_on_guard_drop() {
+        let authority = Arc::new(RecordingCodexTokenAuthority::default());
+        let authority_dyn: Arc<dyn CodexRunTokenAuthority> = authority.clone();
+
+        let (secrets, guard) = build_codex_run_secrets(
+            &codex_executor(Some("bamboo"), None),
+            Some(authority_dyn),
+            "child-570",
+        )
+        .unwrap();
+
+        let token = secrets
+            .codex_provider_token
+            .as_ref()
+            .expect("bamboo mode mints a token");
+        assert_eq!(token.expose(), "bcx1_secret-child-570");
+        assert!(!format!("{token:?}").contains("secret-child-570"));
+        assert_eq!(
+            authority.issued_for.lock().unwrap().as_slice(),
+            ["child-570"]
+        );
+        assert!(authority.revoked.lock().unwrap().is_empty());
+
+        drop(guard);
+        assert_eq!(
+            authority.revoked.lock().unwrap().as_slice(),
+            ["id-child-570"]
+        );
+    }
+
+    #[test]
+    fn non_bamboo_codex_never_mints_and_bamboo_fails_closed_without_authority() {
+        let authority = Arc::new(RecordingCodexTokenAuthority::default());
+        let authority_dyn: Arc<dyn CodexRunTokenAuthority> = authority.clone();
+        let (secrets, guard) = build_codex_run_secrets(
+            &codex_executor(Some("custom"), None),
+            Some(authority_dyn),
+            "child-custom",
+        )
+        .unwrap();
+        assert!(secrets.codex_provider_token.is_none());
+        assert!(guard.is_none());
+        assert!(authority.issued_for.lock().unwrap().is_empty());
+
+        let error = build_codex_run_secrets(
+            &codex_executor(Some("bamboo"), None),
+            None,
+            "child-no-authority",
+        )
+        .err()
+        .expect("bamboo mode without an authority must fail closed");
+        assert!(error.to_string().contains("per-run token authority"));
+    }
+
+    #[test]
+    fn codex_provisioning_never_leaks_the_session_provider_credential() {
+        let credentials = vec![ScopedCredential {
+            provider: "openai".to_string(),
+            api_key: "upstream-secret-must-not-cross".to_string(),
+            base_url: None,
+            provider_type: Some("openai".to_string()),
+            credential_ref: Some("provider.openai.api_key".to_string()),
+        }];
+
+        for (mode, label) in [
+            (Some("inherit"), "inherit"),
+            (Some("api_key"), "api_key"),
+            (Some("bamboo"), "bamboo"),
+            (None, "default-bamboo"),
+        ] {
+            let runner = ActorChildRunner::new(
+                format!("codex-{label}-test"),
+                PathBuf::from("/bin/false"),
+                Vec::new(),
+                std::env::temp_dir().join(format!("bamboo-codex-{label}-570")),
+                codex_executor(mode, None),
+                credentials.clone(),
+                "openai".to_string(),
+                1,
+            );
+            let mut session = Session::new(format!("child-{label}"), "model");
+            session.add_message(bamboo_agent_core::Message::user("test"));
+            let spec = runner.build_spec(
+                &session,
+                &crate::runtime::execution::SpawnJob {
+                    parent_session_id: "parent".to_string(),
+                    child_session_id: format!("child-{label}"),
+                    model: "gpt-5.4".to_string(),
+                    disabled_tools: None,
+                },
+            );
+            assert!(
+                spec.secrets.provider_credentials.is_empty(),
+                "{label} Codex must not receive the session provider key"
+            );
+        }
+    }
+
+    #[test]
+    fn non_codex_provisioning_still_receives_only_its_selected_provider_credential() {
+        let credentials = vec![
+            ScopedCredential {
+                provider: "openai".to_string(),
+                api_key: "selected-openai-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.openai.api_key".to_string()),
+            },
+            ScopedCredential {
+                provider: "other".to_string(),
+                api_key: "unrelated-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.other.api_key".to_string()),
+            },
+        ];
+        let runner = ActorChildRunner::new(
+            "echo-test".to_string(),
+            PathBuf::from("/bin/false"),
+            Vec::new(),
+            std::env::temp_dir().join("bamboo-echo-provider-570"),
+            ExecutorSpec::Echo,
+            credentials,
+            "openai".to_string(),
+            1,
+        );
+        let spec = runner.build_spec(
+            &Session::new("child-echo", "model"),
+            &crate::runtime::execution::SpawnJob {
+                parent_session_id: "parent".to_string(),
+                child_session_id: "child-echo".to_string(),
+                model: "gpt-5.4".to_string(),
+                disabled_tools: None,
+            },
+        );
+
+        assert_eq!(spec.secrets.provider_credentials.len(), 1);
+        assert_eq!(
+            spec.secrets.provider_credentials[0].api_key,
+            "selected-openai-secret"
+        );
+    }
+
+    #[test]
+    fn custom_codex_provisioning_scopes_only_the_referenced_credential() {
+        let mut executor = codex_executor(Some("custom"), None);
+        if let ExecutorSpec::Codex {
+            base_url,
+            provider_key_ref,
+            ..
+        } = &mut executor
+        {
+            *base_url = Some("https://provider.example/v1".to_string());
+            *provider_key_ref = Some("provider.custom.api_key".to_string());
+        }
+        let credentials = vec![
+            ScopedCredential {
+                provider: "openai".to_string(),
+                api_key: "session-provider-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.openai.api_key".to_string()),
+            },
+            ScopedCredential {
+                provider: "custom".to_string(),
+                api_key: "selected-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.custom.api_key".to_string()),
+            },
+            ScopedCredential {
+                provider: "other".to_string(),
+                api_key: "unrelated-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.other.api_key".to_string()),
+            },
+        ];
+        let runner = ActorChildRunner::new(
+            "codex-test".to_string(),
+            PathBuf::from("/bin/false"),
+            Vec::new(),
+            std::env::temp_dir().join("bamboo-codex-570"),
+            executor,
+            credentials,
+            "openai".to_string(),
+            1,
+        );
+        let mut session = Session::new("child-custom", "model");
+        session.add_message(bamboo_agent_core::Message::user("test"));
+        let spec = runner.build_spec(
+            &session,
+            &crate::runtime::execution::SpawnJob {
+                parent_session_id: "parent".to_string(),
+                child_session_id: "child-custom".to_string(),
+                model: "gpt-5.4".to_string(),
+                disabled_tools: None,
+            },
+        );
+
+        assert_eq!(spec.secrets.provider_credentials.len(), 1);
+        assert_eq!(
+            spec.secrets.provider_credentials[0]
+                .credential_ref
+                .as_deref(),
+            Some("provider.custom.api_key")
+        );
+        assert_eq!(
+            spec.secrets.provider_credentials[0].api_key,
+            "selected-secret"
+        );
+    }
 
     fn spec_with(
         role: &str,

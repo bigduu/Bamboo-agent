@@ -2,7 +2,7 @@
 
 Status: **implemented** — `ClaudeCodeExecutor` lives at `src/claude_code_executor.rs`
 and is selected via `subagents.executor = "claude_code"` (see the [config
-reference](config-reference.md#sub-agents--the-claude_code-executor) for the
+reference](config-reference.md#sub-agents--external-cli-executors) for the
 user-facing config surface). This doc is kept as protocol-reference detail for
 anyone touching/extending the executor itself — the original design record.
 Source: distilled from `chenhg5/cc-connect` `agent/claudecode/` (Go, battle-tested against

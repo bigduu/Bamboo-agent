@@ -188,22 +188,38 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                 ref model,
                 ref sandbox,
                 ref inherit_user_config,
+                ref auth_mode,
+                ref base_url,
+                ref wire_api,
+                ref provider_key_ref,
                 ref forward_env,
-            } => Arc::new(
-                crate::codex_cli_executor::CodexExecutor::new(
-                    binary.clone(),
-                    model.clone(),
-                    sandbox.clone(),
-                    spec.workspace.clone(),
-                    Some(crate::codex_cli_executor::resolve_codex_state_dir(
-                        &spec.storage_dir,
-                        &spec.identity.child_id,
-                    )),
+            } => {
+                let forward_env = forward_env.clone().unwrap_or_default();
+                let auth = crate::codex_cli_executor::resolve_codex_auth_config(
+                    auth_mode.as_deref(),
                     inherit_user_config.unwrap_or(false),
-                    forward_env.clone().unwrap_or_default(),
+                    base_url.clone(),
+                    wire_api.clone(),
+                    provider_key_ref.as_deref(),
+                    &spec.secrets.provider_credentials,
+                    &forward_env,
+                )?;
+                Arc::new(
+                    crate::codex_cli_executor::CodexExecutor::new(
+                        binary.clone(),
+                        model.clone(),
+                        sandbox.clone(),
+                        spec.workspace.clone(),
+                        Some(crate::codex_cli_executor::resolve_codex_state_dir(
+                            &spec.storage_dir,
+                            &spec.identity.child_id,
+                        )),
+                        forward_env,
+                        auth,
+                    )
+                    .await?,
                 )
-                .await?,
-            ),
+            }
             _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
         };
         return bamboo_broker::serve_executor_full(

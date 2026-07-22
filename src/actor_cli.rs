@@ -296,6 +296,7 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            secrets: Default::default(),
         }))
         .await
         .map_err(|e| format!("dispatch failed: {e}"))?;

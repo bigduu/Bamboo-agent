@@ -639,6 +639,7 @@ where
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: prior,
+                secrets: Default::default(),
             },
             sink,
             SteerInbox::disconnected(),
@@ -1229,6 +1230,7 @@ mod tests {
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
+            secrets: Default::default(),
         };
         let run = InboxMessage {
             id: MsgId::new(),

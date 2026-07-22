@@ -42,6 +42,45 @@ pub struct RunSpec {
     /// across one-shot actor processes. Empty = first activation, no history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<serde_json::Value>,
+    /// Secrets minted for this activation only. They are delivered in-memory
+    /// over the actor transport and must never be persisted by the worker.
+    #[serde(default, skip_serializing_if = "RunSecrets::is_empty")]
+    pub secrets: RunSecrets,
+}
+
+/// Per-activation secret envelope. A Bamboo-routed Codex token lives here so a
+/// warm worker never reuses a credential from an earlier run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunSecrets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_provider_token: Option<SecretValue>,
+}
+
+impl RunSecrets {
+    pub fn is_empty(&self) -> bool {
+        self.codex_provider_token.is_none()
+    }
+}
+
+/// Serializable secret whose debug representation is always redacted.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValue(String);
+
+impl SecretValue {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretValue([REDACTED])")
+    }
 }
 
 /// Host-computed permission state for one actor activation. The policy payload
@@ -148,6 +187,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }),
             ParentFrame::Cancel,
             ParentFrame::Message { text: "hi".into() },
@@ -204,10 +244,37 @@ mod tests {
             reasoning_effort: Some("high".into()),
             permission_policy: None,
             messages: Vec::new(),
+            secrets: Default::default(),
         });
         let v: serde_json::Value = serde_json::from_str(&f.to_text()).unwrap();
         assert_eq!(v["kind"], "run");
         assert_eq!(v["assignment"], "a");
+        assert!(v.get("secrets").is_none());
+    }
+
+    #[test]
+    fn run_secret_round_trips_but_debug_output_is_redacted() {
+        let secret = SecretValue::new("bcx1_secret-570");
+        assert_eq!(format!("{secret:?}"), "SecretValue([REDACTED])");
+        assert!(!format!(
+            "{:?}",
+            RunSecrets {
+                codex_provider_token: Some(secret.clone()),
+            }
+        )
+        .contains("secret-570"));
+
+        let frame = ParentFrame::Run(RunSpec {
+            assignment: "a".into(),
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: Vec::new(),
+            secrets: RunSecrets {
+                codex_provider_token: Some(secret),
+            },
+        });
+        let decoded = ParentFrame::from_text(&frame.to_text()).unwrap();
+        assert_eq!(decoded, frame);
     }
 
     #[test]
@@ -225,6 +292,7 @@ mod tests {
             reasoning_effort: None,
             permission_policy: Some(context.clone()),
             messages: Vec::new(),
+            secrets: Default::default(),
         });
         let decoded = ParentFrame::from_text(&frame.to_text()).unwrap();
         assert_eq!(decoded, frame);

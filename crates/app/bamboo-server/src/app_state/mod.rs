@@ -437,6 +437,11 @@ pub struct AppState {
     /// so the desktop can never lock itself out. PROCESS-EPHEMERAL — never
     /// persisted; a restart clears all counters.
     pub root_password_guard: Arc<crate::handlers::settings::RootPasswordGuard>,
+
+    /// Process-ephemeral credentials for Codex children that route model calls
+    /// through this server. Tokens are hashed in memory and revoked at the end
+    /// of their owning actor activation.
+    pub(crate) codex_run_tokens: Arc<crate::codex_run_tokens::CodexRunTokenRegistry>,
 }
 
 impl AppState {

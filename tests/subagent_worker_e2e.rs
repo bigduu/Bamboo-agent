@@ -54,6 +54,7 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            secrets: Default::default(),
         }))
         .await
         .unwrap();
