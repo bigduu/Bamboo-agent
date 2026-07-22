@@ -25,6 +25,10 @@ pub fn create_schedule_session(
     );
 
     let mut session = Session::new(session_id.clone(), model.to_string());
+    session.metadata.insert(
+        bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY.to_string(),
+        "startup".to_string(),
+    );
     session.title = title;
     session.metadata.insert(
         "created_by_schedule_id".to_string(),

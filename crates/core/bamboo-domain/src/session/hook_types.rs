@@ -19,7 +19,10 @@ pub enum HookPayload {
     #[default]
     None,
     /// Session initialization completed for this user turn.
-    SessionSetup { initial_message: String },
+    SessionSetup {
+        initial_message: String,
+        source: SessionStartSource,
+    },
     /// A round is about to start or has just completed.
     Round { round: u32 },
     /// A prompt-oriented hook payload reserved for prompt/LLM seams.
@@ -43,7 +46,31 @@ pub enum HookPayload {
         phase: String,
     },
     /// The run is about to emit its terminal completion event.
-    Finalize,
+    Finalize { stop_hook_active: bool },
+    /// The run reached a terminal status and is about to be persisted.
+    SessionEnd {
+        status: SessionEndStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_reason: Option<String>,
+    },
+}
+
+/// Why a `SessionStart` hook is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartSource {
+    #[default]
+    Startup,
+    Resume,
+}
+
+/// Terminal status exposed to `SessionEnd` hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEndStatus {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 /// Engine-independent view of a tool execution outcome.
@@ -68,6 +95,7 @@ pub enum AgentHookPoint {
     BeforeSessionSetup,
     AfterSessionSetup,
     BeforeFinalize,
+    AfterSessionEnd,
 
     // Round-level
     BeforeRound,
@@ -140,6 +168,7 @@ mod tests {
             AgentHookPoint::BeforeSessionSetup,
             AgentHookPoint::AfterSessionSetup,
             AgentHookPoint::BeforeFinalize,
+            AgentHookPoint::AfterSessionEnd,
             AgentHookPoint::BeforeRound,
             AgentHookPoint::AfterRound,
             AgentHookPoint::BeforePromptAssembly,

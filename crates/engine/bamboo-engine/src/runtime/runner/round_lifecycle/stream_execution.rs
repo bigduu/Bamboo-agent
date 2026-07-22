@@ -11,7 +11,7 @@ use crate::runtime::runner::prompt_context::{
     strip_existing_task_list,
 };
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    assemble_prompt_envelope, build_active_workflow_context_block,
+    assemble_prompt_envelope, build_active_workflow_context_block, build_agent_hook_context_block,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_plan_mode_context_block, build_plan_runtime_context_block,
     build_task_list_context_block,
@@ -302,6 +302,9 @@ fn build_request_envelope(
     // NOT injected into the system message — so a goal change never invalidates
     // the cached system prefix (goal-leak fix).
     if let Some(block) = build_goal_context_block(config.active_goal()) {
+        volatile_blocks.push(block);
+    }
+    if let Some(block) = build_agent_hook_context_block(session) {
         volatile_blocks.push(block);
     }
     // Plan runtime + plan mode blocks are built DIRECTLY from session state (the
