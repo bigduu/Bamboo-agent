@@ -11,6 +11,7 @@ use bamboo_agent::codex_cli_executor::{
 };
 use bamboo_subagent::executor::{ChildExecutor, EventSink, SteerInbox};
 use bamboo_subagent::proto::{RunSpec, TerminalStatus};
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -172,4 +173,108 @@ async fn real_workspace_write_denies_outside_write_and_emits_tool_error() {
         events.iter().any(|event| event["type"] == "tool_error"),
         "outside denial was not surfaced as a tool error: {events:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires a logged-in Codex CLI >= 0.144 on PATH"]
+async fn real_codex_second_activation_resumes_and_recalls_native_context() {
+    const NONCE: &str = "BAMBOO_RESUME_572_NONCE_9F3A";
+
+    let workspace = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(workspace.path())
+        .status()
+        .expect("git is installed");
+    assert!(status.success());
+
+    let executor = CodexExecutor::new(
+        None,
+        None,
+        Some(workspace.path().to_string_lossy().into_owned()),
+        Some(state.path().to_path_buf()),
+        Vec::new(),
+        CodexAuthConfig::inherit(),
+        resolve_codex_permission_config(
+            Some("read-only"),
+            Some("never"),
+            false,
+            false,
+            Some("read-only".to_string()),
+            false,
+            false,
+        )
+        .unwrap(),
+    )
+    .await
+    .expect("Codex preflight succeeds");
+
+    let (sink, _events) = EventSink::channel();
+    let first = tokio::time::timeout(
+        Duration::from_secs(180),
+        executor.run(
+            RunSpec {
+                assignment: format!(
+                    "Remember this nonce for the next turn: {NONCE}. Reply with exactly STORED."
+                ),
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: Vec::new(),
+                secrets: Default::default(),
+            },
+            sink,
+            SteerInbox::disconnected(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("first real Codex turn timed out");
+    assert_eq!(first.status, TerminalStatus::Completed, "{first:?}");
+    assert_eq!(first.result.as_deref().map(str::trim), Some("STORED"));
+
+    let state_path = state.path().join("codex-session.json");
+    let first_state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(first_state["thread_id"]
+        .as_str()
+        .is_some_and(|thread_id| !thread_id.is_empty()));
+
+    let current_task = "What exact nonce did I ask you to remember? Reply with that nonce only.";
+    let (sink, mut events) = EventSink::channel();
+    let second = tokio::time::timeout(
+        Duration::from_secs(180),
+        executor.run(
+            RunSpec {
+                assignment: current_task.to_string(),
+                reasoning_effort: None,
+                permission_policy: None,
+                // Deliberately ship only the current message. This keeps the
+                // activation discriminant non-empty but gives fallback
+                // rehydration no copy of NONCE, so only native resume can pass.
+                messages: vec![json!({"role": "user", "content": current_task})],
+                secrets: Default::default(),
+            },
+            sink,
+            SteerInbox::disconnected(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("resumed real Codex turn timed out");
+    assert_eq!(second.status, TerminalStatus::Completed, "{second:?}");
+    assert_eq!(second.result.as_deref().map(str::trim), Some(NONCE));
+
+    let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| event["phase"] == "resume_fallback"),
+        "real resume unexpectedly used fallback: {emitted:?}"
+    );
+    let second_state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(second_state["thread_id"]
+        .as_str()
+        .is_some_and(|thread_id| !thread_id.is_empty()));
 }

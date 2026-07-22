@@ -113,8 +113,49 @@ warning event as well as the bootstrap policy metadata.
 
 For a non-Git workspace, Bamboo adds `--skip-git-repo-check` only when the
 directory is under Bamboo's configured workspace root or a
-`<project>/.bamboo/worktree/...` directory. An arbitrary user-selected
-directory keeps Codex's repository check.
+`<project>/.bamboo/worktree/...` directory carrying the matching Bamboo
+lifecycle ownership marker. Merely imitating that directory shape is not
+enough. An arbitrary user-selected directory keeps Codex's repository check.
+
+## Session identity and resume
+
+Codex transcripts are machine-local. On every `thread.started`, Bamboo writes
+the newest thread id atomically to `<child-state>/codex-session.json`:
+
+```json
+{
+  "thread_id": "...",
+  "workspace": "...",
+  "codex_home_mode": "isolated",
+  "updated_at": "2026-..."
+}
+```
+
+`codex_home_mode` is `inherit` when Codex uses the invoking user's home and
+`isolated` when it uses `<child-state>/codex-home`. A persisted id is usable
+only from the same workspace and home mode; changing either falls back safely
+instead of trying to resume a transcript Codex cannot see.
+
+Activation follows four bounded branches:
+
+1. Empty `RunSpec.messages` means a fresh activation. Bamboo deletes stale
+   state before spawning, so rerun never resumes accidentally.
+2. Non-empty messages plus a usable id invokes
+   `codex exec ... resume <thread_id> -` and sends only the live assignment.
+   Any new id from the resumed process replaces the prior state atomically.
+3. Without a usable id, Bamboo prepends a shared, role-tagged history preamble.
+   The newest ~40 messages are kept within ~24k characters, older entries are
+   dropped with an explicit truncation note, and the trailing current user
+   message is excluded to avoid duplication under `## Current task`.
+4. If a resume process exits before either `turn.started` or `turn.completed`,
+   Bamboo clears the bad id and retries exactly once as a fresh process with
+   that fallback history. Failures after turn progress and failures of the
+   fallback attempt are not retried.
+
+The history renderer and atomic JSON replacement live in `bamboo-subagent` and
+are shared with `ClaudeCodeExecutor`, keeping both adapters' fallback behavior
+identical. Mid-turn steering, multimodal input, and cross-machine resume remain
+out of scope.
 
 ## Isolation and environment policy
 
