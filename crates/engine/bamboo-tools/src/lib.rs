@@ -11,6 +11,7 @@ pub mod guide;
 pub mod orchestrator;
 pub mod output_manager;
 pub mod parallel;
+mod permission_override;
 pub use bamboo_permission as permission;
 pub mod slash_commands;
 #[allow(clippy::module_inception)]
@@ -21,6 +22,9 @@ pub use executor::{BuiltinToolExecutor, BuiltinToolExecutorBuilder};
 
 // Re-export cross-process approval proxy (Phase 2: child → parent delegation)
 pub use approval::{current_approval_proxy, with_approval_proxy, ApprovalAsk, ApprovalProxy};
+pub use permission_override::{
+    current_hook_permission_override, with_hook_permission_override, HookPermissionOverride,
+};
 
 // Re-export tool name utilities
 pub use bamboo_domain::tool_names::{
