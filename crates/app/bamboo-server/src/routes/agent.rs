@@ -106,6 +106,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/runs/active",
             web::get().to(agent::sessions::running_sessions_snapshot),
         )
+        .route(
+            "/subagents/snapshot",
+            web::get().to(agent::subagent_snapshot::handler),
+        )
         .route("/sessions", web::get().to(agent::sessions::list_sessions))
         .route("/sessions", web::post().to(agent::sessions::create_session))
         .route(
