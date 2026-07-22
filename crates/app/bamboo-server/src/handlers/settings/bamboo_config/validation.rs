@@ -1,6 +1,11 @@
 use std::collections::BTreeMap;
 
 use actix_web::{web, HttpResponse};
+use bamboo_config::{
+    LifecycleHookGroup, LifecycleHooksConfig, LIFECYCLE_HOOK_EVENT_NAMES,
+    MAX_LIFECYCLE_HOOK_TIMEOUT_MS, MIN_LIFECYCLE_HOOK_TIMEOUT_MS,
+};
+use regex::Regex;
 use serde_json::Value;
 
 use crate::config_manager;
@@ -28,6 +33,19 @@ pub async fn validate_bamboo_config_patch(
         ));
     }
     config_manager::sanitize_root_patch(&mut patch_obj);
+
+    let lifecycle_schema_issues = patch_obj
+        .get("lifecycle_hooks")
+        .map(validate_lifecycle_hooks_shape)
+        .unwrap_or_default();
+    if !lifecycle_schema_issues.is_empty() {
+        let mut errors = BTreeMap::new();
+        errors.insert("lifecycle_hooks".to_string(), lifecycle_schema_issues);
+        return Ok(HttpResponse::Ok().json(ValidateConfigResponse {
+            valid: false,
+            errors,
+        }));
+    }
 
     let current = app_state.config.read().await.clone();
     let merged = config_manager::build_merged_config(&current, patch_obj.clone())?;
@@ -70,8 +88,185 @@ pub async fn validate_bamboo_config_patch(
         }
     }
 
+    if domains.lifecycle_hooks {
+        for issue in validate_lifecycle_hooks_config(&merged.lifecycle_hooks) {
+            errors
+                .entry("lifecycle_hooks".to_string())
+                .or_default()
+                .push(issue);
+        }
+    }
+
     let valid = errors.values().all(|items| items.is_empty());
     Ok(HttpResponse::Ok().json(ValidateConfigResponse { valid, errors }))
+}
+
+fn issue(path: impl Into<String>, message: impl Into<String>) -> ValidationIssue {
+    ValidationIssue {
+        path: path.into(),
+        message: message.into(),
+    }
+}
+
+/// Validate the JSON shape before deserializing the merged config so serde
+/// failures (notably negative timeouts and missing command fields) are returned
+/// through the endpoint's structured field-error contract instead of a generic
+/// 400 response. Semantic checks run against the typed merged config below.
+fn validate_lifecycle_hooks_shape(value: &Value) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let Some(root) = value.as_object() else {
+        issues.push(issue(
+            "lifecycle_hooks",
+            "lifecycle_hooks must be a JSON object",
+        ));
+        return issues;
+    };
+
+    if let Some(enabled) = root.get("enabled") {
+        if !enabled.is_boolean() {
+            issues.push(issue(
+                "lifecycle_hooks.enabled",
+                "enabled must be a boolean",
+            ));
+        }
+    }
+
+    for (event, groups) in root {
+        if event == "enabled" {
+            continue;
+        }
+        if !LIFECYCLE_HOOK_EVENT_NAMES.contains(&event.as_str()) {
+            issues.push(issue(
+                format!("lifecycle_hooks.{event}"),
+                format!("unknown lifecycle hook event '{event}'"),
+            ));
+            continue;
+        }
+        let Some(groups) = groups.as_array() else {
+            issues.push(issue(
+                format!("lifecycle_hooks.{event}"),
+                "event hooks must be an array",
+            ));
+            continue;
+        };
+        for (group_index, group) in groups.iter().enumerate() {
+            let group_path = format!("lifecycle_hooks.{event}[{group_index}]");
+            let Some(group) = group.as_object() else {
+                issues.push(issue(&group_path, "hook group must be an object"));
+                continue;
+            };
+            if group
+                .get("enabled")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                issues.push(issue(
+                    format!("{group_path}.enabled"),
+                    "enabled must be a boolean",
+                ));
+            }
+            if group
+                .get("matcher")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                issues.push(issue(
+                    format!("{group_path}.matcher"),
+                    "matcher must be a string or null",
+                ));
+            }
+            let Some(hooks) = group.get("hooks") else {
+                continue;
+            };
+            let Some(hooks) = hooks.as_array() else {
+                issues.push(issue(
+                    format!("{group_path}.hooks"),
+                    "hooks must be an array",
+                ));
+                continue;
+            };
+            for (hook_index, hook) in hooks.iter().enumerate() {
+                let hook_path = format!("{group_path}.hooks[{hook_index}]");
+                let Some(hook) = hook.as_object() else {
+                    issues.push(issue(&hook_path, "hook must be an object"));
+                    continue;
+                };
+                match hook.get("type").and_then(Value::as_str) {
+                    Some("command") => {}
+                    Some(other) => issues.push(issue(
+                        format!("{hook_path}.type"),
+                        format!("unsupported lifecycle hook type '{other}'"),
+                    )),
+                    None => issues.push(issue(
+                        format!("{hook_path}.type"),
+                        "hook type must be 'command'",
+                    )),
+                }
+                if !hook.get("command").is_some_and(Value::is_string) {
+                    issues.push(issue(
+                        format!("{hook_path}.command"),
+                        "command must be a string",
+                    ));
+                }
+                if hook
+                    .get("timeout_ms")
+                    .is_some_and(|value| value.as_u64().is_none())
+                {
+                    issues.push(issue(
+                        format!("{hook_path}.timeout_ms"),
+                        "timeout_ms must be a non-negative integer",
+                    ));
+                }
+            }
+        }
+    }
+
+    issues
+}
+
+fn validate_lifecycle_hooks_config(config: &LifecycleHooksConfig) -> Vec<ValidationIssue> {
+    let events: [(&str, &[LifecycleHookGroup]); 8] = [
+        ("SessionStart", &config.session_start),
+        ("UserPromptSubmit", &config.user_prompt_submit),
+        ("PreToolUse", &config.pre_tool_use),
+        ("PostToolUse", &config.post_tool_use),
+        ("Stop", &config.stop),
+        ("SessionEnd", &config.session_end),
+        ("PreCompact", &config.pre_compact),
+        ("Notification", &config.notification),
+    ];
+    let mut issues = Vec::new();
+    for (event, groups) in events {
+        for (group_index, group) in groups.iter().enumerate() {
+            let group_path = format!("lifecycle_hooks.{event}[{group_index}]");
+            if let Some(matcher) = group.matcher.as_deref() {
+                if let Err(error) = Regex::new(matcher) {
+                    issues.push(issue(
+                        format!("{group_path}.matcher"),
+                        format!("invalid matcher regex: {error}"),
+                    ));
+                }
+            }
+            for (hook_index, hook) in group.hooks.iter().enumerate() {
+                let hook_path = format!("{group_path}.hooks[{hook_index}]");
+                if hook.command.trim().is_empty() {
+                    issues.push(issue(
+                        format!("{hook_path}.command"),
+                        "command must not be empty",
+                    ));
+                }
+                if !(MIN_LIFECYCLE_HOOK_TIMEOUT_MS..=MAX_LIFECYCLE_HOOK_TIMEOUT_MS)
+                    .contains(&hook.timeout_ms)
+                {
+                    issues.push(issue(
+                        format!("{hook_path}.timeout_ms"),
+                        format!(
+                            "timeout_ms must be between {MIN_LIFECYCLE_HOOK_TIMEOUT_MS} and {MAX_LIFECYCLE_HOOK_TIMEOUT_MS}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    issues
 }
 
 pub(super) fn provider_validation_issue(

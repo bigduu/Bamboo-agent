@@ -33,3 +33,90 @@ async fn test_validate_config_patch_reports_domain_errors() {
     assert_eq!(result["valid"], false);
     assert!(!result["errors"]["setup"].as_array().unwrap().is_empty());
 }
+
+#[actix_web::test]
+async fn test_validate_lifecycle_hooks_reports_structured_field_errors() {
+    let state = crate::e2e::common::create_test_app().await;
+    let app = test::init_service(App::new().app_data(state).configure(configure_routes)).await;
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/v1/bamboo/config/validate")
+            .set_json(json!({
+                "lifecycle_hooks": {
+                    "enabled": true,
+                    "PreToolUse": [{
+                        "matcher": "[",
+                        "hooks": [{"type": "command", "command": "   ", "timeout_ms": 0}]
+                    }],
+                    "SessionEnd": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "echo done",
+                            "timeout_ms": bamboo_config::MAX_LIFECYCLE_HOOK_TIMEOUT_MS + 1
+                        }]
+                    }]
+                }
+            }))
+            .to_request(),
+    )
+    .await;
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["valid"], false);
+    let paths = body["errors"]["lifecycle_hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|issue| issue["path"].as_str())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&"lifecycle_hooks.PreToolUse[0].matcher"));
+    assert!(paths.contains(&"lifecycle_hooks.PreToolUse[0].hooks[0].command"));
+    assert!(paths.contains(&"lifecycle_hooks.PreToolUse[0].hooks[0].timeout_ms"));
+    assert!(paths.contains(&"lifecycle_hooks.SessionEnd[0].hooks[0].timeout_ms"));
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/v1/bamboo/config/validate")
+            .set_json(json!({
+                "lifecycle_hooks": {"BeforeEverything": []}
+            }))
+            .to_request(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["valid"], false);
+    assert_eq!(
+        body["errors"]["lifecycle_hooks"][0]["path"],
+        "lifecycle_hooks.BeforeEverything"
+    );
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/v1/bamboo/config/validate")
+            .set_json(json!({
+                "lifecycle_hooks": {
+                    "PreToolUse": [{
+                        "hooks": [{"type": "command", "command": "echo ok", "timeout_ms": -1}]
+                    }]
+                }
+            }))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        response.status().is_success(),
+        "shape errors use the structured response"
+    );
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["valid"], false);
+    assert_eq!(
+        body["errors"]["lifecycle_hooks"][0]["path"],
+        "lifecycle_hooks.PreToolUse[0].hooks[0].timeout_ms"
+    );
+}

@@ -30,7 +30,9 @@ pub use config::{
 // `crate::runtime::config::AgentLoopConfig`. External code drives the loop only
 // through `AgentRuntime::execute`.
 pub use execution::runner_state::{AgentRunner, AgentStatus};
-pub use hooks::{HookRunner, ShellCommandHook, ShellHookEvent};
+pub use hooks::{
+    test_lifecycle_shell_command, HookRunner, ShellCommandHook, ShellHookEvent, ShellHookTestOutput,
+};
 pub use managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };

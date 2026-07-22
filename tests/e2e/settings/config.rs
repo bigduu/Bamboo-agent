@@ -105,6 +105,83 @@ async fn test_set_bamboo_config() {
 }
 
 #[actix_web::test]
+async fn test_lifecycle_hooks_round_trip_persists_and_reloads() {
+    let state = crate::e2e::common::create_test_app().await;
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .route(
+                "/v1/bamboo/config",
+                web::post().to(settings::set_bamboo_config),
+            )
+            .route(
+                "/v1/bamboo/config",
+                web::get().to(settings::get_bamboo_config),
+            ),
+    )
+    .await;
+    let lifecycle_hooks = json!({
+        "enabled": true,
+        "PreToolUse": [{
+            "enabled": false,
+            "matcher": "^Bash$",
+            "hooks": [{"type": "command", "command": "echo checked", "timeout_ms": 2500}]
+        }],
+        "SessionEnd": [{
+            "hooks": [{"type": "command", "command": "echo complete"}]
+        }]
+    });
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/v1/bamboo/config")
+            .set_json(json!({"lifecycle_hooks": lifecycle_hooks}))
+            .to_request(),
+    )
+    .await;
+    assert!(response.status().is_success());
+
+    let persisted: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(data_dir.join("hooks.json")).expect("hooks.json persisted"),
+    )
+    .unwrap();
+    let persisted = persisted.get("data").unwrap_or(&persisted);
+    assert_eq!(persisted["lifecycle_hooks"]["enabled"], true);
+    assert_eq!(
+        persisted["lifecycle_hooks"]["PreToolUse"][0]["enabled"],
+        false
+    );
+    assert_eq!(
+        persisted["lifecycle_hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "echo checked"
+    );
+
+    let reloaded = state.reload_config().await;
+    assert!(reloaded.lifecycle_hooks.enabled);
+    assert!(!reloaded.lifecycle_hooks.pre_tool_use[0].enabled);
+    assert_eq!(
+        reloaded.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms,
+        2_500
+    );
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/v1/bamboo/config")
+            .to_request(),
+    )
+    .await;
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["lifecycle_hooks"]["PreToolUse"][0]["enabled"], false);
+    assert_eq!(
+        body["lifecycle_hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+        "echo complete"
+    );
+}
+
+#[actix_web::test]
 async fn test_set_bamboo_config_allows_incomplete_provider_config() {
     let state = crate::e2e::common::create_test_app().await;
 

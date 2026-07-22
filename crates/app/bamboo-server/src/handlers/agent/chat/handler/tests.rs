@@ -466,6 +466,7 @@ mod optional_model_e2e {
             config.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
                 enabled: true,
                 user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
+                    enabled: true,
                     matcher: None,
                     hooks: vec![bamboo_config::LifecycleHookCommand {
                         hook_type: bamboo_config::LifecycleHookType::Command,

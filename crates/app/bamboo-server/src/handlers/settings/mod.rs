@@ -8,6 +8,7 @@ mod bamboo_config;
 mod cluster_fabric;
 mod env_vars;
 mod keyword_masking;
+mod lifecycle_hooks;
 mod permission;
 mod provider;
 mod provider_instances;
@@ -39,6 +40,7 @@ pub use env_vars::{delete_env_var, list_env_vars, replace_env_vars, upsert_env_v
 pub use keyword_masking::{
     get_keyword_masking_config, update_keyword_masking_config, validate_keyword_entries,
 };
+pub use lifecycle_hooks::{test_lifecycle_hook, LifecycleHookTestRequest};
 pub use permission::{
     create_permission_rule, delete_permission_rule, diagnose_permission, get_permission_ask_rules,
     get_permission_policy, update_permission_ask_rules, update_permission_rule,

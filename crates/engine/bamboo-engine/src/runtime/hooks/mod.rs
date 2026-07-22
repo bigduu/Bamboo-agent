@@ -12,7 +12,9 @@ use bamboo_domain::{
 use chrono::Utc;
 use tokio::sync::mpsc;
 
-pub use shell_command::{ShellCommandHook, ShellHookEvent};
+pub use shell_command::{
+    test_lifecycle_shell_command, ShellCommandHook, ShellHookEvent, ShellHookTestOutput,
+};
 
 /// Aggregate output from every hook registered at one seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
