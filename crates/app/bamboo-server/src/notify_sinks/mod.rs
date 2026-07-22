@@ -15,6 +15,7 @@
 //! notification must never break an agent run.
 
 mod bark;
+mod command;
 mod desktop;
 mod ntfy;
 
@@ -24,11 +25,12 @@ use bamboo_llm::Config;
 
 /// An owned, sink-agnostic notification payload.
 ///
-/// Deliberately decoupled from `AgentEvent::Notification` (whose fields are
-/// wire-shaped for the SSE/WS client, e.g. carrying a dedup key and a
-/// timestamp sinks have no use for) — see [`SinkNotification::from_event`].
+/// Decoupled from `AgentEvent::Notification` so producers can attach a sink-only
+/// click URL. Delivery metadata is retained because command hooks receive the
+/// complete classified notification — see [`SinkNotification::from_event`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SinkNotification {
+    pub id: Option<String>,
     pub title: String,
     pub body: String,
     /// Stable wire category, e.g. `"needs_approval"`, `"run_completed"` (see
@@ -38,8 +40,10 @@ pub struct SinkNotification {
     /// `bamboo_notification::policy::NotificationPriority::as_str`).
     pub priority: String,
     pub session_id: String,
-    /// Deep link to surface in a click-through push notification. Not yet
-    /// populated by any producer — reserved for a future frontend route.
+    pub dedup_key: Option<String>,
+    pub created_at: Option<String>,
+    /// Deep link to surface in a click-through push notification. The explicit
+    /// `Notify` tool populates this when its caller supplies a URL.
     pub click_url: Option<String>,
 }
 
@@ -50,18 +54,24 @@ impl SinkNotification {
     pub fn from_event(event: &bamboo_agent_core::AgentEvent) -> Option<Self> {
         match event {
             bamboo_agent_core::AgentEvent::Notification {
+                id,
                 session_id,
                 category,
                 priority,
                 title,
                 body,
+                dedup_key,
+                created_at,
                 ..
             } => Some(Self {
+                id: Some(id.clone()),
                 title: title.clone(),
                 body: body.clone(),
                 category: category.clone(),
                 priority: priority.clone(),
                 session_id: session_id.clone(),
+                dedup_key: dedup_key.clone(),
+                created_at: Some(created_at.clone()),
                 click_url: None,
             }),
             _ => None,
@@ -95,6 +105,15 @@ pub trait NotificationSink: Send + Sync {
 /// actually exercised.
 pub fn attempted_channels(config: &Config, has_watcher: bool, category: &str) -> Vec<&'static str> {
     let mut channels = Vec::new();
+    if config.lifecycle_hooks.enabled
+        && config
+            .lifecycle_hooks
+            .notification
+            .iter()
+            .any(|group| group.enabled && !group.hooks.is_empty())
+    {
+        channels.push("command");
+    }
     if desktop::desktop_enabled(
         config.notifications.desktop.enabled,
         desktop::is_sidecar_mode(),
@@ -125,6 +144,7 @@ pub fn attempted_channels(config: &Config, has_watcher: bool, category: &str) ->
 pub fn dispatch_to_sinks(config: &Config, has_watcher: bool, notification: &SinkNotification) {
     for channel in attempted_channels(config, has_watcher, &notification.category) {
         match channel {
+            "command" => command::CommandSink::from_config(config).deliver(notification),
             "desktop" => desktop::DesktopSink.deliver(notification),
             "ntfy" => ntfy::NtfySink::from_config(&config.notifications.ntfy).deliver(notification),
             "bark" => bark::BarkSink::from_config(&config.notifications.bark).deliver(notification),
@@ -158,6 +178,9 @@ mod tests {
         assert_eq!(sink.category, "needs_approval");
         assert_eq!(sink.priority, "high");
         assert_eq!(sink.session_id, "sess-1");
+        assert_eq!(sink.id.as_deref(), Some("n1"));
+        assert_eq!(sink.dedup_key.as_deref(), Some("dk"));
+        assert_eq!(sink.created_at.as_deref(), Some("2026-01-01T00:00:00Z"));
         assert_eq!(sink.click_url, None);
     }
 
@@ -184,6 +207,30 @@ mod tests {
         let mut config = Config::default();
         config.notifications.desktop.enabled = Some(false);
         assert!(attempted_channels(&config, false, "custom").is_empty());
+    }
+
+    #[test]
+    fn attempted_channels_reports_enabled_notification_command_hook() {
+        let mut config = Config::default();
+        config.notifications.desktop.enabled = Some(false);
+        config.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+            enabled: true,
+            notification: vec![bamboo_config::LifecycleHookGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![bamboo_config::LifecycleHookCommand {
+                    hook_type: bamboo_config::LifecycleHookType::Command,
+                    command: "true".to_string(),
+                    timeout_ms: bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                }],
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            attempted_channels(&config, false, "custom"),
+            vec!["command"]
+        );
     }
 
     #[test]
@@ -228,7 +275,7 @@ mod tests {
             let names = attempted_channels(&config, false, "custom");
             assert!(names
                 .iter()
-                .all(|c| ["desktop", "ntfy", "bark"].contains(c)));
+                .all(|c| ["command", "desktop", "ntfy", "bark"].contains(c)));
         }
     }
 }

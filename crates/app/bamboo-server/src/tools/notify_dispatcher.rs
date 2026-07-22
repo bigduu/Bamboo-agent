@@ -8,7 +8,7 @@
 //! - re-broadcasts the resulting `AgentEvent::Notification` on the session's
 //!   event channel so connected SSE/WS clients see it, same as the always-on
 //!   relay (`app_state::session_events::ensure_notification_relay`); and
-//! - fans it out to configured delivery sinks (desktop/ntfy/bark) via
+//! - fans it out to configured delivery sinks (command/desktop/ntfy/bark) via
 //!   [`crate::notify_sinks::dispatch_to_sinks`] (WP3), reading the CURRENT
 //!   config so a hot-reloaded topic/token/toggle takes effect immediately.
 //!

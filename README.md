@@ -347,6 +347,7 @@ Zenith is a monorepo, and bamboo is the execution-engine submodule within it.
 **In-module docs:** start at [`docs/README.md`](./docs/README.md) for the full index. Highlights:
 - Getting started: [`docs/guides/GETTING_STARTED.md`](./docs/guides/GETTING_STARTED.md)
 - Configuration reference (every `config.json` key + env vars): [`docs/config-reference.md`](./docs/config-reference.md)
+- Lifecycle command hooks (events, payloads, decisions, examples): [`docs/lifecycle-hooks.md`](./docs/lifecycle-hooks.md)
 - How-to guides: [Connect/IM bridge](./docs/guides/CONNECT.md) · [Plugins](./docs/guides/PLUGINS.md) · [Deploy](./docs/guides/DEPLOY.md)
 - API reference: [`docs/guides/API.md`](./docs/guides/API.md)
 - Migration: [`docs/guides/MIGRATION_GUIDE.md`](./docs/guides/MIGRATION_GUIDE.md)

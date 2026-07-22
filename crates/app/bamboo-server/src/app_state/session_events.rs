@@ -38,7 +38,7 @@ pub struct NotificationRelayDeps {
 /// notification policy on each event, and:
 /// - re-broadcasts any resulting `AgentEvent::Notification` onto the same
 ///   channel so connected SSE/WS clients receive it, and
-/// - fans it out to the configured delivery sinks (desktop/ntfy/bark — see
+/// - fans it out to the configured delivery sinks (command/desktop/ntfy/bark — see
 ///   [`crate::notify_sinks::dispatch_to_sinks`]), reading the CURRENT config
 ///   on every notification so a hot-reloaded topic/token/toggle takes effect
 ///   immediately.
@@ -131,7 +131,7 @@ impl super::AppState {
     }
 
     /// Fans a classified notification out to configured delivery sinks
-    /// (desktop/ntfy/bark). Free of `&self` — the relay task started by
+    /// (command/desktop/ntfy/bark). Free of `&self` — the relay task started by
     /// [`ensure_notification_relay`] only holds cloned `Arc`s (not a full
     /// `AppState`), so this is a plain associated function over the values
     /// it needs; see [`crate::notify_sinks::dispatch_to_sinks`].

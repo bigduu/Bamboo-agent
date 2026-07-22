@@ -34,6 +34,7 @@ pub enum ShellHookEvent {
     Stop,
     SessionEnd,
     PreCompact,
+    Notification,
 }
 
 /// Raw process result returned by the settings dry-run endpoint. Unlike the
@@ -59,6 +60,7 @@ impl ShellHookEvent {
             Self::Stop => "Stop",
             Self::SessionEnd => "SessionEnd",
             Self::PreCompact => "PreCompact",
+            Self::Notification => "Notification",
         }
     }
 
@@ -71,6 +73,7 @@ impl ShellHookEvent {
             Self::Stop => AgentHookPoint::BeforeFinalize,
             Self::SessionEnd => AgentHookPoint::AfterSessionEnd,
             Self::PreCompact => AgentHookPoint::BeforeCompression,
+            Self::Notification => AgentHookPoint::AfterNotification,
         }
     }
 
@@ -213,9 +216,10 @@ impl ShellCommandHook {
                 Some(*status),
                 completion_reason.clone(),
             ),
-            HookPayload::None | HookPayload::Round { .. } | HookPayload::Compression { .. } => {
-                (None, None, None, None, None, None, None, None)
-            }
+            HookPayload::None
+            | HookPayload::Round { .. }
+            | HookPayload::Compression { .. }
+            | HookPayload::Notification { .. } => (None, None, None, None, None, None, None, None),
         };
 
         HookEnvelope {
@@ -226,6 +230,7 @@ impl ShellCommandHook {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             model: session.model.clone(),
+            payload: payload.clone(),
             tool_name,
             tool_input,
             tool_response,
@@ -490,16 +495,25 @@ pub async fn test_lifecycle_shell_command(
             HookPayload::Compression {
                 estimated_tokens: 1_000,
                 usage_percent: 50.0,
+                max_context_tokens: 2_000,
+                trigger_context_tokens: 1_600,
+                trigger: "threshold".to_string(),
                 phase: "test".to_string(),
             },
         ),
-        // Notification is a reserved config event whose runtime seam is owned
-        // by a follow-up issue. It can still be dry-run safely with a generic
-        // payload and the correct event name/environment.
         "Notification" => (
-            ShellHookEvent::SessionStart,
-            Some("Notification"),
-            HookPayload::None,
+            ShellHookEvent::Notification,
+            None,
+            HookPayload::Notification {
+                id: Some("notification-test".to_string()),
+                category: "custom".to_string(),
+                priority: "normal".to_string(),
+                title: "Lifecycle hook test".to_string(),
+                body: "Synthetic notification delivery".to_string(),
+                dedup_key: Some("lifecycle-hook-test".to_string()),
+                created_at: Some(Utc::now().to_rfc3339()),
+                click_url: None,
+            },
         ),
         other => return Err(format!("unknown lifecycle hook event '{other}'")),
     };
@@ -594,6 +608,9 @@ struct HookEnvelope {
     session_id: String,
     workspace_path: String,
     model: String,
+    /// Complete, event-specific payload. Legacy convenience fields below stay
+    /// populated for existing tool/prompt/session hook commands.
+    payload: HookPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -672,7 +689,7 @@ pub(super) fn register_configured_shell_hooks(
         return;
     }
 
-    let events: [(ShellHookEvent, &[LifecycleHookGroup]); 7] = [
+    let events: [(ShellHookEvent, &[LifecycleHookGroup]); 8] = [
         (ShellHookEvent::SessionStart, &config.session_start),
         (ShellHookEvent::UserPromptSubmit, &config.user_prompt_submit),
         (ShellHookEvent::PreToolUse, &config.pre_tool_use),
@@ -680,6 +697,7 @@ pub(super) fn register_configured_shell_hooks(
         (ShellHookEvent::Stop, &config.stop),
         (ShellHookEvent::SessionEnd, &config.session_end),
         (ShellHookEvent::PreCompact, &config.pre_compact),
+        (ShellHookEvent::Notification, &config.notification),
     ];
     let mut sequence = 0_usize;
     for (event, groups) in events {
@@ -997,6 +1015,8 @@ mod tests {
         assert_eq!(value["model"], "test-model");
         assert_eq!(value["tool_name"], "bash");
         assert_eq!(value["tool_input"]["command"], "pwd");
+        assert_eq!(value["payload"]["type"], "tool_execution");
+        assert_eq!(value["payload"]["tool_call_id"], "call-1");
         assert!(value["timestamp"].as_str().is_some());
     }
 
@@ -1046,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_runner_registers_only_enabled_engine_events() {
+    fn configured_runner_registers_all_enabled_events() {
         let hook = command("true", 1_000);
         let config = LifecycleHooksConfig {
             enabled: true,
@@ -1084,11 +1104,12 @@ mod tests {
             base.is_empty(),
             "per-run registration must not mutate the base"
         );
-        assert_eq!(configured.len(), 4);
+        assert_eq!(configured.len(), 5);
         assert!(configured.has_hooks_for(AgentHookPoint::AfterSessionSetup));
         assert!(configured.has_hooks_for(AgentHookPoint::BeforeSessionSetup));
         assert!(configured.has_hooks_for(AgentHookPoint::AfterSessionEnd));
         assert!(configured.has_hooks_for(AgentHookPoint::BeforeToolExecution));
+        assert!(configured.has_hooks_for(AgentHookPoint::AfterNotification));
     }
 
     #[test]
@@ -1145,6 +1166,50 @@ mod tests {
             }
         );
         assert_eq!(state.checkpoints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn precompact_observer_ignores_block_and_collects_later_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LifecycleHooksConfig {
+            enabled: true,
+            pre_compact: vec![LifecycleHookGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![
+                    command("printf 'cannot block compaction' >&2; exit 2", 1_000),
+                    command(
+                        r#"printf '%s' '{"additional_context":"preserve the failing assertion"}'"#,
+                        1_000,
+                    ),
+                ],
+            }],
+            ..LifecycleHooksConfig::default()
+        };
+        let runner = HookRunner::new().with_lifecycle_config(&config, None);
+        let mut state = bamboo_domain::AgentRuntimeState::new("run-precompact");
+        let outcome = runner
+            .run_observer_hooks(
+                AgentHookPoint::BeforeCompression,
+                &HookPayload::Compression {
+                    estimated_tokens: 1_700,
+                    usage_percent: 85.0,
+                    max_context_tokens: 2_000,
+                    trigger_context_tokens: 1_600,
+                    trigger: "threshold".to_string(),
+                    phase: "pre-turn".to_string(),
+                },
+                &session(dir.path()),
+                &mut state,
+                None,
+            )
+            .await;
+
+        assert_eq!(state.checkpoints.len(), 2);
+        assert_eq!(
+            outcome.injected_contexts,
+            vec!["preserve the failing assertion".to_string()]
+        );
     }
 
     #[test]

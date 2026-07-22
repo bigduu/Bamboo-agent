@@ -78,19 +78,20 @@ impl HookRunner {
     }
 
     /// Run every matching hook while recording checkpoints/events, but never
-    /// short-circuit on a control decision. Terminal observer seams such as
-    /// `SessionEnd` use this so one cleanup hook cannot suppress later ones.
-    async fn run_observer_hooks(
+    /// short-circuit on a control decision. Observer/advisory seams such as
+    /// `SessionEnd`, `PreCompact`, and `Notification` use this so a command's
+    /// control-shaped output cannot suppress later hooks or reverse an
+    /// operation that must proceed for correctness.
+    pub async fn run_observer_hooks(
         &self,
         point: AgentHookPoint,
         payload: &HookPayload,
         session: &Session,
         runtime_state: &mut AgentRuntimeState,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
-    ) {
-        let _ = self
-            .run_hooks_with_control(point, payload, session, runtime_state, event_tx, false)
-            .await;
+    ) -> HookRunOutcome {
+        self.run_hooks_with_control(point, payload, session, runtime_state, event_tx, false)
+            .await
     }
 
     async fn run_hooks_with_control(
