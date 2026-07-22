@@ -15,6 +15,7 @@
 pub mod discovery;
 pub mod error;
 pub mod executor;
+pub mod executor_util;
 pub mod fleet;
 pub mod mailbox;
 pub(crate) mod poison;

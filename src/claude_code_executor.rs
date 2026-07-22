@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
 use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EventSink, HostBridge, SteerInbox};
+use bamboo_subagent::executor_util::{render_history_preamble, write_json_atomic};
 use bamboo_subagent::proto::RunSpec;
 
 /// Upper bound on a single stdout NDJSON line. Tool results can be huge (the
@@ -99,11 +100,6 @@ pub fn resolve_claude_code_state_dir(storage_dir: &Option<String>, child_id: &st
 /// agent-assigned Claude Code session id this actor last saw, so the NEXT
 /// activation of the SAME child can `--resume` it instead of losing context.
 const STATE_FILE_NAME: &str = "claude-code-session.json";
-
-/// Fallback history preamble cap (issue #444 test plan: "~24k chars / last
-/// ~40 messages, oldest dropped first").
-const HISTORY_PREAMBLE_MAX_CHARS: usize = 24_000;
-const HISTORY_PREAMBLE_MAX_MESSAGES: usize = 40;
 
 /// On-disk shape of [`STATE_FILE_NAME`]. `workspace` is recorded so a later
 /// activation on a DIFFERENT workspace (or a different machine — Claude Code
@@ -219,19 +215,9 @@ impl ClaudeCodeExecutor {
             workspace: self.workspace.clone(),
             updated_at: Utc::now(),
         };
-        let Ok(bytes) = serde_json::to_vec_pretty(&state) else {
-            return;
-        };
-        if tokio::fs::create_dir_all(dir).await.is_err() {
-            return;
+        if let Err(error) = write_json_atomic(&path, &state).await {
+            tracing::warn!(%error, "claude code: persist session state");
         }
-        // Unique tmp name (pid + session id) so concurrent activations of
-        // different children never collide on the same tmp path.
-        let tmp_path = dir.join(format!("{STATE_FILE_NAME}.{}.tmp", std::process::id()));
-        if tokio::fs::write(&tmp_path, &bytes).await.is_err() {
-            return;
-        }
-        let _ = tokio::fs::rename(&tmp_path, &path).await;
     }
 
     /// Step 2 of the activation logic (issue #444): a usable persisted id
@@ -981,72 +967,6 @@ fn build_turn_body(spec: &RunSpec, resume_id: Option<&str>) -> String {
 /// skipped defensively rather than failing the run. Returns `None` when
 /// there is nothing left to render (e.g. the only shipped message IS the
 /// current assignment, already excluded below to avoid duplicating it).
-fn render_history_preamble(messages: &[Value], assignment: &str) -> Option<String> {
-    let mut entries: Vec<(String, String)> = messages
-        .iter()
-        .filter_map(|m| {
-            let role = m.get("role").and_then(Value::as_str)?.to_string();
-            let content = m.get("content").and_then(Value::as_str)?;
-            if content.is_empty() {
-                return None;
-            }
-            Some((role, content.to_string()))
-        })
-        .collect();
-
-    // The assignment's own user message rides in `messages` too (contract) —
-    // drop it here so the preamble doesn't duplicate the live task below it.
-    if let Some((role, content)) = entries.last() {
-        if role == "user" && content == assignment {
-            entries.pop();
-        }
-    }
-    if entries.is_empty() {
-        return None;
-    }
-
-    // Cap by message count, oldest dropped first.
-    let dropped_by_count = entries.len().saturating_sub(HISTORY_PREAMBLE_MAX_MESSAGES);
-    if dropped_by_count > 0 {
-        entries.drain(0..dropped_by_count);
-    }
-
-    let mut rendered: Vec<String> = entries
-        .iter()
-        .map(|(role, content)| format!("**{role}**: {content}"))
-        .collect();
-
-    // Cap by char budget, oldest rendered entry dropped first; if even the
-    // single most-recent entry alone exceeds the budget, truncate it in place
-    // (never silently drop the entire preamble).
-    let mut dropped_by_chars = 0usize;
-    while rendered.len() > 1
-        && rendered
-            .iter()
-            .map(|s| s.chars().count() + 2)
-            .sum::<usize>()
-            > HISTORY_PREAMBLE_MAX_CHARS
-    {
-        rendered.remove(0);
-        dropped_by_chars += 1;
-    }
-    if let [only] = rendered.as_mut_slice() {
-        if only.chars().count() > HISTORY_PREAMBLE_MAX_CHARS {
-            *only = truncate_chars(only, HISTORY_PREAMBLE_MAX_CHARS);
-        }
-    }
-
-    let mut out = String::from("## Prior conversation (rehydrated)\n\n");
-    if dropped_by_count > 0 || dropped_by_chars > 0 {
-        out.push_str(&format!(
-            "_[truncated: {} earlier message(s) omitted]_\n\n",
-            dropped_by_count + dropped_by_chars
-        ));
-    }
-    out.push_str(&rendered.join("\n\n"));
-    Some(out)
-}
-
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();

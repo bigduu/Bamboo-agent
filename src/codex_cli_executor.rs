@@ -5,7 +5,9 @@
 //! argv), stdout is consumed as bounded JSONL, and the process owns a process
 //! group so cancellation tears down any descendants as well as the leader.
 //! Provider/auth selection and Bamboo permission-profile mapping are resolved
-//! before every spawn; session resume is handled by a dependent epic issue.
+//! before every spawn. Thread ids are persisted per child so later activations
+//! can use `codex exec resume`, with bounded history rehydration when the local
+//! Codex transcript is unavailable.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,6 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -22,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
 use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EventSink, SteerInbox};
+use bamboo_subagent::executor_util::{build_rehydrated_turn, write_json_atomic};
 use bamboo_subagent::proto::RunSpec;
 
 /// The oldest Codex CLI schema this executor intentionally supports. The
@@ -41,6 +46,15 @@ const ENV_ALLOWLIST: &[&str] = &[
 ];
 
 const CODEX_PROVIDER_ENV: &str = "BAMBOO_CODEX_PROVIDER_KEY";
+const CODEX_SESSION_STATE_FILE: &str = "codex-session.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexSessionState {
+    thread_id: String,
+    workspace: Option<String>,
+    codex_home_mode: String,
+    updated_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexAuthMode {
@@ -528,10 +542,83 @@ impl CodexExecutor {
             .map(|directory| directory.join("codex-last-message.txt"))
     }
 
+    fn session_state_path(&self) -> Option<PathBuf> {
+        self.state_dir
+            .as_ref()
+            .map(|directory| directory.join(CODEX_SESSION_STATE_FILE))
+    }
+
+    fn codex_home_mode(&self) -> &'static str {
+        if self.auth.isolated() {
+            "isolated"
+        } else {
+            "inherit"
+        }
+    }
+
+    async fn read_session_state(&self) -> Option<CodexSessionState> {
+        let path = self.session_state_path()?;
+        let bytes = tokio::fs::read(path).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    async fn delete_session_state(&self) {
+        let Some(path) = self.session_state_path() else {
+            return;
+        };
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "codex: remove stale session state"
+            ),
+        }
+    }
+
+    async fn write_session_state(&self, thread_id: &str) {
+        let Some(path) = self.session_state_path() else {
+            return;
+        };
+        let state = CodexSessionState {
+            thread_id: thread_id.to_string(),
+            workspace: self.workspace.clone(),
+            codex_home_mode: self.codex_home_mode().to_string(),
+            updated_at: Utc::now(),
+        };
+        if let Err(error) = write_json_atomic(&path, &state).await {
+            tracing::warn!(%error, "codex: persist thread state");
+        }
+    }
+
+    async fn resolve_resume_id(&self) -> Option<String> {
+        let state = self.read_session_state().await?;
+        if state.workspace != self.workspace {
+            tracing::warn!(
+                recorded = ?state.workspace,
+                current = ?self.workspace,
+                "codex: session state workspace mismatch; using history rehydration"
+            );
+            return None;
+        }
+        let current_mode = self.codex_home_mode();
+        if state.codex_home_mode != current_mode {
+            tracing::warn!(
+                recorded = %state.codex_home_mode,
+                current = current_mode,
+                "codex: session state CODEX_HOME mode mismatch; using history rehydration"
+            );
+            return None;
+        }
+        (!state.thread_id.trim().is_empty()).then_some(state.thread_id)
+    }
+
     fn build_command(
         &self,
         run_provider_token: Option<&str>,
         policy: &EffectiveCodexPolicy,
+        resume_id: Option<&str>,
     ) -> Result<Command, String> {
         let mut command = Command::new(&self.binary);
         command
@@ -581,6 +668,10 @@ impl CodexExecutor {
         }
         if let Some(path) = self.last_message_path() {
             command.arg("--output-last-message").arg(path);
+        }
+
+        if let Some(thread_id) = resume_id {
+            command.arg("resume").arg(thread_id);
         }
 
         // `-` is the documented stdin prompt sentinel. It avoids both argv
@@ -709,8 +800,9 @@ impl CodexExecutor {
         policy: &EffectiveCodexPolicy,
         events: &EventSink,
         state: &mut RunState,
-    ) {
+    ) -> Option<String> {
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let mut captured_thread_id = None;
         match event_type {
             "thread.started" => {
                 state.thread_id = value
@@ -718,6 +810,9 @@ impl CodexExecutor {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                if !state.thread_id.is_empty() {
+                    captured_thread_id = Some(state.thread_id.clone());
+                }
                 events.emit(json!({
                     "type": "runner_progress",
                     "session_id": state.thread_id,
@@ -794,6 +889,7 @@ impl CodexExecutor {
                 tracing::debug!(event_type = other, "codex: unrecognized JSONL event");
             }
         }
+        captured_thread_id
     }
 
     async fn read_last_message(&self) -> Option<String> {
@@ -806,11 +902,12 @@ impl CodexExecutor {
     async fn run_process(
         &self,
         prompt: &str,
+        resume_id: Option<&str>,
         run_provider_token: Option<&str>,
         parent_bypass: bool,
         events: &EventSink,
         cancel: &CancellationToken,
-    ) -> ChildOutcome {
+    ) -> (ChildOutcome, bool) {
         let policy = self.permissions.effective(parent_bypass, running_as_root());
         self.emit_policy_bootstrap(&policy, events);
         // Warm workers reuse this executor across activations. Reassert the
@@ -818,32 +915,35 @@ impl CodexExecutor {
         // process cannot leave an auth artifact or mutate provider routing for
         // the next child session.
         if let Err(error) = self.prepare_auth_home().await {
-            return ChildOutcome::error(error);
+            return (ChildOutcome::error(error), false);
         }
         if let Err(error) = self.prepare_output_file().await {
-            return ChildOutcome::error(error);
+            return (ChildOutcome::error(error), false);
         }
 
         let mut child = match spawn_with_etxtbsy_retry(|| {
-            self.build_command(run_provider_token, &policy)
+            self.build_command(run_provider_token, &policy, resume_id)
         })
         .await
         {
             Ok(child) => child,
             Err(error) => {
-                return ChildOutcome::error(format!(
-                    "spawn Codex CLI '{}': {error}; install with `npm i -g @openai/codex`, `brew install codex`, or an official GitHub release",
-                    self.binary.display()
-                ));
+                return (
+                    ChildOutcome::error(format!(
+                        "spawn Codex CLI '{}': {error}; install with `npm i -g @openai/codex`, `brew install codex`, or an official GitHub release",
+                        self.binary.display()
+                    )),
+                    false,
+                );
             }
         };
         let Some(mut stdin) = child.stdin.take() else {
             terminate_child(&mut child).await;
-            return ChildOutcome::error("Codex child has no stdin pipe");
+            return (ChildOutcome::error("Codex child has no stdin pipe"), false);
         };
         let Some(stdout) = child.stdout.take() else {
             terminate_child(&mut child).await;
-            return ChildOutcome::error("Codex child has no stdout pipe");
+            return (ChildOutcome::error("Codex child has no stdout pipe"), false);
         };
         let stderr = child.stderr.take();
 
@@ -858,12 +958,15 @@ impl CodexExecutor {
                 events.emit(event_json(AgentEvent::Cancelled {
                     message: Some("Codex child cancelled".to_string()),
                 }));
-                return ChildOutcome::cancelled();
+                return (ChildOutcome::cancelled(), false);
             }
         };
         if let Err(error) = write_result {
             terminate_child(&mut child).await;
-            return ChildOutcome::error(format!("write Codex prompt to stdin: {error}"));
+            return (
+                ChildOutcome::error(format!("write Codex prompt to stdin: {error}")),
+                false,
+            );
         }
         drop(stdin);
 
@@ -891,7 +994,16 @@ impl CodexExecutor {
                                 continue;
                             }
                             match serde_json::from_slice::<Value>(&bytes) {
-                                Ok(value) => self.handle_event(value, &policy, events, &mut state),
+                                Ok(value) => {
+                                    if let Some(thread_id) = self.handle_event(
+                                        value,
+                                        &policy,
+                                        events,
+                                        &mut state,
+                                    ) {
+                                        self.write_session_state(&thread_id).await;
+                                    }
+                                }
                                 Err(error) => tracing::debug!(%error, "codex: skipping unparsable stdout line"),
                             }
                         }
@@ -926,45 +1038,45 @@ impl CodexExecutor {
             events.emit(event_json(AgentEvent::Cancelled {
                 message: Some("Codex child cancelled".to_string()),
             }));
-            return ChildOutcome::cancelled();
+            return (ChildOutcome::cancelled(), false);
         }
-        if let Some(error) = read_error {
-            return ChildOutcome::error(error);
-        }
-        if status.as_ref().is_some_and(|status| !status.success()) {
-            return ChildOutcome::error(format!(
+
+        let exited_without_turn = !state.turn_started && !state.completed;
+        let outcome = if let Some(error) = read_error {
+            ChildOutcome::error(error)
+        } else if status.as_ref().is_some_and(|status| !status.success()) {
+            ChildOutcome::error(format!(
                 "Codex CLI exited with status {}; stderr tail: {}",
                 status
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "<unknown>".to_string()),
                 display_stderr_tail(&stderr)
-            ));
-        }
-        if let Some(error) = state.failure {
-            return ChildOutcome::error(format!(
+            ))
+        } else if let Some(error) = state.failure {
+            ChildOutcome::error(format!(
                 "{error}; stderr tail: {}",
                 display_stderr_tail(&stderr)
-            ));
-        }
-        if !state.completed {
-            return ChildOutcome::error(format!(
+            ))
+        } else if !state.completed {
+            ChildOutcome::error(format!(
                 "Codex CLI exited without a turn.completed event; stderr tail: {}",
                 display_stderr_tail(&stderr)
-            ));
-        }
-
-        let final_text = if state.last_agent_message.trim().is_empty() {
-            self.read_last_message().await
+            ))
         } else {
-            Some(state.last_agent_message)
+            let final_text = if state.last_agent_message.trim().is_empty() {
+                self.read_last_message().await
+            } else {
+                Some(state.last_agent_message)
+            };
+            match final_text {
+                Some(text) => ChildOutcome::completed(text),
+                None => ChildOutcome::error(
+                    "Codex CLI completed without a final agent message or output-last-message file",
+                ),
+            }
         };
-        match final_text {
-            Some(text) => ChildOutcome::completed(text),
-            None => ChildOutcome::error(
-                "Codex CLI completed without a final agent message or output-last-message file",
-            ),
-        }
+        (outcome, exited_without_turn)
     }
 
     fn emit_policy_bootstrap(&self, policy: &EffectiveCodexPolicy, events: &EventSink) {
@@ -1016,18 +1128,61 @@ impl ChildExecutor for CodexExecutor {
             .as_ref()
             .map(|policy| policy.bypass_permissions)
             .unwrap_or(self.permissions.provisioned_bypass);
-        let outcome = self
+        if spec.messages.is_empty() {
+            self.delete_session_state().await;
+        }
+        let resume_id = if spec.messages.is_empty() {
+            None
+        } else {
+            self.resolve_resume_id().await
+        };
+        let body = if resume_id.is_some() || spec.messages.is_empty() {
+            spec.assignment.clone()
+        } else {
+            build_rehydrated_turn(&spec.messages, &spec.assignment)
+        };
+        let run_provider_token = spec
+            .secrets
+            .codex_provider_token
+            .as_ref()
+            .map(bamboo_subagent::proto::SecretValue::expose);
+        let (outcome, exited_without_turn) = self
             .run_process(
-                &spec.assignment,
-                spec.secrets
-                    .codex_provider_token
-                    .as_ref()
-                    .map(bamboo_subagent::proto::SecretValue::expose),
+                &body,
+                resume_id.as_deref(),
+                run_provider_token,
                 parent_bypass,
                 &events,
                 &cancel,
             )
             .await;
+        let outcome = if resume_id.is_some() && exited_without_turn {
+            tracing::warn!(
+                "codex: resume exited before turn progress; retrying once with rehydrated history"
+            );
+            events.emit(json!({
+                "type": "runner_progress",
+                "session_id": "codex",
+                "round_count": 0,
+                "executor": "codex",
+                "phase": "resume_fallback",
+                "message": "resume failed before turn progress; retrying once with rehydrated history",
+            }));
+            self.delete_session_state().await;
+            let fallback_body = build_rehydrated_turn(&spec.messages, &spec.assignment);
+            self.run_process(
+                &fallback_body,
+                None,
+                run_provider_token,
+                parent_bypass,
+                &events,
+                &cancel,
+            )
+            .await
+            .0
+        } else {
+            outcome
+        };
         steer_drain.abort();
         outcome
     }
@@ -2007,7 +2162,7 @@ mod tests {
         executor.workspace = Some(workspace.path().to_string_lossy().into_owned());
 
         let policy = executor.permissions.effective(false, false);
-        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        let args = command_args(&executor.build_command(None, &policy, None).unwrap());
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--sandbox", "workspace-write"]));
@@ -2020,21 +2175,21 @@ mod tests {
 
         executor.permissions = permissions(None, None, false, false, None, false, true);
         let policy = executor.permissions.effective(false, false);
-        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        let args = command_args(&executor.build_command(None, &policy, None).unwrap());
         assert!(args
             .iter()
             .any(|argument| argument == "--skip-git-repo-check"));
 
         executor.permissions = permissions(None, None, true, false, None, false, true);
         let policy = executor.permissions.effective(false, false);
-        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        let args = command_args(&executor.build_command(None, &policy, None).unwrap());
         assert!(args
             .windows(2)
             .any(|pair| { pair == ["--config", "sandbox_workspace_write.network_access=true"] }));
 
         executor.permissions = permissions(None, None, false, false, None, false, true);
         let policy = executor.permissions.effective(true, false);
-        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        let args = command_args(&executor.build_command(None, &policy, None).unwrap());
         assert!(args.iter().any(|argument| argument == "--full-auto"));
         assert!(!args
             .iter()
@@ -2050,7 +2205,7 @@ mod tests {
             true,
         );
         let policy = executor.permissions.effective(true, false);
-        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        let args = command_args(&executor.build_command(None, &policy, None).unwrap());
         assert!(args
             .iter()
             .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox"));
@@ -2104,7 +2259,7 @@ mod tests {
         let mut inherit_executor = fixture_executor();
         inherit_executor.auth = inherit;
         let policy = default_policy(&inherit_executor);
-        let inherit_command = inherit_executor.build_command(None, &policy).unwrap();
+        let inherit_command = inherit_executor.build_command(None, &policy, None).unwrap();
         assert!(command_env(&inherit_command, "CODEX_HOME").is_none());
         let inherit_args = inherit_command
             .as_std()
@@ -2141,7 +2296,7 @@ mod tests {
         custom_executor.state_dir = Some(state.path().to_path_buf());
         custom_executor.auth = custom;
         let policy = default_policy(&custom_executor);
-        let custom_command = custom_executor.build_command(None, &policy).unwrap();
+        let custom_command = custom_executor.build_command(None, &policy, None).unwrap();
         assert_eq!(
             command_env(&custom_command, CODEX_PROVIDER_ENV).as_deref(),
             Some("custom-secret-570")
@@ -2179,11 +2334,11 @@ mod tests {
         bamboo_executor.auth = bamboo;
         let policy = default_policy(&bamboo_executor);
         assert!(bamboo_executor
-            .build_command(None, &policy)
+            .build_command(None, &policy, None)
             .unwrap_err()
             .contains("per-run provider token"));
         let bamboo_command = bamboo_executor
-            .build_command(Some("bcx1_per_run_570"), &policy)
+            .build_command(Some("bcx1_per_run_570"), &policy, None)
             .unwrap();
         assert_eq!(
             command_env(&bamboo_command, CODEX_PROVIDER_ENV).as_deref(),
@@ -2508,6 +2663,20 @@ mod tests {
             }
         }
 
+        fn run_spec_with_messages(assignment: &str, messages: Vec<Value>) -> RunSpec {
+            RunSpec {
+                assignment: assignment.to_string(),
+                reasoning_effort: None,
+                permission_policy: None,
+                messages,
+                secrets: Default::default(),
+            }
+        }
+
+        fn message(role: &str, content: &str) -> Value {
+            json!({"role": role, "content": content})
+        }
+
         #[tokio::test]
         async fn preflight_accepts_current_surface_and_rejects_old_or_missing_binary() {
             let dir = tempfile::tempdir().unwrap();
@@ -2696,6 +2865,399 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
             }
             assert!(!argv.lines().any(|arg| arg == "--ignore-rules"));
             assert!(!argv.lines().any(|arg| arg == "--ignore-user-config"));
+        }
+
+        #[tokio::test]
+        async fn thread_state_is_captured_resumed_recaptured_and_cleared_for_fresh_run() {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin_dir = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let bin = write_stub(
+                bin_dir.path(),
+                r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+N=$(cat "$DIR/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$DIR/count"
+printf '%s\n' "$@" > "$DIR/argv-$N.txt"
+IFS= read -r prompt
+printf '%s\n' "$prompt" > "$DIR/stdin-$N.txt"
+case "$N" in
+  1) THREAD='thread-one'; ANSWER='first' ;;
+  2) THREAD='thread-two'; ANSWER='second' ;;
+  *) THREAD=''; ANSWER='third' ;;
+esac
+if [ -n "$THREAD" ]; then
+  printf '{"type":"thread.started","thread_id":"%s"}\n' "$THREAD"
+fi
+echo '{"type":"turn.started"}'
+printf '{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"%s"}}\n' "$ANSWER"
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+            );
+            let mut exec = executor(bin, workspace.path());
+            exec.state_dir = Some(state_dir.path().to_path_buf());
+            let state_path = state_dir.path().join(CODEX_SESSION_STATE_FILE);
+
+            let (sink, _rx) = EventSink::channel();
+            let first = exec
+                .run(
+                    run_spec("remember amber-572"),
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(first.status, TerminalStatus::Completed);
+            assert!(!std::fs::read_to_string(bin_dir.path().join("argv-1.txt"))
+                .unwrap()
+                .lines()
+                .any(|argument| argument == "resume"));
+            let state: CodexSessionState =
+                serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+            assert_eq!(state.thread_id, "thread-one");
+            assert_eq!(state.workspace, exec.workspace);
+            assert_eq!(state.codex_home_mode, "inherit");
+
+            let (sink, _rx) = EventSink::channel();
+            let second = exec
+                .run(
+                    run_spec_with_messages(
+                        "what nonce?",
+                        vec![
+                            message("user", "remember amber-572"),
+                            message("assistant", "stored"),
+                            message("user", "what nonce?"),
+                        ],
+                    ),
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(second.status, TerminalStatus::Completed);
+            let argv = std::fs::read_to_string(bin_dir.path().join("argv-2.txt")).unwrap();
+            let arguments = argv.lines().collect::<Vec<_>>();
+            let resume_index = arguments
+                .iter()
+                .position(|argument| *argument == "resume")
+                .expect("resume subcommand");
+            assert_eq!(arguments.get(resume_index + 1), Some(&"thread-one"));
+            assert_eq!(arguments.last(), Some(&"-"));
+            assert_eq!(
+                std::fs::read_to_string(bin_dir.path().join("stdin-2.txt"))
+                    .unwrap()
+                    .trim(),
+                "what nonce?"
+            );
+            let state: CodexSessionState =
+                serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+            assert_eq!(state.thread_id, "thread-two");
+
+            let (sink, _rx) = EventSink::channel();
+            let third = exec
+                .run(
+                    run_spec("fresh rerun"),
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(third.status, TerminalStatus::Completed);
+            assert!(!state_path.exists());
+            assert!(!std::fs::read_to_string(bin_dir.path().join("argv-3.txt"))
+                .unwrap()
+                .lines()
+                .any(|argument| argument == "resume"));
+        }
+
+        #[tokio::test]
+        async fn missing_or_mismatched_state_uses_bounded_history_rehydration() {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin_dir = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let bin = write_stub(
+                bin_dir.path(),
+                r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+printf '%s\n' "$@" > "$DIR/argv.txt"
+cat > "$DIR/stdin.txt"
+echo '{"type":"thread.started","thread_id":"fallback-thread"}'
+echo '{"type":"turn.started"}'
+echo '{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"ok"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+            );
+            let mut exec = executor(bin, workspace.path());
+            exec.state_dir = Some(state_dir.path().to_path_buf());
+            write_json_atomic(
+                &state_dir.path().join(CODEX_SESSION_STATE_FILE),
+                &CodexSessionState {
+                    thread_id: "unusable-thread".to_string(),
+                    workspace: exec.workspace.clone(),
+                    codex_home_mode: "isolated".to_string(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let (sink, _rx) = EventSink::channel();
+            let outcome = exec
+                .run(
+                    run_spec_with_messages(
+                        "continue",
+                        vec![
+                            message("user", "old question"),
+                            message("assistant", "old answer"),
+                            message("user", "continue"),
+                        ],
+                    ),
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+            let argv = std::fs::read_to_string(bin_dir.path().join("argv.txt")).unwrap();
+            assert!(!argv.lines().any(|argument| argument == "resume"));
+            assert!(!argv.contains("unusable-thread"));
+            let body = std::fs::read_to_string(bin_dir.path().join("stdin.txt")).unwrap();
+            assert!(body.contains("## Prior conversation (rehydrated)"));
+            assert!(body.contains("old question"));
+            assert!(body.contains("old answer"));
+            assert!(body.contains("## Current task"));
+            assert_eq!(body.matches("continue").count(), 1);
+
+            let state: CodexSessionState = serde_json::from_slice(
+                &std::fs::read(state_dir.path().join(CODEX_SESSION_STATE_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state.thread_id, "fallback-thread");
+
+            let workspace_mismatch = CodexSessionState {
+                thread_id: "wrong-workspace".to_string(),
+                workspace: Some("/different/workspace".to_string()),
+                codex_home_mode: "inherit".to_string(),
+                updated_at: Utc::now(),
+            };
+            write_json_atomic(
+                &state_dir.path().join(CODEX_SESSION_STATE_FILE),
+                &workspace_mismatch,
+            )
+            .await
+            .unwrap();
+            assert_eq!(exec.resolve_resume_id().await, None);
+        }
+
+        #[tokio::test]
+        async fn invalid_resume_retries_once_fresh_with_rehydrated_history() {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin_dir = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let bin = write_stub(
+                bin_dir.path(),
+                r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+N=$(cat "$DIR/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$DIR/count"
+printf '%s\n' "$@" > "$DIR/argv-$N.txt"
+cat > "$DIR/stdin-$N.txt"
+case " $* " in
+  *' resume dead-thread '*)
+    echo 'thread not found' >&2
+    exit 1
+    ;;
+  *)
+    echo '{"type":"thread.started","thread_id":"recovered-thread"}'
+    echo '{"type":"turn.started"}'
+    echo '{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"recovered"}}'
+    echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+    ;;
+esac
+"#,
+            );
+            let mut exec = executor(bin, workspace.path());
+            exec.state_dir = Some(state_dir.path().to_path_buf());
+            write_json_atomic(
+                &state_dir.path().join(CODEX_SESSION_STATE_FILE),
+                &CodexSessionState {
+                    thread_id: "dead-thread".to_string(),
+                    workspace: exec.workspace.clone(),
+                    codex_home_mode: "inherit".to_string(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let (sink, mut events) = EventSink::channel();
+            let outcome = exec
+                .run(
+                    run_spec_with_messages(
+                        "please continue",
+                        vec![
+                            message("user", "prior nonce amber-572"),
+                            message("assistant", "stored"),
+                            message("user", "please continue"),
+                        ],
+                    ),
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+            assert_eq!(outcome.result.as_deref(), Some("recovered"));
+            assert_eq!(
+                std::fs::read_to_string(bin_dir.path().join("count"))
+                    .unwrap()
+                    .trim(),
+                "2"
+            );
+            let first_argv = std::fs::read_to_string(bin_dir.path().join("argv-1.txt")).unwrap();
+            assert!(first_argv.lines().any(|argument| argument == "resume"));
+            assert!(first_argv.lines().any(|argument| argument == "dead-thread"));
+            let second_argv = std::fs::read_to_string(bin_dir.path().join("argv-2.txt")).unwrap();
+            assert!(!second_argv.lines().any(|argument| argument == "resume"));
+            let fallback = std::fs::read_to_string(bin_dir.path().join("stdin-2.txt")).unwrap();
+            assert!(fallback.contains("## Prior conversation (rehydrated)"));
+            assert!(fallback.contains("prior nonce amber-572"));
+            assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+                event["type"] == "runner_progress" && event["phase"] == "resume_fallback"
+            }));
+
+            let state: CodexSessionState = serde_json::from_slice(
+                &std::fs::read(state_dir.path().join(CODEX_SESSION_STATE_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state.thread_id, "recovered-thread");
+            assert!(!std::fs::read_dir(state_dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".tmp.")));
+        }
+
+        #[tokio::test]
+        async fn resume_failure_after_turn_progress_is_not_retried() {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin_dir = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let bin = write_stub(
+                bin_dir.path(),
+                r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+N=$(cat "$DIR/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$DIR/count"
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"progressed-thread"}'
+echo '{"type":"turn.started"}'
+echo '{"type":"turn.failed","error":{"message":"model failed"}}'
+exit 1
+"#,
+            );
+            let mut exec = executor(bin, workspace.path());
+            exec.state_dir = Some(state_dir.path().to_path_buf());
+            write_json_atomic(
+                &state_dir.path().join(CODEX_SESSION_STATE_FILE),
+                &CodexSessionState {
+                    thread_id: "resumable-thread".to_string(),
+                    workspace: exec.workspace.clone(),
+                    codex_home_mode: "inherit".to_string(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let (sink, mut events) = EventSink::channel();
+            let outcome = exec
+                .run(
+                    run_spec_with_messages(
+                        "continue",
+                        vec![message("user", "earlier"), message("user", "continue")],
+                    ),
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+
+            assert_eq!(outcome.status, TerminalStatus::Error);
+            assert_eq!(
+                std::fs::read_to_string(bin_dir.path().join("count"))
+                    .unwrap()
+                    .trim(),
+                "1"
+            );
+            assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+                event["type"] == "runner_progress" && event["phase"] == "resume_fallback"
+            }));
+        }
+
+        #[tokio::test]
+        async fn failed_fallback_is_not_retried_a_second_time() {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin_dir = tempfile::tempdir().unwrap();
+            let state_dir = tempfile::tempdir().unwrap();
+            let bin = write_stub(
+                bin_dir.path(),
+                r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+N=$(cat "$DIR/count" 2>/dev/null || echo 0)
+N=$((N+1))
+echo "$N" > "$DIR/count"
+cat >/dev/null
+echo "attempt $N failed" >&2
+exit 1
+"#,
+            );
+            let mut exec = executor(bin, workspace.path());
+            exec.state_dir = Some(state_dir.path().to_path_buf());
+            let state_path = state_dir.path().join(CODEX_SESSION_STATE_FILE);
+            write_json_atomic(
+                &state_path,
+                &CodexSessionState {
+                    thread_id: "dead-thread".to_string(),
+                    workspace: exec.workspace.clone(),
+                    codex_home_mode: "inherit".to_string(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let (sink, mut events) = EventSink::channel();
+            let outcome = exec
+                .run(
+                    run_spec_with_messages(
+                        "continue",
+                        vec![message("user", "earlier"), message("user", "continue")],
+                    ),
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+
+            assert_eq!(outcome.status, TerminalStatus::Error);
+            assert_eq!(
+                std::fs::read_to_string(bin_dir.path().join("count"))
+                    .unwrap()
+                    .trim(),
+                "2"
+            );
+            assert_eq!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .filter(|event| {
+                        event["type"] == "runner_progress" && event["phase"] == "resume_fallback"
+                    })
+                    .count(),
+                1
+            );
+            assert!(!state_path.exists());
         }
 
         #[tokio::test]
