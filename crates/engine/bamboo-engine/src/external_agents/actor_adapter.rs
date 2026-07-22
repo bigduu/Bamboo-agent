@@ -578,51 +578,58 @@ impl ActorChildRunner {
                 })
             });
         spec.disabled_tools = job.disabled_tools.clone();
-        // Least-privilege secrets: only the credential for the child's provider.
-        let provider = spec
-            .model
-            .as_ref()
-            .map(|m| m.provider.as_str())
-            .filter(|p| !p.trim().is_empty())
-            .unwrap_or(&self.default_provider);
-        if let Some(cred) = self.credentials.iter().find(|c| c.provider == provider) {
-            spec.secrets.provider_credentials.push(cred.clone());
-        } else {
-            tracing::warn!(
-                "actor child {}: no credential found for provider '{}'",
-                job.child_session_id,
-                provider
-            );
-        }
-        // Custom Codex routing selects a key by stable credential reference,
-        // which may intentionally differ from the session's normal provider.
-        // Carry that one additional credential in the in-memory provision
-        // envelope; the key itself never appears in ExecutorSpec/config.
-        if let ExecutorSpec::Codex {
-            auth_mode,
-            provider_key_ref: Some(reference),
-            ..
-        } = &spec.executor
-        {
-            if auth_mode.as_deref() == Some("custom") {
+        match &spec.executor {
+            // Codex auth is independent of the session's normal Bamboo model
+            // provider. Inherit/API-key/Bamboo modes need no credential-store
+            // secret at provisioning; custom mode gets exactly its referenced
+            // key. This prevents an unrelated upstream provider key from
+            // reaching a Codex worker that only needs a per-run bcx1_ token.
+            ExecutorSpec::Codex {
+                auth_mode,
+                provider_key_ref,
+                ..
+            } => {
+                if auth_mode.as_deref() == Some("custom") {
+                    if let Some(reference) = provider_key_ref {
+                        if let Some(credential) = self.credentials.iter().find(|credential| {
+                            credential.credential_ref.as_deref() == Some(reference)
+                        }) {
+                            spec.secrets.provider_credentials.push(credential.clone());
+                        } else {
+                            tracing::warn!(
+                                "actor child {}: custom Codex credential reference '{}' did not resolve",
+                                job.child_session_id,
+                                reference
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "actor child {}: custom Codex executor has no credential reference",
+                            job.child_session_id
+                        );
+                    }
+                }
+            }
+            // Other executors keep the existing least-privilege contract: only
+            // the credential for the child session's selected provider.
+            _ => {
+                let provider = spec
+                    .model
+                    .as_ref()
+                    .map(|model| model.provider.as_str())
+                    .filter(|provider| !provider.trim().is_empty())
+                    .unwrap_or(&self.default_provider);
                 if let Some(credential) = self
                     .credentials
                     .iter()
-                    .find(|credential| credential.credential_ref.as_deref() == Some(reference))
+                    .find(|credential| credential.provider == provider)
                 {
-                    if !spec
-                        .secrets
-                        .provider_credentials
-                        .iter()
-                        .any(|existing| existing.credential_ref.as_deref() == Some(reference))
-                    {
-                        spec.secrets.provider_credentials.push(credential.clone());
-                    }
+                    spec.secrets.provider_credentials.push(credential.clone());
                 } else {
                     tracing::warn!(
-                        "actor child {}: custom Codex credential reference '{}' did not resolve",
+                        "actor child {}: no credential found for provider '{}'",
                         job.child_session_id,
-                        reference
+                        provider
                     );
                 }
             }
@@ -1471,13 +1478,15 @@ mod tests {
     }
 
     fn codex_executor(auth_mode: Option<&str>, inherit_user_config: Option<bool>) -> ExecutorSpec {
+        let bamboo_mode = auth_mode == Some("bamboo")
+            || (auth_mode.is_none() && !inherit_user_config.unwrap_or(false));
         ExecutorSpec::Codex {
             binary: None,
             model: None,
             sandbox: None,
             inherit_user_config,
             auth_mode: auth_mode.map(str::to_string),
-            base_url: Some("http://127.0.0.1:9562/openai/v1".to_string()),
+            base_url: bamboo_mode.then(|| "http://127.0.0.1:9562/openai/v1".to_string()),
             wire_api: Some("responses".to_string()),
             provider_key_ref: None,
             forward_env: None,
@@ -1540,7 +1549,96 @@ mod tests {
     }
 
     #[test]
-    fn custom_codex_provisioning_scopes_exactly_the_referenced_credential() {
+    fn codex_provisioning_never_leaks_the_session_provider_credential() {
+        let credentials = vec![ScopedCredential {
+            provider: "openai".to_string(),
+            api_key: "upstream-secret-must-not-cross".to_string(),
+            base_url: None,
+            provider_type: Some("openai".to_string()),
+            credential_ref: Some("provider.openai.api_key".to_string()),
+        }];
+
+        for (mode, label) in [
+            (Some("inherit"), "inherit"),
+            (Some("api_key"), "api_key"),
+            (Some("bamboo"), "bamboo"),
+            (None, "default-bamboo"),
+        ] {
+            let runner = ActorChildRunner::new(
+                format!("codex-{label}-test"),
+                PathBuf::from("/bin/false"),
+                Vec::new(),
+                std::env::temp_dir().join(format!("bamboo-codex-{label}-570")),
+                codex_executor(mode, None),
+                credentials.clone(),
+                "openai".to_string(),
+                1,
+            );
+            let mut session = Session::new(format!("child-{label}"), "model");
+            session.add_message(bamboo_agent_core::Message::user("test"));
+            let spec = runner.build_spec(
+                &session,
+                &crate::runtime::execution::SpawnJob {
+                    parent_session_id: "parent".to_string(),
+                    child_session_id: format!("child-{label}"),
+                    model: "gpt-5.4".to_string(),
+                    disabled_tools: None,
+                },
+            );
+            assert!(
+                spec.secrets.provider_credentials.is_empty(),
+                "{label} Codex must not receive the session provider key"
+            );
+        }
+    }
+
+    #[test]
+    fn non_codex_provisioning_still_receives_only_its_selected_provider_credential() {
+        let credentials = vec![
+            ScopedCredential {
+                provider: "openai".to_string(),
+                api_key: "selected-openai-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.openai.api_key".to_string()),
+            },
+            ScopedCredential {
+                provider: "other".to_string(),
+                api_key: "unrelated-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.other.api_key".to_string()),
+            },
+        ];
+        let runner = ActorChildRunner::new(
+            "echo-test".to_string(),
+            PathBuf::from("/bin/false"),
+            Vec::new(),
+            std::env::temp_dir().join("bamboo-echo-provider-570"),
+            ExecutorSpec::Echo,
+            credentials,
+            "openai".to_string(),
+            1,
+        );
+        let spec = runner.build_spec(
+            &Session::new("child-echo", "model"),
+            &crate::runtime::execution::SpawnJob {
+                parent_session_id: "parent".to_string(),
+                child_session_id: "child-echo".to_string(),
+                model: "gpt-5.4".to_string(),
+                disabled_tools: None,
+            },
+        );
+
+        assert_eq!(spec.secrets.provider_credentials.len(), 1);
+        assert_eq!(
+            spec.secrets.provider_credentials[0].api_key,
+            "selected-openai-secret"
+        );
+    }
+
+    #[test]
+    fn custom_codex_provisioning_scopes_only_the_referenced_credential() {
         let mut executor = codex_executor(Some("custom"), None);
         if let ExecutorSpec::Codex {
             base_url,
@@ -1552,6 +1650,13 @@ mod tests {
             *provider_key_ref = Some("provider.custom.api_key".to_string());
         }
         let credentials = vec![
+            ScopedCredential {
+                provider: "openai".to_string(),
+                api_key: "session-provider-secret".to_string(),
+                base_url: None,
+                provider_type: Some("openai".to_string()),
+                credential_ref: Some("provider.openai.api_key".to_string()),
+            },
             ScopedCredential {
                 provider: "custom".to_string(),
                 api_key: "selected-secret".to_string(),
@@ -1584,7 +1689,7 @@ mod tests {
             &crate::runtime::execution::SpawnJob {
                 parent_session_id: "parent".to_string(),
                 child_session_id: "child-custom".to_string(),
-                model: String::new(),
+                model: "gpt-5.4".to_string(),
                 disabled_tools: None,
             },
         );
