@@ -39,8 +39,11 @@ pub use bamboo_agent_core::{
     ToolError, ToolExecutionContext, ToolExecutor, ToolRegistry, ToolResult, ToolSchema,
 };
 
-// Re-export from runtime
-pub use bamboo_domain::RuntimeSessionPersistence;
+// Re-export hook contracts and runtime persistence so consumers can configure
+// lifecycle hooks without depending on the domain crate directly.
+pub use bamboo_domain::{
+    AgentHookPoint, HookPayload, HookResult, HookToolOutcome, RuntimeSessionPersistence,
+};
 pub use runtime::agent::AgentBuilder;
 // `AgentLoopConfig` is intentionally NOT re-exported: its fields are `pub(crate)`,
 // so it cannot be constructed outside the engine. Execution funnels solely through

@@ -60,6 +60,10 @@ impl ToolManager for DefaultToolManager {
             llm: &self.llm,
             tools: &self.tools,
         };
+        let mut runtime_state = session
+            .agent_runtime_state
+            .clone()
+            .unwrap_or_else(|| bamboo_domain::AgentRuntimeState::new(session_id));
 
         // Mirror the live pipeline's #30 biased-cancel wrap so a cancel issued
         // DURING tool execution (e.g. a long foreground Bash run) is honored on
@@ -75,6 +79,7 @@ impl ToolManager for DefaultToolManager {
                 tool_calls,
                 &frame,
                 session,
+                &mut runtime_state,
                 task_context,
                 config
                     .summarization_model_name
@@ -87,6 +92,9 @@ impl ToolManager for DefaultToolManager {
                 tool_schemas,
             ) => result?,
         };
+        if !config.hook_runner.is_empty() {
+            session.agent_runtime_state = Some(runtime_state);
+        }
 
         Ok(ToolRoundResult {
             awaiting_clarification: result.awaiting_clarification,

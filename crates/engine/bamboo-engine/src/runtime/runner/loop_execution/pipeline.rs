@@ -30,6 +30,7 @@ use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
     WaitingForChildrenState,
 };
+use bamboo_domain::{AgentHookPoint, HookPayload};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -1024,7 +1025,7 @@ async fn handle_no_tool_calls(
     eval_model: &str,
     iteration: u32,
     llm: Arc<dyn LLMProvider>,
-) -> TurnOutcome {
+) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
     // (matching the pre-#343 add-before-gold order). When no goal loop is active
@@ -1077,10 +1078,10 @@ async fn handle_no_tool_calls(
             session,
             round_usage,
         );
-        return TurnOutcome {
+        return Ok(TurnOutcome {
             should_break: false,
             sent_complete: false,
-        };
+        });
     }
 
     // Gold decided STOP: the goal is met, or no goal loop is configured. Only now
@@ -1113,10 +1114,34 @@ async fn handle_no_tool_calls(
         // Suspended on the guardian verdict. In the no-goal case the assistant
         // message was intentionally not appended yet (the resumed turn re-emits
         // it), so nothing to roll back here.
-        return review;
+        return Ok(review);
     }
 
     // Guardian approved, inactive, or out of budget → complete the run.
+    if config
+        .hook_runner
+        .has_hooks_for(AgentHookPoint::BeforeFinalize)
+    {
+        let outcome = config
+            .hook_runner
+            .run_hooks(
+                AgentHookPoint::BeforeFinalize,
+                &HookPayload::Finalize,
+                session,
+                runtime_state,
+                Some(event_tx),
+            )
+            .await;
+        let hook_result = crate::runtime::hooks::apply_hook_outcome(
+            AgentHookPoint::BeforeFinalize,
+            outcome,
+            session,
+            runtime_state,
+        );
+        state_bridge::write_runtime_state(session, runtime_state);
+        hook_result?;
+    }
+
     if let Some(message) = deferred_assistant_message.take() {
         session.add_message(message);
     }
@@ -1132,10 +1157,10 @@ async fn handle_no_tool_calls(
         session,
         round_usage,
     );
-    TurnOutcome {
+    Ok(TurnOutcome {
         should_break: true,
         sent_complete: true,
-    }
+    })
 }
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
@@ -1146,6 +1171,7 @@ async fn handle_tool_calls_path(
     stream_output: StreamHandlingOutput,
     mut round_usage: MetricsTokenUsage,
     session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
     auxiliary_models: &crate::runtime::config::AuxiliaryModelConfig,
     model_name: &str,
     task_context: &mut Option<TaskLoopContext>,
@@ -1215,6 +1241,7 @@ async fn handle_tool_calls_path(
             &stream_output.tool_calls,
             frame,
             session,
+            runtime_state,
             task_context,
             compression_model
                 .as_deref()
@@ -1501,6 +1528,32 @@ pub(super) async fn run_pipeline(
 
         let round_id = format!("{}-round-{}", state.session_id, turn_counter + 1);
         state.runtime_state.round.last_round_id = Some(round_id.clone());
+
+        if config
+            .hook_runner
+            .has_hooks_for(AgentHookPoint::BeforeRound)
+        {
+            let outcome = config
+                .hook_runner
+                .run_hooks(
+                    AgentHookPoint::BeforeRound,
+                    &HookPayload::Round {
+                        round: turn_counter + 1,
+                    },
+                    session,
+                    &mut state.runtime_state,
+                    Some(event_tx),
+                )
+                .await;
+            let hook_result = crate::runtime::hooks::apply_hook_outcome(
+                AgentHookPoint::BeforeRound,
+                outcome,
+                session,
+                &mut state.runtime_state,
+            );
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+            hook_result?;
+        }
 
         // --- Prompt context refresh ---
         let runtime_context = PromptMemoryRuntimeContext {
@@ -1823,7 +1876,7 @@ pub(super) async fn run_pipeline(
                         turn_counter + 1,
                         llm.clone(),
                     )
-                    .await,
+                    .await?,
                 );
                 break;
             }
@@ -1845,6 +1898,7 @@ pub(super) async fn run_pipeline(
                 stream_output,
                 llm_output.round_usage,
                 session,
+                &mut state.runtime_state,
                 &state.auxiliary_models,
                 &state.model_name,
                 &mut state.task_context,
@@ -2117,6 +2171,36 @@ pub(super) async fn run_pipeline(
             .round
             .total_subagents_spawned
             .saturating_add(round_activity.subagent_spawn_count);
+
+        if !config.hook_runner.is_empty() {
+            crate::runtime::hooks::merge_session_hook_checkpoints(
+                session,
+                &mut state.runtime_state,
+            );
+        }
+
+        if config.hook_runner.has_hooks_for(AgentHookPoint::AfterRound) {
+            let hook_outcome = config
+                .hook_runner
+                .run_hooks(
+                    AgentHookPoint::AfterRound,
+                    &HookPayload::Round {
+                        round: turn_counter + 1,
+                    },
+                    session,
+                    &mut state.runtime_state,
+                    Some(event_tx),
+                )
+                .await;
+            let hook_result = crate::runtime::hooks::apply_hook_outcome(
+                AgentHookPoint::AfterRound,
+                hook_outcome,
+                session,
+                &mut state.runtime_state,
+            );
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+            hook_result?;
+        }
 
         state_bridge::write_runtime_state(session, &state.runtime_state);
 
@@ -2783,7 +2867,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         // The run keeps going: no break, no terminal Complete.
         assert!(!outcome.should_break);
@@ -2843,7 +2928,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(outcome.should_break);
         assert!(outcome.sent_complete);
@@ -2903,7 +2989,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(!r1.should_break, "undeclared + continue → keep working");
         assert!(!r1.sent_complete);
 
@@ -2946,7 +3033,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(r2.should_break, "declared complete + achieved → stop");
         assert!(r2.sent_complete);
 
@@ -3004,7 +3092,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(!outcome.should_break, "premature completion vetoed");
         assert!(!outcome.sent_complete);
@@ -3080,7 +3169,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         // The run keeps working: no break, no terminal Complete.
         assert!(!outcome.should_break);
@@ -3146,7 +3236,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         // The guardian engaged: the run suspended on the reviewer verdict instead
         // of emitting a terminal Complete.
@@ -4359,7 +4450,8 @@ mod tests {
             1,
             Arc::new(StubProvider),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(outcome.should_break);
         assert!(outcome.sent_complete);
@@ -5004,6 +5096,7 @@ mod tests {
             tools: &tools,
         };
         let auxiliary_models = crate::runtime::config::AuxiliaryModelConfig::default();
+        let mut runtime_state = AgentRuntimeState::new("s-cancel");
         let mut task_context: Option<TaskLoopContext> = None;
         let cancel_token = CancellationToken::new();
 
@@ -5038,6 +5131,7 @@ mod tests {
                     total_tokens: 0,
                 },
                 &mut session,
+                &mut runtime_state,
                 &auxiliary_models,
                 "model",
                 &mut task_context,
@@ -5094,6 +5188,7 @@ mod tests {
             tools: &tools,
         };
         let tool_schemas = tools.list_tools();
+        let mut runtime_state = AgentRuntimeState::new("s-normal");
         let mut task_context: Option<TaskLoopContext> = None;
 
         let result = tokio::time::timeout(
@@ -5102,6 +5197,7 @@ mod tests {
                 std::slice::from_ref(&single_read_call()),
                 &frame,
                 &mut session,
+                &mut runtime_state,
                 &mut task_context,
                 // No compression model -> mid-turn compression short-circuits, so
                 // the healthy path is exercised without any auxiliary LLM call.
@@ -5294,6 +5390,7 @@ mod tests {
             tools: &tools,
         };
         let auxiliary_models = crate::runtime::config::AuxiliaryModelConfig::default();
+        let mut runtime_state = AgentRuntimeState::new("s-compress-fail");
         let mut task_context: Option<TaskLoopContext> = None;
         let cancel_token = CancellationToken::new();
 
@@ -5329,6 +5426,7 @@ mod tests {
                     total_tokens: 0,
                 },
                 &mut session,
+                &mut runtime_state,
                 &auxiliary_models,
                 "model",
                 &mut task_context,
@@ -5922,7 +6020,8 @@ mod tests {
             1,
             Arc::new(StubProvider),
         )
-        .await;
+        .await
+        .unwrap();
 
         // The guardian engaged: suspended on the reviewer verdict rather than
         // completing outright.
@@ -5996,7 +6095,8 @@ mod tests {
                 confidence: "high",
             }),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(outcome.should_break);
         assert!(!outcome.sent_complete);
@@ -6052,7 +6152,8 @@ mod tests {
             1,
             Arc::new(StubProvider),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(outcome.should_break);
         assert!(!outcome.sent_complete);

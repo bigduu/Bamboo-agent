@@ -31,6 +31,11 @@ pub enum AgentError {
     #[error("Tool error: {0}")]
     Tool(String),
 
+    /// A lifecycle hook deliberately suspended this activation. The outer
+    /// runner converts this control signal into a normal persisted suspension.
+    #[error("Hook suspended: {0}")]
+    HookSuspended(String),
+
     /// Token budget exceeded error
     #[error("Budget error: {0}")]
     Budget(String),
@@ -55,5 +60,10 @@ impl AgentError {
     /// logic.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, AgentError::Cancelled)
+    }
+
+    /// Returns `true` when a lifecycle hook intentionally suspended the run.
+    pub fn is_hook_suspended(&self) -> bool {
+        matches!(self, AgentError::HookSuspended(_))
     }
 }

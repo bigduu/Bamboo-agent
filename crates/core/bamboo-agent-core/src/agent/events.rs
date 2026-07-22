@@ -36,7 +36,7 @@
 //! ```
 
 use crate::tools::ToolResult;
-use bamboo_domain::{TaskItemStatus, TaskList};
+use bamboo_domain::{AgentHookPoint, HookResult, TaskItemStatus, TaskList};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +176,21 @@ pub enum AgentEvent {
         /// Error message (if phase == "error")
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// A registered lifecycle hook completed at an engine seam.
+    HookLifecycle {
+        /// Stable hook name supplied by the hook implementation.
+        hook_name: String,
+        /// Engine seam where the hook ran.
+        point: AgentHookPoint,
+        /// Lifecycle phase. Currently `completed`; kept explicit so future
+        /// start/error events remain schema-compatible.
+        phase: String,
+        /// Wall-clock time spent inside the hook.
+        duration_ms: u64,
+        /// Decision returned by the hook.
+        decision: HookResult,
     },
 
     /// Agent needs clarification from the user.

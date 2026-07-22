@@ -6,7 +6,7 @@
 //! [`HookResult`](bamboo_domain::HookResult).
 
 use async_trait::async_trait;
-use bamboo_domain::{AgentHookPoint, HookResult};
+use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
 
 use super::types::Session;
 
@@ -21,9 +21,15 @@ pub trait AgentHook: Send + Sync {
 
     /// Execute the hook.
     ///
-    /// Receives immutable access to the session and the current hook point.
+    /// Receives immutable access to the session, the current hook point, and a
+    /// point-specific payload.
     /// Returns a [`HookResult`] to control flow.
-    async fn run(&self, point: AgentHookPoint, session: &Session) -> HookResult;
+    async fn run(
+        &self,
+        point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+    ) -> HookResult;
 
     /// Optional priority (lower runs first). Default is 100.
     fn priority(&self) -> u32 {

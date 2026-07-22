@@ -116,7 +116,10 @@ pub mod core {
 // (`bamboo_agent::agent::...`, `bamboo_agent::Agent`, ...) stable.
 pub use bamboo_infrastructure as infrastructure;
 pub use bamboo_sdk::agent;
-pub use bamboo_sdk::{Agent, AgentBuilder};
+pub use bamboo_sdk::{
+    Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
+    HookToolOutcome,
+};
 
 // Re-export the runtime config crate so consumers can reach config, paths,
 // proxy auth, encryption, etc. via `bamboo_agent::config::...`. These moved out
