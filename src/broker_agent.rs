@@ -193,6 +193,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                 ref wire_api,
                 ref provider_key_ref,
                 ref forward_env,
+                ref approval_policy,
+                ref network_access,
+                ref allow_danger_bypass,
+                ref permission_profile,
+                ref workspace_owned,
             } => {
                 let forward_env = forward_env.clone().unwrap_or_default();
                 let auth = crate::codex_cli_executor::resolve_codex_auth_config(
@@ -204,11 +209,19 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                     &spec.secrets.provider_credentials,
                     &forward_env,
                 )?;
+                let permissions = crate::codex_cli_executor::resolve_codex_permission_config(
+                    sandbox.as_deref(),
+                    approval_policy.as_deref(),
+                    network_access.unwrap_or(false),
+                    allow_danger_bypass.unwrap_or(false),
+                    permission_profile.clone(),
+                    spec.capabilities.bypass,
+                    workspace_owned.unwrap_or(false),
+                )?;
                 Arc::new(
                     crate::codex_cli_executor::CodexExecutor::new(
                         binary.clone(),
                         model.clone(),
-                        sandbox.clone(),
                         spec.workspace.clone(),
                         Some(crate::codex_cli_executor::resolve_codex_state_dir(
                             &spec.storage_dir,
@@ -216,6 +229,7 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                         )),
                         forward_env,
                         auth,
+                        permissions,
                     )
                     .await?,
                 )

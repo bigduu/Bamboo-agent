@@ -4,8 +4,8 @@
 //! The CLI is one process per activation. Prompts are written on stdin (never
 //! argv), stdout is consumed as bounded JSONL, and the process owns a process
 //! group so cancellation tears down any descendants as well as the leader.
-//! Session resume, provider/auth selection, and bamboo permission-profile
-//! mapping are intentionally handled by the dependent issues in epic #568.
+//! Provider/auth selection and Bamboo permission-profile mapping are resolved
+//! before every spawn; session resume is handled by a dependent epic issue.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -190,12 +190,257 @@ pub fn resolve_codex_state_dir(storage_dir: &Option<String>, child_id: &str) -> 
         .unwrap_or_else(|| bamboo_config::paths::subagents_dir().join(child_id))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexSandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl CodexSandbox {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "read-only" => Ok(Self::ReadOnly),
+            "workspace-write" => Ok(Self::WorkspaceWrite),
+            "danger-full-access" => Ok(Self::DangerFullAccess),
+            other => Err(format!(
+                "unknown Codex sandbox '{other}'; expected read-only, workspace-write, or danger-full-access"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexApprovalPolicy {
+    Never,
+    OnFailure,
+}
+
+impl CodexApprovalPolicy {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "never" => Ok(Self::Never),
+            "on-failure" => Ok(Self::OnFailure),
+            "untrusted" | "on-request" => Err(format!(
+                "Codex approval policy '{raw}' is interactive and unsupported by non-interactive exec mode"
+            )),
+            other => Err(format!(
+                "unknown Codex approval policy '{other}'; expected never or on-failure"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnFailure => "on-failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexPolicyInvocation {
+    Explicit,
+    FullAuto,
+    DangerBypass,
+}
+
+impl CodexPolicyInvocation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::FullAuto => "full-auto",
+            Self::DangerBypass => "danger-bypass",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexPermissionConfig {
+    sandbox: Option<CodexSandbox>,
+    approval_policy: Option<CodexApprovalPolicy>,
+    network_access: bool,
+    allow_danger_bypass: bool,
+    permission_profile: Option<String>,
+    provisioned_bypass: bool,
+    workspace_owned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveCodexPolicy {
+    sandbox: CodexSandbox,
+    approval_policy: CodexApprovalPolicy,
+    invocation: CodexPolicyInvocation,
+    network_access: bool,
+    warnings: Vec<String>,
+}
+
+impl CodexPermissionConfig {
+    fn effective(&self, bypass: bool, is_root: bool) -> EffectiveCodexPolicy {
+        let read_only_profile = self
+            .permission_profile
+            .as_deref()
+            .is_some_and(profile_is_read_only);
+        let mut warnings = Vec::new();
+
+        let (sandbox, approval_policy, invocation) = match self.sandbox {
+            Some(CodexSandbox::ReadOnly) => (
+                CodexSandbox::ReadOnly,
+                self.approval_policy.unwrap_or(CodexApprovalPolicy::Never),
+                CodexPolicyInvocation::Explicit,
+            ),
+            Some(CodexSandbox::WorkspaceWrite) => (
+                CodexSandbox::WorkspaceWrite,
+                self.approval_policy.unwrap_or(CodexApprovalPolicy::Never),
+                CodexPolicyInvocation::Explicit,
+            ),
+            Some(CodexSandbox::DangerFullAccess) => {
+                resolve_danger_request(bypass, self.allow_danger_bypass, is_root, &mut warnings)
+            }
+            None if self.allow_danger_bypass => {
+                resolve_danger_request(bypass, true, is_root, &mut warnings)
+            }
+            None if bypass => (
+                CodexSandbox::WorkspaceWrite,
+                CodexApprovalPolicy::Never,
+                CodexPolicyInvocation::FullAuto,
+            ),
+            None if read_only_profile => (
+                CodexSandbox::ReadOnly,
+                self.approval_policy.unwrap_or(CodexApprovalPolicy::Never),
+                CodexPolicyInvocation::Explicit,
+            ),
+            None => (
+                CodexSandbox::WorkspaceWrite,
+                self.approval_policy.unwrap_or(CodexApprovalPolicy::Never),
+                CodexPolicyInvocation::Explicit,
+            ),
+        };
+
+        let network_access = match sandbox {
+            CodexSandbox::ReadOnly => false,
+            CodexSandbox::WorkspaceWrite => self.network_access,
+            CodexSandbox::DangerFullAccess => true,
+        };
+        if invocation == CodexPolicyInvocation::DangerBypass {
+            warnings.push(
+                "DANGER: Codex is running with approvals and the OS sandbox disabled for this parent-bypass run"
+                    .to_string(),
+            );
+        }
+
+        EffectiveCodexPolicy {
+            sandbox,
+            approval_policy,
+            invocation,
+            network_access,
+            warnings,
+        }
+    }
+}
+
+fn resolve_danger_request(
+    bypass: bool,
+    allow_danger_bypass: bool,
+    is_root: bool,
+    warnings: &mut Vec<String>,
+) -> (CodexSandbox, CodexApprovalPolicy, CodexPolicyInvocation) {
+    if bypass && allow_danger_bypass && !is_root {
+        return (
+            CodexSandbox::DangerFullAccess,
+            CodexApprovalPolicy::Never,
+            CodexPolicyInvocation::DangerBypass,
+        );
+    }
+
+    let reason = if !bypass {
+        "the parent run is not in bypass mode"
+    } else if !allow_danger_bypass {
+        "codex_allow_danger_bypass is false"
+    } else {
+        "the worker is running as root"
+    };
+    warnings.push(format!(
+        "Codex danger-full-access request was downgraded to a sandboxed policy because {reason}"
+    ));
+    // A requested danger posture first falls back to Codex's sandboxed
+    // convenience mode. This keeps the two gates independent: neither a
+    // config-only request nor a root process can silently become unsandboxed.
+    (
+        CodexSandbox::WorkspaceWrite,
+        CodexApprovalPolicy::Never,
+        CodexPolicyInvocation::FullAuto,
+    )
+}
+
+fn profile_is_read_only(raw: &str) -> bool {
+    let normalized = raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    matches!(
+        normalized.as_str(),
+        "read-only" | "readonly" | "research" | "researcher" | "guardian" | "plan"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_codex_permission_config(
+    sandbox: Option<&str>,
+    approval_policy: Option<&str>,
+    network_access: bool,
+    allow_danger_bypass: bool,
+    permission_profile: Option<String>,
+    provisioned_bypass: bool,
+    workspace_owned: bool,
+) -> Result<CodexPermissionConfig, String> {
+    let sandbox = sandbox.map(CodexSandbox::parse).transpose()?;
+    let approval_policy = approval_policy
+        .map(CodexApprovalPolicy::parse)
+        .transpose()?;
+    let profile_read_only = permission_profile
+        .as_deref()
+        .is_some_and(profile_is_read_only);
+    if network_access
+        && (sandbox == Some(CodexSandbox::ReadOnly) || (sandbox.is_none() && profile_read_only))
+    {
+        return Err(
+            "Codex network access requires an effective workspace-write sandbox".to_string(),
+        );
+    }
+    Ok(CodexPermissionConfig {
+        sandbox,
+        approval_policy,
+        network_access,
+        allow_danger_bypass,
+        permission_profile,
+        provisioned_bypass,
+        workspace_owned,
+    })
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions and does not dereference memory.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
+}
+
 /// One-process-per-activation Codex CLI executor.
 pub struct CodexExecutor {
     binary: PathBuf,
     version: String,
     model: Option<String>,
-    sandbox: Option<String>,
+    permissions: CodexPermissionConfig,
     workspace: Option<String>,
     state_dir: Option<PathBuf>,
     forward_env: Vec<String>,
@@ -210,11 +455,11 @@ impl CodexExecutor {
     pub async fn new(
         binary: Option<String>,
         model: Option<String>,
-        sandbox: Option<String>,
         workspace: Option<String>,
         state_dir: Option<PathBuf>,
         forward_env: Vec<String>,
         auth: CodexAuthConfig,
+        permissions: CodexPermissionConfig,
     ) -> Result<Self, String> {
         let requested = binary.unwrap_or_else(|| "codex".to_string());
         let resolved =
@@ -251,7 +496,14 @@ impl CodexExecutor {
         verify_help_surface(
             &resolved,
             &["exec", "--help"],
-            &["--json", "--output-last-message", "stdin"],
+            &[
+                "--json",
+                "--output-last-message",
+                "--config",
+                "--sandbox",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "stdin",
+            ],
         )
         .await?;
         verify_help_surface(&resolved, &["exec", "resume", "--help"], &["--json"]).await?;
@@ -260,7 +512,7 @@ impl CodexExecutor {
             binary: resolved,
             version: version_text,
             model,
-            sandbox,
+            permissions,
             workspace,
             state_dir,
             forward_env,
@@ -276,7 +528,11 @@ impl CodexExecutor {
             .map(|directory| directory.join("codex-last-message.txt"))
     }
 
-    fn build_command(&self, run_provider_token: Option<&str>) -> Result<Command, String> {
+    fn build_command(
+        &self,
+        run_provider_token: Option<&str>,
+        policy: &EffectiveCodexPolicy,
+    ) -> Result<Command, String> {
         let mut command = Command::new(&self.binary);
         command
             .arg("exec")
@@ -290,20 +546,36 @@ impl CodexExecutor {
         } else {
             std::env::current_dir().ok()
         };
-        if workspace_path
-            .as_deref()
-            .is_some_and(|path| !has_git_metadata(path))
+        if self.permissions.workspace_owned
+            && workspace_path
+                .as_deref()
+                .is_some_and(|path| !has_git_metadata(path))
         {
             command.arg("--skip-git-repo-check");
         }
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
         }
-        // Safe foundation default until #571 maps Bamboo permission profiles
-        // onto Codex's sandbox and approval-policy pair.
-        command
-            .arg("--sandbox")
-            .arg(self.sandbox.as_deref().unwrap_or("read-only"));
+        match policy.invocation {
+            CodexPolicyInvocation::Explicit => {
+                command.arg("--sandbox").arg(policy.sandbox.as_str());
+                command.arg("--config").arg(format!(
+                    "approval_policy=\"{}\"",
+                    policy.approval_policy.as_str()
+                ));
+            }
+            CodexPolicyInvocation::FullAuto => {
+                command.arg("--full-auto");
+            }
+            CodexPolicyInvocation::DangerBypass => {
+                command.arg("--dangerously-bypass-approvals-and-sandbox");
+            }
+        }
+        if policy.sandbox == CodexSandbox::WorkspaceWrite && policy.network_access {
+            command
+                .arg("--config")
+                .arg("sandbox_workspace_write.network_access=true");
+        }
         if self.auth.isolated() {
             command.arg("--ignore-rules");
         }
@@ -431,7 +703,13 @@ impl CodexExecutor {
         }
     }
 
-    fn handle_event(&self, value: Value, events: &EventSink, state: &mut RunState) {
+    fn handle_event(
+        &self,
+        value: Value,
+        policy: &EffectiveCodexPolicy,
+        events: &EventSink,
+        state: &mut RunState,
+    ) {
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         match event_type {
             "thread.started" => {
@@ -447,7 +725,11 @@ impl CodexExecutor {
                     "executor": "codex",
                     "binary": self.binary,
                     "version": self.version,
-                    "sandbox": self.sandbox.as_deref().unwrap_or("read-only"),
+                    "sandbox": policy.sandbox.as_str(),
+                    "approval_policy": policy.approval_policy.as_str(),
+                    "network_access": policy.network_access,
+                    "policy_invocation": policy.invocation.as_str(),
+                    "permission_profile": self.permissions.permission_profile.as_deref(),
                 }));
             }
             "turn.started" => {
@@ -461,6 +743,33 @@ impl CodexExecutor {
                 let phase = event_type.trim_start_matches("item.");
                 if let Some(item) = value.get("item") {
                     handle_item(phase, item, events, state);
+                    // Codex CLI 0.144 can omit the command_execution item when
+                    // the OS sandbox itself rejects the command, even though
+                    // it reports the exit status and errno to the model. Keep
+                    // that safety failure visible instead of reducing the JSONL
+                    // stream to an apparently successful agent message.
+                    if phase == "completed"
+                        && policy.sandbox != CodexSandbox::DangerFullAccess
+                        && !state.tool_error_emitted
+                        && item.get("type").and_then(Value::as_str) == Some("agent_message")
+                        && item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(looks_like_sandbox_denial)
+                    {
+                        let item_id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("codex-sandbox-denial");
+                        let error = item.get("text").and_then(Value::as_str).unwrap_or(
+                            "Codex reported that the OS sandbox denied a tool operation",
+                        );
+                        events.emit(event_json(AgentEvent::ToolError {
+                            tool_call_id: format!("{item_id}-sandbox-denial"),
+                            error: truncate_chars(error, TOOL_RESULT_TRUNCATE_CHARS),
+                        }));
+                        state.tool_error_emitted = true;
+                    }
                 }
             }
             "turn.completed" => {
@@ -498,9 +807,12 @@ impl CodexExecutor {
         &self,
         prompt: &str,
         run_provider_token: Option<&str>,
+        parent_bypass: bool,
         events: &EventSink,
         cancel: &CancellationToken,
     ) -> ChildOutcome {
+        let policy = self.permissions.effective(parent_bypass, running_as_root());
+        self.emit_policy_bootstrap(&policy, events);
         // Warm workers reuse this executor across activations. Reassert the
         // isolated-home invariant at every run boundary so a prior Codex
         // process cannot leave an auth artifact or mutate provider routing for
@@ -512,8 +824,10 @@ impl CodexExecutor {
             return ChildOutcome::error(error);
         }
 
-        let mut child = match spawn_with_etxtbsy_retry(|| self.build_command(run_provider_token))
-            .await
+        let mut child = match spawn_with_etxtbsy_retry(|| {
+            self.build_command(run_provider_token, &policy)
+        })
+        .await
         {
             Ok(child) => child,
             Err(error) => {
@@ -577,7 +891,7 @@ impl CodexExecutor {
                                 continue;
                             }
                             match serde_json::from_slice::<Value>(&bytes) {
-                                Ok(value) => self.handle_event(value, events, &mut state),
+                                Ok(value) => self.handle_event(value, &policy, events, &mut state),
                                 Err(error) => tracing::debug!(%error, "codex: skipping unparsable stdout line"),
                             }
                         }
@@ -652,6 +966,37 @@ impl CodexExecutor {
             ),
         }
     }
+
+    fn emit_policy_bootstrap(&self, policy: &EffectiveCodexPolicy, events: &EventSink) {
+        events.emit(json!({
+            "type": "runner_progress",
+            "session_id": "codex",
+            "round_count": 0,
+            "executor": "codex",
+            "phase": "bootstrap",
+            "sandbox": policy.sandbox.as_str(),
+            "approval_policy": policy.approval_policy.as_str(),
+            "network_access": policy.network_access,
+            "policy_invocation": policy.invocation.as_str(),
+            "permission_profile": self.permissions.permission_profile.as_deref(),
+        }));
+        for warning in &policy.warnings {
+            tracing::warn!(message = %warning, "Codex spawn policy warning");
+            events.emit(json!({
+                "type": "runner_progress",
+                "session_id": "codex",
+                "round_count": 0,
+                "executor": "codex",
+                "phase": "policy_warning",
+                "level": "warning",
+                "message": warning,
+                "sandbox": policy.sandbox.as_str(),
+                "approval_policy": policy.approval_policy.as_str(),
+                "network_access": policy.network_access,
+                "policy_invocation": policy.invocation.as_str(),
+            }));
+        }
+    }
 }
 
 #[async_trait]
@@ -666,6 +1011,11 @@ impl ChildExecutor for CodexExecutor {
         // `codex exec` v1 has no mid-turn steering channel. Drain the inbox so
         // transport senders cannot build an unbounded backlog.
         let steer_drain = tokio::spawn(async move { while steer.recv().await.is_some() {} });
+        let parent_bypass = spec
+            .permission_policy
+            .as_ref()
+            .map(|policy| policy.bypass_permissions)
+            .unwrap_or(self.permissions.provisioned_bypass);
         let outcome = self
             .run_process(
                 &spec.assignment,
@@ -673,6 +1023,7 @@ impl ChildExecutor for CodexExecutor {
                     .codex_provider_token
                     .as_ref()
                     .map(bamboo_subagent::proto::SecretValue::expose),
+                parent_bypass,
                 &events,
                 &cancel,
             )
@@ -690,6 +1041,7 @@ struct RunState {
     failure: Option<String>,
     last_agent_message: String,
     usage: TokenUsage,
+    tool_error_emitted: bool,
     started_items: HashSet<String>,
     item_text: HashMap<String, String>,
     item_output: HashMap<String, String>,
@@ -773,6 +1125,7 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                         tool_call_id: item_id,
                         error,
                     }));
+                    state.tool_error_emitted = true;
                 }
             }
         }
@@ -790,7 +1143,7 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 state,
             );
             if phase == "completed" {
-                complete_structured_tool(&item_id, item, events);
+                complete_structured_tool(&item_id, item, events, state);
             }
         }
         "mcp_tool_call" => {
@@ -808,7 +1161,7 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 .unwrap_or_else(|| json!({}));
             ensure_tool_started(&item_id, &tool_name, arguments, events, state);
             if phase == "completed" {
-                complete_structured_tool(&item_id, item, events);
+                complete_structured_tool(&item_id, item, events, state);
             }
         }
         "web_search" => {
@@ -821,7 +1174,7 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 state,
             );
             if phase == "completed" {
-                complete_structured_tool(&item_id, item, events);
+                complete_structured_tool(&item_id, item, events, state);
             }
         }
         "todo_list" => {
@@ -871,12 +1224,13 @@ fn emit_tool_output_delta(item_id: &str, output: &str, events: &EventSink, state
     *previous = output.to_string();
 }
 
-fn complete_structured_tool(item_id: &str, item: &Value, events: &EventSink) {
+fn complete_structured_tool(item_id: &str, item: &Value, events: &EventSink, state: &mut RunState) {
     if let Some(error) = item.get("error").filter(|value| !value.is_null()) {
         events.emit(event_json(AgentEvent::ToolError {
             tool_call_id: item_id.to_string(),
             error: value_text(error),
         }));
+        state.tool_error_emitted = true;
         return;
     }
     let result = item
@@ -891,6 +1245,18 @@ fn complete_structured_tool(item_id: &str, item: &Value, events: &EventSink) {
             truncate_chars(&value_text(&result), TOOL_RESULT_TRUNCATE_CHARS),
         ),
     }));
+}
+
+fn looks_like_sandbox_denial(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    let denied = normalized.contains("operation not permitted")
+        || normalized.contains("permission denied")
+        || normalized.contains("read-only file system");
+    let operation = normalized.contains("sandbox")
+        || normalized.contains("command")
+        || normalized.contains("write")
+        || normalized.contains("exit status");
+    denied && operation
 }
 
 fn emit_text_delta<F>(
@@ -1350,6 +1716,14 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
     }
 
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
     fn auth_error(result: Result<CodexAuthConfig, String>) -> String {
         match result {
             Err(error) => error,
@@ -1357,12 +1731,41 @@ mod tests {
         }
     }
 
+    fn permissions(
+        sandbox: Option<&str>,
+        approval_policy: Option<&str>,
+        network_access: bool,
+        allow_danger_bypass: bool,
+        permission_profile: Option<&str>,
+        provisioned_bypass: bool,
+        workspace_owned: bool,
+    ) -> CodexPermissionConfig {
+        resolve_codex_permission_config(
+            sandbox,
+            approval_policy,
+            network_access,
+            allow_danger_bypass,
+            permission_profile.map(str::to_string),
+            provisioned_bypass,
+            workspace_owned,
+        )
+        .unwrap()
+    }
+
+    fn default_permissions() -> CodexPermissionConfig {
+        permissions(None, None, false, false, None, false, false)
+    }
+
+    fn default_policy(executor: &CodexExecutor) -> EffectiveCodexPolicy {
+        executor.permissions.effective(false, false)
+    }
+
     fn fixture_executor() -> CodexExecutor {
         CodexExecutor {
             binary: PathBuf::from("/usr/local/bin/codex"),
             version: "codex-cli 0.144.5".to_string(),
             model: None,
-            sandbox: None,
+            permissions: default_permissions(),
             workspace: None,
             state_dir: None,
             forward_env: Vec::new(),
@@ -1374,8 +1777,14 @@ mod tests {
         let executor = fixture_executor();
         let (sink, mut rx) = EventSink::channel();
         let mut state = RunState::default();
+        let policy = default_policy(&executor);
         for line in input.lines().filter(|line| !line.trim().is_empty()) {
-            executor.handle_event(serde_json::from_str(line).unwrap(), &sink, &mut state);
+            executor.handle_event(
+                serde_json::from_str(line).unwrap(),
+                &policy,
+                &sink,
+                &mut state,
+            );
         }
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -1392,6 +1801,295 @@ mod tests {
     }
 
     #[test]
+    fn permission_profile_mapping_table_is_explicit_and_double_gated() {
+        struct Case {
+            name: &'static str,
+            permissions: CodexPermissionConfig,
+            parent_bypass: bool,
+            is_root: bool,
+            sandbox: CodexSandbox,
+            approval: CodexApprovalPolicy,
+            invocation: CodexPolicyInvocation,
+            network: bool,
+            warning: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "default",
+                permissions: permissions(None, None, false, false, None, false, false),
+                parent_bypass: false,
+                is_root: false,
+                sandbox: CodexSandbox::WorkspaceWrite,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::Explicit,
+                network: false,
+                warning: false,
+            },
+            Case {
+                name: "restricted",
+                permissions: permissions(
+                    None,
+                    None,
+                    false,
+                    false,
+                    Some("restricted"),
+                    false,
+                    false,
+                ),
+                parent_bypass: false,
+                is_root: false,
+                sandbox: CodexSandbox::WorkspaceWrite,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::Explicit,
+                network: false,
+                warning: false,
+            },
+            Case {
+                name: "research",
+                permissions: permissions(None, None, false, false, Some("research"), false, false),
+                parent_bypass: false,
+                is_root: false,
+                sandbox: CodexSandbox::ReadOnly,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::Explicit,
+                network: false,
+                warning: false,
+            },
+            Case {
+                name: "network workspace",
+                permissions: permissions(None, None, true, false, None, false, false),
+                parent_bypass: false,
+                is_root: false,
+                sandbox: CodexSandbox::WorkspaceWrite,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::Explicit,
+                network: true,
+                warning: false,
+            },
+            Case {
+                name: "ordinary bypass stays sandboxed",
+                permissions: permissions(None, None, false, false, None, false, false),
+                parent_bypass: true,
+                is_root: false,
+                sandbox: CodexSandbox::WorkspaceWrite,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::FullAuto,
+                network: false,
+                warning: false,
+            },
+            Case {
+                name: "config-only danger opt-in downgrades",
+                permissions: permissions(None, None, false, true, None, false, false),
+                parent_bypass: false,
+                is_root: false,
+                sandbox: CodexSandbox::WorkspaceWrite,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::FullAuto,
+                network: false,
+                warning: true,
+            },
+            Case {
+                name: "both danger gates",
+                permissions: permissions(None, None, false, true, None, false, false),
+                parent_bypass: true,
+                is_root: false,
+                sandbox: CodexSandbox::DangerFullAccess,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::DangerBypass,
+                network: true,
+                warning: true,
+            },
+            Case {
+                name: "root danger request downgrades",
+                permissions: permissions(
+                    Some("danger-full-access"),
+                    None,
+                    false,
+                    true,
+                    None,
+                    false,
+                    false,
+                ),
+                parent_bypass: true,
+                is_root: true,
+                sandbox: CodexSandbox::WorkspaceWrite,
+                approval: CodexApprovalPolicy::Never,
+                invocation: CodexPolicyInvocation::FullAuto,
+                network: false,
+                warning: true,
+            },
+            Case {
+                name: "explicit safe override",
+                permissions: permissions(
+                    Some("workspace-write"),
+                    Some("on-failure"),
+                    false,
+                    false,
+                    Some("read-only"),
+                    false,
+                    false,
+                ),
+                parent_bypass: false,
+                is_root: false,
+                sandbox: CodexSandbox::WorkspaceWrite,
+                approval: CodexApprovalPolicy::OnFailure,
+                invocation: CodexPolicyInvocation::Explicit,
+                network: false,
+                warning: false,
+            },
+        ];
+
+        for case in cases {
+            let actual = case.permissions.effective(case.parent_bypass, case.is_root);
+            assert_eq!(actual.sandbox, case.sandbox, "{} sandbox", case.name);
+            assert_eq!(
+                actual.approval_policy, case.approval,
+                "{} approval",
+                case.name
+            );
+            assert_eq!(
+                actual.invocation, case.invocation,
+                "{} invocation",
+                case.name
+            );
+            assert_eq!(actual.network_access, case.network, "{} network", case.name);
+            assert_eq!(
+                !actual.warnings.is_empty(),
+                case.warning,
+                "{} warning",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn permission_configuration_rejects_interactive_and_incoherent_values() {
+        assert!(resolve_codex_permission_config(
+            None,
+            Some("on-request"),
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .contains("non-interactive"));
+        assert!(resolve_codex_permission_config(
+            Some("read-only"),
+            None,
+            true,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .contains("effective workspace-write"));
+        assert!(resolve_codex_permission_config(
+            None,
+            None,
+            true,
+            false,
+            Some("research".to_string()),
+            false,
+            false,
+        )
+        .unwrap_err()
+        .contains("effective workspace-write"));
+    }
+
+    #[test]
+    fn command_flags_match_effective_policy_and_workspace_ownership() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = fixture_executor();
+        executor.workspace = Some(workspace.path().to_string_lossy().into_owned());
+
+        let policy = executor.permissions.effective(false, false);
+        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--config", "approval_policy=\"never\""]));
+        assert!(!args
+            .iter()
+            .any(|argument| argument == "--skip-git-repo-check"));
+
+        executor.permissions = permissions(None, None, false, false, None, false, true);
+        let policy = executor.permissions.effective(false, false);
+        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--skip-git-repo-check"));
+
+        executor.permissions = permissions(None, None, true, false, None, false, true);
+        let policy = executor.permissions.effective(false, false);
+        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["--config", "sandbox_workspace_write.network_access=true"] }));
+
+        executor.permissions = permissions(None, None, false, false, None, false, true);
+        let policy = executor.permissions.effective(true, false);
+        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        assert!(args.iter().any(|argument| argument == "--full-auto"));
+        assert!(!args
+            .iter()
+            .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox"));
+
+        executor.permissions = permissions(
+            Some("danger-full-access"),
+            None,
+            false,
+            true,
+            None,
+            false,
+            true,
+        );
+        let policy = executor.permissions.effective(true, false);
+        let args = command_args(&executor.build_command(None, &policy).unwrap());
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!args.iter().any(|argument| argument == "--full-auto"));
+    }
+
+    #[test]
+    fn danger_bypass_emits_loud_audit_warning() {
+        let mut executor = fixture_executor();
+        executor.permissions = permissions(
+            Some("danger-full-access"),
+            None,
+            false,
+            true,
+            Some("bypass"),
+            false,
+            false,
+        );
+        let policy = executor.permissions.effective(true, false);
+        let (sink, mut receiver) = EventSink::channel();
+        executor.emit_policy_bootstrap(&policy, &sink);
+
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["phase"] == "bootstrap"
+                && event["sandbox"] == "danger-full-access"
+                && event["approval_policy"] == "never"
+                && event["policy_invocation"] == "danger-bypass"
+        }));
+        assert!(events.iter().any(|event| {
+            event["phase"] == "policy_warning"
+                && event["level"] == "warning"
+                && event["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("DANGER"))
+        }));
+    }
+
+    #[test]
     fn auth_mode_matrix_is_explicit_isolated_and_secret_safe() {
         let credential = ScopedCredential {
             provider: "custom-provider".to_string(),
@@ -1405,7 +2103,8 @@ mod tests {
         assert_eq!(inherit.mode(), CodexAuthMode::Inherit);
         let mut inherit_executor = fixture_executor();
         inherit_executor.auth = inherit;
-        let inherit_command = inherit_executor.build_command(None).unwrap();
+        let policy = default_policy(&inherit_executor);
+        let inherit_command = inherit_executor.build_command(None, &policy).unwrap();
         assert!(command_env(&inherit_command, "CODEX_HOME").is_none());
         let inherit_args = inherit_command
             .as_std()
@@ -1441,7 +2140,8 @@ mod tests {
         let mut custom_executor = fixture_executor();
         custom_executor.state_dir = Some(state.path().to_path_buf());
         custom_executor.auth = custom;
-        let custom_command = custom_executor.build_command(None).unwrap();
+        let policy = default_policy(&custom_executor);
+        let custom_command = custom_executor.build_command(None, &policy).unwrap();
         assert_eq!(
             command_env(&custom_command, CODEX_PROVIDER_ENV).as_deref(),
             Some("custom-secret-570")
@@ -1477,12 +2177,13 @@ mod tests {
         let mut bamboo_executor = fixture_executor();
         bamboo_executor.state_dir = Some(state.path().to_path_buf());
         bamboo_executor.auth = bamboo;
+        let policy = default_policy(&bamboo_executor);
         assert!(bamboo_executor
-            .build_command(None)
+            .build_command(None, &policy)
             .unwrap_err()
             .contains("per-run provider token"));
         let bamboo_command = bamboo_executor
-            .build_command(Some("bcx1_per_run_570"))
+            .build_command(Some("bcx1_per_run_570"), &policy)
             .unwrap();
         assert_eq!(
             command_env(&bamboo_command, CODEX_PROVIDER_ENV).as_deref(),
@@ -1718,19 +2419,53 @@ mod tests {
         let executor = fixture_executor();
         let (sink, mut rx) = EventSink::channel();
         let mut state = RunState::default();
+        let policy = default_policy(&executor);
         executor.handle_event(
             json!({"type":"future.event","payload":{"schema":2}}),
+            &policy,
             &sink,
             &mut state,
         );
         executor.handle_event(
             json!({"type":"item.completed","item":{"id":"x","type":"future_item"}}),
+            &policy,
             &sink,
             &mut state,
         );
         assert!(rx.try_recv().is_err());
         assert!(!state.completed);
         assert!(state.failure.is_none());
+    }
+
+    #[test]
+    fn sandbox_denial_report_without_cli_tool_item_becomes_tool_error() {
+        let executor = fixture_executor();
+        let policy = executor.permissions.effective(false, false);
+        let (sink, mut receiver) = EventSink::channel();
+        let mut state = RunState::default();
+        executor.handle_event(
+            json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "denied-report",
+                    "type": "agent_message",
+                    "text": "Command exited with status 1. Sandbox failure: outside write: Operation not permitted"
+                }
+            }),
+            &policy,
+            &sink,
+            &mut state,
+        );
+
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| event["type"] == "token"));
+        assert!(events.iter().any(|event| {
+            event["type"] == "tool_error"
+                && event["tool_call_id"] == "denied-report-sandbox-denial"
+                && event["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Operation not permitted"))
+        }));
     }
 
     #[cfg(unix)]
@@ -1755,7 +2490,7 @@ mod tests {
                 binary,
                 version: "codex-cli 0.144.5".to_string(),
                 model: None,
-                sandbox: None,
+                permissions: permissions(None, None, false, false, None, false, true),
                 workspace: Some(workspace.to_string_lossy().into_owned()),
                 state_dir: None,
                 forward_env: Vec::new(),
@@ -1781,7 +2516,7 @@ mod tests {
                 r#"
 case "$*" in
   "--version") echo 'codex-cli 0.144.5' ;;
-  "exec --help") echo '--json --output-last-message prompt from stdin' ;;
+  "exec --help") echo '--json --output-last-message --config --sandbox --dangerously-bypass-approvals-and-sandbox prompt from stdin' ;;
   "exec resume --help") echo '--json' ;;
   *) exit 2 ;;
 esac
@@ -1792,9 +2527,9 @@ esac
                 None,
                 None,
                 None,
-                None,
                 Vec::new(),
                 CodexAuthConfig::inherit(),
+                default_permissions(),
             )
             .await
             .unwrap();
@@ -1812,9 +2547,9 @@ if [ "$1" = "--version" ]; then echo 'codex-cli 0.143.9'; else exit 2; fi
                 None,
                 None,
                 None,
-                None,
                 Vec::new(),
                 CodexAuthConfig::inherit(),
+                default_permissions(),
             )
             .await
             .err()
@@ -1827,9 +2562,9 @@ if [ "$1" = "--version" ]; then echo 'codex-cli 0.143.9'; else exit 2; fi
                 None,
                 None,
                 None,
-                None,
                 Vec::new(),
                 CodexAuthConfig::inherit(),
+                default_permissions(),
             )
             .await
             .err()
@@ -1948,7 +2683,9 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
                 "--cd",
                 "--skip-git-repo-check",
                 "--sandbox",
-                "read-only",
+                "workspace-write",
+                "--config",
+                "approval_policy=\"never\"",
                 "--output-last-message",
                 "-",
             ] {

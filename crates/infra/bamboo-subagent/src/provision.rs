@@ -251,8 +251,8 @@ pub enum ExecutorSpec {
         forward_env: Option<Vec<String>>,
     },
     /// Drive the official Codex CLI as a one-process-per-activation engine
-    /// over `codex exec --json`. Authentication, permission-profile mapping,
-    /// and resume state are layered on by the dependent issues in epic #568.
+    /// over `codex exec --json`. Authentication and spawn-time permission
+    /// posture are explicit because exec mode has no runtime approval relay.
     Codex {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary: Option<String>,
@@ -279,6 +279,20 @@ pub enum ExecutorSpec {
         provider_key_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forward_env: Option<Vec<String>>,
+        /// `never | on-failure`; interactive approval policies are rejected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_access: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_danger_bypass: Option<bool>,
+        /// External-agent permission profile used for default sandbox mapping.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_profile: Option<String>,
+        /// Whether Bamboo created/owns the workspace. Only owned non-git
+        /// workspaces may receive `--skip-git-repo-check`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_owned: Option<bool>,
     },
 }
 
@@ -633,12 +647,20 @@ mod tests {
             wire_api: None,
             provider_key_ref: None,
             forward_env: Some(vec!["OPENAI_API_KEY".into()]),
+            approval_policy: Some("never".into()),
+            network_access: Some(true),
+            allow_danger_bypass: Some(false),
+            permission_profile: Some("restricted".into()),
+            workspace_owned: Some(true),
         };
         let vc = serde_json::to_value(&codex).unwrap();
         assert_eq!(vc["kind"], "codex");
         assert_eq!(vc["binary"], "/usr/local/bin/codex");
         assert_eq!(vc["sandbox"], "workspace-write");
         assert_eq!(vc["forward_env"][0], "OPENAI_API_KEY");
+        assert_eq!(vc["approval_policy"], "never");
+        assert_eq!(vc["network_access"], true);
+        assert_eq!(vc["permission_profile"], "restricted");
         assert_eq!(serde_json::from_value::<ExecutorSpec>(vc).unwrap(), codex);
         let minimal_codex = ExecutorSpec::Codex {
             binary: None,
@@ -650,6 +672,11 @@ mod tests {
             wire_api: None,
             provider_key_ref: None,
             forward_env: None,
+            approval_policy: None,
+            network_access: None,
+            allow_danger_bypass: None,
+            permission_profile: None,
+            workspace_owned: None,
         };
         assert_eq!(
             serde_json::to_value(&minimal_codex).unwrap(),

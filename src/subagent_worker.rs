@@ -119,6 +119,11 @@ pub async fn run() -> std::result::Result<(), String> {
             wire_api,
             provider_key_ref,
             forward_env,
+            approval_policy,
+            network_access,
+            allow_danger_bypass,
+            permission_profile,
+            workspace_owned,
         } => {
             let forward_env = forward_env.clone().unwrap_or_default();
             let auth = crate::codex_cli_executor::resolve_codex_auth_config(
@@ -130,11 +135,19 @@ pub async fn run() -> std::result::Result<(), String> {
                 &spec.secrets.provider_credentials,
                 &forward_env,
             )?;
+            let permissions = crate::codex_cli_executor::resolve_codex_permission_config(
+                sandbox.as_deref(),
+                approval_policy.as_deref(),
+                network_access.unwrap_or(false),
+                allow_danger_bypass.unwrap_or(false),
+                permission_profile.clone(),
+                spec.capabilities.bypass,
+                workspace_owned.unwrap_or(false),
+            )?;
             Arc::new(
                 CodexExecutor::new(
                     binary.clone(),
                     model.clone(),
-                    sandbox.clone(),
                     spec.workspace.clone(),
                     Some(crate::codex_cli_executor::resolve_codex_state_dir(
                         &spec.storage_dir,
@@ -142,6 +155,7 @@ pub async fn run() -> std::result::Result<(), String> {
                     )),
                     forward_env,
                     auth,
+                    permissions,
                 )
                 .await?,
             )

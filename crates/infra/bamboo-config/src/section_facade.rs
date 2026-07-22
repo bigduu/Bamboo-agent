@@ -1594,7 +1594,11 @@ pub fn validate_codex_subagents_config(value: &SubagentsConfig) -> Result<(), St
         || value.codex_base_url.is_some()
         || value.codex_wire_api.is_some()
         || value.codex_provider_key_ref.is_some()
-        || value.codex_forward_env.is_some();
+        || value.codex_forward_env.is_some()
+        || value.codex_sandbox.is_some()
+        || value.codex_approval_policy.is_some()
+        || value.codex_network_access.is_some()
+        || value.codex_allow_danger_bypass.is_some();
     if value.executor.as_deref() != Some("codex") && !codex_fields_present {
         return Ok(());
     }
@@ -1623,6 +1627,23 @@ pub fn validate_codex_subagents_config(value: &SubagentsConfig) -> Result<(), St
     }
     if mode != crate::CodexAuthMode::ApiKey && forwards_openai {
         return Err("OPENAI_API_KEY may only be forwarded in api_key auth mode".to_string());
+    }
+
+    if value.codex_network_access == Some(true)
+        && value.codex_sandbox == Some(crate::CodexSandbox::ReadOnly)
+    {
+        return Err(
+            "codex_network_access requires the workspace-write sandbox (or an unset sandbox)"
+                .to_string(),
+        );
+    }
+    if value.codex_sandbox == Some(crate::CodexSandbox::DangerFullAccess)
+        && value.codex_allow_danger_bypass != Some(true)
+    {
+        return Err(
+            "danger-full-access sandbox requires codex_allow_danger_bypass = true; parent bypass is still required at run time"
+                .to_string(),
+        );
     }
 
     match mode {
@@ -4533,6 +4554,21 @@ mod tests {
         assert!(validate_codex_subagents_config(&config)
             .unwrap_err()
             .contains("must not contain credentials"));
+
+        config.codex_base_url = Some("https://provider.example/v1".to_string());
+        config.codex_sandbox = Some(crate::CodexSandbox::ReadOnly);
+        config.codex_network_access = Some(true);
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("workspace-write"));
+
+        config.codex_network_access = None;
+        config.codex_sandbox = Some(crate::CodexSandbox::DangerFullAccess);
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("codex_allow_danger_bypass"));
+        config.codex_allow_danger_bypass = Some(true);
+        assert!(validate_codex_subagents_config(&config).is_ok());
     }
 
     fn directory_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {

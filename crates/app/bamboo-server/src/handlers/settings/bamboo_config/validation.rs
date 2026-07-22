@@ -115,6 +115,14 @@ pub async fn validate_bamboo_config_patch(
                 "subagents.codex_provider_key_ref"
             } else if message.contains("forward_env") || message.contains("OPENAI_API_KEY") {
                 "subagents.codex_forward_env"
+            } else if message.contains("network_access") || message.contains("workspace-write") {
+                "subagents.codex_network_access"
+            } else if message.contains("allow_danger_bypass") {
+                "subagents.codex_allow_danger_bypass"
+            } else if message.contains("approval") {
+                "subagents.codex_approval_policy"
+            } else if message.contains("sandbox") || message.contains("danger-full-access") {
+                "subagents.codex_sandbox"
             } else {
                 "subagents.codex_auth_mode"
             };
@@ -157,6 +165,44 @@ fn validate_codex_subagents_shape(value: &Value) -> Vec<ValidationIssue> {
             issues.push(issue(
                 "subagents.codex_wire_api",
                 "codex_wire_api must be responses for Codex CLI >= 0.144",
+            ));
+        }
+    }
+    if let Some(sandbox) = object.get("codex_sandbox") {
+        let valid = sandbox.is_null()
+            || sandbox.as_str().is_some_and(|sandbox| {
+                matches!(
+                    sandbox,
+                    "read-only" | "workspace-write" | "danger-full-access"
+                )
+            });
+        if !valid {
+            issues.push(issue(
+                "subagents.codex_sandbox",
+                "codex_sandbox must be read-only, workspace-write, or danger-full-access",
+            ));
+        }
+    }
+    if let Some(policy) = object.get("codex_approval_policy") {
+        let valid = policy.is_null()
+            || policy
+                .as_str()
+                .is_some_and(|policy| matches!(policy, "never" | "on-failure"));
+        if !valid {
+            issues.push(issue(
+                "subagents.codex_approval_policy",
+                "codex_approval_policy must be never or on-failure in non-interactive exec mode",
+            ));
+        }
+    }
+    for field in ["codex_network_access", "codex_allow_danger_bypass"] {
+        if object
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+        {
+            issues.push(issue(
+                format!("subagents.{field}"),
+                format!("{field} must be a boolean or null"),
             ));
         }
     }
@@ -442,7 +488,11 @@ mod tests {
             "codex_wire_api": "chat",
             "codex_base_url": 42,
             "codex_provider_key_ref": "not a credential ref",
-            "codex_forward_env": ["OPENAI_API_KEY", 1]
+            "codex_forward_env": ["OPENAI_API_KEY", 1],
+            "codex_sandbox": "host-write",
+            "codex_approval_policy": "on-request",
+            "codex_network_access": "yes",
+            "codex_allow_danger_bypass": 1
         }));
         let paths = issues
             .iter()
@@ -455,6 +505,10 @@ mod tests {
             "subagents.codex_base_url",
             "subagents.codex_provider_key_ref",
             "subagents.codex_forward_env",
+            "subagents.codex_sandbox",
+            "subagents.codex_approval_policy",
+            "subagents.codex_network_access",
+            "subagents.codex_allow_danger_bypass",
         ] {
             assert!(
                 paths.contains(expected),
@@ -470,7 +524,11 @@ mod tests {
             "codex_wire_api": "responses",
             "codex_base_url": "https://provider.example/v1",
             "codex_provider_key_ref": "provider.openai.api_key",
-            "codex_forward_env": ["LANG"]
+            "codex_forward_env": ["LANG"],
+            "codex_sandbox": "workspace-write",
+            "codex_approval_policy": "never",
+            "codex_network_access": true,
+            "codex_allow_danger_bypass": false
         }))
         .is_empty());
     }
