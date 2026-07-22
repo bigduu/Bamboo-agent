@@ -124,6 +124,7 @@ pub struct DomainChanges {
     pub mcp: bool,
     pub keyword_masking: bool,
     pub hooks: bool,
+    pub lifecycle_hooks: bool,
     pub model_mapping: bool,
 }
 
@@ -159,6 +160,7 @@ pub fn domains_for_root_patch(patch_obj: &Map<String, Value>) -> DomainChanges {
             // Other known config domains
             "keyword_masking" => changes.keyword_masking = true,
             "hooks" => changes.hooks = true,
+            "lifecycle_hooks" => changes.lifecycle_hooks = true,
             "anthropic_model_mapping" | "gemini_model_mapping" => changes.model_mapping = true,
 
             _ => {}
@@ -1031,6 +1033,19 @@ mod tests {
 
         let domains = domains_for_root_patch(patch.as_object().unwrap());
         assert!(domains.provider);
+    }
+
+    #[test]
+    fn domains_for_root_patch_detects_lifecycle_hooks() {
+        let patch = json!({"lifecycle_hooks": {"enabled": true}});
+
+        let domains = domains_for_root_patch(patch.as_object().unwrap());
+
+        assert!(domains.lifecycle_hooks);
+        assert!(
+            !domains.hooks,
+            "request hooks and lifecycle hooks are distinct"
+        );
     }
 
     #[test]

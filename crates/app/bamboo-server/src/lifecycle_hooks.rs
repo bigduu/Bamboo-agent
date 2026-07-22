@@ -90,6 +90,7 @@ mod tests {
         LifecycleHooksConfig {
             enabled: true,
             user_prompt_submit: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: None,
                 hooks: vec![LifecycleHookCommand {
                     hook_type: LifecycleHookType::Command,

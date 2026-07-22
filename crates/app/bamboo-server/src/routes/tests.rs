@@ -213,6 +213,43 @@ async fn remote_unverified_request_is_blocked_by_access_middleware() {
 }
 
 #[actix_web::test]
+async fn lifecycle_hook_dry_run_is_blocked_by_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    for uri in ["/api/v1/bamboo/hooks/test", "/v1/bamboo/hooks/test"] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(uri)
+                .insert_header((header::HOST, "bamboo.example.com"))
+                .set_json(serde_json::json!({
+                    "event": "SessionStart",
+                    "command": "exit 99"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+}
+
+#[actix_web::test]
 async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
     let data_dir = tempdir().unwrap();
     let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());

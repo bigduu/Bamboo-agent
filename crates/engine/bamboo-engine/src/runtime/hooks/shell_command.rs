@@ -36,6 +36,19 @@ pub enum ShellHookEvent {
     PreCompact,
 }
 
+/// Raw process result returned by the settings dry-run endpoint. Unlike the
+/// normal hook path, this deliberately exposes captured streams so users can
+/// diagnose a command before enabling it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShellHookTestOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
 impl ShellHookEvent {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -69,6 +82,7 @@ impl ShellHookEvent {
 /// One config-driven lifecycle shell command.
 pub struct ShellCommandHook {
     event: ShellHookEvent,
+    event_name_override: Option<&'static str>,
     command: String,
     timeout: Duration,
     matcher: Option<Regex>,
@@ -87,12 +101,18 @@ impl ShellCommandHook {
         let matcher = matcher.map(Regex::new).transpose()?;
         Ok(Self {
             event,
+            event_name_override: None,
             command: config.command.clone(),
             timeout: Duration::from_millis(config.timeout_ms.max(1)),
             matcher,
             fallback_cwd,
             name: format!("lifecycle_shell:{}:{sequence}", event.as_str()),
         })
+    }
+
+    fn event_name(&self) -> &'static str {
+        self.event_name_override
+            .unwrap_or_else(|| self.event.as_str())
     }
 
     fn effective_cwd(&self, session: &Session) -> Option<PathBuf> {
@@ -200,7 +220,7 @@ impl ShellCommandHook {
 
         HookEnvelope {
             schema_version: 1,
-            hook_event_name: self.event.as_str(),
+            hook_event_name: self.event_name().to_string(),
             session_id: session.id.clone(),
             workspace_path: cwd
                 .map(|path| path.to_string_lossy().into_owned())
@@ -237,7 +257,7 @@ impl ShellCommandHook {
             .arg(shell.arg)
             .arg(&self.command)
             .env("BAMBOO_SESSION_ID", &session.id)
-            .env("BAMBOO_HOOK_EVENT", self.event.as_str())
+            .env("BAMBOO_HOOK_EVENT", self.event_name())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -380,6 +400,116 @@ impl ShellCommandHook {
             None => result,
         }
     }
+
+    async fn test(
+        &self,
+        payload: &HookPayload,
+        session: &Session,
+    ) -> Result<ShellHookTestOutput, String> {
+        let cwd = self.effective_cwd(session);
+        let input = serde_json::to_vec(&self.envelope(payload, session, cwd.as_ref()))
+            .map_err(|error| format!("failed serializing lifecycle hook test payload: {error}"))?;
+        let output = self.execute(input, cwd.as_ref(), session).await?;
+        Ok(ShellHookTestOutput {
+            exit_code: output.exit_code,
+            stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
+            timed_out: output.timed_out,
+            stdout_truncated: output.stdout.truncated,
+            stderr_truncated: output.stderr.truncated,
+        })
+    }
+}
+
+/// Execute one lifecycle command against a deterministic synthetic payload.
+/// This shares the production shell/environment/timeout/output-capping path;
+/// only hook-result interpretation is skipped so callers receive raw output.
+pub async fn test_lifecycle_shell_command(
+    event_name: &str,
+    config: &LifecycleHookCommand,
+    fallback_cwd: Option<PathBuf>,
+) -> Result<ShellHookTestOutput, String> {
+    let (event, event_name_override, payload) = match event_name {
+        "SessionStart" => (
+            ShellHookEvent::SessionStart,
+            None,
+            HookPayload::SessionSetup {
+                initial_message: "Lifecycle hook test".to_string(),
+                source: SessionStartSource::Startup,
+            },
+        ),
+        "UserPromptSubmit" => (
+            ShellHookEvent::UserPromptSubmit,
+            None,
+            HookPayload::Prompt {
+                prompt: "Lifecycle hook test".to_string(),
+            },
+        ),
+        "PreToolUse" => (
+            ShellHookEvent::PreToolUse,
+            None,
+            HookPayload::ToolExecution {
+                tool_name: "Bash".to_string(),
+                tool_call_id: "hook-test-call".to_string(),
+                parsed_args: serde_json::json!({"command": "echo lifecycle-hook-test"}),
+            },
+        ),
+        "PostToolUse" => (
+            ShellHookEvent::PostToolUse,
+            None,
+            HookPayload::ToolResult {
+                tool_name: "Bash".to_string(),
+                tool_call_id: "hook-test-call".to_string(),
+                outcome: bamboo_domain::HookToolOutcome {
+                    success: true,
+                    result: Some("lifecycle-hook-test".to_string()),
+                    error: None,
+                    needs_human: false,
+                    duration_ms: 1,
+                },
+            },
+        ),
+        "Stop" => (
+            ShellHookEvent::Stop,
+            None,
+            HookPayload::Finalize {
+                stop_hook_active: false,
+            },
+        ),
+        "SessionEnd" => (
+            ShellHookEvent::SessionEnd,
+            None,
+            HookPayload::SessionEnd {
+                status: SessionEndStatus::Completed,
+                completion_reason: Some("lifecycle hook test".to_string()),
+            },
+        ),
+        "PreCompact" => (
+            ShellHookEvent::PreCompact,
+            None,
+            HookPayload::Compression {
+                estimated_tokens: 1_000,
+                usage_percent: 50.0,
+                phase: "test".to_string(),
+            },
+        ),
+        // Notification is a reserved config event whose runtime seam is owned
+        // by a follow-up issue. It can still be dry-run safely with a generic
+        // payload and the correct event name/environment.
+        "Notification" => (
+            ShellHookEvent::SessionStart,
+            Some("Notification"),
+            HookPayload::None,
+        ),
+        other => return Err(format!("unknown lifecycle hook event '{other}'")),
+    };
+
+    let mut hook = ShellCommandHook::new(event, config, None, fallback_cwd, 0)
+        .map_err(|error| format!("invalid lifecycle hook matcher: {error}"))?;
+    hook.event_name_override = event_name_override;
+    hook.name = format!("lifecycle_shell_test:{event_name}");
+    let session = Session::new("lifecycle-hook-test", "hook-test");
+    hook.test(&payload, &session).await
 }
 
 #[cfg(unix)]
@@ -460,7 +590,7 @@ impl AgentHook for ShellCommandHook {
 #[derive(Debug, Serialize)]
 struct HookEnvelope {
     schema_version: u8,
-    hook_event_name: &'static str,
+    hook_event_name: String,
     session_id: String,
     workspace_path: String,
     model: String,
@@ -554,6 +684,10 @@ pub(super) fn register_configured_shell_hooks(
     let mut sequence = 0_usize;
     for (event, groups) in events {
         for group in groups {
+            if !group.enabled {
+                sequence += group.hooks.len();
+                continue;
+            }
             let matcher = if event.supports_tool_matcher() {
                 group.matcher.as_deref()
             } else {
@@ -917,22 +1051,27 @@ mod tests {
         let config = LifecycleHooksConfig {
             enabled: true,
             pre_tool_use: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: Some("bash".to_string()),
                 hooks: vec![hook.clone()],
             }],
             session_start: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: None,
                 hooks: vec![hook.clone()],
             }],
             user_prompt_submit: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: None,
                 hooks: vec![hook.clone()],
             }],
             session_end: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: None,
                 hooks: vec![hook.clone()],
             }],
             notification: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: None,
                 hooks: vec![hook],
             }],
@@ -952,12 +1091,30 @@ mod tests {
         assert!(configured.has_hooks_for(AgentHookPoint::BeforeToolExecution));
     }
 
+    #[test]
+    fn disabled_group_is_preserved_but_not_registered() {
+        let config = LifecycleHooksConfig {
+            enabled: true,
+            pre_tool_use: vec![LifecycleHookGroup {
+                enabled: false,
+                matcher: None,
+                hooks: vec![command("exit 2", 1_000)],
+            }],
+            ..LifecycleHooksConfig::default()
+        };
+
+        let configured = HookRunner::new().with_lifecycle_config(&config, None);
+
+        assert!(configured.is_empty());
+    }
+
     #[tokio::test]
     async fn configured_commands_run_in_order_and_first_block_wins() {
         let dir = tempfile::tempdir().unwrap();
         let config = LifecycleHooksConfig {
             enabled: true,
             pre_tool_use: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: None,
                 hooks: vec![
                     command("printf 'first' >&2; exit 2", 1_000),
@@ -995,6 +1152,7 @@ mod tests {
         let config = LifecycleHooksConfig {
             enabled: true,
             pre_tool_use: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: Some("[".to_string()),
                 hooks: vec![command("true", 1_000)],
             }],

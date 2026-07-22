@@ -1006,6 +1006,7 @@ mod hook_tests {
         let lifecycle_config = LifecycleHooksConfig {
             enabled: true,
             pre_tool_use: vec![LifecycleHookGroup {
+                enabled: true,
                 matcher: Some("^bash$".to_string()),
                 hooks: vec![LifecycleHookCommand {
                     hook_type: LifecycleHookType::Command,

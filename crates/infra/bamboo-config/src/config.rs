@@ -2075,6 +2075,24 @@ pub struct HooksConfig {
 
 /// Default deadline for one lifecycle command hook.
 pub const DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 60_000;
+/// Smallest accepted lifecycle hook deadline at the config API boundary.
+pub const MIN_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 1;
+/// Largest accepted lifecycle hook deadline (10 minutes). Lifecycle hooks run
+/// inline with agent progress, so they share the same upper bound as Bamboo's
+/// interactive shell tool instead of allowing an accidental hours-long stall.
+pub const MAX_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 600_000;
+
+/// Stable user-facing event keys accepted by `lifecycle_hooks`.
+pub const LIFECYCLE_HOOK_EVENT_NAMES: [&str; 8] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd",
+    "PreCompact",
+    "Notification",
+];
 
 fn default_lifecycle_hook_timeout_ms() -> u64 {
     DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
@@ -2082,6 +2100,14 @@ fn default_lifecycle_hook_timeout_ms() -> u64 {
 
 fn lifecycle_hook_timeout_is_default(value: &u64) -> bool {
     *value == DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
+}
+
+fn lifecycle_hook_enabled_default() -> bool {
+    true
+}
+
+fn lifecycle_hook_enabled_is_default(value: &bool) -> bool {
+    *value
 }
 
 /// Config-driven agent lifecycle hooks.
@@ -2138,12 +2164,29 @@ impl LifecycleHooksConfig {
 }
 
 /// A matcher and its ordered command-hook list for one lifecycle event.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleHookGroup {
+    /// A disabled group remains persisted and editable but is not registered
+    /// for execution. Missing values default to true for old config files.
+    #[serde(
+        default = "lifecycle_hook_enabled_default",
+        skip_serializing_if = "lifecycle_hook_enabled_is_default"
+    )]
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     #[serde(default)]
     pub hooks: Vec<LifecycleHookCommand>,
+}
+
+impl Default for LifecycleHookGroup {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            matcher: None,
+            hooks: Vec::new(),
+        }
+    }
 }
 
 /// Supported lifecycle hook implementation kinds.
@@ -4815,6 +4858,10 @@ mod tests {
 
         assert!(config.lifecycle_hooks.enabled);
         assert_eq!(config.lifecycle_hooks.pre_tool_use.len(), 1);
+        assert!(
+            config.lifecycle_hooks.pre_tool_use[0].enabled,
+            "legacy groups without an enabled flag remain active"
+        );
         assert_eq!(
             config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms,
             DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
@@ -4834,6 +4881,9 @@ mod tests {
             json["lifecycle_hooks"]["PreToolUse"][0]["hooks"][0]["type"],
             "command"
         );
+        assert!(json["lifecycle_hooks"]["PreToolUse"][0]
+            .get("enabled")
+            .is_none());
         assert!(json["lifecycle_hooks"]["PreToolUse"][0]["hooks"][0]
             .get("timeout_ms")
             .is_none());
