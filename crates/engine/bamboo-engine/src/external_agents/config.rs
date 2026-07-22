@@ -82,6 +82,14 @@ pub struct ExternalAgentProfile {
     pub codex_provider_key_ref: Option<bamboo_config::CredentialRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_forward_env: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_sandbox: Option<bamboo_config::CodexSandbox>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_approval_policy: Option<bamboo_config::CodexApprovalPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_network_access: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_allow_danger_bypass: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -233,6 +241,40 @@ mod tests {
             Some("https://example.com/agent-card.json".to_string())
         );
         assert_eq!(profile.auth_ref, Some("REMOTE_IMPL_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn parse_external_codex_permission_fields() {
+        let mut config = Config::default();
+        config.extra.insert(
+            "externalAgents".to_string(),
+            serde_json::json!({
+                "codex_research": {
+                    "agent_id": "codex_research",
+                    "protocol": "actor",
+                    "permission_profile": "research",
+                    "executor": "codex",
+                    "codex_sandbox": "read-only",
+                    "codex_approval_policy": "never",
+                    "codex_network_access": false,
+                    "codex_allow_danger_bypass": false
+                }
+            }),
+        );
+
+        let profile = parse_external_agents(&config)
+            .remove("codex_research")
+            .expect("typed Codex profile");
+        assert_eq!(
+            profile.codex_sandbox,
+            Some(bamboo_config::CodexSandbox::ReadOnly)
+        );
+        assert_eq!(
+            profile.codex_approval_policy,
+            Some(bamboo_config::CodexApprovalPolicy::Never)
+        );
+        assert_eq!(profile.codex_network_access, Some(false));
+        assert_eq!(profile.codex_allow_danger_bypass, Some(false));
     }
 
     #[test]

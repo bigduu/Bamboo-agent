@@ -262,6 +262,10 @@ in-process runtime toggle.
 | `codex_wire_api` | `"responses"` (the only protocol accepted by supported Codex CLI versions). |
 | `codex_provider_key_ref` | Existing Bamboo provider credential reference used only by `custom` mode; the key is injected through an environment variable and is not written to the generated Codex config. |
 | `codex_forward_env` | Extra environment names after `env_clear()`; `api_key` mode requires an explicit `OPENAI_API_KEY`, and other modes reject it. `CODEX_*` and Bamboo's managed provider-key variable are reserved. |
+| `codex_sandbox` | Optional explicit `"read-only"` \| `"workspace-write"` \| `"danger-full-access"`. Unset derives a safe value from the child profile and live parent bypass posture. |
+| `codex_approval_policy` | Optional explicit `"never"` \| `"on-failure"`. Interactive policies are rejected because `codex exec` has no approval relay. |
+| `codex_network_access` | Enables network access inside `workspace-write`; incompatible with an explicit `read-only` sandbox. |
+| `codex_allow_danger_bypass` | Second gate for disabling the OS sandbox. The live parent must also be in bypass mode; root workers always downgrade and warn. |
 | `remote_placements` / `schedulable_placements` | Where a sub-agent may run (local / a named Cluster Fabric node) and whether schedules may target it. |
 | `mcp_role_allowlist` | Restrict which MCP servers a sub-agent role may see. |
 
@@ -276,11 +280,11 @@ in-process runtime toggle.
 }
 ```
 
-The same `claude_code_*` field set is duplicated per-agent under
+The same `claude_code_*` and `codex_*` field sets are duplicated per-agent under
 `ExternalAgentProfile` (`Config.extra["externalAgents"]`,
 `bamboo-engine/src/external_agents/config.rs`) when you need different
-`claude` executor settings for different named external agents rather than
-one global default.
+external CLI executor settings for different named agents rather than one
+global default.
 
 The concrete spawn implementation is `src/claude_code_executor.rs`
 (`ClaudeCodeExecutor`): it runs `claude --output-format stream-json

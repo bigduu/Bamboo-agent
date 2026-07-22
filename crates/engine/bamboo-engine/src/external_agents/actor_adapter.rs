@@ -11,7 +11,7 @@
 //! tables can additionally route specific roles to other actor/a2a agents.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,6 +97,36 @@ fn executor_uses_bamboo_codex(executor: &ExecutorSpec) -> bool {
             ..
         } if !inherit_user_config.unwrap_or(false)
     )
+}
+
+fn workspace_is_bamboo_owned(raw: &str) -> bool {
+    let workspace = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
+    let configured_root = bamboo_config::paths::resolve_workspace_root();
+    let configured_root = std::fs::canonicalize(&configured_root).unwrap_or(configured_root);
+    if workspace.starts_with(&configured_root) {
+        return true;
+    }
+
+    // Project worktrees created by Bamboo live under
+    // `<project>/.bamboo/worktree/<name>` and carry the ownership marker used
+    // by the project-worktree lifecycle. A path that merely imitates the
+    // directory shape is not sufficient to bypass Codex's git guard.
+    workspace.ancestors().any(|candidate| {
+        let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Some(worktree_root) = candidate.parent() else {
+            return false;
+        };
+        if worktree_root.file_name() != Some(std::ffi::OsStr::new("worktree"))
+            || worktree_root.parent().and_then(Path::file_name)
+                != Some(std::ffi::OsStr::new(".bamboo"))
+        {
+            return false;
+        }
+        let marker = worktree_root.join(".bamboo-owned").join(name);
+        std::fs::read_to_string(marker).is_ok_and(|branch| branch == format!("bamboo/{name}"))
+    })
 }
 
 fn build_codex_run_secrets(
@@ -558,6 +588,16 @@ impl ActorChildRunner {
             self.fabric_dir.to_string_lossy().into_owned(),
         );
         spec.workspace = session.workspace.clone();
+        if let ExecutorSpec::Codex {
+            workspace_owned, ..
+        } = &mut spec.executor
+        {
+            *workspace_owned = Some(
+                spec.workspace
+                    .as_deref()
+                    .is_some_and(workspace_is_bamboo_owned),
+            );
+        }
         // Unified transport: when a bus is configured, the child dials it (no
         // listen socket / file discovery) and the parent drives it by mailbox id.
         spec.bus = self.bus.clone();
@@ -675,6 +715,14 @@ impl ActorChildRunner {
         // still `rm -rf` / `git push` / `curl | sh`, defeating "read-only".
         spec.capabilities.guardian_read_only =
             session.metadata.get("subagent_type").map(String::as_str) == Some("guardian");
+        if spec.capabilities.guardian_read_only {
+            if let ExecutorSpec::Codex {
+                permission_profile, ..
+            } = &mut spec.executor
+            {
+                *permission_profile = Some("read-only".to_string());
+            }
+        }
         // #193: route this role to a REMOTE resident worker when one is pinned.
         // `spec.identity.role` was just computed from `subagent_type` above; a
         // match flips the placement to Remote and rides the worker's bearer on the
@@ -1490,7 +1538,34 @@ mod tests {
             wire_api: Some("responses".to_string()),
             provider_key_ref: None,
             forward_env: None,
+            approval_policy: None,
+            network_access: None,
+            allow_danger_bypass: None,
+            permission_profile: None,
+            workspace_owned: None,
         }
+    }
+
+    #[test]
+    fn only_bamboo_managed_non_git_workspaces_are_marked_owned() {
+        let project = tempfile::tempdir().unwrap();
+        let managed = project.path().join(".bamboo/worktree/child-571");
+        std::fs::create_dir_all(&managed).unwrap();
+        assert!(!workspace_is_bamboo_owned(managed.to_str().unwrap()));
+        let marker = project
+            .path()
+            .join(".bamboo/worktree/.bamboo-owned/child-571");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "bamboo/child-571").unwrap();
+        assert!(workspace_is_bamboo_owned(managed.to_str().unwrap()));
+        let nested = managed.join("nested/path");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(workspace_is_bamboo_owned(nested.to_str().unwrap()));
+
+        let arbitrary = tempfile::tempdir().unwrap();
+        assert!(!workspace_is_bamboo_owned(
+            arbitrary.path().to_str().unwrap()
+        ));
     }
 
     #[test]

@@ -29,6 +29,23 @@ fn codex_wire_api_name(wire_api: bamboo_config::CodexWireApi) -> String {
     .to_string()
 }
 
+fn codex_sandbox_name(sandbox: bamboo_config::CodexSandbox) -> String {
+    match sandbox {
+        bamboo_config::CodexSandbox::ReadOnly => "read-only",
+        bamboo_config::CodexSandbox::WorkspaceWrite => "workspace-write",
+        bamboo_config::CodexSandbox::DangerFullAccess => "danger-full-access",
+    }
+    .to_string()
+}
+
+fn codex_approval_policy_name(policy: bamboo_config::CodexApprovalPolicy) -> String {
+    match policy {
+        bamboo_config::CodexApprovalPolicy::Never => "never",
+        bamboo_config::CodexApprovalPolicy::OnFailure => "on-failure",
+    }
+    .to_string()
+}
+
 fn codex_base_url(
     config: &Config,
     mode: bamboo_config::CodexAuthMode,
@@ -202,7 +219,7 @@ pub fn build_external_child_runner_with_codex_tokens(
                 Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
                     binary: profile.codex_binary.clone(),
                     model: profile.codex_model.clone(),
-                    sandbox: None,
+                    sandbox: profile.codex_sandbox.map(codex_sandbox_name),
                     inherit_user_config: None,
                     auth_mode: Some(codex_auth_mode_name(
                         profile.codex_auth_mode.unwrap_or_default(),
@@ -218,6 +235,13 @@ pub fn build_external_child_runner_with_codex_tokens(
                         .as_ref()
                         .map(|reference| reference.as_str().to_string()),
                     forward_env: profile.codex_forward_env.clone(),
+                    approval_policy: profile
+                        .codex_approval_policy
+                        .map(codex_approval_policy_name),
+                    network_access: profile.codex_network_access,
+                    allow_danger_bypass: profile.codex_allow_danger_bypass,
+                    permission_profile: Some(profile.permission_profile.clone()),
+                    workspace_owned: None,
                 },
                 Some(other) => {
                     tracing::error!(
@@ -360,7 +384,7 @@ fn build_local_actor_runner(
         Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
             binary: sub.codex_binary.clone(),
             model: sub.codex_model.clone(),
-            sandbox: None,
+            sandbox: sub.codex_sandbox.map(codex_sandbox_name),
             inherit_user_config: None,
             auth_mode: Some(codex_auth_mode_name(
                 sub.codex_auth_mode.unwrap_or_default(),
@@ -376,6 +400,11 @@ fn build_local_actor_runner(
                 .as_ref()
                 .map(|reference| reference.as_str().to_string()),
             forward_env: sub.codex_forward_env.clone(),
+            approval_policy: sub.codex_approval_policy.map(codex_approval_policy_name),
+            network_access: sub.codex_network_access,
+            allow_danger_bypass: sub.codex_allow_danger_bypass,
+            permission_profile: None,
+            workspace_owned: None,
         },
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };
@@ -664,8 +693,11 @@ pub fn extract_provider_credentials(
 
 #[cfg(test)]
 mod codex_runtime_config_tests {
-    use super::{codex_auth_mode_name, codex_base_url, codex_wire_api_name};
-    use bamboo_config::{CodexAuthMode, CodexWireApi};
+    use super::{
+        codex_approval_policy_name, codex_auth_mode_name, codex_base_url, codex_sandbox_name,
+        codex_wire_api_name,
+    };
+    use bamboo_config::{CodexApprovalPolicy, CodexAuthMode, CodexSandbox, CodexWireApi};
     use bamboo_llm::Config;
 
     #[test]
@@ -675,6 +707,15 @@ mod codex_runtime_config_tests {
 
         assert_eq!(codex_auth_mode_name(CodexAuthMode::Bamboo), "bamboo");
         assert_eq!(codex_wire_api_name(CodexWireApi::Responses), "responses");
+        assert_eq!(codex_sandbox_name(CodexSandbox::ReadOnly), "read-only");
+        assert_eq!(
+            codex_sandbox_name(CodexSandbox::WorkspaceWrite),
+            "workspace-write"
+        );
+        assert_eq!(
+            codex_approval_policy_name(CodexApprovalPolicy::OnFailure),
+            "on-failure"
+        );
         assert_eq!(
             codex_base_url(&config, CodexAuthMode::Bamboo, None).as_deref(),
             Some("http://127.0.0.1:5700/openai/v1")

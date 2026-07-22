@@ -7,10 +7,11 @@ with `--output-last-message`.
 
 The minimum supported version is **Codex CLI 0.144.0**. Bamboo verifies the
 installed version and the required `exec --json`, stdin prompt,
-`--output-last-message`, and `exec resume --json` surfaces before a worker
-starts. The implementation and live Bamboo-provider test are verified against
-0.144.5. Codex 0.144 removed the custom-provider Chat Completions wire, so
-`codex_wire_api` only accepts `"responses"`.
+`--output-last-message`, `--config`, sandbox/danger flags, and
+`exec resume --json` surfaces before a worker starts. The implementation and
+live Bamboo-provider test are verified against 0.144.5. Codex 0.144 removed the
+custom-provider Chat Completions wire, so `codex_wire_api` only accepts
+`"responses"`.
 
 ## Authentication and billing modes
 
@@ -85,6 +86,36 @@ query parameters, or a fragment. It and `codex_provider_key_ref` are valid only
 in `custom` mode. `OPENAI_API_KEY` is valid in `codex_forward_env` only in
 `api_key` mode. Unknown modes and wire protocols fail settings validation.
 
+## Sandbox and approval policy
+
+`codex exec` has no interactive approval relay. Bamboo therefore resolves both
+permission knobs before spawn and never relies on the CLI's implicit defaults:
+
+| Child posture | Effective Codex invocation |
+|---|---|
+| default / restricted | `--sandbox workspace-write --config approval_policy="never"` |
+| read-only / research / guardian | `--sandbox read-only --config approval_policy="never"` |
+| bypass parent | `--full-auto`, which remains workspace-sandboxed |
+| workspace network enabled | the workspace-write flags plus `--config sandbox_workspace_write.network_access=true` |
+
+`codex_sandbox` can explicitly select `read-only`, `workspace-write`, or
+`danger-full-access`; `codex_approval_policy` accepts only the non-interactive
+`never` and `on-failure` values. `codex_network_access` applies only to
+workspace-write. The same fields are available globally under `subagents` and
+per named `ExternalAgentProfile`.
+
+Disabling the OS sandbox is double-gated. A `danger-full-access` request becomes
+`--dangerously-bypass-approvals-and-sandbox` only when the child session's
+parent is currently in bypass mode and `codex_allow_danger_bypass` is true.
+Otherwise it is downgraded to `--full-auto` with an audit warning. Root workers
+are always downgraded. A successful danger bypass emits a separate, loud
+warning event as well as the bootstrap policy metadata.
+
+For a non-Git workspace, Bamboo adds `--skip-git-repo-check` only when the
+directory is under Bamboo's configured workspace root or a
+`<project>/.bamboo/worktree/...` directory. An arbitrary user-selected
+directory keeps Codex's repository check.
+
 ## Isolation and environment policy
 
 Every child starts after `env_clear()`. Bamboo restores only `HOME`, `PATH`,
@@ -122,11 +153,11 @@ record the request and outcome in the parent.
 ## Verification
 
 Run the deterministic executor and security tests normally with `cargo test`.
-Two real-machine tests are ignored in routine CI because they require an
+Real-machine tests are ignored in routine CI because they require an
 installed external binary:
 
 ```sh
-# User-login/inherit smoke test
+# User-login/inherit smoke and workspace sandbox tests
 cargo test --test e2e_codex_cli_manual -- --ignored --nocapture
 
 # Live Codex -> Bamboo Responses path, metrics, and post-run revocation

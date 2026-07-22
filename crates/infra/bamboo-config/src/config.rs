@@ -629,6 +629,27 @@ pub enum CodexWireApi {
     Responses,
 }
 
+/// OS sandbox selected for non-interactive `codex exec` children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+/// Spawn-time approval policy for non-interactive `codex exec` children.
+///
+/// Interactive policies (`untrusted` / `on-request`) are intentionally not
+/// representable: exec mode has no approval relay, so either policy would
+/// eventually wait for a human that cannot answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    Never,
+    OnFailure,
+}
+
 /// Sub-agent execution settings.
 ///
 /// Sub-agents always run as independent **actor** processes — an isolated OS
@@ -714,6 +735,21 @@ pub struct SubagentsConfig {
     /// requires an explicit `OPENAI_API_KEY` entry; it is never implicit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_forward_env: Option<Vec<String>>,
+    /// Explicit Codex sandbox override. Unset derives the sandbox from the
+    /// child permission profile and the parent session's bypass posture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_sandbox: Option<CodexSandbox>,
+    /// Explicit non-interactive approval policy. Unset always resolves to an
+    /// explicit safe value; Bamboo never trusts the CLI's implicit default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_approval_policy: Option<CodexApprovalPolicy>,
+    /// Permit network access from a workspace-write sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_network_access: Option<bool>,
+    /// Opt in to disabling the Codex OS sandbox, but only when the parent run
+    /// is itself in bypass mode. False/unset keeps bypass runs sandboxed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_allow_danger_bypass: Option<bool>,
     /// The active message-broker endpoint the `ask_agent` tool / sub-agent bus
     /// dials. RUNTIME-ONLY (`#[serde(skip)]`): never read from nor written to
     /// `config.json`. It is populated in memory each boot by `maybe_embed_broker`
