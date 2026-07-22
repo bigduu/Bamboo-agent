@@ -40,6 +40,18 @@ pub struct DurableApproval {
     pub reason: Option<String>,
 }
 
+/// Stable, read-only view used by account-level recovery APIs.
+///
+/// `approvals` contains only records that have not reached a terminal
+/// delivery outcome. `DecisionRecorded` is intentionally retained: the
+/// decision is no longer user-actionable, but the child is still blocked
+/// until delivery finishes and clients must not infer that it resumed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalRegistrySnapshot {
+    pub revision: u64,
+    pub approvals: Vec<DurableApproval>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RegistryFile {
     schema_version: u32,
@@ -145,6 +157,44 @@ impl ApprovalRegistry {
     /// Stable process-local identity used to isolate ephemeral live state.
     pub fn scope_id(&self) -> usize {
         self.scope_id
+    }
+
+    /// Return the complete unresolved approval set at one registry revision.
+    ///
+    /// The deterministic ordering keeps HTTP snapshots and tests stable while
+    /// the registry continues to use a hash map internally.
+    pub fn unresolved_snapshot(&self) -> ApprovalRegistrySnapshot {
+        let mut approvals = self
+            .records
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    ApprovalState::Pending | ApprovalState::DecisionRecorded
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        approvals.sort_by(|left, right| {
+            (
+                &left.created_at,
+                &left.parent_session_id,
+                &left.child_session_id,
+                left.child_attempt,
+                &left.request_id,
+            )
+                .cmp(&(
+                    &right.created_at,
+                    &right.parent_session_id,
+                    &right.child_session_id,
+                    right.child_attempt,
+                    &right.request_id,
+                ))
+        });
+        ApprovalRegistrySnapshot {
+            revision: self.revision,
+            approvals,
+        }
     }
 
     pub fn record_decision(
@@ -563,5 +613,43 @@ mod tests {
             second.get("child", "request").unwrap().state,
             ApprovalState::Pending
         );
+    }
+
+    #[test]
+    fn unresolved_snapshot_is_revisioned_sorted_and_excludes_terminal_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry =
+            ApprovalRegistry::open(dir.path().join("child-approvals-v1.json")).unwrap();
+
+        let mut later = pending();
+        later.request_id = "request-z".into();
+        later.created_at = "2026-01-02T00:00:00Z".into();
+        let mut earlier = pending();
+        earlier.request_id = "request-a".into();
+        registry.register(later).unwrap();
+        registry.register(earlier).unwrap();
+        registry
+            .record_decision("parent", "child", 1, "request-a", true)
+            .unwrap();
+
+        let snapshot = registry.unresolved_snapshot();
+        assert_eq!(snapshot.revision, 3);
+        assert_eq!(
+            snapshot
+                .approvals
+                .iter()
+                .map(|record| record.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["request-a", "request-z"]
+        );
+        assert_eq!(snapshot.approvals[0].state, ApprovalState::DecisionRecorded);
+
+        registry
+            .finish("parent", "child", 1, "request-a", true, None)
+            .unwrap();
+        let snapshot = registry.unresolved_snapshot();
+        assert_eq!(snapshot.revision, 4);
+        assert_eq!(snapshot.approvals.len(), 1);
+        assert_eq!(snapshot.approvals[0].request_id, "request-z");
     }
 }
