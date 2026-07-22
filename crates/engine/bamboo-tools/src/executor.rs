@@ -352,6 +352,7 @@ impl ToolExecutor for BuiltinToolExecutor {
         let Some(permission_checker) = &self.permission_checker else {
             return Ok(None);
         };
+        let hook_permission_override = crate::current_hook_permission_override(&call.id);
 
         // Mirror the head of `execute_with_context_outcome`: reuse the pre-parsed
         // args when threaded, apply the legacy-arg normalization, then resolve the
@@ -415,6 +416,15 @@ impl ToolExecutor for BuiltinToolExecutor {
                         crate::permission::PermissionOutcome::Deny { reason, .. } => {
                             return Err(ToolError::Execution(reason.message));
                         }
+                        crate::permission::PermissionOutcome::Ask(request)
+                            if matches!(
+                                hook_permission_override,
+                                Some(crate::HookPermissionOverride::Allow)
+                            ) && request.reason_code
+                                != crate::permission::PermissionReasonCode::HardDangerous =>
+                        {
+                            continue;
+                        }
                         crate::permission::PermissionOutcome::Ask(request) => request,
                     }
                 } else {
@@ -422,7 +432,11 @@ impl ToolExecutor for BuiltinToolExecutor {
                     // typed config. It remains one-shot only and fail-closed.
                     let force_ask =
                         permission_checker.requires_forced_confirmation(&tool_name, &args);
-                    if ctx.bypass_permissions && !force_ask {
+                    let hook_allows = matches!(
+                        hook_permission_override,
+                        Some(crate::HookPermissionOverride::Allow)
+                    );
+                    if (ctx.bypass_permissions || hook_allows) && !force_ask {
                         continue;
                     }
                     let decision = if force_ask {
@@ -1220,6 +1234,96 @@ mod tests {
             event_rx.try_recv().is_err(),
             "ordinary bypassed child command must not emit a human approval event"
         );
+    }
+
+    #[tokio::test]
+    async fn hook_allow_skips_configured_ask_for_exact_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook-allowed.txt");
+        let path_str = path.to_str().unwrap().to_string();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_ask_rules([format!("Write({}/**)", dir.path().to_str().unwrap())]);
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path": path_str, "content": "allowed by hook"}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-hook-allow"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            executor.execute_with_context(&call, ctx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "hook allow should skip ordinary ask: {result:?}"
+        );
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "allowed by hook");
+        assert_eq!(
+            crate::current_hook_permission_override(&call.id),
+            None,
+            "the one-call override must not leak"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_allow_cannot_skip_hard_dangerous_parent_review() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(BashTool::new())
+            .expect("register Bash tool")
+            .with_permission_checker(checker)
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hard-dangerous-must-not-run.txt");
+        let command = format!("eval 'printf denied > {}'", path.display());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(RecordingApprovalProxy {
+            requests: requests.clone(),
+            approve: false,
+        });
+        let call = make_tool_call("Bash", json!({"command": command}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-hook-hard-dangerous"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            crate::approval::with_approval_proxy(
+                Some(proxy),
+                executor.execute_with_context(&call, ctx),
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref message)) if message.contains("denied by host")),
+            "hard-dangerous review must remain authoritative: {result:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!path.exists());
     }
 
     #[tokio::test]

@@ -86,6 +86,10 @@ pub(super) struct ToolExecutionOutcome {
     /// `result` above, so the compressor/policy path is unchanged). Handled in
     /// [`apply_tool_execution_outcome`] before the normal success path.
     pub needs_human: Option<bamboo_agent_core::PendingQuestion>,
+    /// True only after a terminal executor outcome (`Completed` or an execution
+    /// error). Pre-dispatch blocks, `Running`, and `NeedsHuman` do not represent
+    /// a completed tool and must not fire `PostToolUse`.
+    pub post_tool_hook_eligible: bool,
     pub tool_duration: std::time::Duration,
 }
 
@@ -103,6 +107,7 @@ pub(super) async fn execute_tool_call_only(
         );
         return Ok(ToolExecutionOutcome {
             needs_human: None,
+            post_tool_hook_eligible: false,
             result: Err(policy_error),
             tool_duration: std::time::Duration::ZERO,
         });
@@ -163,6 +168,7 @@ pub(super) async fn execute_tool_call_only(
     }
 
     let tool_timer = std::time::Instant::now();
+    let mut permission_override = None;
 
     if ctx
         .config
@@ -207,6 +213,7 @@ pub(super) async fn execute_tool_call_only(
                 return Ok(ToolExecutionOutcome {
                     result: Err(format!("Tool execution denied by hook: {reason}")),
                     needs_human: None,
+                    post_tool_hook_eligible: false,
                     tool_duration: elapsed,
                 });
             }
@@ -228,6 +235,15 @@ pub(super) async fn execute_tool_call_only(
                     let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
                     return Ok(outcome);
                 }
+            }
+            HookResult::Allow => {
+                crate::runtime::hooks::apply_hook_outcome(
+                    AgentHookPoint::BeforeToolExecution,
+                    hook_outcome,
+                    session,
+                    runtime_state,
+                )?;
+                permission_override = Some(bamboo_tools::HookPermissionOverride::Allow);
             }
             _ => {
                 if let Err(error) = crate::runtime::hooks::apply_hook_outcome(
@@ -277,20 +293,26 @@ pub(super) async fn execute_tool_call_only(
     // apply before the success path) and collapse the rest to a ToolResult so the
     // compressor / policy / transcript path is unchanged. Completed -> its result,
     // Running -> its synthetic ack, NeedsHuman -> its rich display result.
-    let (needs_human, result) =
-        match bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
-            ctx.tool_call,
-            ctx.tools.as_ref(),
-            // Agent execution does not route through the legacy composition
-            // runtime; catalog-pinned workflow_run is the sole orchestrator.
-            None,
-            tool_ctx,
+    let dispatch = bamboo_agent_core::tools::executor::execute_tool_call_with_context_outcome(
+        ctx.tool_call,
+        ctx.tools.as_ref(),
+        // Agent execution does not route through the legacy composition
+        // runtime; catalog-pinned workflow_run is the sole orchestrator.
+        None,
+        tool_ctx,
+    );
+    let (needs_human, result, post_tool_hook_eligible) =
+        match bamboo_tools::with_hook_permission_override(
+            permission_override,
+            &ctx.tool_call.id,
+            dispatch,
         )
         .await
         {
-            Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result)),
-            Ok(other) => (None, Ok(other.into_tool_result())),
-            Err(error) => (None, Err(error)),
+            Ok(ToolOutcome::Completed(result)) => (None, Ok(result), true),
+            Ok(ToolOutcome::Running(handle)) => (None, Ok(handle.ack), false),
+            Ok(ToolOutcome::NeedsHuman { question, result }) => (Some(question), Ok(result), false),
+            Err(error) => (None, Err(error), true),
         };
 
     let tool_duration = tool_timer.elapsed();
@@ -322,6 +344,7 @@ pub(super) async fn execute_tool_call_only(
     Ok(ToolExecutionOutcome {
         result: result.map_err(|error| error.to_string()),
         needs_human,
+        post_tool_hook_eligible,
         tool_duration,
     })
 }
@@ -394,6 +417,7 @@ async fn hook_ask_outcome(
         return (!approved).then(|| ToolExecutionOutcome {
             result: Err("Tool execution denied by parent agent review".to_string()),
             needs_human: None,
+            post_tool_hook_eligible: false,
             tool_duration: std::time::Duration::ZERO,
         });
     }
@@ -404,20 +428,44 @@ async fn hook_ask_outcome(
                 .to_string(),
         ),
         needs_human: None,
+        post_tool_hook_eligible: false,
         tool_duration: std::time::Duration::ZERO,
     })
+}
+
+fn append_post_tool_feedback(result: &mut Result<ToolResult, String>, feedback: Vec<String>) {
+    let feedback = feedback
+        .into_iter()
+        .filter_map(|text| {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        })
+        .collect::<Vec<_>>();
+    if feedback.is_empty() {
+        return;
+    }
+
+    let block = format!(
+        "\n\n<post_tool_use_feedback>\n{}\n</post_tool_use_feedback>",
+        feedback.join("\n")
+    );
+    match result {
+        Ok(result) => result.result.push_str(&block),
+        Err(error) => error.push_str(&block),
+    }
 }
 
 pub(super) async fn apply_tool_execution_outcome(
     ctx: ToolExecutionApplyContext<'_>,
     mut outcome: ToolExecutionOutcome,
 ) -> Result<bool, AgentError> {
-    let mut deferred_contexts = Vec::new();
+    let mut post_tool_feedback = Vec::new();
     let mut deferred_hook_control = None;
-    if ctx
-        .config
-        .hook_runner
-        .has_hooks_for(AgentHookPoint::AfterToolExecution)
+    if outcome.post_tool_hook_eligible
+        && ctx
+            .config
+            .hook_runner
+            .has_hooks_for(AgentHookPoint::AfterToolExecution)
     {
         let hook_payload = HookPayload::ToolResult {
             tool_name: ctx.tool_call.function.name.clone(),
@@ -450,10 +498,9 @@ pub(super) async fn apply_tool_execution_outcome(
                 Some(ctx.event_tx),
             )
             .await;
-        deferred_contexts = std::mem::take(&mut hook_outcome.injected_contexts);
+        post_tool_feedback = std::mem::take(&mut hook_outcome.injected_contexts);
         if let HookResult::Deny { reason } = hook_outcome.decision.clone() {
-            outcome.needs_human = None;
-            outcome.result = Err(format!("Tool result denied by hook: {reason}"));
+            post_tool_feedback.push(format!("Blocked by PostToolUse hook: {reason}"));
             hook_outcome.decision = HookResult::Continue;
         }
         if matches!(
@@ -470,6 +517,7 @@ pub(super) async fn apply_tool_execution_outcome(
             )?;
         }
     }
+    append_post_tool_feedback(&mut outcome.result, post_tool_feedback);
 
     // Capture tool lifecycle metadata before the borrow-splitting match.
     let tool_name_for_meta = ctx.tool_call.function.name.clone();
@@ -583,12 +631,6 @@ pub(super) async fn apply_tool_execution_outcome(
         msg.metadata = Some(metadata_value);
     }
 
-    crate::runtime::hooks::inject_contexts(
-        ctx.session,
-        AgentHookPoint::AfterToolExecution,
-        deferred_contexts,
-    );
-
     if let Some(hook_outcome) = deferred_hook_control {
         crate::runtime::hooks::apply_hook_outcome(
             AgentHookPoint::AfterToolExecution,
@@ -605,9 +647,14 @@ pub(super) async fn apply_tool_execution_outcome(
 mod hook_tests {
     use super::*;
     use async_trait::async_trait;
-    use bamboo_agent_core::tools::{FunctionCall, ToolError};
+    use bamboo_agent_core::tools::{
+        AsyncWaitKind, FunctionCall, RunningCompletion, RunningHandle, ToolError,
+    };
     use bamboo_agent_core::AgentHook;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use bamboo_config::{
+        LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType, LifecycleHooksConfig,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct DenyToolHook;
 
@@ -659,6 +706,74 @@ mod hook_tests {
         }
     }
 
+    struct AllowToolHook;
+
+    #[async_trait]
+    impl AgentHook for AllowToolHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeToolExecution
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            HookResult::Allow
+        }
+    }
+
+    struct PostFeedbackHook;
+
+    #[async_trait]
+    impl AgentHook for PostFeedbackHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterToolExecution
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            assert!(matches!(
+                payload,
+                HookPayload::ToolResult {
+                    tool_name,
+                    outcome: HookToolOutcome { success: true, .. },
+                    ..
+                } if tool_name == "probe"
+            ));
+            HookResult::WithContext {
+                result: Box::new(HookResult::Deny {
+                    reason: "generated output violates policy".to_string(),
+                }),
+                text: "lint: replace the generated token".to_string(),
+            }
+        }
+    }
+
+    struct CountingPostHook(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl AgentHook for CountingPostHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterToolExecution
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            HookResult::Continue
+        }
+    }
+
     struct RecordingParentReviewer {
         seen: AtomicBool,
         approve: bool,
@@ -673,6 +788,13 @@ mod hook_tests {
                     .as_ref()
                     .map(|request| request.reason_code),
                 Some(bamboo_tools::permission::PermissionReasonCode::ConfiguredAlwaysAsk)
+            );
+            assert_eq!(
+                ask.permission_request
+                    .as_ref()
+                    .map(|request| request.bypass_requested),
+                Some(true),
+                "hook ask must reach the parent reviewer even under bypass"
             );
             self.seen.store(true, Ordering::SeqCst);
             self.approve
@@ -698,6 +820,51 @@ mod hook_tests {
         }
     }
 
+    enum NonTerminalOutcome {
+        Running,
+        NeedsHuman,
+    }
+
+    struct NonTerminalExecutor(NonTerminalOutcome);
+
+    #[async_trait]
+    impl ToolExecutor for NonTerminalExecutor {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("the outcome-aware path must be used")
+        }
+
+        async fn execute_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            _ctx: bamboo_agent_core::tools::ToolExecutionContext<'_>,
+        ) -> Result<ToolOutcome, ToolError> {
+            match self.0 {
+                NonTerminalOutcome::Running => Ok(ToolOutcome::Running(RunningHandle {
+                    tool_call_id: call.id.clone(),
+                    ack: ToolResult::text(true, "running"),
+                    completion: RunningCompletion::Detached,
+                    wait_kind: AsyncWaitKind::AsyncTools,
+                    kill: Box::new(|| {}),
+                })),
+                NonTerminalOutcome::NeedsHuman => Ok(ToolOutcome::NeedsHuman {
+                    question: bamboo_agent_core::PendingQuestion {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.function.name.clone(),
+                        question: "Choose?".to_string(),
+                        options: vec!["yes".to_string(), "no".to_string()],
+                        allow_custom: false,
+                        source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+                    },
+                    result: ToolResult::text(false, "decision pending"),
+                }),
+            }
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
     struct PanicLegacyApprovalDelegate;
 
     #[async_trait]
@@ -708,6 +875,49 @@ mod hook_tests {
         ) -> Result<crate::runtime::config::ChildApprovalOutcome, String> {
             panic!("Hook Ask must not enter the legacy interactive approval path")
         }
+    }
+
+    fn probe_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: format!("call-{name}"),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: serde_json::json!({"value": 7}).to_string(),
+            },
+        }
+    }
+
+    async fn apply_test_outcome(
+        config: &AgentLoopConfig,
+        tools: &Arc<dyn ToolExecutor>,
+        tool_call: &ToolCall,
+        session: &mut Session,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        outcome: ToolExecutionOutcome,
+    ) -> Result<bool, AgentError> {
+        let session_id = session.id.clone();
+        let mut runtime_state = AgentRuntimeState::new(&session.id);
+        let mut task_context = None;
+        let mut state = RoundExecutionState::default();
+        apply_tool_execution_outcome(
+            ToolExecutionApplyContext {
+                tool_call,
+                event_tx,
+                metrics_collector: None,
+                session_id: &session_id,
+                round_id: "round-1",
+                round: 0,
+                session,
+                tools,
+                config,
+                runtime_state: &mut runtime_state,
+                task_context: &mut task_context,
+                state: &mut state,
+            },
+            outcome,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -761,6 +971,134 @@ mod hook_tests {
     }
 
     #[tokio::test]
+    async fn configured_shell_hook_denies_bash_and_persists_synthetic_result() {
+        let lifecycle_config = LifecycleHooksConfig {
+            enabled: true,
+            pre_tool_use: vec![LifecycleHookGroup {
+                matcher: Some("^bash$".to_string()),
+                hooks: vec![LifecycleHookCommand {
+                    hook_type: LifecycleHookType::Command,
+                    command: "printf 'configured bash denial' >&2; exit 2".to_string(),
+                    timeout_ms: 1_000,
+                }],
+            }],
+            ..LifecycleHooksConfig::default()
+        };
+        let runner =
+            crate::runtime::hooks::HookRunner::new().with_lifecycle_config(&lifecycle_config, None);
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        };
+        let concrete_tools = Arc::new(RecordingExecutor(AtomicBool::new(false)));
+        let tools: Arc<dyn ToolExecutor> = concrete_tools.clone();
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let tool_call = probe_call("bash");
+        let workspace = tempfile::tempdir().unwrap();
+        let mut session = Session::new("configured-hook-deny", "model");
+        session.workspace = Some(workspace.path().to_string_lossy().into_owned());
+        let session_flags = ToolExecutionSessionFlags::from_session(&session);
+        let mut runtime_state = AgentRuntimeState::new(&session.id);
+
+        let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            tool_call: &tool_call,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            session_id: "configured-hook-deny",
+            round_id: "round-1",
+            round: 0,
+            tools: &tools,
+            config: &config,
+            hook_session: Some(&mut session),
+            hook_runtime_state: Some(&mut runtime_state),
+            session_flags,
+            available_tool_schemas: &[],
+        })
+        .await
+        .expect("hook denial is represented as a synthetic tool error");
+
+        assert!(!concrete_tools.0.load(Ordering::SeqCst));
+        apply_test_outcome(
+            &config,
+            &tools,
+            &tool_call,
+            &mut session,
+            &event_tx,
+            outcome,
+        )
+        .await
+        .unwrap();
+        let tool_message = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(&tool_call.id))
+            .expect("synthetic denial must be appended as a tool result");
+        assert!(tool_message.content.contains("configured bash denial"));
+    }
+
+    #[tokio::test]
+    async fn allow_hook_skips_exact_configured_ask_in_engine_dispatch() {
+        let mut runner = crate::runtime::hooks::HookRunner::new();
+        runner.register(Arc::new(AllowToolHook));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("engine-hook-allowed.txt");
+        let permission_config = Arc::new(bamboo_tools::permission::PermissionConfig::new());
+        permission_config
+            .set_ask_rules([format!("Write({}/**)", workspace.path().to_string_lossy())]);
+        let checker = Arc::new(bamboo_tools::permission::ConfigPermissionChecker::new(
+            permission_config,
+        ));
+        let tools: Arc<dyn ToolExecutor> = Arc::new(
+            bamboo_tools::BuiltinToolExecutorBuilder::new()
+                .with_tool(bamboo_tools::WriteTool::new())
+                .unwrap()
+                .with_permission_checker(checker)
+                .build(),
+        );
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let tool_call = ToolCall {
+            id: "call-write-allow".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Write".to_string(),
+                arguments: serde_json::json!({
+                    "file_path": path.to_string_lossy(),
+                    "content": "allowed"
+                })
+                .to_string(),
+            },
+        };
+        let mut session = Session::new("hook-allow-engine", "model");
+        session.workspace = Some(workspace.path().to_string_lossy().into_owned());
+        let session_flags = ToolExecutionSessionFlags::from_session(&session);
+        let mut runtime_state = AgentRuntimeState::new(&session.id);
+
+        let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            tool_call: &tool_call,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            session_id: "hook-allow-engine",
+            round_id: "round-1",
+            round: 0,
+            tools: &tools,
+            config: &config,
+            hook_session: Some(&mut session),
+            hook_runtime_state: Some(&mut runtime_state),
+            session_flags,
+            available_tool_schemas: &[],
+        })
+        .await
+        .unwrap();
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "allowed");
+    }
+
+    #[tokio::test]
     async fn ask_hook_routes_to_parent_proxy_and_executes_only_after_approval() {
         let mut runner = crate::runtime::hooks::HookRunner::new();
         runner.register(Arc::new(AskToolHook));
@@ -785,8 +1123,10 @@ mod hook_tests {
             },
         };
         let mut session = Session::new("hook-ask-session", "model");
-        let session_flags = ToolExecutionSessionFlags::from_session(&session);
         let mut runtime_state = AgentRuntimeState::new(&session.id);
+        runtime_state.bypass_permissions = true;
+        session.agent_runtime_state = Some(runtime_state.clone());
+        let session_flags = ToolExecutionSessionFlags::from_session(&session);
 
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
@@ -811,6 +1151,106 @@ mod hook_tests {
         assert!(outcome.result.is_ok());
         assert!(reviewer.seen.load(Ordering::SeqCst));
         assert!(tools.0.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn post_tool_feedback_is_appended_to_persisted_tool_result() {
+        let mut runner = crate::runtime::hooks::HookRunner::new();
+        runner.register(Arc::new(PostFeedbackHook));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        };
+        let tools: Arc<dyn ToolExecutor> = Arc::new(RecordingExecutor(AtomicBool::new(false)));
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let tool_call = probe_call("probe");
+        let mut session = Session::new("post-feedback", "model");
+        let outcome = ToolExecutionOutcome {
+            result: Ok(ToolResult::text(true, "raw output")),
+            needs_human: None,
+            post_tool_hook_eligible: true,
+            tool_duration: std::time::Duration::from_millis(7),
+        };
+
+        apply_test_outcome(
+            &config,
+            &tools,
+            &tool_call,
+            &mut session,
+            &event_tx,
+            outcome,
+        )
+        .await
+        .unwrap();
+        let persisted = serde_json::to_vec(&session).unwrap();
+        let restored: Session = serde_json::from_slice(&persisted).unwrap();
+        let content = &restored
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(&tool_call.id))
+            .expect("tool result must survive persistence")
+            .content;
+        assert!(content.contains("raw output"));
+        assert!(content.contains("lint: replace the generated token"));
+        assert!(content.contains("Blocked by PostToolUse hook"));
+        assert!(content.contains("generated output violates policy"));
+    }
+
+    #[tokio::test]
+    async fn post_tool_hook_skips_running_and_needs_human_outcomes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runner = crate::runtime::hooks::HookRunner::new();
+        runner.register(Arc::new(CountingPostHook(calls.clone())));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        };
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let tool_call = probe_call("probe");
+
+        for (session_id, executor) in [
+            (
+                "post-skip-running",
+                NonTerminalExecutor(NonTerminalOutcome::Running),
+            ),
+            (
+                "post-skip-needs-human",
+                NonTerminalExecutor(NonTerminalOutcome::NeedsHuman),
+            ),
+        ] {
+            let tools: Arc<dyn ToolExecutor> = Arc::new(executor);
+            let mut session = Session::new(session_id, "model");
+            let session_flags = ToolExecutionSessionFlags::from_session(&session);
+            let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+                tool_call: &tool_call,
+                event_tx: &event_tx,
+                metrics_collector: None,
+                session_id,
+                round_id: "round-1",
+                round: 0,
+                tools: &tools,
+                config: &config,
+                hook_session: None,
+                hook_runtime_state: None,
+                session_flags,
+                available_tool_schemas: &[],
+            })
+            .await
+            .unwrap();
+            assert!(!outcome.post_tool_hook_eligible);
+            apply_test_outcome(
+                &config,
+                &tools,
+                &tool_call,
+                &mut session,
+                &event_tx,
+                outcome,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
