@@ -183,6 +183,27 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                 inherit_user_config.unwrap_or(false),
                 forward_env.clone().unwrap_or_default(),
             )),
+            ExecutorSpec::Codex {
+                ref binary,
+                ref model,
+                ref sandbox,
+                ref inherit_user_config,
+                ref forward_env,
+            } => Arc::new(
+                crate::codex_cli_executor::CodexExecutor::new(
+                    binary.clone(),
+                    model.clone(),
+                    sandbox.clone(),
+                    spec.workspace.clone(),
+                    Some(crate::codex_cli_executor::resolve_codex_state_dir(
+                        &spec.storage_dir,
+                        &spec.identity.child_id,
+                    )),
+                    inherit_user_config.unwrap_or(false),
+                    forward_env.clone().unwrap_or_default(),
+                )
+                .await?,
+            ),
             _ => Arc::new(BambooRuntimeExecutor::build(&spec).await?),
         };
         return bamboo_broker::serve_executor_full(

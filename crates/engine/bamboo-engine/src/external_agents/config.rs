@@ -35,8 +35,7 @@ pub struct ExternalAgentProfile {
     /// Actor protocol only: which engine the worker runs.
     /// `"bamboo_runtime"` (default) for the real agent loop, `"echo"` for a
     /// dependency-free smoke run through the whole chain, `"claude_code"` to
-    /// drive the official Claude Code CLI (see the `claude_code_*` fields
-    /// below).
+    /// drive the official Claude Code CLI, or `"codex"` for `codex exec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
     /// `executor = "claude_code"` only: override the `claude` executable.
@@ -66,6 +65,12 @@ pub struct ExternalAgentProfile {
     /// billing from the CLI's own subscription auth to the API key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_forward_env: Option<Vec<String>>,
+    /// `executor = "codex"` only: override the `codex` executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_binary: Option<String>,
+    /// `executor = "codex"` only: `--model` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

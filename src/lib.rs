@@ -54,6 +54,10 @@ pub mod subagent_worker;
 /// `ChildExecutor` (`ExecutorSpec::ClaudeCode`), sibling of `subagent_worker`.
 pub mod claude_code_executor;
 
+/// `CodexExecutor`: drives `codex exec --json` as a one-shot
+/// `ChildExecutor` (`ExecutorSpec::Codex`).
+pub mod codex_cli_executor;
+
 /// The `bamboo broker-agent serve` worker: connect to a central broker and
 /// answer Ask/Task (query/steer) for its mailbox; deployable local/Docker/remote.
 pub mod broker_agent;

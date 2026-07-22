@@ -114,17 +114,21 @@ mod tests {
         config.lifecycle_hooks = hooks;
         CommandSink::from_config(&config).deliver(&sample_notification());
 
-        let written = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&output) {
-                    break contents;
+                    // The shell creates the redirection target before `cat`
+                    // writes the hook payload. Do not treat that transient
+                    // empty/partial file as a completed delivery.
+                    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&contents) {
+                        break envelope;
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("notification hook should complete within its test deadline");
-        let envelope: serde_json::Value = serde_json::from_str(&written).unwrap();
 
         assert_eq!(envelope["hook_event_name"], "Notification");
         assert_eq!(envelope["session_id"], "session-1");
