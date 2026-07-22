@@ -912,6 +912,103 @@ async fn provider_credential_full_payload_allows_unchanged_sidecars() {
     );
 }
 
+/// #573: the Codex custom-provider field is a stable credential reference,
+/// never a second copy of the provider secret. A subagents-only settings patch
+/// may round-trip that reference and update unrelated Codex fields without
+/// replacing, clearing, or exposing the provider-instance key.
+#[actix_web::test]
+async fn codex_provider_reference_round_trip_preserves_masked_provider_secret() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let app_state = web::Data::new(state);
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .route("/bamboo/config", web::get().to(super::get_bamboo_config))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    let provider = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "provider_instances": {
+                "codex-work": {
+                    "provider_type": "openai",
+                    "enabled": true,
+                    "api_key": "sk-codex-provider-secret"
+                }
+            }
+        }))
+        .to_request();
+    assert!(test::call_service(&app, provider)
+        .await
+        .status()
+        .is_success());
+
+    let reference = app_state.config.read().await.provider_instances["codex-work"]
+        .credential_ref
+        .clone()
+        .expect("provider instance has a stable credential reference");
+    let codex = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "subagents": {
+                "executor": "codex",
+                "codex_auth_mode": "custom",
+                "codex_base_url": "https://provider.example/v1",
+                "codex_wire_api": "responses",
+                "codex_provider_key_ref": reference.as_str(),
+                "codex_sandbox": "workspace-write",
+                "codex_approval_policy": "never"
+            }
+        }))
+        .to_request();
+    assert!(test::call_service(&app, codex).await.status().is_success());
+
+    let body: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get().uri("/bamboo/config").to_request(),
+    )
+    .await;
+    assert_eq!(
+        body["provider_instances"]["codex-work"]["api_key"],
+        "****...****"
+    );
+    assert_eq!(
+        body["subagents"]["codex_provider_key_ref"],
+        reference.as_str(),
+        "the non-secret reference remains visible and editable"
+    );
+
+    let update = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "subagents": {"codex_model": "gpt-5.4-mini"}
+        }))
+        .to_request();
+    assert!(test::call_service(&app, update).await.status().is_success());
+
+    assert_eq!(
+        app_state
+            .credential_store
+            .resolve(&reference)
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "sk-codex-provider-secret"
+    );
+    let subagents = std::fs::read_to_string(temp_dir.path().join("subagents.json")).unwrap();
+    assert!(subagents.contains(reference.as_str()));
+    assert!(!subagents.contains("sk-codex-provider-secret"));
+    assert!(!subagents.contains("****...****"));
+}
+
 #[actix_web::test]
 async fn redacted_full_payload_provider_update_preserves_notification_credential() {
     use crate::app_state::AppState;

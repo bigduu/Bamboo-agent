@@ -9,10 +9,31 @@ use std::time::Duration;
 use bamboo_agent::codex_cli_executor::{
     resolve_codex_permission_config, CodexAuthConfig, CodexExecutor,
 };
+use bamboo_subagent::codex_discovery::discover_codex_cli;
 use bamboo_subagent::executor::{ChildExecutor, EventSink, SteerInbox};
 use bamboo_subagent::proto::{RunSpec, TerminalStatus};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+#[ignore = "requires an installed Codex CLI >= 0.144 on PATH"]
+async fn real_codex_discovery_reports_path_version_and_actionable_missing_error() {
+    let discovered = discover_codex_cli(None)
+        .await
+        .expect("installed Codex passes the shared discovery preflight");
+    println!(
+        "CODEX_DISCOVERY path={} version={}",
+        discovered.path, discovered.version
+    );
+    assert!(!discovered.path.is_empty());
+    assert!(discovered.version.contains("codex-cli"));
+
+    let missing = discover_codex_cli(Some("/definitely/missing/codex"))
+        .await
+        .expect_err("missing override must be rejected");
+    assert!(missing.contains("npm i -g @openai/codex"));
+    assert!(missing.contains("codex_binary"));
+}
 
 #[tokio::test]
 #[ignore = "requires a logged-in Codex CLI >= 0.144 on PATH"]
@@ -68,10 +89,13 @@ async fn real_codex_completes_trivial_turn_and_reports_bootstrap_metadata() {
     assert_eq!(outcome.status, TerminalStatus::Completed);
     assert_eq!(outcome.result.as_deref().map(str::trim), Some("PONG"));
     let mut bootstrap = None;
+    let mut usage = None;
     while let Ok(event) = rx.try_recv() {
         println!("EVENT: {event}");
         if event["executor"] == "codex" {
             bootstrap = Some(event);
+        } else if event["type"] == "complete" {
+            usage = Some(event["usage"].clone());
         }
     }
     let bootstrap = bootstrap.expect("thread.started emitted bootstrap metadata");
@@ -84,6 +108,13 @@ async fn real_codex_completes_trivial_turn_and_reports_bootstrap_metadata() {
     assert_eq!(bootstrap["sandbox"], "read-only");
     assert_eq!(bootstrap["approval_policy"], "never");
     assert_eq!(bootstrap["policy_invocation"], "explicit");
+    assert_eq!(bootstrap["auth_mode"], "inherit");
+    assert_eq!(bootstrap["codex_home_mode"], "inherit");
+    assert_eq!(bootstrap["forward_env"], json!([]));
+    assert!(usage
+        .as_ref()
+        .and_then(|value| value["total_tokens"].as_u64())
+        .is_some_and(|total| total > 0));
 }
 
 #[tokio::test]
@@ -277,4 +308,120 @@ async fn real_codex_second_activation_resumes_and_recalls_native_context() {
     assert!(second_state["thread_id"]
         .as_str()
         .is_some_and(|thread_id| !thread_id.is_empty()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires a logged-in Codex CLI >= 0.144 on PATH"]
+async fn real_cancellation_kills_the_process_group_and_the_session_can_resume() {
+    let workspace = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(workspace.path())
+        .status()
+        .expect("git is installed");
+    assert!(status.success());
+
+    let executor = CodexExecutor::new(
+        None,
+        None,
+        Some(workspace.path().to_string_lossy().into_owned()),
+        Some(state.path().to_path_buf()),
+        Vec::new(),
+        CodexAuthConfig::inherit(),
+        resolve_codex_permission_config(
+            Some("workspace-write"),
+            Some("never"),
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap(),
+    )
+    .await
+    .expect("Codex preflight succeeds");
+
+    let pid_file = workspace.path().join("cancel-child.pid");
+    let cancel = CancellationToken::new();
+    let cancel_for_run = cancel.clone();
+    let (sink, _events) = EventSink::channel();
+    let first = executor.run(
+        RunSpec {
+            assignment: "Run this exact command now and wait for it to finish: /bin/sh -c 'echo $$ > ./cancel-child.pid; sleep 120'".to_string(),
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: Vec::new(),
+            secrets: Default::default(),
+        },
+        sink,
+        SteerInbox::disconnected(),
+        cancel_for_run,
+    );
+    tokio::pin!(first);
+
+    let shell_pid = tokio::time::timeout(Duration::from_secs(90), async {
+        tokio::select! {
+            pid = async {
+                loop {
+                    if let Ok(raw) = tokio::fs::read_to_string(&pid_file).await {
+                        if let Ok(pid) = raw.trim().parse::<i32>() {
+                            break pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            } => pid,
+            outcome = &mut first => {
+                panic!("Codex ended before starting the long-running descendant: {outcome:?}")
+            }
+        }
+    })
+    .await
+    .expect("Codex did not start the long-running descendant in time");
+    cancel.cancel();
+    let cancelled = tokio::time::timeout(Duration::from_secs(15), &mut first)
+        .await
+        .expect("cancelled Codex process did not exit in time");
+    assert_eq!(cancelled.status, TerminalStatus::Cancelled, "{cancelled:?}");
+
+    let descendant_gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // SAFETY: signal 0 performs an existence/permission probe and does
+            // not deliver a signal or dereference memory.
+            if unsafe { libc::kill(shell_pid, 0) } != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        descendant_gone.is_ok(),
+        "cancelled Codex descendant process {shell_pid} is still alive"
+    );
+
+    let assignment = "Reply with exactly RECOVERED and nothing else.";
+    let (sink, _events) = EventSink::channel();
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(180),
+        executor.run(
+            RunSpec {
+                assignment: assignment.to_string(),
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: vec![json!({"role": "user", "content": assignment})],
+                secrets: Default::default(),
+            },
+            sink,
+            SteerInbox::disconnected(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("Codex did not resume after cancellation");
+    assert_eq!(resumed.status, TerminalStatus::Completed, "{resumed:?}");
+    assert_eq!(resumed.result.as_deref().map(str::trim), Some("RECOVERED"));
 }

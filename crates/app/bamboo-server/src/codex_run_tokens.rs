@@ -357,6 +357,12 @@ wire_api = "responses"
             }),
             "parent metrics must record the Codex Responses request: {recorded:?}"
         );
+        assert!(
+            !format!("{recorded:?}").contains(&issued.token)
+                && !stdout.contains(&issued.token)
+                && !stderr.contains(&issued.token),
+            "the scoped run token must remain masked from metrics and process output"
+        );
 
         registry.revoke(&issued.token_id);
         let revoked = live_client
