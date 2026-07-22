@@ -31,6 +31,15 @@ pub trait AgentHook: Send + Sync {
         session: &Session,
     ) -> HookResult;
 
+    /// Whether this hook applies to the point-specific payload.
+    ///
+    /// The default accepts every payload. Configured tool hooks override this
+    /// to apply their tool-name matcher without spawning a process or emitting
+    /// a misleading execution checkpoint for non-matching calls.
+    fn matches(&self, _payload: &HookPayload) -> bool {
+        true
+    }
+
     /// Optional priority (lower runs first). Default is 100.
     fn priority(&self) -> u32 {
         100

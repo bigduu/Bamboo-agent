@@ -23,10 +23,10 @@ use crate::{
     ClusterFabricConfig, Config, ConfigSectionEvent, ConfigStoreResult, ConfigValues,
     ConnectConfig, CredentialRef, CredentialSource, CredentialStatus, CredentialStore,
     DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry, FeatureFlags, GeminiModelMapping,
-    HooksConfig, KeywordMaskingConfig, LiveSection, MemoryConfig, NotificationsConfig,
-    PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope,
-    SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig, StreamTimeoutConfig,
-    SubagentsConfig, ToolsConfig,
+    HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, MemoryConfig,
+    NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
+    RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig,
+    StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
 };
 
 const SECTION_SCHEMA_VERSION: u32 = 1;
@@ -186,7 +186,7 @@ impl SectionId {
 /// `proxy_auth` and `proxy_auth_encrypted` remain compatibility read fields,
 /// but their owner is still core; section serialization always drops them in
 /// favour of `proxy_auth_credential_ref`.
-pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 29] = [
+pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 30] = [
     ("http_proxy", SectionId::Core),
     ("https_proxy", SectionId::Core),
     ("proxy_auth", SectionId::Core),
@@ -202,6 +202,7 @@ pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 29] = [
     ("anthropic_model_mapping", SectionId::ModelPolicy),
     ("gemini_model_mapping", SectionId::ModelPolicy),
     ("hooks", SectionId::Hooks),
+    ("lifecycle_hooks", SectionId::Hooks),
     ("tools", SectionId::ToolsSkills),
     ("skills", SectionId::ToolsSkills),
     ("env_vars", SectionId::Env),
@@ -327,8 +328,12 @@ pub struct EnvSection(pub Vec<EnvVarEntry>);
 pub struct AccessControlSection(pub Option<AccessControlConfig>);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HooksSection(pub HooksConfig);
+pub struct HooksSection {
+    #[serde(flatten)]
+    pub request_hooks: HooksConfig,
+    #[serde(default, skip_serializing_if = "LifecycleHooksConfig::is_empty")]
+    pub lifecycle_hooks: LifecycleHooksConfig,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPolicySection {
@@ -482,6 +487,7 @@ impl SectionProjection {
             anthropic_model_mapping,
             gemini_model_mapping,
             hooks,
+            lifecycle_hooks,
             tools,
             skills,
             env_vars,
@@ -534,7 +540,10 @@ impl SectionProjection {
             cluster_fabric: ClusterFabricSection(cluster_fabric),
             env: EnvSection(env_vars),
             access_control: AccessControlSection(access_control),
-            hooks: HooksSection(hooks),
+            hooks: HooksSection {
+                request_hooks: hooks,
+                lifecycle_hooks,
+            },
             model_policy: ModelPolicySection {
                 keyword_masking,
                 anthropic_model_mapping,
@@ -613,7 +622,8 @@ impl SectionProjection {
                 keyword_masking,
                 anthropic_model_mapping,
                 gemini_model_mapping,
-                hooks: hooks.0,
+                hooks: hooks.request_hooks,
+                lifecycle_hooks: hooks.lifecycle_hooks,
                 tools,
                 skills,
                 env_vars: env.0,
@@ -1803,7 +1813,7 @@ fn validate_access_control(value: &AccessControlSection) -> Result<(), String> {
 
 fn validate_hooks(value: &HooksSection) -> Result<(), String> {
     if !matches!(
-        value.0.image_fallback.mode.as_str(),
+        value.request_hooks.image_fallback.mode.as_str(),
         "placeholder" | "error" | "ocr" | "vision"
     ) {
         return Err("image fallback mode is invalid".to_string());
@@ -2592,6 +2602,7 @@ fn project_legacy_raw_sections(
     let mut tools_skills = Map::new();
     let mut subagents = Map::new();
     let mut notifications = Map::new();
+    let mut hooks = Map::new();
     let mut model_policy = Map::new();
 
     for (key, value) in root {
@@ -2656,7 +2667,15 @@ fn project_legacy_raw_sections(
                 sections.insert(SectionId::AccessControl, value.clone());
             }
             "hooks" => {
-                sections.insert(SectionId::Hooks, value.clone());
+                let object = value.as_object().ok_or_else(|| {
+                    crate::ConfigStoreError::Validation(
+                        "legacy hooks configuration must be an object".to_string(),
+                    )
+                })?;
+                hooks.extend(object.clone());
+            }
+            "lifecycle_hooks" => {
+                hooks.insert(key.clone(), value.clone());
             }
             "keyword_masking" | "anthropic_model_mapping" | "gemini_model_mapping" => {
                 model_policy.insert(key.clone(), value.clone());
@@ -2680,6 +2699,7 @@ fn project_legacy_raw_sections(
         (SectionId::ToolsSkills, tools_skills),
         (SectionId::Subagents, subagents),
         (SectionId::Notifications, notifications),
+        (SectionId::Hooks, hooks),
         (SectionId::ModelPolicy, model_policy),
     ] {
         if !object.is_empty() {
@@ -4469,6 +4489,7 @@ mod tests {
             "default_work_area",
             "run_budget",
             "stream_timeout",
+            "lifecycle_hooks",
         ] {
             assert!(names.contains(required), "missing owner for {required}");
         }
@@ -4496,6 +4517,13 @@ mod tests {
             "notifications": {"desktop": {"enabled": true}},
             "connect": {"platforms": []},
             "plugin_trust": {"enforcement": "off"},
+            "lifecycle_hooks": {
+                "enabled": true,
+                "PreToolUse": [{
+                    "matcher": "bash",
+                    "hooks": [{"type": "command", "command": "guard.sh"}]
+                }]
+            },
             "memory": {"background_model": "memory-model"},
             "subagents": {"max_concurrent": 3},
             "providers": {"openai": {"model": "gpt-test"}},
@@ -4524,6 +4552,11 @@ mod tests {
         assert_eq!(value["default_work_area"]["path"], "/workspace");
         assert_eq!(value["run_budget"]["max_tool_calls"], 4);
         assert_eq!(value["plugin_trust"]["enforcement"], "off");
+        assert_eq!(value["lifecycle_hooks"]["enabled"], true);
+        assert_eq!(
+            value["lifecycle_hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "guard.sh"
+        );
         assert!(round_trip.connect.platforms.is_empty());
         assert_eq!(value["future_root_key"]["nested"], true);
         assert_eq!(
