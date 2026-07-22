@@ -36,6 +36,7 @@ use bamboo_subagent::transport::WsServer;
 use futures::StreamExt;
 
 use crate::claude_code_executor::ClaudeCodeExecutor;
+use crate::codex_cli_executor::CodexExecutor;
 
 /// How long a finished actor's isolated storage is retained for debugging
 /// before background GC removes it.
@@ -108,6 +109,27 @@ pub async fn run() -> std::result::Result<(), String> {
             inherit_user_config.unwrap_or(false),
             forward_env.clone().unwrap_or_default(),
         )),
+        ExecutorSpec::Codex {
+            binary,
+            model,
+            sandbox,
+            inherit_user_config,
+            forward_env,
+        } => Arc::new(
+            CodexExecutor::new(
+                binary.clone(),
+                model.clone(),
+                sandbox.clone(),
+                spec.workspace.clone(),
+                Some(crate::codex_cli_executor::resolve_codex_state_dir(
+                    &spec.storage_dir,
+                    &spec.identity.child_id,
+                )),
+                inherit_user_config.unwrap_or(false),
+                forward_env.clone().unwrap_or_default(),
+            )
+            .await?,
+        ),
         ExecutorSpec::CliAdapter { .. } => {
             return Err("cli_adapter executor is not implemented yet".to_string());
         }

@@ -141,6 +141,13 @@ pub fn build_external_child_runner_with_registry_and_reviewer(
                     inherit_user_config: profile.claude_code_inherit_user_config,
                     forward_env: profile.claude_code_forward_env.clone(),
                 },
+                Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
+                    binary: profile.codex_binary.clone(),
+                    model: profile.codex_model.clone(),
+                    sandbox: None,
+                    inherit_user_config: None,
+                    forward_env: None,
+                },
                 Some(other) => {
                     tracing::error!(
                         "Actor agent profile {} has unknown executor '{}'; skipping",
@@ -276,6 +283,13 @@ fn build_local_actor_runner(
             permission_mode: sub.claude_code_permission_mode.clone(),
             inherit_user_config: sub.claude_code_inherit_user_config,
             forward_env: sub.claude_code_forward_env.clone(),
+        },
+        Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
+            binary: sub.codex_binary.clone(),
+            model: sub.codex_model.clone(),
+            sandbox: None,
+            inherit_user_config: None,
+            forward_env: None,
         },
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };

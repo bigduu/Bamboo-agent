@@ -630,7 +630,7 @@ pub struct SubagentsConfig {
     pub fabric_dir: Option<String>,
     /// Expert: `"echo"` swaps in a dependency-free smoke executor (no LLM)
     /// to verify the actor chain end-to-end; `"claude_code"` drives the
-    /// official Claude Code CLI (see the `claude_code_*` fields below).
+    /// official Claude Code CLI; `"codex"` drives `codex exec --json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
     /// `executor = "claude_code"` only: override the `claude` executable.
@@ -660,6 +660,14 @@ pub struct SubagentsConfig {
     /// billing from the CLI's own subscription auth to the API key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_forward_env: Option<Vec<String>>,
+    /// `executor = "codex"` only: override the `codex` executable. `None`
+    /// resolves `codex` from `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_binary: Option<String>,
+    /// `executor = "codex"` only: `--model` override. `None` uses the CLI
+    /// default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
     /// The active message-broker endpoint the `ask_agent` tool / sub-agent bus
     /// dials. RUNTIME-ONLY (`#[serde(skip)]`): never read from nor written to
     /// `config.json`. It is populated in memory each boot by `maybe_embed_broker`
