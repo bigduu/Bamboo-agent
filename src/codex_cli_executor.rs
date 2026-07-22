@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
+use bamboo_subagent::codex_discovery::discover_codex_cli;
 use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EventSink, SteerInbox};
 use bamboo_subagent::executor_util::{build_rehydrated_turn, write_json_atomic};
 use bamboo_subagent::proto::RunSpec;
@@ -33,7 +34,7 @@ use bamboo_subagent::proto::RunSpec;
 /// executor additionally capability-checks `exec --help` and `exec resume
 /// --help`, so a backported or vendor build must still expose the required
 /// flags. Version 0.144 is the schema verified by issue #569.
-pub const MIN_CODEX_VERSION: (u64, u64, u64) = (0, 144, 0);
+pub use bamboo_subagent::codex_discovery::MIN_CODEX_VERSION;
 
 const MAX_STDOUT_LINE_BYTES: usize = 10 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -62,6 +63,17 @@ pub enum CodexAuthMode {
     ApiKey,
     Custom,
     Bamboo,
+}
+
+impl CodexAuthMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::ApiKey => "api_key",
+            Self::Custom => "custom",
+            Self::Bamboo => "bamboo",
+        }
+    }
 }
 
 /// Fully resolved auth posture. The custom-provider key is deliberately
@@ -475,56 +487,11 @@ impl CodexExecutor {
         auth: CodexAuthConfig,
         permissions: CodexPermissionConfig,
     ) -> Result<Self, String> {
-        let requested = binary.unwrap_or_else(|| "codex".to_string());
-        let resolved =
-            resolve_binary(&requested).ok_or_else(|| missing_binary_error(&requested))?;
-        ensure_executable(&resolved)?;
-
-        let version_output = Command::new(&resolved)
-            .arg("--version")
-            .output()
-            .await
-            .map_err(|error| format!("run '{} --version': {error}", resolved.display()))?;
-        if !version_output.status.success() {
-            return Err(format!(
-                "'{} --version' failed with status {}; reinstall or upgrade Codex CLI",
-                resolved.display(),
-                version_output.status
-            ));
-        }
-        let version_text = String::from_utf8_lossy(&version_output.stdout)
-            .trim()
-            .to_string();
-        let parsed_version = parse_codex_version(&version_text).ok_or_else(|| {
-            format!(
-                "could not parse Codex CLI version from {version_text:?}; expected `codex-cli X.Y.Z`"
-            )
-        })?;
-        if parsed_version < MIN_CODEX_VERSION {
-            return Err(format!(
-                "Codex CLI {version_text} is too old; Bamboo requires >= {}.{}.{} with `exec --json` and `exec resume`",
-                MIN_CODEX_VERSION.0, MIN_CODEX_VERSION.1, MIN_CODEX_VERSION.2
-            ));
-        }
-
-        verify_help_surface(
-            &resolved,
-            &["exec", "--help"],
-            &[
-                "--json",
-                "--output-last-message",
-                "--config",
-                "--sandbox",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "stdin",
-            ],
-        )
-        .await?;
-        verify_help_surface(&resolved, &["exec", "resume", "--help"], &["--json"]).await?;
+        let discovery = discover_codex_cli(binary.as_deref()).await?;
 
         let executor = Self {
-            binary: resolved,
-            version: version_text,
+            binary: PathBuf::from(discovery.path),
+            version: discovery.version,
             model,
             permissions,
             workspace,
@@ -820,6 +787,10 @@ impl CodexExecutor {
                     "executor": "codex",
                     "binary": self.binary,
                     "version": self.version,
+                    "model": self.model,
+                    "auth_mode": self.auth.mode().as_str(),
+                    "codex_home_mode": self.codex_home_mode(),
+                    "forward_env": self.forward_env,
                     "sandbox": policy.sandbox.as_str(),
                     "approval_policy": policy.approval_policy.as_str(),
                     "network_access": policy.network_access,
@@ -1086,6 +1057,12 @@ impl CodexExecutor {
             "round_count": 0,
             "executor": "codex",
             "phase": "bootstrap",
+            "binary": self.binary,
+            "version": self.version,
+            "model": self.model,
+            "auth_mode": self.auth.mode().as_str(),
+            "codex_home_mode": self.codex_home_mode(),
+            "forward_env": self.forward_env,
             "sandbox": policy.sandbox.as_str(),
             "approval_policy": policy.approval_policy.as_str(),
             "network_access": policy.network_access,
@@ -1514,107 +1491,6 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     format!("{head}\n… [truncated, {dropped} more chars]")
 }
 
-fn missing_binary_error(requested: &str) -> String {
-    format!(
-        "Codex CLI binary {requested:?} was not found or is not executable; install it with `npm i -g @openai/codex`, `brew install codex`, or an official GitHub release, or set codex_binary"
-    )
-}
-
-fn resolve_binary(requested: &str) -> Option<PathBuf> {
-    let requested_path = Path::new(requested);
-    if requested_path.components().count() > 1 || requested_path.is_absolute() {
-        return requested_path
-            .exists()
-            .then(|| requested_path.to_path_buf());
-    }
-    let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(requested);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        for extension in ["exe", "cmd", "bat"] {
-            let candidate = directory.join(format!("{requested}.{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn ensure_executable(path: &Path) -> Result<(), String> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| format!("inspect Codex binary '{}': {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(missing_binary_error(&path.display().to_string()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(missing_binary_error(&path.display().to_string()));
-        }
-    }
-    Ok(())
-}
-
-fn parse_codex_version(text: &str) -> Option<(u64, u64, u64)> {
-    let token = text
-        .split_whitespace()
-        .find(|token| token.chars().next().is_some_and(|ch| ch.is_ascii_digit()))?;
-    let clean = token.trim_start_matches('v').split(['-', '+']).next()?;
-    let mut parts = clean.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
-}
-
-async fn verify_help_surface(
-    binary: &Path,
-    args: &[&str],
-    required: &[&str],
-) -> Result<(), String> {
-    let output = Command::new(binary)
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| format!("run '{} {}': {error}", binary.display(), args.join(" ")))?;
-    if !output.status.success() {
-        return Err(format!(
-            "'{} {}' failed with status {}; upgrade Codex CLI",
-            binary.display(),
-            args.join(" "),
-            output.status
-        ));
-    }
-    let help = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let missing: Vec<_> = required
-        .iter()
-        .copied()
-        .filter(|flag| !help.contains(flag))
-        .collect();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Codex CLI '{}' lacks required `{}` capability flag(s): {}; upgrade to >= {}.{}.{}",
-            binary.display(),
-            args.join(" "),
-            missing.join(", "),
-            MIN_CODEX_VERSION.0,
-            MIN_CODEX_VERSION.1,
-            MIN_CODEX_VERSION.2
-        ))
-    }
-}
-
 fn has_git_metadata(path: &Path) -> bool {
     path.ancestors()
         .any(|ancestor| ancestor.join(".git").exists())
@@ -1727,6 +1603,55 @@ fn signal_process_group(pgid: libc::pid_t, signal: ProcessSignal) {
 }
 
 #[cfg(unix)]
+fn signal_process(pid: libc::pid_t, signal: ProcessSignal) {
+    let signal = match signal {
+        ProcessSignal::Term => libc::SIGTERM,
+        ProcessSignal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: the pid comes from the OS process table. ESRCH is harmless.
+    unsafe {
+        libc::kill(pid, signal);
+    }
+}
+
+#[cfg(unix)]
+fn descendant_processes(root: libc::pid_t) -> Vec<libc::pid_t> {
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let mut known = HashSet::from([root]);
+    let mut descendants = Vec::new();
+    loop {
+        let mut added = false;
+        for (pid, process) in system.processes() {
+            let pid = pid.as_u32() as libc::pid_t;
+            let parent = process
+                .parent()
+                .map(|parent| parent.as_u32() as libc::pid_t);
+            if !known.contains(&pid) && parent.is_some_and(|parent| known.contains(&parent)) {
+                known.insert(pid);
+                descendants.push(pid);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    descendants
+}
+
+#[cfg(unix)]
+fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only probes whether the process exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
 fn process_group_exists(pgid: libc::pid_t) -> bool {
     // SAFETY: signal 0 only probes whether the process group exists.
     if unsafe { libc::kill(-pgid, 0) } == 0 {
@@ -1740,13 +1665,20 @@ async fn terminate_child(child: &mut Child) {
     let Some(pgid) = child.id().map(|pid| pid as libc::pid_t) else {
         return;
     };
+    // Codex may launch a sandbox/tool command in a NEW process group. Capture
+    // the full descendant tree before terminating the Codex leader; otherwise
+    // those commands are reparented to init and escape a group-only signal.
+    let descendants = descendant_processes(pgid);
+    for &pid in descendants.iter().rev() {
+        signal_process(pid, ProcessSignal::Term);
+    }
     signal_process_group(pgid, ProcessSignal::Term);
     let deadline = tokio::time::Instant::now() + SIGTERM_WAIT;
     loop {
-        // Reap the leader when it exits, but keep tracking the process group:
-        // a descendant may have ignored SIGTERM and outlived that leader.
+        // Reap the leader when it exits, but keep tracking its process group
+        // and any descendants Codex placed in independent groups.
         let _ = child.try_wait();
-        if !process_group_exists(pgid) {
+        if !process_group_exists(pgid) && !descendants.iter().copied().any(process_exists) {
             let _ = child.wait().await;
             return;
         }
@@ -1754,6 +1686,9 @@ async fn terminate_child(child: &mut Child) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    for &pid in descendants.iter().rev() {
+        signal_process(pid, ProcessSignal::Kill);
     }
     signal_process_group(pgid, ProcessSignal::Kill);
     let _ = child.start_kill();
@@ -1946,13 +1881,6 @@ mod tests {
             events.push(event);
         }
         (state, events)
-    }
-
-    #[test]
-    fn version_parser_accepts_current_and_rejects_noise() {
-        assert_eq!(parse_codex_version("codex-cli 0.144.5"), Some((0, 144, 5)));
-        assert_eq!(parse_codex_version("codex 1.2"), Some((1, 2, 0)));
-        assert_eq!(parse_codex_version("not-a-version"), None);
     }
 
     #[test]

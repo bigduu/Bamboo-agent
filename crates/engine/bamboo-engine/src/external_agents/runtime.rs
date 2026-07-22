@@ -368,46 +368,7 @@ fn build_local_actor_runner(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(bamboo_config::paths::subagents_dir);
 
-    let executor = match sub.executor.as_deref() {
-        Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
-        Some("bamboo_runtime") | None => bamboo_subagent::provision::ExecutorSpec::BambooRuntime,
-        // #443: binary/model/permission_mode/isolation/env-forward are
-        // plumbed from `subagents.claude_code_*` — mirrors the matching arm
-        // in `build_external_child_runner` above.
-        Some("claude_code") => bamboo_subagent::provision::ExecutorSpec::ClaudeCode {
-            binary: sub.claude_code_binary.clone(),
-            model: sub.claude_code_model.clone(),
-            permission_mode: sub.claude_code_permission_mode.clone(),
-            inherit_user_config: sub.claude_code_inherit_user_config,
-            forward_env: sub.claude_code_forward_env.clone(),
-        },
-        Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
-            binary: sub.codex_binary.clone(),
-            model: sub.codex_model.clone(),
-            sandbox: sub.codex_sandbox.map(codex_sandbox_name),
-            inherit_user_config: None,
-            auth_mode: Some(codex_auth_mode_name(
-                sub.codex_auth_mode.unwrap_or_default(),
-            )),
-            base_url: codex_base_url(
-                config,
-                sub.codex_auth_mode.unwrap_or_default(),
-                sub.codex_base_url.clone(),
-            ),
-            wire_api: sub.codex_wire_api.map(codex_wire_api_name),
-            provider_key_ref: sub
-                .codex_provider_key_ref
-                .as_ref()
-                .map(|reference| reference.as_str().to_string()),
-            forward_env: sub.codex_forward_env.clone(),
-            approval_policy: sub.codex_approval_policy.map(codex_approval_policy_name),
-            network_access: sub.codex_network_access,
-            allow_danger_bypass: sub.codex_allow_danger_bypass,
-            permission_profile: None,
-            workspace_owned: None,
-        },
-        Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
-    };
+    let executor = subagent_executor_spec(config)?;
 
     let mut runner = ActorChildRunner::new(
         super::config::LOCAL_ACTOR_AGENT_ID.to_string(),
@@ -443,6 +404,52 @@ fn build_local_actor_runner(
         runner = runner.with_permission_config(config);
     }
     Ok(Arc::new(runner))
+}
+
+/// Convert the durable typed `subagents` section into the exact worker
+/// provisioning executor. This is deliberately independent of actor launch so
+/// the settings-to-spawn contract can be tested directly.
+fn subagent_executor_spec(
+    config: &Config,
+) -> Result<bamboo_subagent::provision::ExecutorSpec, String> {
+    let sub = config.subagents();
+    Ok(match sub.executor.as_deref() {
+        Some("echo") => bamboo_subagent::provision::ExecutorSpec::Echo,
+        Some("bamboo_runtime") | None => bamboo_subagent::provision::ExecutorSpec::BambooRuntime,
+        Some("claude_code") => bamboo_subagent::provision::ExecutorSpec::ClaudeCode {
+            binary: sub.claude_code_binary.clone(),
+            model: sub.claude_code_model.clone(),
+            permission_mode: sub.claude_code_permission_mode.clone(),
+            inherit_user_config: sub.claude_code_inherit_user_config,
+            forward_env: sub.claude_code_forward_env.clone(),
+        },
+        Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
+            binary: sub.codex_binary.clone(),
+            model: sub.codex_model.clone(),
+            sandbox: sub.codex_sandbox.map(codex_sandbox_name),
+            inherit_user_config: None,
+            auth_mode: Some(codex_auth_mode_name(
+                sub.codex_auth_mode.unwrap_or_default(),
+            )),
+            base_url: codex_base_url(
+                config,
+                sub.codex_auth_mode.unwrap_or_default(),
+                sub.codex_base_url.clone(),
+            ),
+            wire_api: sub.codex_wire_api.map(codex_wire_api_name),
+            provider_key_ref: sub
+                .codex_provider_key_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
+            forward_env: sub.codex_forward_env.clone(),
+            approval_policy: sub.codex_approval_policy.map(codex_approval_policy_name),
+            network_access: sub.codex_network_access,
+            allow_danger_bypass: sub.codex_allow_danger_bypass,
+            permission_profile: None,
+            workspace_owned: None,
+        },
+        Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
+    })
 }
 
 /// Resolve config `schedulable_placements` into runner-ready handles (#181, P2b),
@@ -695,10 +702,13 @@ pub fn extract_provider_credentials(
 mod codex_runtime_config_tests {
     use super::{
         codex_approval_policy_name, codex_auth_mode_name, codex_base_url, codex_sandbox_name,
-        codex_wire_api_name,
+        codex_wire_api_name, subagent_executor_spec,
     };
-    use bamboo_config::{CodexApprovalPolicy, CodexAuthMode, CodexSandbox, CodexWireApi};
+    use bamboo_config::{
+        CodexApprovalPolicy, CodexAuthMode, CodexSandbox, CodexWireApi, CredentialRef,
+    };
     use bamboo_llm::Config;
+    use bamboo_subagent::provision::ExecutorSpec;
 
     #[test]
     fn codex_runtime_mapping_keeps_parent_loopback_and_custom_url_unambiguous() {
@@ -731,6 +741,59 @@ mod codex_runtime_config_tests {
         );
         assert_eq!(codex_base_url(&config, CodexAuthMode::Inherit, None), None);
         assert_eq!(codex_base_url(&config, CodexAuthMode::ApiKey, None), None);
+    }
+
+    #[test]
+    fn durable_codex_fields_map_without_loss_to_worker_spawn_spec() {
+        let mut config = Config::default();
+        let subagents = config.subagents_mut();
+        subagents.executor = Some("codex".to_string());
+        subagents.codex_binary = Some("/opt/codex/bin/codex".to_string());
+        subagents.codex_model = Some("gpt-5.4".to_string());
+        subagents.codex_auth_mode = Some(CodexAuthMode::Custom);
+        subagents.codex_base_url = Some("https://provider.example/v1".to_string());
+        subagents.codex_wire_api = Some(CodexWireApi::Responses);
+        subagents.codex_provider_key_ref = Some(
+            CredentialRef::parse("provider.codex-work.api_key").expect("valid credential ref"),
+        );
+        subagents.codex_forward_env = Some(vec!["HTTPS_PROXY".to_string()]);
+        subagents.codex_sandbox = Some(CodexSandbox::WorkspaceWrite);
+        subagents.codex_approval_policy = Some(CodexApprovalPolicy::OnFailure);
+        subagents.codex_network_access = Some(true);
+        subagents.codex_allow_danger_bypass = Some(false);
+
+        let spec = subagent_executor_spec(&config).expect("Codex config maps to executor spec");
+        let ExecutorSpec::Codex {
+            binary,
+            model,
+            sandbox,
+            auth_mode,
+            base_url,
+            wire_api,
+            provider_key_ref,
+            forward_env,
+            approval_policy,
+            network_access,
+            allow_danger_bypass,
+            ..
+        } = spec
+        else {
+            panic!("expected Codex executor spec");
+        };
+        assert_eq!(binary.as_deref(), Some("/opt/codex/bin/codex"));
+        assert_eq!(model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(auth_mode.as_deref(), Some("custom"));
+        assert_eq!(base_url.as_deref(), Some("https://provider.example/v1"));
+        assert_eq!(wire_api.as_deref(), Some("responses"));
+        assert_eq!(
+            provider_key_ref.as_deref(),
+            Some("provider.codex-work.api_key")
+        );
+        assert_eq!(forward_env, Some(vec!["HTTPS_PROXY".to_string()]));
+        assert_eq!(approval_policy.as_deref(), Some("on-failure"));
+        assert_eq!(network_access, Some(true));
+        assert_eq!(allow_danger_bypass, Some(false));
     }
 }
 

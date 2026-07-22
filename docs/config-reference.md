@@ -296,6 +296,10 @@ via a small `claude-code-session.json` state file per sub-agent workspace.
 
 For Codex configuration, billing implications, isolation details, and the
 per-run Bamboo token contract, see [`codex-executor.md`](codex-executor.md).
+Lotus validates this section with `POST /bamboo/config/validate`; its binary
+Detect action calls `POST /bamboo/config/codex/detect`, which returns the
+resolved `path` and `version` only after the same preflight used at worker
+spawn.
 
 ## MCP servers
 

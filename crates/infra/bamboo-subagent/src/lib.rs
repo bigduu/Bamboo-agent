@@ -12,6 +12,7 @@
 //! crate stays a leaf and is fully unit-testable with a tempdir; higher layers pass the
 //! domain `Session`. Index rebuild is decoupled via the [`store::MetaExtractor`] seam.
 
+pub mod codex_discovery;
 pub mod discovery;
 pub mod error;
 pub mod executor;

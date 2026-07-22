@@ -110,6 +110,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::validate_bamboo_config_patch),
         )
         .route(
+            "/bamboo/config/codex/detect",
+            web::post().to(settings::detect_codex_cli),
+        )
+        .route(
             "/bamboo/hooks/test",
             web::post().to(settings::test_lifecycle_hook),
         )

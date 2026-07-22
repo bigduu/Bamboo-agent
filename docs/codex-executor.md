@@ -13,6 +13,40 @@ live Bamboo-provider test are verified against 0.144.5. Codex 0.144 removed the
 custom-provider Chat Completions wire, so `codex_wire_api` only accepts
 `"responses"`.
 
+The Lotus Sub-agents settings card exposes the same fields and validates the
+pending patch through `POST /bamboo/config/validate` before saving. Its Detect
+button calls `POST /bamboo/config/codex/detect` with an optional
+`{"binary":"..."}` override. The response is the resolved `path` and
+`version`; the endpoint and worker share one discovery implementation, so a
+successful detection cannot bypass the worker's version/capability preflight.
+
+## Spawn contract
+
+| Concern | Codex executor behavior |
+|---|---|
+| Process lifetime | One `codex exec` process group per activation; a warm Bamboo worker may run many activations but never reuses a Codex process. |
+| Prompt transport | The assignment is written to stdin (`-`), never placed in argv. |
+| Output | `--json --color never` JSONL plus a bounded `--output-last-message` fallback file. |
+| Model | `codex_model`, when set, becomes an explicit `--model`; otherwise the flag is omitted. |
+| Repository guard | A real Git workspace needs no override. `--skip-git-repo-check` is allowed only for a Bamboo-owned non-Git workspace. |
+| Cancellation | Bamboo snapshots the full descendant tree, sends SIGTERM deepest-first plus to the Codex process group, then escalates every survivor to SIGKILL after a bounded grace period. This also covers tool commands that create a new process group. |
+
+## Event mapping
+
+| Codex JSONL event | Bamboo output |
+|---|---|
+| `thread.started` | Persists the native thread id and emits runner metadata including binary, version, model, auth/home mode, sandbox, approval policy, and forwarded environment names. |
+| `turn.started` | `runner_progress` for round 1. |
+| `item.started/updated/completed` | Agent text becomes token deltas; reasoning becomes reasoning deltas; command/MCP/web items become Bamboo tool start/output/complete/error events. |
+| `turn.completed` | Captures input/output token usage and emits Bamboo `complete`. |
+| `turn.failed` / `error` | A bounded error outcome with the Codex message and stderr tail. |
+
+Unknown top-level or item event types are ignored rather than failing the run,
+so additive Codex schemas are tolerated. Bamboo raises the minimum version or
+changes the capability checks only when a required flag or event contract
+changes; CI fixtures cover known events and the ignored real-machine suite is
+the version-drift merge gate.
+
 ## Authentication and billing modes
 
 `codex_auth_mode` has four values. Unset defaults to `"bamboo"`; inheriting a
@@ -173,9 +207,21 @@ the environment variable but never includes a key or run token. The executor
 also passes `--ignore-rules`; `inherit` intentionally does neither and leaves
 `CODEX_HOME` unset.
 
-The process owns its own process group. Cancellation sends SIGTERM to the
-whole group, waits five seconds, then escalates to SIGKILL, so the npm launcher
-and its native Codex child cannot be orphaned independently.
+The process owns its own process group. Cancellation snapshots its descendant
+tree, sends SIGTERM deepest-first and to the whole group, waits five seconds,
+then escalates every survivor to SIGKILL. Tracking descendants separately is
+required because a Codex tool shell may create its own process group; a
+group-only signal would otherwise let that tool survive after Codex exits.
+
+## Differences from the Claude Code executor
+
+| Area | Codex | Claude Code |
+|---|---|---|
+| Activation | New `codex exec` process each turn; resume uses a persisted thread id. | Stream-JSON process per activation with Claude's session id and `--resume`. |
+| Runtime approvals | No interactive approval relay in v1; only `never` and `on-failure` are accepted. | Permission prompts can be relayed over stdio. |
+| Safety boundary | OS sandbox is the primary guard and unsandboxed mode is double-gated. | Claude permission mode plus Bamboo's permission relay is primary. |
+| Personal config | Explicit `inherit` auth mode; isolated modes create a minimal `CODEX_HOME`. | Controlled by `claude_code_inherit_user_config`. |
+| Parent provider | Scoped per-run Bamboo token can route Codex through `/openai/v1`. | Provider auth is controlled by Claude CLI login or explicitly forwarded environment names. |
 
 ## Bamboo-as-provider token and observability
 
@@ -206,3 +252,12 @@ cargo test -p bamboo-server \
   live_bamboo_codex_completes_records_metrics_and_rejects_revoked_token \
   --lib -- --ignored --nocapture
 ```
+
+The consolidated checklist covered by those commands is:
+
+1. Shared discovery reports the resolved path/version and an actionable missing-binary error.
+2. A fresh temporary Git-repository run completes with final text, token usage, and bootstrap metadata.
+3. A second activation resumes the native thread and recalls a nonce absent from fallback history.
+4. `workspace-write` permits an in-workspace write and blocks an out-of-workspace write with a tool error.
+5. `bamboo` auth completes through the parent `/openai/v1`, records parent metrics/session masking, and rejects the revoked scoped token.
+6. Cancellation removes a live descendant process group, returns `Cancelled`, and the same session subsequently resumes successfully.
