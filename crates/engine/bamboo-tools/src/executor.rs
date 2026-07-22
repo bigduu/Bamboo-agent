@@ -1327,6 +1327,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_allow_cannot_skip_explicit_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit-deny.txt");
+        let path_str = path.to_str().unwrap().to_string();
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.deny_scoped_session_permission(
+            "s-hook-explicit-deny",
+            crate::permission::PermissionType::WriteFile,
+            path_str.clone(),
+        );
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = make_executor(Some(checker));
+        let call = make_tool_call(
+            "Write",
+            json!({"file_path": path_str, "content": "must not be written"}),
+        );
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-hook-explicit-deny"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = crate::with_hook_permission_override(
+            Some(crate::HookPermissionOverride::Allow),
+            &call.id,
+            executor.execute_with_context(&call, ctx),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(ref message)) if message.contains("remembered session decision")),
+            "explicit deny must remain authoritative: {result:?}"
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
     async fn test_forced_ask_rule_overrides_bypass() {
         // A hard-dangerous Bash command must still traverse the worker's parent
         // approval proxy under bypass. The returned verdict is authoritative:

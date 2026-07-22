@@ -755,6 +755,37 @@ mod hook_tests {
         }
     }
 
+    struct ErrorPostFeedbackHook;
+
+    #[async_trait]
+    impl AgentHook for ErrorPostFeedbackHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterToolExecution
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            assert!(matches!(
+                payload,
+                HookPayload::ToolResult {
+                    outcome: HookToolOutcome {
+                        success: false,
+                        error: Some(error),
+                        ..
+                    },
+                    ..
+                } if error == "executor exploded"
+            ));
+            HookResult::InjectContext {
+                text: "error diagnostic from PostToolUse".to_string(),
+            }
+        }
+    }
+
     struct CountingPostHook(Arc<AtomicUsize>);
 
     #[async_trait]
@@ -1194,6 +1225,45 @@ mod hook_tests {
         assert!(content.contains("lint: replace the generated token"));
         assert!(content.contains("Blocked by PostToolUse hook"));
         assert!(content.contains("generated output violates policy"));
+    }
+
+    #[tokio::test]
+    async fn post_tool_feedback_runs_for_executor_errors() {
+        let mut runner = crate::runtime::hooks::HookRunner::new();
+        runner.register(Arc::new(ErrorPostFeedbackHook));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        };
+        let tools: Arc<dyn ToolExecutor> = Arc::new(RecordingExecutor(AtomicBool::new(false)));
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let tool_call = probe_call("probe");
+        let mut session = Session::new("post-error-feedback", "model");
+        let outcome = ToolExecutionOutcome {
+            result: Err("executor exploded".to_string()),
+            needs_human: None,
+            post_tool_hook_eligible: true,
+            tool_duration: std::time::Duration::from_millis(3),
+        };
+
+        apply_test_outcome(
+            &config,
+            &tools,
+            &tool_call,
+            &mut session,
+            &event_tx,
+            outcome,
+        )
+        .await
+        .unwrap();
+        let content = &session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(&tool_call.id))
+            .expect("error tool result must be appended")
+            .content;
+        assert!(content.contains("executor exploded"));
+        assert!(content.contains("error diagnostic from PostToolUse"));
     }
 
     #[tokio::test]
