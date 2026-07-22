@@ -29,6 +29,14 @@ fn codex_wire_api_name(wire_api: bamboo_config::CodexWireApi) -> String {
     .to_string()
 }
 
+fn codex_mode_name(mode: bamboo_config::CodexMode) -> String {
+    match mode {
+        bamboo_config::CodexMode::Exec => "exec",
+        bamboo_config::CodexMode::AppServer => "app_server",
+    }
+    .to_string()
+}
+
 fn codex_sandbox_name(sandbox: bamboo_config::CodexSandbox) -> String {
     match sandbox {
         bamboo_config::CodexSandbox::ReadOnly => "read-only",
@@ -42,6 +50,7 @@ fn codex_approval_policy_name(policy: bamboo_config::CodexApprovalPolicy) -> Str
     match policy {
         bamboo_config::CodexApprovalPolicy::Never => "never",
         bamboo_config::CodexApprovalPolicy::OnFailure => "on-failure",
+        bamboo_config::CodexApprovalPolicy::OnRequest => "on-request",
     }
     .to_string()
 }
@@ -219,6 +228,7 @@ pub fn build_external_child_runner_with_codex_tokens(
                 Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
                     binary: profile.codex_binary.clone(),
                     model: profile.codex_model.clone(),
+                    mode: profile.codex_mode.map(codex_mode_name),
                     sandbox: profile.codex_sandbox.map(codex_sandbox_name),
                     inherit_user_config: None,
                     auth_mode: Some(codex_auth_mode_name(
@@ -426,6 +436,7 @@ fn subagent_executor_spec(
         Some("codex") => bamboo_subagent::provision::ExecutorSpec::Codex {
             binary: sub.codex_binary.clone(),
             model: sub.codex_model.clone(),
+            mode: sub.codex_mode.map(codex_mode_name),
             sandbox: sub.codex_sandbox.map(codex_sandbox_name),
             inherit_user_config: None,
             auth_mode: Some(codex_auth_mode_name(
@@ -701,11 +712,11 @@ pub fn extract_provider_credentials(
 #[cfg(test)]
 mod codex_runtime_config_tests {
     use super::{
-        codex_approval_policy_name, codex_auth_mode_name, codex_base_url, codex_sandbox_name,
-        codex_wire_api_name, subagent_executor_spec,
+        codex_approval_policy_name, codex_auth_mode_name, codex_base_url, codex_mode_name,
+        codex_sandbox_name, codex_wire_api_name, subagent_executor_spec,
     };
     use bamboo_config::{
-        CodexApprovalPolicy, CodexAuthMode, CodexSandbox, CodexWireApi, CredentialRef,
+        CodexApprovalPolicy, CodexAuthMode, CodexMode, CodexSandbox, CodexWireApi, CredentialRef,
     };
     use bamboo_llm::Config;
     use bamboo_subagent::provision::ExecutorSpec;
@@ -716,6 +727,7 @@ mod codex_runtime_config_tests {
         config.server.port = 5700;
 
         assert_eq!(codex_auth_mode_name(CodexAuthMode::Bamboo), "bamboo");
+        assert_eq!(codex_mode_name(CodexMode::AppServer), "app_server");
         assert_eq!(codex_wire_api_name(CodexWireApi::Responses), "responses");
         assert_eq!(codex_sandbox_name(CodexSandbox::ReadOnly), "read-only");
         assert_eq!(
@@ -750,6 +762,7 @@ mod codex_runtime_config_tests {
         subagents.executor = Some("codex".to_string());
         subagents.codex_binary = Some("/opt/codex/bin/codex".to_string());
         subagents.codex_model = Some("gpt-5.4".to_string());
+        subagents.codex_mode = Some(CodexMode::AppServer);
         subagents.codex_auth_mode = Some(CodexAuthMode::Custom);
         subagents.codex_base_url = Some("https://provider.example/v1".to_string());
         subagents.codex_wire_api = Some(CodexWireApi::Responses);
@@ -758,7 +771,7 @@ mod codex_runtime_config_tests {
         );
         subagents.codex_forward_env = Some(vec!["HTTPS_PROXY".to_string()]);
         subagents.codex_sandbox = Some(CodexSandbox::WorkspaceWrite);
-        subagents.codex_approval_policy = Some(CodexApprovalPolicy::OnFailure);
+        subagents.codex_approval_policy = Some(CodexApprovalPolicy::OnRequest);
         subagents.codex_network_access = Some(true);
         subagents.codex_allow_danger_bypass = Some(false);
 
@@ -766,6 +779,7 @@ mod codex_runtime_config_tests {
         let ExecutorSpec::Codex {
             binary,
             model,
+            mode,
             sandbox,
             auth_mode,
             base_url,
@@ -782,6 +796,7 @@ mod codex_runtime_config_tests {
         };
         assert_eq!(binary.as_deref(), Some("/opt/codex/bin/codex"));
         assert_eq!(model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(mode.as_deref(), Some("app_server"));
         assert_eq!(sandbox.as_deref(), Some("workspace-write"));
         assert_eq!(auth_mode.as_deref(), Some("custom"));
         assert_eq!(base_url.as_deref(), Some("https://provider.example/v1"));
@@ -791,7 +806,7 @@ mod codex_runtime_config_tests {
             Some("provider.codex-work.api_key")
         );
         assert_eq!(forward_env, Some(vec!["HTTPS_PROXY".to_string()]));
-        assert_eq!(approval_policy.as_deref(), Some("on-failure"));
+        assert_eq!(approval_policy.as_deref(), Some("on-request"));
         assert_eq!(network_access, Some(true));
         assert_eq!(allow_danger_bypass, Some(false));
     }

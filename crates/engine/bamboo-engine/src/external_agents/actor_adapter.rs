@@ -490,8 +490,11 @@ impl ActorChildRunner {
         let mut tools = spec.disabled_tools.clone().unwrap_or_default();
         tools.sort();
         let caps = &spec.capabilities;
+        // The worker constructs its executor exactly once. In particular,
+        // Codex exec and app-server workers are not interchangeable.
+        let executor = serde_json::to_string(&spec.executor).unwrap_or_default();
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}\u{1}executor={executor}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
@@ -1531,6 +1534,7 @@ mod tests {
         ExecutorSpec::Codex {
             binary: None,
             model: None,
+            mode: None,
             sandbox: None,
             inherit_user_config,
             auth_mode: auth_mode.map(str::to_string),
@@ -1935,6 +1939,20 @@ mod tests {
             base_fp,
             ActorChildRunner::fingerprint(&gro),
             "guardian_read_only must split"
+        );
+    }
+
+    #[test]
+    fn fingerprint_splits_codex_exec_and_app_server_workers() {
+        let mut exec = spec_with("explorer", "p", "m", Some("/ws"), None);
+        exec.executor = codex_executor(Some("inherit"), None);
+        let mut app_server = exec.clone();
+        if let ExecutorSpec::Codex { mode, .. } = &mut app_server.executor {
+            *mode = Some("app_server".to_string());
+        }
+        assert_ne!(
+            ActorChildRunner::fingerprint(&exec),
+            ActorChildRunner::fingerprint(&app_server)
         );
     }
 

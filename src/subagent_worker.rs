@@ -36,6 +36,7 @@ use bamboo_subagent::transport::WsServer;
 use futures::StreamExt;
 
 use crate::claude_code_executor::ClaudeCodeExecutor;
+use crate::codex_app_server_executor::CodexAppServerExecutor;
 use crate::codex_cli_executor::CodexExecutor;
 
 /// How long a finished actor's isolated storage is retained for debugging
@@ -112,6 +113,7 @@ pub async fn run() -> std::result::Result<(), String> {
         ExecutorSpec::Codex {
             binary,
             model,
+            mode,
             sandbox,
             inherit_user_config,
             auth_mode,
@@ -135,30 +137,64 @@ pub async fn run() -> std::result::Result<(), String> {
                 &spec.secrets.provider_credentials,
                 &forward_env,
             )?;
-            let permissions = crate::codex_cli_executor::resolve_codex_permission_config(
-                sandbox.as_deref(),
-                approval_policy.as_deref(),
-                network_access.unwrap_or(false),
-                allow_danger_bypass.unwrap_or(false),
-                permission_profile.clone(),
-                spec.capabilities.bypass,
-                workspace_owned.unwrap_or(false),
-            )?;
-            Arc::new(
-                CodexExecutor::new(
-                    binary.clone(),
-                    model.clone(),
-                    spec.workspace.clone(),
-                    Some(crate::codex_cli_executor::resolve_codex_state_dir(
-                        &spec.storage_dir,
-                        &spec.identity.child_id,
-                    )),
-                    forward_env,
-                    auth,
-                    permissions,
-                )
-                .await?,
-            )
+            let state_dir = Some(crate::codex_cli_executor::resolve_codex_state_dir(
+                &spec.storage_dir,
+                &spec.identity.child_id,
+            ));
+            match mode.as_deref().unwrap_or("exec") {
+                "exec" => {
+                    let permissions = crate::codex_cli_executor::resolve_codex_permission_config(
+                        sandbox.as_deref(),
+                        approval_policy.as_deref(),
+                        network_access.unwrap_or(false),
+                        allow_danger_bypass.unwrap_or(false),
+                        permission_profile.clone(),
+                        spec.capabilities.bypass,
+                        workspace_owned.unwrap_or(false),
+                    )?;
+                    Arc::new(
+                        CodexExecutor::new(
+                            binary.clone(),
+                            model.clone(),
+                            spec.workspace.clone(),
+                            state_dir,
+                            forward_env,
+                            auth,
+                            permissions,
+                        )
+                        .await?,
+                    )
+                }
+                "app_server" => {
+                    let permissions =
+                        crate::codex_cli_executor::resolve_codex_app_server_permission_config(
+                            sandbox.as_deref(),
+                            approval_policy.as_deref(),
+                            network_access.unwrap_or(false),
+                            allow_danger_bypass.unwrap_or(false),
+                            permission_profile.clone(),
+                            spec.capabilities.bypass,
+                            workspace_owned.unwrap_or(false),
+                        )?;
+                    Arc::new(
+                        CodexAppServerExecutor::new(
+                            binary.clone(),
+                            model.clone(),
+                            spec.workspace.clone(),
+                            state_dir,
+                            forward_env,
+                            auth,
+                            permissions,
+                        )
+                        .await?,
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "unknown Codex mode '{other}'; expected exec or app_server"
+                    ))
+                }
+            }
         }
         ExecutorSpec::CliAdapter { .. } => {
             return Err("cli_adapter executor is not implemented yet".to_string());

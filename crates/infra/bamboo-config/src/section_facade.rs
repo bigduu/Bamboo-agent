@@ -1590,7 +1590,8 @@ fn validate_subagents(value: &SubagentsSection) -> Result<(), String> {
 /// root `/bamboo/config/validate` endpoint can return the same rules through its
 /// structured field-error contract.
 pub fn validate_codex_subagents_config(value: &SubagentsConfig) -> Result<(), String> {
-    let codex_fields_present = value.codex_auth_mode.is_some()
+    let codex_fields_present = value.codex_mode.is_some()
+        || value.codex_auth_mode.is_some()
         || value.codex_base_url.is_some()
         || value.codex_wire_api.is_some()
         || value.codex_provider_key_ref.is_some()
@@ -1603,6 +1604,24 @@ pub fn validate_codex_subagents_config(value: &SubagentsConfig) -> Result<(), St
         return Ok(());
     }
     let mode = value.codex_auth_mode.unwrap_or_default();
+    let transport = value.codex_mode.unwrap_or_default();
+
+    match (transport, value.codex_approval_policy) {
+        (crate::CodexMode::Exec, Some(crate::CodexApprovalPolicy::OnRequest)) => {
+            return Err(
+                "codex_approval_policy on-request requires codex_mode = app_server; exec mode has no approval relay"
+                    .to_string(),
+            )
+        }
+        (crate::CodexMode::AppServer, None | Some(crate::CodexApprovalPolicy::OnRequest)) => {}
+        (crate::CodexMode::AppServer, Some(_)) => {
+            return Err(
+                "codex_mode app_server requires codex_approval_policy = on-request"
+                    .to_string(),
+            )
+        }
+        (crate::CodexMode::Exec, _) => {}
+    }
 
     let forwarded = value.codex_forward_env.as_deref().unwrap_or_default();
     let mut names = BTreeSet::new();
@@ -4569,6 +4588,27 @@ mod tests {
             .contains("codex_allow_danger_bypass"));
         config.codex_allow_danger_bypass = Some(true);
         assert!(validate_codex_subagents_config(&config).is_ok());
+    }
+
+    #[test]
+    fn codex_transport_mode_requires_matching_approval_semantics() {
+        let mut config = SubagentsConfig {
+            executor: Some("codex".to_string()),
+            codex_mode: Some(crate::CodexMode::AppServer),
+            ..Default::default()
+        };
+        assert!(validate_codex_subagents_config(&config).is_ok());
+
+        config.codex_approval_policy = Some(crate::CodexApprovalPolicy::Never);
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("requires codex_approval_policy = on-request"));
+
+        config.codex_mode = Some(crate::CodexMode::Exec);
+        config.codex_approval_policy = Some(crate::CodexApprovalPolicy::OnRequest);
+        assert!(validate_codex_subagents_config(&config)
+            .unwrap_err()
+            .contains("exec mode has no approval relay"));
     }
 
     fn directory_snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {

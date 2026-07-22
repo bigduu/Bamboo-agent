@@ -250,14 +250,16 @@ pub enum ExecutorSpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forward_env: Option<Vec<String>>,
     },
-    /// Drive the official Codex CLI as a one-process-per-activation engine
-    /// over `codex exec --json`. Authentication and spawn-time permission
-    /// posture are explicit because exec mode has no runtime approval relay.
+    /// Drive the official Codex CLI in one-shot `exec` mode (default) or as a
+    /// long-lived `app-server` JSON-RPC peer with interactive approval relay.
     Codex {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// `exec | app_server`; absent preserves the one-shot exec default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,7 +281,7 @@ pub enum ExecutorSpec {
         provider_key_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forward_env: Option<Vec<String>>,
-        /// `never | on-failure`; interactive approval policies are rejected.
+        /// `never | on-failure` in exec mode; `on-request` in app-server mode.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approval_policy: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -640,6 +642,7 @@ mod tests {
         let codex = ExecutorSpec::Codex {
             binary: Some("/usr/local/bin/codex".into()),
             model: Some("gpt-5-codex".into()),
+            mode: Some("exec".into()),
             sandbox: Some("workspace-write".into()),
             inherit_user_config: Some(true),
             auth_mode: Some("inherit".into()),
@@ -665,6 +668,7 @@ mod tests {
         let minimal_codex = ExecutorSpec::Codex {
             binary: None,
             model: None,
+            mode: None,
             sandbox: None,
             inherit_user_config: None,
             auth_mode: None,

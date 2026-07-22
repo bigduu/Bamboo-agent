@@ -1,5 +1,5 @@
 use actix_web::{web, HttpResponse};
-use bamboo_subagent::codex_discovery::discover_codex_cli;
+use bamboo_subagent::codex_discovery::{discover_codex_app_server, discover_codex_cli};
 use serde::Deserialize;
 
 use crate::error::AppError;
@@ -8,6 +8,8 @@ use crate::error::AppError;
 pub struct DetectCodexRequest {
     #[serde(default)]
     binary: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// Resolve and capability-check the configured Codex CLI without persisting
@@ -23,9 +25,14 @@ pub async fn detect_codex_cli(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let discovery = discover_codex_cli(binary)
-        .await
-        .map_err(AppError::BadRequest)?;
+    let discovery = match payload.mode.as_deref().unwrap_or("exec") {
+        "exec" => discover_codex_cli(binary).await,
+        "app_server" => discover_codex_app_server(binary).await,
+        other => Err(format!(
+            "unknown Codex mode '{other}'; expected exec or app_server"
+        )),
+    }
+    .map_err(AppError::BadRequest)?;
     Ok(HttpResponse::Ok().json(discovery))
 }
 
@@ -49,6 +56,7 @@ mod tests {
   "--version") echo 'codex-cli 0.144.5' ;;
   "exec --help") echo '--json --output-last-message --config --sandbox --dangerously-bypass-approvals-and-sandbox prompt from stdin' ;;
   "exec resume --help") echo '--json' ;;
+  "app-server --help") echo '--listen stdio:// --stdio' ;;
   *) exit 2 ;;
 esac"#
         )
@@ -64,6 +72,7 @@ esac"#
         let (_directory, binary) = write_codex_stub();
         let response = detect_codex_cli(web::Json(DetectCodexRequest {
             binary: Some(binary.clone()),
+            mode: None,
         }))
         .await
         .unwrap();
@@ -78,10 +87,23 @@ esac"#
     async fn detect_rejects_a_missing_override_with_install_guidance() {
         let error = detect_codex_cli(web::Json(DetectCodexRequest {
             binary: Some("/definitely/missing/codex".to_string()),
+            mode: Some("app_server".to_string()),
         }))
         .await
         .unwrap_err();
         assert!(error.to_string().contains("npm i -g @openai/codex"));
         assert!(error.to_string().contains("codex_binary"));
+    }
+
+    #[actix_web::test]
+    async fn app_server_detection_uses_the_extra_capability_gate() {
+        let (_directory, binary) = write_codex_stub();
+        let response = detect_codex_cli(web::Json(DetectCodexRequest {
+            binary: Some(binary),
+            mode: Some("app_server".to_string()),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

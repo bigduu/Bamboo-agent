@@ -75,6 +75,22 @@ pub async fn discover_codex_cli(binary: Option<&str>) -> Result<CodexCliDiscover
     })
 }
 
+/// Resolve Codex and additionally require the long-lived app-server surface.
+/// Never falls back to exec mode because that would silently remove runtime
+/// approval semantics selected by the caller.
+pub async fn discover_codex_app_server(binary: Option<&str>) -> Result<CodexCliDiscovery, String> {
+    let discovery = discover_codex_cli(binary).await?;
+    let path = PathBuf::from(&discovery.path);
+    verify_help_surface(&path, &["app-server", "--help"], &["stdio", "--listen"])
+        .await
+        .map_err(|error| {
+            format!(
+                "{error}; Codex app-server mode is unavailable: use codex_mode = \"exec\" or upgrade Codex CLI"
+            )
+        })?;
+    Ok(discovery)
+}
+
 /// Parse `codex-cli X.Y.Z` while tolerating vendor prefixes and a missing
 /// patch component.
 pub fn parse_codex_version(text: &str) -> Option<(u64, u64, u64)> {
@@ -192,7 +208,7 @@ async fn command_output(binary: &Path, args: &[&str]) -> Result<std::process::Ou
 
 #[cfg(test)]
 mod tests {
-    use super::parse_codex_version;
+    use super::{discover_codex_app_server, parse_codex_version};
 
     #[test]
     fn version_parser_accepts_current_and_rejects_noise() {
@@ -200,5 +216,30 @@ mod tests {
         assert_eq!(parse_codex_version("vendor v0.144.5"), Some((0, 144, 5)));
         assert_eq!(parse_codex_version("codex 1.2"), Some((1, 2, 0)));
         assert_eq!(parse_codex_version("not-a-version"), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn app_server_preflight_never_silently_downgrades_to_exec() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("codex-no-app-server.sh");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
+if [ "$1" = "exec" ]; then echo '--json --output-last-message --config --sandbox --dangerously-bypass-approvals-and-sandbox stdin'; exit 0; fi
+exit 2
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        let error = discover_codex_app_server(binary.to_str())
+            .await
+            .expect_err("app-server capability must be required");
+        assert!(error.contains("use codex_mode = \"exec\" or upgrade"));
     }
 }

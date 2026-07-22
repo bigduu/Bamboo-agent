@@ -257,13 +257,14 @@ in-process runtime toggle.
 | `claude_code_inherit_user_config` | `false`/unset adds `--strict-mcp-config --setting-sources project`, sandboxing the child from your personal `claude` config. |
 | `claude_code_forward_env` | Extra environment variable **names** forwarded verbatim into the child (on top of a fixed allowlist: `HOME`/`PATH`/`SHELL`/`TERM`/`LANG`/`LC_*`/`TMPDIR`/`USER`/`LOGNAME`). |
 | `codex_binary` / `codex_model` | Codex executable and optional `--model` override. |
+| `codex_mode` | `"exec"` (default, one process per activation) or `"app_server"` (long-lived JSON-RPC with parent approval relay). Missing app-server capability fails clearly and never downgrades. |
 | `codex_auth_mode` | `"inherit"` \| `"api_key"` \| `"custom"` \| `"bamboo"`; unset defaults to the recommended `"bamboo"` parent-provider mode. |
 | `codex_base_url` | Absolute HTTP(S) URL for `custom` mode only; credentials, query parameters, and fragments are rejected. |
 | `codex_wire_api` | `"responses"` (the only protocol accepted by supported Codex CLI versions). |
 | `codex_provider_key_ref` | Existing Bamboo provider credential reference used only by `custom` mode; the key is injected through an environment variable and is not written to the generated Codex config. |
 | `codex_forward_env` | Extra environment names after `env_clear()`; `api_key` mode requires an explicit `OPENAI_API_KEY`, and other modes reject it. `CODEX_*` and Bamboo's managed provider-key variable are reserved. |
 | `codex_sandbox` | Optional explicit `"read-only"` \| `"workspace-write"` \| `"danger-full-access"`. Unset derives a safe value from the child profile and live parent bypass posture. |
-| `codex_approval_policy` | Optional explicit `"never"` \| `"on-failure"`. Interactive policies are rejected because `codex exec` has no approval relay. |
+| `codex_approval_policy` | Exec mode accepts optional `"never"` \| `"on-failure"`; app-server mode accepts unset or `"on-request"`. Cross-mode combinations are rejected. |
 | `codex_network_access` | Enables network access inside `workspace-write`; incompatible with an explicit `read-only` sandbox. |
 | `codex_allow_danger_bypass` | Second gate for disabling the OS sandbox. The live parent must also be in bypass mode; root workers always downgrade and warn. |
 | `remote_placements` / `schedulable_placements` | Where a sub-agent may run (local / a named Cluster Fabric node) and whether schedules may target it. |

@@ -66,7 +66,7 @@ pub enum CodexAuthMode {
 }
 
 impl CodexAuthMode {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Inherit => "inherit",
             Self::ApiKey => "api_key",
@@ -101,7 +101,7 @@ impl CodexAuthConfig {
         self.mode
     }
 
-    fn isolated(&self) -> bool {
+    pub(crate) fn isolated(&self) -> bool {
         self.mode != CodexAuthMode::Inherit
     }
 
@@ -145,6 +145,114 @@ impl CodexAuthConfig {
         toml::to_string(&toml::Value::Table(root))
             .map_err(|error| format!("serialize isolated Codex config.toml: {error}"))
     }
+
+    /// App-server stays alive across activations, while Bamboo provider tokens
+    /// are intentionally minted and revoked per activation. Use Codex's
+    /// command-backed auth hook to read the current 0600 token file instead of
+    /// freezing the first token in the process environment.
+    pub(crate) fn generated_app_server_config_toml(
+        &self,
+        token_helper: &Path,
+        token_path: &Path,
+    ) -> Result<String, String> {
+        if self.mode != CodexAuthMode::Bamboo {
+            return self.generated_config_toml();
+        }
+        let base_url = self
+            .base_url
+            .as_ref()
+            .ok_or_else(|| "Codex auth mode 'bamboo' requires a provider base URL".to_string())?;
+        let mut auth = toml::Table::new();
+        auth.insert(
+            "command".to_string(),
+            toml::Value::String(token_helper.to_string_lossy().into_owned()),
+        );
+        auth.insert(
+            "args".to_string(),
+            toml::Value::Array(vec![
+                toml::Value::String("codex-provider-token".to_string()),
+                toml::Value::String(token_path.to_string_lossy().into_owned()),
+            ]),
+        );
+        auth.insert("timeout_ms".to_string(), toml::Value::Integer(5_000));
+        auth.insert("refresh_interval_ms".to_string(), toml::Value::Integer(1));
+        let mut provider = toml::Table::new();
+        provider.insert(
+            "name".to_string(),
+            toml::Value::String("Bamboo bamboo".to_string()),
+        );
+        provider.insert(
+            "base_url".to_string(),
+            toml::Value::String(base_url.clone()),
+        );
+        provider.insert(
+            "wire_api".to_string(),
+            toml::Value::String(self.wire_api.clone()),
+        );
+        provider.insert("auth".to_string(), toml::Value::Table(auth));
+        let mut providers = toml::Table::new();
+        providers.insert("bamboo".to_string(), toml::Value::Table(provider));
+        let mut root = toml::Table::new();
+        root.insert(
+            "model_provider".to_string(),
+            toml::Value::String("bamboo".to_string()),
+        );
+        root.insert("model_providers".to_string(), toml::Value::Table(providers));
+        toml::to_string(&toml::Value::Table(root))
+            .map_err(|error| format!("serialize isolated Codex app-server config.toml: {error}"))
+    }
+
+    pub(crate) fn provider_key(&self) -> Option<&str> {
+        self.provider_key.as_deref()
+    }
+}
+
+/// Read the short-lived Bamboo provider token for Codex command-backed auth.
+/// The final path component is opened without following symlinks on Unix, and
+/// permissions are verified on the opened descriptor to avoid check/open races.
+pub fn read_codex_provider_token(path: &Path) -> Result<String, String> {
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("inspect Codex provider token: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("Codex provider token path must not be a symlink".to_string());
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("open Codex provider token: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect Codex provider token: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Codex provider token path must be a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(
+                "Codex provider token file must not be accessible by group/other".to_string(),
+            );
+        }
+    }
+    let mut token = String::new();
+    std::io::Read::read_to_string(&mut file, &mut token)
+        .map_err(|error| format!("read Codex provider token: {error}"))?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("Codex provider token file is empty".to_string());
+    }
+    Ok(token.to_string())
 }
 
 /// Resolve and validate the public provision fields plus the one referenced
@@ -248,6 +356,7 @@ impl CodexSandbox {
 enum CodexApprovalPolicy {
     Never,
     OnFailure,
+    OnRequest,
 }
 
 impl CodexApprovalPolicy {
@@ -255,11 +364,10 @@ impl CodexApprovalPolicy {
         match raw {
             "never" => Ok(Self::Never),
             "on-failure" => Ok(Self::OnFailure),
-            "untrusted" | "on-request" => Err(format!(
-                "Codex approval policy '{raw}' is interactive and unsupported by non-interactive exec mode"
-            )),
+            "on-request" => Ok(Self::OnRequest),
+            "untrusted" => Err("Codex approval policy 'untrusted' is unsupported; use on-request in app_server mode".to_string()),
             other => Err(format!(
-                "unknown Codex approval policy '{other}'; expected never or on-failure"
+                "unknown Codex approval policy '{other}'; expected never, on-failure, or on-request"
             )),
         }
     }
@@ -268,6 +376,7 @@ impl CodexApprovalPolicy {
         match self {
             Self::Never => "never",
             Self::OnFailure => "on-failure",
+            Self::OnRequest => "on-request",
         }
     }
 }
@@ -429,6 +538,12 @@ pub fn resolve_codex_permission_config(
     let approval_policy = approval_policy
         .map(CodexApprovalPolicy::parse)
         .transpose()?;
+    if approval_policy == Some(CodexApprovalPolicy::OnRequest) {
+        return Err(
+            "Codex approval policy 'on-request' requires codex_mode = \"app_server\"; non-interactive exec mode has no approval relay"
+                .to_string(),
+        );
+    }
     let profile_read_only = permission_profile
         .as_deref()
         .is_some_and(profile_is_read_only);
@@ -448,6 +563,68 @@ pub fn resolve_codex_permission_config(
         provisioned_bypass,
         workspace_owned,
     })
+}
+
+/// App-server mode always routes approvals to Bamboo. Accepting `never` or
+/// `on-failure` here would make the selected transport's safety contract lie.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_codex_app_server_permission_config(
+    sandbox: Option<&str>,
+    approval_policy: Option<&str>,
+    network_access: bool,
+    allow_danger_bypass: bool,
+    permission_profile: Option<String>,
+    provisioned_bypass: bool,
+    workspace_owned: bool,
+) -> Result<CodexPermissionConfig, String> {
+    match approval_policy {
+        None | Some("on-request") => {}
+        Some(other) => {
+            return Err(format!(
+                "Codex approval policy '{other}' is incompatible with codex_mode = \"app_server\"; use on-request"
+            ))
+        }
+    }
+    let sandbox = sandbox.map(CodexSandbox::parse).transpose()?;
+    let profile_read_only = permission_profile
+        .as_deref()
+        .is_some_and(profile_is_read_only);
+    if network_access
+        && (sandbox == Some(CodexSandbox::ReadOnly) || (sandbox.is_none() && profile_read_only))
+    {
+        return Err(
+            "Codex network access requires an effective workspace-write sandbox".to_string(),
+        );
+    }
+    Ok(CodexPermissionConfig {
+        sandbox,
+        approval_policy: Some(CodexApprovalPolicy::OnRequest),
+        network_access,
+        allow_danger_bypass,
+        permission_profile,
+        provisioned_bypass,
+        workspace_owned,
+    })
+}
+
+impl CodexPermissionConfig {
+    pub(crate) fn app_server_posture(&self, bypass: bool) -> (String, bool, Vec<String>) {
+        let mut policy = self.effective(bypass, running_as_root());
+        policy.approval_policy = CodexApprovalPolicy::OnRequest;
+        (
+            policy.sandbox.as_str().to_string(),
+            policy.network_access,
+            policy.warnings,
+        )
+    }
+
+    pub(crate) fn permission_profile(&self) -> Option<&str> {
+        self.permission_profile.as_deref()
+    }
+
+    pub(crate) fn provisioned_bypass(&self) -> bool {
+        self.provisioned_bypass
+    }
 }
 
 #[cfg(unix)]
@@ -1661,7 +1838,7 @@ fn process_group_exists(pgid: libc::pid_t) -> bool {
 }
 
 #[cfg(unix)]
-async fn terminate_child(child: &mut Child) {
+pub(crate) async fn terminate_child(child: &mut Child) {
     let Some(pgid) = child.id().map(|pid| pid as libc::pid_t) else {
         return;
     };
@@ -1696,7 +1873,7 @@ async fn terminate_child(child: &mut Child) {
 }
 
 #[cfg(not(unix))]
-async fn terminate_child(child: &mut Child) {
+pub(crate) async fn terminate_child(child: &mut Child) {
     if tokio::time::timeout(SIGTERM_WAIT, child.wait())
         .await
         .is_ok()
@@ -1707,7 +1884,10 @@ async fn terminate_child(child: &mut Child) {
     let _ = child.wait().await;
 }
 
-async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>>
+pub(crate) async fn read_bounded_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<Vec<u8>>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
@@ -2257,6 +2437,18 @@ mod tests {
         assert!(generated.contains("model_provider = \"bamboo\""));
         assert!(generated.contains("http://127.0.0.1:9562/openai/v1"));
         assert!(!generated.contains("bcx1_"));
+        let app_server_generated = bamboo
+            .generated_app_server_config_toml(
+                Path::new("/opt/bamboo/bin/bamboo"),
+                Path::new("/private/state/codex-provider-token"),
+            )
+            .unwrap();
+        assert!(app_server_generated.contains("[model_providers.bamboo.auth]"));
+        assert!(app_server_generated.contains("command = \"/opt/bamboo/bin/bamboo\""));
+        assert!(app_server_generated.contains("\"codex-provider-token\""));
+        assert!(app_server_generated.contains("refresh_interval_ms = 1"));
+        assert!(!app_server_generated.contains("env_key"));
+        assert!(!app_server_generated.contains("bcx1_"));
         let mut bamboo_executor = fixture_executor();
         bamboo_executor.state_dir = Some(state.path().to_path_buf());
         bamboo_executor.auth = bamboo;
@@ -2549,6 +2741,30 @@ mod tests {
                     .as_str()
                     .is_some_and(|error| error.contains("Operation not permitted"))
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_token_reader_checks_open_descriptor_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let token = root.path().join("token");
+        std::fs::write(&token, "  bcx1_short_lived  \n").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_codex_provider_token(&token).unwrap(),
+            "bcx1_short_lived"
+        );
+
+        let link = root.path().join("token-link");
+        symlink(&token, &link).unwrap();
+        assert!(read_codex_provider_token(&link).is_err());
+
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_codex_provider_token(&token)
+            .unwrap_err()
+            .contains("group/other"));
     }
 
     #[cfg(unix)]
