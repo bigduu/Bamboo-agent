@@ -47,6 +47,7 @@ pub struct ResolvedRunConfig {
     pub system_prompt: String,
     pub base_system_prompt: String,
     pub workspace_path: Option<String>,
+    pub lifecycle_hooks: bamboo_config::LifecycleHooksConfig,
 }
 
 #[derive(Clone)]
@@ -363,6 +364,31 @@ async fn run_schedule_job(
         .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
         .no_human_approver = true;
 
+    let mut prompt_hook_block = None;
+    if let Some(user_index) = session
+        .messages
+        .iter()
+        .rposition(|message| matches!(message.role, Role::User))
+    {
+        let raw_prompt = session.messages[user_index].content.clone();
+        match crate::lifecycle_hooks::apply_user_prompt_submit_hooks(
+            &resolved.lifecycle_hooks,
+            ctx.app_data_dir.clone(),
+            &mut session,
+            &raw_prompt,
+        )
+        .await
+        {
+            Ok(prompt) => session.messages[user_index].content = prompt,
+            Err(reason) => {
+                session.messages.remove(user_index);
+                session.set_last_run_status("error");
+                session.set_last_run_error(reason.clone());
+                prompt_hook_block = Some(reason);
+            }
+        }
+    }
+
     // Persist session and index entry.
     ctx.persistence
         .merge_save_runtime(&mut session)
@@ -385,6 +411,12 @@ async fn run_schedule_job(
         session_id.clone(),
         Arc::new(parking_lot::RwLock::new(session.clone())),
     );
+
+    if let Some(reason) = prompt_hook_block {
+        return Err(format!(
+            "UserPromptSubmit hook blocked scheduled run: {reason}"
+        ));
+    }
 
     // If no task message (or not configured to execute), we're done.
     let should_execute = job.run_config.auto_execute
@@ -744,6 +776,7 @@ fn resolve_run_config_from_config(
         system_prompt,
         base_system_prompt: base_system_prompt.to_string(),
         workspace_path,
+        lifecycle_hooks: config_snapshot.lifecycle_hooks.clone(),
     }
 }
 
@@ -849,6 +882,34 @@ mod build_context_tests {
         let resolved =
             resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
         assert_eq!(resolved.model_roster.model.as_deref(), Some("gpt-chat"));
+    }
+
+    #[test]
+    fn resolve_run_config_from_config_snapshots_lifecycle_hooks_for_scheduled_runs() {
+        let lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+            enabled: true,
+            session_start: vec![bamboo_config::LifecycleHookGroup {
+                matcher: None,
+                hooks: vec![bamboo_config::LifecycleHookCommand {
+                    hook_type: bamboo_config::LifecycleHookType::Command,
+                    command: "printf schedule-start".to_string(),
+                    timeout_ms: bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                }],
+            }],
+            ..Default::default()
+        };
+        let config = test_config! {
+            lifecycle_hooks: lifecycle_hooks.clone(),
+        };
+        let registry = Arc::new(ProviderRegistry::new(
+            Default::default(),
+            "openai".to_string(),
+        ));
+
+        let resolved =
+            resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
+
+        assert_eq!(resolved.lifecycle_hooks, lifecycle_hooks);
     }
 }
 

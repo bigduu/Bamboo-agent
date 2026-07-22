@@ -45,10 +45,10 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // (an explicit model) pays none of that cost. #480: fall back to the SAME
     // resolved default the connect bridge and `GET /execute/defaults` use, so
     // there is one implementation of "what model does this server default to".
+    let config_snapshot = state.config.read().await.clone();
     let default_model = if request::optional_non_empty(req.model.as_deref()).is_some() {
         None
     } else {
-        let config_snapshot = state.config.read().await.clone();
         bamboo_engine::resolved_defaults::resolve_default_run_config(
             &config_snapshot,
             &state.provider_registry,
@@ -114,6 +114,25 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         }
     };
 
+    let effective_message = match crate::lifecycle_hooks::apply_user_prompt_submit_hooks(
+        &config_snapshot.lifecycle_hooks,
+        Some(state.app_data_dir.clone()),
+        &mut session,
+        &req.message,
+    )
+    .await
+    {
+        Ok(message) => message,
+        Err(reason) => {
+            // Persist the hook checkpoint but never the rejected user message.
+            state.save_and_cache_session(&mut session).await;
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": crate::error::error_value(reason),
+                "hook_event": "UserPromptSubmit"
+            }));
+        }
+    };
+
     // ---- Goal command interception ----
     if let Some(goal_cmd) = parse_goal_command(&req.message) {
         tracing::debug!(
@@ -125,8 +144,13 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     }
 
     // Image handling stays in the handler layer (depends on AppState attachment reader).
-    if let Err(response) =
-        images::append_user_message(&state, &mut session, &req.message, req.images.as_deref()).await
+    if let Err(response) = images::append_user_message(
+        &state,
+        &mut session,
+        &effective_message,
+        req.images.as_deref(),
+    )
+    .await
     {
         return response;
     }

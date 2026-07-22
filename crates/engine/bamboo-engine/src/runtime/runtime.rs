@@ -752,7 +752,9 @@ impl AgentRuntime {
 
         drop(config);
 
-        run_agent_loop_with_config(
+        let session_end_runner = loop_config.hook_runner.clone();
+        let session_end_event_tx = event_tx.clone();
+        let result = run_agent_loop_with_config(
             session,
             initial_message,
             event_tx,
@@ -761,6 +763,16 @@ impl AgentRuntime {
             cancel_token,
             loop_config,
         )
-        .await
+        .await;
+
+        crate::runtime::hooks::run_session_end_hooks(
+            &session_end_runner,
+            &result,
+            session,
+            &session_end_event_tx,
+        )
+        .await;
+
+        result
     }
 }

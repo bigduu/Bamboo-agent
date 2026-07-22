@@ -320,6 +320,14 @@ pub struct AgentRuntimeState {
     pub waiting_for_bash: Option<WaitingForBashState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<HookCheckpoint>,
+    /// Volatile context injected by lifecycle hooks for this run. Request
+    /// assembly renders it after conversation history, never into the cached
+    /// system prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_contexts: Vec<String>,
+    /// Number of extra rounds forced by a blocking `Stop` hook in this run.
+    #[serde(default)]
+    pub stop_hook_forced_continuations: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<PlanModeState>,
     /// When `true`, this session skips all tool permission checks (the
@@ -353,6 +361,8 @@ impl AgentRuntimeState {
             waiting_for_children: None,
             waiting_for_bash: None,
             checkpoints: Vec::new(),
+            hook_contexts: Vec::new(),
+            stop_hook_forced_continuations: 0,
             plan_mode: None,
             bypass_permissions: false,
             no_human_approver: false,
@@ -376,6 +386,8 @@ impl Default for AgentRuntimeState {
             waiting_for_children: None,
             waiting_for_bash: None,
             checkpoints: Vec::new(),
+            hook_contexts: Vec::new(),
+            stop_hook_forced_continuations: 0,
             plan_mode: None,
             bypass_permissions: false,
             no_human_approver: false,

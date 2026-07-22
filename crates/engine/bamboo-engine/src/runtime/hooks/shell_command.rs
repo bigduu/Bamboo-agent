@@ -7,7 +7,9 @@ use bamboo_agent_core::{AgentHook, Session};
 use bamboo_config::{
     LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType, LifecycleHooksConfig,
 };
-use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
+use bamboo_domain::{
+    AgentHookPoint, HookPayload, HookResult, SessionEndStatus, SessionStartSource,
+};
 use bamboo_infrastructure::{
     build_command_environment, hide_window_for_tokio_command, preferred_bash_shell,
 };
@@ -26,9 +28,11 @@ const HOOK_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellHookEvent {
     SessionStart,
+    UserPromptSubmit,
     PreToolUse,
     PostToolUse,
     Stop,
+    SessionEnd,
     PreCompact,
 }
 
@@ -36,9 +40,11 @@ impl ShellHookEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::Stop => "Stop",
+            Self::SessionEnd => "SessionEnd",
             Self::PreCompact => "PreCompact",
         }
     }
@@ -46,9 +52,11 @@ impl ShellHookEvent {
     fn point(self) -> AgentHookPoint {
         match self {
             Self::SessionStart => AgentHookPoint::AfterSessionSetup,
+            Self::UserPromptSubmit => AgentHookPoint::BeforeSessionSetup,
             Self::PreToolUse => AgentHookPoint::BeforeToolExecution,
             Self::PostToolUse => AgentHookPoint::AfterToolExecution,
             Self::Stop => AgentHookPoint::BeforeFinalize,
+            Self::SessionEnd => AgentHookPoint::AfterSessionEnd,
             Self::PreCompact => AgentHookPoint::BeforeCompression,
         }
     }
@@ -103,11 +111,39 @@ impl ShellCommandHook {
         session: &Session,
         cwd: Option<&PathBuf>,
     ) -> HookEnvelope {
-        let (tool_name, tool_input, tool_response, prompt) = match payload {
-            HookPayload::SessionSetup { initial_message } => {
-                (None, None, None, Some(initial_message.clone()))
-            }
-            HookPayload::Prompt { prompt } => (None, None, None, Some(prompt.clone())),
+        let (
+            tool_name,
+            tool_input,
+            tool_response,
+            prompt,
+            source,
+            stop_hook_active,
+            terminal_status,
+            completion_reason,
+        ) = match payload {
+            HookPayload::SessionSetup {
+                initial_message,
+                source,
+            } => (
+                None,
+                None,
+                None,
+                Some(initial_message.clone()),
+                Some(*source),
+                None,
+                None,
+                None,
+            ),
+            HookPayload::Prompt { prompt } => (
+                None,
+                None,
+                None,
+                Some(prompt.clone()),
+                None,
+                None,
+                None,
+                None,
+            ),
             HookPayload::ToolExecution {
                 tool_name,
                 parsed_args,
@@ -115,6 +151,10 @@ impl ShellCommandHook {
             } => (
                 Some(tool_name.clone()),
                 Some(parsed_args.clone()),
+                None,
+                None,
+                None,
+                None,
                 None,
                 None,
             ),
@@ -125,11 +165,37 @@ impl ShellCommandHook {
                 None,
                 serde_json::to_value(outcome).ok(),
                 None,
+                None,
+                None,
+                None,
+                None,
             ),
-            HookPayload::None
-            | HookPayload::Round { .. }
-            | HookPayload::Compression { .. }
-            | HookPayload::Finalize => (None, None, None, None),
+            HookPayload::Finalize { stop_hook_active } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(*stop_hook_active),
+                None,
+                None,
+            ),
+            HookPayload::SessionEnd {
+                status,
+                completion_reason,
+            } => (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(*status),
+                completion_reason.clone(),
+            ),
+            HookPayload::None | HookPayload::Round { .. } | HookPayload::Compression { .. } => {
+                (None, None, None, None, None, None, None, None)
+            }
         };
 
         HookEnvelope {
@@ -144,6 +210,10 @@ impl ShellCommandHook {
             tool_input,
             tool_response,
             prompt,
+            source,
+            stop_hook_active,
+            terminal_status,
+            completion_reason,
             timestamp: Utc::now().to_rfc3339(),
         }
     }
@@ -402,6 +472,14 @@ struct HookEnvelope {
     tool_response: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<SessionStartSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_hook_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_status: Option<SessionEndStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_reason: Option<String>,
     timestamp: String,
 }
 
@@ -464,11 +542,13 @@ pub(super) fn register_configured_shell_hooks(
         return;
     }
 
-    let events: [(ShellHookEvent, &[LifecycleHookGroup]); 5] = [
+    let events: [(ShellHookEvent, &[LifecycleHookGroup]); 7] = [
         (ShellHookEvent::SessionStart, &config.session_start),
+        (ShellHookEvent::UserPromptSubmit, &config.user_prompt_submit),
         (ShellHookEvent::PreToolUse, &config.pre_tool_use),
         (ShellHookEvent::PostToolUse, &config.post_tool_use),
         (ShellHookEvent::Stop, &config.stop),
+        (ShellHookEvent::SessionEnd, &config.session_end),
         (ShellHookEvent::PreCompact, &config.pre_compact),
     ];
     let mut sequence = 0_usize;
@@ -547,6 +627,7 @@ mod tests {
                 AgentHookPoint::AfterSessionSetup,
                 &HookPayload::SessionSetup {
                     initial_message: "hello".to_string(),
+                    source: SessionStartSource::Startup,
                 },
                 &session(dir.path()),
             )
@@ -786,6 +867,51 @@ mod tests {
     }
 
     #[test]
+    fn session_envelopes_include_source_stop_and_terminal_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session(dir.path());
+        for (event, payload, expected) in [
+            (
+                ShellHookEvent::SessionStart,
+                HookPayload::SessionSetup {
+                    initial_message: "hello".to_string(),
+                    source: SessionStartSource::Resume,
+                },
+                ("source", json!("resume")),
+            ),
+            (
+                ShellHookEvent::Stop,
+                HookPayload::Finalize {
+                    stop_hook_active: true,
+                },
+                ("stop_hook_active", json!(true)),
+            ),
+            (
+                ShellHookEvent::SessionEnd,
+                HookPayload::SessionEnd {
+                    status: SessionEndStatus::Cancelled,
+                    completion_reason: Some("cancelled by user".to_string()),
+                },
+                ("terminal_status", json!("cancelled")),
+            ),
+        ] {
+            let hook =
+                ShellCommandHook::new(event, &command("true", 1_000), None, None, 0).expect("hook");
+            let value = serde_json::to_value(hook.envelope(
+                &payload,
+                &session,
+                hook.effective_cwd(&session).as_ref(),
+            ))
+            .unwrap();
+            assert_eq!(value["hook_event_name"], event.as_str());
+            assert_eq!(value[expected.0], expected.1);
+            if matches!(event, ShellHookEvent::SessionEnd) {
+                assert_eq!(value["completion_reason"], "cancelled by user");
+            }
+        }
+    }
+
+    #[test]
     fn configured_runner_registers_only_enabled_engine_events() {
         let hook = command("true", 1_000);
         let config = LifecycleHooksConfig {
@@ -795,6 +921,14 @@ mod tests {
                 hooks: vec![hook.clone()],
             }],
             session_start: vec![LifecycleHookGroup {
+                matcher: None,
+                hooks: vec![hook.clone()],
+            }],
+            user_prompt_submit: vec![LifecycleHookGroup {
+                matcher: None,
+                hooks: vec![hook.clone()],
+            }],
+            session_end: vec![LifecycleHookGroup {
                 matcher: None,
                 hooks: vec![hook.clone()],
             }],
@@ -811,8 +945,10 @@ mod tests {
             base.is_empty(),
             "per-run registration must not mutate the base"
         );
-        assert_eq!(configured.len(), 2);
+        assert_eq!(configured.len(), 4);
         assert!(configured.has_hooks_for(AgentHookPoint::AfterSessionSetup));
+        assert!(configured.has_hooks_for(AgentHookPoint::BeforeSessionSetup));
+        assert!(configured.has_hooks_for(AgentHookPoint::AfterSessionEnd));
         assert!(configured.has_hooks_for(AgentHookPoint::BeforeToolExecution));
     }
 

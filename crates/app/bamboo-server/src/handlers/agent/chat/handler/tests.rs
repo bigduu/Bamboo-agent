@@ -457,4 +457,66 @@ mod optional_model_e2e {
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[actix_web::test]
+    async fn user_prompt_submit_block_returns_reason_and_persists_no_user_message() {
+        let state = new_state().await;
+        {
+            let mut config = state.config.write().await;
+            config.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+                enabled: true,
+                user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
+                    matcher: None,
+                    hooks: vec![bamboo_config::LifecycleHookCommand {
+                        hook_type: bamboo_config::LifecycleHookType::Command,
+                        command: "printf 'prompt rejected by policy' >&2; exit 2".to_string(),
+                        timeout_ms: bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                    }],
+                }],
+                ..Default::default()
+            };
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": "blocked-user-prompt",
+                    "message": "must not persist",
+                    "model": "test-model"
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(response).await;
+        assert!(body.to_string().contains("prompt rejected by policy"));
+        assert_eq!(body["hook_event"], "UserPromptSubmit");
+
+        let session = state
+            .storage
+            .load_session("blocked-user-prompt")
+            .await
+            .expect("load")
+            .expect("prepared session is persisted for hook observability");
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| !matches!(message.role, bamboo_agent_core::Role::User)));
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.checkpoints.len()),
+            Some(1)
+        );
+    }
 }

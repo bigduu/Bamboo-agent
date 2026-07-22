@@ -30,7 +30,7 @@ use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
     WaitingForChildrenState,
 };
-use bamboo_domain::{AgentHookPoint, HookPayload};
+use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -1118,6 +1118,8 @@ async fn handle_no_tool_calls(
     }
 
     // Guardian approved, inactive, or out of budget → complete the run.
+    const MAX_STOP_HOOK_CONTINUATIONS: u8 = 5;
+
     if config
         .hook_runner
         .has_hooks_for(AgentHookPoint::BeforeFinalize)
@@ -1126,20 +1128,71 @@ async fn handle_no_tool_calls(
             .hook_runner
             .run_hooks(
                 AgentHookPoint::BeforeFinalize,
-                &HookPayload::Finalize,
+                &HookPayload::Finalize {
+                    stop_hook_active: runtime_state.stop_hook_forced_continuations > 0,
+                },
                 session,
                 runtime_state,
                 Some(event_tx),
             )
             .await;
-        let hook_result = crate::runtime::hooks::apply_hook_outcome(
-            AgentHookPoint::BeforeFinalize,
-            outcome,
-            session,
-            runtime_state,
-        );
-        state_bridge::write_runtime_state(session, runtime_state);
-        hook_result?;
+        if let HookResult::Deny { reason } = &outcome.decision {
+            if runtime_state.stop_hook_forced_continuations < MAX_STOP_HOOK_CONTINUATIONS {
+                runtime_state.stop_hook_forced_continuations += 1;
+                if let Some(message) = deferred_assistant_message.take() {
+                    session.add_message(message);
+                }
+                let extra_context = outcome
+                    .injected_contexts
+                    .iter()
+                    .map(|context| context.trim())
+                    .filter(|context| !context.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let context_suffix = if extra_context.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\nAdditional hook context:\n{extra_context}")
+                };
+                session.add_message(Message::user(format!(
+                    "A Stop lifecycle hook requires another work round ({}/{}): {}{}\n\nContinue working and address this feedback before attempting to finish again.",
+                    runtime_state.stop_hook_forced_continuations,
+                    MAX_STOP_HOOK_CONTINUATIONS,
+                    reason.trim(),
+                    context_suffix,
+                )));
+                state_bridge::write_runtime_state(session, runtime_state);
+                record_no_tool_calls_round_completed(
+                    metrics_collector,
+                    round_id,
+                    session_id,
+                    session,
+                    round_usage,
+                );
+                return Ok(TurnOutcome {
+                    should_break: false,
+                    sent_complete: false,
+                });
+            }
+            tracing::warn!(
+                "[{}] Stop hook continuation cap ({}) reached; ignoring further block",
+                session_id,
+                MAX_STOP_HOOK_CONTINUATIONS
+            );
+            session.metadata.insert(
+                "runtime.completion_reason".to_string(),
+                "stop_hook_continuation_cap".to_string(),
+            );
+        } else {
+            let hook_result = crate::runtime::hooks::apply_hook_outcome(
+                AgentHookPoint::BeforeFinalize,
+                outcome,
+                session,
+                runtime_state,
+            );
+            state_bridge::write_runtime_state(session, runtime_state);
+            hook_result?;
+        }
     }
 
     if let Some(message) = deferred_assistant_message.take() {
@@ -2427,8 +2480,8 @@ mod tests {
     };
     use crate::runtime::runner::state_bridge;
     use bamboo_agent_core::storage::Storage;
-    use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
-    use bamboo_domain::AgentRuntimeState;
+    use bamboo_agent_core::{AgentError, AgentEvent, AgentHook, Message, Session};
+    use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload, HookResult};
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -2833,6 +2886,178 @@ mod tests {
             completion_tokens: 1,
             total_tokens: 2,
         }
+    }
+
+    struct BlockFirstStopHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for BlockFirstStopHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeFinalize
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            match payload {
+                HookPayload::Finalize {
+                    stop_hook_active: false,
+                } => HookResult::WithContext {
+                    result: Box::new(HookResult::Deny {
+                        reason: "verify the result".to_string(),
+                    }),
+                    text: "run the focused check".to_string(),
+                },
+                HookPayload::Finalize {
+                    stop_hook_active: true,
+                } => HookResult::Continue,
+                payload => panic!("unexpected stop payload: {payload:?}"),
+            }
+        }
+    }
+
+    struct AlwaysBlockStopHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for AlwaysBlockStopHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeFinalize
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            HookResult::Deny {
+                reason: "keep going".to_string(),
+            }
+        }
+    }
+
+    fn stop_hook_config(hook: Arc<dyn AgentHook>) -> AgentLoopConfig {
+        let mut runner = crate::runtime::hooks::HookRunner::new();
+        runner.register(hook);
+        AgentLoopConfig {
+            hook_runner: Arc::new(runner),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_hook_block_continues_then_allows_completion_with_active_payload() {
+        let mut session = Session::new("stop-hook", "model");
+        let mut runtime_state = AgentRuntimeState::new("stop-hook");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let config = stop_hook_config(Arc::new(BlockFirstStopHook));
+
+        let first = super::handle_no_tool_calls(
+            "first final answer".to_string(),
+            None,
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-1",
+            "stop-hook",
+            &config,
+            &None,
+            "model",
+            1,
+            Arc::new(StubProvider),
+        )
+        .await
+        .unwrap();
+        assert!(!first.should_break);
+        assert!(!first.sent_complete);
+        assert_eq!(runtime_state.stop_hook_forced_continuations, 1);
+        assert!(session.messages.last().is_some_and(|message| {
+            message.content.contains("verify the result")
+                && message.content.contains("run the focused check")
+        }));
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::Complete { .. }),
+                "blocked stop must not emit Complete"
+            );
+        }
+
+        let second = super::handle_no_tool_calls(
+            "verified final answer".to_string(),
+            None,
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-2",
+            "stop-hook",
+            &config,
+            &None,
+            "model",
+            2,
+            Arc::new(StubProvider),
+        )
+        .await
+        .unwrap();
+        assert!(second.should_break);
+        assert!(second.sent_complete);
+        let mut saw_complete = false;
+        while let Ok(event) = rx.try_recv() {
+            saw_complete |= matches!(event, AgentEvent::Complete { .. });
+        }
+        assert!(saw_complete, "allowed stop must emit Complete");
+    }
+
+    #[tokio::test]
+    async fn stop_hook_continuation_cap_completes_despite_further_blocks() {
+        let mut session = Session::new("stop-hook-cap", "model");
+        let mut runtime_state = AgentRuntimeState::new("stop-hook-cap");
+        runtime_state.stop_hook_forced_continuations = 5;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let config = stop_hook_config(Arc::new(AlwaysBlockStopHook));
+
+        let outcome = super::handle_no_tool_calls(
+            "forced final answer".to_string(),
+            None,
+            None,
+            5,
+            5,
+            round_usage(),
+            &mut session,
+            &mut runtime_state,
+            &tx,
+            None,
+            "round-cap",
+            "stop-hook-cap",
+            &config,
+            &None,
+            "model",
+            6,
+            Arc::new(StubProvider),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.should_break);
+        assert!(outcome.sent_complete);
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.completion_reason")
+                .map(String::as_str),
+            Some("stop_hook_continuation_cap")
+        );
     }
 
     /// THE bug-fix invariant: when Gold decides to continue at the terminal

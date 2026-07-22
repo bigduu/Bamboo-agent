@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bamboo_agent_core::{AgentError, AgentEvent, AgentHook, Message, Session};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, AgentStatusState, HookCheckpoint, HookPayload, HookResult,
-    SuspensionState,
+    SessionEndStatus, SuspensionState,
 };
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -71,6 +71,35 @@ impl HookRunner {
         runtime_state: &mut AgentRuntimeState,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) -> HookRunOutcome {
+        self.run_hooks_with_control(point, payload, session, runtime_state, event_tx, true)
+            .await
+    }
+
+    /// Run every matching hook while recording checkpoints/events, but never
+    /// short-circuit on a control decision. Terminal observer seams such as
+    /// `SessionEnd` use this so one cleanup hook cannot suppress later ones.
+    async fn run_observer_hooks(
+        &self,
+        point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+        runtime_state: &mut AgentRuntimeState,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    ) {
+        let _ = self
+            .run_hooks_with_control(point, payload, session, runtime_state, event_tx, false)
+            .await;
+    }
+
+    async fn run_hooks_with_control(
+        &self,
+        point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+        runtime_state: &mut AgentRuntimeState,
+        event_tx: Option<&mpsc::Sender<AgentEvent>>,
+        honor_control_decisions: bool,
+    ) -> HookRunOutcome {
         let mut outcome = HookRunOutcome::default();
 
         for hook in &self.hooks {
@@ -109,8 +138,10 @@ impl HookRunner {
                 | HookResult::Suspend { .. }
                 | HookResult::Deny { .. }
                 | HookResult::Ask => {
-                    outcome.decision = result;
-                    return outcome;
+                    if honor_control_decisions {
+                        outcome.decision = result;
+                        return outcome;
+                    }
                 }
                 HookResult::InjectContext { text } => {
                     outcome.injected_contexts.push(text.clone());
@@ -145,6 +176,57 @@ impl HookRunner {
     }
 }
 
+/// Fire cleanup/notification hooks after a terminal run. Decisions and context
+/// are intentionally ignored: `SessionEnd` observes a settled outcome and may
+/// not reverse it. Suspended runs are non-terminal and do not fire this event.
+pub(crate) async fn run_session_end_hooks(
+    runner: &HookRunner,
+    result: &Result<(), AgentError>,
+    session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) {
+    let suspended_non_terminal = result.is_ok()
+        && session
+            .metadata
+            .get("runtime.suspend_reason")
+            .is_some_and(|reason| !reason.trim().is_empty());
+    if suspended_non_terminal || !runner.has_hooks_for(AgentHookPoint::AfterSessionEnd) {
+        return;
+    }
+
+    let (status, completion_reason) = match result {
+        Ok(()) => (
+            SessionEndStatus::Completed,
+            session
+                .metadata
+                .get("runtime.completion_reason")
+                .cloned()
+                .or_else(|| Some("completed".to_string())),
+        ),
+        Err(error) if error.is_cancelled() => {
+            (SessionEndStatus::Cancelled, Some(error.to_string()))
+        }
+        Err(error) => (SessionEndStatus::Failed, Some(error.to_string())),
+    };
+    let mut runtime_state = session
+        .agent_runtime_state
+        .clone()
+        .unwrap_or_else(|| AgentRuntimeState::new(&session.id));
+    runner
+        .run_observer_hooks(
+            AgentHookPoint::AfterSessionEnd,
+            &HookPayload::SessionEnd {
+                status,
+                completion_reason,
+            },
+            session,
+            &mut runtime_state,
+            Some(event_tx),
+        )
+        .await;
+    session.agent_runtime_state = Some(runtime_state);
+}
+
 fn unwrap_context_result(mut result: HookResult) -> (HookResult, Vec<String>) {
     let mut contexts = Vec::new();
     while let HookResult::WithContext {
@@ -168,7 +250,16 @@ pub(crate) fn apply_hook_outcome(
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,
 ) -> Result<(), AgentError> {
-    inject_contexts(session, point, outcome.injected_contexts);
+    if matches!(point, AgentHookPoint::AfterSessionSetup) {
+        runtime_state.hook_contexts.extend(
+            outcome
+                .injected_contexts
+                .into_iter()
+                .filter(|text| !text.trim().is_empty()),
+        );
+    } else {
+        inject_contexts(session, point, outcome.injected_contexts);
+    }
 
     match outcome.decision {
         HookResult::Continue
@@ -435,5 +526,93 @@ mod tests {
 
         assert_eq!(result.decision, HookResult::Continue);
         assert!(state.checkpoints.is_empty());
+    }
+
+    struct RecordingSessionEndHook {
+        payloads: Arc<std::sync::Mutex<Vec<HookPayload>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for RecordingSessionEndHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterSessionEnd
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            self.payloads.lock().unwrap().push(payload.clone());
+            // Decisions at SessionEnd are observability-only and must not
+            // change the already-settled terminal outcome.
+            HookResult::Deny {
+                reason: "ignored cleanup decision".to_string(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_end_fires_for_completed_failed_and_cancelled_and_ignores_decisions() {
+        for (result, expected_status) in [
+            (Ok(()), SessionEndStatus::Completed),
+            (
+                Err(AgentError::Tool("terminal failure".to_string())),
+                SessionEndStatus::Failed,
+            ),
+            (Err(AgentError::Cancelled), SessionEndStatus::Cancelled),
+        ] {
+            let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut runner = HookRunner::new();
+            runner.register(Arc::new(RecordingSessionEndHook {
+                payloads: payloads.clone(),
+            }));
+            runner.register(Arc::new(RecordingSessionEndHook {
+                payloads: payloads.clone(),
+            }));
+            let mut session = test_session();
+            let (tx, _rx) = mpsc::channel(4);
+
+            run_session_end_hooks(&runner, &result, &mut session, &tx).await;
+
+            let recorded = payloads.lock().unwrap();
+            assert_eq!(
+                recorded.len(),
+                2,
+                "a denied observer must not suppress later cleanup hooks"
+            );
+            assert!(recorded.iter().all(|payload| matches!(
+                payload,
+                HookPayload::SessionEnd { status, .. } if *status == expected_status
+            )));
+            assert_eq!(
+                session
+                    .agent_runtime_state
+                    .as_ref()
+                    .map(|state| state.checkpoints.len()),
+                Some(2)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_end_skips_suspended_non_terminal_runs() {
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Arc::new(RecordingSessionEndHook {
+            payloads: payloads.clone(),
+        }));
+        let mut session = test_session();
+        session.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        let (tx, _rx) = mpsc::channel(4);
+
+        run_session_end_hooks(&runner, &Ok(()), &mut session, &tx).await;
+
+        assert!(payloads.lock().unwrap().is_empty());
+        assert!(session.agent_runtime_state.is_none());
     }
 }

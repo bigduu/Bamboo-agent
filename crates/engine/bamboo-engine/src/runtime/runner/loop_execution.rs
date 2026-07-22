@@ -7,7 +7,7 @@ use tracing::Instrument;
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_domain::{AgentHookPoint, HookPayload};
+use bamboo_domain::{AgentHookPoint, HookPayload, SessionStartSource};
 use bamboo_llm::LLMProvider;
 
 mod gold;
@@ -47,6 +47,28 @@ pub(crate) async fn run_agent_loop_with_config(
 ) -> super::Result<()> {
     let session_span = tracing::info_span!("agent_loop", session_id = %session.id);
     async {
+        let session_start_source = session
+            .metadata
+            .remove(crate::session_app::chat::SESSION_START_SOURCE_METADATA_KEY)
+            .as_deref()
+            .map(|source| match source {
+                "resume" => SessionStartSource::Resume,
+                _ => SessionStartSource::Startup,
+            })
+            .unwrap_or_else(|| {
+                let has_prior_run = session.last_run_status().is_some()
+                    || session.messages.iter().any(|message| {
+                        matches!(
+                            message.role,
+                            bamboo_agent_core::Role::Assistant | bamboo_agent_core::Role::Tool
+                        )
+                    });
+                if has_prior_run {
+                    SessionStartSource::Resume
+                } else {
+                    SessionStartSource::Startup
+                }
+            });
         let mut state: LoopRunState = initialize_loop_state(
             session,
             initial_message.as_str(),
@@ -62,6 +84,7 @@ pub(crate) async fn run_agent_loop_with_config(
         {
             let payload = HookPayload::SessionSetup {
                 initial_message: initial_message.clone(),
+                source: session_start_source,
             };
             let outcome = config
                 .hook_runner
@@ -264,7 +287,10 @@ mod hook_tests {
         ) -> HookResult {
             assert!(matches!(
                 payload,
-                HookPayload::SessionSetup { initial_message } if initial_message == "hello hooks"
+                HookPayload::SessionSetup {
+                    initial_message,
+                    source: SessionStartSource::Startup,
+                } if initial_message == "hello hooks"
             ));
             HookResult::InjectContext {
                 text: "injected setup context".to_string(),
@@ -320,13 +346,16 @@ mod hook_tests {
         .await
         .expect_err("the test's BeforeRound hook stops after setup");
         assert!(matches!(error, bamboo_agent_core::AgentError::Tool(_)));
-        let injected = session.messages.iter().find(|message| {
-            message.role == Role::System && message.content.contains("injected setup context")
-        });
-        assert!(
-            injected.is_some(),
-            "hook context must be stored in the session"
+        assert!(session.messages.iter().all(|message| {
+            message.role != Role::System || !message.content.contains("injected setup context")
+        }));
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.hook_contexts.as_slice()),
+            Some(["injected setup context".to_string()].as_slice()),
+            "session hook context must ride runtime state, not the cached system prompt"
         );
-        assert!(injected.is_some_and(|message| message.never_compress));
     }
 }

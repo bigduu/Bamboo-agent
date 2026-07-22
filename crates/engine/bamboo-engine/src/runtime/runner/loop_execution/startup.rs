@@ -158,6 +158,15 @@ pub(super) async fn initialize_loop_state(
         .agent_runtime_state
         .as_ref()
         .is_some_and(|prev| prev.no_human_approver);
+    // Server-owned UserPromptSubmit runs before the engine loop and records
+    // into the session state. Carry those current-turn checkpoints into the
+    // fresh runner-owned state. This also preserves hook context/checkpoints
+    // when a suspended run resumes without a new user prompt.
+    if let Some(previous) = session.agent_runtime_state.as_ref() {
+        runtime_state.checkpoints = previous.checkpoints.clone();
+        runtime_state.hook_contexts = previous.hook_contexts.clone();
+        runtime_state.stop_hook_forced_continuations = previous.stop_hook_forced_continuations;
+    }
     runtime_state.llm.model_name = Some(model_name.clone());
     runtime_state.llm.provider_name = config.provider_name.clone();
     runtime_state.llm.fast_model_name = auxiliary_models.fast_model_name.clone();

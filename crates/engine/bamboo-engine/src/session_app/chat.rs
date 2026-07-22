@@ -30,6 +30,7 @@ const PROMPT_COMPONENT_FLAGS_KEY: &str = "prompt_component_flags";
 const PROMPT_COMPONENT_LENGTHS_KEY: &str = "prompt_component_lengths";
 
 const PROMPT_COMPOSER_VERSION: &str = "bamboo.prompt-composer.v2";
+pub const SESSION_START_SOURCE_METADATA_KEY: &str = "runtime.session_start_source";
 
 /// Prepare a chat turn: load/create session, resolve prompts, update metadata,
 /// append user message, persist.
@@ -44,7 +45,17 @@ pub async fn prepare_chat_turn(
     global_default_prompt: &str,
     builtin_fallback_prompt: &str,
 ) -> Result<Session, ChatError> {
-    let mut session = repo.load_or_create(&input.session_id, &input.model).await?;
+    let (mut session, session_start_source) = match repo.load_merged(&input.session_id).await? {
+        Some(session) => (session, "resume"),
+        None => (
+            repo.load_or_create(&input.session_id, &input.model).await?,
+            "startup",
+        ),
+    };
+    session.metadata.insert(
+        SESSION_START_SOURCE_METADATA_KEY.to_string(),
+        session_start_source.to_string(),
+    );
 
     // ---- Resolve base prompt ----
     let base_prompt = resolve_base_prompt(
@@ -565,6 +576,8 @@ mod tests {
 
     struct InMemorySessionAccess;
 
+    struct ExistingSessionAccess(Session);
+
     #[async_trait]
     impl SessionAccess for InMemorySessionAccess {
         async fn load_session(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
@@ -577,6 +590,33 @@ mod tests {
 
         async fn load_merged(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
             Ok(None)
+        }
+
+        async fn save_session(&self, _session: &mut Session) -> Result<(), SessionSaveError> {
+            Ok(())
+        }
+
+        async fn save_and_cache(&self, _session: &mut Session) -> Result<(), SessionSaveError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SessionAccess for ExistingSessionAccess {
+        async fn load_session(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
+            Ok(Some(self.0.clone()))
+        }
+
+        async fn load_or_create(
+            &self,
+            _id: &str,
+            _model: &str,
+        ) -> Result<Session, SessionLoadError> {
+            panic!("existing chat session must not be recreated")
+        }
+
+        async fn load_merged(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
+            Ok(Some(self.0.clone()))
         }
 
         async fn save_session(&self, _session: &mut Session) -> Result<(), SessionSaveError> {
@@ -629,6 +669,41 @@ mod tests {
             context_fingerprint: Some("fingerprint".to_string()),
             dynamic_context: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_classifies_new_and_existing_sessions() {
+        let startup = prepare_chat_turn(
+            &InMemorySessionAccess,
+            chat_turn_input(None),
+            "global",
+            "builtin",
+        )
+        .await
+        .expect("new turn");
+        assert_eq!(
+            startup
+                .metadata
+                .get(SESSION_START_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("startup")
+        );
+
+        let existing = prepare_chat_turn(
+            &ExistingSessionAccess(Session::new("session-enhance", "gpt-5")),
+            chat_turn_input(None),
+            "global",
+            "builtin",
+        )
+        .await
+        .expect("existing turn");
+        assert_eq!(
+            existing
+                .metadata
+                .get(SESSION_START_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("resume")
+        );
     }
 
     #[test]

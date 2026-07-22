@@ -93,6 +93,8 @@ pub enum ContextBlockType {
     /// Per-round session-goal block (placed in the volatile tail so a goal
     /// change never invalidates the cached prefix).
     GoalState,
+    /// Context injected by session lifecycle hooks for the current run.
+    AgentHookContext,
     EnvSnapshot,
     RecoverySnapshot,
 }
@@ -114,6 +116,7 @@ impl ContextBlockType {
             Self::PlanModeState => "plan_mode_state",
             Self::PlanRuntimeState => "plan_runtime_state",
             Self::GoalState => "goal_state",
+            Self::AgentHookContext => "agent_hook_context",
             Self::EnvSnapshot => "env_snapshot",
             Self::RecoverySnapshot => "recovery_snapshot",
         }

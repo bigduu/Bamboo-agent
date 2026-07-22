@@ -157,6 +157,29 @@ pub(crate) fn build_goal_context_block(goal: Option<&str>) -> Option<ContextBloc
     ))
 }
 
+/// Build context injected by `SessionStart` hooks as a volatile block. The
+/// source strings live in the current run's structured runtime state, so they
+/// never mutate or invalidate the cached base system prompt.
+pub(crate) fn build_agent_hook_context_block(session: &Session) -> Option<ContextBlock> {
+    let contexts = &session.agent_runtime_state.as_ref()?.hook_contexts;
+    let content = contexts
+        .iter()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    if content.is_empty() {
+        return None;
+    }
+    Some(ContextBlock::new(
+        ContextBlockType::AgentHookContext,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Session Hook Context",
+        content,
+    ))
+}
+
 /// Build the per-round plan-mode block directly from session state (the active
 /// `PlanModeState`), replacing the legacy inject-into-system + reparse path.
 /// Returns `None` when plan mode is inactive.
@@ -323,6 +346,23 @@ mod tests {
         assert!(block.content.contains("Session note body"));
         // No external memory field → no block.
         assert!(build_external_memory_context_block(&Session::new("s2", "model")).is_none());
+    }
+
+    #[test]
+    fn build_agent_hook_context_block_reads_runtime_state_as_volatile_context() {
+        let mut session = Session::new("session-hook-block", "model");
+        let mut state = bamboo_domain::AgentRuntimeState::new("run-hook");
+        state.hook_contexts = vec!["first hook context".to_string(), "second".to_string()];
+        session.agent_runtime_state = Some(state);
+
+        let block = build_agent_hook_context_block(&session).expect("hook block should exist");
+
+        assert_eq!(block.block_type, ContextBlockType::AgentHookContext);
+        assert_eq!(block.priority, ContextBlockPriority::High);
+        assert_eq!(block.stability, ContextBlockStability::RoundDynamic);
+        assert!(block.content.contains("first hook context"));
+        assert!(block.content.contains("second"));
+        assert!(build_agent_hook_context_block(&Session::new("empty", "model")).is_none());
     }
 
     #[test]

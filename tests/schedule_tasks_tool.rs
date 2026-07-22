@@ -170,6 +170,7 @@ fn build_manager(
             system_prompt: String::new(),
             base_system_prompt: String::new(),
             workspace_path: None,
+            lifecycle_hooks: bamboo_config::LifecycleHooksConfig::default(),
         }
     });
 

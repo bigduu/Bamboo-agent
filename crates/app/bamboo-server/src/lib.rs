@@ -111,6 +111,7 @@ pub mod connect;
 pub mod error;
 pub mod events;
 pub mod handlers;
+mod lifecycle_hooks;
 pub mod logging;
 pub mod notify_sinks;
 pub mod plugin_installer;
