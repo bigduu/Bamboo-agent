@@ -79,6 +79,45 @@ pub struct StreamHandlingOutput {
     pub input_tokens: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PartialToolCallSnapshot {
+    pub id: String,
+    pub tool_type: String,
+    pub name: String,
+    pub arguments: String,
+    pub index: Option<u32>,
+}
+
+/// Crate-private interrupted-stream payload.  Keeping this separate from the
+/// public successful [`StreamHandlingOutput`] avoids a source-breaking public
+/// field while retaining fragments that finalization intentionally drops or
+/// normalizes.
+pub(crate) struct InterruptedStreamOutput {
+    pub content: String,
+    pub reasoning_content: String,
+    pub partial_tool_calls: Vec<PartialToolCallSnapshot>,
+}
+
+impl From<&bamboo_agent_core::tools::PartialToolCall> for PartialToolCallSnapshot {
+    fn from(value: &bamboo_agent_core::tools::PartialToolCall) -> Self {
+        Self {
+            id: value.id.clone(),
+            tool_type: value.tool_type.clone(),
+            name: value.name.clone(),
+            arguments: value.arguments.clone(),
+            index: value.index,
+        }
+    }
+}
+
+/// A stream failure together with every semantic fragment accumulated before
+/// the failure.  The agent round uses this to create a durable, explicitly
+/// interrupted assistant record instead of losing already-visible output.
+pub(crate) struct StreamHandlingFailure {
+    pub error: AgentError,
+    pub partial_output: InterruptedStreamOutput,
+}
+
 pub async fn consume_llm_stream(
     stream: LLMStream,
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -112,6 +151,23 @@ pub async fn consume_llm_stream_with_context(
     .await
 }
 
+pub(crate) async fn consume_llm_stream_with_context_and_partial(
+    stream: LLMStream,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    cancel_token: &CancellationToken,
+    session_id: &str,
+    timeout_context: &StreamTimeoutContext,
+) -> Result<StreamHandlingOutput, StreamHandlingFailure> {
+    consume::consume_llm_stream_internal_with_partial(
+        stream,
+        Some(event_tx),
+        cancel_token,
+        session_id,
+        timeout_context,
+    )
+    .await
+}
+
 pub async fn consume_llm_stream_silent(
     stream: LLMStream,
     cancel_token: &CancellationToken,
@@ -134,6 +190,22 @@ pub async fn consume_llm_stream_silent_with_context(
 ) -> Result<StreamHandlingOutput, AgentError> {
     consume::consume_llm_stream_internal(stream, None, cancel_token, session_id, timeout_context)
         .await
+}
+
+pub(crate) async fn consume_llm_stream_silent_with_context_and_partial(
+    stream: LLMStream,
+    cancel_token: &CancellationToken,
+    session_id: &str,
+    timeout_context: &StreamTimeoutContext,
+) -> Result<StreamHandlingOutput, StreamHandlingFailure> {
+    consume::consume_llm_stream_internal_with_partial(
+        stream,
+        None,
+        cancel_token,
+        session_id,
+        timeout_context,
+    )
+    .await
 }
 
 #[cfg(test)]

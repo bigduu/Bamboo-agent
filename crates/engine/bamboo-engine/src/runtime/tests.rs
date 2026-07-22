@@ -1,14 +1,21 @@
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use async_trait::async_trait;
 use bamboo_agent_core::composition::CompositionExecutor;
+use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
     execute_tool_call, handle_tool_result_with_agentic_support, AgenticToolResult, FunctionCall,
-    ToolCall, ToolExecutor, ToolHandlingOutcome, ToolRegistry, ToolResult,
+    ToolCall, ToolError, ToolExecutor, ToolHandlingOutcome, ToolRegistry, ToolResult, ToolSchema,
 };
-use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_agent_core::{AgentEvent, Message, Session};
+use bamboo_domain::RuntimeSessionPersistence;
+use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use bamboo_tools::BuiltinToolExecutor;
-use tokio::sync::mpsc;
+use futures::stream;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use super::config::AgentLoopConfig;
 
@@ -245,4 +252,535 @@ async fn execute_tool_call_falls_back_when_composition_misses_tool() {
 
     assert!(result.success);
     assert!(!result.result.is_empty());
+}
+
+struct CompletedTranscriptProvider;
+
+#[async_trait]
+impl LLMProvider for CompletedTranscriptProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("durable final answer".to_string())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+struct PartialThenTerminalErrorProvider;
+
+#[async_trait]
+impl LLMProvider for PartialThenTerminalErrorProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        // An early indexed argument fragment has neither provider id nor tool
+        // name yet.  Finalizing ToolCallAccumulator would drop it; the
+        // interrupted-output snapshot must retain it verbatim without inventing
+        // an id or exposing it as an executable Message::tool_calls entry.
+        let partial_call = ToolCall {
+            id: String::new(),
+            tool_type: String::new(),
+            function: FunctionCall {
+                name: String::new(),
+                arguments: r#"{"file_path""#.to_string(),
+            },
+        };
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("visible before failure".to_string())),
+            Ok(LLMChunk::ToolCallsIndexed(vec![(0, partial_call)])),
+            Err(LLMError::Api(
+                "authentication error: intentional terminal stream failure".to_string(),
+            )),
+        ])))
+    }
+}
+
+struct NeverCalledTranscriptProvider;
+
+#[async_trait]
+impl LLMProvider for NeverCalledTranscriptProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        panic!("pre-cancelled direct execute must not call the provider")
+    }
+}
+
+struct ImmediateTerminalErrorProvider;
+
+#[async_trait]
+impl LLMProvider for ImmediateTerminalErrorProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        Err(LLMError::Api(
+            "authentication error: original execution failure".to_string(),
+        ))
+    }
+}
+
+struct MidLoopThenPartialErrorProvider {
+    calls: AtomicUsize,
+}
+
+struct RetryBeforeStreamThenSuccessProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for RetryBeforeStreamThenSuccessProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(LLMError::Api(
+                "temporary provider dispatch failure".to_string(),
+            )),
+            1 => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("retry recovered".to_string())),
+                Ok(LLMChunk::Done),
+            ]))),
+            call => panic!("unexpected LLM call {call}"),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for MidLoopThenPartialErrorProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![make_tool_call(
+                    "mid-loop-call",
+                    "Read",
+                    r#"{"file_path":"demo"}"#,
+                )])),
+                Ok(LLMChunk::Done),
+            ]))),
+            1 => {
+                let fragment = ToolCall {
+                    id: String::new(),
+                    tool_type: String::new(),
+                    function: FunctionCall {
+                        name: String::new(),
+                        arguments: "{\"next".to_string(),
+                    },
+                };
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("second-round partial".to_string())),
+                    Ok(LLMChunk::ToolCallsIndexed(vec![(0, fragment)])),
+                    Err(LLMError::Api(
+                        "authentication error: terminal second-round failure".to_string(),
+                    )),
+                ])))
+            }
+            call => panic!("unexpected LLM call {call}"),
+        }
+    }
+}
+
+struct SuccessfulReadToolExecutor;
+
+#[async_trait]
+impl ToolExecutor for SuccessfulReadToolExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        assert_eq!(call.id, "mid-loop-call");
+        Ok(ToolResult {
+            success: true,
+            result: "mid-loop tool result".to_string(),
+            display_preference: None,
+            images: Vec::new(),
+        })
+    }
+
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: "Read".to_string(),
+                description: "test read".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }]
+    }
+}
+
+struct FailingCheckpointPersistence {
+    attempts: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for FailingCheckpointPersistence {
+    async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn checkpoint_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::other("intentional checkpoint failure"))
+    }
+}
+
+async fn build_direct_execute_agent(
+    provider: Arc<dyn LLMProvider>,
+    persistence_override: Option<Arc<dyn RuntimeSessionPersistence>>,
+    tools_override: Option<Arc<dyn ToolExecutor>>,
+) -> (tempfile::TempDir, crate::runtime::Agent, Arc<dyn Storage>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let session_store = Arc::new(
+        bamboo_storage::SessionStoreV2::new(temp.path().join("sessions"))
+            .await
+            .expect("session store"),
+    );
+    let storage: Arc<dyn Storage> = session_store.clone();
+    let persistence = persistence_override.unwrap_or_else(|| {
+        Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()))
+            as Arc<dyn RuntimeSessionPersistence>
+    });
+    let metrics = bamboo_metrics::MetricsCollector::spawn(
+        Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+            temp.path().join("metrics.db"),
+        )),
+        7,
+    );
+    let agent = crate::runtime::Agent::builder()
+        .storage(storage.clone())
+        .persistence(persistence)
+        .attachment_reader(session_store)
+        .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+        .metrics_collector(metrics)
+        .config(Arc::new(RwLock::new(bamboo_llm::Config::default())))
+        .provider(provider)
+        .default_tools(tools_override.unwrap_or_else(|| Arc::new(BuiltinToolExecutor::new())))
+        .build()
+        .expect("direct execute agent");
+    (temp, agent, storage)
+}
+
+fn direct_request(
+    event_tx: mpsc::Sender<AgentEvent>,
+    cancel_token: CancellationToken,
+) -> crate::runtime::ExecuteRequest {
+    crate::runtime::ExecuteRequestBuilder::new("", event_tx, cancel_token)
+        .model("test-model")
+        .build()
+}
+
+#[tokio::test]
+async fn direct_execute_checkpoints_normal_completion_without_task_context() {
+    let (_temp, agent, storage) =
+        build_direct_execute_agent(Arc::new(CompletedTranscriptProvider), None, None).await;
+    let mut session = Session::new("direct-normal-checkpoint", "test-model");
+    session.add_message(Message::user("finish normally"));
+    storage.save_session(&session).await.unwrap();
+
+    let (event_tx, _event_rx) = mpsc::channel(32);
+    agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect("normal execute");
+
+    let saved = storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .expect("saved session");
+    assert!(saved
+        .messages
+        .iter()
+        .any(|message| message.content == "durable final answer"));
+    assert!(saved.agent_runtime_state.as_ref().is_some_and(|state| {
+        matches!(state.status, bamboo_domain::AgentStatusState::Completed)
+    }));
+}
+
+#[tokio::test]
+async fn retryable_pre_stream_error_does_not_delete_existing_interrupted_tail() {
+    let provider = Arc::new(RetryBeforeStreamThenSuccessProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let (_temp, agent, storage) = build_direct_execute_agent(provider.clone(), None, None).await;
+    let mut session = Session::new("retry-preserves-old-interrupted", "test-model");
+    session.add_message(Message::user("base"));
+    let mut old_interrupted = Message::assistant("old interrupted output", None);
+    old_interrupted.id = "old-interrupted".to_string();
+    old_interrupted.metadata = Some(serde_json::json!({
+        "runtime_kind": "interrupted_assistant_output",
+        "interrupted": true,
+        "interruption_kind": "llm_error",
+    }));
+    session.add_message(old_interrupted);
+    storage.save_session(&session).await.unwrap();
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect("retry should recover");
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let saved = storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .expect("saved session");
+    assert!(saved
+        .messages
+        .iter()
+        .any(|message| message.id == "old-interrupted"));
+    assert!(saved
+        .messages
+        .iter()
+        .any(|message| message.content == "retry recovered"));
+}
+
+#[tokio::test]
+async fn direct_execute_persists_partial_stream_error_without_false_completion_or_tool_replay() {
+    let (_temp, agent, storage) =
+        build_direct_execute_agent(Arc::new(PartialThenTerminalErrorProvider), None, None).await;
+    let mut session = Session::new("direct-partial-error", "test-model");
+    session.add_message(Message::user("start streaming"));
+    storage.save_session(&session).await.unwrap();
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let error = agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect_err("stream must fail");
+    assert!(matches!(error, bamboo_agent_core::AgentError::LLM(_)));
+
+    let saved = storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .expect("saved session");
+    let interrupted = saved
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("runtime_kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("interrupted_assistant_output")
+        })
+        .expect("interrupted partial assistant message");
+    assert_eq!(interrupted.content, "visible before failure");
+    assert!(
+        interrupted.tool_calls.is_none(),
+        "partial calls are not executable"
+    );
+    assert!(interrupted
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("partial_tool_calls"))
+        .is_some_and(|calls| calls.is_array()));
+    let fragment = interrupted
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("partial_tool_calls"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|calls| calls.first())
+        .expect("raw partial tool-call fragment");
+    assert_eq!(fragment["id"], "");
+    assert_eq!(fragment["name"], "");
+    assert_eq!(fragment["arguments"], r#"{"file_path""#);
+    assert_eq!(fragment["index"], 0);
+    assert!(!saved.agent_runtime_state.as_ref().is_some_and(|state| {
+        matches!(state.status, bamboo_domain::AgentStatusState::Completed)
+    }));
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(!matches!(event, AgentEvent::Complete { .. }));
+    }
+}
+
+#[tokio::test]
+async fn direct_execute_cancel_checkpoints_committed_messages_without_false_completion() {
+    let (_temp, agent, storage) =
+        build_direct_execute_agent(Arc::new(NeverCalledTranscriptProvider), None, None).await;
+    let mut durable = Session::new("direct-cancel-checkpoint", "test-model");
+    durable.add_message(Message::user("base"));
+    storage.save_session(&durable).await.unwrap();
+
+    let mut session = durable;
+    let tool_call = make_tool_call("committed-call", "Read", r#"{"file_path":"x"}"#);
+    session.add_message(Message::assistant("", Some(vec![tool_call])));
+    session.add_message(Message::tool_result("committed-call", "committed result"));
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let (event_tx, mut event_rx) = mpsc::channel(32);
+
+    let error = agent
+        .execute(&mut session, direct_request(event_tx, cancel))
+        .await
+        .expect_err("cancelled execute");
+    assert!(matches!(error, bamboo_agent_core::AgentError::Cancelled));
+
+    let saved = storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .expect("saved session");
+    assert!(saved
+        .messages
+        .iter()
+        .any(|message| message.content == "committed result"));
+    assert!(!saved.agent_runtime_state.as_ref().is_some_and(|state| {
+        matches!(state.status, bamboo_domain::AgentStatusState::Completed)
+    }));
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(!matches!(event, AgentEvent::Complete { .. }));
+    }
+}
+
+#[tokio::test]
+async fn direct_execute_mid_loop_error_persists_tool_round_and_interrupted_next_round() {
+    let provider = Arc::new(MidLoopThenPartialErrorProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let (_temp, agent, storage) = build_direct_execute_agent(
+        provider.clone(),
+        None,
+        Some(Arc::new(SuccessfulReadToolExecutor)),
+    )
+    .await;
+    let mut session = Session::new("direct-mid-loop-error", "test-model");
+    session.add_message(Message::user("run a tool then fail"));
+    storage.save_session(&session).await.unwrap();
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+
+    let error = agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect_err("second round must fail");
+    assert!(matches!(
+        error,
+        bamboo_agent_core::AgentError::LLM(message)
+            if message.contains("terminal second-round failure")
+    ));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    let saved = storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .expect("saved session");
+    let assistant_tool_call = saved
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "mid-loop-call"))
+        })
+        .expect("first-round assistant tool call");
+    assert!(assistant_tool_call.content.is_empty());
+    assert!(saved.messages.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("mid-loop-call")
+            && message.content == "mid-loop tool result"
+    }));
+    let interrupted = saved
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("runtime_kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("interrupted_assistant_output")
+        })
+        .expect("second-round interrupted output");
+    assert_eq!(interrupted.content, "second-round partial");
+    assert!(interrupted.tool_calls.is_none());
+    let fragment = interrupted
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("partial_tool_calls"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|calls| calls.first())
+        .expect("second-round raw tool fragment");
+    assert_eq!(fragment["id"], "");
+    assert_eq!(fragment["name"], "");
+    assert_eq!(fragment["arguments"], "{\"next");
+    assert_eq!(fragment["index"], 0);
+    assert!(!saved.agent_runtime_state.as_ref().is_some_and(|state| {
+        matches!(state.status, bamboo_domain::AgentStatusState::Completed)
+    }));
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(!matches!(event, AgentEvent::Complete { .. }));
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_failure_does_not_mask_original_execution_error() {
+    let persistence = Arc::new(FailingCheckpointPersistence {
+        attempts: AtomicUsize::new(0),
+    });
+    let (_temp, agent, _storage) = build_direct_execute_agent(
+        Arc::new(ImmediateTerminalErrorProvider),
+        Some(persistence.clone()),
+        None,
+    )
+    .await;
+    let mut session = Session::new("direct-checkpoint-failure", "test-model");
+    session.add_message(Message::user("fail"));
+    let (event_tx, _event_rx) = mpsc::channel(32);
+
+    let error = agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect_err("provider error");
+
+    assert!(matches!(
+        error,
+        bamboo_agent_core::AgentError::LLM(message)
+            if message.contains("original execution failure")
+    ));
+    assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
 }

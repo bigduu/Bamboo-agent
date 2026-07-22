@@ -21,6 +21,7 @@ mod token_budget;
 mod token_estimation;
 
 pub(crate) use context_preparation::force_overflow_context_recovery;
+pub(crate) use stream_execution::discard_latest_interrupted_assistant_output;
 
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,

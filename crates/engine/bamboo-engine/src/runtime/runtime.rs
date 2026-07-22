@@ -773,6 +773,33 @@ impl AgentRuntime {
         )
         .await;
 
+        // The runtime is the one shared execute boundary for HTTP, child-agent
+        // and direct SDK callers.  Checkpoint here on every outcome so durable
+        // transcript correctness never depends on a caller-specific finalize
+        // wrapper (and normal completions without a TaskLoopContext are saved
+        // too).  The checkpoint is append-safe: a stale live snapshot cannot
+        // shrink/rewrite messages appended concurrently on disk.
+        //
+        // Persistence failure must not replace the execution outcome.  In
+        // particular, callers need the original LLM/cancellation error for
+        // retry and terminal-status mapping; the failed durability attempt is
+        // recorded separately.
+        if let Err(checkpoint_error) = self.persistence.checkpoint_runtime_session(session).await {
+            match &result {
+                Ok(()) => tracing::warn!(
+                    session_id = %session.id,
+                    error = %checkpoint_error,
+                    "failed to checkpoint session transcript after successful execution"
+                ),
+                Err(execution_error) => tracing::warn!(
+                    session_id = %session.id,
+                    error = %checkpoint_error,
+                    execution_error = %execution_error,
+                    "failed to checkpoint session transcript after execution error"
+                ),
+            }
+        }
+
         result
     }
 }

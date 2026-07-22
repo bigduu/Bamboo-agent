@@ -1,6 +1,6 @@
 use bamboo_agent_core::tools::ToolCallAccumulator;
 
-use super::StreamHandlingOutput;
+use super::{InterruptedStreamOutput, PartialToolCallSnapshot, StreamHandlingOutput};
 
 pub(super) struct StreamAccumulationState {
     response_id: Option<String>,
@@ -108,6 +108,19 @@ impl StreamAccumulationState {
             cache_creation_input_tokens: self.cache_creation_input_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
             input_tokens: self.input_tokens,
+        }
+    }
+
+    pub(super) fn into_interrupted_output(self) -> InterruptedStreamOutput {
+        InterruptedStreamOutput {
+            content: self.content,
+            reasoning_content: self.reasoning_content,
+            partial_tool_calls: self
+                .tool_calls
+                .parts()
+                .iter()
+                .map(PartialToolCallSnapshot::from)
+                .collect(),
         }
     }
 }

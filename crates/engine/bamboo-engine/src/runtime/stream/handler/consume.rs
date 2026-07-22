@@ -10,7 +10,7 @@ use bamboo_llm::{LLMChunk, LLMStream};
 
 use super::chunk_handling::handle_chunk_result;
 use super::stream_state::StreamAccumulationState;
-use super::{StreamHandlingOutput, StreamTimeoutContext};
+use super::{StreamHandlingFailure, StreamHandlingOutput, StreamTimeoutContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTimeoutPhase {
@@ -112,12 +112,30 @@ fn preview_for_log(value: &str, max_chars: usize) -> String {
 }
 
 pub(super) async fn consume_llm_stream_internal(
-    mut stream: LLMStream,
+    stream: LLMStream,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     session_id: &str,
     timeout_context: &StreamTimeoutContext,
 ) -> Result<StreamHandlingOutput, AgentError> {
+    consume_llm_stream_internal_with_partial(
+        stream,
+        event_tx,
+        cancel_token,
+        session_id,
+        timeout_context,
+    )
+    .await
+    .map_err(|failure| failure.error)
+}
+
+pub(super) async fn consume_llm_stream_internal_with_partial(
+    mut stream: LLMStream,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    cancel_token: &CancellationToken,
+    session_id: &str,
+    timeout_context: &StreamTimeoutContext,
+) -> Result<StreamHandlingOutput, StreamHandlingFailure> {
     let mut state = StreamAccumulationState::new();
     let policy = timeout_context.policy;
     let started_at = tokio::time::Instant::now();
@@ -146,7 +164,12 @@ pub(super) async fn consume_llm_stream_internal(
         // the earliest independent watchdog deadline.
         let chunk_result = tokio::select! {
             biased;
-            _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+            _ = cancel_token.cancelled() => {
+                return Err(StreamHandlingFailure {
+                    error: AgentError::Cancelled,
+                    partial_output: state.into_interrupted_output(),
+                });
+            },
             next = stream.next() => match next {
                 Some(chunk_result) => chunk_result,
                 None => break,
@@ -158,15 +181,18 @@ pub(super) async fn consume_llm_stream_internal(
                 } else {
                     (semantic_phase, semantic_timeout)
                 };
-                return Err(timeout_error(
-                    timeout_context,
-                    session_id,
-                    phase,
-                    deadline,
-                    now,
-                    last_transport_at,
-                    last_semantic_at,
-                ));
+                return Err(StreamHandlingFailure {
+                    error: timeout_error(
+                        timeout_context,
+                        session_id,
+                        phase,
+                        deadline,
+                        now,
+                        last_transport_at,
+                        last_semantic_at,
+                    ),
+                    partial_output: state.into_interrupted_output(),
+                });
             }
         };
 
@@ -180,19 +206,29 @@ pub(super) async fn consume_llm_stream_internal(
                 // semantic timer merely because `stream.next()` is intentionally
                 // ordered before the timer in the biased select. A semantic
                 // chunk ready at the boundary is accepted above and resets it.
-                return Err(timeout_error(
-                    timeout_context,
-                    session_id,
-                    semantic_phase,
-                    semantic_timeout,
-                    now,
-                    last_transport_at,
-                    last_semantic_at,
-                ));
+                return Err(StreamHandlingFailure {
+                    error: timeout_error(
+                        timeout_context,
+                        session_id,
+                        semantic_phase,
+                        semantic_timeout,
+                        now,
+                        last_transport_at,
+                        last_semantic_at,
+                    ),
+                    partial_output: state.into_interrupted_output(),
+                });
             }
         }
 
-        handle_chunk_result(chunk_result, &mut state, event_tx, session_id).await?;
+        if let Err(error) =
+            handle_chunk_result(chunk_result, &mut state, event_tx, session_id).await
+        {
+            return Err(StreamHandlingFailure {
+                error,
+                partial_output: state.into_interrupted_output(),
+            });
+        }
     }
 
     let output = state.into_output();
