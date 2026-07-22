@@ -115,6 +115,15 @@ pub enum HookResult {
     Ask,
     /// Add durable context for the remaining run.
     InjectContext { text: String },
+    /// Apply a control result and inject context from the same hook response.
+    ///
+    /// Config-driven shell hooks use this when stdout includes both a
+    /// `decision` and `additional_context`. The runner unwraps the control
+    /// result before returning its aggregate outcome.
+    WithContext {
+        result: Box<HookResult>,
+        text: String,
+    },
     /// Pause execution; set suspension state.
     Suspend { reason: String },
     /// Abort the agent run.
@@ -168,6 +177,10 @@ mod tests {
             HookResult::Ask,
             HookResult::InjectContext {
                 text: "extra context".to_string(),
+            },
+            HookResult::WithContext {
+                result: Box::new(HookResult::Allow),
+                text: "allowed context".to_string(),
             },
             HookResult::Suspend {
                 reason: "waiting".to_string(),

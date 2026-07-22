@@ -665,6 +665,10 @@ impl AgentRuntime {
             provider_type,
             ..
         } = model_roster;
+        let hook_runner = Arc::new(
+            self.hook_runner
+                .with_lifecycle_config(&config.lifecycle_hooks, app_data_dir.clone()),
+        );
 
         let loop_config = AgentLoopConfig {
             max_rounds: 200,
@@ -731,7 +735,7 @@ impl AgentRuntime {
             guardian_spawner,
             bash_resume_hook,
             bash_completion_sink,
-            hook_runner: self.hook_runner.clone(),
+            hook_runner,
             // Capture the tool executor's server-level guidance (connected MCP
             // servers' `instructions`) once, so it lands in the system prompt only
             // while those servers are loaded for this run.

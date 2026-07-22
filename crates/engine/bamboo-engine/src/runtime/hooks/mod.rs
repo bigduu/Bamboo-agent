@@ -1,5 +1,7 @@
 //! Hook runner — dispatches registered hooks at lifecycle points.
 
+mod shell_command;
+
 use std::sync::Arc;
 
 use bamboo_agent_core::{AgentError, AgentEvent, AgentHook, Message, Session};
@@ -9,6 +11,8 @@ use bamboo_domain::{
 };
 use chrono::Utc;
 use tokio::sync::mpsc;
+
+pub use shell_command::{ShellCommandHook, ShellHookEvent};
 
 /// Aggregate output from every hook registered at one seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +47,18 @@ impl HookRunner {
         self.hooks.sort_by_key(|h| h.priority());
     }
 
+    /// Clone this registry and append shell hooks from one frozen config
+    /// snapshot. The original registry remains reusable by future runs.
+    pub fn with_lifecycle_config(
+        &self,
+        config: &bamboo_config::LifecycleHooksConfig,
+        fallback_cwd: Option<std::path::PathBuf>,
+    ) -> Self {
+        let mut runner = self.clone();
+        shell_command::register_configured_shell_hooks(&mut runner, config, fallback_cwd);
+        runner
+    }
+
     /// Run all hooks matching the given point.
     ///
     /// Records checkpoints in `runtime_state`. Returns the first
@@ -58,7 +74,7 @@ impl HookRunner {
         let mut outcome = HookRunOutcome::default();
 
         for hook in &self.hooks {
-            if hook.point() != point {
+            if hook.point() != point || !hook.matches(payload) {
                 continue;
             }
 
@@ -85,6 +101,9 @@ impl HookRunner {
                     .await;
             }
 
+            let (result, mut contexts) = unwrap_context_result(result);
+            outcome.injected_contexts.append(&mut contexts);
+
             match &result {
                 HookResult::Abort { .. }
                 | HookResult::Suspend { .. }
@@ -95,15 +114,15 @@ impl HookRunner {
                 }
                 HookResult::InjectContext { text } => {
                     outcome.injected_contexts.push(text.clone());
-                    outcome.decision = result;
                 }
-                HookResult::Mutated => outcome.decision = HookResult::Mutated,
-                HookResult::Allow => {
+                HookResult::Mutated => {
                     if matches!(outcome.decision, HookResult::Continue) {
-                        outcome.decision = HookResult::Allow;
+                        outcome.decision = HookResult::Mutated;
                     }
                 }
+                HookResult::Allow => outcome.decision = HookResult::Allow,
                 HookResult::Continue => {}
+                HookResult::WithContext { .. } => unreachable!("context results are unwrapped"),
             }
         }
 
@@ -124,6 +143,21 @@ impl HookRunner {
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
     }
+}
+
+fn unwrap_context_result(mut result: HookResult) -> (HookResult, Vec<String>) {
+    let mut contexts = Vec::new();
+    while let HookResult::WithContext {
+        result: inner,
+        text,
+    } = result
+    {
+        if !text.trim().is_empty() {
+            contexts.push(text);
+        }
+        result = *inner;
+    }
+    (result, contexts)
 }
 
 /// Apply context injections and non-tool control decisions consistently across
@@ -165,6 +199,15 @@ pub(crate) fn apply_hook_outcome(
         HookResult::Ask => Err(AgentError::Tool(format!(
             "hook requested parent approval at non-tool seam {point:?}"
         ))),
+        HookResult::WithContext { result, text } => apply_hook_outcome(
+            point,
+            HookRunOutcome {
+                decision: *result,
+                injected_contexts: vec![text],
+            },
+            session,
+            runtime_state,
+        ),
     }
 }
 

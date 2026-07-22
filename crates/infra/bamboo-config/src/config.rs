@@ -1394,6 +1394,14 @@ pub struct ConfigValues {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// User-configured agent lifecycle command hooks.
+    ///
+    /// This is intentionally separate from `hooks`, which is already the
+    /// provider HTTP request-hook namespace. Lifecycle hooks are snapshotted
+    /// when an agent run starts.
+    #[serde(default, skip_serializing_if = "LifecycleHooksConfig::is_empty")]
+    pub lifecycle_hooks: LifecycleHooksConfig,
+
     /// Global tool toggles.
     ///
     /// Any tool listed in `disabled` is omitted from the tool schemas sent to the LLM.
@@ -1501,6 +1509,7 @@ impl Default for ConfigValues {
             anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_model_mapping: GeminiModelMapping::default(),
             hooks: HooksConfig::default(),
+            lifecycle_hooks: LifecycleHooksConfig::default(),
             tools: ToolsConfig::default(),
             skills: SkillsConfig::default(),
             env_vars: Vec::new(),
@@ -1570,6 +1579,8 @@ struct ModelBehaviorConfigSection {
     gemini_model_mapping: GeminiModelMapping,
     #[serde(default)]
     hooks: HooksConfig,
+    #[serde(default, skip_serializing_if = "LifecycleHooksConfig::is_empty")]
+    lifecycle_hooks: LifecycleHooksConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1703,6 +1714,7 @@ impl From<ConfigValues> for ConfigRoot {
             anthropic_model_mapping,
             gemini_model_mapping,
             hooks,
+            lifecycle_hooks,
             tools,
             skills,
             env_vars,
@@ -1740,6 +1752,7 @@ impl From<ConfigValues> for ConfigRoot {
                 anthropic_model_mapping,
                 gemini_model_mapping,
                 hooks,
+                lifecycle_hooks,
             },
             tooling: ToolingConfigSection { tools, skills, mcp },
             workspace: WorkspaceConfigSection {
@@ -1798,6 +1811,7 @@ impl From<ConfigRoot> for ConfigValues {
             anthropic_model_mapping,
             gemini_model_mapping,
             hooks,
+            lifecycle_hooks,
         } = model_behavior;
         let ToolingConfigSection { tools, skills, mcp } = tooling;
         let WorkspaceConfigSection {
@@ -1833,6 +1847,7 @@ impl From<ConfigRoot> for ConfigValues {
             anthropic_model_mapping,
             gemini_model_mapping,
             hooks,
+            lifecycle_hooks,
             tools,
             skills,
             env_vars,
@@ -2056,6 +2071,99 @@ pub struct HooksConfig {
     /// Image fallback behavior for OpenAI-compatible requests (chat/responses).
     #[serde(default)]
     pub image_fallback: ImageFallbackHookConfig,
+}
+
+/// Default deadline for one lifecycle command hook.
+pub const DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 60_000;
+
+fn default_lifecycle_hook_timeout_ms() -> u64 {
+    DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
+}
+
+fn lifecycle_hook_timeout_is_default(value: &u64) -> bool {
+    *value == DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
+}
+
+/// Config-driven agent lifecycle hooks.
+///
+/// Event names deliberately preserve the user-facing PascalCase protocol.
+/// Server-owned events are represented here even though their invocation
+/// seams are added by follow-up issues; this keeps one stable config schema.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleHooksConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(
+        default,
+        rename = "SessionStart",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub session_start: Vec<LifecycleHookGroup>,
+    #[serde(
+        default,
+        rename = "UserPromptSubmit",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub user_prompt_submit: Vec<LifecycleHookGroup>,
+    #[serde(default, rename = "PreToolUse", skip_serializing_if = "Vec::is_empty")]
+    pub pre_tool_use: Vec<LifecycleHookGroup>,
+    #[serde(default, rename = "PostToolUse", skip_serializing_if = "Vec::is_empty")]
+    pub post_tool_use: Vec<LifecycleHookGroup>,
+    #[serde(default, rename = "Stop", skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<LifecycleHookGroup>,
+    #[serde(default, rename = "SessionEnd", skip_serializing_if = "Vec::is_empty")]
+    pub session_end: Vec<LifecycleHookGroup>,
+    #[serde(default, rename = "PreCompact", skip_serializing_if = "Vec::is_empty")]
+    pub pre_compact: Vec<LifecycleHookGroup>,
+    #[serde(
+        default,
+        rename = "Notification",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub notification: Vec<LifecycleHookGroup>,
+}
+
+impl LifecycleHooksConfig {
+    pub fn is_empty(&self) -> bool {
+        !self.enabled
+            && self.session_start.is_empty()
+            && self.user_prompt_submit.is_empty()
+            && self.pre_tool_use.is_empty()
+            && self.post_tool_use.is_empty()
+            && self.stop.is_empty()
+            && self.session_end.is_empty()
+            && self.pre_compact.is_empty()
+            && self.notification.is_empty()
+    }
+}
+
+/// A matcher and its ordered command-hook list for one lifecycle event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleHookGroup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    #[serde(default)]
+    pub hooks: Vec<LifecycleHookCommand>,
+}
+
+/// Supported lifecycle hook implementation kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LifecycleHookType {
+    Command,
+}
+
+/// One configured lifecycle shell command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleHookCommand {
+    #[serde(rename = "type")]
+    pub hook_type: LifecycleHookType,
+    pub command: String,
+    #[serde(
+        default = "default_lifecycle_hook_timeout_ms",
+        skip_serializing_if = "lifecycle_hook_timeout_is_default"
+    )]
+    pub timeout_ms: u64,
 }
 
 /// Request override configuration for provider-specific HTTP behavior.
@@ -3852,6 +3960,7 @@ impl Config {
                 anthropic_model_mapping: AnthropicModelMapping::default(),
                 gemini_model_mapping: GeminiModelMapping::default(),
                 hooks: HooksConfig::default(),
+                lifecycle_hooks: LifecycleHooksConfig::default(),
                 tools: ToolsConfig::default(),
                 skills: SkillsConfig::default(),
                 env_vars: Vec::new(),
@@ -4684,6 +4793,60 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn lifecycle_hooks_round_trip_as_a_distinct_top_level_section() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "hooks": {
+                "image_fallback": {"enabled": true, "mode": "placeholder"}
+            },
+            "lifecycle_hooks": {
+                "enabled": true,
+                "PreToolUse": [{
+                    "matcher": "bash|write_file",
+                    "hooks": [{"type": "command", "command": "guard.sh"}]
+                }],
+                "SessionStart": [{
+                    "hooks": [{"type": "command", "command": "setup.sh", "timeout_ms": 25}]
+                }]
+            }
+        }))
+        .expect("lifecycle hook config should deserialize");
+
+        assert!(config.lifecycle_hooks.enabled);
+        assert_eq!(config.lifecycle_hooks.pre_tool_use.len(), 1);
+        assert_eq!(
+            config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms,
+            DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.lifecycle_hooks.session_start[0].hooks[0].timeout_ms,
+            25
+        );
+
+        let json = serde_json::to_value(&config).expect("lifecycle hook config should serialize");
+        assert_eq!(json["lifecycle_hooks"]["enabled"], true);
+        assert_eq!(
+            json["lifecycle_hooks"]["PreToolUse"][0]["matcher"],
+            "bash|write_file"
+        );
+        assert_eq!(
+            json["lifecycle_hooks"]["PreToolUse"][0]["hooks"][0]["type"],
+            "command"
+        );
+        assert!(json["lifecycle_hooks"]["PreToolUse"][0]["hooks"][0]
+            .get("timeout_ms")
+            .is_none());
+        assert!(json.get("hooks").is_some());
+    }
+
+    #[test]
+    fn absent_lifecycle_hooks_remain_disabled_and_omitted() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(config.lifecycle_hooks, LifecycleHooksConfig::default());
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("lifecycle_hooks").is_none());
+    }
 
     #[test]
     fn stream_timeout_defaults_are_safe_and_back_compatible() {

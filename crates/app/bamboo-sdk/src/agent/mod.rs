@@ -74,7 +74,7 @@ pub use bamboo_domain::{
     AgentHookPoint, HookPayload, HookResult, HookToolOutcome, TaskItem, TaskItemStatus, TaskList,
 };
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
-pub use bamboo_engine::{ExecuteRequest, HookRunner};
+pub use bamboo_engine::{ExecuteRequest, HookRunner, ShellCommandHook, ShellHookEvent};
 pub use bamboo_llm::LLMProvider;
 pub use bamboo_mcp::manager::McpServerManager;
 pub use bamboo_mcp::McpServerConfig;
