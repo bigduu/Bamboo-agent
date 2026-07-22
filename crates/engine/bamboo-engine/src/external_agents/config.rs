@@ -35,7 +35,7 @@ pub struct ExternalAgentProfile {
     /// Actor protocol only: which engine the worker runs.
     /// `"bamboo_runtime"` (default) for the real agent loop, `"echo"` for a
     /// dependency-free smoke run through the whole chain, `"claude_code"` to
-    /// drive the official Claude Code CLI, or `"codex"` for `codex exec`.
+    /// drive the official Claude Code CLI, or `"codex"` for the selected Codex mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
     /// `executor = "claude_code"` only: override the `claude` executable.
@@ -71,6 +71,9 @@ pub struct ExternalAgentProfile {
     /// `executor = "codex"` only: `--model` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_model: Option<String>,
+    /// `exec` (default) or long-lived `app_server` JSON-RPC mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_mode: Option<bamboo_config::CodexMode>,
     /// `inherit | api_key | custom | bamboo` (unset defaults to bamboo).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_auth_mode: Option<bamboo_config::CodexAuthMode>,
@@ -254,8 +257,9 @@ mod tests {
                     "protocol": "actor",
                     "permission_profile": "research",
                     "executor": "codex",
+                    "codex_mode": "app_server",
                     "codex_sandbox": "read-only",
-                    "codex_approval_policy": "never",
+                    "codex_approval_policy": "on-request",
                     "codex_network_access": false,
                     "codex_allow_danger_bypass": false
                 }
@@ -266,12 +270,16 @@ mod tests {
             .remove("codex_research")
             .expect("typed Codex profile");
         assert_eq!(
+            profile.codex_mode,
+            Some(bamboo_config::CodexMode::AppServer)
+        );
+        assert_eq!(
             profile.codex_sandbox,
             Some(bamboo_config::CodexSandbox::ReadOnly)
         );
         assert_eq!(
             profile.codex_approval_policy,
-            Some(bamboo_config::CodexApprovalPolicy::Never)
+            Some(bamboo_config::CodexApprovalPolicy::OnRequest)
         );
         assert_eq!(profile.codex_network_access, Some(false));
         assert_eq!(profile.codex_allow_danger_bypass, Some(false));

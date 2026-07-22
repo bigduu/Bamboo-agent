@@ -1,9 +1,10 @@
 # Codex executor
 
-`subagents.executor = "codex"` runs one official Codex CLI process per child
-activation through `codex exec --json`. Bamboo passes the assignment through
-stdin, consumes bounded JSONL events, and captures the final answer separately
-with `--output-last-message`.
+`subagents.executor = "codex"` supports two transports. `codex_mode = "exec"`
+(the backward-compatible default) runs one `codex exec --json` process per
+activation. `codex_mode = "app_server"` keeps `codex app-server` alive and
+relays interactive command/file approvals through the parent Bamboo approval
+chain.
 
 The minimum supported version is **Codex CLI 0.144.0**. Bamboo verifies the
 installed version and the required `exec --json`, stdin prompt,
@@ -16,20 +17,36 @@ custom-provider Chat Completions wire, so `codex_wire_api` only accepts
 The Lotus Sub-agents settings card exposes the same fields and validates the
 pending patch through `POST /bamboo/config/validate` before saving. Its Detect
 button calls `POST /bamboo/config/codex/detect` with an optional
-`{"binary":"..."}` override. The response is the resolved `path` and
+`{"binary":"...","mode":"app_server"}` override. The response is the resolved `path` and
 `version`; the endpoint and worker share one discovery implementation, so a
 successful detection cannot bypass the worker's version/capability preflight.
 
-## Spawn contract
+## Transport contract
 
 | Concern | Codex executor behavior |
 |---|---|
-| Process lifetime | One `codex exec` process group per activation; a warm Bamboo worker may run many activations but never reuses a Codex process. |
+| Process lifetime | Exec mode: one process group per activation. App-server mode: one long-lived process per warm worker, with logical threads isolated by Bamboo session id. |
 | Prompt transport | The assignment is written to stdin (`-`), never placed in argv. |
 | Output | `--json --color never` JSONL plus a bounded `--output-last-message` fallback file. |
 | Model | `codex_model`, when set, becomes an explicit `--model`; otherwise the flag is omitted. |
 | Repository guard | A real Git workspace needs no override. `--skip-git-repo-check` is allowed only for a Bamboo-owned non-Git workspace. |
 | Cancellation | Bamboo snapshots the full descendant tree, sends SIGTERM deepest-first plus to the Codex process group, then escalates every survivor to SIGKILL after a bounded grace period. This also covers tool commands that create a new process group. |
+
+In `app_server` mode, Bamboo speaks newline-delimited JSON-RPC over stdio:
+`initialize`/`initialized`, `thread/start` or `thread/resume`, then
+`turn/start`. A warm worker retains the process, while a session-keyed state
+map prevents one logical child from inheriting another child's thread. Resume
+failure starts one new thread with the same bounded history rehydration used by
+exec mode. `turn/steer` handles live parent messages and cancellation first
+requests `turn/interrupt`, then uses the standard process-group TERM/KILL
+ladder if the server does not finish within the grace period.
+
+`item/commandExecution/requestApproval` and
+`item/fileChange/requestApproval` are converted to Bamboo `Bash` and
+`ApplyPatch` approval calls. Missing bridges, relay errors, and the 300-second
+deadline all answer `decline`; approval answers `accept`. Legacy
+`execCommandApproval`/`applyPatchApproval` requests remain compatible. There
+is no silent fallback to exec mode when app-server capability detection fails.
 
 ## Event mapping
 
@@ -57,7 +74,7 @@ personal Codex login is deliberately opt-in.
 | `inherit` | Leaves `CODEX_HOME` unset, so Codex uses the invoking user's `~/.codex/config.toml` and `auth.json`. | The user's configured provider; a ChatGPT login uses that user's subscription. | Inherits the user's full Codex configuration, so use only when that ambient authority is intended. |
 | `api_key` | Uses `<child-state>/codex-home`; `OPENAI_API_KEY` must be named explicitly in `codex_forward_env`. | OpenAI API billing for that key. | Bamboo never forwards `OPENAI_API_KEY` implicitly. The key is process-environment only. |
 | `custom` | Uses the isolated home and a generated `model_providers.custom` entry. The key is selected by `codex_provider_key_ref`. | The configured third-party/proxy provider and its billing policy. | `config.toml` contains only `env_key = "BAMBOO_CODEX_PROVIDER_KEY"`; the referenced key is injected into that environment variable and never written to disk. |
-| `bamboo` | Uses the isolated home and a generated `model_providers.bamboo` entry pointing at the parent loopback `/openai/v1` surface. | The parent Bamboo provider/routing configuration; recommended default. | The parent mints a fresh `bcx1_` token for each activation, binds it to the child session and Responses/models paths, and revokes it on every exit path. No upstream provider key reaches Codex. |
+| `bamboo` | Uses the isolated home and a generated `model_providers.bamboo` entry pointing at the parent loopback `/openai/v1` surface. | The parent Bamboo provider/routing configuration; recommended default. | The parent mints a fresh `bcx1_` token for each activation, binds it to the child session and Responses/models paths, and revokes it on every exit path. In app-server mode Codex command-auth reads that token from a Bamboo-owned `0600` file on demand; the file is cleared at turn end, so the long-lived process never freezes a revoked token in its environment. No upstream provider key reaches Codex. |
 
 Because `bamboo` deliberately targets the parent through `127.0.0.1`, it
 requires local actor placement. A remote worker must use `custom` with an
@@ -74,6 +91,19 @@ Recommended parent-routed mode (also the default when the mode is absent):
     "executor": "codex",
     "codex_auth_mode": "bamboo",
     "codex_model": "gpt-5.4"
+  }
+}
+```
+
+Interactive parent approval relay:
+
+```json
+{
+  "subagents": {
+    "executor": "codex",
+    "codex_mode": "app_server",
+    "codex_approval_policy": "on-request",
+    "codex_auth_mode": "bamboo"
   }
 }
 ```
@@ -133,10 +163,12 @@ permission knobs before spawn and never relies on the CLI's implicit defaults:
 | workspace network enabled | the workspace-write flags plus `--config sandbox_workspace_write.network_access=true` |
 
 `codex_sandbox` can explicitly select `read-only`, `workspace-write`, or
-`danger-full-access`; `codex_approval_policy` accepts only the non-interactive
-`never` and `on-failure` values. `codex_network_access` applies only to
-workspace-write. The same fields are available globally under `subagents` and
-per named `ExternalAgentProfile`.
+`danger-full-access`. In exec mode, `codex_approval_policy` accepts only
+`never` and `on-failure`; `on-request` is rejected with an instruction to use
+app-server. In app-server mode, unset or `on-request` is accepted and every
+other policy is rejected, so config cannot silently remove the relay.
+`codex_network_access` applies only to workspace-write. The same fields are
+available globally under `subagents` and per named `ExternalAgentProfile`.
 
 Disabling the OS sandbox is double-gated. A `danger-full-access` request becomes
 `--dangerously-bypass-approvals-and-sandbox` only when the child session's

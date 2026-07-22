@@ -121,6 +121,8 @@ pub async fn validate_bamboo_config_patch(
                 "subagents.codex_allow_danger_bypass"
             } else if message.contains("approval") {
                 "subagents.codex_approval_policy"
+            } else if message.contains("codex_mode") || message.contains("app_server") {
+                "subagents.codex_mode"
             } else if message.contains("sandbox") || message.contains("danger-full-access") {
                 "subagents.codex_sandbox"
             } else {
@@ -148,6 +150,18 @@ fn validate_codex_subagents_shape(value: &Value) -> Vec<ValidationIssue> {
         return issues;
     };
 
+    if let Some(mode) = object.get("codex_mode") {
+        let valid = mode.is_null()
+            || mode
+                .as_str()
+                .is_some_and(|mode| matches!(mode, "exec" | "app_server"));
+        if !valid {
+            issues.push(issue(
+                "subagents.codex_mode",
+                "codex_mode must be exec or app_server",
+            ));
+        }
+    }
     if let Some(mode) = object.get("codex_auth_mode") {
         let valid = mode.is_null()
             || mode
@@ -187,11 +201,11 @@ fn validate_codex_subagents_shape(value: &Value) -> Vec<ValidationIssue> {
         let valid = policy.is_null()
             || policy
                 .as_str()
-                .is_some_and(|policy| matches!(policy, "never" | "on-failure"));
+                .is_some_and(|policy| matches!(policy, "never" | "on-failure" | "on-request"));
         if !valid {
             issues.push(issue(
                 "subagents.codex_approval_policy",
-                "codex_approval_policy must be never or on-failure in non-interactive exec mode",
+                "codex_approval_policy must be never, on-failure, or on-request",
             ));
         }
     }
@@ -484,13 +498,14 @@ mod tests {
     #[test]
     fn codex_shape_validation_reports_precise_fields() {
         let issues = validate_codex_subagents_shape(&serde_json::json!({
+            "codex_mode": "future",
             "codex_auth_mode": "future",
             "codex_wire_api": "chat",
             "codex_base_url": 42,
             "codex_provider_key_ref": "not a credential ref",
             "codex_forward_env": ["OPENAI_API_KEY", 1],
             "codex_sandbox": "host-write",
-            "codex_approval_policy": "on-request",
+            "codex_approval_policy": "auto",
             "codex_network_access": "yes",
             "codex_allow_danger_bypass": 1
         }));
@@ -500,6 +515,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         for expected in [
+            "subagents.codex_mode",
             "subagents.codex_auth_mode",
             "subagents.codex_wire_api",
             "subagents.codex_base_url",
@@ -520,6 +536,7 @@ mod tests {
     #[test]
     fn codex_shape_validation_accepts_the_documented_surface() {
         assert!(validate_codex_subagents_shape(&serde_json::json!({
+            "codex_mode": "exec",
             "codex_auth_mode": "custom",
             "codex_wire_api": "responses",
             "codex_base_url": "https://provider.example/v1",
@@ -529,6 +546,12 @@ mod tests {
             "codex_approval_policy": "never",
             "codex_network_access": true,
             "codex_allow_danger_bypass": false
+        }))
+        .is_empty());
+
+        assert!(validate_codex_subagents_shape(&serde_json::json!({
+            "codex_mode": "app_server",
+            "codex_approval_policy": "on-request"
         }))
         .is_empty());
     }

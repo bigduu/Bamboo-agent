@@ -58,6 +58,9 @@ pub mod claude_code_executor;
 /// `ChildExecutor` (`ExecutorSpec::Codex`).
 pub mod codex_cli_executor;
 
+/// Long-lived `codex app-server` executor with interactive approval relay.
+pub mod codex_app_server_executor;
+
 /// The `bamboo broker-agent serve` worker: connect to a central broker and
 /// answer Ask/Task (query/steer) for its mailbox; deployable local/Docker/remote.
 pub mod broker_agent;

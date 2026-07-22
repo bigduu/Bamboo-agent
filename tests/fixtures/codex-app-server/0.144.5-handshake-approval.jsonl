@@ -1,0 +1,11 @@
+{"direction":"client","message":{"id":1,"method":"initialize","params":{"clientInfo":{"name":"bamboo","title":"Bamboo","version":"0.0.0"},"capabilities":{"experimentalApi":true}}}}
+{"direction":"server","message":{"id":1,"result":{"userAgent":"codex_cli_rs/0.144.5"}}}
+{"direction":"client","message":{"method":"initialized","params":{}}}
+{"direction":"client","message":{"id":2,"method":"thread/start","params":{"approvalPolicy":"on-request","approvalsReviewer":"user","cwd":"/tmp/workspace","sandbox":"workspace-write"}}}
+{"direction":"server","message":{"id":2,"result":{"thread":{"id":"019f8977-a6ab-7d73-a3f5-510904f03bb3"},"model":"gpt-5.4","modelProvider":"bamboo","cwd":"/tmp/workspace","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}}}
+{"direction":"client","message":{"id":3,"method":"turn/start","params":{"threadId":"019f8977-a6ab-7d73-a3f5-510904f03bb3","input":[{"type":"text","text":"write marker.txt","text_elements":[]}],"approvalPolicy":"on-request","approvalsReviewer":"user","sandboxPolicy":{"type":"workspaceWrite","writableRoots":["/tmp/workspace"],"networkAccess":false}}}}
+{"direction":"server","message":{"id":3,"result":{"turn":{"id":"019f8977-b2dd-7862-b10a-1ce2ca0c6c6f","status":"inProgress","items":[]}}}}
+{"direction":"server","message":{"id":41,"method":"item/fileChange/requestApproval","params":{"threadId":"019f8977-a6ab-7d73-a3f5-510904f03bb3","turnId":"019f8977-b2dd-7862-b10a-1ce2ca0c6c6f","itemId":"item_1","reason":"write marker.txt","grantRoot":"/tmp/workspace","startedAtMs":1784730000000}}}
+{"direction":"client","message":{"id":41,"result":{"decision":"accept"}}}
+{"direction":"server","message":{"method":"item/agentMessage/delta","params":{"threadId":"019f8977-a6ab-7d73-a3f5-510904f03bb3","turnId":"019f8977-b2dd-7862-b10a-1ce2ca0c6c6f","itemId":"item_2","delta":"Done."}}}
+{"direction":"server","message":{"method":"turn/completed","params":{"threadId":"019f8977-a6ab-7d73-a3f5-510904f03bb3","turn":{"id":"019f8977-b2dd-7862-b10a-1ce2ca0c6c6f","status":"completed","items":[]}}}}

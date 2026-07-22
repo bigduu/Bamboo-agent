@@ -349,6 +349,11 @@ enum Commands {
     #[command(name = "subagent-worker", hide = true)]
     SubagentWorker,
 
+    /// Internal Codex command-auth helper. The token stays in a Bamboo-owned
+    /// 0600 file so a long-lived app-server can refresh per-run credentials.
+    #[command(name = "codex-provider-token", hide = true)]
+    CodexProviderToken { path: PathBuf },
+
     /// Run a sub-agent actor from the terminal (spawns the real worker
     /// process + WebSocket chain against your configured providers).
     Actor {
@@ -1304,6 +1309,7 @@ async fn main() {
             // installs none.
         }
         Some(Commands::SubagentWorker)
+        | Some(Commands::CodexProviderToken { .. })
         | Some(Commands::Actor { .. })
         | Some(Commands::Broker { .. })
         | Some(Commands::BrokerAgent { .. })
@@ -1550,6 +1556,16 @@ async fn main() {
             if let Err(e) = bamboo_agent::subagent_worker::run().await {
                 eprintln!("subagent-worker failed: {e}");
                 std::process::exit(1);
+            }
+        }
+
+        Commands::CodexProviderToken { path } => {
+            match bamboo_agent::codex_cli_executor::read_codex_provider_token(&path) {
+                Ok(token) => println!("{token}"),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
             }
         }
 

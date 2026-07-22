@@ -629,6 +629,17 @@ pub enum CodexWireApi {
     Responses,
 }
 
+/// Codex transport used by `executor = "codex"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexMode {
+    /// One `codex exec --json` process per activation.
+    #[default]
+    Exec,
+    /// Long-lived `codex app-server` JSON-RPC session with approval relay.
+    AppServer,
+}
+
 /// OS sandbox selected for non-interactive `codex exec` children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -638,16 +649,14 @@ pub enum CodexSandbox {
     DangerFullAccess,
 }
 
-/// Spawn-time approval policy for non-interactive `codex exec` children.
-///
-/// Interactive policies (`untrusted` / `on-request`) are intentionally not
-/// representable: exec mode has no approval relay, so either policy would
-/// eventually wait for a human that cannot answer.
+/// Codex approval policy. Mode-specific validation rejects interactive policy
+/// in exec mode and non-interactive policy in app-server mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CodexApprovalPolicy {
     Never,
     OnFailure,
+    OnRequest,
 }
 
 /// Sub-agent execution settings.
@@ -678,7 +687,7 @@ pub struct SubagentsConfig {
     pub fabric_dir: Option<String>,
     /// Expert: `"echo"` swaps in a dependency-free smoke executor (no LLM)
     /// to verify the actor chain end-to-end; `"claude_code"` drives the
-    /// official Claude Code CLI; `"codex"` drives `codex exec --json`.
+    /// official Claude Code CLI; `"codex"` drives the selected Codex mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
     /// `executor = "claude_code"` only: override the `claude` executable.
@@ -716,6 +725,9 @@ pub struct SubagentsConfig {
     /// default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_model: Option<String>,
+    /// `executor = "codex"` only: `exec` (default) or long-lived `app_server`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_mode: Option<CodexMode>,
     /// `executor = "codex"` only: authentication/provider mode. Unset defaults
     /// to `bamboo`, which keeps provider credentials in the parent process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -739,8 +751,8 @@ pub struct SubagentsConfig {
     /// child permission profile and the parent session's bypass posture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_sandbox: Option<CodexSandbox>,
-    /// Explicit non-interactive approval policy. Unset always resolves to an
-    /// explicit safe value; Bamboo never trusts the CLI's implicit default.
+    /// Mode-specific approval policy. Exec resolves to a non-interactive safe
+    /// value; app-server requires `on-request` and routes it to the parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_approval_policy: Option<CodexApprovalPolicy>,
     /// Permit network access from a workspace-write sandbox.
