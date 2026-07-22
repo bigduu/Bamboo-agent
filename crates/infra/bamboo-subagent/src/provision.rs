@@ -262,6 +262,21 @@ pub enum ExecutorSpec {
         sandbox: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inherit_user_config: Option<bool>,
+        /// `inherit | api_key | custom | bamboo`. Unset is interpreted as
+        /// `bamboo` unless the legacy `inherit_user_config = true` escape hatch
+        /// is present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_mode: Option<String>,
+        /// Custom-provider base URL, or the parent Bamboo loopback endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        /// Codex custom-provider wire protocol. Codex >= 0.144 accepts
+        /// `responses`; kept explicit on the wire for capability validation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wire_api: Option<String>,
+        /// Stable credential reference for custom mode. Never contains the key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_key_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forward_env: Option<Vec<String>>,
     },
@@ -313,6 +328,10 @@ pub struct ScopedCredential {
     /// Needed when `provider` is an instance id; defaults to `provider`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
+    /// Stable reference used to select a custom Codex provider key without
+    /// copying plaintext credential material into ordinary configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 impl ProvisionSpec {
@@ -409,6 +428,7 @@ mod tests {
             api_key: "sk-test".into(),
             base_url: None,
             provider_type: None,
+            credential_ref: None,
         });
         s
     }
@@ -608,6 +628,10 @@ mod tests {
             model: Some("gpt-5-codex".into()),
             sandbox: Some("workspace-write".into()),
             inherit_user_config: Some(true),
+            auth_mode: Some("inherit".into()),
+            base_url: None,
+            wire_api: None,
+            provider_key_ref: None,
             forward_env: Some(vec!["OPENAI_API_KEY".into()]),
         };
         let vc = serde_json::to_value(&codex).unwrap();
@@ -621,6 +645,10 @@ mod tests {
             model: None,
             sandbox: None,
             inherit_user_config: None,
+            auth_mode: None,
+            base_url: None,
+            wire_api: None,
+            provider_key_ref: None,
             forward_env: None,
         };
         assert_eq!(

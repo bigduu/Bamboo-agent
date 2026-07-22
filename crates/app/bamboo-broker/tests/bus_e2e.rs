@@ -70,6 +70,7 @@ async fn runner_style_child_run_over_the_bus_with_a_real_subprocess() {
         reasoning_effort: None,
         permission_policy: None,
         messages: vec![],
+        secrets: Default::default(),
     }))
     .await
     .expect("send run");
@@ -162,6 +163,7 @@ async fn one_warm_worker_serves_two_sequential_runs() {
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
+            secrets: Default::default(),
         }))
         .await
         .expect("send run");

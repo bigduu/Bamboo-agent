@@ -28,7 +28,7 @@ wins; please file an issue.
 - [Tools, skills, hooks](#tools-skills-hooks)
 - [LLM stream timeouts](#llm-stream-timeouts)
 - [Memory / auto-dream / gardener](#memory--auto-dream--gardener)
-- [Sub-agents + the `claude_code` executor](#sub-agents--the-claude_code-executor)
+- [Sub-agents + external CLI executors](#sub-agents--external-cli-executors)
 - [MCP servers](#mcp-servers)
 - [Notifications](#notifications)
 - [`connect` — the IM bridge](#connect--the-im-bridge)
@@ -239,7 +239,7 @@ one-off container run without touching `config.json`.
 when on; turn them off (`{"memory": {"auto_dream_enabled": false}}`) for a
 minimal-cost deployment.
 
-## Sub-agents + the `claude_code` executor
+## Sub-agents + external CLI executors
 
 Key `subagents` (`SubagentsConfig`). Sub-agents always run as independent
 actor subprocesses (crash isolation + real parallelism) — there is no
@@ -250,12 +250,18 @@ in-process runtime toggle.
 | `max_concurrent` | Cap on simultaneously running sub-agents. |
 | `worker_bin` / `worker_args` | Override the sub-agent worker binary/args (defaults to the current `bamboo` binary's `subagent-worker` mode). |
 | `fabric_dir` | Where the actor fabric's mailbox/state files live. |
-| `executor` | Which executor spawns a child: `"echo"` (test stub) \| `"bamboo_runtime"` (default — a full nested Bamboo agent loop) \| `"claude_code"` (shell out to the `claude` CLI instead). |
+| `executor` | Which executor spawns a child: `"echo"` (test stub) \| `"bamboo_runtime"` (default — a full nested Bamboo agent loop) \| `"claude_code"` \| `"codex"`. |
 | `claude_code_binary` | Path to the `claude` binary; `None` resolves `claude` via `PATH`. |
 | `claude_code_model` | `--model` passed to `claude`. |
 | `claude_code_permission_mode` | `--permission-mode` passed to `claude` (always sent explicitly, even `"default"`, once this executor is selected). |
 | `claude_code_inherit_user_config` | `false`/unset adds `--strict-mcp-config --setting-sources project`, sandboxing the child from your personal `claude` config. |
 | `claude_code_forward_env` | Extra environment variable **names** forwarded verbatim into the child (on top of a fixed allowlist: `HOME`/`PATH`/`SHELL`/`TERM`/`LANG`/`LC_*`/`TMPDIR`/`USER`/`LOGNAME`). |
+| `codex_binary` / `codex_model` | Codex executable and optional `--model` override. |
+| `codex_auth_mode` | `"inherit"` \| `"api_key"` \| `"custom"` \| `"bamboo"`; unset defaults to the recommended `"bamboo"` parent-provider mode. |
+| `codex_base_url` | Absolute HTTP(S) URL for `custom` mode only; credentials, query parameters, and fragments are rejected. |
+| `codex_wire_api` | `"responses"` (the only protocol accepted by supported Codex CLI versions). |
+| `codex_provider_key_ref` | Existing Bamboo provider credential reference used only by `custom` mode; the key is injected through an environment variable and is not written to the generated Codex config. |
+| `codex_forward_env` | Extra environment names after `env_clear()`; `api_key` mode requires an explicit `OPENAI_API_KEY`, and other modes reject it. `CODEX_*` and Bamboo's managed provider-key variable are reserved. |
 | `remote_placements` / `schedulable_placements` | Where a sub-agent may run (local / a named Cluster Fabric node) and whether schedules may target it. |
 | `mcp_role_allowlist` | Restrict which MCP servers a sub-agent role may see. |
 
@@ -283,6 +289,9 @@ The concrete spawn implementation is `src/claude_code_executor.rs`
 [--resume <id>]`, in a fully `env_clear()`'d child process (only the allowlist
 above is passed through) — the session id maps to `claude`'s own `--resume`
 via a small `claude-code-session.json` state file per sub-agent workspace.
+
+For Codex configuration, billing implications, isolation details, and the
+per-run Bamboo token contract, see [`codex-executor.md`](codex-executor.md).
 
 ## MCP servers
 

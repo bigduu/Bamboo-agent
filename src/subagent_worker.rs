@@ -114,22 +114,38 @@ pub async fn run() -> std::result::Result<(), String> {
             model,
             sandbox,
             inherit_user_config,
+            auth_mode,
+            base_url,
+            wire_api,
+            provider_key_ref,
             forward_env,
-        } => Arc::new(
-            CodexExecutor::new(
-                binary.clone(),
-                model.clone(),
-                sandbox.clone(),
-                spec.workspace.clone(),
-                Some(crate::codex_cli_executor::resolve_codex_state_dir(
-                    &spec.storage_dir,
-                    &spec.identity.child_id,
-                )),
+        } => {
+            let forward_env = forward_env.clone().unwrap_or_default();
+            let auth = crate::codex_cli_executor::resolve_codex_auth_config(
+                auth_mode.as_deref(),
                 inherit_user_config.unwrap_or(false),
-                forward_env.clone().unwrap_or_default(),
+                base_url.clone(),
+                wire_api.clone(),
+                provider_key_ref.as_deref(),
+                &spec.secrets.provider_credentials,
+                &forward_env,
+            )?;
+            Arc::new(
+                CodexExecutor::new(
+                    binary.clone(),
+                    model.clone(),
+                    sandbox.clone(),
+                    spec.workspace.clone(),
+                    Some(crate::codex_cli_executor::resolve_codex_state_dir(
+                        &spec.storage_dir,
+                        &spec.identity.child_id,
+                    )),
+                    forward_env,
+                    auth,
+                )
+                .await?,
             )
-            .await?,
-        ),
+        }
         ExecutorSpec::CliAdapter { .. } => {
             return Err("cli_adapter executor is not implemented yet".to_string());
         }
@@ -1264,6 +1280,7 @@ mod tests {
             api_key: key.into(),
             base_url: None,
             provider_type: None,
+            credential_ref: None,
         });
         s.model = model.map(|(p, m)| ModelRefSpec {
             provider: p.into(),

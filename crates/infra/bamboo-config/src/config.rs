@@ -602,6 +602,33 @@ impl RunBudgetConfig {
     }
 }
 
+/// Authentication/provider posture for `executor = "codex"`.
+///
+/// `None` at the containing config field is interpreted as [`Self::Bamboo`],
+/// keeping old documents backward-compatible while making the safe,
+/// parent-routed mode the runtime default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAuthMode {
+    /// Use the invoking user's default `~/.codex` auth and configuration.
+    Inherit,
+    /// Isolated `CODEX_HOME`; `OPENAI_API_KEY` must be explicitly forwarded.
+    ApiKey,
+    /// Isolated `CODEX_HOME` with a custom provider and referenced credential.
+    Custom,
+    /// Isolated `CODEX_HOME`; route through this Bamboo server with a per-run token.
+    #[default]
+    Bamboo,
+}
+
+/// Codex 0.144+ only accepts the Responses wire protocol for custom providers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexWireApi {
+    #[default]
+    Responses,
+}
+
 /// Sub-agent execution settings.
 ///
 /// Sub-agents always run as independent **actor** processes — an isolated OS
@@ -668,6 +695,25 @@ pub struct SubagentsConfig {
     /// default model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_model: Option<String>,
+    /// `executor = "codex"` only: authentication/provider mode. Unset defaults
+    /// to `bamboo`, which keeps provider credentials in the parent process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_auth_mode: Option<CodexAuthMode>,
+    /// `codex_auth_mode = "custom"` only: absolute HTTP(S) provider base URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_base_url: Option<String>,
+    /// `codex_auth_mode = "custom"` only. Codex 0.144+ supports `responses`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_wire_api: Option<CodexWireApi>,
+    /// `codex_auth_mode = "custom"` only: stable reference to an existing
+    /// provider credential. The plaintext key remains in the credential store
+    /// and is injected into the child process environment only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_provider_key_ref: Option<crate::CredentialRef>,
+    /// Extra env var names copied into Codex after `env_clear()`. API-key mode
+    /// requires an explicit `OPENAI_API_KEY` entry; it is never implicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_forward_env: Option<Vec<String>>,
     /// The active message-broker endpoint the `ask_agent` tool / sub-agent bus
     /// dials. RUNTIME-ONLY (`#[serde(skip)]`): never read from nor written to
     /// `config.json`. It is populated in memory each boot by `maybe_embed_broker`

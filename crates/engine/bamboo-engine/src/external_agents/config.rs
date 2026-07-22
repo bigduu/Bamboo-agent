@@ -71,6 +71,17 @@ pub struct ExternalAgentProfile {
     /// `executor = "codex"` only: `--model` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_model: Option<String>,
+    /// `inherit | api_key | custom | bamboo` (unset defaults to bamboo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_auth_mode: Option<bamboo_config::CodexAuthMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_wire_api: Option<bamboo_config::CodexWireApi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_provider_key_ref: Option<bamboo_config::CredentialRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_forward_env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

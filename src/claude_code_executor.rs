@@ -1217,6 +1217,7 @@ mod tests {
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            secrets: Default::default(),
         }
     }
 
@@ -1226,6 +1227,7 @@ mod tests {
             reasoning_effort: None,
             permission_policy: None,
             messages,
+            secrets: Default::default(),
         }
     }
 

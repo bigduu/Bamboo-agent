@@ -89,5 +89,6 @@ pub(super) async fn prepare_request(
         parallel_tool_calls,
         responses_options,
         estimated_prompt_tokens,
+        request_session_id: None,
     })
 }

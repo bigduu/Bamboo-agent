@@ -9,8 +9,47 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::a2a_adapter::A2AExternalChildRunner;
-use super::actor_adapter::{ActorChildRunner, ChildApprovalReviewer};
+use super::actor_adapter::{ActorChildRunner, ChildApprovalReviewer, CodexRunTokenAuthority};
 use super::config::{parse_external_agents, ExternalAgentProtocol};
+
+fn codex_auth_mode_name(mode: bamboo_config::CodexAuthMode) -> String {
+    match mode {
+        bamboo_config::CodexAuthMode::Inherit => "inherit",
+        bamboo_config::CodexAuthMode::ApiKey => "api_key",
+        bamboo_config::CodexAuthMode::Custom => "custom",
+        bamboo_config::CodexAuthMode::Bamboo => "bamboo",
+    }
+    .to_string()
+}
+
+fn codex_wire_api_name(wire_api: bamboo_config::CodexWireApi) -> String {
+    match wire_api {
+        bamboo_config::CodexWireApi::Responses => "responses",
+    }
+    .to_string()
+}
+
+fn codex_base_url(
+    config: &Config,
+    mode: bamboo_config::CodexAuthMode,
+    custom: Option<String>,
+) -> Option<String> {
+    match mode {
+        bamboo_config::CodexAuthMode::Custom => custom,
+        bamboo_config::CodexAuthMode::Bamboo => {
+            let scheme = if config.server.tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            Some(format!(
+                "{scheme}://127.0.0.1:{}/openai/v1",
+                config.server.port
+            ))
+        }
+        bamboo_config::CodexAuthMode::Inherit | bamboo_config::CodexAuthMode::ApiKey => None,
+    }
+}
 
 /// Composite router that delegates to the first matching external child runner.
 pub struct CompositeExternalChildRunner {
@@ -92,6 +131,24 @@ pub fn build_external_child_runner_with_registry_and_reviewer(
     approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
 ) -> Arc<dyn ExternalChildRunner> {
+    build_external_child_runner_with_codex_tokens(
+        config,
+        approval_registry,
+        approval_reviewer,
+        permission_config,
+        None,
+    )
+}
+
+/// Full server wiring, including the process-ephemeral Codex per-run token
+/// authority. Non-server callers keep using the compatibility wrapper above.
+pub fn build_external_child_runner_with_codex_tokens(
+    config: &Config,
+    approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
+    approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+) -> Arc<dyn ExternalChildRunner> {
     let agents = parse_external_agents(config);
 
     let mut runners: Vec<Arc<dyn ExternalChildRunner>> = Vec::new();
@@ -104,6 +161,7 @@ pub fn build_external_child_runner_with_registry_and_reviewer(
         approval_registry.clone(),
         approval_reviewer.clone(),
         permission_config.clone(),
+        codex_run_tokens.clone(),
     ) {
         Ok(runner) => runners.push(runner),
         Err(e) => tracing::error!("local actor sub-agent runner unavailable: {e}"),
@@ -146,7 +204,20 @@ pub fn build_external_child_runner_with_registry_and_reviewer(
                     model: profile.codex_model.clone(),
                     sandbox: None,
                     inherit_user_config: None,
-                    forward_env: None,
+                    auth_mode: Some(codex_auth_mode_name(
+                        profile.codex_auth_mode.unwrap_or_default(),
+                    )),
+                    base_url: codex_base_url(
+                        config,
+                        profile.codex_auth_mode.unwrap_or_default(),
+                        profile.codex_base_url.clone(),
+                    ),
+                    wire_api: profile.codex_wire_api.map(codex_wire_api_name),
+                    provider_key_ref: profile
+                        .codex_provider_key_ref
+                        .as_ref()
+                        .map(|reference| reference.as_str().to_string()),
+                    forward_env: profile.codex_forward_env.clone(),
                 },
                 Some(other) => {
                     tracing::error!(
@@ -179,6 +250,7 @@ pub fn build_external_child_runner_with_registry_and_reviewer(
             if let Some(config) = permission_config.clone() {
                 runner = runner.with_permission_config(config);
             }
+            runner = runner.with_codex_run_tokens(codex_run_tokens.clone());
             runners.push(Arc::new(runner));
             continue;
         }
@@ -247,6 +319,7 @@ fn build_local_actor_runner(
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
     approval_reviewer: Option<Arc<dyn ChildApprovalReviewer>>,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
 ) -> Result<Arc<dyn ExternalChildRunner>, String> {
     let sub = config.subagents();
 
@@ -289,7 +362,20 @@ fn build_local_actor_runner(
             model: sub.codex_model.clone(),
             sandbox: None,
             inherit_user_config: None,
-            forward_env: None,
+            auth_mode: Some(codex_auth_mode_name(
+                sub.codex_auth_mode.unwrap_or_default(),
+            )),
+            base_url: codex_base_url(
+                config,
+                sub.codex_auth_mode.unwrap_or_default(),
+                sub.codex_base_url.clone(),
+            ),
+            wire_api: sub.codex_wire_api.map(codex_wire_api_name),
+            provider_key_ref: sub
+                .codex_provider_key_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
+            forward_env: sub.codex_forward_env.clone(),
         },
         Some(other) => return Err(format!("unknown subagents.executor '{other}'")),
     };
@@ -316,7 +402,8 @@ fn build_local_actor_runner(
     .with_bus(sub.broker.as_ref().map(|b| bamboo_subagent::BusEndpoint {
         endpoint: b.endpoint.clone(),
         token: b.token.clone(),
-    }));
+    }))
+    .with_codex_run_tokens(codex_run_tokens);
     if let Some(registry) = approval_registry {
         runner = runner.with_approval_registry(registry);
     }
@@ -496,29 +583,59 @@ pub fn extract_provider_credentials(
     // Legacy single-instance slots: providers.anthropic / openai / gemini /
     // bodhi. `copilot` is intentionally omitted — it authenticates via device
     // flow and has no `api_key` field to extract.
-    let mut push_legacy = |name: &str, api_key: &str, base_url: Option<String>| {
-        let api_key = api_key.trim().to_string();
-        if api_key.is_empty() {
-            return;
-        }
-        out.push(bamboo_subagent::provision::ScopedCredential {
-            provider: name.to_string(),
-            api_key,
-            base_url,
-            provider_type: Some(name.to_string()),
-        });
-    };
+    let mut push_legacy =
+        |name: &str, api_key: &str, base_url: Option<String>, credential_ref: Option<String>| {
+            let api_key = api_key.trim().to_string();
+            if api_key.is_empty() {
+                return;
+            }
+            out.push(bamboo_subagent::provision::ScopedCredential {
+                provider: name.to_string(),
+                api_key,
+                base_url,
+                provider_type: Some(name.to_string()),
+                credential_ref,
+            });
+        };
     if let Some(c) = &config.providers().openai {
-        push_legacy("openai", &c.api_key, c.base_url.clone());
+        push_legacy(
+            "openai",
+            &c.api_key,
+            c.base_url.clone(),
+            c.credential_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
+        );
     }
     if let Some(c) = &config.providers().anthropic {
-        push_legacy("anthropic", &c.api_key, c.base_url.clone());
+        push_legacy(
+            "anthropic",
+            &c.api_key,
+            c.base_url.clone(),
+            c.credential_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
+        );
     }
     if let Some(c) = &config.providers().gemini {
-        push_legacy("gemini", &c.api_key, c.base_url.clone());
+        push_legacy(
+            "gemini",
+            &c.api_key,
+            c.base_url.clone(),
+            c.credential_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
+        );
     }
     if let Some(c) = &config.providers().bodhi {
-        push_legacy("bodhi", &c.api_key, c.base_url.clone());
+        push_legacy(
+            "bodhi",
+            &c.api_key,
+            c.base_url.clone(),
+            c.credential_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
+        );
     }
 
     // Multi-instance providers: provider_instances keyed by instance id; the
@@ -535,10 +652,45 @@ pub fn extract_provider_credentials(
             api_key,
             base_url: inst.base_url.clone(),
             provider_type: Some(inst.provider_type.clone()),
+            credential_ref: inst
+                .credential_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
         })
     }));
 
     out
+}
+
+#[cfg(test)]
+mod codex_runtime_config_tests {
+    use super::{codex_auth_mode_name, codex_base_url, codex_wire_api_name};
+    use bamboo_config::{CodexAuthMode, CodexWireApi};
+    use bamboo_llm::Config;
+
+    #[test]
+    fn codex_runtime_mapping_keeps_parent_loopback_and_custom_url_unambiguous() {
+        let mut config = Config::default();
+        config.server.port = 5700;
+
+        assert_eq!(codex_auth_mode_name(CodexAuthMode::Bamboo), "bamboo");
+        assert_eq!(codex_wire_api_name(CodexWireApi::Responses), "responses");
+        assert_eq!(
+            codex_base_url(&config, CodexAuthMode::Bamboo, None).as_deref(),
+            Some("http://127.0.0.1:5700/openai/v1")
+        );
+        assert_eq!(
+            codex_base_url(
+                &config,
+                CodexAuthMode::Custom,
+                Some("https://provider.example/v1".to_string()),
+            )
+            .as_deref(),
+            Some("https://provider.example/v1")
+        );
+        assert_eq!(codex_base_url(&config, CodexAuthMode::Inherit, None), None);
+        assert_eq!(codex_base_url(&config, CodexAuthMode::ApiKey, None), None);
+    }
 }
 
 #[cfg(test)]
@@ -635,9 +787,14 @@ mod extract_provider_credentials_tests {
             api_key: "sk-ant-legacy".to_string(),
             ..Default::default()
         });
+        let mut openai_work = instance("openai", "sk-oai-work");
+        openai_work.credential_ref = Some(
+            bamboo_config::CredentialRef::parse("provider.openai-work.api_key")
+                .expect("valid provider credential reference"),
+        );
         config
             .provider_instances
-            .insert("openai-work".to_string(), instance("openai", "sk-oai-work"));
+            .insert("openai-work".to_string(), openai_work);
 
         let mut creds = extract_provider_credentials(&config);
         creds.sort_by(|a, b| a.provider.cmp(&b.provider));
@@ -648,6 +805,10 @@ mod extract_provider_credentials_tests {
         assert_eq!(creds[1].provider, "openai-work");
         assert_eq!(creds[1].api_key, "sk-oai-work");
         assert_eq!(creds[1].provider_type.as_deref(), Some("openai"));
+        assert_eq!(
+            creds[1].credential_ref.as_deref(),
+            Some("provider.openai-work.api_key")
+        );
     }
 }
 

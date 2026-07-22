@@ -19,7 +19,8 @@ Task-oriented, kept current with the shipped codebase.
 | [`guides/API.md`](guides/API.md) | HTTP/SSE API reference. |
 | [`guides/MIGRATION_GUIDE.md`](guides/MIGRATION_GUIDE.md) | Upgrading across breaking changes. |
 | [`architecture-crates.md`](architecture-crates.md) | The Cargo workspace's crate layers and dependency direction — useful when extending Bamboo itself, not just using it. |
-| [`claude-code-executor.md`](claude-code-executor.md) | Protocol reference for driving the `claude` CLI as a sub-agent executor (`subagents.executor = "claude_code"` in the [config reference](config-reference.md#sub-agents--the-claude_code-executor)). |
+| [`claude-code-executor.md`](claude-code-executor.md) | Protocol reference for driving the `claude` CLI as a sub-agent executor (`subagents.executor = "claude_code"` in the [config reference](config-reference.md#sub-agents--external-cli-executors)). |
+| [`codex-executor.md`](codex-executor.md) | Configure the four Codex authentication/billing modes, isolated `CODEX_HOME`, custom providers, and the recommended parent-routed per-run token mode. |
 | [`security/KNOWN_VULNERABILITIES.md`](security/KNOWN_VULNERABILITIES.md) | Tracked `cargo audit` advisories and their resolution status. |
 | [`../examples/`](../examples/) | Compiling, runnable code — quickstart, streaming real event types, a custom tool, resuming a session, the `ExecuteRequest` escape hatch, connecting an MCP server. Built in CI (`cargo build --examples`), so they can't silently drift from the real API. |
 

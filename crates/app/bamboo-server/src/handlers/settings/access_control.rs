@@ -11,7 +11,7 @@ use actix_web::{
     dev::{ServiceRequest, ServiceResponse},
     http::header,
     middleware::Next,
-    web, HttpRequest, HttpResponse, ResponseError,
+    web, HttpMessage, HttpRequest, HttpResponse, ResponseError,
 };
 use chrono::{SecondsFormat, Utc};
 use rand::RngExt;
@@ -374,12 +374,17 @@ fn has_active_devices(config: &Config) -> bool {
 /// `X-Device-Id: bamboo_<...>` (the token alone cannot locate its per-device
 /// salt). Returns `(device_id, token)` when both are present and the
 /// Authorization value carries a `bd1_`-prefixed bearer token.
-fn presented_device_token(req: &HttpRequest) -> Option<(String, String)> {
+fn presented_bearer_token(req: &HttpRequest) -> Option<&str> {
     let auth = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    let token = auth
-        .strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "))?
-        .trim();
+    Some(
+        auth.strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))?
+            .trim(),
+    )
+}
+
+fn presented_device_token(req: &HttpRequest) -> Option<(String, String)> {
+    let token = presented_bearer_token(req)?;
     if !token.starts_with(DEVICE_TOKEN_PREFIX) {
         return None;
     }
@@ -530,6 +535,31 @@ pub async fn enforce_access_password_middleware<B: MessageBody + 'static>(
                 .map(ServiceResponse::map_into_left_body)
         }
     };
+
+    // A `bcx1_` bearer opts into the narrower Codex run-token contract. It is
+    // validated even on loopback (where ordinary requests retain the existing
+    // desktop bypass), is accepted only for the OpenAI Responses surface, and
+    // never falls back to cookie/device auth if expired or revoked.
+    if let Some(token) = presented_bearer_token(req.request()) {
+        if token.starts_with(crate::codex_run_tokens::CODEX_RUN_TOKEN_PREFIX) {
+            let scoped_path = matches!(path.as_str(), "/openai/v1/responses" | "/openai/v1/models");
+            if scoped_path {
+                if let Some(context) = app_state.codex_run_tokens.verify(token) {
+                    req.extensions_mut().insert(context);
+                    return next
+                        .call(req)
+                        .await
+                        .map(ServiceResponse::map_into_left_body);
+                }
+            }
+            let response = AppError::Unauthorized(
+                "invalid, expired, or out-of-scope Codex run credential".to_string(),
+            )
+            .error_response()
+            .map_into_right_body();
+            return Ok(req.into_response(response));
+        }
+    }
 
     let config = app_state.config.read().await.clone();
     // Auth is required when a credential mechanism is configured (a root password
@@ -1334,8 +1364,15 @@ pub async fn rotate_device(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::test::TestRequest;
+    use actix_web::{
+        body::to_bytes,
+        http::StatusCode,
+        middleware::from_fn,
+        test::{self, TestRequest},
+        App,
+    };
     use bamboo_config::AccessControlConfig;
+    use bamboo_engine::external_agents::actor_adapter::CodexRunTokenAuthority as _;
 
     macro_rules! test_config {
         (@assign $config:ident, providers, $value:expr) => { *$config.providers_mut() = $value; };
@@ -1348,6 +1385,69 @@ mod tests {
             config
         }};
     }
+
+    #[actix_web::test]
+    async fn codex_run_token_is_path_and_session_scoped_and_revocation_beats_loopback_bypass() {
+        async fn probe(req: HttpRequest) -> HttpResponse {
+            let session_id = req
+                .extensions()
+                .get::<crate::codex_run_tokens::CodexRunAuthContext>()
+                .map(|context| context.session_id.clone())
+                .unwrap_or_else(|| "missing-context".to_string());
+            HttpResponse::Ok().body(session_id)
+        }
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(data_dir.path().to_path_buf()).await.unwrap();
+        let tokens = state.codex_run_tokens.clone();
+        let issued = tokens.issue("codex-child-570").unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .wrap(from_fn(enforce_access_password_middleware))
+                .route("/openai/v1/responses", web::post().to(probe))
+                .route("/openai/v1/chat/completions", web::post().to(probe)),
+        )
+        .await;
+
+        let valid = TestRequest::post()
+            .uri("/openai/v1/responses")
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .insert_header((header::HOST, "localhost:9562"))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {}", issued.token)))
+            .to_request();
+        let valid = test::call_service(&app, valid).await;
+        assert_eq!(valid.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(valid.into_body()).await.unwrap(),
+            "codex-child-570".as_bytes()
+        );
+
+        let out_of_scope = TestRequest::post()
+            .uri("/openai/v1/chat/completions")
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .insert_header((header::HOST, "localhost:9562"))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {}", issued.token)))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, out_of_scope).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        tokens.revoke(&issued.token_id);
+        let revoked_on_loopback = TestRequest::post()
+            .uri("/openai/v1/responses")
+            .peer_addr("127.0.0.1:5700".parse().unwrap())
+            .insert_header((header::HOST, "localhost:9562"))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {}", issued.token)))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, revoked_on_loopback).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "revoked bcx1_ credentials must never fall through to loopback bypass"
+        );
+    }
+
     #[test]
     fn loopback_request_is_local() {
         let req = TestRequest::default()

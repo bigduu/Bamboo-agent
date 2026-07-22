@@ -37,7 +37,7 @@ pub(super) async fn handle_non_streaming_response(
         None => app_state.get_provider().await,
     };
     let request_options = LLMRequestOptions {
-        session_id: None,
+        session_id: prepared.request_session_id.clone(),
         reasoning_effort: prepared.reasoning_effort,
         parallel_tool_calls: prepared.parallel_tool_calls,
         required_tool: None,

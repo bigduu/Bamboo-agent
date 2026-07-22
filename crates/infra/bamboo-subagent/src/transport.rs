@@ -700,6 +700,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();
@@ -751,6 +752,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();
@@ -803,6 +805,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();
@@ -884,6 +887,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();
@@ -961,6 +965,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();
@@ -1013,6 +1018,7 @@ mod tests {
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),
+                    secrets: Default::default(),
                 }))
                 .await
                 .unwrap();
@@ -1029,6 +1035,7 @@ mod tests {
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),
+                    secrets: Default::default(),
                 }))
                 .await
                 .unwrap();
@@ -1131,6 +1138,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();
@@ -1149,6 +1157,7 @@ mod tests {
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                secrets: Default::default(),
             }))
             .await
             .unwrap();
