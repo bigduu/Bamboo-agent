@@ -23,7 +23,7 @@ use bamboo_agent_core::agent::events::TokenBudgetUsage;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
-    ContextBlockType, Message, Role, Session,
+    ContextBlockType, Message, MessagePhase, Role, Session,
 };
 use bamboo_compression::PreparedContext;
 use bamboo_domain::ReasoningEffort;
@@ -51,6 +51,79 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
 
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
+const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
+
+fn interruption_kind(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::Cancelled => "cancelled",
+        AgentError::StreamTimeout(_) => "stream_timeout",
+        AgentError::LLMOverflow(_) => "llm_overflow",
+        AgentError::LLM(_) => "llm_error",
+        _ => "execution_error",
+    }
+}
+
+/// Materialize already-received semantic output as a non-executable transcript
+/// record before the stream error leaves the round.
+///
+/// Partial tool-call fragments are diagnostic metadata only.  They are never
+/// assigned to `Message::tool_calls`, so a resume cannot replay an incomplete
+/// call as though the model had completed it.
+fn append_interrupted_assistant_output(
+    session: &mut Session,
+    partial: crate::runtime::stream::handler::InterruptedStreamOutput,
+    error: &AgentError,
+) -> bool {
+    if partial.content.is_empty()
+        && partial.reasoning_content.is_empty()
+        && partial.partial_tool_calls.is_empty()
+    {
+        return false;
+    }
+
+    let partial_tool_calls = (!partial.partial_tool_calls.is_empty()).then(|| {
+        serde_json::to_value(&partial.partial_tool_calls).unwrap_or(serde_json::Value::Null)
+    });
+    let mut message = Message::assistant_with_reasoning(
+        partial.content,
+        None,
+        (!partial.reasoning_content.is_empty()).then_some(partial.reasoning_content),
+    );
+    message.phase = Some(MessagePhase::Commentary);
+    message.reasoning_signature = None;
+    message.metadata = Some(serde_json::json!({
+        "runtime_kind": INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+        "interrupted": true,
+        "interruption_kind": interruption_kind(error),
+        "partial_tool_calls": partial_tool_calls,
+    }));
+    session.add_message(message);
+    true
+}
+
+/// Remove the transient partial record before a retry.  A terminal attempt
+/// leaves it in place for the shared execute-boundary checkpoint.
+pub(crate) fn discard_latest_interrupted_assistant_output(
+    session: &mut Session,
+    attempt_tail_message_id: Option<&str>,
+) -> bool {
+    let interrupted = session.messages.last().is_some_and(|message| {
+        if Some(message.id.as_str()) == attempt_tail_message_id {
+            return false;
+        }
+        message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("runtime_kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some(INTERRUPTED_ASSISTANT_OUTPUT_KIND)
+    });
+    if interrupted {
+        session.messages.pop();
+        session.updated_at = chrono::Utc::now();
+    }
+    interrupted
+}
 
 fn session_previous_response_id(session: &Session) -> Option<&str> {
     session
@@ -851,27 +924,44 @@ pub(super) async fn execute_llm_stream(
     // Keep that first stream silent; the pipeline verifies and executes the
     // model-issued call, then later rounds stream normally once activation is
     // mirrored into the runner-owned Session.
-    let stream_output =
+    let stream_output_result =
         if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(
             session,
         ) {
-            crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
+            crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
                 stream,
                 cancel_token,
                 session_id,
                 &timeout_context,
             )
-            .await?
+            .await
         } else {
-            crate::runtime::stream::handler::consume_llm_stream_with_context(
+            crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
                 stream,
                 event_tx,
                 cancel_token,
                 session_id,
                 &timeout_context,
             )
-            .await?
+            .await
         };
+    let stream_output = match stream_output_result {
+        Ok(output) => output,
+        Err(failure) => {
+            let appended = append_interrupted_assistant_output(
+                session,
+                failure.partial_output,
+                &failure.error,
+            );
+            if appended {
+                tracing::warn!(
+                    "[{}] Preserved interrupted partial assistant output in the live transcript",
+                    session_id
+                );
+            }
+            return Err(failure.error);
+        }
+    };
 
     // Update session token usage with actual output/thinking/cache stats from the LLM response.
     if let Some(ref mut usage) = session.token_usage {

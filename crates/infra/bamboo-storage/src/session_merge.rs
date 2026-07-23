@@ -195,6 +195,37 @@ impl LockedSessionStore {
         self.merge_save_runtime_inner(session, true).await
     }
 
+    /// Persist an execute-boundary transcript checkpoint without allowing a
+    /// stale runner snapshot to shrink or rewrite the durable message log.
+    ///
+    /// The latest load, append-only message reconciliation, metadata merge and
+    /// save all happen while holding the same per-session lock.  Loading is
+    /// deliberately fail-closed: falling back to a blind full save when the
+    /// latest transcript cannot be read would reintroduce the SHRINK hazard
+    /// this checkpoint exists to prevent.
+    pub async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        let _guard = self.acquire_lock(&session.id).await;
+        let latest = self.storage.load_session(&session.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            let incoming_count = session.messages.len();
+            let durable_count = latest.messages.len();
+            let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
+            tracing::debug!(
+                "[{}] append-safe runtime checkpoint: durable={}, incoming={}, appended={}, saved={}",
+                session.id,
+                durable_count,
+                incoming_count,
+                appended,
+                session.messages.len(),
+            );
+            apply_authoritative_metadata(session, latest);
+            adopt_disk_bypass_permissions(session, latest);
+        }
+
+        self.storage.save_session(session).await
+    }
+
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
     /// `bypass_permissions` — the caller's in-memory value is authoritative and
     /// persists as-is.
@@ -299,6 +330,10 @@ impl LockedSessionStore {
 impl RuntimeSessionPersistence for LockedSessionStore {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime(session).await
+    }
+
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        LockedSessionStore::checkpoint_runtime_session(self, session).await
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
@@ -522,6 +557,51 @@ mod tests {
             1,
             "merge_save_runtime clobbers concurrent appends — this is why config patches must use update_runtime_config"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_runtime_session_preserves_disk_suffix_and_appends_live_messages() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "checkpoint-no-shrink";
+
+        let mut baseline = fresh(session_id);
+        baseline.add_message(Message::user("base"));
+        storage.save_session(&baseline).await.unwrap();
+        let mut runner_snapshot = baseline.clone();
+
+        let mut durable = baseline;
+        let mut disk_only = Message::user("concurrent injected message");
+        disk_only.id = "disk-only".to_string();
+        durable.add_message(disk_only);
+        storage.save_session(&durable).await.unwrap();
+
+        let mut live_only = Message::assistant("partial runner output", None);
+        live_only.id = "live-only".to_string();
+        runner_snapshot.add_message(live_only);
+
+        store
+            .checkpoint_runtime_session(&mut runner_snapshot)
+            .await
+            .unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        let ids = saved
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![durable.messages[0].id.as_str(), "disk-only", "live-only"]
+        );
+        assert_eq!(runner_snapshot.messages.len(), saved.messages.len());
+        assert_eq!(runner_snapshot.messages[1].id, saved.messages[1].id);
+        assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
+        assert_eq!(saved.messages[1].content, "concurrent injected message");
+        assert_eq!(saved.messages[2].content, "partial runner output");
     }
 
     #[tokio::test]

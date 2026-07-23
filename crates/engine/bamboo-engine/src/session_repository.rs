@@ -258,6 +258,23 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         result
     }
 
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        // The execute-boundary checkpoint uses LockedSessionStore's atomic
+        // append-safe transcript merge, then publishes that reconciled snapshot
+        // to the runtime cache.  On failure, leave the existing cache alone: the
+        // checkpoint may have failed to load the latest durable transcript, and
+        // replacing a fresher cache entry with the stale runner snapshot would
+        // set up a later SHRINK write.
+        let result = self.persistence.checkpoint_runtime_session(session).await;
+        if result.is_ok() {
+            self.cache.insert(
+                session.id.clone(),
+                Arc::new(parking_lot::RwLock::new(session.clone())),
+            );
+        }
+        result
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.try_load(session_id).await
     }

@@ -1714,6 +1714,12 @@ pub(super) async fn run_pipeline(
         let mut round_activity = RoundActivity::default();
 
         for attempt in 1..=MAX_LLM_TURN_ATTEMPTS {
+            // Retry cleanup may remove only an interrupted record created by
+            // THIS attempt.  An older durable interrupted tail can legitimately
+            // be the session's starting point and must never be mistaken for a
+            // transient record when context preparation/provider dispatch fails
+            // before streaming starts.
+            let attempt_tail_message_id = session.messages.last().map(|message| message.id.clone());
             let llm_output = match crate::runtime::runner::round_lifecycle::execute_llm_round(
                 session,
                 config,
@@ -1829,6 +1835,16 @@ pub(super) async fn run_pipeline(
                             break;
                         }
                     } else if should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
+                        // A failed stream may have materialized already-visible
+                        // output as an interrupted transcript record.  Keep it
+                        // only when the error becomes terminal; a retry must not
+                        // feed the partial assistant turn back into the next
+                        // provider request or leave duplicate failed attempts in
+                        // the durable transcript.
+                        crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
+                            session,
+                            attempt_tail_message_id.as_deref(),
+                        );
                         let delay_ms = LLM_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                         tracing::warn!(
                             "[{}] Turn {} LLM call failed (attempt {}/{}): {}. Retrying in {}ms",
@@ -1975,6 +1991,10 @@ pub(super) async fn run_pipeline(
                 }
                 Err(error) => {
                     if should_retry_turn_error(&error) && attempt < MAX_LLM_TURN_ATTEMPTS {
+                        crate::runtime::runner::round_lifecycle::discard_latest_interrupted_assistant_output(
+                            session,
+                            attempt_tail_message_id.as_deref(),
+                        );
                         let delay_ms = LLM_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
                         tracing::warn!(
                             "[{}] Turn {} post-LLM handling failed (attempt {}/{}): {}. Retrying in {}ms",
