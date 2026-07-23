@@ -40,6 +40,19 @@ pub enum SdkError {
     #[error("provider initialization failed: {0}")]
     ProviderInit(String),
 
+    /// [`AgentBuilder::api_key`](super::AgentBuilder::api_key) was paired with
+    /// a provider that does not accept a plain API key (for example `copilot`,
+    /// which uses cached OAuth) or an unknown provider name.
+    #[error("provider '{provider}' does not accept a plain API key")]
+    UnsupportedApiKeyProvider { provider: String },
+
+    /// A new session was requested but neither `.model(...)` nor the assembled
+    /// provider configuration supplied an effective model.
+    #[error(
+        "no model configured; call AgentBuilder::model or configure the active provider model"
+    )]
+    ModelNotConfigured,
+
     /// `with_defaults_for_data_dir` failed to open the session store at the
     /// given data directory.
     #[error("session store initialization failed: {0}")]

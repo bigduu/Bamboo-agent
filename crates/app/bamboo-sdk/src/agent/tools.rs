@@ -89,8 +89,11 @@ fn default_builtin_executor() -> &'static BuiltinToolExecutor {
 /// it is a discovery aid. Call [`BuiltinTool::tool`] to get the real `Arc<dyn Tool>`
 /// implementation to hand to [`AgentBuilder::tools`](super::AgentBuilder::tools):
 ///
-/// ```rust,ignore
-/// Agent::builder().tools([BuiltinTool::WebSearch.tool(), BuiltinTool::Read.tool()]);
+/// ```rust,no_run
+/// # use bamboo_sdk::{Agent, BuiltinTool};
+/// let builder = Agent::builder()
+///     .tools([BuiltinTool::WebSearch.tool(), BuiltinTool::Read.tool()]);
+/// # let _ = builder;
 /// ```
 ///
 /// The variant set is kept in lock-step with [`BUILTIN_TOOL_NAMES`] by a
@@ -179,7 +182,7 @@ impl BuiltinTool {
         }
     }
 
-    /// The real built-in [`Tool`](ToolTrait) implementation as an
+    /// The real built-in [`Tool`](bamboo_agent_core::tools::Tool) implementation as an
     /// `Arc<dyn Tool>`, ready to pass to
     /// [`AgentBuilder::tools`](super::AgentBuilder::tools).
     pub fn tool(self) -> SharedTool {

@@ -152,6 +152,22 @@ impl BuiltinToolExecutor {
         }
     }
 
+    /// Creates a new executor from an existing registry and permission checker.
+    ///
+    /// This is the dependency-injection counterpart to
+    /// [`new_with_permissions`](Self::new_with_permissions): callers that
+    /// intentionally expose a selected/custom registry can keep the canonical
+    /// permission gate instead of silently dropping it.
+    pub fn with_registry_and_permissions(
+        registry: ToolRegistry,
+        permission_checker: Arc<dyn PermissionChecker>,
+    ) -> Self {
+        Self {
+            registry,
+            permission_checker: Some(permission_checker),
+        }
+    }
+
     /// Returns a reference to the internal registry
     pub fn registry(&self) -> &ToolRegistry {
         &self.registry
