@@ -1,15 +1,29 @@
 //! Non-destructive, idempotent adapters for pre-catalog workflow formats.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::store::parser::is_valid_skill_id;
+use crate::store::parser::{
+    is_valid_skill_id, parse_markdown_skill, render_skill_markdown, split_frontmatter,
+};
+use crate::store::storage::{
+    open_skill_file_no_follow, FailedSkillRecord, LoadedSkillRecord, SkillDirectorySource,
+    SkillDiscoveryDir, SkillLoadReport,
+};
+use crate::types::SkillDefinition;
 use crate::types::{SkillError, SkillResult};
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MAX_LEGACY_WORKFLOW_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+fn migration_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 async fn unique_staging_file(
     directory: &Path,
@@ -66,6 +80,510 @@ pub struct LegacyImportReport {
     pub updated: Vec<String>,
     pub already_present: Vec<String>,
     pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyWorkflowMigrationOutcome {
+    Migrated,
+    AlreadyMigrated,
+    Conflict,
+}
+
+fn public_legacy_error(error: &SkillError) -> String {
+    match error {
+        SkillError::Yaml(error) => match error.location() {
+            Some(location) => format!(
+                "legacy workflow: invalid metadata at line {}, column {}",
+                location.line(),
+                location.column()
+            ),
+            None => "legacy workflow: invalid metadata".to_string(),
+        },
+        SkillError::Validation(_) => "legacy workflow: invalid frontmatter".to_string(),
+        _ => "legacy workflow: failed to load".to_string(),
+    }
+}
+
+async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>> {
+    let metadata_bytes = tokio::fs::metadata(path).await?.len() as usize;
+    if metadata_bytes > max_bytes {
+        return Err(SkillError::Storage(format!(
+            "legacy workflow exceeds per-file limit ({metadata_bytes} > {max_bytes} bytes)"
+        )));
+    }
+    let file = open_skill_file_no_follow(path).await?;
+    let mut bytes = Vec::with_capacity(metadata_bytes.min(max_bytes));
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > max_bytes {
+        return Err(SkillError::Storage(format!(
+            "legacy workflow exceeds per-file limit ({} > {max_bytes} bytes)",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_legacy_description(description: &str) -> SkillResult<()> {
+    if description.contains('<') || description.contains('>') {
+        return Err(SkillError::Validation(
+            "Legacy workflow description cannot contain angle brackets".to_string(),
+        ));
+    }
+    if description.len() > 1024 {
+        return Err(SkillError::Validation(
+            "Legacy workflow description is too long".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_legacy_markdown_adapter(
+    source: &Path,
+    id: &str,
+    content: &str,
+) -> SkillResult<SkillDefinition> {
+    if !is_valid_skill_id(id) {
+        return Err(SkillError::InvalidId(id.to_string()));
+    }
+    let legacy_name = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(id);
+    let (description, prompt, placeholder) = if content.lines().next() == Some("---") {
+        let (frontmatter, body) = split_frontmatter(content)?;
+        let metadata: serde_yaml::Value = serde_yaml::from_str(&frontmatter)?;
+        let description = metadata
+            .get("description")
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        match description {
+            Some(description) => (description, body.trim().to_string(), false),
+            None => (
+                format!(
+                    "Legacy workflow '{legacy_name}' requires a description before automatic use."
+                ),
+                body.trim().to_string(),
+                true,
+            ),
+        }
+    } else {
+        (
+            format!("Legacy workflow '{legacy_name}' requires a description before automatic use."),
+            content.trim().to_string(),
+            true,
+        )
+    };
+    validate_legacy_description(&description)?;
+    Ok(SkillDefinition {
+        id: id.to_string(),
+        name: id.to_string(),
+        description,
+        license: None,
+        compatibility: None,
+        metadata: Some(serde_json::json!({
+            "legacy_adapter": true,
+            "legacy_manual_only": placeholder,
+            "legacy_name": legacy_name,
+            "original_source": source.to_string_lossy(),
+            "format": "workspace_workflow_markdown"
+        })),
+        prompt,
+        tool_refs: Vec::new(),
+    })
+}
+
+/// Discover legacy markdown workflows without modifying their source directory.
+///
+/// Each source file becomes a virtual instruction Skill whose root identity is
+/// the source file itself. Virtual legacy skills expose no sibling resources.
+pub async fn load_legacy_markdown_workflow_records(
+    discovery_dirs: &[SkillDiscoveryDir],
+    max_file_bytes: usize,
+    max_candidates: usize,
+) -> SkillResult<SkillLoadReport> {
+    let mut report = SkillLoadReport::default();
+    for discovery in discovery_dirs {
+        let mut entries = match tokio::fs::read_dir(&discovery.dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(
+                    directory = %discovery.dir.display(),
+                    %error,
+                    "Failed to inspect legacy workflow directory"
+                );
+                continue;
+            }
+        };
+        let mut sources = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_file()
+                && !file_type.is_symlink()
+                && path.extension().and_then(|value| value.to_str()) == Some("md")
+            {
+                sources.push(path);
+            }
+        }
+        sources.sort();
+        if report
+            .loaded
+            .len()
+            .saturating_add(report.failed.len())
+            .saturating_add(sources.len())
+            > max_candidates
+        {
+            return Err(SkillError::Storage(format!(
+                "legacy workflow candidate count exceeds limit ({max_candidates})"
+            )));
+        }
+        for source in sources {
+            let Some(legacy_name) = source.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let id = legacy_workflow_skill_id(legacy_name);
+            let loaded = async {
+                let bytes = read_bounded_file(&source, max_file_bytes).await?;
+                let content = String::from_utf8(bytes).map_err(|_| {
+                    SkillError::Validation("legacy workflow is not UTF-8".to_string())
+                })?;
+                parse_legacy_markdown_adapter(&source, &id, &content)
+            }
+            .await;
+            match loaded {
+                Ok(skill) => report.loaded.push(LoadedSkillRecord {
+                    skill,
+                    skill_root: source.clone(),
+                    source: discovery.source,
+                    mode: discovery.mode.clone(),
+                    skill_file: source,
+                }),
+                Err(error) => report.failed.push(FailedSkillRecord {
+                    skill_id: Some(id),
+                    skill_root: source.clone(),
+                    skill_file: source,
+                    source: discovery.source,
+                    mode: discovery.mode.clone(),
+                    error: public_legacy_error(&error),
+                }),
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Return in-place workflow discovery roots for installed plugins.
+pub async fn discover_plugin_legacy_workflow_dirs(plugins_root: &Path) -> Vec<SkillDiscoveryDir> {
+    let mut discovered = Vec::new();
+    let mut entries = match tokio::fs::read_dir(plugins_root).await {
+        Ok(entries) => entries,
+        Err(_) => return discovered,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| name.starts_with('.'))
+        {
+            continue;
+        }
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|value| value.is_dir() && !value.is_symlink())
+            .unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let plugin_dir = entry.path();
+        let manifest = match read_bounded_file(
+            &plugin_dir.join("plugin.json"),
+            MAX_LEGACY_WORKFLOW_FILE_BYTES,
+        )
+        .await
+        {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let manifest: serde_json::Value = match serde_json::from_slice(&manifest) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        let Some(declared) = manifest
+            .get("provides")
+            .and_then(|provides| provides.get("workflows"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let declared_names: BTreeSet<&str> = declared
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if declared_names.is_empty() || declared_names.len() != declared.len() {
+            continue;
+        }
+
+        let workflows = plugin_dir.join("workflows");
+        let is_real_directory = tokio::fs::symlink_metadata(&workflows)
+            .await
+            .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_real_directory {
+            continue;
+        }
+        let mut actual_names = BTreeSet::new();
+        let mut workflow_entries = match tokio::fs::read_dir(&workflows).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        let mut invalid_entry = false;
+        loop {
+            let workflow = match workflow_entries.next_entry().await {
+                Ok(Some(workflow)) => workflow,
+                Ok(None) => break,
+                Err(_) => {
+                    invalid_entry = true;
+                    break;
+                }
+            };
+            let path = workflow.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("md") {
+                continue;
+            }
+            let regular = workflow
+                .file_type()
+                .await
+                .map(|file_type| file_type.is_file() && !file_type.is_symlink())
+                .unwrap_or(false);
+            let Some(filename) = workflow.file_name().to_str().map(str::to_string) else {
+                invalid_entry = true;
+                break;
+            };
+            if !regular || !actual_names.insert(filename) {
+                invalid_entry = true;
+                break;
+            }
+        }
+        if invalid_entry
+            || actual_names.len() != declared_names.len()
+            || !actual_names
+                .iter()
+                .all(|name| declared_names.contains(name.as_str()))
+        {
+            tracing::warn!(
+                plugin = %entry.file_name().to_string_lossy(),
+                "Skipping plugin legacy workflows because plugin.json is not authoritative for workflows/*.md"
+            );
+            continue;
+        }
+        discovered.push(SkillDiscoveryDir {
+            dir: workflows,
+            source: SkillDirectorySource::Plugin,
+            mode: None,
+        });
+    }
+    discovered.sort_by(|left, right| left.dir.cmp(&right.dir));
+    discovered
+}
+
+fn is_owned_legacy_migration(raw: &str, target: &Path, source_identity: &str) -> bool {
+    parse_markdown_skill(target, raw)
+        .ok()
+        .and_then(|skill| skill.metadata)
+        .is_some_and(|metadata| {
+            metadata
+                .get("legacy_migration")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && metadata
+                    .get("original_source")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_identity)
+        })
+}
+
+async fn ensure_manual_only_policy(target_dir: &Path, manual_only: bool) -> SkillResult<()> {
+    if !manual_only {
+        return Ok(());
+    }
+    let target_metadata = tokio::fs::symlink_metadata(target_dir).await?;
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+        return Err(SkillError::Storage(
+            "legacy migration target must be a real directory".to_string(),
+        ));
+    }
+    let canonical_target = tokio::fs::canonicalize(target_dir).await?;
+    let agents = canonical_target.join("agents");
+    match tokio::fs::symlink_metadata(&agents).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(SkillError::Storage(
+                "legacy migration agents directory must be a real directory".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir(&agents).await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let canonical_agents = tokio::fs::canonicalize(&agents).await?;
+    if !canonical_agents.starts_with(&canonical_target) {
+        return Err(SkillError::Storage(
+            "legacy migration agents directory escapes the target bundle".to_string(),
+        ));
+    }
+    let policy = canonical_agents.join("bamboo.yaml");
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&policy)
+        .await
+    {
+        Ok(mut file) => {
+            file.write_all(
+                b"version: '1'\ninvocation_policy:\n  explicit: true\n  automatic: false\n",
+            )
+            .await?;
+            file.flush().await?;
+            file.sync_all().await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = tokio::fs::symlink_metadata(&policy).await?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(SkillError::Storage(
+                    "legacy migration policy must be a regular file".to_string(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Clone one read-only legacy workflow into a canonical workspace Skill bundle.
+///
+/// The source is never changed or removed. Existing targets are never overwritten;
+/// a target created by the same migration is an idempotent success.
+pub async fn migrate_legacy_markdown_workflow(
+    source: &Path,
+    source_identity: &str,
+    skills_dir: &Path,
+    id: &str,
+    description_override: Option<&str>,
+) -> SkillResult<LegacyWorkflowMigrationOutcome> {
+    let _guard = migration_lock().lock().await;
+    if !is_valid_skill_id(id) {
+        return Err(SkillError::InvalidId(id.to_string()));
+    }
+    if source_identity.trim().is_empty()
+        || source_identity.starts_with('/')
+        || source_identity.contains("..")
+        || source_identity.contains('\\')
+    {
+        return Err(SkillError::Validation(
+            "legacy workflow source identity must be a safe relative path".to_string(),
+        ));
+    }
+    let bytes = read_bounded_file(source, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
+    let content = String::from_utf8(bytes)
+        .map_err(|_| SkillError::Validation("legacy workflow is not UTF-8".to_string()))?;
+    let mut skill = parse_legacy_markdown_adapter(source, id, &content)?;
+    let mut placeholder = skill
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("legacy_manual_only"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if let Some(description) = description_override
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        validate_legacy_description(description)?;
+        skill.description = description.to_string();
+        placeholder = false;
+    }
+    skill.metadata = Some(serde_json::json!({
+        "legacy_migration": true,
+        "legacy_manual_only": placeholder,
+        "legacy_name": source.file_stem().and_then(|value| value.to_str()).unwrap_or(id),
+        "original_source": source_identity,
+        "format": "workspace_workflow_markdown"
+    }));
+    let rendered = render_skill_markdown(&skill)?;
+
+    tokio::fs::create_dir_all(skills_dir).await?;
+    if tokio::fs::symlink_metadata(skills_dir)
+        .await?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(SkillError::Storage(
+            "workspace skills directory cannot be a symbolic link".to_string(),
+        ));
+    }
+    let target_dir = skills_dir.join(id);
+    let target = target_dir.join("SKILL.md");
+    match tokio::fs::symlink_metadata(&target_dir).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Ok(LegacyWorkflowMigrationOutcome::Conflict);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match read_bounded_file(&target, MAX_LEGACY_WORKFLOW_FILE_BYTES).await {
+        Ok(existing) => {
+            let existing = String::from_utf8(existing).map_err(|_| {
+                SkillError::Validation("existing Skill bundle is not UTF-8".to_string())
+            })?;
+            if is_owned_legacy_migration(&existing, &target, source_identity) {
+                ensure_manual_only_policy(&target_dir, placeholder).await?;
+                return Ok(LegacyWorkflowMigrationOutcome::AlreadyMigrated);
+            }
+            return Ok(LegacyWorkflowMigrationOutcome::Conflict);
+        }
+        Err(SkillError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    match tokio::fs::create_dir(&target_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(LegacyWorkflowMigrationOutcome::Conflict)
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let result = async {
+        let (temporary, mut file) = unique_staging_file(&target_dir, "SKILL.md").await?;
+        let write_result = async {
+            file.write_all(rendered.as_bytes()).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::hard_link(&temporary, &target).await
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&temporary).await;
+        write_result?;
+        ensure_manual_only_policy(&target_dir, placeholder).await
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(&target).await;
+        let agents = target_dir.join("agents");
+        let _ = tokio::fs::remove_file(agents.join("bamboo.yaml")).await;
+        let _ = tokio::fs::remove_dir(&agents).await;
+        let _ = tokio::fs::remove_dir(&target_dir).await;
+        return Err(error);
+    }
+    Ok(LegacyWorkflowMigrationOutcome::Migrated)
 }
 
 /// Map a legacy filename to a stable Agent Skills-compatible bundle id.
@@ -613,5 +1131,231 @@ mod tests {
                 .expect("target preserved"),
             invalid
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_legacy_discovery_is_read_only_and_manual_without_description() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workflows = temp.path().join("workspace/.bamboo/workflows");
+        tokio::fs::create_dir_all(&workflows)
+            .await
+            .expect("workflows");
+        let source = workflows.join("review.md");
+        tokio::fs::write(&source, "Review the current diff.\n")
+            .await
+            .expect("source");
+        let report = load_legacy_markdown_workflow_records(
+            &[SkillDiscoveryDir {
+                dir: workflows.clone(),
+                source: SkillDirectorySource::Workspace,
+                mode: None,
+            }],
+            1024,
+            10,
+        )
+        .await
+        .expect("discovery");
+
+        assert!(report.failed.is_empty());
+        assert_eq!(report.loaded.len(), 1);
+        let record = &report.loaded[0];
+        assert_eq!(record.skill.id, "review");
+        assert_eq!(record.skill.prompt, "Review the current diff.");
+        assert_eq!(record.skill_root, source);
+        assert_eq!(record.source, SkillDirectorySource::Workspace);
+        let metadata = record.skill.metadata.as_ref().expect("legacy metadata");
+        assert_eq!(metadata["legacy_adapter"], true);
+        assert_eq!(metadata["legacy_manual_only"], true);
+        assert!(record.skill.description.contains("requires a description"));
+        assert!(!temp
+            .path()
+            .join("workspace/.bamboo/skills/review/SKILL.md")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn described_legacy_frontmatter_is_eligible_for_automatic_matching() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workflows = temp.path().join("workflows");
+        tokio::fs::create_dir_all(&workflows)
+            .await
+            .expect("workflows");
+        tokio::fs::write(
+            workflows.join("release.md"),
+            "---\ndescription: Use when publishing a verified release.\n---\nPublish safely.\n",
+        )
+        .await
+        .expect("source");
+        let report = load_legacy_markdown_workflow_records(
+            &[SkillDiscoveryDir {
+                dir: workflows,
+                source: SkillDirectorySource::Plugin,
+                mode: None,
+            }],
+            1024,
+            10,
+        )
+        .await
+        .expect("discovery");
+        let skill = &report.loaded[0].skill;
+        assert_eq!(skill.description, "Use when publishing a verified release.");
+        assert_eq!(skill.prompt, "Publish safely.");
+        assert_eq!(
+            skill.metadata.as_ref().expect("metadata")["legacy_manual_only"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_is_idempotent_non_destructive_and_never_overwrites() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workflows = temp.path().join("workspace/.bamboo/workflows");
+        let skills = temp.path().join("workspace/.bamboo/skills");
+        tokio::fs::create_dir_all(&workflows)
+            .await
+            .expect("workflows");
+        let source = workflows.join("review.md");
+        tokio::fs::write(&source, "Review exactly this way.\n")
+            .await
+            .expect("source");
+
+        let first = migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            None,
+        )
+        .await
+        .expect("first migration");
+        let second = migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            None,
+        )
+        .await
+        .expect("second migration");
+        assert_eq!(first, LegacyWorkflowMigrationOutcome::Migrated);
+        assert_eq!(second, LegacyWorkflowMigrationOutcome::AlreadyMigrated);
+        assert_eq!(
+            tokio::fs::read_to_string(&source)
+                .await
+                .expect("source kept"),
+            "Review exactly this way.\n"
+        );
+        let target = skills.join("review/SKILL.md");
+        let migrated = tokio::fs::read_to_string(&target)
+            .await
+            .expect("migrated Skill");
+        assert!(migrated.contains("legacy_migration: true"));
+        assert!(migrated.contains("Review exactly this way."));
+        assert!(skills.join("review/agents/bamboo.yaml").exists());
+
+        tokio::fs::write(&target, migrated.replace("Review exactly", "User edited"))
+            .await
+            .expect("user edit");
+        let third = migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            Some("A replacement description"),
+        )
+        .await
+        .expect("idempotent after edit");
+        assert_eq!(third, LegacyWorkflowMigrationOutcome::AlreadyMigrated);
+        assert!(tokio::fs::read_to_string(&target)
+            .await
+            .expect("edited target")
+            .contains("User edited"));
+
+        let conflict_source = workflows.join("conflict.md");
+        tokio::fs::write(&conflict_source, "Legacy body")
+            .await
+            .expect("conflict source");
+        let conflict_target = skills.join("conflict");
+        tokio::fs::create_dir_all(&conflict_target)
+            .await
+            .expect("target");
+        tokio::fs::write(
+            conflict_target.join("SKILL.md"),
+            "---\nname: conflict\ndescription: User owned\n---\nKeep me.\n",
+        )
+        .await
+        .expect("user target");
+        let conflict = migrate_legacy_markdown_workflow(
+            &conflict_source,
+            ".bamboo/workflows/conflict.md",
+            &skills,
+            "conflict",
+            None,
+        )
+        .await
+        .expect("conflict result");
+        assert_eq!(conflict, LegacyWorkflowMigrationOutcome::Conflict);
+        assert!(tokio::fs::read_to_string(conflict_target.join("SKILL.md"))
+            .await
+            .expect("user target kept")
+            .contains("Keep me."));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migration_rejects_symlinked_target_and_policy_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workflows = temp.path().join("workspace/.bamboo/workflows");
+        let skills = temp.path().join("workspace/.bamboo/skills");
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&workflows)
+            .await
+            .expect("workflows");
+        tokio::fs::create_dir_all(&skills).await.expect("skills");
+        tokio::fs::create_dir_all(&outside).await.expect("outside");
+        let source = workflows.join("review.md");
+        tokio::fs::write(&source, "Review safely.\n")
+            .await
+            .expect("source");
+
+        symlink(&outside, skills.join("review")).expect("target symlink");
+        let target_conflict = migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            None,
+        )
+        .await
+        .expect("symlink target is a conflict");
+        assert_eq!(target_conflict, LegacyWorkflowMigrationOutcome::Conflict);
+        assert!(!outside.join("SKILL.md").exists());
+        tokio::fs::remove_file(skills.join("review"))
+            .await
+            .expect("remove target symlink");
+
+        migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            Some("Use when reviewing a code change."),
+        )
+        .await
+        .expect("initial migration");
+        symlink(&outside, skills.join("review/agents")).expect("agents symlink");
+        let error = migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            None,
+        )
+        .await
+        .expect_err("symlinked agents directory must be rejected");
+        assert!(error.to_string().contains("agents directory"));
+        assert!(!outside.join("bamboo.yaml").exists());
     }
 }

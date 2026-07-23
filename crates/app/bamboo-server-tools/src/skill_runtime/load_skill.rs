@@ -949,7 +949,10 @@ impl Tool for LoadSkillTool {
             ));
         }
         let restored_snapshot = store.activation_was_restored(session_id).await;
-        let canonical_skill_root = if restored_snapshot {
+        let canonical_skill_root = if restored_snapshot
+            || catalog_entry.migration_status
+                == Some(bamboo_skills::LegacyWorkflowMigrationStatus::Available)
+        {
             None
         } else {
             Some(

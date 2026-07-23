@@ -6,6 +6,27 @@ pub struct WorkflowCatalogQuery {
     pub session_id: Option<String>,
 }
 
+/// Request body for explicitly cloning a read-only legacy workflow into the
+/// current session workspace's canonical Skill directory.
+#[derive(Debug, Default, Deserialize)]
+pub struct MigrateWorkflowRequest {
+    /// Trusted session used to resolve the Project/workspace publication scope.
+    pub session_id: String,
+    /// Optional replacement for the legacy workflow description. Supplying one
+    /// enables automatic invocation; otherwise description-less sources remain
+    /// manual-only after migration.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MigrateWorkflowResponse {
+    pub workflow_id: String,
+    pub outcome: bamboo_skills::legacy::LegacyWorkflowMigrationOutcome,
+    pub source_preserved: bool,
+    pub catalog_revision: u64,
+}
+
 /// Workflow list item for API responses.
 #[derive(Serialize)]
 pub(super) struct WorkflowListItem {

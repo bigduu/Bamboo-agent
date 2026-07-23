@@ -21,6 +21,8 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
             invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
             argument_schema: serde_json::json!({"type":"object"}),
             status: WorkflowStatus::Valid,
+            legacy: false,
+            migration_status: None,
             last_error: None,
             winner: true,
             shadowed_candidates: Vec::new(),

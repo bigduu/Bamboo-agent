@@ -1,19 +1,54 @@
-use actix_web::{web, HttpResponse};
-use bamboo_skills::legacy::LegacySyncOutcome;
+use actix_web::{http::StatusCode, web, HttpResponse};
+use bamboo_skills::legacy::{LegacySyncOutcome, LegacyWorkflowMigrationOutcome};
 use bamboo_skills::types::SkillDefinition;
+use bamboo_skills::LegacyWorkflowMigrationStatus;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::{app_state::AppState, error::AppError};
 
 use super::types::{
-    SaveWorkflowRequest, WorkflowCatalogQuery, WorkflowGetResponse, WorkflowListItem,
+    MigrateWorkflowRequest, MigrateWorkflowResponse, SaveWorkflowRequest, WorkflowCatalogQuery,
+    WorkflowGetResponse, WorkflowListItem,
 };
 use super::validation::is_safe_workflow_name;
 
 fn legacy_workflow_io_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn workspace_skills_dir(workspace: &std::path::Path) -> Result<std::path::PathBuf, AppError> {
+    let workspace = tokio::fs::canonicalize(workspace).await?;
+    let bamboo_dir = workspace.join(".bamboo");
+    let skills_dir = bamboo_dir.join("skills");
+    for directory in [&bamboo_dir, &skills_dir] {
+        match tokio::fs::symlink_metadata(directory).await {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(AppError::Forbidden(format!(
+                    "Workspace publication directory '{}' must be a real directory",
+                    directory
+                        .strip_prefix(&workspace)
+                        .unwrap_or(directory)
+                        .display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir(directory).await?;
+            }
+            Err(error) => return Err(AppError::StorageError(error)),
+        }
+        let canonical = tokio::fs::canonicalize(directory).await?;
+        if !canonical.starts_with(&workspace) {
+            return Err(AppError::Forbidden(
+                "Workspace publication directory escapes the trusted workspace".to_string(),
+            ));
+        }
+    }
+    tokio::fs::canonicalize(skills_dir)
+        .await
+        .map_err(AppError::StorageError)
 }
 
 /// Metadata-only catalog shared by Lotus palette, explicit selection and model matching.
@@ -100,6 +135,189 @@ pub async fn list_workflow_catalog(
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "no-store"))
         .json(snapshot))
+}
+
+/// Clone one read-only workspace/plugin legacy workflow into the trusted
+/// session workspace's canonical `.bamboo/skills/<id>/SKILL.md` bundle.
+///
+/// The legacy source is never changed or removed, and an existing target is
+/// never overwritten. Repeating a completed migration is an idempotent
+/// `already_migrated` success.
+pub async fn migrate_workflow(
+    app_state: web::Data<AppState>,
+    workflow_id: web::Path<String>,
+    payload: web::Json<MigrateWorkflowRequest>,
+) -> Result<HttpResponse, AppError> {
+    let workflow_id = workflow_id.into_inner();
+    let session_id = payload.session_id.trim();
+    if session_id.is_empty() {
+        return Err(AppError::BadRequest("session_id is required".to_string()));
+    }
+    let session = app_state
+        .load_session(session_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
+    let project_id =
+        match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+            &session,
+        ) {
+            bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                Some(project_id)
+            }
+            bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+            bamboo_engine::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(AppError::BadRequest(format!(
+                    "Session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        };
+    let workspace = crate::project_context::validate_workspace_assignment(
+        &app_state.project_store,
+        project_id.as_ref(),
+        session.workspace_path_meta().as_deref(),
+    )
+    .map_err(|error| match error {
+        crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }
+        | crate::project_context::ProjectWorkspaceValidationError::Conflict { .. } => {
+            AppError::BadRequest(error.to_string())
+        }
+        crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+            AppError::InternalError(anyhow::anyhow!(error))
+        }
+    })?
+    .ok_or_else(|| {
+        AppError::BadRequest("Legacy workflow migration requires a session workspace".to_string())
+    })?;
+
+    let store = if let Some(project_id) = project_id {
+        app_state.project_store.get(&project_id).map_err(|error| {
+            AppError::BadRequest(format!("Assigned Project is unavailable: {error}"))
+        })?;
+        let project_home = app_state.project_store.paths().project_home(&project_id);
+        app_state
+            .skill_manager
+            .store_for_project_workspace(&project_id, &project_home, Some(&workspace))
+            .await
+    } else {
+        app_state
+            .skill_manager
+            .store_for_workspace(Some(&workspace))
+            .await
+    }
+    .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+    store
+        .reload()
+        .await
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+    let catalog = store.workflow_catalog_snapshot().await;
+    let entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == workflow_id)
+        .ok_or_else(|| AppError::NotFound(format!("Workflow '{workflow_id}'")))?;
+    if entry.migration_status == Some(LegacyWorkflowMigrationStatus::Migrated) {
+        return Ok(HttpResponse::Ok()
+            .insert_header(("Cache-Control", "no-store"))
+            .json(MigrateWorkflowResponse {
+                workflow_id,
+                outcome: LegacyWorkflowMigrationOutcome::AlreadyMigrated,
+                source_preserved: true,
+                catalog_revision: catalog.revision,
+            }));
+    }
+    if entry.migration_status != Some(LegacyWorkflowMigrationStatus::Available) {
+        if entry.shadowed_candidates.iter().any(|candidate| {
+            candidate.migration_status == Some(LegacyWorkflowMigrationStatus::Available)
+        }) {
+            return Ok(crate::error::json_error(
+                StatusCode::CONFLICT,
+                format!(
+                    "Workflow '{workflow_id}' already has a target Skill bundle; it was not overwritten"
+                ),
+            ));
+        }
+        return Err(AppError::BadRequest(format!(
+            "Workflow '{workflow_id}' is not a migratable legacy workflow"
+        )));
+    }
+
+    let source = store.get_skill_root(&workflow_id).await.map_err(|error| {
+        AppError::BadRequest(format!("Legacy workflow is unavailable: {error}"))
+    })?;
+    let source = tokio::fs::canonicalize(&source).await.map_err(|error| {
+        AppError::BadRequest(format!("Legacy workflow source is unavailable: {error}"))
+    })?;
+    let canonical_workspace = tokio::fs::canonicalize(&workspace).await?;
+    let workspace_legacy = workspace.join(".bamboo/workflows");
+    let workspace_source_identity = match tokio::fs::canonicalize(&workspace_legacy).await {
+        Ok(root) => {
+            if root.starts_with(&canonical_workspace) && source.parent() == Some(root.as_path()) {
+                source
+                    .file_name()
+                    .and_then(|filename| filename.to_str())
+                    .map(|filename| format!(".bamboo/workflows/{filename}"))
+            } else {
+                None
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(AppError::StorageError(error)),
+    };
+    let plugin_source_identity =
+        match tokio::fs::canonicalize(app_state.app_data_dir.join("plugins")).await {
+            Ok(root) => source.strip_prefix(&root).ok().and_then(|relative| {
+                let components: Vec<_> = relative.components().collect();
+                if components.len() != 3 || components[1].as_os_str() != "workflows" {
+                    return None;
+                }
+                Some(format!(
+                    "plugins/{}/workflows/{}",
+                    components[0].as_os_str().to_str()?,
+                    components[2].as_os_str().to_str()?
+                ))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AppError::StorageError(error)),
+        };
+    let source_identity = workspace_source_identity
+        .or(plugin_source_identity)
+        .ok_or_else(|| {
+            AppError::Forbidden(
+                "Legacy workflow source is outside a migratable workspace/plugin scope".to_string(),
+            )
+        })?;
+
+    let skills_dir = workspace_skills_dir(&canonical_workspace).await?;
+    let outcome = bamboo_skills::legacy::migrate_legacy_markdown_workflow(
+        &source,
+        &source_identity,
+        &skills_dir,
+        &workflow_id,
+        payload.description.as_deref(),
+    )
+    .await
+    .map_err(|error| AppError::BadRequest(format!("Legacy workflow migration failed: {error}")))?;
+    if outcome == LegacyWorkflowMigrationOutcome::Conflict {
+        return Ok(crate::error::json_error(
+            StatusCode::CONFLICT,
+            format!(
+                "Workflow '{workflow_id}' already has a target Skill bundle; it was not overwritten"
+            ),
+        ));
+    }
+    store
+        .reload()
+        .await
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+    let revision = store.workflow_catalog_snapshot().await.revision;
+    Ok(HttpResponse::Ok()
+        .insert_header(("Cache-Control", "no-store"))
+        .json(MigrateWorkflowResponse {
+            workflow_id,
+            outcome,
+            source_preserved: true,
+            catalog_revision: revision,
+        }))
 }
 
 /// Lists all workflow markdown files

@@ -147,11 +147,9 @@ async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
     let workspace = tempfile::tempdir().expect("workspace");
     let workspace_skill = workspace.path().join(".bamboo/skills/other-project-secret");
     std::fs::create_dir_all(&workspace_skill).expect("workspace skill");
-    std::fs::write(
-        workspace_skill.join("SKILL.md"),
-        "---\nname: other-project-secret\ndescription: Other Project Secret\n---\nSECRET BODY\n",
-    )
-    .expect("workspace skill");
+    let secret =
+        "---\nname: other-project-secret\ndescription: Other Project Secret\n---\nSECRET BODY\n";
+    std::fs::write(workspace_skill.join("SKILL.md"), secret).expect("workspace skill");
 
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
@@ -183,10 +181,18 @@ async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
         std::sync::Arc::new(parking_lot::RwLock::new(session)),
     );
 
-    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
-        "/catalog",
-        actix_web::web::get().to(super::list_workflow_catalog),
-    ))
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/catalog/{workflow_id}/migrate",
+                actix_web::web::post().to(super::migrate_workflow),
+            ),
+    )
     .await;
     let response = actix_web::test::call_service(
         &app,
@@ -202,6 +208,148 @@ async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
             .windows(b"Other Project Secret".len())
             .any(|window| window == b"Other Project Secret"),
         "cross-Project workflow metadata must not be returned"
+    );
+    let migration = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/other-project-secret/migrate")
+            .set_json(serde_json::json!({
+                "session_id": "cross-project-workflow-session"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(migration.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        std::fs::read_to_string(workspace_skill.join("SKILL.md")).expect("secret unchanged"),
+        secret
+    );
+}
+
+#[actix_web::test]
+async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_idempotent() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let legacy_dir = workspace.path().join(".bamboo/workflows");
+    std::fs::create_dir_all(&legacy_dir).expect("legacy workflow dir");
+    let source = legacy_dir.join("daily-report.md");
+    let original = "# Daily report\n\nSummarize today's changes.\n";
+    std::fs::write(&source, original).expect("legacy workflow");
+    let protected_source = legacy_dir.join("protected.md");
+    std::fs::write(&protected_source, "Legacy source must remain.\n")
+        .expect("protected legacy workflow");
+    let protected_target = workspace.path().join(".bamboo/skills/protected/SKILL.md");
+    std::fs::create_dir_all(protected_target.parent().expect("protected target parent"))
+        .expect("protected target dir");
+    let protected_skill =
+        "---\nname: protected\ndescription: Existing canonical Skill\n---\nKeep this target.\n";
+    std::fs::write(&protected_target, protected_skill).expect("protected target");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut session = bamboo_agent_core::Session::new("legacy-migration-session", "test-model");
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/catalog/{workflow_id}/migrate",
+                actix_web::web::post().to(super::migrate_workflow),
+            ),
+    )
+    .await;
+
+    let conflict = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/protected/migrate")
+            .set_json(serde_json::json!({"session_id": "legacy-migration-session"}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(conflict.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(&protected_target).expect("protected target unchanged"),
+        protected_skill
+    );
+    assert_eq!(
+        std::fs::read_to_string(&protected_source).expect("protected source unchanged"),
+        "Legacy source must remain.\n"
+    );
+
+    let before: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=legacy-migration-session")
+            .to_request(),
+    )
+    .await;
+    let legacy = before["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .find(|entry| entry["id"] == "daily-report")
+        .expect("legacy workflow entry");
+    assert_eq!(legacy["legacy"], true);
+    assert_eq!(legacy["migration_status"], "available");
+    assert_eq!(legacy["invocation_policy"]["explicit"], true);
+    assert_eq!(legacy["invocation_policy"]["automatic"], false);
+
+    let migrate = || {
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/daily-report/migrate")
+            .set_json(serde_json::json!({"session_id": "legacy-migration-session"}))
+            .to_request()
+    };
+    let first = actix_web::test::call_service(&app, migrate()).await;
+    assert!(first.status().is_success());
+    let first: serde_json::Value = actix_web::test::read_body_json(first).await;
+    assert_eq!(first["outcome"], "migrated");
+    assert_eq!(first["source_preserved"], true);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+
+    let target = workspace.path().join(".bamboo/skills/daily-report");
+    let migrated = std::fs::read_to_string(target.join("SKILL.md")).expect("migrated Skill");
+    assert!(migrated.contains("legacy_migration: true"));
+    assert!(migrated.contains(".bamboo/workflows/daily-report.md"));
+    assert!(!migrated.contains(workspace.path().to_string_lossy().as_ref()));
+    assert!(migrated.contains("Summarize today's changes."));
+    assert!(target.join("agents/bamboo.yaml").exists());
+
+    let second = actix_web::test::call_service(&app, migrate()).await;
+    assert!(second.status().is_success());
+    let second: serde_json::Value = actix_web::test::read_body_json(second).await;
+    assert_eq!(second["outcome"], "already_migrated");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+
+    let after: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=legacy-migration-session")
+            .to_request(),
+    )
+    .await;
+    let migrated = after["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .find(|entry| entry["id"] == "daily-report")
+        .expect("migrated workflow entry");
+    assert_eq!(migrated["migration_status"], "migrated");
+    assert_eq!(
+        migrated["shadowed_candidates"][0]["migration_status"],
+        "available"
     );
 }
 

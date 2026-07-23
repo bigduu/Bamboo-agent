@@ -47,10 +47,23 @@ pub enum WorkflowStatus {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyWorkflowMigrationStatus {
+    /// A read-only legacy source is catalog-visible and can be migrated.
+    Available,
+    /// The winning Skill bundle records a completed non-destructive migration.
+    Migrated,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowedWorkflowCandidate {
     pub source: WorkflowSource,
     pub status: WorkflowStatus,
+    #[serde(default)]
+    pub legacy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_status: Option<LegacyWorkflowMigrationStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -68,6 +81,10 @@ pub struct WorkflowCatalogEntry {
     pub invocation_policy: serde_json::Value,
     pub argument_schema: serde_json::Value,
     pub status: WorkflowStatus,
+    #[serde(default)]
+    pub legacy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_status: Option<LegacyWorkflowMigrationStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub winner: bool,
@@ -231,12 +248,47 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
     Ok(result)
 }
 
+pub(crate) fn legacy_migration_status(
+    skill: &SkillDefinition,
+) -> Option<LegacyWorkflowMigrationStatus> {
+    skill.metadata.as_ref().and_then(|metadata| {
+        if metadata
+            .get("legacy_migration")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || metadata
+                .get("legacy_import")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        {
+            Some(LegacyWorkflowMigrationStatus::Migrated)
+        } else if metadata
+            .get("legacy_adapter")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            Some(LegacyWorkflowMigrationStatus::Available)
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn entry_from_skill(
     skill: &SkillDefinition,
     source: SkillDirectorySource,
     revision: u64,
-    metadata: BundleMetadata,
+    mut metadata: BundleMetadata,
 ) -> WorkflowCatalogEntry {
+    let migration_status = legacy_migration_status(skill);
+    if skill.metadata.as_ref().is_some_and(|metadata| {
+        metadata
+            .get("legacy_manual_only")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }) {
+        metadata.invocation_policy = serde_json::json!({"explicit": true, "automatic": false});
+    }
     WorkflowCatalogEntry {
         id: skill.id.clone(),
         name: skill.name.clone(),
@@ -248,6 +300,8 @@ pub(crate) fn entry_from_skill(
         invocation_policy: metadata.invocation_policy,
         argument_schema: metadata.argument_schema,
         status: WorkflowStatus::Valid,
+        legacy: migration_status.is_some(),
+        migration_status,
         last_error: None,
         winner: true,
         shadowed_candidates: Vec::new(),

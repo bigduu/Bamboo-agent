@@ -39,6 +39,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::get().to(settings::list_workflow_catalog),
         )
         .route(
+            "/bamboo/workflow-catalog/{workflow_id}/migrate",
+            web::post().to(settings::migrate_workflow),
+        )
+        .route(
             "/sessions/{session_id}/workflow-runs",
             web::post().to(workflow_runs::start),
         )

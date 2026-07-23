@@ -61,9 +61,9 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::catalog::{
-    entry_from_skill, load_bundle_metadata, ShadowedWorkflowCandidate, WorkflowCatalogEntry,
-    WorkflowCatalogEvent, WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind,
-    WorkflowStatus,
+    entry_from_skill, legacy_migration_status, load_bundle_metadata, LegacyWorkflowMigrationStatus,
+    ShadowedWorkflowCandidate, WorkflowCatalogEntry, WorkflowCatalogEvent,
+    WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind, WorkflowStatus,
 };
 use crate::store::builtin::{archive_exact_legacy_materialization, load_builtin_skill_bundles};
 use crate::store::parser::render_skill_markdown;
@@ -402,6 +402,7 @@ fn invalid_placeholder(
     source: SkillDirectorySource,
     revision: u64,
     error: &str,
+    migration_status: Option<LegacyWorkflowMigrationStatus>,
 ) -> WorkflowCatalogEntry {
     WorkflowCatalogEntry {
         id: id.to_string(),
@@ -414,6 +415,8 @@ fn invalid_placeholder(
         invocation_policy: serde_json::json!({"explicit": false, "automatic": false}),
         argument_schema: serde_json::json!({"type": "object"}),
         status: WorkflowStatus::Invalid,
+        legacy: migration_status.is_some(),
+        migration_status,
         last_error: Some(error.to_string()),
         winner: true,
         shadowed_candidates: Vec::new(),
@@ -950,12 +953,31 @@ impl SkillStore {
         let mut dirs = dirs;
         let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
         dirs.extend(discover_plugin_skill_dirs(&plugins_root).await);
-        let report = load_skills_from_discovery_dirs_detailed_with_limits(
+        let mut report = load_skills_from_discovery_dirs_detailed_with_limits(
             &dirs,
             self.snapshot_limits.max_file_bytes,
             MAX_WORKFLOWS_PER_PUBLICATION,
         )
         .await?;
+        let mut legacy_dirs =
+            crate::legacy::discover_plugin_legacy_workflow_dirs(&plugins_root).await;
+        if let Some(workspace) = self.workspace_overlay_dir.as_ref() {
+            legacy_dirs.push(SkillDiscoveryDir {
+                dir: workspace.join(".bamboo").join("workflows"),
+                source: SkillDirectorySource::Workspace,
+                mode: None,
+            });
+        }
+        let used_candidates = report.loaded.len().saturating_add(report.failed.len());
+        let remaining_candidates = MAX_WORKFLOWS_PER_PUBLICATION.saturating_sub(used_candidates);
+        let legacy_report = crate::legacy::load_legacy_markdown_workflow_records(
+            &legacy_dirs,
+            self.snapshot_limits.max_file_bytes,
+            remaining_candidates,
+        )
+        .await?;
+        report.loaded.extend(legacy_report.loaded);
+        report.failed.extend(legacy_report.failed);
 
         let (previous_skills, previous_roots, previous_resources, previous_catalog) = {
             let _snapshot_guard = self.snapshot_publish_lock.read().await;
@@ -1118,6 +1140,21 @@ impl SkillStore {
                     Self::Invalid(record) => Some(record.error.clone()),
                 }
             }
+            fn migration_status(&self) -> Option<LegacyWorkflowMigrationStatus> {
+                match self {
+                    Self::Valid(record) => legacy_migration_status(&record.skill),
+                    Self::Invalid(record)
+                        if record
+                            .skill_root
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            == Some("md") =>
+                    {
+                        Some(LegacyWorkflowMigrationStatus::Available)
+                    }
+                    Self::Invalid(_) => None,
+                }
+            }
         }
 
         let mut grouped: HashMap<String, Vec<Candidate>> = HashMap::new();
@@ -1159,6 +1196,8 @@ impl SkillStore {
                 .map(|candidate| ShadowedWorkflowCandidate {
                     source: candidate.source().into(),
                     status: candidate.status(),
+                    legacy: candidate.migration_status().is_some(),
+                    migration_status: candidate.migration_status(),
                     last_error: candidate.error(),
                 })
                 .collect();
@@ -1182,10 +1221,22 @@ impl SkillStore {
                                 entry.last_error = Some(error);
                                 entry
                             } else {
-                                invalid_placeholder(&id, record.source, revision, &error)
+                                invalid_placeholder(
+                                    &id,
+                                    record.source,
+                                    revision,
+                                    &error,
+                                    legacy_migration_status(&record.skill),
+                                )
                             }
                         } else {
-                            invalid_placeholder(&id, record.source, revision, &error)
+                            invalid_placeholder(
+                                &id,
+                                record.source,
+                                revision,
+                                &error,
+                                legacy_migration_status(&record.skill),
+                            )
                         }
                     }
                 },
@@ -1201,10 +1252,22 @@ impl SkillStore {
                             entry.last_error = Some(record.error.clone());
                             entry
                         } else {
-                            invalid_placeholder(&id, record.source, revision, &record.error)
+                            invalid_placeholder(
+                                &id,
+                                record.source,
+                                revision,
+                                &record.error,
+                                winner.migration_status(),
+                            )
                         }
                     } else {
-                        invalid_placeholder(&id, record.source, revision, &record.error)
+                        invalid_placeholder(
+                            &id,
+                            record.source,
+                            revision,
+                            &record.error,
+                            winner.migration_status(),
+                        )
                     }
                 }
             };
@@ -2321,7 +2384,9 @@ impl SkillStore {
                         .ok()
                         .and_then(|relative| relative.components().next())
                         .and_then(|component| component.as_os_str().to_str())
-                        .is_some_and(|name| name == "skills" || name.starts_with("skills-"))
+                        .is_some_and(|name| {
+                            name == "skills" || name.starts_with("skills-") || name == "workflows"
+                        })
                 })
     }
 
@@ -4234,6 +4299,52 @@ Use this skill for testing.
     }
 
     #[tokio::test]
+    async fn os_watcher_hot_discovers_workspace_legacy_workflow() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("data/skills");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&skills_dir).await.expect("skills dir");
+        fs::create_dir_all(&workspace).await.expect("workspace");
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize manager");
+        let store = manager
+            .store_for_workspace(Some(&workspace))
+            .await
+            .expect("workspace store");
+        let initial_revision = store.workflow_catalog_snapshot().await.revision;
+
+        let workflows = workspace.join(".bamboo/workflows");
+        fs::create_dir_all(&workflows).await.expect("workflow dir");
+        fs::write(
+            workflows.join("live-review.md"),
+            "Review the live change.\n",
+        )
+        .await
+        .expect("legacy workflow");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = store.workflow_catalog_snapshot().await;
+                if snapshot.revision > initial_revision
+                    && snapshot.entries.iter().any(|entry| {
+                        entry.id == "live-review"
+                            && entry.migration_status
+                                == Some(crate::LegacyWorkflowMigrationStatus::Available)
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("watcher should publish workspace legacy workflow");
+    }
+
+    #[tokio::test]
     async fn workspace_catalog_views_are_isolated_per_session() {
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("data/skills");
@@ -5002,6 +5113,210 @@ Use this skill for testing.
             .err()
             .expect("empty workspace stores must be capped");
         assert!(error.to_string().contains("workspace store capacity"));
+    }
+
+    #[tokio::test]
+    async fn workspace_legacy_workflow_is_read_only_catalog_input_with_lkg() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        let workflows = workspace.join(".bamboo/workflows");
+        fs::create_dir_all(&workflows).await.expect("workflows");
+        let source = workflows.join("review.md");
+        fs::write(
+            &source,
+            "---\ndescription: Use when reviewing a code change.\n---\nStable review instructions.\n",
+        )
+        .await
+        .expect("legacy workflow");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        });
+        let workspace_store = store
+            .skill_store_for_workspace(&workspace)
+            .await
+            .expect("workspace store");
+        let catalog = workspace_store.workflow_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review")
+            .expect("legacy entry");
+        assert_eq!(entry.source, crate::WorkflowSource::Workspace);
+        assert!(entry.legacy);
+        assert_eq!(
+            entry.migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+        assert_eq!(entry.status, WorkflowStatus::Valid);
+        assert_eq!(entry.invocation_policy["automatic"], true);
+        assert_eq!(
+            workspace_store
+                .get_skill("review")
+                .await
+                .expect("legacy skill")
+                .prompt,
+            "Stable review instructions."
+        );
+        assert!(source.exists());
+        assert!(!workspace.join(".bamboo/skills/review/SKILL.md").exists());
+
+        fs::write(
+            &source,
+            "---\ndescription: [private-broken-value\n---\nPRIVATE BROKEN BODY\n",
+        )
+        .await
+        .expect("break source");
+        workspace_store
+            .reload()
+            .await
+            .expect("isolated invalid reload");
+        let catalog = workspace_store.workflow_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review")
+            .expect("LKG entry");
+        assert_eq!(entry.status, WorkflowStatus::Invalid);
+        assert!(entry.legacy);
+        assert_eq!(
+            entry.migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+        let public = serde_json::to_string(entry).expect("catalog JSON");
+        assert!(!public.contains("private-broken-value"));
+        assert!(!public.contains("PRIVATE BROKEN BODY"));
+        assert!(!public.contains(workspace.to_string_lossy().as_ref()));
+        assert_eq!(
+            workspace_store
+                .get_skill("review")
+                .await
+                .expect("retained LKG skill")
+                .prompt,
+            "Stable review instructions."
+        );
+    }
+
+    #[tokio::test]
+    async fn migrated_workspace_bundle_wins_and_reports_legacy_shadow() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        let workflows = workspace.join(".bamboo/workflows");
+        let skills = workspace.join(".bamboo/skills");
+        fs::create_dir_all(&workflows).await.expect("workflows");
+        let source = workflows.join("review.md");
+        fs::write(&source, "Review the diff.\n")
+            .await
+            .expect("legacy source");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: directory.path().join("data/skills"),
+            ..Default::default()
+        });
+        let workspace_store = store
+            .skill_store_for_workspace(&workspace)
+            .await
+            .expect("workspace store");
+        crate::legacy::migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            Some("Use when reviewing a code change."),
+        )
+        .await
+        .expect("migration");
+        workspace_store.reload().await.expect("reload migration");
+        let catalog = workspace_store.workflow_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review")
+            .expect("migrated winner");
+        assert!(entry.legacy);
+        assert_eq!(
+            entry.migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Migrated)
+        );
+        assert_eq!(entry.source, crate::WorkflowSource::Workspace);
+        assert_eq!(entry.shadowed_candidates.len(), 1);
+        assert!(entry.shadowed_candidates[0].legacy);
+        assert_eq!(
+            entry.shadowed_candidates[0].migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_legacy_workflow_is_discovered_in_place_without_global_copy() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data = directory.path().join("data");
+        let workflows = data.join("plugins/reporter/workflows");
+        fs::create_dir_all(&workflows)
+            .await
+            .expect("plugin workflows");
+        fs::write(
+            workflows.join("daily-report.md"),
+            "---\ndescription: Use for the daily report.\n---\nReport instructions.\n",
+        )
+        .await
+        .expect("plugin workflow");
+        fs::write(
+            data.join("plugins/reporter/plugin.json"),
+            r#"{"id":"reporter","provides":{"workflows":["daily-report.md"]}}"#,
+        )
+        .await
+        .expect("plugin manifest");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: data.join("skills"),
+            ..Default::default()
+        });
+        store.reload().await.expect("plugin catalog");
+        let catalog = store.workflow_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "daily-report")
+            .expect("plugin legacy entry");
+        assert_eq!(entry.source, crate::WorkflowSource::Plugin);
+        assert_eq!(
+            entry.migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+        assert!(!data.join("workflows/daily-report.md").exists());
+        assert!(!data.join("skills/daily-report/SKILL.md").exists());
+    }
+
+    #[tokio::test]
+    async fn undeclared_plugin_workflow_is_not_published() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data = directory.path().join("data");
+        let plugin = data.join("plugins/reporter");
+        fs::create_dir_all(plugin.join("workflows"))
+            .await
+            .expect("plugin workflows");
+        fs::write(
+            plugin.join("workflows/private-notes.md"),
+            "Private undeclared instructions.\n",
+        )
+        .await
+        .expect("undeclared workflow");
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"id":"reporter","provides":{"workflows":[]}}"#,
+        )
+        .await
+        .expect("plugin manifest");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: data.join("skills"),
+            ..Default::default()
+        });
+        store.reload().await.expect("plugin catalog");
+        assert!(store
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .iter()
+            .all(|entry| entry.id != "private-notes"));
     }
 
     #[cfg(unix)]
