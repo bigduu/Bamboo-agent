@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 pub struct ChatRequest {
     pub message: String,
     pub session_id: Option<String>,
+    /// Stable first-class Project membership for a newly-created session.
+    /// Existing sessions cannot be reassigned through chat.
+    #[serde(default)]
+    pub project_id: Option<bamboo_domain::ProjectId>,
     #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]
@@ -157,6 +161,7 @@ mod tests {
         let req = ChatRequest {
             message: "Test".to_string(),
             session_id: None,
+            project_id: None,
             system_prompt: None,
             enhance_prompt: None,
             copilot_conclusion_with_options_enhancement_enabled: None,

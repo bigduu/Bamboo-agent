@@ -232,6 +232,7 @@ mod tests {
 
         link.send(ParentFrame::Run(RunSpec {
             assignment: "hello world".into(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
@@ -364,6 +365,7 @@ mod tests {
 
         link.send(ParentFrame::Run(RunSpec {
             assignment: "go".into(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
@@ -410,6 +412,7 @@ mod tests {
 
         link.send(ParentFrame::Run(RunSpec {
             assignment: "do the dangerous thing".into(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],

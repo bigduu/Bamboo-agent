@@ -28,6 +28,10 @@ pub use bamboo_client_core::{
 #[derive(Deserialize, Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
+    /// Stable Project membership used when authoring a schedule from the
+    /// currently selected session.
+    #[serde(default)]
+    pub project_id: Option<String>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -266,6 +270,8 @@ pub struct ScheduleStateView {
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct ScheduleRunConfigView {
     #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
     pub task_message: Option<String>,
 }
 
@@ -290,6 +296,8 @@ pub enum ScheduleTriggerReq {
 
 #[derive(Serialize, Default)]
 pub struct ScheduleRunConfigReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_message: Option<String>,
     /// Run the authored prompt when the schedule fires (only meaningful with a

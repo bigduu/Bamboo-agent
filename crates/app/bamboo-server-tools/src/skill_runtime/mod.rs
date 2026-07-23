@@ -12,6 +12,7 @@ use bamboo_skills::{SkillManager, SkillStore};
 
 use bamboo_agent_core::tools::ToolError;
 use bamboo_agent_core::Session;
+use bamboo_domain::ProjectId;
 
 mod load_skill;
 mod read_resource;
@@ -29,6 +30,12 @@ pub(super) struct SkillToolAccess {
     pub(super) skill_manager: Arc<SkillManager>,
     config: Arc<RwLock<Config>>,
     pub(super) session_repo: bamboo_engine::SessionRepository,
+    project_store: Option<Arc<bamboo_projects::ProjectStore>>,
+}
+
+struct SessionSkillScope {
+    workspace: Option<PathBuf>,
+    project: Option<(ProjectId, PathBuf)>,
 }
 
 impl SkillToolAccess {
@@ -41,7 +48,16 @@ impl SkillToolAccess {
             skill_manager,
             config,
             session_repo,
+            project_store: None,
         }
+    }
+
+    pub(super) fn with_project_store(
+        mut self,
+        project_store: Arc<bamboo_projects::ProjectStore>,
+    ) -> Self {
+        self.project_store = Some(project_store);
+        self
     }
 
     pub(super) async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
@@ -52,6 +68,32 @@ impl SkillToolAccess {
         &self,
         session_id: Option<&str>,
     ) -> Result<Arc<SkillStore>, ToolError> {
+        let scope = self.session_skill_scope(session_id).await?;
+        match scope.project {
+            Some((project_id, project_home)) => {
+                self.skill_manager
+                    .store_for_project_workspace(
+                        &project_id,
+                        &project_home,
+                        scope.workspace.as_deref(),
+                    )
+                    .await
+            }
+            None => {
+                self.skill_manager
+                    .store_for_workspace(scope.workspace.as_deref())
+                    .await
+            }
+        }
+        .map_err(|error| {
+            ToolError::Execution(format!("Failed to resolve session skill store: {error}"))
+        })
+    }
+
+    async fn session_skill_scope(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<SessionSkillScope, ToolError> {
         let session_id = session_id.ok_or_else(|| {
             ToolError::Execution(
                 "Skill runtime tools require a session_id in tool context".to_string(),
@@ -66,12 +108,65 @@ impl SkillToolAccess {
                 ))
             })?;
         let workspace = session.workspace_path_meta().map(PathBuf::from);
-        self.skill_manager
-            .store_for_workspace(workspace.as_deref())
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("Failed to resolve session skill store: {error}"))
-            })
+        let project = match session.project_id_meta() {
+            Some(raw_project_id) => {
+                let project_id = ProjectId::parse(&raw_project_id).map_err(|error| {
+                    ToolError::Execution(format!(
+                        "Session '{session_id}' has invalid Project identity: {error}"
+                    ))
+                })?;
+                let project_store = self.project_store.as_ref().ok_or_else(|| {
+                    ToolError::Execution(
+                        "Assigned Project skill resolution is unavailable".to_string(),
+                    )
+                })?;
+                project_store.get(&project_id).map_err(|error| {
+                    ToolError::Execution(format!("Assigned Project is unavailable: {error}"))
+                })?;
+                Some((
+                    project_id.clone(),
+                    project_store.paths().project_home(&project_id),
+                ))
+            }
+            None => None,
+        };
+        Ok(SessionSkillScope { workspace, project })
+    }
+
+    pub(super) async fn pin_current_activation(
+        &self,
+        session_id: &str,
+        selected_skill_ids: &[String],
+        selected_skill_mode: Option<&str>,
+    ) -> Result<(), ToolError> {
+        let scope = self.session_skill_scope(Some(session_id)).await?;
+        let result = match scope.project {
+            Some((project_id, project_home)) => {
+                self.skill_manager
+                    .pin_current_activation_for_project_workspace(
+                        &project_id,
+                        &project_home,
+                        scope.workspace.as_deref(),
+                        session_id,
+                        selected_skill_ids,
+                        selected_skill_mode,
+                    )
+                    .await
+            }
+            None => {
+                self.skill_manager
+                    .pin_current_activation_for_workspace(
+                        session_id,
+                        scope.workspace.as_deref(),
+                        selected_skill_ids,
+                        selected_skill_mode,
+                    )
+                    .await
+            }
+        };
+        result.map(|_| ()).map_err(|error| {
+            ToolError::Execution(format!("Failed to pin workflow activation: {error}"))
+        })
     }
 }
 

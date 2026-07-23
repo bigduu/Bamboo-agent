@@ -1417,6 +1417,7 @@ while IFS= read -r ignored; do :; done
             .run(
                 RunSpec {
                     assignment: "exercise approval".to_string(),
+                    project_id: None,
                     reasoning_effort: None,
                     permission_policy: Some(PermissionPolicyContext {
                         revision: 1,
@@ -1610,6 +1611,7 @@ while IFS= read -r ignored; do :; done
         .unwrap();
         let spec = RunSpec {
             assignment: "token lifecycle".to_string(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),

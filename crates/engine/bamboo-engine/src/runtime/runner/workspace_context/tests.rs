@@ -3,6 +3,7 @@ use super::{
     apply_workspace_path_to_session, extract_workspace_path_from_tool_result,
     should_apply_workspace_update,
 };
+use crate::project_context::WorkspaceBindingStatus;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
 use bamboo_agent_core::{Message, Session};
 
@@ -25,8 +26,25 @@ fn extract_workspace_path_from_tool_result_supports_alias_name() {
 
     assert_eq!(
         extract_workspace_path_from_tool_result(&tool_call, &result),
-        Some("/tmp/ws".to_string())
+        Some(super::workspace_update::WorkspaceUpdate {
+            path: "/tmp/ws".to_string(),
+            binding_status: WorkspaceBindingStatus::Unregistered,
+        })
     );
+}
+
+#[test]
+fn workspace_tool_set_is_an_explicit_persisted_update() {
+    let session = Session::new("session-workspace", "test-model");
+    let tool_call = ToolCall {
+        id: "call-workspace".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "Workspace".to_string(),
+            arguments: r#"{"path":"/tmp/project"}"#.to_string(),
+        },
+    };
+    assert!(should_apply_workspace_update(&session, &tool_call));
 }
 
 #[test]
@@ -110,7 +128,7 @@ fn upsert_workspace_context_replaces_existing_segment() {
         "Base prompt\n\nWorkspace path: /old/path\n{}\n\n## Tool Usage Guidelines\nX",
         guidance
     );
-    let updated = upsert_workspace_context(&old, "/new/path");
+    let updated = upsert_workspace_context(&old, "/new/path", WorkspaceBindingStatus::Unregistered);
 
     assert!(updated.contains("Workspace path: /new/path"));
     assert!(!updated.contains("Workspace path: /old/path"));
@@ -120,11 +138,43 @@ fn upsert_workspace_context_replaces_existing_segment() {
 }
 
 #[test]
+fn workspace_upsert_preserves_stable_project_block() {
+    let project_block = format!(
+        "{}\nProject ID: project-1\nProject name: Zenith\n{}",
+        crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+        crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
+    );
+    let old_workspace = crate::runtime::context::build_workspace_prompt_context("/old/path")
+        .expect("workspace context");
+    let prompt = format!("Base prompt\n\n{project_block}\n\n{old_workspace}");
+
+    let updated =
+        upsert_workspace_context(&prompt, "/new/path", WorkspaceBindingStatus::Unregistered);
+    assert!(updated.contains(&project_block));
+    assert_eq!(
+        updated
+            .matches(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
+            .count(),
+        1
+    );
+    assert_eq!(
+        updated
+            .matches(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
     let mut session = Session::new("session-1", "test-model");
     session.add_message(Message::system("Base prompt".to_string()));
 
-    apply_workspace_path_to_session(&mut session, "/tmp/workspace");
+    apply_workspace_path_to_session(
+        &mut session,
+        "/tmp/workspace",
+        WorkspaceBindingStatus::Unregistered,
+    );
 
     assert_eq!(
         session.metadata.get("workspace_path"),
@@ -148,4 +198,40 @@ fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
     assert!(snapshot
         .effective_system_prompt
         .contains("Workspace path: /tmp/workspace"));
+}
+
+#[test]
+fn registered_workspace_update_preserves_project_block_byte_for_byte() {
+    let project_block = format!(
+        "{}\nProject ID: project-1\nProject name: Zenith\nProject home: /data/projects/project-1\n{}",
+        crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+        crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
+    );
+    let mut session = Session::new("session-registered", "test-model");
+    session.add_message(Message::system(format!("Base\n\n{project_block}")));
+
+    apply_workspace_path_to_session(
+        &mut session,
+        "/tmp/registered",
+        WorkspaceBindingStatus::Registered,
+    );
+
+    let system = session
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+        .unwrap();
+    assert!(system.content.contains(&project_block));
+    assert!(system.content.contains("Binding status: registered"));
+    assert_eq!(
+        system
+            .content
+            .matches(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
+            .count(),
+        1
+    );
+    assert_eq!(
+        session.workspace_path_meta(),
+        Some("/tmp/registered".to_string())
+    );
 }

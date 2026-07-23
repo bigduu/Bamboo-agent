@@ -61,6 +61,7 @@ fn chat_request_blank_model_trims_to_empty() {
     let request = ChatRequest {
         message: "Hello".to_string(),
         session_id: None,
+        project_id: None,
         system_prompt: None,
         enhance_prompt: None,
         copilot_conclusion_with_options_enhancement_enabled: None,

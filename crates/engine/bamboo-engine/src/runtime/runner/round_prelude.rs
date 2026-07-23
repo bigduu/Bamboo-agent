@@ -41,8 +41,16 @@ pub(crate) async fn refresh_round_prompt_context(
     session: &mut Session,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
-) {
-    refresh_external_memory_context(session, prompt_memory_flags, runtime_context).await;
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) -> Result<(), AgentError> {
+    refresh_project_context(session, project_context_resolver).await?;
+    refresh_external_memory_context(
+        session,
+        prompt_memory_flags,
+        runtime_context,
+        project_context_resolver,
+    )
+    .await;
     // Task list, goal, plan-mode, and plan-runtime context are NOT injected into
     // the system message — they are built as dedicated volatile blocks directly
     // from session state during request assembly (cache-stable system prefix).
@@ -58,6 +66,21 @@ pub(crate) async fn refresh_round_prompt_context(
         persist_round_prompt_metadata(session, &prompt);
         log_round_prompt_refresh_summary(session_id.as_str(), &prompt);
     }
+    Ok(())
+}
+
+async fn refresh_project_context(
+    session: &mut Session,
+    resolver: Option<&crate::project_context::ProjectContextResolver>,
+) -> Result<(), AgentError> {
+    let Some(resolver) = resolver else {
+        return Ok(());
+    };
+    resolver
+        .refresh_session_prompt(session)
+        .await
+        .map(|_| ())
+        .map_err(|error| AgentError::ProjectContext(error.to_string()))
 }
 
 // ---- round_state functions ----
@@ -152,6 +175,7 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
                 .cloned()
                 .unwrap_or_default(),
             enhancement_prompt: session.enhance_prompt(),
+            project_context: super::session_setup::prompt_setup::extract_project_context(prompt),
             workspace_context: session.workspace_path_meta().and_then(|workspace_path| {
                 crate::runtime::context::build_workspace_prompt_context(&workspace_path)
             }),
@@ -249,7 +273,13 @@ pub(crate) async fn prepare_round(
         llm: config.background_model_provider.clone().unwrap_or(llm),
         background_model_name: config.background_model_name.clone(),
     };
-    refresh_round_prompt_context(session, config.prompt_memory_flags, Some(&runtime_context)).await;
+    refresh_round_prompt_context(
+        session,
+        config.prompt_memory_flags,
+        Some(&runtime_context),
+        config.project_context_resolver.as_deref(),
+    )
+    .await?;
     update_task_round_state(task_context, round, max_rounds);
 
     let round_id = build_round_id(session_id, round);
@@ -275,4 +305,228 @@ pub(crate) async fn prepare_round(
     );
 
     Ok(round_id)
+}
+
+#[cfg(test)]
+mod project_prompt_tests {
+    use async_trait::async_trait;
+    use bamboo_agent_core::{Message, Session};
+    use bamboo_domain::{ProjectId, ProjectResourceSummary, WorkspaceBinding};
+
+    use crate::project_context::{
+        ProjectContextError, ProjectContextResolver, ProjectContextSource, ProjectDescriptor,
+    };
+
+    struct StaticSource(ProjectDescriptor);
+
+    #[async_trait]
+    impl ProjectContextSource for StaticSource {
+        async fn find_project(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<Option<ProjectDescriptor>, ProjectContextError> {
+            Ok((&self.0.id == project_id).then(|| self.0.clone()))
+        }
+    }
+
+    struct OwnedWorkspaceSource {
+        descriptor: ProjectDescriptor,
+        owner: ProjectId,
+    }
+
+    #[async_trait]
+    impl ProjectContextSource for OwnedWorkspaceSource {
+        async fn find_project(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<Option<ProjectDescriptor>, ProjectContextError> {
+            Ok((&self.descriptor.id == project_id).then(|| self.descriptor.clone()))
+        }
+
+        async fn find_workspace_owner(
+            &self,
+            _workspace: &std::path::Path,
+        ) -> Result<Option<ProjectId>, ProjectContextError> {
+            Ok(Some(self.owner.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn per_round_resolution_injects_project_once_and_refreshes_only_workspace() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first = directory.path().join("main");
+        let second = directory.path().join("worktree");
+        std::fs::create_dir_all(&first).expect("first");
+        std::fs::create_dir_all(&second).expect("second");
+        let project_id = ProjectId::parse("project-1").expect("project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Zenith".to_string(),
+            home: directory.path().join("projects/project-1"),
+            workspace_bindings: vec![
+                WorkspaceBinding {
+                    path: first.to_string_lossy().to_string(),
+                    label: None,
+                    git_common_dir: None,
+                },
+                WorkspaceBinding {
+                    path: second.to_string_lossy().to_string(),
+                    label: None,
+                    git_common_dir: None,
+                },
+            ],
+            resources: ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
+                primary: directory.path().join("projects/project-1/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor)));
+        let mut session = Session::new("session-1", "model");
+        session.set_project_id_meta(project_id.to_string());
+        session.set_workspace_path_meta(first.to_string_lossy().to_string());
+        session.add_message(Message::system("Base"));
+
+        super::refresh_project_context(&mut session, Some(&resolver))
+            .await
+            .expect("first Project refresh");
+        let first_prompt = session.messages[0].content.clone();
+        let project_block = first_prompt
+            .split(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(crate::runtime::context::PROJECT_CONTEXT_END_MARKER)
+                    .next()
+            })
+            .expect("project body")
+            .to_string();
+
+        session.set_workspace_path_meta(second.to_string_lossy().to_string());
+        super::refresh_project_context(&mut session, Some(&resolver))
+            .await
+            .expect("second Project refresh");
+        let second_prompt = &session.messages[0].content;
+        assert_eq!(
+            second_prompt
+                .matches(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
+                .count(),
+            1
+        );
+        assert_eq!(
+            second_prompt
+                .matches(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
+                .count(),
+            1
+        );
+        assert!(second_prompt.contains(&project_block));
+        let second = bamboo_config::paths::path_to_display_string(
+            &second.canonicalize().expect("canonical second workspace"),
+        );
+        assert!(
+            second_prompt.contains(&format!("Workspace path: {second}")),
+            "second workspace was not refreshed in prompt: {second_prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_project_refresh_fails_closed_for_invalid_missing_and_cross_project_context() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let project_id = ProjectId::parse("round-project").expect("project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Round Project".to_string(),
+            home: directory.path().join("projects/round-project"),
+            workspace_bindings: Vec::new(),
+            resources: ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
+                primary: directory.path().join("projects/round-project/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver =
+            ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor.clone())));
+
+        let mut invalid = Session::new("round-invalid-project", "model");
+        invalid
+            .metadata
+            .insert("project_id".to_string(), "../invalid".to_string());
+        let error = super::refresh_project_context(&mut invalid, Some(&resolver))
+            .await
+            .expect_err("invalid identity must stop the round");
+        assert!(matches!(
+            error,
+            bamboo_agent_core::AgentError::ProjectContext(ref message)
+                if message.contains("invalid Project identity")
+        ));
+
+        let mut missing = Session::new("round-missing-project", "model");
+        missing.set_project_id_meta("missing-project");
+        let error = super::refresh_project_context(&mut missing, Some(&resolver))
+            .await
+            .expect_err("missing assigned Project must stop the round");
+        assert!(matches!(
+            error,
+            bamboo_agent_core::AgentError::ProjectContext(ref message)
+                if message.contains("unavailable")
+        ));
+
+        let foreign_owner = ProjectId::parse("foreign-owner").expect("foreign Project id");
+        let owned_resolver =
+            ProjectContextResolver::new(std::sync::Arc::new(OwnedWorkspaceSource {
+                descriptor,
+                owner: foreign_owner,
+            }));
+        let mut cross_project = Session::new("round-cross-project", "model");
+        cross_project.set_project_id_meta(project_id);
+        cross_project.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        let error = super::refresh_project_context(&mut cross_project, Some(&owned_resolver))
+            .await
+            .expect_err("cross-Project workspace must stop the round");
+        assert!(matches!(
+            error,
+            bamboo_agent_core::AgentError::ProjectContext(ref message)
+                if message.contains("belongs to Project")
+        ));
+    }
+
+    #[tokio::test]
+    async fn round_project_refresh_keeps_unassigned_unbound_legacy_session_executable() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let project_id = ProjectId::parse("unrelated-project").expect("project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Unrelated".to_string(),
+            home: directory.path().join("projects/unrelated-project"),
+            workspace_bindings: Vec::new(),
+            resources: ProjectResourceSummary {
+                project_id,
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
+                primary: directory
+                    .path()
+                    .join("projects/unrelated-project/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor)));
+        let mut session = Session::new("round-unassigned-legacy", "model");
+        session.add_message(Message::system("legacy base prompt"));
+
+        super::refresh_project_context(&mut session, Some(&resolver))
+            .await
+            .expect("unassigned unbound legacy session remains executable");
+        assert_eq!(session.messages[0].content, "legacy base prompt");
+    }
 }

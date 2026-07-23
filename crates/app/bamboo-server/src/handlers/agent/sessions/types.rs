@@ -7,9 +7,23 @@ use bamboo_storage::{SessionIndexEntry, SessionPlacement};
 
 use bamboo_engine::model_config_helper::parse_session_gold_config;
 
+/// Deserialize an explicitly-present nullable Project id while preserving the
+/// distinction between an absent field (`None`, no-op) and JSON `null`
+/// (`Some(None)`, explicit unassign).
+fn deserialize_project_reassignment<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
     pub id: String,
+    #[serde(default)]
+    pub project_id: Option<bamboo_domain::ProjectId>,
     pub kind: bamboo_agent_core::SessionKind,
     pub title: String,
     pub title_version: u64,
@@ -85,8 +99,21 @@ pub struct SessionSummary {
 
 impl SessionSummary {
     pub(crate) fn from_entry(entry: SessionIndexEntry, is_running: bool) -> Self {
+        let project_id = entry.project_id.as_deref().and_then(|raw| {
+            raw.trim()
+                .parse::<bamboo_domain::ProjectId>()
+                .map_err(|error| {
+                    tracing::warn!(
+                        session_id = %entry.id,
+                        %error,
+                        "ignoring malformed legacy Project id in session index"
+                    );
+                })
+                .ok()
+        });
         Self {
             id: entry.id,
+            project_id,
             kind: entry.kind,
             title: entry.title,
             title_version: entry.title_version,
@@ -191,6 +218,9 @@ pub struct RunningSessionsResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
+    /// Stable first-class Project membership for the new root session.
+    #[serde(default)]
+    pub project_id: Option<bamboo_domain::ProjectId>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -230,6 +260,8 @@ pub struct SessionSystemPromptResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enhancement_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction_context: Option<String>,
@@ -267,6 +299,10 @@ pub struct PatchSessionRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub pinned: Option<bool>,
+    /// Explicit Project reassignment: absent = no-op, string = validate+assign,
+    /// JSON null = unassign. Empty strings are rejected.
+    #[serde(default, deserialize_with = "deserialize_project_reassignment")]
+    pub project_id: Option<Option<String>>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -335,6 +371,7 @@ mod tests {
     #[test]
     fn test_create_session_request_debug() {
         let req = CreateSessionRequest {
+            project_id: None,
             title: Some("Test".to_string()),
             system_prompt: None,
             model: None,
@@ -427,6 +464,7 @@ mod tests {
     fn test_create_session_response_serialization() {
         let summary = SessionSummary {
             id: "test-id".to_string(),
+            project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
@@ -473,6 +511,7 @@ mod tests {
     fn test_get_session_response_serialization() {
         let summary = SessionSummary {
             id: "session-123".to_string(),
+            project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Child,
@@ -521,6 +560,7 @@ mod tests {
             session_id: "session-id".to_string(),
             base_system_prompt: "You are helpful".to_string(),
             enhancement_prompt: None,
+            project_context: None,
             workspace_context: None,
             instruction_context: None,
             env_context: None,
@@ -550,6 +590,7 @@ mod tests {
             session_id: "session-id".to_string(),
             base_system_prompt: "Base".to_string(),
             enhancement_prompt: Some("Enhancement".to_string()),
+            project_context: Some("Project".to_string()),
             workspace_context: Some("Workspace".to_string()),
             instruction_context: Some("Instruction".to_string()),
             env_context: Some("Env".to_string()),
@@ -605,6 +646,7 @@ mod tests {
     fn test_session_summary_debug() {
         let summary = SessionSummary {
             id: "test".to_string(),
+            project_id: None,
             bypass_permissions: false,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,

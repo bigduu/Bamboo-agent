@@ -26,6 +26,7 @@ const RUNTIME_PROMPT_MEMORY_OBSERVABILITY_KEY: &str =
     crate::runtime::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY;
 
 const BASE_PROMPT_SECTION_ID: &str = "base_prompt";
+const PROJECT_CONTEXT_SECTION_ID: &str = "project_context";
 const WORKSPACE_CONTEXT_SECTION_ID: &str = "workspace_context";
 const INSTRUCTION_CONTEXT_SECTION_ID: &str = "instruction_context";
 const ENV_CONTEXT_SECTION_ID: &str = "env_context";
@@ -35,6 +36,8 @@ const WORKSPACE_CONTEXT_START_MARKER: &str =
     crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER;
 const WORKSPACE_CONTEXT_END_MARKER: &str = crate::runtime::context::WORKSPACE_CONTEXT_END_MARKER;
 const WORKSPACE_CONTEXT_PREFIX: &str = crate::runtime::context::WORKSPACE_CONTEXT_PREFIX;
+const PROJECT_CONTEXT_START_MARKER: &str = crate::runtime::context::PROJECT_CONTEXT_START_MARKER;
+const PROJECT_CONTEXT_END_MARKER: &str = crate::runtime::context::PROJECT_CONTEXT_END_MARKER;
 const ENV_CONTEXT_START_MARKER: &str = crate::runtime::context::ENV_CONTEXT_START_MARKER;
 const ENV_CONTEXT_END_MARKER: &str = crate::runtime::context::ENV_CONTEXT_END_MARKER;
 const INSTRUCTION_CONTEXT_START_MARKER: &str =
@@ -45,6 +48,7 @@ const INSTRUCTION_CONTEXT_END_MARKER: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptLayer {
     CoreStatic,
+    EnvironmentProject,
     EnvironmentWorkspace,
     EnvironmentInstruction,
     EnvironmentConfiguration,
@@ -56,6 +60,7 @@ impl PromptLayer {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::CoreStatic => "core_static",
+            Self::EnvironmentProject => "environment_project",
             Self::EnvironmentWorkspace => "environment_workspace",
             Self::EnvironmentInstruction => "environment_instruction",
             Self::EnvironmentConfiguration => "environment_configuration",
@@ -142,7 +147,8 @@ impl PromptAssemblyReport {
 
     pub(crate) fn component_flags_value(&self) -> String {
         format!(
-            "workspace={};instruction={};env={};skill={};tool_guide={};external_memory={};task_list={}",
+            "project={};workspace={};instruction={};env={};skill={};tool_guide={};external_memory={};task_list={}",
+            self.section_enabled_by_name(PROJECT_CONTEXT_SECTION_ID) as u8,
             self.section_enabled_by_name(WORKSPACE_CONTEXT_SECTION_ID) as u8,
             self.section_enabled_by_name(INSTRUCTION_CONTEXT_SECTION_ID) as u8,
             self.section_enabled_by_name(ENV_CONTEXT_SECTION_ID) as u8,
@@ -161,8 +167,9 @@ impl PromptAssemblyReport {
             .map(PromptSection::len)
             .sum();
         format!(
-            "base={};workspace={};instruction={};env={};skill={};tool_guide={};external_memory={};task_list={};final={}",
+            "base={};project={};workspace={};instruction={};env={};skill={};tool_guide={};external_memory={};task_list={};final={}",
             base_len,
+            self.dynamic_len_by_name(PROJECT_CONTEXT_SECTION_ID),
             self.dynamic_len_by_name(WORKSPACE_CONTEXT_SECTION_ID),
             self.dynamic_len_by_name(INSTRUCTION_CONTEXT_SECTION_ID),
             self.dynamic_len_by_name(ENV_CONTEXT_SECTION_ID),
@@ -200,6 +207,7 @@ impl PromptAssemblyReport {
                 .filter(|value| !value.is_empty())
         };
         let base_system_prompt = section_content(BASE_PROMPT_SECTION_ID).unwrap_or_default();
+        let project_context = section_content(PROJECT_CONTEXT_SECTION_ID);
         let workspace_context = section_content(WORKSPACE_CONTEXT_SECTION_ID);
         let instruction_context = section_content(INSTRUCTION_CONTEXT_SECTION_ID);
         let env_context = section_content(ENV_CONTEXT_SECTION_ID);
@@ -208,6 +216,7 @@ impl PromptAssemblyReport {
         let enhancement_prompt = derive_enhancement_prompt(
             &base_system_prompt,
             effective_system_prompt,
+            project_context.as_deref(),
             workspace_context.as_deref(),
             instruction_context.as_deref(),
             env_context.as_deref(),
@@ -222,6 +231,7 @@ impl PromptAssemblyReport {
         PromptSnapshot {
             base_system_prompt,
             enhancement_prompt,
+            project_context,
             workspace_context,
             instruction_context,
             env_context,
@@ -278,6 +288,7 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
     activated_discoverable_tools: &BTreeSet<String>,
 ) -> (StablePromptFrame, Vec<StablePrefixSection>) {
     let raw_base_prompt = resolve_base_prompt_for_language(config, session).to_string();
+    let project_context = extract_project_context(&raw_base_prompt);
     let workspace_context = extract_workspace_context(&raw_base_prompt);
     let instruction_context = workspace_context
         .as_deref()
@@ -311,6 +322,7 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
 
     let stable_instructions = merge_with_optional_contexts(
         &base_prompt,
+        project_context.as_deref(),
         workspace_context.as_deref(),
         instruction_context.as_deref(),
         env_context.as_deref(),
@@ -326,6 +338,10 @@ pub(crate) fn build_stable_prompt_frame_with_sections(
         StablePrefixSection {
             name: "core_directives",
             content: core_directives,
+        },
+        StablePrefixSection {
+            name: "project",
+            content: project_context.unwrap_or_default(),
         },
         StablePrefixSection {
             name: "workspace",
@@ -397,79 +413,92 @@ pub(crate) fn apply_system_prompt_contexts(
     skill_context: &str,
     tool_guide_context: &str,
 ) -> PromptAssemblyReport {
-    let (base_prompt, workspace_context, instruction_context, env_context, merged_prompt) =
-        if let Some(system_message) = session
-            .messages
-            .iter_mut()
-            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        {
-            let raw_base_prompt = config
-                .system_prompt
-                .as_deref()
-                .unwrap_or(&system_message.content)
-                .to_string();
-            let workspace_context = extract_workspace_context(&raw_base_prompt);
-            let instruction_context = workspace_context
-                .as_deref()
-                .and_then(workspace_path_from_context)
-                .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
-            let env_context = extract_env_context(&raw_base_prompt)
-                .or_else(crate::runtime::context::build_env_prompt_context);
-            let base_prompt = normalize_base_prompt(&raw_base_prompt);
-            let merged_prompt = merge_with_optional_contexts(
-                &base_prompt,
-                workspace_context.as_deref(),
-                instruction_context.as_deref(),
-                env_context.as_deref(),
-                skill_context,
-                tool_guide_context,
-            );
-            system_message.content = merged_prompt.clone();
-            (
-                base_prompt,
-                workspace_context,
-                instruction_context,
-                env_context,
-                merged_prompt,
-            )
-        } else {
-            let raw_base_prompt = config
-                .system_prompt
-                .as_deref()
-                .unwrap_or_default()
-                .to_string();
-            let workspace_context = extract_workspace_context(&raw_base_prompt);
-            let instruction_context = workspace_context
-                .as_deref()
-                .and_then(workspace_path_from_context)
-                .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
-            let env_context = extract_env_context(&raw_base_prompt)
-                .or_else(crate::runtime::context::build_env_prompt_context);
-            let base_prompt = normalize_base_prompt(&raw_base_prompt);
-            let merged_prompt = merge_with_optional_contexts(
-                &base_prompt,
-                workspace_context.as_deref(),
-                instruction_context.as_deref(),
-                env_context.as_deref(),
-                skill_context,
-                tool_guide_context,
-            );
-            if !merged_prompt.is_empty() {
-                session
-                    .messages
-                    .insert(0, Message::system(merged_prompt.clone()));
-            }
-            (
-                base_prompt,
-                workspace_context,
-                instruction_context,
-                env_context,
-                merged_prompt,
-            )
-        };
+    let (
+        base_prompt,
+        project_context,
+        workspace_context,
+        instruction_context,
+        env_context,
+        merged_prompt,
+    ) = if let Some(system_message) = session
+        .messages
+        .iter_mut()
+        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+    {
+        let raw_base_prompt = config
+            .system_prompt
+            .as_deref()
+            .unwrap_or(&system_message.content)
+            .to_string();
+        let project_context = extract_project_context(&raw_base_prompt);
+        let workspace_context = extract_workspace_context(&raw_base_prompt);
+        let instruction_context = workspace_context
+            .as_deref()
+            .and_then(workspace_path_from_context)
+            .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
+        let env_context = extract_env_context(&raw_base_prompt)
+            .or_else(crate::runtime::context::build_env_prompt_context);
+        let base_prompt = normalize_base_prompt(&raw_base_prompt);
+        let merged_prompt = merge_with_optional_contexts(
+            &base_prompt,
+            project_context.as_deref(),
+            workspace_context.as_deref(),
+            instruction_context.as_deref(),
+            env_context.as_deref(),
+            skill_context,
+            tool_guide_context,
+        );
+        system_message.content = merged_prompt.clone();
+        (
+            base_prompt,
+            project_context,
+            workspace_context,
+            instruction_context,
+            env_context,
+            merged_prompt,
+        )
+    } else {
+        let raw_base_prompt = config
+            .system_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        let project_context = extract_project_context(&raw_base_prompt);
+        let workspace_context = extract_workspace_context(&raw_base_prompt);
+        let instruction_context = workspace_context
+            .as_deref()
+            .and_then(workspace_path_from_context)
+            .and_then(crate::runtime::context::instruction::build_instruction_prompt_context);
+        let env_context = extract_env_context(&raw_base_prompt)
+            .or_else(crate::runtime::context::build_env_prompt_context);
+        let base_prompt = normalize_base_prompt(&raw_base_prompt);
+        let merged_prompt = merge_with_optional_contexts(
+            &base_prompt,
+            project_context.as_deref(),
+            workspace_context.as_deref(),
+            instruction_context.as_deref(),
+            env_context.as_deref(),
+            skill_context,
+            tool_guide_context,
+        );
+        if !merged_prompt.is_empty() {
+            session
+                .messages
+                .insert(0, Message::system(merged_prompt.clone()));
+        }
+        (
+            base_prompt,
+            project_context,
+            workspace_context,
+            instruction_context,
+            env_context,
+            merged_prompt,
+        )
+    };
 
     let sections = build_prompt_sections(
         base_prompt.as_str(),
+        project_context.as_deref(),
         workspace_context.as_deref(),
         instruction_context.as_deref(),
         env_context.as_deref(),
@@ -520,13 +549,23 @@ pub fn refresh_prompt_snapshot_from_session(session: &mut Session) {
         .filter(|value| !value.is_empty())
         .unwrap_or_default();
 
-    let workspace_context = session
-        .metadata
-        .get("workspace_path")
-        .and_then(|workspace_path| {
+    let project_context = extract_project_context(&effective_system_prompt);
+    let persisted_workspace = session.metadata.get("workspace_path").map(String::as_str);
+    let extracted_workspace_context = extract_workspace_context(&effective_system_prompt);
+    let workspace_context = match persisted_workspace {
+        Some(workspace_path)
+            if extracted_workspace_context
+                .as_deref()
+                .and_then(workspace_path_from_context)
+                == Some(workspace_path) =>
+        {
+            extracted_workspace_context
+        }
+        Some(workspace_path) => {
             crate::runtime::context::build_workspace_prompt_context(workspace_path)
-        })
-        .or_else(|| extract_workspace_context(&effective_system_prompt));
+        }
+        None => extracted_workspace_context,
+    };
     let instruction_context = session
         .metadata
         .get("workspace_path")
@@ -571,6 +610,7 @@ pub fn refresh_prompt_snapshot_from_session(session: &mut Session) {
         derive_enhancement_prompt(
             &base_system_prompt,
             &effective_system_prompt,
+            project_context.as_deref(),
             workspace_context.as_deref(),
             instruction_context.as_deref(),
             env_context.as_deref(),
@@ -588,6 +628,7 @@ pub fn refresh_prompt_snapshot_from_session(session: &mut Session) {
         PromptSnapshot {
             base_system_prompt,
             enhancement_prompt,
+            project_context,
             workspace_context,
             instruction_context,
             env_context,
@@ -609,6 +650,7 @@ pub fn refresh_prompt_snapshot_from_session(session: &mut Session) {
 
 fn build_prompt_sections(
     base_prompt: &str,
+    project_context: Option<&str>,
     workspace_context: Option<&str>,
     instruction_context: Option<&str>,
     env_context: Option<&str>,
@@ -621,6 +663,12 @@ fn build_prompt_sections(
             PromptLayer::CoreStatic,
             false,
             base_prompt,
+        ),
+        PromptSection::new(
+            PROJECT_CONTEXT_SECTION_ID,
+            PromptLayer::EnvironmentProject,
+            false,
+            project_context.unwrap_or_default(),
         ),
         PromptSection::new(
             WORKSPACE_CONTEXT_SECTION_ID,
@@ -656,7 +704,8 @@ fn build_prompt_sections(
 }
 
 fn normalize_base_prompt(prompt: &str) -> String {
-    let without_workspace = strip_workspace_context(prompt);
+    let without_project = strip_project_context(prompt);
+    let without_workspace = strip_workspace_context(&without_project);
     let without_instruction = strip_instruction_context(&without_workspace);
     let without_env = strip_env_context(&without_instruction);
     let without_external_memory = strip_existing_external_memory(&without_env);
@@ -677,6 +726,7 @@ fn normalize_base_prompt(prompt: &str) -> String {
 
 pub(crate) fn merge_with_optional_contexts(
     base_prompt: &str,
+    project_context: Option<&str>,
     workspace_context: Option<&str>,
     instruction_context: Option<&str>,
     env_context: Option<&str>,
@@ -685,6 +735,12 @@ pub(crate) fn merge_with_optional_contexts(
 ) -> String {
     let merged = merge_system_prompt_with_contexts(base_prompt, skill_context, tool_guide_context);
     let mut sections = Vec::new();
+    if let Some(project_context) = project_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(project_context.to_string());
+    }
     if let Some(workspace_context) = workspace_context
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -712,6 +768,7 @@ pub(crate) fn merge_with_optional_contexts(
 fn derive_enhancement_prompt(
     base_system_prompt: &str,
     effective_system_prompt: &str,
+    project_context: Option<&str>,
     workspace_context: Option<&str>,
     instruction_context: Option<&str>,
     env_context: Option<&str>,
@@ -722,6 +779,7 @@ fn derive_enhancement_prompt(
 ) -> Option<String> {
     let mut stripped = effective_system_prompt.trim().to_string();
     for section in [
+        project_context,
         workspace_context,
         instruction_context,
         env_context,
@@ -749,6 +807,14 @@ fn derive_enhancement_prompt(
     }
 }
 
+pub(crate) fn extract_project_context(prompt: &str) -> Option<String> {
+    extract_wrapped_section(
+        prompt,
+        PROJECT_CONTEXT_START_MARKER,
+        PROJECT_CONTEXT_END_MARKER,
+    )
+}
+
 fn extract_workspace_context(prompt: &str) -> Option<String> {
     extract_wrapped_section(
         prompt,
@@ -770,6 +836,16 @@ fn strip_workspace_context(prompt: &str) -> String {
     )
     .map(|stripped| stripped.trim().to_string())
     .unwrap_or_else(|| strip_legacy_workspace_context(prompt).trim().to_string())
+}
+
+fn strip_project_context(prompt: &str) -> String {
+    strip_wrapped_section(
+        prompt,
+        PROJECT_CONTEXT_START_MARKER,
+        PROJECT_CONTEXT_END_MARKER,
+    )
+    .map(|stripped| stripped.trim().to_string())
+    .unwrap_or_else(|| prompt.trim().to_string())
 }
 
 fn strip_instruction_context(prompt: &str) -> String {

@@ -890,6 +890,7 @@ dependencies = [
  "bamboo-mcp",
  "bamboo-metrics",
  "bamboo-notification",
+ "bamboo-projects",
  "bamboo-sdk",
  "bamboo-server",
  "bamboo-server-tools",
@@ -1310,6 +1311,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-projects"
+version = "0.0.0"
+dependencies = [
+ "bamboo-domain",
+ "bamboo-memory",
+ "chrono",
+ "fs2",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "bamboo-sdk"
 version = "0.0.0"
 dependencies = [
@@ -1321,7 +1344,10 @@ dependencies = [
  "bamboo-infrastructure",
  "bamboo-llm",
  "bamboo-mcp",
+ "bamboo-memory",
  "bamboo-metrics",
+ "bamboo-projects",
+ "bamboo-server-tools",
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",
@@ -1361,6 +1387,7 @@ dependencies = [
  "bamboo-metrics",
  "bamboo-notification",
  "bamboo-plugin",
+ "bamboo-projects",
  "bamboo-server-tools",
  "bamboo-skills",
  "bamboo-storage",
@@ -1380,6 +1407,7 @@ dependencies = [
  "hex",
  "http 1.4.2",
  "mockall",
+ "notify",
  "notify-rust",
  "parking_lot",
  "prost",
@@ -1427,6 +1455,7 @@ dependencies = [
  "bamboo-llm",
  "bamboo-memory",
  "bamboo-metrics",
+ "bamboo-projects",
  "bamboo-skills",
  "bamboo-storage",
  "bamboo-subagent",
@@ -1494,6 +1523,7 @@ name = "bamboo-subagent"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bamboo-domain",
  "chrono",
  "futures-util",
  "rustls",

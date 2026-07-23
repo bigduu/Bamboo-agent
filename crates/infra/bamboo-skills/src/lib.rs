@@ -312,6 +312,47 @@ impl SkillManager {
         }
     }
 
+    /// Resolve the stable Project shared layer plus the current workspace
+    /// overlay. Both values must come from trusted server-side session/Project
+    /// state, never directly from request arguments.
+    pub async fn store_for_project_workspace(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+    ) -> SkillResult<Arc<SkillStore>> {
+        self.store
+            .skill_store_for_project_workspace(project_id, project_home, workspace)
+            .await
+    }
+
+    pub async fn workflow_catalog_for_project_workspace(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+    ) -> SkillResult<WorkflowCatalogSnapshot> {
+        Ok(self
+            .store_for_project_workspace(project_id, project_home, workspace)
+            .await?
+            .workflow_catalog_snapshot()
+            .await)
+    }
+
+    pub async fn pin_workflow_definition_bundle_for_project_workspace(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+        root_id: &str,
+        root_revision: u64,
+    ) -> SkillResult<bamboo_domain::WorkflowDefinitionBundle> {
+        self.store_for_project_workspace(project_id, project_home, workspace)
+            .await?
+            .pin_workflow_definition_bundle(root_id, root_revision)
+            .await
+    }
+
     /// Build an immutable workflow bundle from one global/workspace publication.
     /// The workspace argument must be derived from trusted server-side session state.
     pub async fn pin_workflow_definition_bundle(
@@ -686,6 +727,41 @@ impl SkillManager {
         .await
     }
 
+    /// Resolve and pin one immutable activation from the stable Project-home
+    /// publication plus the current workspace overlay.
+    ///
+    /// The Project identity and paths must be resolved from trusted
+    /// server-side session state before calling this method.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_and_pin_activation_in_project_workspace_with_mode_and_budget(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+        max_context_tokens: usize,
+    ) -> SkillResult<SkillActivationSelection> {
+        let store = self
+            .store_for_project_workspace(project_id, project_home, workspace)
+            .await?;
+        let _scope_guard = self.activation_scope_coordinator.lock().await;
+        self.prepare_activation_scope(activation_id, &store).await;
+        Self::resolve_and_pin_activation_from_store(
+            store.as_ref(),
+            activation_id,
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+            request_hint,
+            max_context_tokens,
+        )
+        .await
+    }
+
     async fn prepare_activation_scope(&self, activation_id: &str, target: &Arc<SkillStore>) {
         let mut has_non_target_owner = self
             .store
@@ -723,6 +799,25 @@ impl SkillManager {
             .await
     }
 
+    pub async fn pin_current_activation_for_project_workspace(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+        activation_id: &str,
+        selected_skill_ids: &[String],
+        selected_skill_mode: Option<&str>,
+    ) -> SkillResult<SkillActivationDescriptor> {
+        let store = self
+            .store_for_project_workspace(project_id, project_home, workspace)
+            .await?;
+        let _scope_guard = self.activation_scope_coordinator.lock().await;
+        self.prepare_activation_scope(activation_id, &store).await;
+        store
+            .pin_current_activation(activation_id, selected_skill_ids, selected_skill_mode)
+            .await
+    }
+
     pub async fn pinned_allowed_tools_for_workspace(
         &self,
         activation_id: &str,
@@ -735,15 +830,51 @@ impl SkillManager {
             .await)
     }
 
+    pub async fn pinned_allowed_tools_for_project_workspace(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+    ) -> SkillResult<Option<Vec<String>>> {
+        let store = self
+            .store_for_project_workspace(project_id, project_home, workspace)
+            .await?;
+        Ok(store
+            .pinned_allowed_tools(activation_id, disabled_skill_ids)
+            .await)
+    }
+
     pub async fn pinned_activation_for_workspace(
         &self,
         activation_id: &str,
         workspace: Option<&Path>,
     ) -> SkillResult<Option<SkillActivationSelection>> {
         let store = self.store_for_workspace(workspace).await?;
+        Ok(Self::pinned_activation_from_store(store.as_ref(), activation_id).await)
+    }
+
+    pub async fn pinned_activation_for_project_workspace(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+        activation_id: &str,
+    ) -> SkillResult<Option<SkillActivationSelection>> {
+        let store = self
+            .store_for_project_workspace(project_id, project_home, workspace)
+            .await?;
+        Ok(Self::pinned_activation_from_store(store.as_ref(), activation_id).await)
+    }
+
+    async fn pinned_activation_from_store(
+        store: &SkillStore,
+        activation_id: &str,
+    ) -> Option<SkillActivationSelection> {
         let pinned = store.pinned_activation_skills(activation_id).await;
         let catalog_entries = store.pinned_activation_catalog_entries(activation_id).await;
-        Ok(pinned
+        pinned
             .zip(catalog_entries)
             .map(|((skills, descriptor), catalog_entries)| {
                 let chars = skills
@@ -767,7 +898,7 @@ impl SkillManager {
                     },
                     descriptor,
                 }
-            }))
+            })
     }
 
     pub async fn release_activation_for_workspace(
@@ -1237,5 +1368,113 @@ mod tests {
             );
         }
         assert_eq!(owners, 1, "coordinator must prevent duplicate scope owners");
+    }
+
+    #[tokio::test]
+    async fn project_home_and_workspace_are_distinct_overlay_sources() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_skills = directory.path().join("data/skills");
+        let project_home = directory.path().join("projects/project-1");
+        let workspace = directory.path().join("workspace");
+        let project_skill = project_home.join("skills/shared");
+        let workspace_skill = workspace.join(".bamboo/skills/shared");
+        fs::create_dir_all(&project_skill)
+            .await
+            .expect("project skill root");
+        fs::create_dir_all(&workspace_skill)
+            .await
+            .expect("workspace skill root");
+        fs::write(
+            project_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: project shared\n---\nProject prompt.\n",
+        )
+        .await
+        .expect("project skill");
+        fs::write(
+            workspace_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: workspace overlay\n---\nWorkspace prompt.\n",
+        )
+        .await
+        .expect("workspace skill");
+
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir: data_skills,
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize");
+        let project_id = bamboo_domain::ProjectId::parse("project-1").expect("project id");
+        let project_only = manager
+            .workflow_catalog_for_project_workspace(&project_id, &project_home, None)
+            .await
+            .expect("project catalog");
+        assert_eq!(
+            project_only
+                .entries
+                .iter()
+                .find(|entry| entry.id == "shared")
+                .expect("project entry")
+                .source,
+            WorkflowSource::Project
+        );
+
+        let overlaid = manager
+            .workflow_catalog_for_project_workspace(&project_id, &project_home, Some(&workspace))
+            .await
+            .expect("overlay catalog");
+        let winner = overlaid
+            .entries
+            .iter()
+            .find(|entry| entry.id == "shared")
+            .expect("overlay entry");
+        assert_eq!(winner.source, WorkflowSource::Workspace);
+        assert_eq!(winner.shadowed_candidates.len(), 1);
+        assert_eq!(
+            winner.shadowed_candidates[0].source,
+            WorkflowSource::Project
+        );
+
+        let selected = vec!["shared".to_string()];
+        let project_activation = manager
+            .resolve_and_pin_activation_in_project_workspace_with_mode_and_budget(
+                &project_id,
+                &project_home,
+                None,
+                "project-activation",
+                &BTreeSet::new(),
+                Some(&selected),
+                None,
+                Some("shared"),
+                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await
+            .expect("project activation");
+        assert_eq!(project_activation.skills[0].description, "project shared");
+        assert_eq!(
+            project_activation.catalog_entries[0].source,
+            WorkflowSource::Project
+        );
+
+        let workspace_activation = manager
+            .resolve_and_pin_activation_in_project_workspace_with_mode_and_budget(
+                &project_id,
+                &project_home,
+                Some(&workspace),
+                "workspace-activation",
+                &BTreeSet::new(),
+                Some(&selected),
+                None,
+                Some("shared"),
+                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await
+            .expect("workspace activation");
+        assert_eq!(
+            workspace_activation.skills[0].description,
+            "workspace overlay"
+        );
+        assert_eq!(
+            workspace_activation.catalog_entries[0].source,
+            WorkflowSource::Workspace
+        );
     }
 }

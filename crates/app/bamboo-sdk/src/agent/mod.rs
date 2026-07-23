@@ -107,6 +107,8 @@ pub struct Agent {
     /// Effective configured model used only when creating a new session. This
     /// must not alter an existing caller-supplied session during execution.
     session_model: Option<String>,
+    /// Default first-class Project membership for newly-created/unassigned sessions.
+    project_id: Option<bamboo_domain::ProjectId>,
     /// Concrete session-index handle, present only when assembled via
     /// [`AgentBuilder::with_defaults_for_data_dir`]. Backs
     /// [`list_sessions`](Self::list_sessions) — the type-erased
@@ -134,6 +136,7 @@ impl Agent {
             system_prompt: None,
             model: None,
             session_model: None,
+            project_id: None,
             session_store: None,
             permission_checker: None,
         }
@@ -146,6 +149,7 @@ impl Agent {
         system_prompt: Option<String>,
         model: Option<String>,
         session_model: Option<String>,
+        project_id: Option<bamboo_domain::ProjectId>,
         session_store: Option<Arc<bamboo_storage::SessionStoreV2>>,
         permission_checker: Option<Arc<dyn bamboo_tools::permission::PermissionChecker>>,
     ) -> Self {
@@ -154,6 +158,7 @@ impl Agent {
             system_prompt,
             model,
             session_model,
+            project_id,
             session_store,
             permission_checker,
         }
@@ -339,6 +344,11 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
+        if session.project_id_meta().is_none() {
+            if let Some(project_id) = self.project_id.as_ref() {
+                session.set_project_id_meta(project_id.to_string());
+            }
+        }
         // If `answer()` just approved a gated tool call, `session.metadata` carries
         // the re-execution marker `submit_pending_response` set — the gated tool
         // never actually ran (the permission gate intercepted it before
@@ -706,7 +716,11 @@ impl Agent {
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .ok_or(SdkError::ModelNotConfigured)?;
-        Ok(Session::new(session_id.into(), model.to_string()))
+        let mut session = Session::new(session_id.into(), model.to_string());
+        if let Some(project_id) = self.project_id.as_ref() {
+            session.set_project_id_meta(project_id.to_string());
+        }
+        Ok(session)
     }
 
     /// List every session in the data directory, most-recently-updated first.
@@ -1181,6 +1195,7 @@ mod approval_and_session_tests {
             // Reuse the inner engine agent — only the SDK-level session_store
             // handle is what `list_sessions` checks.
             agent.inner.clone(),
+            None,
             None,
             None,
             None,

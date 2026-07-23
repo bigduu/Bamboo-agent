@@ -112,6 +112,46 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .route("/sessions", web::get().to(agent::sessions::list_sessions))
         .route("/sessions", web::post().to(agent::sessions::create_session))
+        // First-class Project registry. Register the literal migration route
+        // before `/{id}` so it cannot be captured as a Project id.
+        .route(
+            "/projects/migrations/legacy/dry-run",
+            web::post().to(agent::projects::legacy_dry_run),
+        )
+        .route(
+            "/projects/{project_id}/migrations/legacy-memory",
+            web::post().to(agent::projects::migrate_legacy_memory),
+        )
+        .route(
+            "/projects/{project_id}/migrations/legacy-memory",
+            web::get().to(agent::projects::legacy_memory_migration_status),
+        )
+        .route("/projects", web::get().to(agent::projects::list_projects))
+        .route("/projects", web::post().to(agent::projects::create_project))
+        .route(
+            "/projects/{project_id}",
+            web::get().to(agent::projects::get_project),
+        )
+        .route(
+            "/projects/{project_id}",
+            web::patch().to(agent::projects::patch_project),
+        )
+        .route(
+            "/projects/{project_id}/workspaces",
+            web::post().to(agent::projects::bind_workspace),
+        )
+        .route(
+            "/projects/{project_id}/workspaces",
+            web::delete().to(agent::projects::unbind_workspace),
+        )
+        .route(
+            "/projects/{project_id}/resources",
+            web::get().to(agent::projects::project_resources),
+        )
+        .route(
+            "/projects/{project_id}/archive",
+            web::post().to(agent::projects::archive_project),
+        )
         .route(
             "/sessions/cleanup",
             web::post().to(agent::sessions::cleanup_sessions),

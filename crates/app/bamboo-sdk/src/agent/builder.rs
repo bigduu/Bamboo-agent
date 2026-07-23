@@ -50,6 +50,97 @@ use super::Agent;
 /// Default metrics retention window (days), mirroring `MetricsService::new`.
 const DEFAULT_METRICS_RETENTION_DAYS: u32 = 90;
 
+struct SdkProjectContextSource {
+    store: Arc<bamboo_projects::ProjectStore>,
+}
+
+#[async_trait::async_trait]
+impl bamboo_engine::project_context::ProjectContextSource for SdkProjectContextSource {
+    async fn find_project(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+    ) -> Result<
+        Option<bamboo_engine::project_context::ProjectDescriptor>,
+        bamboo_engine::project_context::ProjectContextError,
+    > {
+        let manifest = match self.store.get(project_id) {
+            Ok(project) => project,
+            Err(bamboo_projects::ProjectStoreError::NotFound(_)) => return Ok(None),
+            Err(error) => {
+                return Err(bamboo_engine::project_context::ProjectContextError::Source(
+                    error.to_string(),
+                ));
+            }
+        };
+        let resources = self.store.resource_summary(project_id).map_err(|error| {
+            bamboo_engine::project_context::ProjectContextError::Source(error.to_string())
+        })?;
+        let roots = self
+            .store
+            .project_memory_read_roots(project_id)
+            .map_err(|error| {
+                bamboo_engine::project_context::ProjectContextError::Source(error.to_string())
+            })?;
+        Ok(Some(bamboo_engine::project_context::ProjectDescriptor {
+            id: manifest.id.clone(),
+            name: manifest.name,
+            home: self.store.paths().project_home(project_id),
+            workspace_bindings: manifest.workspace_bindings,
+            resources,
+            memory_read_roots: bamboo_engine::project_context::ProjectMemoryReadRoots {
+                primary: roots.primary,
+                legacy_aliases: roots
+                    .legacy_aliases
+                    .into_iter()
+                    .map(
+                        |root| bamboo_memory::memory_store::LegacyProjectMemoryReadRoot {
+                            project_key: root.legacy_project_key,
+                            root: root.root,
+                        },
+                    )
+                    .collect(),
+            },
+        }))
+    }
+
+    async fn list_projects(
+        &self,
+    ) -> Result<
+        Vec<bamboo_engine::project_context::ProjectDescriptor>,
+        bamboo_engine::project_context::ProjectContextError,
+    > {
+        let ids = self
+            .store
+            .list()
+            .map_err(|error| {
+                bamboo_engine::project_context::ProjectContextError::Source(error.to_string())
+            })?
+            .into_iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        let mut projects = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(project) = self.find_project(&id).await? {
+                projects.push(project);
+            }
+        }
+        Ok(projects)
+    }
+
+    async fn find_workspace_owner(
+        &self,
+        workspace: &std::path::Path,
+    ) -> Result<Option<bamboo_domain::ProjectId>, bamboo_engine::project_context::ProjectContextError>
+    {
+        self.store
+            .find_workspace_owner_for_path(&bamboo_config::paths::path_to_display_string(workspace))
+            .map(|owner| owner.map(|project| project.id))
+            .map_err(|error| {
+                bamboo_engine::project_context::ProjectContextError::Source(error.to_string())
+            })
+    }
+}
+
 /// Ergonomic builder for [`Agent`].
 ///
 /// Holds the configured instruction (system-prompt fragment), tool set, model,
@@ -72,6 +163,9 @@ pub struct AgentBuilder {
     /// Kept separate from `model` so adding session ergonomics does not start
     /// overwriting caller-supplied session models during execution.
     session_model: Option<String>,
+    /// Stable Project membership applied to newly-created or still-unassigned
+    /// sessions. Existing membership is never overwritten by execution.
+    project_id: Option<String>,
     /// Provider to select (e.g. `anthropic`, `openai`, `gemini`, `copilot`,
     /// `bodhi`) in `with_defaults_for_data_dir`, overriding `config.json`'s
     /// `provider`. `None` keeps the configured default.
@@ -102,6 +196,8 @@ pub struct AgentBuilder {
     /// which need the concrete `SessionStoreV2` rather than the type-erased
     /// `Arc<dyn Storage>` the engine builder takes.
     session_store: Option<Arc<SessionStoreV2>>,
+    project_store: Option<Arc<bamboo_projects::ProjectStore>>,
+    project_sessions: Option<bamboo_engine::SessionRepository>,
 }
 
 impl AgentBuilder {
@@ -113,6 +209,7 @@ impl AgentBuilder {
             tools: None,
             model: None,
             session_model: None,
+            project_id: None,
             provider_name: None,
             api_key: None,
             mcp_servers: Vec::new(),
@@ -123,6 +220,8 @@ impl AgentBuilder {
             assembled_config: None,
             assembled_mcp_tools: None,
             session_store: None,
+            project_store: None,
+            project_sessions: None,
         }
     }
 
@@ -131,6 +230,14 @@ impl AgentBuilder {
     /// Set the primary model.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Bind sessions created by this SDK facade to a first-class Project.
+    /// The opaque id is preserved as supplied; execution only fills missing
+    /// membership and never silently reassigns an existing session.
+    pub fn project_id(mut self, project_id: impl Into<String>) -> Self {
+        self.project_id = Some(project_id.into());
         self
     }
 
@@ -462,6 +569,21 @@ impl AgentBuilder {
                 .map_err(|e| SdkError::StoreInit(e.to_string()))?,
         );
         let persistence = Arc::new(LockedSessionStore::new(store.clone()));
+        let project_store = Arc::new(
+            bamboo_projects::ProjectStore::open(&data_dir)
+                .map_err(|error| SdkError::ProjectStoreInit(error.to_string()))?,
+        );
+        let project_context_resolver =
+            Arc::new(bamboo_engine::project_context::ProjectContextResolver::new(
+                Arc::new(SdkProjectContextSource {
+                    store: project_store.clone(),
+                }),
+            ));
+        let project_sessions = bamboo_engine::SessionRepository::new(
+            Default::default(),
+            store.clone(),
+            persistence.clone(),
+        );
 
         // 4. Skill manager.
         let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
@@ -481,6 +603,8 @@ impl AgentBuilder {
             MetricsCollector::spawn(metrics_storage, DEFAULT_METRICS_RETENTION_DAYS);
 
         self.session_store = Some(store.clone());
+        self.project_store = Some(project_store);
+        self.project_sessions = Some(project_sessions);
         self.assembled_config = Some(assembled_config.clone());
         self.assembled_mcp_tools = mcp_tools;
         self.inner = self
@@ -490,6 +614,7 @@ impl AgentBuilder {
             .attachment_reader(store)
             .skill_manager(skill_manager)
             .metrics_collector(metrics_collector)
+            .project_context_resolver(project_context_resolver)
             .config(assembled_config);
         if let Some(provider) = provider {
             self.inner = self.inner.provider(provider);
@@ -542,14 +667,34 @@ impl AgentBuilder {
         } else if let Some(executor) = self.default_tools_override.take() {
             self.inner = self.inner.default_tools(executor);
         } else if let Some(config) = effective_config {
-            let builtin_tools: Arc<dyn ToolExecutor> = match self.permission_checker.clone() {
-                Some(checker) => Arc::new(
+            let builtin_tools = match self.permission_checker.clone() {
+                Some(checker) => {
                     bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
                         config, checker,
-                    ),
-                ),
-                None => Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_config(config)),
+                    )
+                }
+                None => bamboo_tools::BuiltinToolExecutor::new_with_config(config),
             };
+            if let (Some(sessions), Some(projects)) =
+                (self.project_sessions.clone(), self.project_store.clone())
+            {
+                if !builtin_tools.registry().unregister("Workspace") {
+                    return Err(SdkError::Build(
+                        "default Workspace tool was unavailable for Project-aware replacement"
+                            .to_string(),
+                    ));
+                }
+                builtin_tools
+                    .register_tool(bamboo_server_tools::ProjectWorkspaceTool::new(
+                        sessions.clone(),
+                        projects.clone(),
+                    ))
+                    .map_err(|error| SdkError::Build(error.to_string()))?;
+                builtin_tools
+                    .register_tool(bamboo_server_tools::ProjectTool::new(sessions, projects))
+                    .map_err(|error| SdkError::Build(error.to_string()))?;
+            }
+            let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(builtin_tools);
             let executor: Arc<dyn ToolExecutor> = match self.assembled_mcp_tools.take() {
                 Some(mcp_tools) => Arc::new(CompositeToolExecutor::new(builtin_tools, mcp_tools)),
                 None => builtin_tools,
@@ -557,6 +702,32 @@ impl AgentBuilder {
             self.inner = self.inner.default_tools(executor);
         }
 
+        let project_id = self
+            .project_id
+            .map(|value| {
+                let normalized = value.trim().to_string();
+                normalized
+                    .parse::<bamboo_domain::ProjectId>()
+                    .map_err(|_| SdkError::InvalidProjectId(value))
+            })
+            .transpose()?;
+        if project_id.is_some() && self.project_store.is_none() {
+            return Err(SdkError::Unsupported(
+                "Project identity requires with_defaults_for_data_dir so the Project store, resolver, and Project-aware tools share one authority"
+                    .to_string(),
+            ));
+        }
+        if let (Some(store), Some(project_id)) = (self.project_store.as_ref(), project_id.as_ref())
+        {
+            let project = store
+                .get(project_id)
+                .map_err(|error| SdkError::ProjectUnavailable(error.to_string()))?;
+            if project.status != bamboo_domain::ProjectStatus::Active {
+                return Err(SdkError::ProjectUnavailable(format!(
+                    "Project {project_id} is archived"
+                )));
+            }
+        }
         let runtime = self
             .inner
             .build()
@@ -566,6 +737,7 @@ impl AgentBuilder {
             self.system_prompt,
             self.model,
             self.session_model,
+            project_id,
             self.session_store,
             self.permission_checker,
         ))
@@ -658,7 +830,8 @@ mod tests {
     use super::{apply_api_key, permission_checker_for_mode, AgentBuilder};
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{
-        FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutor, ToolOutcome, ToolResult,
+        FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutionContext, ToolExecutor,
+        ToolOutcome, ToolResult,
     };
     use bamboo_agent_core::{Message, ToolSchema};
     use bamboo_llm::{Config, LLMProvider, LLMStream};
@@ -666,6 +839,22 @@ mod tests {
     use bamboo_tools::ToolRegistry;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    fn execution_context<'a>(
+        session_id: &'a str,
+        tool_call_id: &'a str,
+    ) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+    }
 
     /// `.api_key()` must FABRICATE a usable stanza for each keyed provider when
     /// the config has none — i.e. a key-only JSON deserializes into the provider
@@ -1097,6 +1286,174 @@ mod tests {
                 "test provider must not be called".to_string(),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn defaults_backed_sdk_validates_and_propagates_project_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
+        let project = store.create("SDK Project", None).unwrap();
+        let empty_executor: Arc<dyn ToolExecutor> = Arc::new(
+            bamboo_tools::BuiltinToolExecutor::with_registry(ToolRegistry::new()),
+        );
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .default_tools(empty_executor)
+            .model("test-model")
+            .project_id(project.id.to_string())
+            .with_defaults_for_data_dir(dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let session = agent.new_session("sdk-project-session").unwrap();
+        assert_eq!(session.project_id_meta(), Some(project.id.to_string()));
+    }
+
+    #[test]
+    fn project_identity_without_defaults_backing_fails_closed() {
+        let result = AgentBuilder::new().project_id("project-sdk").build();
+        assert!(matches!(
+            result,
+            Err(super::SdkError::Unsupported(message))
+                if message.contains("with_defaults_for_data_dir")
+        ));
+    }
+
+    #[tokio::test]
+    async fn defaults_backed_sdk_workspace_tool_enforces_project_ownership_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_a = dir.path().join("workspace-a");
+        let workspace_b = dir.path().join("workspace-b");
+        let ephemeral = dir.path().join("ephemeral");
+        std::fs::create_dir_all(&workspace_a).unwrap();
+        std::fs::create_dir_all(&workspace_b).unwrap();
+        std::fs::create_dir_all(&ephemeral).unwrap();
+        let store = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
+        let project_a = store
+            .create_with_bindings(
+                "Project A",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: workspace_a.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        let project_b = store
+            .create_with_bindings(
+                "Project B",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: workspace_b.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .model("test-model")
+            .project_id(project_a.id.to_string())
+            .with_defaults_for_data_dir(dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(
+            agent
+                .inner
+                .default_tools()
+                .list_tools()
+                .iter()
+                .any(|schema| schema.function.name == "Project"),
+            "SDK defaults must expose the same Project contract as the server"
+        );
+
+        let mut session = agent.new_session("sdk-project-workspace").unwrap();
+        session.set_workspace_path_meta(workspace_a.to_string_lossy().into_owned());
+        agent.inner.storage().save_session(&session).await.unwrap();
+        bamboo_agent_core::workspace_state::set_workspace(
+            &session.id,
+            workspace_a.canonicalize().unwrap(),
+        );
+        let call = |id: &str, path: &std::path::Path| ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Workspace".to_string(),
+                arguments: serde_json::json!({"path": path}).to_string(),
+            },
+        };
+        let conflict = agent
+            .inner
+            .default_tools()
+            .execute_with_context(
+                &call("workspace-conflict", &workspace_b),
+                execution_context(&session.id, "workspace-conflict"),
+            )
+            .await
+            .expect("structured conflict result");
+        assert!(!conflict.success);
+        let conflict_value: serde_json::Value =
+            serde_json::from_str(&conflict.result).expect("conflict JSON");
+        assert_eq!(conflict_value["code"], "project_workspace_conflict");
+        assert_eq!(conflict_value["owner_project_id"], project_b.id.to_string());
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&session.id),
+            Some(workspace_a.canonicalize().unwrap()),
+            "rejected SDK call must not mutate runtime workspace"
+        );
+        let persisted = agent
+            .inner
+            .storage()
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.workspace_path_meta(),
+            session.workspace_path_meta()
+        );
+
+        for (id, path, expected_binding) in [
+            (
+                "workspace-same-project",
+                workspace_a.as_path(),
+                "registered",
+            ),
+            ("workspace-ephemeral", ephemeral.as_path(), "unregistered"),
+        ] {
+            let success = agent
+                .inner
+                .default_tools()
+                .execute_with_context(&call(id, path), execution_context(&session.id, id))
+                .await
+                .expect("allowed workspace result");
+            assert!(success.success, "{id}: {}", success.result);
+            let value: serde_json::Value =
+                serde_json::from_str(&success.result).expect("workspace JSON");
+            assert_eq!(value["binding_status"], expected_binding);
+        }
+        let persisted = agent
+            .inner
+            .storage()
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ephemeral_display =
+            bamboo_config::paths::path_to_display_string(&ephemeral.canonicalize().unwrap());
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(ephemeral_display.as_str())
+        );
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&session.id),
+            Some(ephemeral.canonicalize().unwrap())
+        );
     }
 
     #[tokio::test]

@@ -53,6 +53,18 @@ pub enum SdkError {
     )]
     ModelNotConfigured,
 
+    /// A caller supplied a Project id that is not a valid opaque/path-safe id.
+    #[error("invalid Project id: {0}")]
+    InvalidProjectId(String),
+
+    /// The defaults-backed SDK could not open the first-class Project store.
+    #[error("Project store initialization failed: {0}")]
+    ProjectStoreInit(String),
+
+    /// The configured Project is missing or archived in the defaults-backed store.
+    #[error("Project is unavailable: {0}")]
+    ProjectUnavailable(String),
+
     /// `with_defaults_for_data_dir` failed to open the session store at the
     /// given data directory.
     #[error("session store initialization failed: {0}")]

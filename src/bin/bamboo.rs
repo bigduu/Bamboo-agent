@@ -44,6 +44,11 @@ struct Cli {
     #[arg(long)]
     workspace: Option<PathBuf>,
 
+    /// With -p: bind a NEW session to this first-class Project id. Continuing
+    /// an existing session keeps its persisted Project membership.
+    #[arg(long = "project-id")]
+    project_id: Option<String>,
+
     /// With -p: data directory holding config.json (defaults to ~/.bamboo).
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -1404,6 +1409,7 @@ async fn main() {
                 session: cli.session,
                 model: cli.model,
                 workspace: cli.workspace,
+                project_id: cli.project_id,
                 data_dir: bamboo_home_dir,
                 stream_json: cli.stream_json,
                 permission_mode: cli.permission_mode,

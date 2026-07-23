@@ -935,6 +935,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
             format!("{}-run-{}", self.child_id, uuid::Uuid::new_v4()),
             self.model.clone().unwrap_or_default(),
         );
+        if let Some(project_id) = run.project_id.as_ref() {
+            session.set_project_id_meta(project_id.as_str());
+        }
         let mut effective_bypass = self.bypass;
         let mut effective_workspace = self.workspace.clone();
         if let (Some(context), Some(config)) = (

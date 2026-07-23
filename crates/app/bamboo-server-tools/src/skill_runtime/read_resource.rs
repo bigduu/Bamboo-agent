@@ -45,6 +45,11 @@ impl ReadSkillResourceTool {
             access: SkillToolAccess::new(skill_manager, config, session_repo),
         }
     }
+
+    pub fn with_project_store(mut self, project_store: Arc<bamboo_projects::ProjectStore>) -> Self {
+        self.access = self.access.with_project_store(project_store);
+        self
+    }
 }
 
 #[async_trait]

@@ -1074,6 +1074,11 @@ pub struct ConnectPlatformConfig {
     /// which position+type alone cannot always disambiguate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Optional first-class Project id assigned to newly-created sessions from
+    /// this connector. Existing connector sessions keep their persisted
+    /// membership when configuration changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<bamboo_domain::ProjectId>,
     /// Platform adapter selector, e.g. `"telegram"`. Unrecognized values are
     /// skipped (with a startup warning) rather than failing config load —
     /// forward-compatible with future adapters (Feishu/Slack).
@@ -6300,6 +6305,7 @@ mod tests {
     ) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
             id: None,
+            project_id: None,
             platform_type: platform_type.to_string(),
             token: None,
             token_encrypted: Some(token_encrypted.to_string()),
@@ -7039,6 +7045,7 @@ mod tests {
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
             id: None,
+            project_id: None,
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,
@@ -7084,6 +7091,7 @@ mod tests {
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
             id: None,
+            project_id: None,
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,

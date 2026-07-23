@@ -72,6 +72,140 @@ async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
 }
 
 #[actix_web::test]
+async fn assigned_project_workflow_catalog_reports_workspace_then_project_sources() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let project_store = bamboo_projects::ProjectStore::open(data.path()).expect("Project store");
+    let project = project_store
+        .create("Workflow Project", None)
+        .expect("create Project");
+    let project_skills = project_store
+        .paths()
+        .project_home(&project.id)
+        .join("skills");
+    for (id, description) in [
+        ("shared-workflow", "Project shared workflow"),
+        ("project-only", "Project only workflow"),
+    ] {
+        let skill = project_skills.join(id);
+        std::fs::create_dir_all(&skill).expect("Project skill");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: {description}\n---\nPROJECT BODY\n"),
+        )
+        .expect("write Project skill");
+    }
+    let workspace_skill = workspace.path().join(".bamboo/skills/shared-workflow");
+    std::fs::create_dir_all(&workspace_skill).expect("workspace skill");
+    std::fs::write(
+        workspace_skill.join("SKILL.md"),
+        "---\nname: shared-workflow\ndescription: Workspace overlay workflow\n---\nWORKSPACE BODY\n",
+    )
+    .expect("write workspace skill");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut session = bamboo_agent_core::Session::new("project-workflow-session", "test-model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog",
+        actix_web::web::get().to(super::list_workflow_catalog),
+    ))
+    .await;
+    let body: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=project-workflow-session")
+            .to_request(),
+    )
+    .await;
+    let entries = body["entries"].as_array().expect("catalog entries");
+    let shared = entries
+        .iter()
+        .find(|entry| entry["id"] == "shared-workflow")
+        .expect("shared workflow");
+    assert_eq!(shared["description"], "Workspace overlay workflow");
+    assert_eq!(shared["source"], "workspace");
+    let project_only = entries
+        .iter()
+        .find(|entry| entry["id"] == "project-only")
+        .expect("Project workflow");
+    assert_eq!(project_only["source"], "project");
+}
+
+#[actix_web::test]
+async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_skill = workspace.path().join(".bamboo/skills/other-project-secret");
+    std::fs::create_dir_all(&workspace_skill).expect("workspace skill");
+    std::fs::write(
+        workspace_skill.join("SKILL.md"),
+        "---\nname: other-project-secret\ndescription: Other Project Secret\n---\nSECRET BODY\n",
+    )
+    .expect("workspace skill");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session_project = state
+        .project_store
+        .create("Session Project", None)
+        .expect("session Project");
+    let _workspace_owner = state
+        .project_store
+        .create_with_bindings(
+            "Workspace Owner",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("workspace owner");
+    let mut session =
+        bamboo_agent_core::Session::new("cross-project-workflow-session", "test-model");
+    session.set_project_id_meta(session_project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog",
+        actix_web::web::get().to(super::list_workflow_catalog),
+    ))
+    .await;
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=cross-project-workflow-session")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    let body = actix_web::test::read_body(response).await;
+    assert!(
+        !body
+            .windows(b"Other Project Secret".len())
+            .any(|window| window == b"Other Project Secret"),
+        "cross-Project workflow metadata must not be returned"
+    );
+}
+
+#[actix_web::test]
 async fn legacy_api_writes_through_bundle_and_bridges_catalog_event() {
     let data = tempfile::tempdir().expect("data dir");
     let state = actix_web::web::Data::new(

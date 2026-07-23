@@ -573,6 +573,9 @@ async fn snapshot_skill_resources(
 /// let skill = store.get_skill("my-skill").await?;
 /// println!("Skill: {}", skill.name);
 /// ```
+type ProjectWorkspaceStoreKey = (String, PathBuf, Option<PathBuf>);
+type SharedSkillStore = std::sync::Arc<SkillStore>;
+
 pub struct SkillStore {
     store_token: u64,
     /// Serializes publication and observation of the correlated snapshot maps below.
@@ -594,8 +597,11 @@ pub struct SkillStore {
     reload_lock: tokio::sync::Mutex<()>,
     mode_stores: RwLock<HashMap<String, std::sync::Arc<SkillStore>>>,
     workspace_stores: RwLock<HashMap<PathBuf, std::sync::Arc<SkillStore>>>,
+    project_workspace_stores: RwLock<HashMap<ProjectWorkspaceStoreKey, SharedSkillStore>>,
     retained_budget: Arc<RetainedResourceBudget>,
     snapshot_limits: SkillSnapshotLimits,
+    project_home_dir: Option<PathBuf>,
+    workspace_overlay_dir: Option<PathBuf>,
 
     /// Configuration specifying the skills directory path.
     config: SkillStoreConfig,
@@ -635,12 +641,20 @@ impl SkillStore {
         parent.join(format!("skills-{mode}"))
     }
 
-    fn project_skills_dir(project_dir: &Path) -> PathBuf {
-        project_dir.join(".bamboo").join("skills")
+    fn project_home_skills_dir(project_home: &Path) -> PathBuf {
+        project_home.join("skills")
     }
 
-    fn project_skills_mode_dir(project_dir: &Path, mode: &str) -> PathBuf {
-        project_dir.join(".bamboo").join(format!("skills-{mode}"))
+    fn project_home_skills_mode_dir(project_home: &Path, mode: &str) -> PathBuf {
+        project_home.join(format!("skills-{mode}"))
+    }
+
+    fn workspace_skills_dir(workspace: &Path) -> PathBuf {
+        workspace.join(".bamboo").join("skills")
+    }
+
+    fn workspace_skills_mode_dir(workspace: &Path, mode: &str) -> PathBuf {
+        workspace.join(".bamboo").join(format!("skills-{mode}"))
     }
 
     /// Embedded bundles live outside the user-editable global skills directory.
@@ -705,16 +719,30 @@ impl SkillStore {
             });
         }
 
-        if let Some(project_dir) = self.config.project_dir.as_ref() {
+        if let Some(project_home) = self.project_home_dir.as_ref() {
             dirs.push(SkillDiscoveryDir {
-                dir: Self::project_skills_dir(project_dir),
+                dir: Self::project_home_skills_dir(project_home),
                 source: SkillDirectorySource::Project,
                 mode: None,
             });
             if let Some(mode) = active_mode.as_ref() {
                 dirs.push(SkillDiscoveryDir {
-                    dir: Self::project_skills_mode_dir(project_dir, mode),
+                    dir: Self::project_home_skills_mode_dir(project_home, mode),
                     source: SkillDirectorySource::Project,
+                    mode: Some(mode.clone()),
+                });
+            }
+        }
+        if let Some(workspace) = self.workspace_overlay_dir.as_ref() {
+            dirs.push(SkillDiscoveryDir {
+                dir: Self::workspace_skills_dir(workspace),
+                source: SkillDirectorySource::Workspace,
+                mode: None,
+            });
+            if let Some(mode) = active_mode.as_ref() {
+                dirs.push(SkillDiscoveryDir {
+                    dir: Self::workspace_skills_mode_dir(workspace, mode),
+                    source: SkillDirectorySource::Workspace,
                     mode: Some(mode.clone()),
                 });
             }
@@ -750,6 +778,7 @@ impl SkillStore {
             SkillDirectorySource::Agents => 2,
             SkillDirectorySource::Global => 3,
             SkillDirectorySource::Project => 4,
+            SkillDirectorySource::Workspace => 5,
         }
     }
 
@@ -787,6 +816,23 @@ impl SkillStore {
         retained_budget: Arc<RetainedResourceBudget>,
         snapshot_limits: SkillSnapshotLimits,
     ) -> Self {
+        let workspace_overlay_dir = config.project_dir.clone();
+        Self::new_with_resource_scope(
+            config,
+            retained_budget,
+            snapshot_limits,
+            None,
+            workspace_overlay_dir,
+        )
+    }
+
+    fn new_with_resource_scope(
+        config: SkillStoreConfig,
+        retained_budget: Arc<RetainedResourceBudget>,
+        snapshot_limits: SkillSnapshotLimits,
+        project_home_dir: Option<PathBuf>,
+        workspace_overlay_dir: Option<PathBuf>,
+    ) -> Self {
         let (catalog_events, _) = tokio::sync::broadcast::channel(128);
         Self {
             store_token: NEXT_SKILL_STORE_TOKEN.fetch_add(1, Ordering::Relaxed),
@@ -802,8 +848,11 @@ impl SkillStore {
             reload_lock: tokio::sync::Mutex::new(()),
             mode_stores: RwLock::new(HashMap::new()),
             workspace_stores: RwLock::new(HashMap::new()),
+            project_workspace_stores: RwLock::new(HashMap::new()),
             retained_budget,
             snapshot_limits,
+            project_home_dir,
+            workspace_overlay_dir,
             config,
         }
     }
@@ -1908,7 +1957,7 @@ impl SkillStore {
                 "cached workflow mode store capacity ({MAX_CACHED_MODE_STORES}) reached"
             )));
         }
-        let store = std::sync::Arc::new(SkillStore::new_with_shared_snapshot_state(
+        let store = std::sync::Arc::new(SkillStore::new_with_resource_scope(
             SkillStoreConfig {
                 skills_dir: self.config.skills_dir.clone(),
                 project_dir: self.config.project_dir.clone(),
@@ -1916,6 +1965,8 @@ impl SkillStore {
             },
             self.retained_budget.clone(),
             self.snapshot_limits,
+            self.project_home_dir.clone(),
+            self.workspace_overlay_dir.clone(),
         ));
         store.load().await?;
         store.start_live_reload();
@@ -2085,9 +2136,96 @@ impl SkillStore {
         Ok(store)
     }
 
+    /// Resolve one stable Project-home publication with an optional current
+    /// workspace overlay.
+    ///
+    /// Precedence is builtin < global/user < Project home < workspace. The
+    /// project id is used only for opaque diagnostics/cache identity; no
+    /// filesystem path is exposed through catalog events.
+    pub async fn skill_store_for_project_workspace(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        project_home: &Path,
+        workspace: Option<&Path>,
+    ) -> SkillResult<std::sync::Arc<SkillStore>> {
+        let project_home = tokio::fs::canonicalize(project_home).await?;
+        let workspace = match workspace {
+            Some(workspace) => Some(tokio::fs::canonicalize(workspace).await?),
+            None => None,
+        };
+        let key = (
+            project_id.to_string(),
+            project_home.clone(),
+            workspace.clone(),
+        );
+        if let Some(store) = self
+            .project_workspace_stores
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+        {
+            return Ok(store);
+        }
+
+        let mut stores = self.project_workspace_stores.write().await;
+        if let Some(store) = stores.get(&key).cloned() {
+            return Ok(store);
+        }
+        if stores.len() >= MAX_CACHED_WORKSPACE_STORES {
+            return Err(SkillError::Storage(format!(
+                "cached Project/workspace store capacity ({MAX_CACHED_WORKSPACE_STORES}) reached"
+            )));
+        }
+
+        let store = std::sync::Arc::new(SkillStore::new_with_resource_scope(
+            SkillStoreConfig {
+                skills_dir: self.config.skills_dir.clone(),
+                project_dir: None,
+                active_mode: self.config.active_mode.clone(),
+            },
+            self.retained_budget.clone(),
+            self.snapshot_limits,
+            Some(project_home),
+            workspace.clone(),
+        ));
+        store.load().await?;
+        store.start_live_reload();
+
+        let scope = match workspace.as_deref() {
+            Some(workspace) => format!(
+                "project:{}:workspace:{:016x}",
+                project_id,
+                stable_workspace_hash(workspace)
+            ),
+            None => format!("project:{project_id}"),
+        };
+        let mut events = store.subscribe_workflow_catalog();
+        let aggregate = self.catalog_events.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(mut event) => {
+                        event.scope = scope.clone();
+                        let _ = aggregate.send(event);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        stores.insert(key, store.clone());
+        Ok(store)
+    }
+
     pub(crate) async fn cached_workspace_stores(&self) -> Vec<std::sync::Arc<SkillStore>> {
         let mut unique = Vec::new();
-        for store in self.workspace_stores.read().await.values() {
+        let workspace_stores = self.workspace_stores.read().await;
+        let project_workspace_stores = self.project_workspace_stores.read().await;
+        for store in workspace_stores
+            .values()
+            .chain(project_workspace_stores.values())
+        {
             if !unique
                 .iter()
                 .any(|existing| std::sync::Arc::ptr_eq(existing, store))
@@ -2119,8 +2257,11 @@ impl SkillStore {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.config.skills_dir.clone())];
-        if let Some(project) = self.config.project_dir.as_ref() {
-            roots.push(project.clone());
+        if let Some(project_home) = self.project_home_dir.as_ref() {
+            roots.push(project_home.clone());
+        }
+        if let Some(workspace) = self.workspace_overlay_dir.as_ref() {
+            roots.push(workspace.clone());
         }
         roots
     }
@@ -2160,14 +2301,28 @@ impl SkillStore {
                 return true;
             }
         }
-        self.config.project_dir.as_ref().is_some_and(|project| {
-            normalized(path)
-                .strip_prefix(normalized(&project.join(".bamboo")).as_ref())
+        let project_match = self.project_home_dir.as_ref().is_some_and(|project_home| {
+            let normalized_path = normalized(path);
+            let normalized_project = normalized(project_home);
+            let relative = normalized_path
+                .strip_prefix(normalized_project.as_ref())
                 .ok()
                 .and_then(|relative| relative.components().next())
-                .and_then(|component| component.as_os_str().to_str())
-                .is_some_and(|name| name == "skills" || name.starts_with("skills-"))
-        })
+                .and_then(|component| component.as_os_str().to_str());
+            relative.is_some_and(|name| name == "skills" || name.starts_with("skills-"))
+        });
+        project_match
+            || self
+                .workspace_overlay_dir
+                .as_ref()
+                .is_some_and(|workspace| {
+                    normalized(path)
+                        .strip_prefix(normalized(&workspace.join(".bamboo")).as_ref())
+                        .ok()
+                        .and_then(|relative| relative.components().next())
+                        .and_then(|component| component.as_os_str().to_str())
+                        .is_some_and(|name| name == "skills" || name.starts_with("skills-"))
+                })
     }
 
     /// Start an OS-backed recursive watcher. Debouncing coalesces editor atomic-renames and
@@ -3199,7 +3354,7 @@ Use this skill for testing.
             .iter()
             .find(|entry| entry.id == "override-skill")
             .expect("catalog entry");
-        assert_eq!(entry.source, WorkflowSource::Project);
+        assert_eq!(entry.source, WorkflowSource::Workspace);
         assert_eq!(entry.shadowed_candidates.len(), 1);
         assert_eq!(entry.shadowed_candidates[0].source, WorkflowSource::User);
     }

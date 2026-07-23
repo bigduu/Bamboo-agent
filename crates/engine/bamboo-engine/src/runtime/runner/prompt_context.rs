@@ -17,9 +17,15 @@ pub(crate) async fn refresh_external_memory_context(
     session: &mut bamboo_agent_core::Session,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
 ) {
-    external_memory::refresh_external_memory_context(session, prompt_memory_flags, runtime_context)
-        .await;
+    external_memory::refresh_external_memory_context(
+        session,
+        prompt_memory_flags,
+        runtime_context,
+        project_context_resolver,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -34,6 +40,25 @@ pub(super) async fn refresh_external_memory_context_with_store(
         memory,
         prompt_memory_flags,
         runtime_context,
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
+    session: &mut bamboo_agent_core::Session,
+    memory: &bamboo_memory::memory_store::MemoryStore,
+    prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) {
+    external_memory::refresh_external_memory_context_with_store_and_resolver(
+        session,
+        memory,
+        prompt_memory_flags,
+        runtime_context,
+        project_context_resolver,
     )
     .await;
 }

@@ -51,12 +51,41 @@ fn test_context(session_id: &str) -> ToolCtx {
 }
 
 fn build_tool(data_dir: &std::path::Path) -> (LedgerTool, Arc<dyn Storage>) {
+    build_tool_with_optional_session(data_dir, None, None)
+}
+
+fn build_tool_for_session(
+    data_dir: &std::path::Path,
+    session: Session,
+    project_store: Option<Arc<bamboo_projects::ProjectStore>>,
+) -> (LedgerTool, Arc<dyn Storage>) {
+    build_tool_with_optional_session(data_dir, Some(session), project_store)
+}
+
+fn build_tool_with_optional_session(
+    data_dir: &std::path::Path,
+    session: Option<Session>,
+    project_store: Option<Arc<bamboo_projects::ProjectStore>>,
+) -> (LedgerTool, Arc<dyn Storage>) {
     let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    if let Some(session) = session {
+        sessions.insert(
+            session.id.clone(),
+            Arc::new(parking_lot::RwLock::new(session)),
+        );
+    }
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
     let session_repo =
         bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);
-    (LedgerTool::new(session_repo, data_dir), storage)
+    let tool = LedgerTool::new(session_repo, data_dir);
+    (
+        match project_store {
+            Some(project_store) => tool.with_project_store(project_store),
+            None => tool,
+        },
+        storage,
+    )
 }
 
 async fn invoke(tool: &LedgerTool, session_id: &str, args: Value) -> Value {
@@ -66,6 +95,137 @@ async fn invoke(tool: &LedgerTool, session_id: &str, args: Value) -> Value {
     };
     assert!(result.success);
     serde_json::from_str(&result.result).unwrap()
+}
+
+#[tokio::test]
+async fn assigned_project_ledger_scope_is_stable_across_workspace_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_one = dir.path().join("workspace-one");
+    let workspace_two = dir.path().join("workspace-two");
+    std::fs::create_dir_all(&workspace_one).unwrap();
+    std::fs::create_dir_all(&workspace_two).unwrap();
+    let project_store = Arc::new(bamboo_projects::ProjectStore::open(dir.path()).unwrap());
+    let project = project_store
+        .create_with_bindings(
+            "Ledger Project",
+            None,
+            vec![
+                bamboo_domain::WorkspaceBinding {
+                    path: workspace_one.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                },
+                bamboo_domain::WorkspaceBinding {
+                    path: workspace_two.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                },
+            ],
+        )
+        .unwrap();
+    let mut session = Session::new("session-1", "test-model");
+    session.set_project_id_meta(format!("  {}  ", project.id));
+    session.set_workspace_path_meta(workspace_one.to_string_lossy().into_owned());
+    let (tool, _) =
+        build_tool_for_session(dir.path(), session.clone(), Some(project_store.clone()));
+
+    let first = invoke(
+        &tool,
+        "session-1",
+        serde_json::json!({
+            "action": "upsert",
+            "scope": "project",
+            "title": "First Project record"
+        }),
+    )
+    .await;
+    assert_eq!(first["data"]["record"]["project_key"], project.id.as_str());
+
+    session.set_workspace_path_meta(workspace_two.to_string_lossy().into_owned());
+    tool.session_repo.save_and_cache(&mut session).await;
+    let second = invoke(
+        &tool,
+        "session-1",
+        serde_json::json!({
+            "action": "upsert",
+            "scope": "project",
+            "title": "Second Project record"
+        }),
+    )
+    .await;
+    assert_eq!(second["data"]["record"]["project_key"], project.id.as_str());
+    let queried = invoke(
+        &tool,
+        "session-1",
+        serde_json::json!({"action": "query", "scope": "project"}),
+    )
+    .await;
+    assert_eq!(queried["matched"], 2);
+    assert!(dir
+        .path()
+        .join("ledger/v1/scopes/projects")
+        .join(project.id.as_str())
+        .join("records")
+        .is_dir());
+    for workspace in [&workspace_one, &workspace_two] {
+        let legacy_key = project_key_from_path(workspace);
+        assert!(!dir
+            .path()
+            .join("ledger/v1/scopes/projects")
+            .join(legacy_key)
+            .exists());
+    }
+}
+
+#[tokio::test]
+async fn ledger_rejects_cross_project_key_and_unassigned_project_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_store = Arc::new(bamboo_projects::ProjectStore::open(dir.path()).unwrap());
+    let project = project_store
+        .create("Assigned Project", None)
+        .expect("create Project");
+    let mut assigned = Session::new("session-1", "test-model");
+    assigned.set_project_id_meta(project.id.to_string());
+    let (assigned_tool, _) =
+        build_tool_for_session(dir.path(), assigned, Some(project_store.clone()));
+    let mismatch = assigned_tool
+        .invoke(
+            serde_json::json!({
+                "action": "upsert",
+                "scope": "project",
+                "project_key": "other-project",
+                "title": "Must not write"
+            }),
+            test_context("session-1"),
+        )
+        .await
+        .expect_err("cross-Project key must fail");
+    assert!(mismatch
+        .to_string()
+        .contains("does not match assigned Project"));
+
+    let workspace = dir.path().join("legacy-workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut unassigned = Session::new("session-1", "test-model");
+    unassigned.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+    let (unassigned_tool, _) = build_tool_for_session(dir.path(), unassigned, None);
+    let denied = unassigned_tool
+        .invoke(
+            serde_json::json!({
+                "action": "upsert",
+                "scope": "project",
+                "title": "Must remain read-only"
+            }),
+            test_context("session-1"),
+        )
+        .await
+        .expect_err("unassigned Project write must fail");
+    assert!(denied.to_string().contains("cannot mutate"));
+    assert!(!dir
+        .path()
+        .join("ledger/v1/scopes/projects")
+        .join(project_key_from_path(&workspace))
+        .exists());
 }
 
 #[tokio::test]

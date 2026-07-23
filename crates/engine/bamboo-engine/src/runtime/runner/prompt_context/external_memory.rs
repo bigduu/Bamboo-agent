@@ -1,6 +1,6 @@
-use std::path::Path;
 use std::sync::Arc;
 
+use crate::project_context::{ProjectContextResolver, ProjectMemoryScope};
 use crate::runtime::config::PromptMemoryFlags;
 use bamboo_agent_core::{PromptMemoryObservability, Session};
 use bamboo_domain::ledger::LedgerScope;
@@ -8,12 +8,11 @@ use bamboo_llm::LLMProvider;
 use bamboo_memory::budget::{segment_by_granularity_budget, GranularityBudgetItem};
 use bamboo_memory::ledger_store::{AgendaItem, AgendaSnapshot, LedgerStore};
 use bamboo_memory::memory_store::{
-    project_key_from_path, render_memory_freshness_note, select_relevant_memories,
+    render_memory_freshness_note, select_relevant_memories,
     truncate_chars as memory_truncate_chars, FreshnessKind, MemoryRecallCandidate,
     MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallStrategy, MemoryScope, MemoryStore,
     TemporalGranularity,
 };
-use bamboo_tools::tools::workspace_state;
 
 use super::system_sections::strip_existing_prompt_block;
 
@@ -177,29 +176,74 @@ pub(super) async fn refresh_external_memory_context(
     session: &mut Session,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
+    project_context_resolver: Option<&ProjectContextResolver>,
 ) {
     let memory = MemoryStore::with_defaults();
-    refresh_external_memory_context_with_store(
+    refresh_external_memory_context_with_store_and_resolver(
         session,
         &memory,
         prompt_memory_flags,
         runtime_context,
+        project_context_resolver,
     )
     .await;
 }
 
+#[cfg(test)]
 pub(super) async fn refresh_external_memory_context_with_store(
     session: &mut Session,
     memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
+    refresh_external_memory_context_with_store_and_resolver(
+        session,
+        memory,
+        prompt_memory_flags,
+        runtime_context,
+        None,
+    )
+    .await;
+}
+
+pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
+    session: &mut Session,
+    memory: &MemoryStore,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+    project_context_resolver: Option<&ProjectContextResolver>,
+) {
     // Computed each round and cached in a session field (NOT injected into the
     // system message), so a per-round memory change never invalidates the cached
     // system prefix; the request assembler reads the field to build a volatile
     // block.
     let session_id = session.id.clone();
-    let resolved_project_key = resolve_prompt_project_key(session);
+    let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+    let resolved_project_scope = if let Some(resolver) = project_context_resolver {
+        match resolver
+            .resolve_memory_read_scope(session, workspace.as_deref())
+            .await
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    "failed to resolve Project memory read roots: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        resolve_prompt_project_scope(session)
+    };
+    let scoped_memory = resolved_project_scope
+        .as_ref()
+        .map(|scope| scope.scoped_store(memory))
+        .unwrap_or_else(|| memory.clone());
+    let memory = &scoped_memory;
+    let resolved_project_key = resolved_project_scope
+        .as_ref()
+        .map(|scope| scope.key().to_string());
     let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
     let ledger_agenda = if prompt_memory_flags.ledger_agenda {
         load_ledger_agenda_snippet(memory, resolved_project_key.as_deref()).await
@@ -400,19 +444,8 @@ fn render_ledger_agenda_section(snippet: &LedgerAgendaSnippet) -> String {
     section
 }
 
-fn resolve_prompt_project_key(session: &Session) -> Option<String> {
-    session
-        .metadata
-        .get("workspace_path")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(Path::new)
-        .map(project_key_from_path)
-        .or_else(|| {
-            workspace_state::get_workspace(session.id.as_str())
-                .map(|path| project_key_from_path(&path))
-        })
+fn resolve_prompt_project_scope(session: &Session) -> Option<ProjectMemoryScope> {
+    ProjectContextResolver::memory_read_identity_for_session(session)
 }
 
 fn latest_user_query_text(session: &Session) -> Option<String> {

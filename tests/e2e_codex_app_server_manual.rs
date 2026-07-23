@@ -72,6 +72,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
         executor.run(
             RunSpec {
                 assignment: prompt,
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: Some(PermissionPolicyContext {
                     revision: 1,
@@ -118,6 +119,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                     "Again use a shell command to create this exact file outside the workspace, then explain the result: {}",
                     denied_marker.display()
                 ),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: Some(PermissionPolicyContext {
                     revision: 2,

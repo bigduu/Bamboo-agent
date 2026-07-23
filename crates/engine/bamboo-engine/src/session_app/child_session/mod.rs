@@ -160,6 +160,18 @@ pub struct QueuedInjectedMessage {
 
 #[async_trait]
 pub trait ChildSessionPort: Send + Sync {
+    /// Validate and normalize the child's workspace before any child/session
+    /// state is created. Server adapters override this with the authoritative
+    /// Project registry ownership check; non-server embeddings still apply the
+    /// shared confinement resolver.
+    async fn validate_child_workspace(
+        &self,
+        _project_id: Option<&bamboo_domain::ProjectId>,
+        requested_workspace: &str,
+    ) -> Result<String, ChildSessionError> {
+        normalize_child_workspace(requested_workspace)
+    }
+
     async fn load_root_session(&self, root_id: &str) -> Result<Session, ChildSessionError>;
     async fn load_child_for_parent(
         &self,
@@ -177,6 +189,23 @@ pub trait ChildSessionPort: Send + Sync {
         &self,
         child: &mut Session,
     ) -> Result<(), ChildSessionError>;
+    /// Commit the live parent's posture plus a validated workspace when
+    /// reusing a resident. Persistence happens before the runtime workspace is
+    /// published, so a failed save cannot move tools onto an uncommitted path.
+    async fn save_resident_reuse_state(
+        &self,
+        child: &mut Session,
+        workspace: &str,
+    ) -> Result<(), ChildSessionError> {
+        child.workspace = Some(workspace.to_string());
+        child.set_workspace_path_meta(workspace);
+        self.save_child_session_authoritative_flags(child).await?;
+        bamboo_agent_core::workspace_state::publish_resolved_workspace(
+            &child.id,
+            std::path::PathBuf::from(workspace),
+        );
+        Ok(())
+    }
     async fn is_child_running(&self, child_id: &str) -> bool;
     async fn list_children(&self, parent_id: &str) -> Vec<ChildSessionEntry>;
     async fn enqueue_child_run(
@@ -246,6 +275,26 @@ pub trait ChildSessionPort: Send + Sync {
     /// immediately after creation (the index is otherwise eventually
     /// consistent). Failures are ignored by the caller.
     async fn ensure_child_indexed(&self, child_session_id: &str);
+}
+
+fn normalize_child_workspace(requested_workspace: &str) -> Result<String, ChildSessionError> {
+    let requested_workspace = requested_workspace.trim();
+    if requested_workspace.is_empty() {
+        return Err(ChildSessionError::InvalidArguments(
+            "child workspace must be a non-empty path".to_string(),
+        ));
+    }
+    let requested = std::path::PathBuf::from(requested_workspace);
+    if requested.exists() && !requested.is_dir() {
+        return Err(ChildSessionError::InvalidArguments(format!(
+            "child workspace is not a directory: {requested_workspace}"
+        )));
+    }
+    let canonical = requested.canonicalize().unwrap_or(requested);
+    let final_workspace = bamboo_agent_core::workspace_state::resolve_workspace_path(canonical);
+    Ok(bamboo_config::paths::path_to_display_string(
+        &final_workspace,
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -86,6 +86,7 @@ impl PromptManager for DefaultPromptManager {
             session,
             config.prompt_memory_flags,
             None,
+            config.project_context_resolver.as_deref(),
         )
         .await;
     }

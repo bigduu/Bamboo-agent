@@ -187,6 +187,9 @@ pub struct HeadlessArgs {
     pub session: Option<String>,
     pub model: Option<String>,
     pub workspace: Option<PathBuf>,
+    /// First-class Project membership for a newly-created root session.
+    /// Existing sessions retain their persisted membership.
+    pub project_id: Option<String>,
     pub data_dir: PathBuf,
     /// Override the permission mode for this headless run (no interactive
     /// approver exists). One of: `default`, `plan`, `accept-edits`, `dont-ask`,
@@ -237,6 +240,26 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     let state = AppState::new(args.data_dir.clone())
         .await
         .map_err(|e| format!("boot app state: {e}"))?;
+    let requested_project = match args.project_id.as_deref() {
+        Some(raw) => {
+            let value = raw.trim();
+            Some(
+                value
+                    .parse::<bamboo_domain::ProjectId>()
+                    .map_err(|_| format!("invalid --project-id '{raw}'"))?,
+            )
+        }
+        None => None,
+    };
+    if let Some(project_id) = requested_project.as_ref() {
+        let project = state
+            .project_store
+            .get(project_id)
+            .map_err(|error| format!("validate --project-id: {error}"))?;
+        if project.status != bamboo_domain::ProjectStatus::Active {
+            return Err(format!("Project '{project_id}' is archived"));
+        }
+    }
 
     // Headless has no interactive approver, so the default ask-on-high-risk
     // posture strands a tool-using run at the first gated tool. An explicit
@@ -261,20 +284,54 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             if existing.kind != SessionKind::Root {
                 return Err(format!("session '{id}' is not a root session"));
             }
+            if let Some(project_id) = requested_project.as_ref() {
+                let current = match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&existing) {
+                    bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => Some(project_id),
+                    bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+                    bamboo_engine::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+                        return Err(format!(
+                            "session '{id}' carries an invalid Project identity '{raw}': {message}"
+                        ));
+                    }
+                };
+                if current.as_ref() != Some(project_id) {
+                    return Err(format!(
+                        "session '{id}' belongs to Project {}; --project-id cannot reassign it",
+                        current
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "Unassigned".to_string())
+                    ));
+                }
+            }
             id.clone()
         }
         None => {
+            let workspace = args
+                .workspace
+                .clone()
+                .or_else(|| std::env::current_dir().ok());
+            let workspace_display = workspace
+                .as_deref()
+                .map(bamboo_config::paths::path_to_display_string);
+            let workspace = bamboo_server::project_context::validate_workspace_assignment(
+                &state.project_store,
+                requested_project.as_ref(),
+                workspace_display.as_deref(),
+            )
+            .map_err(|error| format!("validate headless workspace: {error}"))?;
             let mut title: String = args.prompt.chars().take(48).collect();
             if title.len() < args.prompt.len() {
                 title.push('…');
             }
             let mut session = Session::new(uuid::Uuid::new_v4().to_string(), String::new());
             session.title = title;
-            session.workspace = args
-                .workspace
-                .clone()
-                .or_else(|| std::env::current_dir().ok())
-                .map(|w| w.to_string_lossy().into_owned());
+            if let Some(project_id) = requested_project.as_ref() {
+                session.set_project_id_meta(project_id.to_string());
+            }
+            session.workspace = workspace
+                .as_deref()
+                .map(bamboo_config::paths::path_to_display_string);
             let id = session.id.clone();
             state
                 .storage

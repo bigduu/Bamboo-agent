@@ -256,7 +256,7 @@ impl Drop for ConnectManager {
 /// doesn't count as a "started" bot for this guard's purposes (so a blank
 /// placeholder entry followed by one real entry still starts the real one).
 /// Unknown platform types are always `true` — `start` skips them anyway.
-fn multi_bot_guard(platforms: &[ConnectPlatformConfig]) -> Vec<bool> {
+pub(crate) fn multi_bot_guard(platforms: &[ConnectPlatformConfig]) -> Vec<bool> {
     let mut seen_valid: std::collections::HashSet<&str> = std::collections::HashSet::new();
     platforms
         .iter()
@@ -274,6 +274,32 @@ fn multi_bot_guard(platforms: &[ConnectPlatformConfig]) -> Vec<bool> {
             seen_valid.insert(platform_cfg.platform_type.as_str())
         })
         .collect()
+}
+
+/// Whether this exact config entry will reach `spawn_platform_tasks`.
+///
+/// Startup metadata (notably Project membership) must use this same predicate,
+/// otherwise a later same-type entry that `multi_bot_guard` suppresses can
+/// overwrite the active bot's platform-scoped metadata.
+pub(crate) fn platform_config_will_start(
+    platform: &ConnectPlatformConfig,
+    guard_allows: bool,
+) -> bool {
+    let non_empty = |field: &Option<String>| {
+        field
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    match platform.platform_type.as_str() {
+        "telegram" => guard_allows && non_empty(&platform.token),
+        "feishu" => {
+            guard_allows
+                && non_empty(&platform.app_id)
+                && non_empty(&platform.app_secret)
+                && resolve_feishu_base_url(platform.domain.as_deref()).is_some()
+        }
+        _ => false,
+    }
 }
 
 /// Pulls inbound events (messages and button-press callbacks, issue #458)
@@ -320,6 +346,7 @@ mod tests {
     fn platform(platform_type: &str, token: Option<&str>) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
             id: None,
+            project_id: None,
             platform_type: platform_type.to_string(),
             token: token.map(str::to_string),
             token_encrypted: None,

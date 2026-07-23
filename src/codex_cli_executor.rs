@@ -2800,6 +2800,7 @@ mod tests {
         fn run_spec(assignment: &str) -> RunSpec {
             RunSpec {
                 assignment: assignment.to_string(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -2810,6 +2811,7 @@ mod tests {
         fn run_spec_with_messages(assignment: &str, messages: Vec<Value>) -> RunSpec {
             RunSpec {
                 assignment: assignment.to_string(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages,

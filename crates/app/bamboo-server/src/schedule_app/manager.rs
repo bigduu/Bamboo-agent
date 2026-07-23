@@ -64,6 +64,8 @@ pub struct ScheduleContext {
     pub account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     pub app_data_dir: Option<std::path::PathBuf>,
     pub trigger_engine: DynTriggerEngine,
+    /// Authoritative Project registry, rechecked when each persisted job fires.
+    pub project_store: Arc<bamboo_projects::ProjectStore>,
     /// Dependencies to start the always-on notification relay (see
     /// `crate::app_state::session_events::ensure_notification_relay`).
     /// Scheduled runs previously never classified events into notifications
@@ -306,7 +308,41 @@ async fn run_schedule_job(
     ctx: ScheduleContext,
     job: ScheduleRunJob,
 ) -> Result<ScheduleRunLifecycleResult, String> {
-    let resolved = (ctx.resolve_run_config)(&job);
+    validate_schedule_project_at_fire(&ctx.project_store, &job.run_config)?;
+    let mut resolved = (ctx.resolve_run_config)(&job);
+    let final_workspace = crate::project_context::validate_workspace_assignment(
+        &ctx.project_store,
+        job.run_config.project_id.as_ref(),
+        resolved.workspace_path.as_deref(),
+    )
+    .map_err(|error| format!("validate schedule workspace at execution time: {error}"))?;
+    resolved.workspace_path = final_workspace
+        .as_deref()
+        .map(bamboo_config::paths::path_to_display_string);
+    let binding_status = match (
+        job.run_config.project_id.as_ref(),
+        final_workspace.as_deref(),
+    ) {
+        (Some(project_id), Some(workspace)) => {
+            let workspace = bamboo_config::paths::path_to_display_string(workspace);
+            if ctx
+                .project_store
+                .find_workspace_owner_for_path(&workspace)
+                .map_err(|error| format!("resolve schedule workspace owner: {error}"))?
+                .is_some_and(|owner| owner.id == *project_id)
+            {
+                bamboo_engine::project_context::WorkspaceBindingStatus::Registered
+            } else {
+                bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered
+            }
+        }
+        _ => bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered,
+    };
+    resolved.system_prompt = bamboo_engine::runtime::context::upsert_workspace_prompt_context(
+        &resolved.system_prompt,
+        resolved.workspace_path.as_deref(),
+        binding_status,
+    );
     // Primary model is required for a schedule run; the roster stores it as
     // `Option<String>`, so recover the owned String once for the checks/logging
     // below (an absent primary is treated as the old empty-string skip).
@@ -654,6 +690,24 @@ async fn run_schedule_job(
     Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress)
 }
 
+fn validate_schedule_project_at_fire(
+    store: &bamboo_projects::ProjectStore,
+    run_config: &ScheduleRunConfig,
+) -> Result<(), String> {
+    let Some(project_id) = run_config.project_id.as_ref() else {
+        return Ok(());
+    };
+    match store.get(project_id) {
+        Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => Ok(()),
+        Ok(_) => Err(format!(
+            "schedule Project is archived at execution time: {project_id}"
+        )),
+        Err(error) => Err(format!(
+            "schedule Project is unavailable at execution time ({project_id}): {error}"
+        )),
+    }
+}
+
 /// Build a [`ScheduleContext`] with server-specific config resolution.
 ///
 /// Callers should prefer this over constructing `ScheduleContext` directly
@@ -675,6 +729,7 @@ pub fn build_schedule_context(
         account_feed_inbox: base.account_feed_inbox,
         app_data_dir: base.app_data_dir,
         trigger_engine: base.trigger_engine,
+        project_store: base.project_store,
         persistence: base.persistence,
         notification_relay: base.notification_relay,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {
@@ -782,8 +837,8 @@ fn resolve_run_config_from_config(
 
 #[cfg(test)]
 mod build_context_tests {
-    use super::resolve_run_config_from_config;
     use super::ScheduleRunJob;
+    use super::{resolve_run_config_from_config, validate_schedule_project_at_fire};
     use bamboo_config::DefaultsConfig;
     use bamboo_config::{OpenAIConfig, ProviderConfigs};
     use bamboo_domain::{ProviderModelRef, ScheduleRunConfig};
@@ -813,6 +868,21 @@ mod build_context_tests {
             claimed_at: chrono::Utc::now(),
             was_catch_up: false,
         }
+    }
+
+    #[test]
+    fn archived_project_is_rejected_when_persisted_schedule_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
+        let project = store.create("Scheduled", None).unwrap();
+        let run_config = ScheduleRunConfig {
+            project_id: Some(project.id.clone()),
+            ..ScheduleRunConfig::default()
+        };
+        assert!(validate_schedule_project_at_fire(&store, &run_config).is_ok());
+        store.archive(&project.id, project.revision).unwrap();
+        let error = validate_schedule_project_at_fire(&store, &run_config).unwrap_err();
+        assert!(error.contains("archived at execution time"));
     }
 
     #[test]

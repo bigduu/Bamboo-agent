@@ -6,6 +6,156 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+enum SkillResourceScope {
+    Project {
+        project_id: bamboo_domain::ProjectId,
+        project_home: PathBuf,
+        workspace: Option<PathBuf>,
+    },
+    Legacy {
+        workspace: Option<PathBuf>,
+    },
+}
+
+impl SkillResourceScope {
+    async fn resolve(config: &AgentLoopConfig, session: &Session) -> Result<Self, String> {
+        let workspace = session.workspace_path_meta().map(PathBuf::from);
+        let Some(resolver) = config.project_context_resolver.as_deref() else {
+            return Ok(Self::Legacy { workspace });
+        };
+        match resolver.resolve(session, workspace.as_deref()).await {
+            Ok(Some(context)) => Ok(Self::Project {
+                project_id: context.project.id,
+                project_home: context.project.home,
+                workspace: context.workspace,
+            }),
+            Ok(None) => Ok(Self::Legacy { workspace }),
+            Err(error) => Err(format!(
+                "Failed to resolve Project workflow resources: {error}"
+            )),
+        }
+    }
+
+    fn workspace(&self) -> Option<&Path> {
+        match self {
+            Self::Project { workspace, .. } | Self::Legacy { workspace } => workspace.as_deref(),
+        }
+    }
+
+    async fn store(
+        &self,
+        skill_manager: &bamboo_skills::SkillManager,
+    ) -> bamboo_skills::SkillResult<std::sync::Arc<bamboo_skills::SkillStore>> {
+        match self {
+            Self::Project {
+                project_id,
+                project_home,
+                workspace,
+            } => {
+                skill_manager
+                    .store_for_project_workspace(project_id, project_home, workspace.as_deref())
+                    .await
+            }
+            Self::Legacy { workspace } => {
+                skill_manager
+                    .store_for_workspace(workspace.as_deref())
+                    .await
+            }
+        }
+    }
+
+    async fn pinned_activation(
+        &self,
+        skill_manager: &bamboo_skills::SkillManager,
+        activation_id: &str,
+    ) -> bamboo_skills::SkillResult<Option<bamboo_skills::SkillActivationSelection>> {
+        match self {
+            Self::Project {
+                project_id,
+                project_home,
+                workspace,
+            } => {
+                skill_manager
+                    .pinned_activation_for_project_workspace(
+                        project_id,
+                        project_home,
+                        workspace.as_deref(),
+                        activation_id,
+                    )
+                    .await
+            }
+            Self::Legacy { workspace } => {
+                skill_manager
+                    .pinned_activation_for_workspace(activation_id, workspace.as_deref())
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_and_pin_activation(
+        &self,
+        skill_manager: &bamboo_skills::SkillManager,
+        activation_id: &str,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+        max_context_tokens: usize,
+    ) -> bamboo_skills::SkillResult<bamboo_skills::SkillActivationSelection> {
+        match self {
+            Self::Project {
+                project_id,
+                project_home,
+                workspace,
+            } => {
+                skill_manager
+                    .resolve_and_pin_activation_in_project_workspace_with_mode_and_budget(
+                        project_id,
+                        project_home,
+                        workspace.as_deref(),
+                        activation_id,
+                        disabled_skill_ids,
+                        selected_skill_ids,
+                        selected_skill_mode,
+                        request_hint,
+                        max_context_tokens,
+                    )
+                    .await
+            }
+            Self::Legacy {
+                workspace: Some(workspace),
+            } => {
+                skill_manager
+                    .resolve_and_pin_activation_in_workspace_with_mode_and_budget(
+                        workspace,
+                        activation_id,
+                        disabled_skill_ids,
+                        selected_skill_ids,
+                        selected_skill_mode,
+                        request_hint,
+                        max_context_tokens,
+                    )
+                    .await
+            }
+            Self::Legacy { workspace: None } => {
+                skill_manager
+                    .resolve_and_pin_activation_for_request_with_mode_and_budget(
+                        activation_id,
+                        disabled_skill_ids,
+                        selected_skill_ids,
+                        selected_skill_mode,
+                        request_hint,
+                        max_context_tokens,
+                    )
+                    .await
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct SkillContextLoadResult {
@@ -49,17 +199,18 @@ pub(super) async fn load_skill_context(
     must_resume_pinned_activation: bool,
 ) -> Result<SkillContextLoadResult, String> {
     if let Some(skill_manager) = config.skill_manager.as_ref() {
+        let resource_scope = SkillResourceScope::resolve(config, session).await?;
+        let workspace = resource_scope.workspace();
         let retained_selection_source = session
             .metadata
             .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY)
             .filter(|source| matches!(source.as_str(), "explicit" | "auto"))
             .cloned();
-        let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
         // Completed activations are released by finalization. Therefore an existing
         // pin identifies a suspended/in-flight continuation even though startup has
         // already replaced the session's prior status with `Initializing`.
-        let mut retained_activation = skill_manager
-            .pinned_activation_for_workspace(session_id, workspace.as_deref())
+        let mut retained_activation = resource_scope
+            .pinned_activation(skill_manager, session_id)
             .await
             .map_err(|error| format!("Failed to inspect retained workflow activation: {error}"))?;
         let persisted_selection_requires_snapshot = retained_selection_source.as_deref()
@@ -116,10 +267,10 @@ pub(super) async fn load_skill_context(
                                 .map_err(|_| "in-flight workflow candidate snapshot is invalid")
                         })?
                 };
-                let store = skill_manager
-                    .store_for_workspace(workspace.as_deref())
+                let store = resource_scope
+                    .store(skill_manager)
                     .await
-                    .map_err(|_| "durable workflow workspace is unavailable")?;
+                    .map_err(|_| "durable workflow resource scope is unavailable")?;
                 store
                     .restore_activation_snapshot(session_id, snapshot)
                     .await
@@ -133,8 +284,8 @@ pub(super) async fn load_skill_context(
                     error,
                 ));
             }
-            retained_activation = skill_manager
-                .pinned_activation_for_workspace(session_id, workspace.as_deref())
+            retained_activation = resource_scope
+                .pinned_activation(skill_manager, session_id)
                 .await
                 .map_err(|error| {
                     format!("Failed to inspect restored workflow activation: {error}")
@@ -169,7 +320,7 @@ pub(super) async fn load_skill_context(
             };
             if !mode_matches || !selection_matches {
                 if let Err(error) = skill_manager
-                    .release_activation_for_workspace(session_id, workspace.as_deref())
+                    .release_activation_for_workspace(session_id, workspace)
                     .await
                 {
                     tracing::warn!(
@@ -189,39 +340,10 @@ pub(super) async fn load_skill_context(
             .unwrap_or(bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS);
         let activation = if let Some(activation) = retained_activation {
             Some(activation)
-        } else if let Some(workspace_path) = workspace.as_deref() {
-            match skill_manager
-                .resolve_and_pin_activation_in_workspace_with_mode_and_budget(
-                    workspace_path,
-                    session_id,
-                    &config.disabled_skill_ids,
-                    config.selected_skill_ids.as_deref(),
-                    config.selected_skill_mode.as_deref(),
-                    Some(request_hint),
-                    max_context_tokens,
-                )
-                .await
-            {
-                Ok(activation) => Some(activation),
-                Err(error) => {
-                    if let Err(release_error) = skill_manager
-                        .release_activation_for_workspace(session_id, Some(workspace_path))
-                        .await
-                    {
-                        tracing::warn!(
-                            "[{}] Failed to clear stale workflow activation: {}",
-                            session_id,
-                            release_error
-                        );
-                    }
-                    return Err(format!(
-                        "Failed to pin immutable workflow activation for this run: {error}. Retry as a new activation after releasing capacity or reducing workflow resources"
-                    ));
-                }
-            }
         } else {
-            match skill_manager
-                .resolve_and_pin_activation_for_request_with_mode_and_budget(
+            match resource_scope
+                .resolve_and_pin_activation(
+                    skill_manager,
                     session_id,
                     &config.disabled_skill_ids,
                     config.selected_skill_ids.as_deref(),
@@ -234,7 +356,7 @@ pub(super) async fn load_skill_context(
                 Ok(activation) => Some(activation),
                 Err(error) => {
                     if let Err(release_error) = skill_manager
-                        .release_activation_for_workspace(session_id, None)
+                        .release_activation_for_workspace(session_id, workspace)
                         .await
                     {
                         tracing::warn!(
@@ -398,8 +520,8 @@ pub(super) async fn load_skill_context(
         let durable_snapshot = if activation.is_some()
             && (selection_source.as_deref() == Some("explicit") || durable_active.is_some())
         {
-            let store = skill_manager
-                .store_for_workspace(workspace.as_deref())
+            let store = resource_scope
+                .store(skill_manager)
                 .await
                 .map_err(|error| format!("Failed to resolve workflow snapshot store: {error}"))?;
             store.export_activation_snapshot(session_id).await

@@ -11,6 +11,7 @@ pub mod tool_names;
 pub mod tool_types;
 
 // Provider/Model first-class types
+pub mod project;
 pub mod provider_catalog;
 pub mod provider_model_ref;
 
@@ -35,6 +36,7 @@ pub mod prompt_markers;
 // Flat re-exports for backward-compatible access
 pub use ledger::*;
 pub use mcp_config::*;
+pub use project::*;
 pub use prompt_markers::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 pub use provider_catalog::*;
 pub use provider_model_ref::ProviderModelRef;

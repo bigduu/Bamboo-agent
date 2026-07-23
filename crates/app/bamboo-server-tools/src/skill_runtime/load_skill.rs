@@ -63,6 +63,11 @@ impl LoadSkillTool {
         }
     }
 
+    pub fn with_project_store(mut self, project_store: Arc<bamboo_projects::ProjectStore>) -> Self {
+        self.access = self.access.with_project_store(project_store);
+        self
+    }
+
     /// Register the permission-wrapped base tool surface used by declared
     /// dynamic context providers. Keeping this explicit prevents arbitrary
     /// shell preprocessing and avoids recursive load_skill/workflow_run calls.
@@ -908,20 +913,8 @@ impl Tool for LoadSkillTool {
                     })?
                     .into_iter()
                     .collect::<Vec<_>>();
-            let session = self
-                .access
-                .session_for_context(Some(session_id))
-                .await
-                .ok_or_else(|| ToolError::Execution(format!("Session '{session_id}' not found")))?;
-            let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
             self.access
-                .skill_manager
-                .pin_current_activation_for_workspace(
-                    session_id,
-                    workspace.as_deref(),
-                    &selected_ids,
-                    skill_mode.as_deref(),
-                )
+                .pin_current_activation(session_id, &selected_ids, skill_mode.as_deref())
                 .await
                 .map_err(|err| {
                     ToolError::Execution(format!(

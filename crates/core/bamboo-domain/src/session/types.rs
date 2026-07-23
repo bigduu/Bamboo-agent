@@ -473,6 +473,8 @@ pub struct PromptSnapshot {
     pub base_system_prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enhancement_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1174,6 +1176,7 @@ mod tests {
         session.prompt_snapshot = Some(PromptSnapshot {
             base_system_prompt: "Base prompt".to_string(),
             enhancement_prompt: Some("Extra guidance".to_string()),
+            project_context: Some("Project ID: 01JPROJECT".to_string()),
             workspace_context: Some("Workspace path: /tmp/ws".to_string()),
             instruction_context: Some("Instruction block".to_string()),
             env_context: Some("Env block".to_string()),

@@ -1202,7 +1202,7 @@ fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
     );
 
     assert_eq!(report.version, "bamboo.runtime-system-prompt.v3");
-    assert_eq!(report.sections.len(), 6);
+    assert_eq!(report.sections.len(), 7);
     assert_eq!(
         session
             .metadata
@@ -1240,7 +1240,7 @@ fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
         .content
         .contains("environment variables were explicitly configured by the user inside Bodhi"));
     let expected_layout = format!(
-        "base_prompt:core_static:static:1:{};workspace_context:environment_workspace:dynamic:1:{};instruction_context:environment_instruction:dynamic:1:{};env_context:environment_configuration:dynamic:1:{};skill_context:skill_metadata:dynamic:1:{};tool_guide_context:capability_tool:dynamic:1:{}",
+        "base_prompt:core_static:static:1:{};project_context:environment_project:static:0:0;workspace_context:environment_workspace:dynamic:1:{};instruction_context:environment_instruction:dynamic:1:{};env_context:environment_configuration:dynamic:1:{};skill_context:skill_metadata:dynamic:1:{};tool_guide_context:capability_tool:dynamic:1:{}",
         base_prompt.len(),
         workspace_context.len(),
         instruction_context.len(),
@@ -1330,8 +1330,9 @@ fn prompt_assembly_report_component_values_match_sections() {
     let report = PromptAssemblyReport::from_sections(sections, &final_prompt);
 
     let expected_lengths = format!(
-        "base={};workspace={};instruction={};env={};skill={};tool_guide={};external_memory={};task_list={};final={}",
+        "base={};project={};workspace={};instruction={};env={};skill={};tool_guide={};external_memory={};task_list={};final={}",
         base_prompt.len(),
+        0,
         workspace_context.len(),
         instruction_context.len(),
         env_context.len(),
@@ -1353,7 +1354,7 @@ fn prompt_assembly_report_component_values_match_sections() {
 
     assert_eq!(
         report.component_flags_value(),
-        "workspace=1;instruction=1;env=1;skill=1;tool_guide=1;external_memory=0;task_list=0"
+        "project=0;workspace=1;instruction=1;env=1;skill=1;tool_guide=1;external_memory=0;task_list=0"
     );
     assert_eq!(report.component_lengths_value(), expected_lengths);
     assert_eq!(report.section_layout_value(), expected_layout);
@@ -1483,4 +1484,115 @@ fn stable_prompt_frame_carries_instructions_and_prefix_messages() {
     assert_eq!(stable.stable_instructions, "Stable instructions");
     assert_eq!(stable.stable_prefix_messages.len(), 1);
     assert_eq!(stable.stable_prefix_messages[0].content, "stable prefix");
+}
+
+#[tokio::test]
+async fn runtime_skill_context_rejects_another_projects_workspace_overlay() {
+    struct CrossProjectSource {
+        descriptor: crate::project_context::ProjectDescriptor,
+        workspace_owner: bamboo_domain::ProjectId,
+    }
+
+    #[async_trait]
+    impl crate::project_context::ProjectContextSource for CrossProjectSource {
+        async fn find_project(
+            &self,
+            project_id: &bamboo_domain::ProjectId,
+        ) -> Result<
+            Option<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            Ok((&self.descriptor.id == project_id).then(|| self.descriptor.clone()))
+        }
+
+        async fn find_workspace_owner(
+            &self,
+            _workspace: &std::path::Path,
+        ) -> Result<Option<bamboo_domain::ProjectId>, crate::project_context::ProjectContextError>
+        {
+            Ok(Some(self.workspace_owner.clone()))
+        }
+    }
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let workspace = directory.path().join("foreign-workspace");
+    let foreign_skill = workspace.join(".bamboo/skills/foreign-only");
+    std::fs::create_dir_all(&foreign_skill).expect("foreign skill");
+    std::fs::write(
+        foreign_skill.join("SKILL.md"),
+        "---\nname: foreign-only\ndescription: MUST NOT LOAD FOREIGN OVERLAY\n---\nFOREIGN BODY\n",
+    )
+    .expect("foreign skill");
+    let session_project = bamboo_domain::ProjectId::parse("session-project").expect("Project id");
+    let workspace_owner =
+        bamboo_domain::ProjectId::parse("workspace-owner").expect("owner Project id");
+    let project_home = directory.path().join("projects/session-project");
+    std::fs::create_dir_all(project_home.join("skills")).expect("Project skills");
+    let descriptor = crate::project_context::ProjectDescriptor {
+        id: session_project.clone(),
+        name: "Session Project".to_string(),
+        home: project_home.clone(),
+        workspace_bindings: Vec::new(),
+        resources: bamboo_domain::ProjectResourceSummary {
+            project_id: session_project.clone(),
+            resource_revision: 1,
+            resources: Vec::new(),
+        },
+        memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
+            primary: project_home.join("memory/v1"),
+            legacy_aliases: Vec::new(),
+        },
+    };
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("global-skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize skills");
+    let resolver = Arc::new(crate::project_context::ProjectContextResolver::new(
+        Arc::new(CrossProjectSource {
+            descriptor,
+            workspace_owner,
+        }),
+    ));
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager),
+        project_context_resolver: Some(resolver),
+        selected_skill_ids: Some(vec!["foreign-only".to_string()]),
+        ..Default::default()
+    };
+    let mut session = Session::new("cross-project-skill", "model");
+    session.set_project_id_meta(session_project.to_string());
+    session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+
+    let error = super::skill_context::load_skill_context(
+        &config,
+        &session,
+        "cross-project-skill",
+        "load foreign-only",
+        false,
+    )
+    .await
+    .expect_err("foreign workspace overlay must fail closed before skill discovery");
+    assert!(error.contains("belongs to Project"));
+    assert!(!error.contains("MUST NOT LOAD FOREIGN OVERLAY"));
+    assert!(!session
+        .metadata
+        .contains_key(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY));
+
+    let mut unassigned = Session::new("unassigned-cross-project-skill", "model");
+    unassigned.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+    let error = super::skill_context::load_skill_context(
+        &config,
+        &unassigned,
+        "unassigned-cross-project-skill",
+        "load foreign-only",
+        false,
+    )
+    .await
+    .expect_err("Unassigned session must not load an owned workspace overlay");
+    assert!(error.contains("but the session is Unassigned"));
+    assert!(!error.contains("MUST NOT LOAD FOREIGN OVERLAY"));
+    assert!(!unassigned
+        .metadata
+        .contains_key(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY));
 }

@@ -80,6 +80,9 @@ pub enum ContextBlockType {
     /// Framework-invariant operating directives folded on top of base.
     CoreDirectives,
     Workspace,
+    /// Per-round Project-shared resource inventory. Project identity itself is
+    /// carried by the stable Project marker in the system prompt.
+    ProjectResources,
     InstructionOverlay,
     ToolGuide,
     SkillContext,
@@ -105,6 +108,7 @@ impl ContextBlockType {
             Self::Base => "base",
             Self::CoreDirectives => "core_directives",
             Self::Workspace => "workspace",
+            Self::ProjectResources => "project_resources",
             Self::InstructionOverlay => "instruction_overlay",
             Self::ToolGuide => "tool_guide",
             Self::SkillContext => "skill_context",

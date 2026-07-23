@@ -229,9 +229,86 @@ fn validate_hms(hour: u8, minute: u8, second: u8) -> Result<(), HttpResponse> {
 pub(super) async fn validate_auto_execute_run_config(
     state: &web::Data<AppState>,
     run_config: &ScheduleRunConfig,
-) -> Result<(), HttpResponse> {
+) -> Result<ScheduleRunConfig, HttpResponse> {
+    let mut normalized = run_config.clone();
+    if let Some(project_id) = run_config.project_id.as_ref() {
+        match state.project_store.get(project_id) {
+            Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => {}
+            Ok(_) => {
+                return Err(HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "project_archived",
+                        "message": "run_config.project_id must reference an active Project"
+                    },
+                    "project_id": project_id,
+                })));
+            }
+            Err(bamboo_projects::ProjectStoreError::NotFound(_)) => {
+                return Err(HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": crate::error::error_value(
+                        "run_config.project_id references a Project that does not exist"
+                    ),
+                    "project_id": project_id,
+                })));
+            }
+            Err(error) => {
+                return Err(HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": crate::error::error_value(format!(
+                        "failed to validate run_config.project_id: {error}"
+                    ))
+                })));
+            }
+        }
+    }
+    normalized.workspace_path = match crate::project_context::validate_workspace_assignment(
+        &state.project_store,
+        run_config.project_id.as_ref(),
+        run_config.workspace_path.as_deref(),
+    ) {
+        Ok(workspace) => workspace
+            .as_deref()
+            .map(bamboo_config::paths::path_to_display_string),
+        Err(crate::project_context::ProjectWorkspaceValidationError::Invalid {
+            code,
+            workspace,
+            message,
+        }) => {
+            return Err(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": code,
+                    "message": message
+                },
+                "workspace": workspace,
+            })));
+        }
+        Err(crate::project_context::ProjectWorkspaceValidationError::Conflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        }) => {
+            return Err(HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_workspace_conflict",
+                    "message": "Workspace belongs to another Project"
+                },
+                "workspace": workspace,
+                "owner_project_id": owner_project_id,
+                "session_project_id": session_project_id,
+            })));
+        }
+        Err(crate::project_context::ProjectWorkspaceValidationError::Store(error)) => {
+            return Err(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value(format!(
+                    "failed to validate run_config.workspace_path: {error}"
+                ))
+            })));
+        }
+    };
     if !run_config.auto_execute {
-        return Ok(());
+        return Ok(normalized);
     }
 
     let has_task = run_config
@@ -254,7 +331,7 @@ pub(super) async fn validate_auto_execute_run_config(
         .filter(|value| !value.is_empty())
         .is_some();
     if has_explicit_model {
-        return Ok(());
+        return Ok(normalized);
     }
 
     let snapshot = state.config.read().await.clone();
@@ -267,7 +344,7 @@ pub(super) async fn validate_auto_execute_run_config(
         })));
     }
 
-    Ok(())
+    Ok(normalized)
 }
 
 #[cfg(test)]

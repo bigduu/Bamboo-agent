@@ -7,6 +7,7 @@ description = "Sub-agent fleet runtime: project-keyed session store, indices, an
 license = "MIT"
 
 [dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

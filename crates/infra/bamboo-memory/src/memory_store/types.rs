@@ -308,7 +308,7 @@ pub struct SessionState {
     pub topics: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryQueryOptions {
     #[serde(default)]
     pub limit: Option<usize>,

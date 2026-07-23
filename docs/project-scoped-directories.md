@@ -1,6 +1,8 @@
-# Project-scoped Bamboo directories
+# Repository-scoped Bamboo directories
 
-Bamboo keeps repository-bound runtime files below the Git project root:
+Bamboo keeps repository-bound runtime files below the Git root. These files
+are the current Workspace overlay; they are not the first-class Project home
+described in [Project identity and shared resources](project-identity.md).
 
 ```text
 <git-root>/.bamboo/

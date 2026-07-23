@@ -2,7 +2,8 @@ use crate::llm_summarizer::LlmSummarizer;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_external_memory_context_block,
-    build_plan_mode_context_block, build_plan_runtime_context_block, build_task_list_context_block,
+    build_plan_mode_context_block, build_plan_runtime_context_block,
+    build_project_resources_context_block, build_task_list_context_block,
 };
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
@@ -161,6 +162,9 @@ fn build_compression_context_blocks(
         blocks.push(block);
     }
     if let Some(block) = build_external_memory_context_block(session) {
+        blocks.push(block);
+    }
+    if let Some(block) = build_project_resources_context_block(session) {
         blocks.push(block);
     }
     // Plan blocks come straight from session state, not reparsed markers.

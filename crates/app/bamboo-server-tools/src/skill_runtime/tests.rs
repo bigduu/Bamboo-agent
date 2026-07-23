@@ -1,4 +1,4 @@
-use super::{LoadSkillTool, ReadSkillResourceTool};
+use super::{LoadSkillTool, ReadSkillResourceTool, SkillToolAccess};
 use bamboo_skills::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
 use bamboo_skills::runtime_metadata::{
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
@@ -1577,4 +1577,83 @@ async fn session_workspace_catalog_selection_and_runtime_roots_are_isolated() {
             serde_json::from_str(&resource.result).expect("resource result json");
         assert_eq!(resource["content"], expected_resource);
     }
+}
+
+#[tokio::test]
+async fn runtime_skill_store_keeps_project_home_across_workspace_switches() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let global_skills = directory.path().join("global-skills");
+    std::fs::create_dir_all(&global_skills).expect("global skills");
+    let project_store =
+        Arc::new(bamboo_projects::ProjectStore::open(directory.path()).expect("Project store"));
+    let project = project_store
+        .create("Runtime Skills", None)
+        .expect("create Project");
+    let project_skill = project_store
+        .paths()
+        .project_home(&project.id)
+        .join("skills/project-shared");
+    std::fs::create_dir_all(&project_skill).expect("Project skill");
+    std::fs::write(
+        project_skill.join("SKILL.md"),
+        "---\nname: project-shared\ndescription: Shared Project runtime skill\n---\nPROJECT_SHARED_RUNTIME\n",
+    )
+    .expect("write Project skill");
+
+    let workspace_one = directory.path().join("workspace-one");
+    let workspace_two = directory.path().join("workspace-two");
+    for (workspace, skill_id) in [
+        (&workspace_one, "workspace-one-only"),
+        (&workspace_two, "workspace-two-only"),
+    ] {
+        let skill = workspace.join(".bamboo/skills").join(skill_id);
+        std::fs::create_dir_all(&skill).expect("workspace skill");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: {skill_id}\ndescription: Workspace runtime skill\n---\n{skill_id}\n"
+            ),
+        )
+        .expect("write workspace skill");
+    }
+
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: global_skills,
+        ..Default::default()
+    }));
+    manager.initialize().await.expect("initialize manager");
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let sessions = Arc::new(dashmap::DashMap::new());
+    let repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
+    let mut session = Session::new("project-runtime-skill", "model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace_one.to_string_lossy().into_owned());
+    repo.save(&mut session)
+        .await
+        .expect("save assigned session");
+    let access = SkillToolAccess::new(
+        manager,
+        Arc::new(RwLock::new(Config::default())),
+        repo.clone(),
+    )
+    .with_project_store(project_store);
+
+    let first = access
+        .skill_store(Some(&session.id))
+        .await
+        .expect("first runtime store");
+    assert!(first.get_skill("project-shared").await.is_ok());
+    assert!(first.get_skill("workspace-one-only").await.is_ok());
+    assert!(first.get_skill("workspace-two-only").await.is_err());
+
+    session.set_workspace_path_meta(workspace_two.to_string_lossy().into_owned());
+    repo.save(&mut session).await.expect("switch workspace");
+    let second = access
+        .skill_store(Some(&session.id))
+        .await
+        .expect("second runtime store");
+    assert!(second.get_skill("project-shared").await.is_ok());
+    assert!(second.get_skill("workspace-one-only").await.is_err());
+    assert!(second.get_skill("workspace-two-only").await.is_ok());
 }

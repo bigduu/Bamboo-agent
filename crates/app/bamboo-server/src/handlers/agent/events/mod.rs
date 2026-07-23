@@ -16,9 +16,10 @@ pub(crate) use stream::Coalescer;
 // child sub-agents are still running (parity with the v1 SSE stream, which does
 // not close on the parent terminal while descendants survive).
 pub(crate) use terminal::{
-    begin_execute_startup, clear_pending_turn, has_running_child, mark_pending_turn,
-    reconcile_abandoned_startup, startup_reconcile_delay, startup_work_id, terminal_event_if_ready,
-    transition_startup_failure_if_owned, ExecuteStartupGuard, StartupFailureTarget,
+    begin_execute_startup, clear_pending_turn, execute_startup_is_in_flight, has_running_child,
+    mark_pending_turn, reconcile_abandoned_startup, startup_reconcile_delay, startup_work_id,
+    terminal_event_if_ready, transition_startup_failure_if_owned, ExecuteStartupGuard,
+    StartupFailureTarget,
 };
 
 #[cfg(test)]

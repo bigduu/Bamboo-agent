@@ -79,7 +79,7 @@ pub(crate) fn begin_execute_startup(state: &AppState, session_id: &str) -> Execu
     }
 }
 
-fn execute_startup_is_in_flight(state: &AppState, session_id: &str) -> bool {
+pub(crate) fn execute_startup_is_in_flight(state: &AppState, session_id: &str) -> bool {
     state
         .execute_startups
         .lock()

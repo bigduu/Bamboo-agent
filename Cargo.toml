@@ -16,6 +16,7 @@ members = [
     "crates/infra/bamboo-skills",
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-plugin",
+    "crates/infra/bamboo-projects",
     "crates/infra/bamboo-permission",
     "crates/infra/bamboo-compression",
     "crates/infra/bamboo-subagent",
@@ -55,6 +56,7 @@ default-members = [
     "crates/infra/bamboo-skills",
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-plugin",
+    "crates/infra/bamboo-projects",
     "crates/infra/bamboo-permission",
     "crates/infra/bamboo-compression",
     "crates/infra/bamboo-subagent",
@@ -233,6 +235,7 @@ bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
 bamboo-skills = { path = "crates/infra/bamboo-skills" }
 bamboo-server-tools = { path = "crates/app/bamboo-server-tools" }
 bamboo-notification = { path = "crates/infra/bamboo-notification" }
+bamboo-projects = { path = "crates/infra/bamboo-projects" }
 
 [profile.release]
 opt-level = 3

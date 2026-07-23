@@ -22,6 +22,9 @@ bamboo-skills = { path = "../../infra/bamboo-skills" }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
 bamboo-tools = { path = "../../engine/bamboo-tools" }
 bamboo-mcp = { path = "../../infra/bamboo-mcp" }
+bamboo-memory = { path = "../../infra/bamboo-memory" }
+bamboo-projects = { path = "../../infra/bamboo-projects" }
+bamboo-server-tools = { path = "../bamboo-server-tools" }
 
 # Async runtime (sync: mpsc/RwLock; rt: tokio::spawn)
 tokio = { version = "1", features = ["sync", "rt"] }

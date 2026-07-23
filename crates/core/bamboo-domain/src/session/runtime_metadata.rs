@@ -40,6 +40,7 @@ pub mod keys {
     pub const TASK_LIST_VERSION: &str = "task_list_version";
     pub const TODO_LIST_VERSION: &str = "todo_list_version";
     pub const WORKSPACE_PATH: &str = "workspace_path";
+    pub const PROJECT_ID: &str = "project_id";
 }
 
 /// Typed view over the well-known runtime metadata keys on a [`Session`].
@@ -95,6 +96,9 @@ pub struct SessionRuntimeMetadata {
     /// Workspace directory recorded for prompt/workspace context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// Stable Project identity. This does not change when the workspace changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 impl SessionRuntimeMetadata {
