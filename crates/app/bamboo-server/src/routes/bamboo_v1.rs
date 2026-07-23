@@ -162,6 +162,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::put().to(settings::put_typed_section),
         )
         .route(
+            "/bamboo/config/sections/{section}/reset",
+            web::post().to(settings::reset_typed_section),
+        )
+        .route(
             "/bamboo/config/credentials",
             web::get().to(settings::list_credentials),
         )
