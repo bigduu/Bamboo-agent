@@ -17,7 +17,8 @@ pub mod agent;
 pub use agent::ExecuteRequestBuilder;
 pub use agent::{
     Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
-    HookToolOutcome, ShellCommandHook, ShellHookEvent,
+    HookToolOutcome, PermissionMode, RuntimeAgent, RuntimeAgentBuilder, SdkError, ShellCommandHook,
+    ShellHookEvent,
 };
 
 // Tool catalog surfaced by `agent::mod`.

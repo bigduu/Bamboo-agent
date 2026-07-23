@@ -5,8 +5,10 @@
 //! policy; the engine assembles the complete system prompt around it at run
 //! time. Library consumers can write:
 //!
-//! ```rust,ignore
-//! use bamboo_agent::agent::Agent;
+//! ```rust,no_run
+//! # use std::path::PathBuf;
+//! use bamboo_sdk::agent::{Agent, Session};
+//! # async fn example(data_dir: PathBuf) -> Result<(), bamboo_sdk::agent::SdkError> {
 //!
 //! let agent = Agent::builder()
 //!     .model("claude-sonnet-4-6")
@@ -16,6 +18,8 @@
 //!
 //! let mut session = Session::new("s1", "claude-sonnet-4-6");
 //! agent.run(&mut session, "investigate X").await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Surface
@@ -74,12 +78,15 @@ pub use bamboo_domain::{
     AgentHookPoint, HookPayload, HookResult, HookToolOutcome, TaskItem, TaskItemStatus, TaskList,
 };
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
-pub use bamboo_engine::{ExecuteRequest, HookRunner, ShellCommandHook, ShellHookEvent};
+pub use bamboo_engine::{
+    Agent as RuntimeAgent, AgentBuilder as RuntimeAgentBuilder, ExecuteRequest, HookRunner,
+    ShellCommandHook, ShellHookEvent,
+};
 pub use bamboo_llm::LLMProvider;
 pub use bamboo_mcp::manager::McpServerManager;
-pub use bamboo_mcp::McpServerConfig;
+pub use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
 pub use bamboo_storage::SessionIndexEntry;
-pub use bamboo_tools::permission::{PermissionChecker, PermissionType};
+pub use bamboo_tools::permission::{PermissionChecker, PermissionMode, PermissionType};
 pub use bamboo_tools::{BuiltinToolExecutor, BuiltinToolExecutorBuilder, ToolOutputManager};
 
 /// Default event-channel buffer used by [`Agent::run`].
@@ -97,6 +104,9 @@ pub struct Agent {
     system_prompt: Option<String>,
     /// Model override applied to the session at `run` time.
     model: Option<String>,
+    /// Effective configured model used only when creating a new session. This
+    /// must not alter an existing caller-supplied session during execution.
+    session_model: Option<String>,
     /// Concrete session-index handle, present only when assembled via
     /// [`AgentBuilder::with_defaults_for_data_dir`]. Backs
     /// [`list_sessions`](Self::list_sessions) — the type-erased
@@ -123,6 +133,7 @@ impl Agent {
             inner,
             system_prompt: None,
             model: None,
+            session_model: None,
             session_store: None,
             permission_checker: None,
         }
@@ -134,6 +145,7 @@ impl Agent {
         inner: bamboo_engine::Agent,
         system_prompt: Option<String>,
         model: Option<String>,
+        session_model: Option<String>,
         session_store: Option<Arc<bamboo_storage::SessionStoreV2>>,
         permission_checker: Option<Arc<dyn bamboo_tools::permission::PermissionChecker>>,
     ) -> Self {
@@ -141,6 +153,7 @@ impl Agent {
             inner,
             system_prompt,
             model,
+            session_model,
             session_store,
             permission_checker,
         }
@@ -185,12 +198,16 @@ impl Agent {
     /// This is how you pass a full conversation / message list: build the
     /// session from your messages, then run it.
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use bamboo_sdk::agent::{Agent, Message, Session};
+    /// # async fn example(agent: &Agent) -> Result<(), bamboo_sdk::agent::AgentError> {
     /// let mut session = Session::new("s1", "claude-sonnet-4-6");
     /// session.add_message(Message::user("hi"));
     /// session.add_message(Message::assistant("hello!", None));
     /// session.add_message(Message::user("now summarize our chat"));
     /// agent.run_session(&mut session).await?; // no extra input appended
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn run_session(&self, session: &mut Session) -> Result<(), AgentError> {
         self.run_session_with_cancel(session, CancellationToken::new())
@@ -294,12 +311,16 @@ impl Agent {
     /// instruction or model: the caller owns the request entirely. Build it with
     /// [`ExecuteRequestBuilder`].
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use bamboo_sdk::agent::{Agent, CancellationToken, ExecuteRequestBuilder, Session};
+    /// # async fn example(agent: &Agent, session: &mut Session) -> Result<(), bamboo_sdk::agent::AgentError> {
     /// let (tx, _rx) = tokio::sync::mpsc::channel(256);
-    /// let req = ExecuteRequestBuilder::new("investigate X", tx, Default::default())
+    /// let req = ExecuteRequestBuilder::new("investigate X", tx, CancellationToken::new())
     ///     .model("claude-sonnet-4-6")
     ///     .build();
-    /// agent.execute(&mut session, req).await?;
+    /// agent.execute(session, req).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn execute(
         &self,
@@ -669,6 +690,25 @@ impl Agent {
     // Session ergonomics
     // ------------------------------------------------------------------
 
+    /// Create a new in-memory session using this agent's configured model.
+    ///
+    /// The explicit [`AgentBuilder::model`] value wins; otherwise an agent
+    /// assembled via [`AgentBuilder::with_defaults_for_data_dir`] captures the
+    /// active provider's effective configured model. Returns
+    /// [`SdkError::ModelNotConfigured`] instead of creating a session with an
+    /// empty model when neither source supplies one. This does not persist the
+    /// session until it is run or explicitly saved.
+    pub fn new_session(&self, session_id: impl Into<String>) -> Result<Session, SdkError> {
+        let model = self
+            .model
+            .as_deref()
+            .or(self.session_model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .ok_or(SdkError::ModelNotConfigured)?;
+        Ok(Session::new(session_id.into(), model.to_string()))
+    }
+
     /// List every session in the data directory, most-recently-updated first.
     ///
     /// Only available when this `Agent` was built via
@@ -686,17 +726,21 @@ impl Agent {
 
     /// Load a session by ID (its full message history + runtime state), or
     /// `Ok(None)` if it doesn't exist.
-    pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>, SdkError> {
-        self.storage()
-            .load_session(session_id)
+    pub async fn load_session(&self, session_id: &str) -> Result<Option<Session>, SdkError> {
+        SessionAccess::load_session(self, session_id)
             .await
-            .map_err(SdkError::Io)
+            .map_err(SdkError::from)
+    }
+
+    /// Compatibility alias for [`load_session`](Self::load_session).
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>, SdkError> {
+        self.load_session(session_id).await
     }
 
     /// The message history for a session, or [`SdkError::SessionNotFound`] if
     /// it doesn't exist.
     pub async fn session_history(&self, session_id: &str) -> Result<Vec<Message>, SdkError> {
-        self.get_session(session_id)
+        self.load_session(session_id)
             .await?
             .map(|session| session.messages)
             .ok_or_else(|| SdkError::SessionNotFound(session_id.to_string()))
@@ -940,7 +984,8 @@ mod approval_and_session_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let agent = build_test_agent(tmp.path().to_path_buf()).await;
 
-        let mut session_a = Session::new("sess-a".to_string(), "claude-test".to_string());
+        let mut session_a = agent.new_session("sess-a").expect("new_session");
+        assert_eq!(session_a.model, "claude-test");
         session_a.add_message(Message::user("hello"));
         agent
             .storage()
@@ -976,10 +1021,35 @@ mod approval_and_session_tests {
         let deleted = agent.delete_session("sess-a").await.expect("delete");
         assert!(deleted);
         assert!(agent
-            .get_session("sess-a")
+            .load_session("sess-a")
             .await
-            .expect("get_session")
+            .expect("load_session")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn new_session_uses_effective_config_model_when_builder_model_is_unset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_json = r#"{
+            "provider": "anthropic",
+            "providers": {
+                "anthropic": { "api_key": "test-key", "model": "configured-model" }
+            }
+        }"#;
+        std::fs::write(tmp.path().join("config.json"), config_json).expect("write config");
+        let agent = AgentBuilder::new()
+            .with_defaults_for_data_dir(tmp.path().to_path_buf())
+            .await
+            .expect("defaults")
+            .build()
+            .expect("build");
+
+        assert!(
+            agent.model.is_none(),
+            "the inferred session model must not become an execution override"
+        );
+        let session = agent.new_session("from-config").expect("configured model");
+        assert_eq!(session.model, "configured-model");
     }
 
     /// A stub `PermissionChecker` that records one-shot grants
@@ -1115,9 +1185,14 @@ mod approval_and_session_tests {
             None,
             None,
             None,
+            None,
         );
         let result = bare.list_sessions().await;
         assert!(matches!(result, Err(SdkError::Unsupported(_))));
+        assert!(matches!(
+            bare.new_session("missing-model"),
+            Err(SdkError::ModelNotConfigured)
+        ));
     }
 }
 
