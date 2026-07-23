@@ -5,8 +5,8 @@
 //! `bamboo-plugin` is an `infra`-layer crate with no access to `AppState`, so
 //! its `LocalPluginInstaller` reference skeleton stops at
 //! `PluginError::NotImplemented` exactly where capability registration needs
-//! `config.json`, `mcp_manager`, `prompt-presets.json`, and
-//! `workflows_dir()`. This type is the real implementation: an ordinary
+//! `config.json`, `mcp_manager`, `prompt-presets.json`, and plugin discovery
+//! roots. This type is the real implementation: an ordinary
 //! downstream `impl PluginInstaller for ServerPluginInstaller` (the trait is
 //! foreign, the type is local — no orphan-rule issue).
 //!
@@ -52,17 +52,10 @@
 //! appeared. Lock ordering is `PLUGIN_OP_LOCK` → `config_io_lock` (never the
 //! reverse) — see [`PLUGIN_OP_LOCK`].
 //!
-//! Narrower, accepted gap: [`ServerPluginInstaller::register_workflows`] does
-//! NOT get the equivalent live re-check that MCP's step does — there is no
-//! `workflows_io_lock` analogous to `config_io_lock` to re-run
-//! `reconcile_exclusive` inside, because workflow files are plain files under
-//! `workflows_dir()`, not a single locked/rewritten document like
-//! `config.json`. So a concurrent NON-plugin write of a same-named workflow
-//! file landing in the window between `existing_workflow_filenames()` and the
-//! actual `fs::write` below could still be clobbered (and then recorded as
-//! plugin-owned, which a later uninstall would incorrectly delete). Deferred:
-//! this is the same class of race the MCP re-check closes, just for a store
-//! that has no equivalent lock to hook into yet.
+//! Plugin workflow markdown is never copied into the user's global workflow
+//! directory. It remains inside the plugin bundle and is discovered in place
+//! by the SkillStore, so plugin install cannot overwrite a same-named user
+//! source and needs no shared workflow-file lock.
 //!
 //! # Crash safety (process killed mid-install)
 //!
@@ -97,23 +90,22 @@
 //!    `config.json`, started.
 //! 2. **Prompts** — rename-on-collision (never refuse), appended to
 //!    `prompt-presets.json`.
-//! 3. **Workflows** — ownership-checked exactly like MCP, copied into
-//!    `workflows_dir()`.
+//! 3. **Workflows** — validated for safe in-place discovery; no shared-store
+//!    copy or ownership mutation.
 //! 4. **Skills** — nothing to register (discovered in place); just recorded.
 //! 5. **Provenance commit** — `installed.json` is only ever upserted after
 //!    steps 0-4 all succeed.
 //!
-//! Steps 1-3 are real, sequential mutations (config write, then file
-//! writes) — NOT a dry-run computed up front — because `PLUGIN_PLAN.md`
+//! Steps 1-2 are real, sequential mutations (config then prompt-store writes)
+//! — NOT a dry-run computed up front — because `PLUGIN_PLAN.md`
 //! requires the ownership pre-checks to run in that exact order against the
 //! LIVE state each step leaves behind. That means a HARD failure at step 2
-//! or 3 (e.g. an MCP conflict is already past, but the workflow conflict
-//! check at step 3 fails) can happen after step 1 already wrote real
-//! entries into `config.json`. [`ServerPluginInstaller::install`] tracks
+//! or the workflow validation in step 3 can happen after step 1 already wrote
+//! real entries into `config.json`. [`ServerPluginInstaller::install`] tracks
 //! every already-applied mutation in an [`InstallRollback`] and, on any hard
 //! failure from steps 1-3, best-effort UNDOES them (removes the mcp entries
 //! it just added and stops any it started, removes the presets it just
-//! appended, deletes the workflow files it just copied) before returning the
+//! appended, and removes services it started) before returning the
 //! error — so a caller's retry starts from a clean slate. Provenance is
 //! never written on a failed path (step 5 is the only place `installed.json`
 //! is touched on success), which is the minimum safety bar even if a rollback
@@ -210,7 +202,6 @@ struct InstallRollback {
     mcp_ids_added: Vec<String>,
     mcp_ids_started: Vec<String>,
     preset_ids_added: Vec<String>,
-    workflow_files_added: Vec<String>,
     /// Service ids this install claimed ownership of (whether or not the
     /// actual `start_service` call succeeded — best-effort, same contract as
     /// `mcp_ids_added`/`mcp_ids_started`).
@@ -317,33 +308,6 @@ impl ServerPluginInstaller {
             plugin_dir,
             platform,
         )
-    }
-
-    /// Every `.md` filename directly under `workflows_dir()` (created if
-    /// missing). Mirrors `handlers::settings::workflows::list_workflows`'s
-    /// listing logic but returns bare filenames for
-    /// [`bamboo_plugin::registry::reconcile_exclusive`].
-    async fn existing_workflow_filenames(&self) -> PluginResult<Vec<String>> {
-        let dir = self.workflows_dir();
-        fs::create_dir_all(&dir).await?;
-        let mut entries = fs::read_dir(&dir).await?;
-        let mut names = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let is_file = entry
-                .file_type()
-                .await
-                .map(|file_type| file_type.is_file())
-                .unwrap_or(false);
-            if !is_file {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".md") {
-                    names.push(name.to_string());
-                }
-            }
-        }
-        Ok(names)
     }
 
     // --- De-registration primitives (shared by upgrade drop-diff, install
@@ -460,9 +424,6 @@ impl ServerPluginInstaller {
         }
         for id in &rollback.preset_ids_added {
             self.remove_prompt_preset(id).await;
-        }
-        for file in &rollback.workflow_files_added {
-            self.remove_workflow_file(file).await;
         }
         for id in &rollback.service_ids_started {
             let _ = self.state.service_manager.stop_service(id).await;
@@ -743,56 +704,79 @@ impl ServerPluginInstaller {
         Ok(actual_ids)
     }
 
-    /// Step 3: Workflows. Same REFUSE-on-conflict shape as MCP.
+    /// Step 3: validate legacy plugin workflows for in-place discovery.
     ///
-    /// Takes `rollback` directly (unlike [`Self::register_prompts`], which
-    /// commits in one atomic file write) because each workflow file is
-    /// copied with a SEPARATE `fs::write` call: if copying the Nth file
-    /// fails, files 1..N-1 are already really on disk, and `rollback` must
-    /// know about them even though this function returns `Err` — recording
-    /// the whole `to_register` list only on a successful `Ok` return (the
-    /// pattern the caller uses for [`Self::register_mcp`]/
-    /// [`Self::register_prompts`]) would lose that partial progress.
-    async fn register_workflows(
+    /// Workflow markdown stays under `<plugin_dir>/workflows`; the SkillStore
+    /// discovers it as a read-only legacy adapter. Nothing is copied into the
+    /// shared global workflows directory, so a plugin filename can never
+    /// conflict with or overwrite a user's own legacy workflow.
+    async fn validate_workflows_in_place(
         &self,
         manifest: &PluginManifest,
         plugin_dir: &Path,
-        previously_owned: &[String],
-        rollback: &mut InstallRollback,
-    ) -> PluginResult<Vec<String>> {
+    ) -> PluginResult<()> {
         if manifest.provides.workflows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let declared: Vec<String> = manifest.provides.workflows.clone();
-        let existing = self.existing_workflow_filenames().await?;
-        let reconciliation = reconcile_exclusive(&declared, &existing, previously_owned);
-        if !reconciliation.foreign_conflicts.is_empty() {
-            return Err(PluginError::Conflict {
-                kind: "workflow",
-                name: reconciliation.foreign_conflicts.join(", "),
-                plugin_id: manifest.id.clone(),
-            });
+        let workflows_dir = plugin_dir.join("workflows");
+        let directory_metadata = fs::symlink_metadata(&workflows_dir).await?;
+        if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+            return Err(PluginError::InvalidManifest(
+                "plugin workflows must live in a real workflows directory".to_string(),
+            ));
+        }
+        let declared: HashSet<&str> = manifest
+            .provides
+            .workflows
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut actual = HashSet::new();
+        let mut entries = fs::read_dir(&workflows_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("md") {
+                continue;
+            }
+            let file_type = entry.file_type().await?;
+            let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
+                return Err(PluginError::InvalidManifest(
+                    "plugin workflow filename must be UTF-8".to_string(),
+                ));
+            };
+            if !file_type.is_file() || file_type.is_symlink() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "workflow '{filename}' must be a regular in-place markdown file"
+                )));
+            }
+            actual.insert(filename);
+        }
+        if actual.len() != declared.len()
+            || !actual.iter().all(|name| declared.contains(name.as_str()))
+        {
+            return Err(PluginError::InvalidManifest(
+                "provides.workflows must declare every workflows/*.md file exactly once"
+                    .to_string(),
+            ));
         }
 
-        let dest_dir = self.workflows_dir();
-        for filename in &reconciliation.to_register {
+        for filename in &manifest.provides.workflows {
             let stem = filename.strip_suffix(".md").unwrap_or(filename);
             if !bamboo_config::paths::is_safe_workflow_name(stem) {
                 return Err(PluginError::InvalidManifest(format!(
                     "workflow filename '{filename}' is not a safe workflow name"
                 )));
             }
-            let source_path = plugin_dir.join("workflows").join(filename);
-            let content = fs::read_to_string(&source_path).await?;
-            fs::write(dest_dir.join(filename), content).await?;
-            // Recorded immediately, not after the whole loop: if a LATER
-            // file in this same call fails, this one is already really on
-            // disk and rollback must know to remove it.
-            rollback.workflow_files_added.push(filename.clone());
+            let source_path = workflows_dir.join(filename);
+            let metadata = fs::symlink_metadata(&source_path).await?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "workflow '{filename}' must be a regular in-place markdown file"
+                )));
+            }
         }
-
-        Ok(reconciliation.to_register)
+        Ok(())
     }
 
     /// **Same-id upgrade ordering** (issue #479 "Install-flow deltas" /
@@ -951,7 +935,10 @@ impl PluginInstaller for ServerPluginInstaller {
                 .iter()
                 .map(|preset| preset.id.clone())
                 .collect(),
-            workflow_filenames: manifest.provides.workflows.clone(),
+            // New workflow publications are discovered in place. Keeping this
+            // legacy copied-file field empty also makes an upgrade clean up
+            // files copied by pre-#561 installs through the drop-diff below.
+            workflow_filenames: Vec::new(),
             service_ids: manifest
                 .provides
                 .services
@@ -985,10 +972,6 @@ impl PluginInstaller for ServerPluginInstaller {
         let previously_owned_mcp = previous
             .as_ref()
             .map(|p| p.registered.mcp_server_ids.clone())
-            .unwrap_or_default();
-        let previously_owned_workflows = previous
-            .as_ref()
-            .map(|p| p.registered.workflow_filenames.clone())
             .unwrap_or_default();
         let previously_owned_services = previous
             .as_ref()
@@ -1071,20 +1054,11 @@ impl PluginInstaller for ServerPluginInstaller {
             }
         };
 
-        // Step 3: Workflows. `register_workflows` records each copied file
-        // into `rollback` itself as it goes (see its doc comment) — a
-        // partial failure partway through a multi-file copy is still fully
-        // rolled back.
-        let workflow_filenames = match self
-            .register_workflows(
-                manifest,
-                plugin_dir,
-                &previously_owned_workflows,
-                &mut rollback,
-            )
-            .await
+        // Step 3: Workflows remain inside the plugin bundle and are discovered
+        // by the shared SkillStore as read-only legacy adapters.
+        let workflow_filenames = match self.validate_workflows_in_place(manifest, plugin_dir).await
         {
-            Ok(files) => files,
+            Ok(()) => Vec::new(),
             Err(error) => {
                 self.abort_install(&rollback, &previous, &manifest.id, &installed_json_path)
                     .await;

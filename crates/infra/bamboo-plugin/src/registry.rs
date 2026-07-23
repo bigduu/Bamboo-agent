@@ -1,8 +1,8 @@
 //! Provenance registry: `~/.bamboo/plugins/installed.json`.
 //!
 //! Records, for each installed plugin, EXACTLY what it registered (which
-//! `mcpServers` ids, which skill dir names, which prompt preset ids, which
-//! workflow filenames) so uninstall/upgrade can precisely undo only what a
+//! `mcpServers` ids, which skill dir names, which prompt preset ids, and any
+//! legacy workflow-copy filenames) so uninstall/upgrade can precisely undo only what a
 //! given plugin added — never touching a user's own hand-added entries that
 //! happen to share a config file with plugin-registered ones.
 //!
@@ -130,7 +130,9 @@ pub struct RegisteredCapabilities {
     /// Ids appended into `prompt-presets.json`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preset_ids: Vec<String>,
-    /// Filenames copied into `bamboo_config::paths::workflows_dir()`.
+    /// Files copied into the global workflow directory by pre-#561 installers.
+    /// New plugin workflows remain in place, so new installs leave this empty;
+    /// the field remains for backward-compatible cleanup during upgrade/remove.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_filenames: Vec<String>,
     /// Ids started via bamboo-server's `ServiceManager` (issue #479, prereq

@@ -433,11 +433,11 @@ async fn upgrade_deregisters_mcp_server_dropped_by_the_new_version() {
 }
 
 // ---------------------------------------------------------------------
-// Workflow ownership: same REFUSE-on-conflict shape as MCP.
+// Legacy plugin workflows: validate and discover in place, never copy.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn foreign_workflow_conflict_refuses_install() {
+async fn plugin_workflow_stays_in_place_and_does_not_conflict_with_user_source() {
     let root = tempfile::tempdir().unwrap();
     let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
 
@@ -472,7 +472,7 @@ async fn foreign_workflow_conflict_refuses_install() {
         .unwrap();
     let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
 
-    let error = installer
+    let entry = installer
         .install(
             &manifest,
             &plugin_dir,
@@ -483,30 +483,28 @@ async fn foreign_workflow_conflict_refuses_install() {
             Utc::now(),
         )
         .await
-        .expect_err("a foreign workflow filename collision must refuse the install");
-    assert!(matches!(
-        error,
-        PluginError::Conflict {
-            kind: "workflow",
-            ..
-        }
-    ));
+        .expect("plugin workflows are isolated in place");
+    assert!(entry.registered.workflow_filenames.is_empty());
 
     // The user's workflow content must be untouched.
     let content = tokio::fs::read_to_string(workflows_dir.join("daily-report.md"))
         .await
         .unwrap();
     assert_eq!(content, "# my own workflow\n");
+    let plugin_content =
+        tokio::fs::read_to_string(plugin_dir.join("workflows").join("daily-report.md"))
+            .await
+            .unwrap();
+    assert_eq!(plugin_content, "# plugin's workflow\n");
 }
 
-/// A manifest can declare 2+ workflows where the SECOND fails
+/// A manifest can declare 2+ workflows where the second fails
 /// `bamboo_config::paths::is_safe_workflow_name`'s stricter charset check
 /// (bamboo-plugin's own manifest validation is looser — it only rejects path
-/// separators/`..`/control chars, not e.g. `!`). This proves that when the
-/// second file's copy fails mid-loop, the FIRST file (already really written
-/// to `workflows_dir()`) is rolled back too — not just the batch as a whole.
+/// separators/`..`/control chars, not e.g. `!`). Validation must fail without
+/// copying either file into the user's global legacy-workflow directory.
 #[tokio::test]
-async fn partial_workflow_copy_failure_rolls_back_the_files_already_written() {
+async fn unsafe_plugin_workflow_name_is_rejected_without_global_writes() {
     let root = tempfile::tempdir().unwrap();
     let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
 
@@ -548,15 +546,61 @@ async fn partial_workflow_copy_failure_rolls_back_the_files_already_written() {
         .expect_err("the second (unsafe-named) workflow must fail registration");
     assert!(matches!(error, PluginError::InvalidManifest(_)));
 
-    // The first file must have been rolled back, not left orphaned.
+    // Neither source is moved or copied into the global legacy directory.
     let workflows_dir = state.app_data_dir.join("workflows");
     assert!(
         !workflows_dir.join("good-one.md").exists(),
-        "the first workflow's copy must be rolled back when the second fails"
+        "plugin workflow must never be copied into the user's legacy directory"
     );
     assert!(!workflows_dir.join("bad!name.md").exists());
+    assert!(plugin_dir.join("workflows/good-one.md").exists());
+    assert!(plugin_dir.join("workflows/bad!name.md").exists());
 
     // And nothing was committed to provenance.
+    assert!(installer.list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn undeclared_plugin_workflow_is_rejected_before_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let plugin_dir = root.path().join("plugins/undeclared-workflow-plugin");
+    tokio::fs::create_dir_all(plugin_dir.join("workflows"))
+        .await
+        .unwrap();
+    tokio::fs::write(plugin_dir.join("workflows/declared.md"), "Declared.\n")
+        .await
+        .unwrap();
+    tokio::fs::write(plugin_dir.join("workflows/hidden.md"), "Undeclared.\n")
+        .await
+        .unwrap();
+    let manifest_json = serde_json::json!({
+        "id": "undeclared-workflow-plugin",
+        "name": "Undeclared Workflow Plugin",
+        "version": "1.0.0",
+        "provides": {"workflows": ["declared.md"]}
+    })
+    .to_string();
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let error = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect_err("undeclared workflow must fail installation");
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(!state.app_data_dir.join("workflows/declared.md").exists());
+    assert!(!state.app_data_dir.join("workflows/hidden.md").exists());
     assert!(installer.list().await.unwrap().is_empty());
 }
 

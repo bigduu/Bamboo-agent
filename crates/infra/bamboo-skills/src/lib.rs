@@ -14,9 +14,9 @@ pub mod types;
 
 pub use activation::*;
 pub use catalog::{
-    ShadowedWorkflowCandidate, WorkflowCatalogEntry, WorkflowCatalogEvent,
-    WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource,
-    WorkflowStatus,
+    LegacyWorkflowMigrationStatus, ShadowedWorkflowCandidate, WorkflowCatalogEntry,
+    WorkflowCatalogEvent, WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind,
+    WorkflowSource, WorkflowStatus,
 };
 pub use store::{
     SkillActivationDescriptor, SkillActivationSnapshot, SkillActivationSnapshotEntry, SkillStore,
@@ -1082,6 +1082,8 @@ mod tests {
                     invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
                     argument_schema: serde_json::json!({"type": "object"}),
                     status: WorkflowStatus::Valid,
+                    legacy: false,
+                    migration_status: None,
                     last_error: None,
                     winner: true,
                     shadowed_candidates: Vec::new(),
@@ -1116,6 +1118,8 @@ mod tests {
                 invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
                 argument_schema: serde_json::json!({"type": "object"}),
                 status: WorkflowStatus::Valid,
+                legacy: false,
+                migration_status: None,
                 last_error: None,
                 winner: true,
                 shadowed_candidates: Vec::new(),

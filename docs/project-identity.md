@@ -42,6 +42,11 @@ commands are shared by all Project sessions; Workspace skills and commands can
 override them. Deterministic workflows remain `workflow.yaml` files inside skill
 bundles—there is no standalone Project `workflows/` directory.
 
+For repository compatibility only, a Workspace may contain legacy read-only
+`.bamboo/workflows/*.md` sources. They can be explicitly cloned into that
+Workspace's `.bamboo/skills/` directory; migration never creates a Project-home
+`workflows/` directory or writes legacy content into Project storage.
+
 Project memory and Dream data are stored in
 `projects/<id>/memory/v1`. Assigned sessions never derive a write scope from a
 workspace path. Legacy unassigned sessions may read old path-derived memory

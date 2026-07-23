@@ -89,8 +89,9 @@ bamboo plugin list --json
 # Upgrade an installed plugin to a new version (same source/trust flags as install)
 bamboo plugin update nova https://github.com/bigduu/Nova/releases/download/v0.3.0/nova-plugin-v0.3.0.tar.gz
 
-# Uninstall — stops/removes its registered MCP servers, prompt presets, and
-# workflow files, then deletes its plugin directory. Confirms unless --yes.
+# Uninstall — stops/removes its registered MCP servers and prompt presets,
+# then deletes its plugin directory (including in-place skills/workflows).
+# Confirms unless --yes.
 bamboo plugin remove nova
 ```
 
@@ -101,7 +102,10 @@ upgrade that removes a capability.
 ## After installing
 
 A plugin's registered MCP servers/prompt presets/skills/workflows are live
-immediately — no restart needed. Check what a plugin registered with
-`bamboo plugin list --json` (the `registered.mcp_server_ids` /
-`preset_ids` / `skill_dirs` / `workflow_filenames` fields), or `bamboo mcp
-status` for its MCP servers specifically.
+immediately — no restart needed. Skills and legacy workflow markdown are
+discovered in place under the plugin directory; workflow files are never copied
+into `~/.bamboo/workflows`. Check registered shared capabilities with
+`bamboo plugin list --json` (the `registered.mcp_server_ids`, `preset_ids`, and
+`skill_dirs` fields), or `bamboo mcp status` for MCP servers specifically.
+`workflow_filenames` is retained only to clean provenance written by older
+installers and is empty for new installs.

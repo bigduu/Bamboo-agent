@@ -12,7 +12,7 @@
 //! | MCP servers | `config.json` (`Config.mcp`) + `mcp_manager.start_server` | copied into shared config |
 //! | Skills | N/A — discovered **in place** | `~/.bamboo/plugins/*/skills` is an additional `SkillDiscoveryDir` (see `bamboo-skills`) |
 //! | Prompt presets | `prompt-presets.json` | copied into shared store |
-//! | Workflows | `~/.bamboo/workflows/*.md` | copied into shared dir (no discovery-dir mechanism exists yet) |
+//! | Legacy workflows | N/A — discovered **in place** | `~/.bamboo/plugins/*/workflows/*.md` is a read-only Skill adapter source |
 //!
 //! This crate defines the shared skeleton three things build on:
 //!

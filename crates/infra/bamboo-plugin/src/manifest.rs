@@ -526,9 +526,9 @@ pub struct PluginProvides {
     pub skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompts: Vec<PluginPromptPreset>,
-    /// `.md` filenames under `<plugin_dir>/workflows/`, copied by the
-    /// installer into `bamboo_config::paths::workflows_dir()` at install time
-    /// (workflows have no discovery-dir mechanism, unlike skills).
+    /// `.md` filenames under `<plugin_dir>/workflows/`. They remain in place
+    /// and are discovered as read-only legacy Skill adapters; installation
+    /// never copies them into a user's global workflow directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<String>,
     /// Long-running services this plugin wants supervised — see

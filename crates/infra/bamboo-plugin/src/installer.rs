@@ -3,7 +3,7 @@
 //! This crate lives at the `infra` layer and has no access to `AppState`
 //! (`bamboo-server`, an `app`-layer crate). Actually registering capabilities
 //! — merging into `config.json`, calling `mcp_manager.start_server`, appending
-//! to `prompt-presets.json`, writing workflow files — all need `AppState` (or
+//! to `prompt-presets.json`, validating in-place workflow publication — all need `AppState` (or
 //! equivalent handles), so a REAL implementation of this trait has to live in
 //! `bamboo-server` (or a sibling crate that depends on it), implemented by a
 //! later agent (see `PLUGIN_PLAN.md` § Installer-core agent). Because the
@@ -25,8 +25,8 @@
 //!
 //! Two invariants make uninstall/upgrade never touch a user's own entries:
 //!
-//! 1. **Only plugin-created entries are ever recorded as removable.** For the
-//!    REFUSE-on-conflict capabilities (MCP servers, workflow files) the
+//! 1. **Only plugin-created entries are ever recorded as removable.** For MCP
+//!    servers, the
 //!    installer MUST run [`crate::registry::reconcile_exclusive`] against the
 //!    live shared store before touching anything: a declared id/filename that
 //!    already exists and is not owned by this plugin lands in
@@ -84,9 +84,9 @@ pub trait PluginInstaller {
     ///
     /// Contract (see the module docs for the full rationale):
     /// - `disposition` decides already-installed handling (fail vs upgrade).
-    /// - MCP-server and workflow collisions with NON-plugin entries MUST be
-    ///   refused ([`PluginError::Conflict`]) via
-    ///   [`crate::registry::reconcile_exclusive`] — never clobbered.
+    /// - MCP-server collisions with non-plugin entries must be refused through
+    ///   [`crate::registry::reconcile_exclusive`]. Workflow markdown remains
+    ///   isolated in place and therefore cannot clobber a user source.
     /// - On upgrade, capabilities the new version dropped MUST be
     ///   de-registered ([`crate::registry::RegisteredCapabilities::removed_since`]).
     /// - The returned [`InstalledPlugin`] must have already been persisted
@@ -102,7 +102,7 @@ pub trait PluginInstaller {
     ) -> PluginResult<InstalledPlugin>;
 
     /// Reverse everything `install` registered for `id` (stop + remove MCP
-    /// servers, remove prompt presets, remove workflow files), then remove
+    /// servers, remove prompt presets, and clean legacy copied workflow files), then remove
     /// the provenance entry and delete `plugin_dir` from disk. Safe by
     /// construction: the provenance `registered` set only ever names
     /// plugin-created entries (invariant 1 in the module docs).
@@ -229,6 +229,40 @@ pub async fn preflight_install(
             )));
         }
     }
+    let workflows_root = plugin_dir.join("workflows");
+    if tokio::fs::try_exists(&workflows_root)
+        .await
+        .unwrap_or(false)
+    {
+        let declared: std::collections::HashSet<&str> = manifest
+            .provides
+            .workflows
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut actual = std::collections::HashSet::new();
+        let mut entries = tokio::fs::read_dir(&workflows_root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
+                return Err(PluginError::InvalidManifest(
+                    "plugin workflow filename must be UTF-8".to_string(),
+                ));
+            };
+            actual.insert(filename);
+        }
+        if actual.len() != declared.len()
+            || !actual.iter().all(|name| declared.contains(name.as_str()))
+        {
+            return Err(PluginError::InvalidManifest(
+                "provides.workflows must declare every workflows/*.md file exactly once"
+                    .to_string(),
+            ));
+        }
+    }
 
     Ok(resolved_mcp_servers)
 }
@@ -348,16 +382,15 @@ impl PluginInstaller for LocalPluginInstaller {
         //      reusing `validate_preset_id` / `ensure_unique_preset_id` — on an
         //      id collision RENAME (don't refuse), and record the RENAMED id as
         //      owned (not the manifest's nominal one).
-        //   3. Workflows: run `reconcile_exclusive` on the workflow filenames
-        //      the same way as MCP (refuse foreign collisions), then copy
-        //      `<plugin_dir>/workflows/<name>.md` into
-        //      `bamboo_config::paths::workflows_dir()/<name>.md` (validate each
-        //      name with `bamboo_config::paths::is_safe_workflow_name`).
+        //   3. Workflows: validate each declared in-place
+        //      `<plugin_dir>/workflows/<name>.md` with
+        //      `bamboo_config::paths::is_safe_workflow_name`. SkillStore
+        //      discovers the files in place; do not copy them globally.
         //   4. Skills: nothing to register (discovered in place). Record the
         //      declared+validated dir names as owned.
         //   5. Only once 0-4 succeed: build the `RegisteredCapabilities`
         //      reflecting exactly what got registered (renamed preset ids, the
-        //      `to_register` mcp/workflow subsets — NOT a blind copy of
+        //      `to_register` MCP subset — NOT a blind copy of
         //      `manifest.provides`), then upsert provenance via
         //      `InstalledPlugins::load` + `.add(..)` + `.save(..)` at
         //      `self.installed_json_path()`.
