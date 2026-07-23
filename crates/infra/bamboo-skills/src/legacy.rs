@@ -413,9 +413,33 @@ async fn ensure_manual_only_policy(target_dir: &Path, manual_only: bool) -> Skil
     if !manual_only {
         return Ok(());
     }
-    let agents = target_dir.join("agents");
-    tokio::fs::create_dir_all(&agents).await?;
-    let policy = agents.join("bamboo.yaml");
+    let target_metadata = tokio::fs::symlink_metadata(target_dir).await?;
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+        return Err(SkillError::Storage(
+            "legacy migration target must be a real directory".to_string(),
+        ));
+    }
+    let canonical_target = tokio::fs::canonicalize(target_dir).await?;
+    let agents = canonical_target.join("agents");
+    match tokio::fs::symlink_metadata(&agents).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(SkillError::Storage(
+                "legacy migration agents directory must be a real directory".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir(&agents).await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let canonical_agents = tokio::fs::canonicalize(&agents).await?;
+    if !canonical_agents.starts_with(&canonical_target) {
+        return Err(SkillError::Storage(
+            "legacy migration agents directory escapes the target bundle".to_string(),
+        ));
+    }
+    let policy = canonical_agents.join("bamboo.yaml");
     match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -430,7 +454,14 @@ async fn ensure_manual_only_policy(target_dir: &Path, manual_only: bool) -> Skil
             file.flush().await?;
             file.sync_all().await?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = tokio::fs::symlink_metadata(&policy).await?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(SkillError::Storage(
+                    "legacy migration policy must be a regular file".to_string(),
+                ));
+            }
+        }
         Err(error) => return Err(error.into()),
     }
     Ok(())
@@ -499,6 +530,14 @@ pub async fn migrate_legacy_markdown_workflow(
     }
     let target_dir = skills_dir.join(id);
     let target = target_dir.join("SKILL.md");
+    match tokio::fs::symlink_metadata(&target_dir).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Ok(LegacyWorkflowMigrationOutcome::Conflict);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     match read_bounded_file(&target, MAX_LEGACY_WORKFLOW_FILE_BYTES).await {
         Ok(existing) => {
             let existing = String::from_utf8(existing).map_err(|_| {
@@ -1260,5 +1299,63 @@ mod tests {
             .await
             .expect("user target kept")
             .contains("Keep me."));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migration_rejects_symlinked_target_and_policy_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workflows = temp.path().join("workspace/.bamboo/workflows");
+        let skills = temp.path().join("workspace/.bamboo/skills");
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&workflows)
+            .await
+            .expect("workflows");
+        tokio::fs::create_dir_all(&skills).await.expect("skills");
+        tokio::fs::create_dir_all(&outside).await.expect("outside");
+        let source = workflows.join("review.md");
+        tokio::fs::write(&source, "Review safely.\n")
+            .await
+            .expect("source");
+
+        symlink(&outside, skills.join("review")).expect("target symlink");
+        let target_conflict = migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            None,
+        )
+        .await
+        .expect("symlink target is a conflict");
+        assert_eq!(target_conflict, LegacyWorkflowMigrationOutcome::Conflict);
+        assert!(!outside.join("SKILL.md").exists());
+        tokio::fs::remove_file(skills.join("review"))
+            .await
+            .expect("remove target symlink");
+
+        migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            Some("Use when reviewing a code change."),
+        )
+        .await
+        .expect("initial migration");
+        symlink(&outside, skills.join("review/agents")).expect("agents symlink");
+        let error = migrate_legacy_markdown_workflow(
+            &source,
+            ".bamboo/workflows/review.md",
+            &skills,
+            "review",
+            None,
+        )
+        .await
+        .expect_err("symlinked agents directory must be rejected");
+        assert!(error.to_string().contains("agents directory"));
+        assert!(!outside.join("bamboo.yaml").exists());
     }
 }
