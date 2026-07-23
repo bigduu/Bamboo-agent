@@ -342,7 +342,7 @@ pub async fn respond(conn: ConnArgs, session_id: &str, answer: &str) -> anyhow::
     if status.as_u16() == 404 {
         anyhow::bail!("session '{session_id}' not found");
     }
-    let error = body.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    let error = server_error_message(&body);
     if status.as_u16() == 400 && error.contains("No pending question") {
         anyhow::bail!(
             "session '{session_id}' has no pending question — nothing to answer \
@@ -581,13 +581,13 @@ pub async fn session_delete(conn: ConnArgs, session_id: &str, yes: bool) -> anyh
         anyhow::bail!("session '{session_id}' not found");
     }
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-    let error = body.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    let error = server_error_message(&body);
     anyhow::bail!(
         "delete failed: HTTP {status}{}",
         if error.is_empty() {
             String::new()
         } else {
-            format!(" ({error})")
+            format!(" {error}")
         }
     );
 }
@@ -1062,10 +1062,17 @@ fn read_json_payload(source: &str) -> anyhow::Result<serde_json::Value> {
     serde_json::from_str(text.trim()).map_err(|e| anyhow::anyhow!("payload is not valid JSON: {e}"))
 }
 
-/// Pull the server's `{"error": "..."}` detail out of an error body, if any.
+/// Pull the server's canonical `{"error":{"message":"..."}}` detail out of
+/// an error body. The flat-string fallback keeps this CLI compatible with
+/// older Bamboo servers during rolling upgrades.
 pub(crate) fn server_error_message(body: &serde_json::Value) -> String {
     body.get("error")
-        .and_then(|e| e.as_str())
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| error.as_str())
+        })
         .map(|e| format!("({e})"))
         .unwrap_or_default()
 }
@@ -1712,7 +1719,13 @@ mod tests {
     }
 
     #[test]
-    fn server_error_message_extracts_error_field() {
+    fn server_error_message_extracts_nested_and_legacy_error_fields() {
+        assert_eq!(
+            server_error_message(&serde_json::json!({
+                "error": {"message": "name is required", "type": "api_error"}
+            })),
+            "(name is required)"
+        );
         assert_eq!(
             server_error_message(&serde_json::json!({"error":"name is required"})),
             "(name is required)"

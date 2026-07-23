@@ -64,7 +64,7 @@ pub async fn create_session(
         .save_session(&session)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))
+            crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
         })?;
 
     state.sessions.insert(

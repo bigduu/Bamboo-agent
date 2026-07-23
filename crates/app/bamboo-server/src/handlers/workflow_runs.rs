@@ -121,27 +121,30 @@ pub async fn restart(
 fn workflow_error(error: WorkflowRunError) -> HttpResponse {
     let message = error.to_string();
     match error {
-        WorkflowRunError::NotFound => {
-            HttpResponse::NotFound().json(serde_json::json!({"error": message}))
-        }
-        WorkflowRunError::Terminal => {
-            HttpResponse::Conflict().json(serde_json::json!({"error": message}))
-        }
+        WorkflowRunError::NotFound => HttpResponse::NotFound().json(serde_json::json!({
+            "error": crate::error::error_value(message)
+        })),
+        WorkflowRunError::Terminal => HttpResponse::Conflict().json(serde_json::json!({
+            "error": crate::error::error_value(message)
+        })),
         WorkflowRunError::Storage(details) => {
             let recovery_run_id = recovery_run_id_from_storage_details(&details);
             HttpResponse::InternalServerError().json(match recovery_run_id {
                 Some(run_id) => serde_json::json!({
-                    "error": "workflow storage unavailable; run recovery is required",
+                    "error": crate::error::error_value(
+                        "workflow storage unavailable; run recovery is required"
+                    ),
                     "recovery_run_id": run_id,
                 }),
-                None => serde_json::json!({"error": "workflow storage unavailable"}),
+                None => serde_json::json!({
+                    "error": crate::error::error_value("workflow storage unavailable")
+                }),
             })
         }
         WorkflowRunError::Compile(_)
         | WorkflowRunError::InvalidInput(_)
-        | WorkflowRunError::Preflight(_) => {
-            HttpResponse::BadRequest().json(serde_json::json!({"error": message}))
-        }
+        | WorkflowRunError::Preflight(_) => HttpResponse::BadRequest()
+            .json(serde_json::json!({ "error": crate::error::error_value(message) })),
     }
 }
 
@@ -201,10 +204,45 @@ mod tests {
             value["recovery_run_id"],
             "123e4567-e89b-12d3-a456-426614174000"
         );
-        assert!(!value["error"]
+        assert_eq!(value["error"]["type"], "api_error");
+        assert_eq!(
+            value["error"]["message"],
+            "workflow storage unavailable; run recovery is required"
+        );
+        assert!(!value["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .contains("failure"));
         assert_eq!(recovery_run_id_from_storage_details("disk /secret"), None);
+    }
+
+    #[actix_web::test]
+    async fn workflow_errors_preserve_status_and_use_canonical_envelope() {
+        let cases = [
+            (
+                WorkflowRunError::NotFound,
+                actix_web::http::StatusCode::NOT_FOUND,
+            ),
+            (
+                WorkflowRunError::Terminal,
+                actix_web::http::StatusCode::CONFLICT,
+            ),
+            (
+                WorkflowRunError::InvalidInput("bad args".to_string()),
+                actix_web::http::StatusCode::BAD_REQUEST,
+            ),
+        ];
+
+        for (error, expected_status) in cases {
+            let expected_message = error.to_string();
+            let response = workflow_error(error);
+            assert_eq!(response.status(), expected_status);
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .expect("body");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(value["error"]["message"], expected_message);
+            assert_eq!(value["error"]["type"], "api_error");
+        }
     }
 }

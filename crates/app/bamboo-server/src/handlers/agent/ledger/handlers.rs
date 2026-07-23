@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Display;
 
-use actix_web::{error::ErrorInternalServerError, web, Error, HttpResponse, Result};
+use actix_web::{web, Error, HttpResponse, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::json;
 
@@ -87,7 +87,7 @@ pub async fn agenda(
 // ── response helpers (match the neighboring schedules handlers) ─────────────
 
 fn internal_server_error(action: &str, error: impl Display) -> Error {
-    ErrorInternalServerError(format!("Failed to {action}: {error}"))
+    crate::error::json_internal_server_error(format!("Failed to {action}: {error}"))
 }
 
 fn bad_request(message: impl Into<String>) -> HttpResponse {

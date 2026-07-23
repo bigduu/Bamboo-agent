@@ -105,6 +105,32 @@ pub fn error_value(message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({ "message": message.into(), "type": "api_error" })
 }
 
+/// Build bamboo's canonical JSON error response for code paths that cannot
+/// return an [`AppError`] directly (most notably middleware and handlers that
+/// must preserve extra response headers).
+pub fn json_error(status: StatusCode, message: impl Into<String>) -> HttpResponse {
+    json_error_with_code(status, message.into(), None)
+}
+
+/// Preserve an existing `actix_web::Result` signature while ensuring the
+/// framework error is rendered with bamboo's canonical JSON envelope instead
+/// of Actix's default `text/plain` convenience-error body.
+pub fn json_internal_server_error(message: impl Into<String>) -> actix_web::Error {
+    let message = message.into();
+    let response = json_error(StatusCode::INTERNAL_SERVER_ERROR, message.clone());
+    actix_web::error::InternalError::from_response(message, response).into()
+}
+
+fn json_error_with_code(status: StatusCode, message: String, code: Option<&str>) -> HttpResponse {
+    HttpResponse::build(status).json(JsonErrorWrapper {
+        error: JsonError {
+            message,
+            r#type: "api_error".to_string(),
+            code: code.map(str::to_string),
+        },
+    })
+}
+
 impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
@@ -126,21 +152,13 @@ impl ResponseError for AppError {
 
     fn error_response(&self) -> HttpResponse {
         let status_code = self.status_code();
-        let error_response = JsonErrorWrapper {
-            error: JsonError {
-                message: self.to_string(),
-                r#type: "api_error".to_string(),
-                code: match self {
-                    AppError::ProxyAuthRequired => Some("proxy_auth_required".to_string()),
-                    AppError::ConfigRecoveryPending(_) => {
-                        Some("config_recovery_pending".to_string())
-                    }
-                    AppError::ConfigConflict { .. } => Some("config_revision_conflict".to_string()),
-                    _ => None,
-                },
-            },
+        let code = match self {
+            AppError::ProxyAuthRequired => Some("proxy_auth_required"),
+            AppError::ConfigRecoveryPending(_) => Some("config_recovery_pending"),
+            AppError::ConfigConflict { .. } => Some("config_revision_conflict"),
+            _ => None,
         };
-        HttpResponse::build(status_code).json(error_response)
+        json_error_with_code(status_code, self.to_string(), code)
     }
 }
 
@@ -305,5 +323,125 @@ mod tests {
             app_err_body["error"]["type"], helper_error["type"],
             "AppError and error_value must use the same error \"type\" tag"
         );
+    }
+
+    #[actix_web::test]
+    async fn shared_json_error_helpers_use_the_canonical_envelope() {
+        let response = json_error(StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], "slow down");
+        assert_eq!(body["error"]["type"], "api_error");
+
+        let error = json_internal_server_error("storage failed");
+        let response = error.error_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["message"], "storage failed");
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    /// Source-level tripwire for Bamboo's native HTTP surface. Vendor-compat
+    /// handlers and the native WS frame protocol intentionally own different
+    /// wire contracts, but native REST handlers and middleware must not
+    /// reintroduce either a flat `error` value or Actix's text/plain
+    /// convenience errors.
+    #[test]
+    fn native_http_error_sources_use_the_canonical_envelope() {
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let flat_error = regex::Regex::new(r#""error"\s*:\s*([^,}\n]+)"#).unwrap();
+        let actix_convenience_error = regex::Regex::new(
+            r"\bError(?:BadRequest|Unauthorized|Forbidden|NotFound|MethodNotAllowed|NotAcceptable|RequestTimeout|Conflict|Gone|PreconditionFailed|ExpectationFailed|PayloadTooLarge|UnsupportedMediaType|UnprocessableEntity|TooManyRequests|InternalServerError|NotImplemented|BadGateway|ServiceUnavailable|GatewayTimeout)\s*\(",
+        )
+        .unwrap();
+        let mut violations = Vec::new();
+
+        for entry in walkdir::WalkDir::new(source_root.join("handlers"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+        {
+            let relative = entry.path().strip_prefix(&source_root).unwrap();
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative.starts_with("handlers/openai/")
+                || relative.starts_with("handlers/anthropic/")
+                || relative.starts_with("handlers/gemini/")
+                || relative.starts_with("handlers/agent/ws_v2/")
+            {
+                continue;
+            }
+            inspect_native_error_source(
+                entry.path(),
+                &relative,
+                &flat_error,
+                &actix_convenience_error,
+                &mut violations,
+            );
+        }
+        inspect_native_error_source(
+            &source_root.join("rate_limit.rs"),
+            "rate_limit.rs",
+            &flat_error,
+            &actix_convenience_error,
+            &mut violations,
+        );
+
+        assert!(
+            violations.is_empty(),
+            "native HTTP errors must use AppError/error_value/json_error; vendor SSE and WS frames are excluded:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    fn inspect_native_error_source(
+        path: &std::path::Path,
+        relative: &str,
+        flat_error: &regex::Regex,
+        actix_convenience_error: &regex::Regex,
+        violations: &mut Vec<String>,
+    ) {
+        let source = std::fs::read_to_string(path).unwrap();
+        for capture in flat_error.captures_iter(&source) {
+            let matched = capture.get(0).unwrap();
+            let line_number = source[..matched.start()]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let line_start = source[..matched.start()]
+                .rfind('\n')
+                .map_or(0, |position| position + 1);
+            let line_end = source[matched.start()..]
+                .find('\n')
+                .map_or(source.len(), |position| matched.start() + position);
+            if source[line_start..line_end].trim_start().starts_with("//") {
+                continue;
+            }
+            let value = capture.get(1).unwrap().as_str().trim_start();
+            if !value.starts_with("crate::error::error_value(")
+                && !value.starts_with("error_value(")
+                && !value.starts_with('{')
+            {
+                violations.push(format!(
+                    "{relative}:{line_number}: flat error value starts with `{value}`"
+                ));
+            }
+        }
+        for matched in actix_convenience_error.find_iter(&source) {
+            let line_number = source[..matched.start()]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            violations.push(format!(
+                "{relative}:{line_number}: Actix convenience error renders text/plain"
+            ));
+        }
     }
 }

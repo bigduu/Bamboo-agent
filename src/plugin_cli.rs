@@ -26,8 +26,9 @@
 //! - Errors: 409 (Conflict / AlreadyInstalled), 422 (UnsupportedPlatform), 404
 //!   (NotFound), 403 (`url` source: untrusted host / unsigned-or-untrusted
 //!   signature), 400 (bad manifest/artifact/bundle checksum, or a `url`
-//!   install missing both `sha256` and `allow_unverified`); body
-//!   `{"error": "..."}`.
+//!   install missing both `sha256` and `allow_unverified`); the body uses
+//!   the canonical `{"error":{"message":"...","type":"api_error"}}`
+//!   envelope (while the CLI still accepts older flat-string responses).
 //!
 //! # URL installs: three trust layers, secure by default
 //!

@@ -49,7 +49,7 @@ fn normalize_requested_id(value: Option<&str>) -> Option<String> {
 pub async fn list_prompt_presets(state: web::Data<AppState>) -> Result<HttpResponse> {
     let store_path = store_file_path(&state.app_data_dir);
     let store = load_store(&store_path).await.map_err(|error| {
-        actix_web::error::ErrorInternalServerError(format!(
+        crate::error::json_internal_server_error(format!(
             "Failed to load prompt preset store: {error}"
         ))
     })?;
@@ -76,7 +76,7 @@ pub async fn create_prompt_preset(
 
     let store_path = store_file_path(&state.app_data_dir);
     let mut store = load_store(&store_path).await.map_err(|error| {
-        actix_web::error::ErrorInternalServerError(format!(
+        crate::error::json_internal_server_error(format!(
             "Failed to load prompt preset store: {error}"
         ))
     })?;
@@ -121,7 +121,7 @@ pub async fn create_prompt_preset(
     store.prompts.push(created.clone());
 
     save_store(&store_path, &store).await.map_err(|error| {
-        actix_web::error::ErrorInternalServerError(format!(
+        crate::error::json_internal_server_error(format!(
             "Failed to persist prompt preset store: {error}"
         ))
     })?;
@@ -144,7 +144,7 @@ pub async fn patch_prompt_preset(
 
     let store_path = store_file_path(&state.app_data_dir);
     let mut store = load_store(&store_path).await.map_err(|error| {
-        actix_web::error::ErrorInternalServerError(format!(
+        crate::error::json_internal_server_error(format!(
             "Failed to load prompt preset store: {error}"
         ))
     })?;
@@ -178,7 +178,7 @@ pub async fn patch_prompt_preset(
     let updated = preset.clone();
 
     save_store(&store_path, &store).await.map_err(|error| {
-        actix_web::error::ErrorInternalServerError(format!(
+        crate::error::json_internal_server_error(format!(
             "Failed to persist prompt preset store: {error}"
         ))
     })?;
@@ -200,7 +200,7 @@ pub async fn delete_prompt_preset(
 
     let store_path = store_file_path(&state.app_data_dir);
     let mut store = load_store(&store_path).await.map_err(|error| {
-        actix_web::error::ErrorInternalServerError(format!(
+        crate::error::json_internal_server_error(format!(
             "Failed to load prompt preset store: {error}"
         ))
     })?;
@@ -212,7 +212,7 @@ pub async fn delete_prompt_preset(
     }
 
     save_store(&store_path, &store).await.map_err(|error| {
-        actix_web::error::ErrorInternalServerError(format!(
+        crate::error::json_internal_server_error(format!(
             "Failed to persist prompt preset store: {error}"
         ))
     })?;

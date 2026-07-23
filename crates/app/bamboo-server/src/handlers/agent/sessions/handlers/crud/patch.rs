@@ -77,7 +77,7 @@ pub async fn patch_session(
                 return Ok(precondition_failed(&session_id, current));
             }
             Err(err) => {
-                return Err(actix_web::error::ErrorInternalServerError(err.to_string()));
+                return Err(crate::error::json_internal_server_error(err.to_string()));
             }
         }
     }
@@ -102,7 +102,7 @@ pub async fn patch_session(
                 return Ok(precondition_failed(&session_id, current));
             }
             Err(err) => {
-                return Err(actix_web::error::ErrorInternalServerError(err.to_string()));
+                return Err(crate::error::json_internal_server_error(err.to_string()));
             }
         }
     }
@@ -141,7 +141,7 @@ pub async fn patch_session(
                 return Ok(precondition_failed(&session_id, current));
             }
             Err(err) => {
-                return Err(actix_web::error::ErrorInternalServerError(err.to_string()));
+                return Err(crate::error::json_internal_server_error(err.to_string()));
             }
         }
     }
@@ -210,9 +210,7 @@ pub async fn patch_session(
             })
             .await
             .map_err(|error| {
-                actix_web::error::ErrorInternalServerError(format!(
-                    "Failed to save session: {error}"
-                ))
+                crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
             })?;
 
         let Some(session) = updated else {

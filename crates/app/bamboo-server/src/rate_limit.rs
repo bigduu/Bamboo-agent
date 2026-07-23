@@ -11,11 +11,10 @@
 //!   construction actix-governor's `GovernorConfigBuilder::finish()` used);
 //! - on throttle: `429 Too Many Requests` with `retry-after` and
 //!   `x-ratelimit-after` headers (seconds until the bucket admits again) and
-//!   a `text/plain` body — byte-for-byte what actix-governor's `NoOpMiddleware`
-//!   path produced;
+//!   Bamboo's canonical nested JSON error envelope;
 //! - on key-extraction failure: whatever response the extractor's error
-//!   produces (bamboo's `ClientIpKeyExtractor` mirrors actix-governor's
-//!   `SimpleKeyExtractionError` default: `500`, `text/plain`).
+//!   produces (bamboo's `ClientIpKeyExtractor` returns `500` with the same
+//!   canonical nested JSON error envelope).
 //!
 //! actix-governor features bamboo never configured — per-method filtering,
 //! `permissive` mode, whitelisted keys, and the `x-ratelimit-limit` /
@@ -33,7 +32,7 @@ use std::time::Duration;
 use actix_web::body::{EitherBody, MessageBody};
 use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::http::StatusCode;
-use actix_web::{Error, HttpResponse, HttpResponseBuilder, ResponseError};
+use actix_web::{Error, HttpResponse, ResponseError};
 use futures::future::LocalBoxFuture;
 use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DefaultKeyedStateStore;
@@ -56,11 +55,7 @@ pub trait KeyExtractor: Clone + 'static {
     fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError>;
 }
 
-/// A minimal extraction-failure error: fixed status + `text/plain` body.
-///
-/// Matches `actix_governor::SimpleKeyExtractionError`'s default (status
-/// `500`, content-type `text/plain`) — the only shape bamboo ever used (it
-/// never called that type's `set_status_code`/`set_content_type`).
+/// A minimal extraction-failure error with Bamboo's canonical JSON body.
 #[derive(Debug, Clone, Copy)]
 pub struct SimpleKeyExtractionError(pub &'static str);
 
@@ -84,9 +79,7 @@ impl ResponseError for SimpleKeyExtractionError {
     }
 
     fn error_response(&self) -> HttpResponse {
-        HttpResponseBuilder::new(self.status_code())
-            .content_type("text/plain; charset=utf-8")
-            .body(self.0)
+        crate::error::json_error(self.status_code(), self.0)
     }
 }
 
@@ -206,11 +199,18 @@ where
                 let wait_time = negative
                     .wait_time_from(DefaultClock::default().now())
                     .as_secs();
-                let response = HttpResponse::build(StatusCode::TOO_MANY_REQUESTS)
-                    .insert_header(("retry-after", wait_time))
-                    .insert_header(("x-ratelimit-after", wait_time))
-                    .content_type("text/plain; charset=utf-8")
-                    .body(format!("Too many requests, retry in {wait_time}s"));
+                let mut response = crate::error::json_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("Too many requests, retry in {wait_time}s"),
+                );
+                response.headers_mut().insert(
+                    actix_web::http::header::RETRY_AFTER,
+                    actix_web::http::header::HeaderValue::from(wait_time),
+                );
+                response.headers_mut().insert(
+                    actix_web::http::header::HeaderName::from_static("x-ratelimit-after"),
+                    actix_web::http::header::HeaderValue::from(wait_time),
+                );
                 let response = req.into_response(response).map_into_right_body();
                 Box::pin(async move { Ok(response) })
             }
@@ -270,6 +270,11 @@ mod tests {
             res.headers().contains_key("x-ratelimit-after"),
             "a 429 must carry x-ratelimit-after"
         );
+        let body: serde_json::Value = test::read_body_json(res).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Too many requests, retry in ")));
     }
 
     #[actix_web::test]
@@ -340,5 +345,11 @@ mod tests {
             .expect_err("extraction failure must reach the caller as an Err");
         let response = err.error_response();
         assert_eq!(response.status(), HttpStatusCode::INTERNAL_SERVER_ERROR);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], "no key for you");
+        assert_eq!(body["error"]["type"], "api_error");
     }
 }

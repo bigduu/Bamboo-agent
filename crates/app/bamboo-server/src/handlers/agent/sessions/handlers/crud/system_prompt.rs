@@ -20,9 +20,7 @@ pub async fn get_system_prompt_snapshot(
             .load_session(&session_id)
             .await
             .map_err(|error| {
-                actix_web::error::ErrorInternalServerError(format!(
-                    "Failed to load session: {error}"
-                ))
+                crate::error::json_internal_server_error(format!("Failed to load session: {error}"))
             })? {
             Some(session) => session,
             None => {
