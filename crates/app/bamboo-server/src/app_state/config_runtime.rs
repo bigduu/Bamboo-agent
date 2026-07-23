@@ -1479,6 +1479,106 @@ impl AppState {
         Ok(revision)
     }
 
+    /// Reset the complete provider section and all provider-owned credentials
+    /// in one recoverable exact transaction guarded by the typed section
+    /// revision. Runtime publication remains last-known-good when the default
+    /// provider cannot be initialized without credentials.
+    pub(crate) async fn reset_provider_section(
+        &self,
+        expected_revision: u64,
+    ) -> Result<u64, ConfigSectionMutationError> {
+        let config_io_lock = self.config_io_lock.clone();
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let config_live_health = self.config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = config_io_lock.lock().await;
+            ensure_provider_mcp_migration_ready(&app_data_dir)
+                .map_err(ConfigSectionMutationError::Store)?;
+            let facade = config_facade.as_ref().ok_or_else(|| {
+                ConfigSectionMutationError::Invalid(
+                    "provider reset requires the modular configuration facade".to_string(),
+                )
+            })?;
+            let current = config.read().await.clone();
+            let provider_intents = BTreeSet::from([
+                "openai".to_string(),
+                "anthropic".to_string(),
+                "gemini".to_string(),
+                "bodhi".to_string(),
+            ]);
+            let provider_instance_intents = current.provider_instances.keys().cloned().collect();
+            let mut candidate = current;
+            apply_runtime_section(SectionId::Providers, &Config::default(), &mut candidate);
+
+            let transaction_dir = app_data_dir.clone();
+            let candidate = tokio::task::spawn_blocking(move || {
+                bamboo_config::persist_provider_reset_credential_transaction_at_revision(
+                    &transaction_dir,
+                    &mut candidate,
+                    &provider_intents,
+                    &provider_instance_intents,
+                    expected_revision,
+                )?;
+                load_committed_effective_config(&transaction_dir)
+            })
+            .await
+            .map_err(|error| {
+                ConfigSectionMutationError::Runtime(format!(
+                    "provider reset transaction task failed: {error}"
+                ))
+            })?
+            .map_err(ConfigSectionMutationError::Store)?;
+
+            *config.write().await = candidate.clone();
+            publish_exact_facade_commit(
+                Some(facade),
+                &account_sink,
+                &[SectionId::Credentials, SectionId::Providers],
+            )
+            .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+
+            match bamboo_llm::ProviderRegistry::from_config(&candidate, app_data_dir).await {
+                Ok(registry) => {
+                    if let Some(candidate_provider) = registry.get_default() {
+                        provider_registry.replace_with(registry);
+                        *provider.write().await = candidate_provider;
+                    } else {
+                        publish_section_failure(
+                            &config_live_health,
+                            &account_sink,
+                            "providers",
+                            SectionStatus::Degraded,
+                            "provider reset committed; default provider is not initialized"
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "provider reset committed but runtime initialization failed");
+                    publish_section_failure(
+                        &config_live_health,
+                        &account_sink,
+                        "providers",
+                        SectionStatus::Degraded,
+                        "provider reset committed; retaining last-known-good runtime".to_string(),
+                    );
+                }
+            }
+
+            Ok(facade.registry().providers.snapshot().revision)
+        });
+        transaction.await.map_err(|error| {
+            ConfigSectionMutationError::Runtime(format!(
+                "provider reset transaction task failed: {error}"
+            ))
+        })?
+    }
+
     /// Stage MCP connection/initialization/tool discovery, perform the CAS at
     /// the manager's pre-publication boundary, then publish the config snapshot
     /// before the prepared runtimes and finally emit one section event.
@@ -1570,6 +1670,182 @@ impl AppState {
             Some(revision),
         );
         Ok(revision)
+    }
+
+    /// Reset MCP metadata and its owned credentials at the runtime manager's
+    /// pre-publication boundary, preserving the same durable-before-live
+    /// ordering as a normal typed MCP write.
+    pub(crate) async fn reset_mcp_section(
+        &self,
+        expected_revision: u64,
+    ) -> Result<u64, ConfigSectionMutationError> {
+        let _io = self.config_io_lock.lock().await;
+        ensure_provider_mcp_migration_ready(&self.app_data_dir)
+            .map_err(ConfigSectionMutationError::Store)?;
+        let facade = self.config_facade.as_ref().ok_or_else(|| {
+            ConfigSectionMutationError::Invalid(
+                "MCP reset requires the modular configuration facade".to_string(),
+            )
+        })?;
+        let candidate_mcp = McpConfig::default();
+        let mut candidate_config = self.config.read().await.clone();
+        candidate_config.mcp = candidate_mcp.clone();
+        let mut committed_config = None;
+        let mut store_error = None;
+        let data_dir = self.app_data_dir.clone();
+        let result = self
+            .mcp_manager
+            .reconcile_from_config_transactional_after(&candidate_mcp, || async {
+                let mut live_config = self.config.write().await;
+                match bamboo_config::persist_mcp_reset_credential_transaction_at_revision(
+                    &data_dir,
+                    &mut candidate_config,
+                    expected_revision,
+                )
+                .and_then(|_| load_committed_effective_config(&data_dir))
+                {
+                    Ok(committed) => {
+                        *live_config = committed.clone();
+                        committed_config = Some(committed);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        store_error = Some(error);
+                        Err(bamboo_mcp::McpError::InvalidConfig(
+                            "MCP reset durable commit failed".to_string(),
+                        ))
+                    }
+                }
+            })
+            .await;
+        if let Some(error) = store_error {
+            return Err(ConfigSectionMutationError::Store(error));
+        }
+        if result.is_err() || committed_config.is_none() {
+            let message =
+                "MCP reset runtime initialization failed; retaining last-known-good runtime"
+                    .to_string();
+            publish_section_failure(
+                &self.mcp_config_live_health,
+                &self.account_sink,
+                "mcp",
+                SectionStatus::Degraded,
+                message.clone(),
+            );
+            return Err(ConfigSectionMutationError::Runtime(message));
+        }
+        publish_exact_facade_commit(
+            Some(facade),
+            &self.account_sink,
+            &[SectionId::Credentials, SectionId::Mcp],
+        )
+        .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+        let revision = facade.registry().mcp.snapshot().revision;
+        publish_section_success(
+            &self.mcp_config_live_health,
+            &self.account_sink,
+            "mcp",
+            self.app_data_dir.join("mcp.json"),
+            section_is_unhealthy(&self.mcp_config_live_health),
+            Some(revision),
+        );
+        Ok(revision)
+    }
+
+    /// Reset a credential-backed non-provider section using the typed section
+    /// revision as the client CAS authority. The exact transaction rebases on
+    /// the latest unrelated credential document while clearing only references
+    /// owned by this section.
+    pub(crate) async fn reset_credential_backed_section(
+        &self,
+        id: SectionId,
+        expected_revision: u64,
+    ) -> Result<u64, ConfigSectionMutationError> {
+        if !matches!(
+            id,
+            SectionId::Core
+                | SectionId::Notifications
+                | SectionId::Connect
+                | SectionId::Env
+                | SectionId::ClusterFabric
+                | SectionId::AccessControl
+        ) {
+            return Err(ConfigSectionMutationError::Invalid(
+                "section is not a credential-backed reset domain".to_string(),
+            ));
+        }
+        let config_io_lock = self.config_io_lock.clone();
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = config_io_lock.lock().await;
+            ensure_provider_mcp_migration_ready(&app_data_dir)
+                .map_err(ConfigSectionMutationError::Store)?;
+            let facade = config_facade.as_ref().ok_or_else(|| {
+                ConfigSectionMutationError::Invalid(
+                    "section reset requires the modular configuration facade".to_string(),
+                )
+            })?;
+            let mut candidate = config.read().await.clone();
+            apply_runtime_section(id, &Config::default(), &mut candidate);
+            let transaction_dir = app_data_dir.clone();
+            let candidate = tokio::task::spawn_blocking(move || {
+                bamboo_config::persist_credential_backed_section_reset_at_revision(
+                    &transaction_dir,
+                    &mut candidate,
+                    id,
+                    expected_revision,
+                )?;
+                load_committed_effective_config(&transaction_dir)
+            })
+            .await
+            .map_err(|error| {
+                ConfigSectionMutationError::Runtime(format!(
+                    "section reset transaction task failed: {error}"
+                ))
+            })?
+            .map_err(ConfigSectionMutationError::Store)?;
+
+            if id == SectionId::Env {
+                candidate.publish_env_vars();
+            }
+            *config.write().await = candidate.clone();
+            publish_exact_facade_commit(Some(facade), &account_sink, &[SectionId::Credentials, id])
+                .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+
+            if id == SectionId::Core {
+                match bamboo_llm::ProviderRegistry::from_config(&candidate, app_data_dir.clone())
+                    .await
+                {
+                    Ok(registry) => {
+                        if let Some(candidate_provider) = registry.get_default() {
+                            provider_registry.replace_with(registry);
+                            *provider.write().await = candidate_provider;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "core reset committed but provider reload failed");
+                    }
+                }
+                mcp_manager.reconcile_from_config(&candidate.mcp).await;
+            }
+
+            facade
+                .registry()
+                .envelope_value(id)
+                .map(|envelope| envelope.revision)
+                .map_err(ConfigSectionMutationError::Store)
+        });
+        transaction.await.map_err(|error| {
+            ConfigSectionMutationError::Runtime(format!(
+                "section reset transaction task failed: {error}"
+            ))
+        })?
     }
 }
 
@@ -2514,6 +2790,28 @@ impl AppState {
         ),
         AppError,
     > {
+        self.update_core_with_proxy_credential(expected_revision, effects, move |candidate| {
+            candidate.proxy_auth = auth;
+        })
+        .await
+    }
+
+    async fn update_core_with_proxy_credential<F>(
+        &self,
+        expected_revision: u64,
+        effects: ConfigUpdateEffects,
+        update: F,
+    ) -> Result<
+        (
+            Config,
+            bamboo_config::CredentialStatus,
+            bamboo_config::CredentialStoreHealth,
+        ),
+        AppError,
+    >
+    where
+        F: FnOnce(&mut Config) + Send + 'static,
+    {
         let config_io_lock = self.config_io_lock.clone();
         let config = self.config.clone();
         let app_data_dir = self.app_data_dir.clone();
@@ -2534,7 +2832,7 @@ impl AppState {
                 let cfg = config.read().await;
                 reject_if_recovery_pending(&cfg)?;
                 let mut candidate = cfg.clone();
-                candidate.proxy_auth = auth;
+                update(&mut candidate);
                 candidate.assign_connect_platform_ids();
                 candidate.refresh_encrypted_secrets().map_err(|error| {
                     AppError::InternalError(anyhow::anyhow!(

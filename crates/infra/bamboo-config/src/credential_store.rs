@@ -496,6 +496,75 @@ impl CredentialStore {
         self.with_transaction_lock(|| self.clear_unchecked(credential_ref, expected_revision))
     }
 
+    /// Clear the standalone credential document in one CAS commit, but only
+    /// after every config-owned reference has been removed through its owning
+    /// domain transaction. This is the final step of a section-by-section
+    /// reset; it must never detach a live config reference from its secret.
+    pub fn clear_all_unreferenced(
+        &self,
+        config: &crate::Config,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<(u64, Vec<CredentialStatus>)> {
+        self.with_transaction_lock(|| {
+            let referenced = config_credential_ref_counts(config)?;
+            if !referenced.is_empty() {
+                return Err(ConfigStoreError::Validation(
+                    "credentials still referenced by configuration must be reset through their owning sections"
+                        .to_string(),
+                ));
+            }
+            let revision = self.store.commit(
+                expected_revision,
+                CredentialDocument::default(),
+                validate_document,
+            )?;
+            Ok((revision, Vec::new()))
+        })
+    }
+
+    pub(crate) fn prepare_clear_owned_references(
+        &self,
+        config: &crate::Config,
+        references: &BTreeSet<CredentialRef>,
+    ) -> ConfigStoreResult<PreparedProviderCredentialUpdate> {
+        let candidate_counts = config_credential_ref_counts(config)?;
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for section reset".to_string(),
+            ));
+        }
+        let mut changed = false;
+        let mut required_refs = Vec::new();
+        for reference in references {
+            if candidate_counts.get(reference).copied().unwrap_or(0) == 0 {
+                changed |= document.entries.remove(reference).is_some();
+            } else {
+                required_refs.push(reference.clone());
+            }
+        }
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(&document, &required_refs)?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        Ok(PreparedProviderCredentialUpdate {
+            bytes: serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": CREDENTIAL_SCHEMA_VERSION,
+                "revision": revision,
+                "data": document,
+            }))?,
+            expected_revision: health.revision,
+            revision,
+            touched_refs: references.iter().cloned().collect(),
+            required_refs,
+        })
+    }
+
     /// Clear an internally managed rotating credential at the latest durable
     /// revision. Client-facing clears remain explicit-CAS via [`Self::clear`].
     pub fn clear_system_managed(
@@ -603,6 +672,7 @@ impl CredentialStore {
         &self,
         config: &mut crate::Config,
         provider_intents: &BTreeSet<String>,
+        persisted_provider_refs: &BTreeMap<String, CredentialRef>,
         provider_instance_intents: &BTreeSet<String>,
         persisted_instance_refs: &BTreeMap<String, CredentialRef>,
     ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
@@ -630,19 +700,24 @@ impl CredentialStore {
         macro_rules! plan_env {
             ($name:literal, $field:ident) => {
                 if provider_intents.contains($name) {
-                    if let Some(provider) = config.providers.$field.as_ref() {
-                        let reference = credential_ref("provider", $name, "api_key")?;
-                        let secret = (!provider.api_key_from_env
-                            && !provider.api_key.trim().is_empty())
-                        .then(|| provider.api_key.trim().to_string());
-                        updates.push(PlannedUpdate {
-                            target: PlannedProviderTarget::BuiltIn($name),
-                            removes_candidate_consumer: provider.credential_ref.as_ref()
-                                == Some(&reference),
-                            reference,
-                            secret,
-                        });
-                    }
+                    let provider = config.providers.$field.as_ref();
+                    let reference = provider
+                        .and_then(|provider| provider.credential_ref.clone())
+                        .or_else(|| persisted_provider_refs.get($name).cloned())
+                        .unwrap_or(credential_ref("provider", $name, "api_key")?);
+                    let secret = provider
+                        .filter(|provider| {
+                            !provider.api_key_from_env && !provider.api_key.trim().is_empty()
+                        })
+                        .map(|provider| provider.api_key.trim().to_string());
+                    updates.push(PlannedUpdate {
+                        target: PlannedProviderTarget::BuiltIn($name),
+                        removes_candidate_consumer: provider
+                            .and_then(|provider| provider.credential_ref.as_ref())
+                            == Some(&reference),
+                        reference,
+                        secret,
+                    });
                 }
             };
         }
@@ -650,17 +725,21 @@ impl CredentialStore {
         plan_env!("anthropic", anthropic);
         plan_env!("gemini", gemini);
         if provider_intents.contains("bodhi") {
-            if let Some(provider) = config.providers.bodhi.as_ref() {
-                let reference = credential_ref("provider", "bodhi", "api_key")?;
-                updates.push(PlannedUpdate {
-                    target: PlannedProviderTarget::BuiltIn("bodhi"),
-                    removes_candidate_consumer: provider.credential_ref.as_ref()
-                        == Some(&reference),
-                    reference,
-                    secret: (!provider.api_key.trim().is_empty())
-                        .then(|| provider.api_key.trim().to_string()),
-                });
-            }
+            let provider = config.providers.bodhi.as_ref();
+            let reference = provider
+                .and_then(|provider| provider.credential_ref.clone())
+                .or_else(|| persisted_provider_refs.get("bodhi").cloned())
+                .unwrap_or(credential_ref("provider", "bodhi", "api_key")?);
+            updates.push(PlannedUpdate {
+                target: PlannedProviderTarget::BuiltIn("bodhi"),
+                removes_candidate_consumer: provider
+                    .and_then(|provider| provider.credential_ref.as_ref())
+                    == Some(&reference),
+                reference,
+                secret: provider
+                    .filter(|provider| !provider.api_key.trim().is_empty())
+                    .map(|provider| provider.api_key.trim().to_string()),
+            });
         }
 
         for instance_id in provider_instance_intents {
@@ -1429,6 +1508,7 @@ impl CredentialStore {
         persisted: &PersistedAccessCredentialRefs,
     ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
         let candidate_counts = config_credential_ref_counts(config)?;
+        let reset_domain = config.access_control.is_none();
         let access = config.access_control.get_or_insert_with(Default::default);
         let mut device_ids = BTreeSet::new();
         if access.devices.iter().any(|device| {
@@ -1637,7 +1717,7 @@ impl CredentialStore {
             "data": document,
         }))?;
         let touched_refs = touched_refs.into_iter().collect::<Vec<_>>();
-        Ok(Some(PreparedProviderCredentialUpdate {
+        let prepared = PreparedProviderCredentialUpdate {
             bytes,
             expected_revision: health.revision,
             revision,
@@ -1646,7 +1726,11 @@ impl CredentialStore {
                 .into_iter()
                 .filter(|reference| touched_refs.contains(reference))
                 .collect(),
-        }))
+        };
+        if reset_domain {
+            config.access_control = None;
+        }
+        Ok(Some(prepared))
     }
 
     /// Prepare one or more node credential mutations without publishing them.

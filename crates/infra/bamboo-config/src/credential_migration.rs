@@ -122,6 +122,7 @@ struct SectionLayoutCompletionLedger {
 #[serde(rename_all = "snake_case")]
 enum ExactTransactionScope {
     Providers,
+    Mcp,
     ProxyAuth,
     EnvVars,
     Notifications,
@@ -824,6 +825,7 @@ enum MigrationFault {
 fn authoritative_section_file(scope: ExactTransactionScope) -> &'static str {
     match scope {
         ExactTransactionScope::Providers => PROVIDERS_FILE,
+        ExactTransactionScope::Mcp => MCP_FILE,
         ExactTransactionScope::ProxyAuth => CORE_FILE,
         ExactTransactionScope::EnvVars => ENV_FILE,
         ExactTransactionScope::Notifications => NOTIFICATIONS_FILE,
@@ -1692,6 +1694,9 @@ pub fn persist_connect_credential_transaction_at_revision(
         None,
         Some((secret_intents, expected_revision)),
         None,
+        None,
+        None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1727,6 +1732,9 @@ pub fn persist_access_control_credential_transaction_at_revision(
         None,
         None,
         Some((password_intent, device_intents, expected_revision)),
+        None,
+        None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1754,6 +1762,9 @@ pub fn persist_cluster_fabric_credential_transaction_at_revision(
         false,
         None,
         Some((node_intents, expected_revision)),
+        None,
+        None,
+        None,
         None,
         None,
         #[cfg(test)]
@@ -1809,6 +1820,110 @@ pub fn persist_provider_instance_credential_transaction(
     .map(|_| ())
 }
 
+/// Reset the provider domain and its owned credentials under the provider
+/// section revision supplied by a typed client. Compatibility writes may
+/// rebase, but an explicit reset must fail when its section snapshot is stale.
+pub fn persist_provider_reset_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    persist_provider_credential_transaction_with_instances_at_revision_inner(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        Some(expected_revision),
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// Reset MCP metadata and every MCP-owned credential reference in one exact
+/// transaction guarded by the MCP section revision.
+pub fn persist_mcp_reset_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    persist_exact_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(expected_revision),
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// Reset one credential-backed section at its typed section revision while
+/// rebasing safely over unrelated credential-document changes. The section is
+/// the client CAS authority; its owned references are cleared from the latest
+/// credential snapshot inside the same cross-process transaction lock.
+pub fn persist_credential_backed_section_reset_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    section: crate::SectionId,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    let scope = match section {
+        crate::SectionId::Core => ExactTransactionScope::ProxyAuth,
+        crate::SectionId::Notifications => ExactTransactionScope::Notifications,
+        crate::SectionId::Connect => ExactTransactionScope::Connect,
+        crate::SectionId::Env => ExactTransactionScope::EnvVars,
+        crate::SectionId::ClusterFabric => ExactTransactionScope::ClusterFabric,
+        crate::SectionId::AccessControl => ExactTransactionScope::AccessControl,
+        _ => {
+            return Err(ConfigStoreError::Validation(
+                "section is not a credential-backed reset domain".to_string(),
+            ))
+        }
+    };
+    persist_exact_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((scope, expected_revision)),
+        #[cfg(test)]
+        None,
+    )
+}
+
 #[cfg(test)]
 fn persist_provider_credential_transaction_inner(
     data_dir: &Path,
@@ -1851,6 +1966,40 @@ fn persist_provider_credential_transaction_with_instances_inner(
     notification_expected_revision: Option<u64>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
+    persist_provider_credential_transaction_with_instances_at_revision_inner(
+        data_dir,
+        config,
+        provider_intents,
+        provider_instance_intents,
+        proxy_expected_revision,
+        env_intents,
+        env_expected_revision,
+        notification_transaction,
+        notification_intents,
+        notification_reset,
+        notification_expected_revision,
+        None,
+        #[cfg(test)]
+        fault,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_provider_credential_transaction_with_instances_at_revision_inner(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    proxy_expected_revision: Option<u64>,
+    env_intents: &BTreeSet<String>,
+    env_expected_revision: Option<u64>,
+    notification_transaction: bool,
+    notification_intents: &BTreeSet<String>,
+    notification_reset: bool,
+    notification_expected_revision: Option<u64>,
+    provider_expected_revision: Option<u64>,
+    #[cfg(test)] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<u64> {
     persist_exact_credential_transaction_inner(
         data_dir,
         config,
@@ -1864,6 +2013,9 @@ fn persist_provider_credential_transaction_with_instances_inner(
         notification_reset,
         notification_expected_revision,
         None,
+        None,
+        None,
+        provider_expected_revision,
         None,
         None,
         #[cfg(test)]
@@ -1887,18 +2039,23 @@ fn persist_exact_credential_transaction_inner(
     cluster_transaction: Option<(&BTreeSet<String>, u64)>,
     connect_transaction: Option<(&crate::patch::ConnectSecretIntents, u64)>,
     access_transaction: Option<(bool, &BTreeSet<String>, u64)>,
+    provider_expected_revision: Option<u64>,
+    mcp_expected_revision: Option<u64>,
+    reset_scope: Option<(ExactTransactionScope, u64)>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
-    let proxy_only = provider_intents.len() == 1
+    let reset_is = |scope| reset_scope.is_some_and(|(reset, _)| reset == scope);
+    let proxy_only = (provider_intents.len() == 1
         && provider_intents.contains("__proxy_auth")
-        && provider_instance_intents.is_empty();
+        && provider_instance_intents.is_empty())
+        || reset_is(ExactTransactionScope::ProxyAuth);
     let env_only = provider_intents.is_empty()
         && provider_instance_intents.is_empty()
-        && !env_intents.is_empty();
+        && (!env_intents.is_empty() || reset_is(ExactTransactionScope::EnvVars));
     let notification_only = provider_intents.is_empty()
         && provider_instance_intents.is_empty()
         && env_intents.is_empty()
-        && notification_transaction
+        && (notification_transaction || reset_is(ExactTransactionScope::Notifications))
         && cluster_transaction.is_none()
         && connect_transaction.is_none()
         && access_transaction.is_none();
@@ -1906,7 +2063,7 @@ fn persist_exact_credential_transaction_inner(
         && provider_instance_intents.is_empty()
         && env_intents.is_empty()
         && !notification_transaction
-        && cluster_transaction.is_some()
+        && (cluster_transaction.is_some() || reset_is(ExactTransactionScope::ClusterFabric))
         && connect_transaction.is_none()
         && access_transaction.is_none();
     let connect_only = provider_intents.is_empty()
@@ -1914,7 +2071,7 @@ fn persist_exact_credential_transaction_inner(
         && env_intents.is_empty()
         && !notification_transaction
         && cluster_transaction.is_none()
-        && connect_transaction.is_some()
+        && (connect_transaction.is_some() || reset_is(ExactTransactionScope::Connect))
         && access_transaction.is_none();
     let access_only = provider_intents.is_empty()
         && provider_instance_intents.is_empty()
@@ -1922,7 +2079,15 @@ fn persist_exact_credential_transaction_inner(
         && !notification_transaction
         && cluster_transaction.is_none()
         && connect_transaction.is_none()
-        && access_transaction.is_some();
+        && (access_transaction.is_some() || reset_is(ExactTransactionScope::AccessControl));
+    let mcp_only = mcp_expected_revision.is_some()
+        && provider_intents.is_empty()
+        && provider_instance_intents.is_empty()
+        && env_intents.is_empty()
+        && !notification_transaction
+        && cluster_transaction.is_none()
+        && connect_transaction.is_none()
+        && access_transaction.is_none();
     if !env_intents.is_empty() && !env_only {
         return Err(ConfigStoreError::Validation(
             "env credentials must be updated in their own transaction".to_string(),
@@ -1961,7 +2126,9 @@ fn persist_exact_credential_transaction_inner(
     )?;
     discard_uncommitted(data_dir)?;
 
-    let exact_scope = if proxy_only {
+    let exact_scope = if let Some((scope, _)) = reset_scope {
+        Some(scope)
+    } else if proxy_only {
         Some(ExactTransactionScope::ProxyAuth)
     } else if env_only {
         Some(ExactTransactionScope::EnvVars)
@@ -1973,6 +2140,8 @@ fn persist_exact_credential_transaction_inner(
         Some(ExactTransactionScope::AccessControl)
     } else if cluster_only {
         Some(ExactTransactionScope::ClusterFabric)
+    } else if mcp_only {
+        Some(ExactTransactionScope::Mcp)
     } else if crate::section_layout_is_active(data_dir)? {
         Some(ExactTransactionScope::Providers)
     } else {
@@ -1985,6 +2154,36 @@ fn persist_exact_credential_transaction_inner(
     } else {
         None
     };
+    if let (Some(expected), Some(section), Some(ExactTransactionScope::Providers)) = (
+        provider_expected_revision,
+        active_section.as_ref(),
+        exact_scope,
+    ) {
+        if section.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: section.expected_revision,
+            });
+        }
+    }
+    if let (Some(expected), Some(section), Some(ExactTransactionScope::Mcp)) =
+        (mcp_expected_revision, active_section.as_ref(), exact_scope)
+    {
+        if section.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: section.expected_revision,
+            });
+        }
+    }
+    if let (Some((_, expected)), Some(section)) = (reset_scope, active_section.as_ref()) {
+        if section.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: section.expected_revision,
+            });
+        }
+    }
 
     let credentials_original = read_target_or_empty(&data_dir.join(CREDENTIALS_FILE))?;
     let providers_original = read_target_or_empty(&data_dir.join(PROVIDERS_FILE))?;
@@ -2000,6 +2199,17 @@ fn persist_exact_credential_transaction_inner(
             &config_original
         },
     )?;
+    let persisted_provider_refs =
+        provider_refs_from_document(if exact_scope == Some(ExactTransactionScope::Providers) {
+            domain_original
+        } else {
+            &config_original
+        })?;
+    let persisted_mcp_refs = if mcp_only {
+        mcp_refs_from_document(domain_original)?
+    } else {
+        BTreeSet::new()
+    };
     let persisted_env_refs = env_refs_from_document(domain_original)?;
     let persisted_notification_refs = notification_refs_from_document(domain_original)?;
     let persisted_connect_refs = if connect_only {
@@ -2012,10 +2222,51 @@ fn persist_exact_credential_transaction_inner(
     } else {
         crate::credential_store::PersistedAccessCredentialRefs::default()
     };
-    let persisted_cluster_refs = if cluster_transaction.is_some() {
+    let persisted_cluster_refs = if cluster_only {
         cluster_node_refs_from_document(domain_original)?
     } else {
         BTreeMap::new()
+    };
+    let reset_refs = if let Some((scope, _)) = reset_scope {
+        let mut references = BTreeSet::new();
+        match scope {
+            ExactTransactionScope::ProxyAuth => {
+                let root: Value = serde_json::from_slice(domain_original)?;
+                let reference = root
+                    .get("proxy_auth_credential_ref")
+                    .and_then(Value::as_str)
+                    .map(|value| CredentialRef::parse(value.to_string()))
+                    .transpose()?
+                    .unwrap_or(credential_ref("proxy", "default", "auth")?);
+                references.insert(reference);
+            }
+            ExactTransactionScope::EnvVars => {
+                references.extend(persisted_env_refs.values().cloned());
+            }
+            ExactTransactionScope::Notifications => {
+                references.extend(persisted_notification_refs.values().cloned());
+            }
+            ExactTransactionScope::Connect => {
+                for (token, app_secret) in persisted_connect_refs.values() {
+                    references.extend(token.iter().chain(app_secret.iter()).cloned());
+                }
+            }
+            ExactTransactionScope::AccessControl => {
+                references.extend(persisted_access_refs.password.iter().cloned());
+                references.extend(persisted_access_refs.devices.values().cloned());
+            }
+            ExactTransactionScope::ClusterFabric => {
+                for metadata in persisted_cluster_refs.values() {
+                    references.extend(metadata.references().cloned());
+                }
+            }
+            ExactTransactionScope::Providers | ExactTransactionScope::Mcp => {
+                unreachable!("provider and MCP resets use their runtime-staged exact transactions")
+            }
+        }
+        references
+    } else {
+        BTreeSet::new()
     };
     if env_only {
         for name in env_intents {
@@ -2093,7 +2344,9 @@ fn persist_exact_credential_transaction_inner(
         }
     }
     let store = CredentialStore::open(data_dir);
-    let prepared = if env_only {
+    let prepared = if reset_scope.is_some() {
+        Some(store.prepare_clear_owned_references(config, &reset_refs)?)
+    } else if env_only {
         store.prepare_env_var_intents(config, env_intents, &persisted_env_refs)?
     } else if notification_only {
         store.prepare_notification_intents(
@@ -2113,10 +2366,13 @@ fn persist_exact_credential_transaction_inner(
             device_intents,
             &persisted_access_refs,
         )?
+    } else if mcp_only {
+        Some(store.prepare_clear_owned_references(config, &persisted_mcp_refs)?)
     } else {
         store.prepare_provider_api_key_intents(
             config,
             provider_intents,
+            &persisted_provider_refs,
             provider_instance_intents,
             &persisted_instance_refs,
         )?
@@ -2124,7 +2380,7 @@ fn persist_exact_credential_transaction_inner(
     let Some(mut prepared) = prepared else {
         return store.revision_unchecked();
     };
-    if proxy_only {
+    if proxy_only && reset_scope.is_none() {
         let expected = proxy_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "proxy auth credential revision precondition is required".to_string(),
@@ -2137,7 +2393,7 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if env_only {
+    if env_only && reset_scope.is_none() {
         let expected = env_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "env credential revision precondition is required".to_string(),
@@ -2150,7 +2406,7 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if notification_only {
+    if notification_only && reset_scope.is_none() {
         let expected = notification_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "notification credential revision precondition is required".to_string(),
@@ -2202,7 +2458,11 @@ fn persist_exact_credential_transaction_inner(
         )
     } else if notification_only {
         (
-            prepare_notification_config_document(domain_original, config, notification_reset)?,
+            prepare_notification_config_document(
+                domain_original,
+                config,
+                notification_reset || reset_is(ExactTransactionScope::Notifications),
+            )?,
             providers_original.clone(),
         )
     } else if cluster_only {
@@ -2218,6 +2478,11 @@ fn persist_exact_credential_transaction_inner(
     } else if access_only {
         (
             prepare_access_control_config_document(domain_original, config)?,
+            providers_original.clone(),
+        )
+    } else if mcp_only {
+        (
+            serde_json::to_vec_pretty(&config.mcp)?,
             providers_original.clone(),
         )
     } else {
@@ -4014,6 +4279,70 @@ fn provider_instance_refs_from_document(
             ))
         })
         .collect()
+}
+
+fn provider_refs_from_document(bytes: &[u8]) -> ConfigStoreResult<BTreeMap<String, CredentialRef>> {
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let root: Value = serde_json::from_slice(bytes)?;
+    ["openai", "anthropic", "gemini", "bodhi"]
+        .into_iter()
+        .filter_map(|provider| {
+            root.get(provider)
+                .and_then(|value| value.get("credential_ref"))
+                .map(|value| (provider, value))
+        })
+        .map(|(provider, value)| {
+            let value = value.as_str().ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "provider credential reference must be a string".to_string(),
+                )
+            })?;
+            Ok((
+                provider.to_string(),
+                CredentialRef::parse(value.to_string())?,
+            ))
+        })
+        .collect()
+}
+
+fn mcp_refs_from_document(bytes: &[u8]) -> ConfigStoreResult<BTreeSet<CredentialRef>> {
+    if bytes.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    fn collect(value: &Value, output: &mut BTreeSet<CredentialRef>) -> ConfigStoreResult<()> {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if key == "credential_ref" {
+                        if let Some(reference) = value.as_str() {
+                            output.insert(CredentialRef::parse(reference.to_string())?);
+                        }
+                    } else if key.ends_with("credential_refs") {
+                        if let Some(references) = value.as_object() {
+                            for reference in references.values().filter_map(Value::as_str) {
+                                output.insert(CredentialRef::parse(reference.to_string())?);
+                            }
+                        }
+                    } else {
+                        collect(value, output)?;
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, output)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let root: Value = serde_json::from_slice(bytes)?;
+    let mut references = BTreeSet::new();
+    collect(&root, &mut references)?;
+    Ok(references)
 }
 
 fn env_refs_from_document(bytes: &[u8]) -> ConfigStoreResult<BTreeMap<String, CredentialRef>> {
@@ -5851,6 +6180,7 @@ fn section_data_as_legacy_root(
 ) -> ConfigStoreResult<Value> {
     let root = match scope {
         ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
         | ExactTransactionScope::ProxyAuth
         | ExactTransactionScope::Notifications => data,
         ExactTransactionScope::EnvVars => serde_json::json!({ "env_vars": data }),
@@ -5908,6 +6238,7 @@ fn prepare_active_exact_section_document(
     )?;
     let mut updated_data = match scope {
         ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
         | ExactTransactionScope::ProxyAuth
         | ExactTransactionScope::Notifications => Value::Object(updated_root),
         ExactTransactionScope::EnvVars => updated_root
@@ -5979,6 +6310,7 @@ fn prepare_active_exact_section_document(
             }
         }
         ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
         | ExactTransactionScope::ProxyAuth
         | ExactTransactionScope::ClusterFabric
         | ExactTransactionScope::AccessControl => {}
@@ -6780,9 +7112,11 @@ fn rollback_exact_authority_member(
 ) -> ConfigStoreResult<()> {
     match exact_authority_file(manifest) {
         Some(CONFIG_FILE) => match manifest.exact_scope {
-            Some(ExactTransactionScope::Providers) => Err(ConfigStoreError::Validation(
-                "provider exact transaction has no legacy root authority".to_string(),
-            )),
+            Some(ExactTransactionScope::Providers) | Some(ExactTransactionScope::Mcp) => {
+                Err(ConfigStoreError::Validation(
+                    "runtime section exact transaction has no legacy root authority".to_string(),
+                ))
+            }
             Some(ExactTransactionScope::ProxyAuth) => {
                 rollback_proxy_config_member(data_dir, manifest)
             }
@@ -7202,6 +7536,9 @@ fn abort_exact_transaction(data_dir: &Path, manifest: &MigrationManifest) -> Con
     match manifest.exact_scope {
         Some(ExactTransactionScope::Providers) => {
             abort_active_exact_transaction(data_dir, manifest, ExactTransactionScope::Providers)
+        }
+        Some(ExactTransactionScope::Mcp) => {
+            abort_active_exact_transaction(data_dir, manifest, ExactTransactionScope::Mcp)
         }
         Some(ExactTransactionScope::ProxyAuth) => abort_proxy_exact_transaction(data_dir, manifest),
         Some(ExactTransactionScope::EnvVars) => abort_env_exact_transaction(data_dir, manifest),
@@ -8357,6 +8694,7 @@ fn merge_active_section_data(
             merge_active_cluster_data(current, original, staged)
         }
         ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
         | ExactTransactionScope::ProxyAuth
         | ExactTransactionScope::Notifications
         | ExactTransactionScope::Connect
@@ -10682,6 +11020,11 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                 && unique.contains(CREDENTIALS_FILE)
                 && unique.contains(PROVIDERS_FILE)
         }
+        (true, Some(ExactTransactionScope::Mcp)) => {
+            manifest.files.len() == 2
+                && unique.contains(CREDENTIALS_FILE)
+                && unique.contains(MCP_FILE)
+        }
         (true, Some(ExactTransactionScope::ProxyAuth)) => {
             manifest.files.len() == 2
                 && (unique.contains(CONFIG_FILE) ^ unique.contains(CORE_FILE))
@@ -10692,13 +11035,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                     .is_some_and(|file| file.touched_credential_refs.len() == 1)
         }
         (true, Some(ExactTransactionScope::EnvVars)) => {
-            manifest.files.len() == 2
-                && (unique.contains(CONFIG_FILE) ^ unique.contains(ENV_FILE))
-                && manifest
-                    .files
-                    .iter()
-                    .find(|file| file.name == CREDENTIALS_FILE)
-                    .is_some_and(|file| !file.touched_credential_refs.is_empty())
+            manifest.files.len() == 2 && (unique.contains(CONFIG_FILE) ^ unique.contains(ENV_FILE))
         }
         (true, Some(ExactTransactionScope::Notifications)) => {
             manifest.files.len() == 2

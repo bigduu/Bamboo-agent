@@ -1,5 +1,9 @@
 use actix_web::{web, HttpResponse};
-use bamboo_config::{patch::is_masked_api_key, ConfigStoreError, ProviderConfigs, SectionEnvelope};
+use bamboo_config::{
+    patch::is_masked_api_key, ConfigStoreError, HooksSection, MemorySection, ModelLimitsSection,
+    ModelPolicySection, ProviderConfigs, SectionEnvelope, SectionId, SubagentsSection,
+    ToolsSkillsSection,
+};
 use bamboo_mcp::McpConfig;
 use serde::{de::Error as _, Deserialize, Deserializer};
 use serde_json::{json, Map, Value};
@@ -30,6 +34,12 @@ pub struct PutMcpSectionRequest {
 pub struct PutTypedSectionRequest {
     pub expected_revision: u64,
     pub data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetTypedSectionRequest {
+    pub expected_revision: u64,
 }
 
 /// Read-only, secret-free provider section projection. Credential values,
@@ -162,6 +172,78 @@ pub async fn put_typed_section(
         .envelope_value(id)
         .map_err(|error| map_mutation_error(ConfigSectionMutationError::Store(error)))?;
     Ok(HttpResponse::Ok().json(envelope))
+}
+
+/// Reset exactly one section to its backend-owned default using the typed
+/// section revision as the CAS authority. Credential-backed resets rebase on
+/// unrelated credential changes inside their recoverable exact transaction.
+pub async fn reset_typed_section(
+    app_state: web::Data<AppState>,
+    path: web::Path<String>,
+    payload: web::Json<ResetTypedSectionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let name = path.into_inner();
+    let id = section_id(&name)?;
+    let expected_revision = payload.expected_revision;
+
+    match id {
+        SectionId::Core
+        | SectionId::Notifications
+        | SectionId::Connect
+        | SectionId::Env
+        | SectionId::ClusterFabric
+        | SectionId::AccessControl => {
+            app_state
+                .reset_credential_backed_section(id, expected_revision)
+                .await
+                .map_err(map_mutation_error)?;
+        }
+        SectionId::Providers => {
+            app_state
+                .reset_provider_section(expected_revision)
+                .await
+                .map_err(map_mutation_error)?;
+        }
+        SectionId::Mcp => {
+            app_state
+                .reset_mcp_section(expected_revision)
+                .await
+                .map_err(map_mutation_error)?;
+        }
+        SectionId::Credentials => {
+            return super::credentials::reset_credentials(
+                app_state,
+                web::Json(super::credentials::ResetCredentialsRequest { expected_revision }),
+            )
+            .await;
+        }
+        ordinary => {
+            let candidate = default_section_value(ordinary)?;
+            app_state
+                .put_ordinary_section(ordinary, expected_revision, candidate)
+                .await
+                .map_err(map_mutation_error)?;
+        }
+    }
+
+    get_typed_section(app_state, web::Path::from(name)).await
+}
+
+fn default_section_value(id: SectionId) -> Result<Value, AppError> {
+    let value = match id {
+        SectionId::ToolsSkills => serde_json::to_value(ToolsSkillsSection::default()),
+        SectionId::Memory => serde_json::to_value(MemorySection::default()),
+        SectionId::Subagents => serde_json::to_value(SubagentsSection::default()),
+        SectionId::Hooks => serde_json::to_value(HooksSection::default()),
+        SectionId::ModelPolicy => serde_json::to_value(ModelPolicySection::default()),
+        SectionId::ModelLimits => serde_json::to_value(ModelLimitsSection::default()),
+        _ => {
+            return Err(AppError::BadRequest(
+                "this section requires its dedicated reset path".to_string(),
+            ))
+        }
+    };
+    value.map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))
 }
 
 fn section_id(name: &str) -> Result<bamboo_config::SectionId, AppError> {
@@ -504,7 +586,7 @@ mod tests {
         HeaderConfig, McpConfig, McpServerConfig, ReconnectConfig, StdioConfig,
         StreamableHttpConfig, TransportConfig,
     };
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::time::Duration;
 
     fn server(id: &str, transport: TransportConfig) -> McpServerConfig {
@@ -1291,5 +1373,432 @@ mod tests {
             .await
             .proxy_auth_credential_ref
             .is_none());
+    }
+
+    #[actix_web::test]
+    async fn ordinary_section_reset_uses_backend_default_and_section_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/sections/{section}", web::put().to(put_typed_section))
+                .route(
+                    "/sections/{section}/reset",
+                    web::post().to(reset_typed_section),
+                ),
+        )
+        .await;
+
+        let updated = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/model-limits")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": [{"model": "custom", "max_tokens": 42}]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert!(updated.status().is_success());
+
+        let reset = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/model-limits/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        assert!(reset.status().is_success());
+        let reset: Value = test::read_body_json(reset).await;
+        assert_eq!(reset["revision"], 2);
+        assert_eq!(reset["data"], json!([]));
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/model-limits/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+
+        let repeated = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/model-limits/reset")
+                .set_json(json!({"expected_revision": 2}))
+                .to_request(),
+        )
+        .await;
+        assert!(repeated.status().is_success());
+        let repeated: Value = test::read_body_json(repeated).await;
+        assert_eq!(repeated["revision"], 3);
+        assert_eq!(repeated["data"], json!([]));
+    }
+
+    #[actix_web::test]
+    async fn notification_reset_atomically_clears_owned_secret_and_rejects_stale_cas() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x61; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state
+            .update_notification_credentials(
+                0,
+                BTreeSet::from(["ntfy".to_string()]),
+                false,
+                |config| {
+                    config.notifications.ntfy.enabled = true;
+                    config.notifications.ntfy.topic = "alerts".to_string();
+                    config.notifications.ntfy.token = Some("never-return-reset-secret".to_string());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let reference = bamboo_config::credential_ref("notification", "ntfy", "token").unwrap();
+        assert!(
+            state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+        let unrelated = bamboo_config::CredentialRef::parse("custom.unrelated.token").unwrap();
+        state
+            .credential_store
+            .replace(
+                unrelated.clone(),
+                "preserved-unrelated-secret",
+                bamboo_config::CredentialSource::User,
+                1,
+            )
+            .unwrap();
+
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/sections/{section}/reset",
+            web::post().to(reset_typed_section),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/notifications/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
+        assert!(!body.contains("never-return-reset-secret"));
+        assert!(!body.contains("preserved-unrelated-secret"));
+        assert!(body.contains("\"revision\":2"));
+        assert!(
+            !state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+        assert!(
+            state
+                .credential_store
+                .status(&unrelated)
+                .unwrap()
+                .configured
+        );
+        assert_eq!(state.config.read().await.notifications, Default::default());
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/notifications/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+    }
+
+    #[actix_web::test]
+    async fn core_reset_clears_proxy_credential_with_core_metadata() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state.config.write().await.http_proxy = "http://proxy.example:8080".to_string();
+        state
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "proxy-user".to_string(),
+                    password: "proxy-reset-secret".to_string(),
+                }),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let reference = bamboo_config::credential_ref("proxy", "default", "auth").unwrap();
+        assert!(
+            state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/sections/{section}/reset",
+            web::post().to(reset_typed_section),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/core/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
+        assert!(!body.contains("proxy-reset-secret"));
+        assert!(state.config.read().await.http_proxy.is_empty());
+        assert!(state.config.read().await.proxy_auth.is_none());
+        assert!(
+            !state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+    }
+
+    #[actix_web::test]
+    async fn access_control_reset_restores_none_and_clears_verifier() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state
+            .update_access_control_credentials(0, true, BTreeSet::new(), |config| {
+                config.access_control = Some(bamboo_config::AccessControlConfig {
+                    password_enabled: true,
+                    password_hash: Some("a".repeat(64)),
+                    password_salt: Some("b".repeat(32)),
+                    password_configured: true,
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let reference = bamboo_config::config_crypto::access_password_credential_ref().unwrap();
+        assert!(
+            state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/sections/{section}/reset",
+            web::post().to(reset_typed_section),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/access-control/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
+        assert!(state.config.read().await.access_control.is_none());
+        assert!(
+            !state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+    }
+
+    #[actix_web::test]
+    async fn provider_reset_clears_owned_credential_and_uses_provider_revision() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x62; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state
+            .update_config_with_provider_credentials(
+                |config| {
+                    config.provider = "openai".to_string();
+                    config.providers_mut().openai = Some(OpenAIConfig {
+                        api_key: "provider-reset-secret".to_string(),
+                        model: Some("custom-model".to_string()),
+                        ..Default::default()
+                    });
+                    Ok(())
+                },
+                BTreeSet::from(["openai".to_string()]),
+                BTreeSet::new(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+        assert!(
+            state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+        let revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .providers
+            .snapshot()
+            .revision;
+
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/sections/{section}/reset",
+            web::post().to(reset_typed_section),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/providers/reset")
+                .set_json(json!({"expected_revision": revision}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
+        assert!(!body.contains("provider-reset-secret"));
+        assert!(
+            !state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+        assert!(state.config.read().await.providers().openai.is_none());
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/providers/reset")
+                .set_json(json!({"expected_revision": revision}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+    }
+
+    #[actix_web::test]
+    async fn mcp_reset_clears_owned_credentials_at_runtime_commit_boundary() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x66; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let health = state
+                    .mcp_config_live_health
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if health.status == SectionStatus::Healthy && health.revision == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let reference = bamboo_config::credential_ref("mcp", "reset-server", "env_TOKEN").unwrap();
+        state
+            .credential_store
+            .replace(
+                reference.clone(),
+                "mcp-reset-secret",
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        state
+            .put_mcp_section(
+                0,
+                McpConfig {
+                    version: 1,
+                    servers: vec![server(
+                        "reset-server",
+                        TransportConfig::Stdio(StdioConfig {
+                            command: "disabled-command".to_string(),
+                            args: Vec::new(),
+                            cwd: None,
+                            env: HashMap::from([(
+                                "TOKEN".to_string(),
+                                "mcp-reset-secret".to_string(),
+                            )]),
+                            env_encrypted: HashMap::new(),
+                            env_credential_refs: HashMap::from([(
+                                "TOKEN".to_string(),
+                                reference.as_str().to_string(),
+                            )]),
+                            startup_timeout_ms: 500,
+                        }),
+                    )],
+                },
+            )
+            .await
+            .unwrap();
+
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/sections/{section}/reset",
+            web::post().to(reset_typed_section),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/mcp/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
+        assert!(!body.contains("mcp-reset-secret"));
+        assert!(state.config.read().await.mcp.servers.is_empty());
+        assert!(
+            !state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/mcp/reset")
+                .set_json(json!({"expected_revision": 1}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
     }
 }

@@ -29,6 +29,12 @@ pub struct ClearCredentialRequest {
     pub expected_revision: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetCredentialsRequest {
+    pub expected_revision: u64,
+}
+
 pub async fn list_credentials(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let (statuses, health) = app_state
         .credential_store
@@ -84,6 +90,26 @@ pub async fn clear_credential(
         .map_err(map_store_mutation_error)?;
     publish_credential_event(&app_state, revision);
     Ok(HttpResponse::Ok().json(envelope(status, CredentialStoreHealth::committed(revision))))
+}
+
+pub async fn reset_credentials(
+    app_state: web::Data<AppState>,
+    payload: web::Json<ResetCredentialsRequest>,
+) -> Result<HttpResponse, AppError> {
+    let _io = app_state.config_io_lock.lock().await;
+    let config = app_state.config.read().await.clone();
+    let (revision, statuses) = app_state
+        .credential_store
+        .clear_all_unreferenced(&config, payload.expected_revision)
+        .map_err(|error| match error {
+            ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+            other => map_store_mutation_error(other),
+        })?;
+    publish_credential_event(&app_state, revision);
+    Ok(HttpResponse::Ok().json(envelope(
+        statuses,
+        CredentialStoreHealth::committed(revision),
+    )))
 }
 
 pub async fn get_live_config_health(
@@ -499,5 +525,68 @@ mod tests {
         );
         assert_eq!(bamboo_config::Config::current_env_vars(), before_runtime);
         assert_eq!(state.config.read().await.env_vars, before_config.env_vars);
+    }
+
+    #[actix_web::test]
+    async fn reset_clears_all_orphans_in_one_cas_but_rejects_live_references() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let orphan = CredentialRef::parse("custom.orphan.token").unwrap();
+        let active = CredentialRef::parse("env.ACTIVE.value").unwrap();
+        state
+            .credential_store
+            .replace(orphan, "orphan-secret", CredentialSource::User, 0)
+            .unwrap();
+        state
+            .credential_store
+            .replace(active.clone(), "active-secret", CredentialSource::User, 1)
+            .unwrap();
+        state
+            .config
+            .write()
+            .await
+            .env_vars
+            .push(bamboo_config::EnvVarEntry {
+                name: "ACTIVE".to_string(),
+                value: "active-secret".to_string(),
+                secret: true,
+                value_encrypted: None,
+                credential_ref: Some(active),
+                configured: true,
+                description: None,
+            });
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/credentials/reset", web::post().to(reset_credentials)),
+        )
+        .await;
+
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/credentials/reset")
+                .set_json(serde_json::json!({"expected_revision": 2}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(state.credential_store.statuses().unwrap().len(), 2);
+
+        state.config.write().await.env_vars.clear();
+        let reset = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/credentials/reset")
+                .set_json(serde_json::json!({"expected_revision": 2}))
+                .to_request(),
+        )
+        .await;
+        assert!(reset.status().is_success());
+        let reset: serde_json::Value = test::read_body_json(reset).await;
+        assert_eq!(reset["revision"], 3);
+        assert_eq!(reset["data"], serde_json::json!([]));
+        assert!(state.credential_store.statuses().unwrap().is_empty());
     }
 }
