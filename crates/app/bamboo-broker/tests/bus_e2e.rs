@@ -67,6 +67,7 @@ async fn runner_style_child_run_over_the_bus_with_a_real_subprocess() {
 
     link.send(ParentFrame::Run(RunSpec {
         assignment: "ping pong".into(),
+        project_id: None,
         reasoning_effort: None,
         permission_policy: None,
         messages: vec![],
@@ -160,6 +161,7 @@ async fn one_warm_worker_serves_two_sequential_runs() {
 
         link.send(ParentFrame::Run(RunSpec {
             assignment: word.to_string(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],

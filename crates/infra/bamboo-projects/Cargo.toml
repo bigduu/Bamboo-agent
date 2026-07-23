@@ -1,0 +1,31 @@
+[package]
+name = "bamboo-projects"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Crash-safe Project registry and shared-resource paths for Bamboo"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+chrono = { workspace = true }
+fs2 = "0.4"
+hex = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = { workspace = true }
+tracing = "0.1"
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+bamboo-memory = { path = "../../infra/bamboo-memory" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

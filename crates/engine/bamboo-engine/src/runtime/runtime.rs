@@ -45,6 +45,7 @@ pub struct AgentRuntime {
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
     pub attachment_reader: Arc<dyn AttachmentReader>,
     pub skill_manager: Arc<SkillManager>,
+    pub project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     pub metrics_collector: MetricsCollector,
     pub config: Arc<RwLock<Config>>,
 
@@ -80,6 +81,7 @@ pub struct AgentRuntimeBuilder {
     persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
     attachment_reader: Option<Arc<dyn AttachmentReader>>,
     skill_manager: Option<Arc<SkillManager>>,
+    project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     metrics_collector: Option<MetricsCollector>,
     config: Option<Arc<RwLock<Config>>>,
     provider: Option<Arc<dyn LLMProvider>>,
@@ -94,6 +96,7 @@ impl AgentRuntimeBuilder {
             persistence: None,
             attachment_reader: None,
             skill_manager: None,
+            project_context_resolver: None,
             metrics_collector: None,
             config: None,
             provider: None,
@@ -119,6 +122,14 @@ impl AgentRuntimeBuilder {
 
     pub fn skill_manager(mut self, v: Arc<SkillManager>) -> Self {
         self.skill_manager = Some(v);
+        self
+    }
+
+    pub fn project_context_resolver(
+        mut self,
+        v: Arc<crate::project_context::ProjectContextResolver>,
+    ) -> Self {
+        self.project_context_resolver = Some(v);
         self
     }
 
@@ -160,6 +171,7 @@ impl AgentRuntimeBuilder {
             skill_manager: self
                 .skill_manager
                 .ok_or_else(|| format_missing("skill_manager"))?,
+            project_context_resolver: self.project_context_resolver,
             metrics_collector: self
                 .metrics_collector
                 .ok_or_else(|| format_missing("metrics_collector"))?,
@@ -680,6 +692,7 @@ impl AgentRuntime {
             selected_skill_ids,
             selected_skill_mode,
             skill_manager: Some(self.skill_manager.clone()),
+            project_context_resolver: self.project_context_resolver.clone(),
             skip_initial_user_message: true,
             storage: Some(self.storage.clone()),
             persistence: Some(self.persistence.clone()),

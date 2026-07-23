@@ -31,6 +31,11 @@ pub enum AgentError {
     #[error("Tool error: {0}")]
     Tool(String),
 
+    /// Stable Project identity, availability, or workspace ownership failed
+    /// validation before an execution round.
+    #[error("Project context error: {0}")]
+    ProjectContext(String),
+
     /// A lifecycle hook deliberately suspended this activation. The outer
     /// runner converts this control signal into a normal persisted suspension.
     #[error("Hook suspended: {0}")]

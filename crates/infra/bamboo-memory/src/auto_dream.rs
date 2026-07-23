@@ -867,16 +867,4 @@ mod tests {
         assert!(prompt.contains("canonical durable memory plus recent session activity"));
         assert!(prompt.contains("session-3"));
     }
-
-    // -----------------------------------------------------------------------
-    // Orchestration tests
-    // -----------------------------------------------------------------------
-
-    use std::sync::Mutex;
-
-    use async_trait::async_trait;
-    use futures::stream;
-
-    use bamboo_agent_core::storage::Storage;
-    use bamboo_llm::{LLMError, LLMStream};
 }

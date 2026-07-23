@@ -1,8 +1,26 @@
-use actix_web::{web, HttpResponse, Result};
+use actix_web::{http::StatusCode, web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 
 use super::super::super::types::SessionSystemPromptResponse;
+
+fn project_snapshot_error(
+    error: bamboo_engine::project_context::ProjectContextError,
+) -> HttpResponse {
+    use bamboo_engine::project_context::ProjectContextError;
+
+    let status = match error {
+        ProjectContextError::InvalidProjectIdentity { .. }
+        | ProjectContextError::WorkspaceInvalid { .. } => StatusCode::BAD_REQUEST,
+        ProjectContextError::WorkspaceConflict { .. }
+        | ProjectContextError::UnassignedWorkspaceConflict { .. }
+        | ProjectContextError::ProjectUnavailable { .. } => StatusCode::CONFLICT,
+        ProjectContextError::Source(_) | ProjectContextError::IdentityMismatch { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    crate::error::json_error(status, error.to_string())
+}
 
 /// `GET /api/v1/sessions/{session_id}/system-prompt`
 pub async fn get_system_prompt_snapshot(
@@ -13,7 +31,7 @@ pub async fn get_system_prompt_snapshot(
 
     let session = { bamboo_engine::read_cached_session(&state.sessions, &session_id) };
 
-    let session = match session {
+    let mut session = match session {
         Some(session) => session,
         None => match state
             .storage
@@ -32,6 +50,19 @@ pub async fn get_system_prompt_snapshot(
         },
     };
 
+    // A schedule or child created with execution disabled may never have
+    // entered the runner, so its persisted system message can legitimately
+    // predate Project prompt injection. Resolve a temporary clone here to make
+    // the snapshot contract independent of execution. The read-only resolver
+    // does not update runtime workspace state or persist this temporary view.
+    if let Err(error) = state
+        .project_context_resolver
+        .refresh_session_prompt_read_only(&mut session)
+        .await
+    {
+        return Ok(project_snapshot_error(error));
+    }
+
     let default_prompt =
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let snapshot = bamboo_engine::session_app::system_prompt::build_system_prompt_snapshot(
@@ -43,6 +74,7 @@ pub async fn get_system_prompt_snapshot(
         session_id: session_id.to_string(),
         base_system_prompt: snapshot.base_system_prompt,
         enhancement_prompt: snapshot.enhancement_prompt,
+        project_context: snapshot.project_context,
         workspace_context: snapshot.workspace_context,
         instruction_context: snapshot.instruction_context,
         env_context: snapshot.env_context,
@@ -65,7 +97,7 @@ pub async fn get_system_prompt_snapshot(
 mod tests {
     use super::get_system_prompt_snapshot;
     use actix_web::{body::to_bytes, http::StatusCode, web};
-    use bamboo_agent_core::{Message, Session};
+    use bamboo_agent_core::{Message, Role, Session, SessionKind};
 
     fn publish_test_env_context() {
         let mut config = bamboo_llm::Config::default();
@@ -127,6 +159,192 @@ mod tests {
         assert!(snapshot["external_memory"]
             .as_str()
             .is_some_and(|value| value.contains("Handler project dream content")));
+    }
+
+    #[actix_web::test]
+    async fn system_prompt_get_does_not_materialize_fallback_workspace() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = crate::app_state::AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state");
+        let session_id = format!("prompt-read-only-{}", uuid::Uuid::new_v4());
+        let mut session = Session::new(&session_id, "gpt-5");
+        session
+            .metadata
+            .insert("base_system_prompt".to_string(), "Base prompt".to_string());
+        state
+            .storage
+            .save_session(&session)
+            .await
+            .expect("save session");
+        let candidate =
+            bamboo_engine::project_context::ProjectContextResolver::resolve_workspace_candidate(
+                &session, None,
+            )
+            .expect("resolve candidate")
+            .expect("workspace-root fallback");
+        assert!(
+            !candidate.exists(),
+            "pure preflight must not create the fallback directory"
+        );
+        let state = web::Data::new(state);
+
+        let response = get_system_prompt_snapshot(state, web::Path::from(session_id.clone()))
+            .await
+            .expect("snapshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !candidate.exists(),
+            "GET system-prompt must leave the fallback directory absent"
+        );
+        assert!(bamboo_agent_core::workspace_state::peek_workspace(&session_id).is_none());
+    }
+
+    #[actix_web::test]
+    async fn unexecuted_schedule_and_child_snapshots_materialize_project_context_read_only() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let state = crate::app_state::AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        let project = state
+            .project_store
+            .create_with_bindings(
+                "Prompt Snapshot Project",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: workspace.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .expect("create Project");
+        let state = web::Data::new(state);
+
+        for (session_id, kind, schedule_id) in [
+            ("unexecuted-schedule", SessionKind::Root, Some("schedule-1")),
+            ("unexecuted-child", SessionKind::Child, None),
+        ] {
+            let mut session = match kind {
+                SessionKind::Child => {
+                    Session::new_child(session_id, "unexecuted-root", "gpt-5", "Unexecuted child")
+                }
+                SessionKind::Root => Session::new(session_id, "gpt-5"),
+            };
+            session.set_project_id_meta(project.id.to_string());
+            session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+            if let Some(schedule_id) = schedule_id {
+                session.metadata.insert(
+                    "created_by_schedule_id".to_string(),
+                    schedule_id.to_string(),
+                );
+            }
+            session
+                .metadata
+                .insert("base_system_prompt".to_string(), "Base prompt".to_string());
+            state
+                .storage
+                .save_session(&session)
+                .await
+                .expect("save unexecuted session");
+
+            let response =
+                get_system_prompt_snapshot(state.clone(), web::Path::from(session_id.to_string()))
+                    .await
+                    .expect("snapshot request");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body()).await.expect("response body");
+            let snapshot: serde_json::Value = serde_json::from_slice(&body).expect("snapshot JSON");
+            let effective = snapshot["effective_system_prompt"]
+                .as_str()
+                .expect("effective prompt");
+            assert_eq!(effective.matches("BAMBOO_PROJECT_CONTEXT_START").count(), 1);
+            assert_eq!(
+                effective.matches("BAMBOO_WORKSPACE_CONTEXT_START").count(),
+                1
+            );
+            assert!(snapshot["project_context"]
+                .as_str()
+                .is_some_and(|value| value.contains(project.id.as_str())));
+            assert!(snapshot["workspace_context"]
+                .as_str()
+                .is_some_and(|value| value.contains(workspace.to_string_lossy().as_ref())));
+
+            let persisted = state
+                .storage
+                .load_session(session_id)
+                .await
+                .expect("load persisted session")
+                .expect("persisted session");
+            assert!(
+                !persisted
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message.role, Role::System)),
+                "GET must not persist the temporary prompt view"
+            );
+            assert!(
+                persisted.prompt_snapshot.is_none(),
+                "GET must not persist the temporary prompt snapshot"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn snapshot_fails_closed_for_invalid_identity_and_cross_project_workspace() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let workspace = temp_dir.path().join("foreign-workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let state = crate::app_state::AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        let assigned_project = state
+            .project_store
+            .create("Assigned Project", None)
+            .expect("assigned Project");
+        let _workspace_owner = state
+            .project_store
+            .create_with_bindings(
+                "Workspace Owner",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: workspace.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .expect("workspace owner");
+        let state = web::Data::new(state);
+
+        let mut invalid = Session::new("invalid-project-snapshot", "gpt-5");
+        invalid.set_project_id_meta("../invalid".to_string());
+        state
+            .storage
+            .save_session(&invalid)
+            .await
+            .expect("save invalid session");
+        let response =
+            get_system_prompt_snapshot(state.clone(), web::Path::from(invalid.id.clone()))
+                .await
+                .expect("invalid snapshot response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let mut conflict = Session::new("conflicting-project-snapshot", "gpt-5");
+        conflict.set_project_id_meta(assigned_project.id.to_string());
+        conflict.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        state
+            .storage
+            .save_session(&conflict)
+            .await
+            .expect("save conflicting session");
+        let response = get_system_prompt_snapshot(state, web::Path::from(conflict.id.clone()))
+            .await
+            .expect("conflict snapshot response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

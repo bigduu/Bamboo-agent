@@ -902,6 +902,7 @@ impl ExternalChildRunner for ActorChildRunner {
             .iter()
             .filter_map(|m| serde_json::to_value(m).ok())
             .collect();
+        let project_id = project_id_for_actor_run(session)?;
         // Policy is captured per activation (not only when a worker is
         // provisioned), so reused local workers and resident remote/broker
         // workers observe the latest durable revision and bypass flag at the
@@ -1120,6 +1121,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 .send(ParentFrame::Run(RunSpec {
                     // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                     assignment: assignment.clone(),
+                    project_id: project_id.clone(),
                     reasoning_effort: None,
                     permission_policy: permission_policy.clone(),
                     messages: messages.clone(),
@@ -1482,6 +1484,22 @@ async fn drive(
 }
 
 /// The assignment text = the child session's latest user message (falls back to its title).
+fn project_id_for_actor_run(
+    session: &Session,
+) -> Result<Option<bamboo_domain::ProjectId>, AgentError> {
+    match crate::project_context::ProjectContextResolver::session_project_identity(session) {
+        crate::project_context::SessionProjectIdentity::Assigned(project_id) => {
+            Ok(Some(project_id))
+        }
+        crate::project_context::SessionProjectIdentity::Unassigned => Ok(None),
+        crate::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+            Err(AgentError::LLM(format!(
+                "child session carries an invalid Project identity '{raw}': {message}"
+            )))
+        }
+    }
+}
+
 fn extract_assignment(session: &Session) -> String {
     session
         .messages
@@ -2502,6 +2520,59 @@ mod tests {
             spec.capabilities.enforce_permissions,
             "forced-ask evaluation must remain active under bypass"
         );
+    }
+
+    #[tokio::test]
+    async fn child_resident_and_guardian_inherit_project_through_actor_run_spec() {
+        let project_id = bamboo_domain::ProjectId::parse("project-inherited").expect("Project id");
+        let workspace = tempfile::tempdir().expect("workspace fixture");
+
+        for (role, lifecycle, resident_name) in [
+            ("explorer", None, None),
+            ("resident", Some("resident"), Some("stable-reviewer")),
+            ("guardian", None, None),
+        ] {
+            let mut parent = Session::new(format!("parent-{role}"), "test-model");
+            parent.set_project_id_meta(project_id.to_string());
+            let port = RecordingChildSessionPort::default();
+            let child_id = format!("child-{role}-{}", uuid::Uuid::new_v4());
+            crate::session_app::child_session::create_child_action(
+                &port,
+                crate::session_app::child_session::CreateChildInput {
+                    parent_session: parent,
+                    child_id: child_id.clone(),
+                    title: format!("{role} child"),
+                    responsibility: "Review the assigned work".to_string(),
+                    assignment_prompt: "inspect the change".to_string(),
+                    subagent_type: role.to_string(),
+                    workspace: workspace.path().to_string_lossy().into_owned(),
+                    model_override: None,
+                    model_ref_override: None,
+                    runtime_metadata: HashMap::new(),
+                    auto_run: false,
+                    reasoning_effort: None,
+                    lifecycle: lifecycle.map(str::to_string),
+                    resident_name: resident_name.map(str::to_string),
+                    resident_context: None,
+                    disabled_tools: None,
+                    context_fork: None,
+                },
+            )
+            .await
+            .expect("create Project-inheriting child");
+            let child = port.saved_child();
+            assert_eq!(
+                crate::project_context::ProjectContextResolver::project_id_from_session(&child),
+                Some(project_id.clone()),
+                "{role} child must inherit its parent's Project"
+            );
+
+            assert_eq!(
+                project_id_for_actor_run(&child).expect("valid actor Project identity"),
+                Some(project_id.clone()),
+                "{role} actor RunSpec must preserve inherited Project identity"
+            );
+        }
     }
 
     #[test]

@@ -345,6 +345,10 @@ pub struct AgentLoopConfig {
     pub(crate) additional_tool_schemas: Vec<ToolSchema>,
     pub(crate) tool_registry: Arc<ToolRegistry>,
     pub(crate) skill_manager: Option<Arc<SkillManager>>,
+    /// Stable Project identity/resource resolver. The server wires the
+    /// authoritative registry adapter once on `AgentRuntimeBuilder`.
+    pub(crate) project_context_resolver:
+        Option<Arc<crate::project_context::ProjectContextResolver>>,
     /// If true, skip appending the initial user message (already present in session).
     pub(crate) skip_initial_user_message: bool,
     /// Optional storage for persisting session changes
@@ -517,6 +521,7 @@ impl Default for AgentLoopConfig {
             additional_tool_schemas: Vec::new(),
             tool_registry: Arc::new(ToolRegistry::new()),
             skill_manager: None,
+            project_context_resolver: None,
             skip_initial_user_message: false,
             storage: None,
             persistence: None,

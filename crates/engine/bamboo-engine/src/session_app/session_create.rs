@@ -14,6 +14,8 @@ use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
 /// Request-level input for session creation.
 pub struct CreateSessionInput {
     pub id: String,
+    /// Stable Project membership for this root session.
+    pub project_id: Option<bamboo_domain::ProjectId>,
     pub title: Option<String>,
     pub system_prompt: Option<String>,
     pub model: Option<String>,
@@ -62,6 +64,9 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
     }
     if let Some(workspace_path) = trimmed_non_empty(input.workspace_path.as_deref()) {
         session.set_workspace_path_meta(workspace_path);
+    }
+    if let Some(project_id) = input.project_id.as_ref() {
+        session.set_project_id_meta(project_id.to_string());
     }
 
     if let Some(title) = trimmed_non_empty(input.title.as_deref()) {
@@ -167,6 +172,7 @@ mod tests {
     fn build_new_session_applies_title_and_system_prompt() {
         let input = CreateSessionInput {
             id: "session-1".to_string(),
+            project_id: None,
             title: Some("  Sprint Session  ".to_string()),
             system_prompt: Some("  You are helpful  ".to_string()),
             model: Some("gpt-5".to_string()),
@@ -196,6 +202,7 @@ mod tests {
     fn build_new_session_uses_global_default_when_no_explicit_prompt() {
         let input = CreateSessionInput {
             id: "session-2".to_string(),
+            project_id: None,
             title: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
@@ -224,6 +231,7 @@ mod tests {
         };
         let input = CreateSessionInput {
             id: "session-3".to_string(),
+            project_id: None,
             title: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
@@ -247,6 +255,7 @@ mod tests {
     fn build_new_session_with_explicit_prompt_generates_snapshot() {
         let input = CreateSessionInput {
             id: "session-4".to_string(),
+            project_id: None,
             title: None,
             system_prompt: Some("Custom prompt".to_string()),
             model: Some("gpt-5".to_string()),
@@ -267,6 +276,7 @@ mod tests {
     fn build_new_session_with_model_ref_persists_bare_model_and_provider_metadata() {
         let input = CreateSessionInput {
             id: "session-5".to_string(),
+            project_id: None,
             title: None,
             system_prompt: None,
             model: Some("ignored-compat-model".to_string()),
@@ -294,6 +304,7 @@ mod tests {
     fn build_new_session_with_workspace_path_sets_workspace_metadata() {
         let input = CreateSessionInput {
             id: "session-6".to_string(),
+            project_id: None,
             title: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
@@ -314,6 +325,7 @@ mod tests {
     fn build_new_session_without_workspace_path_leaves_metadata_unset() {
         let input = CreateSessionInput {
             id: "session-7".to_string(),
+            project_id: None,
             title: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),

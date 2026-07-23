@@ -241,6 +241,7 @@ mod tests {
             .run(
                 RunSpec {
                     assignment: "alpha beta".into(),
+                    project_id: None,
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),
@@ -272,6 +273,7 @@ mod tests {
             .run(
                 RunSpec {
                     assignment: "a b c".into(),
+                    project_id: None,
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),

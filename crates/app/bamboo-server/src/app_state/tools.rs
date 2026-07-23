@@ -37,6 +37,8 @@ pub(super) fn build_base_tools(
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     session_watchers: Arc<SessionWatchers>,
     ledger_schedule_bridge: Arc<crate::schedule_app::LateBoundLedgerBridge>,
+    project_store: Arc<bamboo_projects::ProjectStore>,
+    account_sink: Arc<bamboo_engine::events::AccountEventSink>,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -60,12 +62,32 @@ pub(super) fn build_base_tools(
         mcp_tools,
     ));
 
-    let memory_tool = Arc::new(crate::tools::MemoryTool::new(
+    // Replace the framework Workspace tool with the Project-aware server
+    // overlay and expose the explicit Project registry tool. Overlay dispatch
+    // still delegates permission decisions to the built-in executor.
+    let workspace_tool = Arc::new(crate::tools::ProjectWorkspaceTool::new(
         session_repo.clone(),
-        app_data_dir.clone(),
+        project_store.clone(),
     ));
-    let with_memory: Arc<dyn ToolExecutor> =
-        Arc::new(crate::tools::OverlayToolExecutor::new(base, memory_tool));
+    let with_workspace: Arc<dyn ToolExecutor> =
+        Arc::new(crate::tools::OverlayToolExecutor::new(base, workspace_tool));
+    let project_tool = Arc::new(
+        crate::tools::ProjectTool::new(session_repo.clone(), project_store.clone())
+            .with_account_sink(account_sink),
+    );
+    let with_project: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_workspace,
+        project_tool,
+    ));
+
+    let memory_tool = Arc::new(
+        crate::tools::MemoryTool::new(session_repo.clone(), app_data_dir.clone())
+            .with_project_store(project_store.clone()),
+    );
+    let with_memory: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_project,
+        memory_tool,
+    ));
 
     // `ledger` sits in the base layer (not root-only) so headless reminder
     // sessions fired by the schedule manager can read and transition the very
@@ -73,7 +95,8 @@ pub(super) fn build_base_tools(
     // is built after the tool chain, and the builder binds it once it's up.
     let ledger_tool = Arc::new(
         crate::tools::LedgerTool::new(session_repo.clone(), app_data_dir.clone())
-            .with_schedule_bridge(ledger_schedule_bridge),
+            .with_schedule_bridge(ledger_schedule_bridge)
+            .with_project_store(project_store.clone()),
     );
     let with_ledger: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_memory,
@@ -86,6 +109,7 @@ pub(super) fn build_base_tools(
             config.clone(),
             session_repo.clone(),
         )
+        .with_project_store(project_store.clone())
         .with_permission_checked_context_registry(
             with_ledger.clone(),
             permission_checker.permission_config(),
@@ -96,11 +120,10 @@ pub(super) fn build_base_tools(
         load_skill_tool,
     ));
 
-    let read_skill_resource_tool = Arc::new(crate::tools::ReadSkillResourceTool::new(
-        skill_manager,
-        config.clone(),
-        session_repo,
-    ));
+    let read_skill_resource_tool = Arc::new(
+        crate::tools::ReadSkillResourceTool::new(skill_manager, config.clone(), session_repo)
+            .with_project_store(project_store),
+    );
     let with_skills: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_load_skill,
         read_skill_resource_tool,
@@ -150,6 +173,7 @@ pub(super) fn build_root_tools(
     broker: Option<bamboo_config::BrokerClientConfig>,
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
     notification_relay: super::session_events::NotificationRelayDeps,
+    project_store: Arc<bamboo_projects::ProjectStore>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
@@ -162,6 +186,7 @@ pub(super) fn build_root_tools(
         session_event_senders,
         subagent_model_resolver,
         config: config.clone(),
+        project_store: Some(project_store.clone()),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
         notification_relay: Some(notification_relay),
     });
@@ -188,6 +213,7 @@ pub(super) fn build_root_tools(
         session_store.clone(),
         storage.clone(),
         config.clone(),
+        project_store,
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),

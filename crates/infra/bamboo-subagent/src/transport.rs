@@ -697,6 +697,7 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "one two".into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -749,6 +750,7 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "go".into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -802,6 +804,7 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -884,6 +887,7 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "start".into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -962,6 +966,7 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "go".into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -1015,6 +1020,7 @@ mod tests {
             client
                 .send(ParentFrame::Run(RunSpec {
                     assignment: "__sleep_ms:300 alpha only".into(),
+                    project_id: None,
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),
@@ -1032,6 +1038,7 @@ mod tests {
             client
                 .send(ParentFrame::Run(RunSpec {
                     assignment: "beta only".into(),
+                    project_id: None,
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),
@@ -1135,6 +1142,7 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "first".into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -1154,6 +1162,7 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "second".into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),

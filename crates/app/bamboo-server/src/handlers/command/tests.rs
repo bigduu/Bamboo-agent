@@ -265,6 +265,74 @@ async fn project_command_is_listed_and_namespace_route_expands_arguments() {
 }
 
 #[actix_web::test]
+async fn assigned_project_commands_use_workspace_overlay_then_project_source() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join(".git")).expect("git marker");
+    let project_store = bamboo_projects::ProjectStore::open(data.path()).expect("Project store");
+    let project = project_store
+        .create("Command Project", None)
+        .expect("create Project");
+    let project_commands = project_store.paths().commands_dir(&project.id);
+    std::fs::create_dir_all(&project_commands).expect("Project commands");
+    std::fs::write(project_commands.join("review.md"), "PROJECT REVIEW")
+        .expect("Project review command");
+    std::fs::write(project_commands.join("project-only.md"), "PROJECT ONLY")
+        .expect("Project-only command");
+    let workspace_commands = workspace.path().join(".bamboo/commands");
+    std::fs::create_dir_all(&workspace_commands).expect("workspace commands");
+    std::fs::write(workspace_commands.join("review.md"), "WORKSPACE REVIEW")
+        .expect("workspace review command");
+
+    let app_state = web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut session = bamboo_agent_core::Session::new("assigned-command-session", "test-model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    app_state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(app_state)
+            .configure(super::config),
+    )
+    .await;
+    let list: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands?session_id=assigned-command-session")
+            .to_request(),
+    )
+    .await;
+    let entries = list["commands"].as_array().expect("commands");
+    let review = entries
+        .iter()
+        .find(|entry| entry["name"] == "review")
+        .expect("review command");
+    assert_eq!(review["metadata"]["source"], "workspace");
+    let project_only = entries
+        .iter()
+        .find(|entry| entry["name"] == "project-only")
+        .expect("Project-only command");
+    assert_eq!(project_only["metadata"]["source"], "project");
+
+    let review: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands/prompt/review?session_id=assigned-command-session")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(review["content"], "WORKSPACE REVIEW");
+    assert_eq!(review["metadata"]["source"], "workspace");
+}
+
+#[actix_web::test]
 async fn arbitrary_workspace_path_is_rejected_for_list_and_get() {
     let data = tempfile::tempdir().expect("data dir");
     let outside = tempfile::tempdir().expect("outside");
@@ -292,5 +360,174 @@ async fn arbitrary_workspace_path_is_rejected_for_list_and_get() {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[actix_web::test]
+async fn production_command_routes_apply_workspace_over_project_over_global_precedence() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join(".git")).expect("git root");
+    let workspace_commands = workspace.path().join(".bamboo/commands");
+    std::fs::create_dir_all(&workspace_commands).expect("workspace commands");
+    std::fs::write(
+        workspace_commands.join("review.md"),
+        "Workspace review $ARGUMENTS",
+    )
+    .expect("workspace command");
+
+    let app_state = web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = app_state
+        .project_store
+        .create_with_bindings(
+            "Commands",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace.path().to_string_lossy().to_string(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("Project");
+    let project_commands = app_state.project_store.paths().commands_dir(&project.id);
+    std::fs::create_dir_all(&project_commands).expect("Project commands");
+    std::fs::write(
+        project_commands.join("review.md"),
+        "Project review $ARGUMENTS",
+    )
+    .expect("Project command");
+    let global_commands = bamboo_config::paths::commands_dir_in(&app_state.app_data_dir);
+    std::fs::create_dir_all(&global_commands).expect("global commands");
+    std::fs::write(
+        global_commands.join("review.md"),
+        "Global review $ARGUMENTS",
+    )
+    .expect("global command");
+
+    let mut session = bamboo_agent_core::Session::new("project-command-session", "model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().to_string());
+    app_state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist session");
+    app_state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(app_state)
+            .configure(super::config),
+    )
+    .await;
+
+    let list: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands?session_id=project-command-session")
+            .to_request(),
+    )
+    .await;
+    let review = list["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["name"] == "review")
+        .expect("review command");
+    assert_eq!(review["metadata"]["source"], "workspace");
+
+    let workspace_get: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands/prompt/review?session_id=project-command-session&arguments=now")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(workspace_get["content"], "Workspace review now");
+    assert_eq!(workspace_get["metadata"]["source"], "workspace");
+
+    std::fs::remove_file(workspace_commands.join("review.md")).expect("remove overlay");
+    let project_get: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands/prompt/review?session_id=project-command-session&arguments=now")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(project_get["content"], "Project review now");
+    assert_eq!(project_get["metadata"]["source"], "project");
+}
+
+#[actix_web::test]
+async fn assigned_project_cannot_read_another_projects_workspace_commands() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join(".git")).expect("git root");
+    let workspace_commands = workspace.path().join(".bamboo/commands");
+    std::fs::create_dir_all(&workspace_commands).expect("workspace commands");
+    std::fs::write(
+        workspace_commands.join("other-project-secret.md"),
+        "OTHER PROJECT SECRET",
+    )
+    .expect("workspace command");
+
+    let app_state = web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session_project = app_state
+        .project_store
+        .create("Session Project", None)
+        .expect("session Project");
+    let _workspace_owner = app_state
+        .project_store
+        .create_with_bindings(
+            "Workspace Owner",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("workspace owner");
+    let mut session = bamboo_agent_core::Session::new("cross-project-command-session", "model");
+    session.set_project_id_meta(session_project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    app_state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(app_state)
+            .configure(super::config),
+    )
+    .await;
+    for uri in [
+        "/commands?session_id=cross-project-command-session",
+        "/commands/prompt/other-project-secret?session_id=cross-project-command-session",
+    ] {
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get().uri(uri).to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = actix_web::test::read_body(response).await;
+        assert!(
+            !body
+                .windows(b"OTHER PROJECT SECRET".len())
+                .any(|window| window == b"OTHER PROJECT SECRET"),
+            "cross-Project command content must not be returned"
+        );
     }
 }

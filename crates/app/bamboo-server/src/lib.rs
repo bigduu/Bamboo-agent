@@ -117,6 +117,7 @@ pub mod logging;
 pub mod notify_sinks;
 pub mod plugin_installer;
 pub mod plugin_source;
+pub mod project_context;
 pub mod rate_limit;
 pub mod reloadable_provider;
 pub mod routes;

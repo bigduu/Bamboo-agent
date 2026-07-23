@@ -12,6 +12,12 @@ use super::sources::{
 };
 use super::types::{CommandItem, CommandListResponse, GetCommandQuery, ListCommandsQuery};
 
+struct SessionResourceContext {
+    workspace: Option<std::path::PathBuf>,
+    project_id: Option<bamboo_domain::ProjectId>,
+    project_home: Option<std::path::PathBuf>,
+}
+
 pub(super) fn append_unique(
     commands: &mut Vec<CommandItem>,
     seen: &mut HashSet<String>,
@@ -28,11 +34,11 @@ pub(super) fn expand_arguments(template: &str, arguments: &str) -> String {
     template.replace("$ARGUMENTS", arguments)
 }
 
-async fn session_workspace(
+async fn session_resource_context(
     app_state: &AppState,
     session_id: Option<&str>,
     legacy_workspace_path: Option<&str>,
-) -> Result<Option<std::path::PathBuf>, AppError> {
+) -> Result<SessionResourceContext, AppError> {
     if legacy_workspace_path.is_some_and(|value| !value.trim().is_empty()) {
         return Err(AppError::BadRequest(
             "workspace_path is deprecated; provide session_id so workspace access is session-bound"
@@ -40,24 +46,57 @@ async fn session_workspace(
         ));
     }
     let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
+        return Ok(SessionResourceContext {
+            workspace: None,
+            project_id: None,
+            project_home: None,
+        });
     };
     let session = app_state
         .load_session(session_id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
-    let Some(workspace) = session.workspace_path_meta() else {
-        return Ok(None);
+    let project_id =
+        match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+            &session,
+        ) {
+            bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                Some(project_id)
+            }
+            bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+            bamboo_engine::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(AppError::BadRequest(format!(
+                    "Session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        };
+    let workspace = crate::project_context::validate_workspace_assignment(
+        &app_state.project_store,
+        project_id.as_ref(),
+        session.workspace_path_meta().as_deref(),
+    )
+    .map_err(|error| match error {
+        crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }
+        | crate::project_context::ProjectWorkspaceValidationError::Conflict { .. } => {
+            AppError::BadRequest(error.to_string())
+        }
+        crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+            AppError::InternalError(anyhow::anyhow!(error))
+        }
+    })?;
+    let project_home = if let Some(project_id) = project_id.as_ref() {
+        app_state.project_store.get(project_id).map_err(|error| {
+            AppError::BadRequest(format!("Assigned Project is unavailable: {error}"))
+        })?;
+        Some(app_state.project_store.paths().project_home(project_id))
+    } else {
+        None
     };
-    let workspace = tokio::fs::canonicalize(workspace)
-        .await
-        .map_err(|error| AppError::BadRequest(format!("Invalid session workspace: {error}")))?;
-    if !workspace.is_dir() {
-        return Err(AppError::BadRequest(
-            "Session workspace must be a directory".to_string(),
-        ));
-    }
-    Ok(Some(workspace))
+    Ok(SessionResourceContext {
+        workspace,
+        project_id,
+        project_home,
+    })
 }
 
 /// Lists all available commands from workflows, skills, and MCP tools.
@@ -67,7 +106,7 @@ pub async fn list_commands(
 ) -> Result<HttpResponse, AppError> {
     let mut commands = Vec::new();
     let mut seen = HashSet::new();
-    let workspace = session_workspace(
+    let context = session_resource_context(
         app_state.get_ref(),
         query.session_id.as_deref(),
         query.workspace_path.as_deref(),
@@ -75,16 +114,28 @@ pub async fn list_commands(
     .await?;
 
     // Conflict precedence is deliberately source-based and stable:
-    // project markdown > global markdown > global preset > workflow > skill > MCP.
-    if let Some(workspace_path) = workspace.as_ref() {
+    // workspace markdown > Project markdown > global markdown > global preset
+    // > workflow/skill catalog > MCP.
+    if let Some(workspace_path) = context.workspace.as_ref() {
         if let Some(dir) = safe_project_commands_dir(workspace_path.to_string_lossy().as_ref()) {
-            let project = list_markdown_commands(&dir, "project")
+            let workspace_commands = list_markdown_commands(&dir, "workspace")
                 .await
                 .into_iter()
                 .map(|command| command.item)
                 .collect();
-            append_unique(&mut commands, &mut seen, project);
+            append_unique(&mut commands, &mut seen, workspace_commands);
         }
+    }
+    if let Some(project_id) = context.project_id.as_ref() {
+        let project = list_markdown_commands(
+            &app_state.project_store.paths().commands_dir(project_id),
+            "project",
+        )
+        .await
+        .into_iter()
+        .map(|command| command.item)
+        .collect();
+        append_unique(&mut commands, &mut seen, project);
     }
 
     let global_dir = bamboo_config::paths::commands_dir_in(&app_state.app_data_dir);
@@ -101,7 +152,19 @@ pub async fn list_commands(
         list_prompt_presets_as_commands(&app_state.app_data_dir).await,
     );
 
-    let catalog = if let Some(workspace) = workspace.as_ref() {
+    let catalog = if let (Some(project_id), Some(project_home)) =
+        (context.project_id.as_ref(), context.project_home.as_ref())
+    {
+        app_state
+            .skill_manager
+            .workflow_catalog_for_project_workspace(
+                project_id,
+                project_home,
+                context.workspace.as_deref(),
+            )
+            .await
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
+    } else if let Some(workspace) = context.workspace.as_ref() {
         app_state
             .skill_manager
             .store()
@@ -143,7 +206,7 @@ pub async fn get_command(
     query: web::Query<GetCommandQuery>,
 ) -> Result<HttpResponse, AppError> {
     let (command_type, id) = path.into_inner();
-    let workspace = session_workspace(
+    let context = session_resource_context(
         app_state.get_ref(),
         query.session_id.as_deref(),
         query.workspace_path.as_deref(),
@@ -153,12 +216,18 @@ pub async fn get_command(
     match command_type.as_str() {
         "prompt" => {
             let mut sources = Vec::new();
-            if let Some(workspace_path) = workspace.as_ref() {
+            if let Some(workspace_path) = context.workspace.as_ref() {
                 if let Some(dir) =
                     safe_project_commands_dir(workspace_path.to_string_lossy().as_ref())
                 {
-                    sources.push((dir, "project"));
+                    sources.push((dir, "workspace"));
                 }
+            }
+            if let Some(project_id) = context.project_id.as_ref() {
+                sources.push((
+                    app_state.project_store.paths().commands_dir(project_id),
+                    "project",
+                ));
             }
             sources.push((
                 bamboo_config::paths::commands_dir_in(&app_state.app_data_dir),
@@ -226,13 +295,26 @@ pub async fn get_command(
             })))
         }
         "skill" => {
-            let store = app_state
-                .skill_manager
-                .store_for_workspace(workspace.as_deref())
-                .await
-                .map_err(|error| {
-                    AppError::BadRequest(format!("Invalid session workspace: {error}"))
-                })?;
+            let store = if let (Some(project_id), Some(project_home)) =
+                (context.project_id.as_ref(), context.project_home.as_ref())
+            {
+                app_state
+                    .skill_manager
+                    .store_for_project_workspace(
+                        project_id,
+                        project_home,
+                        context.workspace.as_deref(),
+                    )
+                    .await
+            } else {
+                app_state
+                    .skill_manager
+                    .store_for_workspace(context.workspace.as_deref())
+                    .await
+            }
+            .map_err(|error| {
+                AppError::BadRequest(format!("Invalid session resource scope: {error}"))
+            })?;
             match store.get_skill(&id).await {
                 Ok(skill) => Ok(HttpResponse::Ok().json(skill)),
                 Err(error) => Err(AppError::NotFound(format!("Skill {id} not found: {error}"))),

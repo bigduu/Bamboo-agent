@@ -337,6 +337,64 @@ async fn external_memory_excludes_other_project_memory_index_content() {
 }
 
 #[tokio::test]
+async fn external_memory_malformed_project_id_does_not_read_path_derived_legacy_scope() {
+    struct EmptyProjectSource;
+
+    #[async_trait]
+    impl crate::project_context::ProjectContextSource for EmptyProjectSource {
+        async fn find_project(
+            &self,
+            _project_id: &bamboo_domain::ProjectId,
+        ) -> Result<
+            Option<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            Ok(None)
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let workspace = temp_dir.path().join("legacy-workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let legacy_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    store
+        .write_memory(
+            bamboo_memory::memory_store::MemoryScope::Project,
+            Some(&legacy_key),
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Legacy secret",
+            "MUST NOT ENTER PROMPT THROUGH MALFORMED PROJECT ID",
+            &[],
+            Some("malformed-prompt-memory"),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .expect("seed legacy memory");
+    let mut session = bamboo_agent_core::Session::new("malformed-prompt-memory", "test-model");
+    session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+    session.set_project_id_meta("../malformed".to_string());
+    session.add_message(bamboo_agent_core::Message::system("Base prompt"));
+    let resolver =
+        crate::project_context::ProjectContextResolver::new(Arc::new(EmptyProjectSource));
+
+    super::refresh_external_memory_context_with_store_and_resolver(
+        &mut session,
+        &store,
+        crate::runtime::config::PromptMemoryFlags::default(),
+        None,
+        Some(&resolver),
+    )
+    .await;
+
+    let rendered = super::render_external_memory_section(&session).unwrap_or_default();
+    assert!(!rendered.contains("Legacy secret"));
+    assert!(!rendered.contains("MUST NOT ENTER PROMPT THROUGH MALFORMED PROJECT ID"));
+}
+
+#[tokio::test]
 async fn external_memory_truncates_project_memory_index_and_adds_freshness_note() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());

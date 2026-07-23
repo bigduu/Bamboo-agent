@@ -12,6 +12,7 @@ bamboo-engine = { path = "../../engine/bamboo-engine" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
 bamboo-memory = { path = "../../infra/bamboo-memory" }
+bamboo-projects = { path = "../../infra/bamboo-projects" }
 bamboo-tools = { path = "../../engine/bamboo-tools" }
 bamboo-metrics = { path = "../../infra/bamboo-metrics" }
 bamboo-skills = { path = "../../infra/bamboo-skills" }

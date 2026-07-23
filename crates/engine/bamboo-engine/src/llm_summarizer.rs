@@ -384,6 +384,7 @@ mod tests {
             ])))
         }
     }
+    #[test]
     fn llm_summarizer_prompt_includes_context_blocks_and_state_sections() {
         let summarizer = LlmSummarizer::new(
             Arc::new(DummyProvider),

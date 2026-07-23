@@ -328,6 +328,32 @@ impl Session {
         self.metadata
             .insert(keys::WORKSPACE_PATH.to_string(), value);
     }
+
+    // ------------------------------------------------------------------
+    // project_id
+    // ------------------------------------------------------------------
+
+    /// Read the stable Project identity, preferring typed runtime metadata and
+    /// falling back to the legacy metadata string during migration.
+    pub fn project_id_meta(&self) -> Option<String> {
+        self.runtime_str(|m| m.project_id.as_ref(), keys::PROJECT_ID)
+    }
+
+    /// Persist Project identity on both planes while legacy raw-map readers
+    /// remain in the tree.
+    pub fn set_project_id_meta(&mut self, value: impl Into<String>) {
+        let value = value.into();
+        self.runtime_metadata_mut().project_id = Some(value.clone());
+        self.metadata.insert(keys::PROJECT_ID.to_string(), value);
+    }
+
+    pub fn clear_project_id_meta(&mut self) {
+        if let Some(runtime_metadata) = self.runtime_metadata.as_mut() {
+            runtime_metadata.project_id = None;
+        }
+        self.metadata.remove(keys::PROJECT_ID);
+        self.prune_runtime_metadata();
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +377,7 @@ mod tests {
             "last_run_status": "completed",
             "provider_name": "openai",
             "workspace_path": "/tmp/ws",
+            "project_id": "01JLEGACYPROJECT000000000000",
             "pending_injected_messages": "[{\"content\":\"hello\"},{\"content\":\"world\"}]",
             "selected_skill_ids": "[\"pdf\",\"web\"]",
             "mode": "ask",
@@ -372,6 +399,10 @@ mod tests {
         assert_eq!(session.last_run_status().as_deref(), Some("completed"));
         assert_eq!(session.provider_name().as_deref(), Some("openai"));
         assert_eq!(session.workspace_path_meta().as_deref(), Some("/tmp/ws"));
+        assert_eq!(
+            session.project_id_meta().as_deref(),
+            Some("01JLEGACYPROJECT000000000000")
+        );
         assert_eq!(session.task_list_version_meta().as_deref(), Some("7"));
 
         // skill_mode falls back to the legacy `mode` key.
@@ -445,6 +476,21 @@ mod tests {
         let raw = session.metadata.get("selected_skill_ids").unwrap();
         let decoded: Vec<String> = serde_json::from_str(raw).unwrap();
         assert_eq!(decoded, vec!["audio".to_string()]);
+
+        session.set_project_id_meta("01JNEWPROJECT000000000000000");
+        assert_eq!(
+            session
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.project_id.as_deref()),
+            Some("01JNEWPROJECT000000000000000")
+        );
+        assert_eq!(
+            session.metadata.get("project_id").map(String::as_str),
+            Some("01JNEWPROJECT000000000000000")
+        );
+        session.clear_project_id_meta();
+        assert!(session.project_id_meta().is_none());
     }
 
     #[test]

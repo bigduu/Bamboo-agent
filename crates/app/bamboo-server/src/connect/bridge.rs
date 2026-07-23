@@ -109,6 +109,11 @@ pub struct ConnectContext {
     pub app_data_dir: Option<PathBuf>,
     pub config: Arc<tokio::sync::RwLock<Config>>,
     pub provider_registry: Arc<ProviderRegistry>,
+    pub project_store: Arc<bamboo_projects::ProjectStore>,
+    /// Connector type -> Project membership for newly-created sessions.
+    /// Multi-instance connectors of the same type are currently rejected, so
+    /// the platform type is an unambiguous key.
+    pub project_ids_by_platform: Arc<HashMap<String, bamboo_domain::ProjectId>>,
     /// Shared with `AppState::permission_checker` — needed so an approved
     /// permission prompt (a gated tool asked to run, answered through
     /// connect) actually grants the session permission the re-executed tool
@@ -190,6 +195,7 @@ fn create_connect_session(
     system_prompt: &str,
     base_system_prompt: &str,
     workspace_path: Option<&str>,
+    project_id: Option<&bamboo_domain::ProjectId>,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Session {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -202,12 +208,15 @@ fn create_connect_session(
         "base_system_prompt".to_string(),
         base_system_prompt.to_string(),
     );
+    if let Some(project_id) = project_id {
+        session.set_project_id_meta(project_id.to_string());
+    }
     if let Some(path) = workspace_path {
-        session.set_workspace_path_meta(path);
-        bamboo_tools::tools::workspace_state::ensure_session_workspace(
-            &session_id,
-            Some(PathBuf::from(path)),
-        );
+        let final_workspace =
+            bamboo_tools::tools::workspace_state::set_workspace(&session_id, PathBuf::from(path));
+        session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+            &final_workspace,
+        ));
     }
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());
@@ -702,18 +711,69 @@ impl ConnectBridge {
         &self,
         key: &str,
         resolved: &ResolvedConnectRunConfig,
-    ) -> Session {
+    ) -> Result<Session, String> {
         let model = resolved.model_roster.model.clone().unwrap_or_default();
+        let platform = key.split(':').next().unwrap_or_default();
+        let project_id = self.ctx.project_ids_by_platform.get(platform);
+        if let Some(project_id) = project_id {
+            match self.ctx.project_store.get(project_id) {
+                Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "Connect Project {project_id} is archived; no session was created"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Connect Project {project_id} is unavailable; no session was created: {error}"
+                    ));
+                }
+            }
+        }
+        let final_workspace = crate::project_context::validate_workspace_assignment(
+            &self.ctx.project_store,
+            project_id,
+            resolved.workspace_path.as_deref(),
+        )
+        .map_err(|error| {
+            format!("Connect workspace is unavailable; no session was created: {error}")
+        })?;
+        let final_workspace_display = final_workspace
+            .as_deref()
+            .map(bamboo_config::paths::path_to_display_string);
+        let binding_status = match (project_id, final_workspace.as_deref()) {
+            (Some(project_id), Some(workspace)) => {
+                let workspace = bamboo_config::paths::path_to_display_string(workspace);
+                if self
+                    .ctx
+                    .project_store
+                    .find_workspace_owner_for_path(&workspace)
+                    .map_err(|error| format!("resolve Connect workspace owner: {error}"))?
+                    .is_some_and(|owner| owner.id == *project_id)
+                {
+                    bamboo_engine::project_context::WorkspaceBindingStatus::Registered
+                } else {
+                    bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered
+                }
+            }
+            _ => bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered,
+        };
+        let system_prompt = bamboo_engine::runtime::context::upsert_workspace_prompt_context(
+            &resolved.system_prompt,
+            final_workspace_display.as_deref(),
+            binding_status,
+        );
         let session = create_connect_session(
             key,
             &model,
-            &resolved.system_prompt,
+            &system_prompt,
             &resolved.base_system_prompt,
-            resolved.workspace_path.as_deref(),
+            final_workspace_display.as_deref(),
+            project_id,
             resolved.reasoning_effort,
         );
         self.set_session_id_for_key(key, &session.id).await;
-        session
+        Ok(session)
     }
 
     /// Runs `text` as a prompt for `key`'s session, through the canonical
@@ -751,12 +811,19 @@ impl ConnectBridge {
         }
 
         let existing_id = self.session_id_for_key(key).await;
-        let mut session = match existing_id {
+        let session = match existing_id {
             Some(id) => match self.ctx.session_repo.load_merged(&id).await {
-                Some(session) => session,
+                Some(session) => Ok(session),
                 None => self.create_and_register_session(key, &resolved).await,
             },
             None => self.create_and_register_session(key, &resolved).await,
+        };
+        let mut session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                reply_text(&platform, reply_ctx, &error).await;
+                return;
+            }
         };
 
         session.add_message(Message::user(text.to_string()));
@@ -1216,6 +1283,8 @@ mod tests {
             app_data_dir: Some(state.app_data_dir.clone()),
             config: state.config.clone(),
             provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
             permission_checker: state.permission_checker.clone(),
         };
         (ctx, dir)
@@ -1289,6 +1358,71 @@ mod tests {
             set.insert(format!("msg-{i}"));
         }
         assert_eq!(set.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn connect_session_creation_revalidates_project_after_startup() {
+        let (mut ctx, _dir) = test_context().await;
+        let project = ctx.project_store.create("Connect", None).unwrap();
+        let mut projects = HashMap::new();
+        projects.insert("fake".to_string(), project.id.clone());
+        ctx.project_ids_by_platform = Arc::new(projects);
+        ctx.project_store
+            .archive(&project.id, project.revision)
+            .unwrap();
+        let resolved = {
+            let config = ctx.config.read().await.clone();
+            resolve_connect_run_config(&config, &ctx.provider_registry)
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+
+        let error = bridge
+            .create_and_register_session("fake:chat:user", &resolved)
+            .await
+            .expect_err("archived Project must reject Connect session creation");
+        assert!(error.contains("archived"));
+        assert!(
+            bridge.session_id_for_key("fake:chat:user").await.is_none(),
+            "failed validation must not publish a chat-to-session mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_session_creation_rejects_another_projects_workspace() {
+        let (mut ctx, _dir) = test_context().await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        let connect_project = ctx.project_store.create("Connect", None).unwrap();
+        let _workspace_owner = ctx
+            .project_store
+            .create_with_bindings(
+                "Workspace Owner",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: workspace.path().to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .expect("Workspace Owner");
+        let mut projects = HashMap::new();
+        projects.insert("fake".to_string(), connect_project.id);
+        ctx.project_ids_by_platform = Arc::new(projects);
+        let mut resolved = {
+            let config = ctx.config.read().await.clone();
+            resolve_connect_run_config(&config, &ctx.provider_registry)
+        };
+        resolved.workspace_path = Some(workspace.path().to_string_lossy().into_owned());
+        let bridge = ConnectBridge::new(ctx, None);
+
+        let error = bridge
+            .create_and_register_session("fake:chat:user", &resolved)
+            .await
+            .expect_err("cross-Project workspace must reject Connect session creation");
+        assert!(error.contains("belongs to Project"));
+        assert!(
+            bridge.session_id_for_key("fake:chat:user").await.is_none(),
+            "failed workspace validation must not publish a chat-to-session mapping"
+        );
     }
 
     #[tokio::test]

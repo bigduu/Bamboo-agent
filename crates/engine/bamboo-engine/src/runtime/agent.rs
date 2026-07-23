@@ -111,6 +111,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn project_context_resolver(
+        mut self,
+        v: Arc<crate::project_context::ProjectContextResolver>,
+    ) -> Self {
+        self.inner = self.inner.project_context_resolver(v);
+        self
+    }
+
     pub fn metrics_collector(mut self, v: bamboo_metrics::MetricsCollector) -> Self {
         self.inner = self.inner.metrics_collector(v);
         self

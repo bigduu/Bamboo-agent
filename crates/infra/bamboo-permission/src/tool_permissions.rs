@@ -105,29 +105,69 @@ pub fn check_permissions(
             let session_memory_dir = bamboo_config::paths::path_to_display_string(
                 &bamboo_dir.join("memory").join("v1").join("sessions"),
             );
-            let durable_memory_dir = bamboo_config::paths::path_to_display_string(
-                &bamboo_dir.join("memory").join("v1").join("scopes"),
+            let global_memory_dir = bamboo_config::paths::path_to_display_string(
+                &bamboo_dir
+                    .join("memory")
+                    .join("v1")
+                    .join("scopes")
+                    .join("global"),
             );
-            let write_resource = match action.as_str() {
-                "session_append" | "session_replace" | "session_clear" => Some(session_memory_dir),
-                // Keep in lockstep with `MemoryTool::classify` (bamboo-server-tools),
-                // which treats every non-read action — including `split` and
-                // `consolidate` — as mutating. Omitting those two let destructive
-                // durable-memory edits skip the WriteFile gate (issue #341).
-                "write" | "merge" | "split" | "consolidate" | "purge" | "rebuild" => {
-                    Some(durable_memory_dir)
-                }
-                _ => None,
-            };
-            if let Some(resource) = write_resource {
-                Ok(Some(vec![PermissionContext::new(
+            let project_memory_dir = bamboo_config::paths::path_to_display_string(
+                // The permission classifier has no trusted session context, so
+                // it cannot resolve the exact opaque Project id. Gate durable
+                // writes at the conservative first-class Project root; runtime
+                // resolution narrows assigned writes to
+                // projects/<id>/memory/v1 and rejects Unassigned Project writes.
+                &bamboo_dir.join("projects"),
+            );
+            let context = |resource: String| {
+                PermissionContext::new(
                     PermissionType::WriteFile,
                     resource.clone(),
                     format!("{} action={} in {}", tool_name, action, resource),
-                )]))
-            } else {
-                Ok(None)
-            }
+                )
+            };
+            let ambiguous_durable_contexts = || {
+                vec![
+                    context(global_memory_dir.clone()),
+                    context(project_memory_dir.clone()),
+                ]
+            };
+            let scoped_durable_contexts = || match args
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("global") => vec![context(global_memory_dir.clone())],
+                Some("project") => vec![context(project_memory_dir.clone())],
+                // Invalid/missing scope fails closed at the permission boundary.
+                // The tool may later reject the arguments, but no durable write
+                // can be authorized by a resource from only one possible scope.
+                _ => ambiguous_durable_contexts(),
+            };
+            let write_contexts = match action.as_str() {
+                "session_append" | "session_replace" | "session_clear" => {
+                    Some(vec![context(session_memory_dir)])
+                }
+                "write" | "rebuild" => Some(scoped_durable_contexts()),
+                // These actions identify existing memories by id(s), so the
+                // classifier cannot know whether execution will mutate the
+                // Global store or the assigned Project store.
+                "merge" | "split" | "consolidate" => Some(ambiguous_durable_contexts()),
+                "purge"
+                    if args
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !id.trim().is_empty()) =>
+                {
+                    Some(ambiguous_durable_contexts())
+                }
+                "purge" => Some(scoped_durable_contexts()),
+                _ => None,
+            };
+            Ok(write_contexts)
         }
         "BashInput" => {
             let bash_id = required_string_arg(args, "bash_id")?;
@@ -225,6 +265,22 @@ pub fn check_permissions(
                     format!("cluster {action} on node '{node}'"),
                 )]))
             } else {
+                Ok(None)
+            }
+        }
+        "Project" => {
+            let action = required_string_arg(args, "action")?
+                .trim()
+                .to_ascii_lowercase();
+            if matches!(action.as_str(), "bind_workspace" | "unbind_workspace") {
+                let path = required_string_arg(args, "path")?;
+                Ok(Some(vec![PermissionContext::new(
+                    PermissionType::WriteFile,
+                    path,
+                    format!("Project {action}: mutate the Project workspace binding for {path}"),
+                )]))
+            } else {
+                // inspect/list_resources are strictly redacted read operations.
                 Ok(None)
             }
         }
@@ -427,6 +483,29 @@ mod tests {
     }
 
     #[test]
+    fn project_binding_mutations_gate_as_writefile() {
+        for action in ["bind_workspace", "unbind_workspace"] {
+            let path = "/workspace/project";
+            let contexts = check_permissions(
+                "Project",
+                &json!({"action": action, "path": path, "expected_revision": 1}),
+            )
+            .unwrap()
+            .expect("Project binding mutation must be permission gated");
+            assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+            assert_eq!(contexts[0].resource, path);
+        }
+        assert!(check_permissions("Project", &json!({"action": "inspect"}))
+            .unwrap()
+            .is_none());
+        assert!(
+            check_permissions("Project", &json!({"action": "list_resources"}))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn subagent_mutations_gate() {
         // update/cancel modify an active child → WriteFile; delete → DeleteOperation.
         for action in ["update", "cancel"] {
@@ -618,12 +697,28 @@ mod tests {
         assert_eq!(session_append[0].permission_type, PermissionType::WriteFile);
         assert!(session_append[0].resource.contains("/memory/v1/sessions"));
 
-        let write = check_permissions("memory", &json!({"action": "write"}))
+        let global_write =
+            check_permissions("memory", &json!({"action": "write", "scope": "global"}))
+                .unwrap()
+                .unwrap();
+        assert_eq!(global_write.len(), 1);
+        assert_eq!(global_write[0].permission_type, PermissionType::WriteFile);
+        assert!(global_write[0]
+            .resource
+            .ends_with("/memory/v1/scopes/global"));
+
+        let project_write =
+            check_permissions("memory", &json!({"action": "write", "scope": "project"}))
+                .unwrap()
+                .unwrap();
+        assert_eq!(project_write.len(), 1);
+        assert_eq!(project_write[0].permission_type, PermissionType::WriteFile);
+        assert!(project_write[0].resource.ends_with("/projects"));
+
+        let ambiguous_write = check_permissions("memory", &json!({"action": "write"}))
             .unwrap()
             .unwrap();
-        assert_eq!(write.len(), 1);
-        assert_eq!(write[0].permission_type, PermissionType::WriteFile);
-        assert!(write[0].resource.contains("/memory/v1/scopes"));
+        assert_eq!(ambiguous_write.len(), 2);
     }
 
     #[test]
@@ -633,21 +728,53 @@ mod tests {
         // omitted (issue #341) even though `MemoryTool::classify` treats them as
         // mutating, so a `memory(*)` ask-rule / Default-mode prompt never fired for
         // them. Guards the full set stays in lockstep with the tool's classifier.
-        for action in ["write", "merge", "split", "consolidate", "purge", "rebuild"] {
-            let contexts = check_permissions("memory", &json!({"action": action}))
+        for (action, args, expected_contexts) in [
+            ("write", json!({"action": "write", "scope": "global"}), 1),
+            ("merge", json!({"action": "merge", "id": "memory-1"}), 2),
+            ("split", json!({"action": "split", "id": "memory-1"}), 2),
+            (
+                "consolidate",
+                json!({"action": "consolidate", "ids": ["memory-1", "memory-2"]}),
+                2,
+            ),
+            ("purge", json!({"action": "purge", "id": "memory-1"}), 2),
+            (
+                "rebuild",
+                json!({"action": "rebuild", "scope": "project"}),
+                1,
+            ),
+        ] {
+            let contexts = check_permissions("memory", &args)
                 .unwrap_or_else(|_| panic!("memory action {action} should classify"))
                 .unwrap_or_else(|| panic!("memory action {action} must require a WriteFile gate"));
-            assert_eq!(contexts.len(), 1, "action {action}");
-            assert_eq!(
-                contexts[0].permission_type,
-                PermissionType::WriteFile,
-                "action {action} must be WriteFile"
-            );
-            assert!(
-                contexts[0].resource.contains("/memory/v1/scopes"),
-                "action {action} must scope to durable memory"
-            );
+            assert_eq!(contexts.len(), expected_contexts, "action {action}");
+            assert!(contexts
+                .iter()
+                .all(|context| context.permission_type == PermissionType::WriteFile));
         }
+
+        let ambiguous = check_permissions(
+            "memory",
+            &json!({"action": "consolidate", "ids": ["a", "b"]}),
+        )
+        .unwrap()
+        .expect("ambiguous mutation must be gated");
+        assert_eq!(ambiguous.len(), 2);
+        assert!(ambiguous
+            .iter()
+            .any(|context| context.resource.ends_with("/memory/v1/scopes/global")));
+        assert!(ambiguous
+            .iter()
+            .any(|context| context.resource.ends_with("/projects")));
+
+        let scoped_purge =
+            check_permissions("memory", &json!({"action": "purge", "scope": "global"}))
+                .unwrap()
+                .expect("scoped purge must be gated");
+        assert_eq!(scoped_purge.len(), 1);
+        assert!(scoped_purge[0]
+            .resource
+            .ends_with("/memory/v1/scopes/global"));
 
         // Read-only actions stay ungated.
         for action in [

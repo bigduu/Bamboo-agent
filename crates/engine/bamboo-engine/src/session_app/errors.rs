@@ -27,6 +27,15 @@ pub enum ChatError {
     InvalidModel(String),
     #[error("invalid workflow selection: {0}")]
     InvalidWorkflowSelection(String),
+    #[error("session carries an invalid Project identity '{raw}': {message}")]
+    InvalidProjectIdentity { raw: String, message: String },
+    #[error(
+        "session Project membership changed while preparing chat (expected {expected:?}, actual {actual:?})"
+    )]
+    ProjectIdentityConflict {
+        expected: Option<bamboo_domain::ProjectId>,
+        actual: Option<bamboo_domain::ProjectId>,
+    },
 }
 
 /// Errors from the execute preparation use case.

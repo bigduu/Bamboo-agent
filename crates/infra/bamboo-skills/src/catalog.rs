@@ -19,6 +19,7 @@ pub enum WorkflowKind {
 pub enum WorkflowSource {
     Builtin,
     Project,
+    Workspace,
     User,
     Plugin,
 }
@@ -28,6 +29,7 @@ impl From<SkillDirectorySource> for WorkflowSource {
         match value {
             SkillDirectorySource::Builtin => Self::Builtin,
             SkillDirectorySource::Project => Self::Project,
+            SkillDirectorySource::Workspace => Self::Workspace,
             SkillDirectorySource::Global => Self::User,
             // `~/.agents/skills` is another user-level discovery root. Keep its lower
             // internal precedence without leaking an implementation-specific fifth public
@@ -92,7 +94,8 @@ pub struct WorkflowCatalogEvent {
     pub workflow_id: String,
     pub revision: u64,
     pub kind: WorkflowCatalogEventKind,
-    /// `global` or an opaque `workspace:<hash>`; never an absolute filesystem path.
+    /// `global`, `project:<id>`, or an opaque `workspace:<hash>`; never an
+    /// absolute filesystem path.
     pub scope: String,
 }
 

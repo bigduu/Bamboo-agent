@@ -11,6 +11,7 @@ pub mod llm_summarizer;
 pub mod message_hooks;
 pub mod model_areas;
 pub mod model_config_helper;
+pub mod project_context;
 pub mod prompt_defaults;
 pub mod resolved_defaults;
 pub mod runtime;

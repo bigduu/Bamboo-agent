@@ -12,8 +12,8 @@
 pub use bamboo_server_tools::{
     AskAgentTool, ClusterTool, CompactContextTool, DeployAgentTool, DeployedRegistry,
     LedgerScheduleBridge, LedgerTool, LoadSkillTool, MemoryTool, NotificationDispatcher,
-    NotifyTool, OverlayToolExecutor, ReadSkillResourceTool, SessionInspectorTool, SubAgentTool,
-    ToolSurface, ToolSurfaceFactory,
+    NotifyTool, OverlayToolExecutor, ProjectTool, ProjectWorkspaceTool, ReadSkillResourceTool,
+    SessionInspectorTool, SubAgentTool, ToolSurface, ToolSurfaceFactory,
 };
 
 pub mod child_session_adapter;

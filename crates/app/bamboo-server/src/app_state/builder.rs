@@ -170,6 +170,13 @@ impl AppState {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage(&data_dir).await?;
+        let project_store = Arc::new(bamboo_projects::ProjectStore::open(&data_dir).map_err(
+            |error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "failed to initialize Project registry: {error}"
+                ))
+            },
+        )?);
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
 
         // In-memory session cache (shared across handlers and background jobs).
@@ -336,6 +343,26 @@ impl AppState {
             persistence.clone(),
         );
 
+        // Account-scoped durable change feed. It is initialized before the
+        // Project tool surface so non-HTTP Project mutations publish the same
+        // replayable events as the REST API.
+        let account_sink = bamboo_engine::events::AccountEventSink::new(data_dir.join("events"))
+            .map_err(|e| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "failed to initialize account change-feed journal: {e}"
+                ))
+            })?;
+        let project_resource_watcher = super::project_watcher::ProjectResourceWatcher::start(
+            project_store.clone(),
+            account_sink.clone(),
+            std::time::Duration::from_millis(120),
+        )
+        .map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "failed to start Project resource watcher: {error}"
+            ))
+        })?;
+
         let base_tools = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -347,6 +374,8 @@ impl AppState {
             session_event_senders.clone(),
             session_watchers.clone(),
             ledger_schedule_bridge.clone(),
+            project_store.clone(),
+            account_sink.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -366,14 +395,6 @@ impl AppState {
         // owns handles to both maps.
         spawn_session_map_cleanup_task(agent_runners.clone(), session_event_senders.clone(), None);
 
-        // Account-scoped durable change feed. Opening the journal recovers the
-        // max seq so the sequence counter stays monotonic across restarts.
-        let account_sink = bamboo_engine::events::AccountEventSink::new(data_dir.join("events"))
-            .map_err(|e| {
-                AppError::InternalError(anyhow::anyhow!(
-                    "failed to initialize account change-feed journal: {e}"
-                ))
-            })?;
         // Bridge global workflow catalog transitions onto the same durable account feed used by
         // SSE and v2 WebSocket clients. Catalog events are account-scoped (no session id).
         {
@@ -437,6 +458,11 @@ impl AppState {
         // default_tools = base_tools (builtin + MCP + memory + skills) as a safe fallback.
         // Interactive execution paths pass an explicit tool surface override:
         // root sessions use ToolSurface::Root; child sessions use ToolSurface::Child.
+        let project_context_resolver = Arc::new(
+            bamboo_engine::project_context::ProjectContextResolver::new(Arc::new(
+                crate::project_context::ProjectStoreContextSource::new(project_store.clone()),
+            )),
+        );
         let agent = Arc::new(
             bamboo_engine::Agent::builder()
                 .storage(storage.clone())
@@ -447,6 +473,7 @@ impl AppState {
                 .config(config.clone())
                 .provider(provider_handle.clone())
                 .default_tools(base_tools.clone())
+                .project_context_resolver(project_context_resolver.clone())
                 .build()
                 .expect("agent runtime should be fully configured"),
         );
@@ -604,9 +631,10 @@ impl AppState {
             Some(data_dir.clone()),
             Some(account_sink.inbox()),
             notification_relay_deps.clone(),
+            project_store.clone(),
         );
 
-        bamboo_engine::auto_dream::spawn_auto_dream_task(
+        bamboo_engine::auto_dream::spawn_auto_dream_task_with_project_resolver(
             bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
@@ -614,18 +642,22 @@ impl AppState {
                 config: config.clone(),
                 provider_registry: provider_registry.clone(),
             },
+            project_context_resolver.as_ref().clone(),
         );
 
         // Background memory "gardener": opt-in blob remediation + near-duplicate
         // consolidation. No-op cost unless `memory.gardener_enabled` /
         // `memory.dedup_gardener_enabled` is set; an empty prefilter makes zero LLM calls.
-        bamboo_engine::gardener::spawn_gardener_task(bamboo_engine::auto_dream::AutoDreamContext {
-            session_store: session_store.clone(),
-            storage: storage.clone(),
-            provider: provider_handle.clone(),
-            config: config.clone(),
-            provider_registry: provider_registry.clone(),
-        });
+        bamboo_engine::gardener::spawn_gardener_task_with_project_resolver(
+            bamboo_engine::auto_dream::AutoDreamContext {
+                session_store: session_store.clone(),
+                storage: storage.clone(),
+                provider: provider_handle.clone(),
+                config: config.clone(),
+                provider_registry: provider_registry.clone(),
+            },
+            project_context_resolver.clone(),
+        );
 
         // Background ledger gardener: expiry + record↔schedule reconciliation
         // are deterministic and free; distillation uses the background model
@@ -708,6 +740,7 @@ impl AppState {
             config_snapshot.subagents().broker.clone(),
             fabric_deployer.clone(),
             notification_relay_deps.clone(),
+            project_store.clone(),
         );
         let workflow_run_tool =
             Arc::new(crate::workflow::WorkflowRunTool::new(workflow_runs.clone()));
@@ -744,8 +777,10 @@ impl AppState {
                 config.clone(),
                 provider_registry.clone(),
                 permission_checker.clone(),
+                project_store.clone(),
             )
-            .await,
+            .await
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
         );
 
         // Dedicated child-session adapter backing the guardian review spawner.
@@ -764,6 +799,7 @@ impl AppState {
             session_event_senders: session_event_senders.clone(),
             subagent_model_resolver: None,
             config: config.clone(),
+            project_store: Some(project_store.clone()),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
             notification_relay: Some(notification_relay_deps.clone()),
         });
@@ -840,6 +876,7 @@ impl AppState {
             config_live_health,
             mcp_config_live_health,
             config_watcher,
+            project_resource_watcher,
             credential_store,
             fabric_deployer,
             embedded_broker,
@@ -849,6 +886,8 @@ impl AppState {
             sessions,
             storage,
             session_store,
+            project_store,
+            project_context_resolver,
             session_repo,
             persistence,
             spawn_scheduler,

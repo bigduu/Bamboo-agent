@@ -42,6 +42,10 @@ pub struct ChildSessionAdapter {
     pub(crate) subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     /// Application config for resolving subagent routing and external agent profiles.
     pub(crate) config: Arc<RwLock<Config>>,
+    /// Authoritative Project registry for child workspace ownership checks.
+    /// Out-of-process worker embeddings may omit it and retain confinement-only
+    /// validation; the server always supplies it.
+    pub(crate) project_store: Option<Arc<bamboo_projects::ProjectStore>>,
     /// Coalesces concurrent parent-wait registrations for the same parent that
     /// arrive in one spawn round (the LLM emitting several `SubAgent.create`
     /// calls at once → `join_all`) into a single parent persist. See
@@ -156,6 +160,7 @@ impl ChildSessionAdapter {
             session_event_senders,
             subagent_model_resolver,
             config,
+            project_store: None,
             // Fresh per-adapter wait-coalescing map (the type is private to this
             // crate, so out-of-crate callers can't supply it).
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
@@ -473,6 +478,41 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    async fn validate_child_workspace(
+        &self,
+        project_id: Option<&bamboo_domain::ProjectId>,
+        requested_workspace: &str,
+    ) -> Result<String, ChildSessionError> {
+        let Some(store) = self.project_store.as_deref() else {
+            let requested = std::path::PathBuf::from(requested_workspace);
+            if requested.exists() && !requested.is_dir() {
+                return Err(ChildSessionError::InvalidArguments(format!(
+                    "child workspace is not a directory: {requested_workspace}"
+                )));
+            }
+            let canonical = requested.canonicalize().unwrap_or(requested);
+            let final_workspace =
+                bamboo_agent_core::workspace_state::resolve_workspace_path(canonical);
+            return Ok(bamboo_config::paths::path_to_display_string(
+                &final_workspace,
+            ));
+        };
+        let final_workspace = crate::project_context::validate_workspace_assignment(
+            store,
+            project_id,
+            Some(requested_workspace),
+        )
+        .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?
+        .ok_or_else(|| {
+            ChildSessionError::InvalidArguments(
+                "child workspace must be a non-empty path".to_string(),
+            )
+        })?;
+        Ok(bamboo_config::paths::path_to_display_string(
+            &final_workspace,
+        ))
+    }
+
     async fn load_root_session(&self, root_session_id: &str) -> Result<Session, ChildSessionError> {
         let Some(session) = self
             .storage

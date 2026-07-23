@@ -14,13 +14,116 @@ mod request;
 
 // Sync runtime workspace so tools can resolve the working directory.
 fn sync_runtime_workspace(session_id: &str, workspace_path: Option<&str>) {
-    let preferred = workspace_path
+    if let Some(workspace) = workspace_path
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
-        .filter(|path| path.is_dir());
-    let _ = bamboo_tools::tools::workspace_state::ensure_session_workspace(session_id, preferred);
+    {
+        bamboo_tools::tools::workspace_state::publish_resolved_workspace(session_id, workspace);
+    }
+}
+
+/// Persist and refresh the cache while the caller holds the session's
+/// `LockedSessionStore` guard.
+///
+/// Calling `save_and_cache_session` here would try to acquire the same
+/// non-reentrant lock again. A plain storage save is safe because the chat
+/// transaction owns the lock from its authoritative reload through its final
+/// message checkpoint.
+async fn save_and_cache_session_locked(
+    state: &AppState,
+    session: &bamboo_agent_core::Session,
+) -> Result<(), HttpResponse> {
+    state
+        .persistence
+        .storage()
+        .save_session(session)
+        .await
+        .map_err(|error| {
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value(format!(
+                    "Failed to persist chat session: {error}"
+                ))
+            }))
+        })?;
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
+    Ok(())
+}
+
+fn project_context_error_response(
+    error: bamboo_engine::project_context::ProjectContextError,
+) -> HttpResponse {
+    use bamboo_engine::project_context::ProjectContextError;
+
+    match error {
+        ProjectContextError::WorkspaceConflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_workspace_conflict",
+                "message": "Workspace belongs to another Project"
+            },
+            "workspace": workspace,
+            "owner_project_id": owner_project_id,
+            "session_project_id": session_project_id,
+        })),
+        ProjectContextError::UnassignedWorkspaceConflict {
+            workspace,
+            owner_project_id,
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_workspace_conflict",
+                "message": "Workspace belongs to another Project"
+            },
+            "workspace": workspace,
+            "owner_project_id": owner_project_id,
+            "session_project_id": "unassigned",
+        })),
+        ProjectContextError::WorkspaceInvalid { workspace, message } => HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "workspace_invalid",
+                    "message": message
+                },
+                "workspace": workspace,
+            })),
+        ProjectContextError::InvalidProjectIdentity { raw, message } => HttpResponse::BadRequest()
+            .json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "invalid_project_identity",
+                    "message": format!(
+                        "Session carries an invalid Project identity '{raw}': {message}"
+                    )
+                }
+            })),
+        ProjectContextError::ProjectUnavailable { project_id } => {
+            HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_unavailable",
+                    "message": "Assigned Project is unavailable"
+                },
+                "project_id": project_id,
+            }))
+        }
+        error @ (ProjectContextError::Source(_) | ProjectContextError::IdentityMismatch { .. }) => {
+            tracing::error!(%error, "failed to resolve Project context");
+            crate::error::json_error(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve Project context",
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -33,6 +136,131 @@ mod tests;
 /// the agent and receive events.
 pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> impl Responder {
     let session_id = request::resolve_session_id(req.session_id.as_deref());
+    let (existing_session_found, existing_project_id, existing_workspace) = match state
+        .storage
+        .load_session(&session_id)
+        .await
+    {
+        Ok(Some(existing)) => {
+            let project_id = match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&existing) {
+                    bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => Some(project_id),
+                    bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+                    bamboo_engine::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+                        return HttpResponse::BadRequest().json(serde_json::json!({
+                            "error": {
+                                "type": "api_error",
+                                "code": "invalid_project_identity",
+                                "message": format!(
+                                    "Session carries an invalid Project identity '{raw}': {message}"
+                                )
+                            },
+                            "session_id": session_id,
+                        }));
+                    }
+                };
+            (true, project_id, existing.workspace_path_meta())
+        }
+        Ok(None) => (false, None, None),
+        Err(error) => {
+            tracing::error!(%error, "failed to load chat session for Project validation");
+            return crate::error::json_error(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to validate session Project membership",
+            );
+        }
+    };
+    if let Some(project_id) = req.project_id.as_ref() {
+        match state.project_store.get(project_id) {
+            Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => {}
+            Ok(_) => {
+                return HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "project_archived",
+                        "message": "Sessions can only be created in an active Project"
+                    },
+                    "project_id": project_id,
+                }));
+            }
+            Err(bamboo_projects::ProjectStoreError::NotFound(_)) => {
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::NOT_FOUND,
+                    "target Project not found",
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to validate chat Project");
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to validate target Project",
+                );
+            }
+        }
+        if existing_session_found && existing_project_id.as_ref() != Some(project_id) {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "session_project_reassignment_required",
+                    "message": "Chat cannot change Project membership; use PATCH /sessions/{id}"
+                },
+                "session_id": session_id,
+                "current_project_id": existing_project_id,
+                "requested_project_id": project_id,
+            }));
+        }
+    }
+    let effective_project_id = req.project_id.clone().or(existing_project_id);
+    let requested_workspace = req
+        .workspace_path
+        .as_deref()
+        .or(existing_workspace.as_deref());
+    let final_workspace = match crate::project_context::validate_workspace_assignment(
+        &state.project_store,
+        effective_project_id.as_ref(),
+        requested_workspace,
+    ) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return match error {
+                crate::project_context::ProjectWorkspaceValidationError::Invalid {
+                    code,
+                    workspace,
+                    message,
+                } => HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": code,
+                        "message": message
+                    },
+                    "workspace": workspace,
+                })),
+                crate::project_context::ProjectWorkspaceValidationError::Conflict {
+                    workspace,
+                    owner_project_id,
+                    session_project_id,
+                } => HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "project_workspace_conflict",
+                        "message": "Workspace belongs to another Project"
+                    },
+                    "workspace": workspace,
+                    "owner_project_id": owner_project_id,
+                    "session_project_id": session_project_id,
+                })),
+                crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+                    tracing::error!(%error, "failed to validate workspace Project ownership");
+                    crate::error::json_error(
+                        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to validate workspace Project ownership",
+                    )
+                }
+            };
+        }
+    };
+    let final_workspace_display = final_workspace
+        .as_deref()
+        .map(bamboo_config::paths::path_to_display_string);
     tracing::debug!(
         "[{}] Chat requested: message_len={}, is_goal_command={}, image_count={}",
         session_id,
@@ -65,17 +293,28 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let builtin_fallback_prompt = crate::app_state::DEFAULT_BASE_PROMPT;
 
-    let workspace_path = request::optional_non_empty(req.workspace_path.as_deref());
     let data_dir = Some(state.app_data_dir.clone());
-
-    // Sync runtime workspace early so the directory exists before prompt building.
-    sync_runtime_workspace(
-        &session_id,
-        workspace_path.map(str::trim).filter(|s| !s.is_empty()),
-    );
-
-    let input = bamboo_engine::session_app::types::ChatTurnInput {
+    let mut project_preflight = bamboo_agent_core::Session::new(&session_id, &model);
+    if let Some(project_id) = effective_project_id.as_ref() {
+        project_preflight.set_project_id_meta(project_id.to_string());
+    }
+    if let Some(workspace) = final_workspace_display.as_deref() {
+        project_preflight.set_workspace_path_meta(workspace);
+    } else if let Some(workspace) = config_snapshot.get_default_work_area_path() {
+        project_preflight
+            .set_workspace_path_meta(bamboo_config::paths::path_to_display_string(&workspace));
+    }
+    if let Err(error) = state
+        .project_context_resolver
+        .refresh_session_prompt_read_only(&mut project_preflight)
+        .await
+    {
+        return project_context_error_response(error);
+    }
+    let workspace_was_explicit = req.workspace_path.is_some();
+    let mut input = bamboo_engine::session_app::types::ChatTurnInput {
         session_id: session_id.clone(),
+        project_id: effective_project_id,
         model: model.clone(),
         model_ref: req.model_ref.clone(),
         provider: req.provider.clone(),
@@ -83,7 +322,16 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         system_prompt: request::optional_non_empty(req.system_prompt.as_deref()).map(String::from),
         enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref())
             .map(String::from),
-        workspace_path: workspace_path.map(String::from),
+        // Preserve field presence. An omitted workspace must be resolved from
+        // the fresh durable session after acquiring the lock, not from this
+        // lock-free preflight snapshot.
+        workspace_path: workspace_was_explicit
+            .then(|| project_preflight.workspace_path_meta())
+            .flatten(),
+        default_workspace_path: config_snapshot
+            .get_default_work_area_path()
+            .as_deref()
+            .map(bamboo_config::paths::path_to_display_string),
         selected_skill_ids: req.selected_skill_ids.clone(),
         workflow_selection: req.workflow_selection.clone(),
         orchestration_opt_in: req.orchestration_opt_in,
@@ -92,27 +340,162 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         data_dir,
     };
 
-    let mut session = match bamboo_engine::session_app::chat::prepare_chat_turn(
-        state.as_ref(),
-        input,
-        global_default_prompt.as_str(),
-        builtin_fallback_prompt,
-    )
-    .await
-    {
+    // Serialize the authoritative reload, Project/workspace resolution and all
+    // writes for this turn. In particular, Project reassignment PATCH uses the
+    // same lock and therefore cannot slip between the second load and a stale
+    // chat snapshot save.
+    let persistence_guard = state.persistence.acquire_lock(&session_id).await;
+    let authoritative_session = match state.persistence.storage().load_session(&session_id).await {
         Ok(session) => session,
-        Err(bamboo_engine::session_app::errors::ChatError::InvalidWorkflowSelection(error)) => {
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": crate::error::error_value(error)
-            }));
-        }
         Err(error) => {
-            tracing::error!("Chat turn preparation failed: {error}");
-            return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": crate::error::error_value(format!("Failed to prepare chat: {error}"))
-            }));
+            tracing::error!(%error, "failed to load authoritative chat session");
+            return crate::error::json_error(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load authoritative chat session",
+            );
         }
     };
+    if req.project_id.is_none() {
+        input.project_id = authoritative_session.as_ref().and_then(|session| {
+            match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                session,
+            ) {
+                bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                    Some(project_id)
+                }
+                bamboo_engine::project_context::SessionProjectIdentity::Unassigned
+                | bamboo_engine::project_context::SessionProjectIdentity::Invalid { .. } => None,
+            }
+        });
+    }
+    if let Some(requested_workspace) = req.workspace_path.as_deref() {
+        input.workspace_path = match crate::project_context::validate_workspace_assignment(
+            &state.project_store,
+            input.project_id.as_ref(),
+            Some(requested_workspace),
+        ) {
+            Ok(workspace) => workspace
+                .as_deref()
+                .map(bamboo_config::paths::path_to_display_string),
+            Err(error) => {
+                return match error {
+                    crate::project_context::ProjectWorkspaceValidationError::Invalid {
+                        code,
+                        workspace,
+                        message,
+                    } => HttpResponse::BadRequest().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": code,
+                            "message": message
+                        },
+                        "workspace": workspace,
+                    })),
+                    crate::project_context::ProjectWorkspaceValidationError::Conflict {
+                        workspace,
+                        owner_project_id,
+                        session_project_id,
+                    } => HttpResponse::Conflict().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "project_workspace_conflict",
+                            "message": "Workspace belongs to another Project"
+                        },
+                        "workspace": workspace,
+                        "owner_project_id": owner_project_id,
+                        "session_project_id": session_project_id,
+                    })),
+                    crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+                        tracing::error!(%error, "failed to revalidate chat workspace ownership");
+                        crate::error::json_error(
+                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to validate workspace Project ownership",
+                        )
+                    }
+                };
+            }
+        };
+    } else {
+        input.workspace_path = None;
+    }
+
+    let mut session =
+        match bamboo_engine::session_app::chat::prepare_chat_turn_from_authoritative_session(
+            authoritative_session,
+            input,
+            global_default_prompt.as_str(),
+            builtin_fallback_prompt,
+        ) {
+            Ok(session) => session,
+            Err(bamboo_engine::session_app::errors::ChatError::InvalidWorkflowSelection(error)) => {
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": crate::error::error_value(error)
+                }));
+            }
+            Err(bamboo_engine::session_app::errors::ChatError::InvalidProjectIdentity {
+                raw,
+                message,
+            }) => {
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "invalid_project_identity",
+                        "message": format!(
+                            "Session carries an invalid Project identity '{raw}': {message}"
+                        )
+                    },
+                    "session_id": session_id,
+                }));
+            }
+            Err(bamboo_engine::session_app::errors::ChatError::ProjectIdentityConflict {
+                expected,
+                actual,
+            }) => {
+                return HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "session_project_changed",
+                        "message": "Session Project membership changed while preparing chat"
+                    },
+                    "session_id": session_id,
+                    "expected_project_id": expected,
+                    "actual_project_id": actual,
+                }));
+            }
+            Err(error) => {
+                tracing::error!("Chat turn preparation failed: {error}");
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": crate::error::error_value(format!("Failed to prepare chat: {error}"))
+                }));
+            }
+        };
+    let session_was_created = session
+        .metadata
+        .get(bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY)
+        .is_some_and(|source| source == "startup");
+    if let Err(error) = state
+        .project_context_resolver
+        .refresh_session_prompt_read_only(&mut session)
+        .await
+    {
+        return project_context_error_response(error);
+    }
+    if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
+        return response;
+    }
+    sync_runtime_workspace(&session_id, session.workspace_path_meta().as_deref());
+    if session_was_created {
+        state.account_sink.record(
+            Some(&session_id),
+            &bamboo_agent_core::AgentEvent::SessionCreated {
+                session_id: session_id.clone(),
+                project_id: session.project_id_meta(),
+                title: session.title.clone(),
+                kind: session.kind,
+                created_at: session.created_at,
+            },
+        );
+    }
 
     let effective_message = match crate::lifecycle_hooks::apply_user_prompt_submit_hooks(
         &config_snapshot.lifecycle_hooks,
@@ -125,7 +508,9 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         Ok(message) => message,
         Err(reason) => {
             // Persist the hook checkpoint but never the rejected user message.
-            state.save_and_cache_session(&mut session).await;
+            if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
+                return response;
+            }
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": crate::error::error_value(reason),
                 "hook_event": "UserPromptSubmit"
@@ -140,6 +525,10 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             session_id,
             goal_cmd
         );
+        // Goal metadata writers acquire the same per-session lock and load the
+        // latest durable session themselves. The prepared checkpoint is
+        // already durable, so hand ownership over before invoking them.
+        drop(persistence_guard);
         return handle_goal_command(state.as_ref(), &session_id, &goal_cmd).await;
     }
 
@@ -156,7 +545,9 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     }
 
     // Re-save to persist image attachments (if any).
-    state.save_and_cache_session(&mut session).await;
+    if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
+        return response;
+    }
 
     // Publish the user message onto the account change feed so other clients
     // see it without reloading history. The feed seq becomes the message's
@@ -180,6 +571,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         session.messages.len(),
         session.messages.last().map(|m| format!("{:?}", m.role)),
     );
+    drop(persistence_guard);
 
     HttpResponse::Created().json(ChatResponse {
         session_id: session_id.clone(),

@@ -36,6 +36,7 @@ bamboo-domain = { path = "../../core/bamboo-domain" }
 # build directly on this infra-layer crate's manifest/registry/installer
 # skeleton.
 bamboo-plugin = { path = "../../infra/bamboo-plugin" }
+bamboo-projects = { path = "../../infra/bamboo-projects" }
 # remote-actor P2a (#181): the server hosts the `/v1/agents` control-plane
 # registry over `bamboo_subagent::proto::AgentRecord`. The engine already pulls
 # this crate in transitively; a DIRECT dep makes the type reuse explicit (no
@@ -137,6 +138,7 @@ tar = "0.4"
 # limiting, so this adds no new crate to the dependency tree.
 governor = "0.10"
 notify-rust = "4.18"
+notify = "8"
 # Feishu/Lark connect adapter (`src/connect/platforms/feishu/`): the
 # `pbbp2.Frame`/`Header` wire types are hand-derived `prost::Message` impls
 # (no build.rs/protoc — see `feishu/pbbp2.rs`'s module doc), and the event

@@ -21,6 +21,25 @@ fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
     }
 }
 
+async fn persist_assigned_project_session(state: &AppState, session_id: &str) {
+    let project = state
+        .project_store
+        .create(format!("Memory test {session_id}"), None)
+        .expect("memory test Project should be created");
+    let mut session = Session::new(session_id, "test-model");
+    session.set_project_id_meta(project.id.to_string());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("assigned memory test session should be saved");
+    state
+        .session_store
+        .save_session(&session)
+        .await
+        .expect("assigned memory test session should be indexed");
+}
+
 #[test]
 fn default_base_prompt_does_not_unconditionally_require_conclusion_with_options() {
     let normalized = DEFAULT_BASE_PROMPT.to_ascii_lowercase();
@@ -245,6 +264,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         "session-merge",
         Some(temp_dir.path().to_path_buf()),
     );
+    persist_assigned_project_session(&state, "session-merge").await;
 
     let write_target = make_tool_call(
         "memory",
@@ -356,6 +376,7 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
         "session-heuristic-merge",
         Some(temp_dir.path().to_path_buf()),
     );
+    persist_assigned_project_session(&state, "session-heuristic-merge").await;
 
     let original = state
         .tools_for(ToolSurface::Root)
@@ -459,6 +480,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
         "session-contradict",
         Some(temp_dir.path().to_path_buf()),
     );
+    persist_assigned_project_session(&state, "session-contradict").await;
 
     let target = state
         .tools_for(ToolSurface::Root)
@@ -568,6 +590,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
         "session-batch-purge",
         Some(temp_dir.path().to_path_buf()),
     );
+    persist_assigned_project_session(&state, "session-batch-purge").await;
 
     let stale_write = state
         .tools_for(ToolSurface::Root)
@@ -697,6 +720,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
         "session-inspect",
         Some(temp_dir.path().to_path_buf()),
     );
+    persist_assigned_project_session(&state, "session-inspect").await;
 
     state
         .tools_for(ToolSurface::Root)

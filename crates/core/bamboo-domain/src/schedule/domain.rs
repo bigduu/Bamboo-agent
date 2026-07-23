@@ -240,6 +240,10 @@ mod tests {
 /// Runtime configuration for schedule-executed sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ScheduleRunConfig {
+    /// Stable Project membership inherited by every session created from this
+    /// schedule. Unlike `workspace_path`, this does not change during a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<crate::ProjectId>,
     /// Optional system prompt override for new sessions created by this schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,

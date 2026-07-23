@@ -152,6 +152,7 @@ mod tests {
     fn session(id: &str) -> SessionSummary {
         SessionSummary {
             id: id.into(),
+            project_id: None,
             title: String::new(),
             model: String::new(),
             is_running: false,

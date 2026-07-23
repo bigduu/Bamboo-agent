@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use bamboo_config::paths::bamboo_dir;
+use bamboo_domain::ProjectId;
 
 use super::types::MemoryScope;
 
@@ -21,6 +22,66 @@ pub const TOPICS_DIR: &str = "topics";
 pub struct MemoryPathResolver {
     data_dir: PathBuf,
     root: PathBuf,
+    project_id: Option<ProjectId>,
+    legacy_project_read_roots: Vec<LegacyProjectMemoryReadRoot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyProjectMemoryReadRoot {
+    pub project_key: String,
+    pub root: PathBuf,
+}
+
+/// Explicit first-class Project memory layout.
+///
+/// This resolver is intentionally separate from the legacy path-hash
+/// `MemoryPathResolver::project_root(&str)`: a safe legacy key and a ProjectId
+/// can have the same character shape, so guessing by string format would move
+/// old scopes silently. Assigned-session writes must use this typed resolver;
+/// legacy roots remain read-only migration aliases.
+#[derive(Debug, Clone)]
+pub struct ProjectMemoryPathResolver {
+    data_dir: PathBuf,
+}
+
+impl ProjectMemoryPathResolver {
+    pub fn from_data_dir(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+        }
+    }
+
+    pub fn project_home(&self, project_id: &ProjectId) -> PathBuf {
+        self.data_dir.join(PROJECTS_DIR).join(project_id.as_str())
+    }
+
+    pub fn memory_root(&self, project_id: &ProjectId) -> PathBuf {
+        self.project_home(project_id)
+            .join(MEMORY_ROOT_DIR)
+            .join(MEMORY_VERSION_DIR)
+    }
+
+    pub fn legacy_read_root(&self, legacy_project_key: &str) -> std::io::Result<PathBuf> {
+        let legacy_project_key = legacy_project_key.trim();
+        if legacy_project_key.is_empty()
+            || legacy_project_key.contains('/')
+            || legacy_project_key.contains('\\')
+            || legacy_project_key == "."
+            || legacy_project_key == ".."
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "legacy project key is not a safe path component",
+            ));
+        }
+        Ok(self
+            .data_dir
+            .join(MEMORY_ROOT_DIR)
+            .join(MEMORY_VERSION_DIR)
+            .join(SCOPES_DIR)
+            .join(PROJECTS_DIR)
+            .join(legacy_project_key))
+    }
 }
 
 impl Default for MemoryPathResolver {
@@ -33,13 +94,87 @@ impl MemoryPathResolver {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let data_dir = infer_data_dir_from_root(&root);
-        Self { data_dir, root }
+        Self {
+            data_dir,
+            root,
+            project_id: None,
+            legacy_project_read_roots: Vec::new(),
+        }
     }
 
     pub fn from_data_dir(data_dir: impl Into<PathBuf>) -> Self {
         let data_dir = data_dir.into();
         let root = data_dir.join(MEMORY_ROOT_DIR).join(MEMORY_VERSION_DIR);
-        Self { data_dir, root }
+        Self {
+            data_dir,
+            root,
+            project_id: None,
+            legacy_project_read_roots: Vec::new(),
+        }
+    }
+
+    /// Bind Project-scope paths to one validated first-class Project id.
+    ///
+    /// This is explicit rather than inferred from an arbitrary string key, so
+    /// legacy path-hash keys keep their original layout.
+    pub fn for_project(&self, project_id: &ProjectId) -> Self {
+        Self {
+            data_dir: self.data_dir.clone(),
+            root: self.root.clone(),
+            project_id: Some(project_id.clone()),
+            legacy_project_read_roots: Vec::new(),
+        }
+    }
+
+    pub fn for_project_with_legacy_read_roots(
+        &self,
+        project_id: &ProjectId,
+        legacy_project_read_roots: Vec<LegacyProjectMemoryReadRoot>,
+    ) -> Self {
+        Self {
+            data_dir: self.data_dir.clone(),
+            root: self.root.clone(),
+            project_id: Some(project_id.clone()),
+            legacy_project_read_roots,
+        }
+    }
+
+    pub fn project_id(&self) -> Option<&ProjectId> {
+        self.project_id.as_ref()
+    }
+
+    pub fn has_legacy_project_read_roots(&self) -> bool {
+        !self.legacy_project_read_roots.is_empty()
+    }
+
+    pub fn project_read_roots(&self, project_key: &str) -> Vec<PathBuf> {
+        if self
+            .project_id
+            .as_ref()
+            .is_some_and(|project_id| project_id.as_str() == project_key)
+        {
+            let mut roots = vec![self.project_root(project_key)];
+            roots.extend(
+                self.legacy_project_read_roots
+                    .iter()
+                    .map(|legacy| legacy.root.clone()),
+            );
+            return roots;
+        }
+        vec![self.project_root(project_key)]
+    }
+
+    pub fn is_legacy_project_read_path(&self, path: &Path) -> bool {
+        self.legacy_project_read_roots
+            .iter()
+            .any(|legacy| path.starts_with(&legacy.root))
+    }
+
+    pub fn scope_read_roots(&self, scope: MemoryScope, project_key: Option<&str>) -> Vec<PathBuf> {
+        match scope {
+            MemoryScope::Project => self.project_read_roots(project_key.unwrap_or("unknown")),
+            _ => vec![self.scope_root(scope, project_key)],
+        }
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -80,6 +215,14 @@ impl MemoryPathResolver {
     }
 
     pub fn project_root(&self, project_key: &str) -> PathBuf {
+        if self
+            .project_id
+            .as_ref()
+            .is_some_and(|project_id| project_id.as_str() == project_key)
+        {
+            return ProjectMemoryPathResolver::from_data_dir(self.data_dir.clone())
+                .memory_root(self.project_id.as_ref().expect("checked Project id"));
+        }
         self.scopes_root().join(PROJECTS_DIR).join(project_key)
     }
 
@@ -204,5 +347,27 @@ mod tests {
             resolver.topic_path(MemoryScope::Project, Some("proj-1"), "mem_1"),
             PathBuf::from("/tmp/memory/v1/scopes/projects/proj-1/topics/mem_1.md")
         );
+    }
+
+    #[test]
+    fn typed_project_memory_uses_project_home_without_guessing_legacy_keys() {
+        let resolver = ProjectMemoryPathResolver::from_data_dir("/tmp/bamboo");
+        let project_id = ProjectId::parse("01JABCDEF0123456789ABCDEFG").expect("id");
+        assert_eq!(
+            resolver.memory_root(&project_id),
+            PathBuf::from("/tmp/bamboo/projects/01JABCDEF0123456789ABCDEFG/memory/v1")
+        );
+        let scoped = MemoryPathResolver::from_data_dir("/tmp/bamboo").for_project(&project_id);
+        assert_eq!(
+            scoped.topic_dir(MemoryScope::Project, Some(project_id.as_str())),
+            PathBuf::from("/tmp/bamboo/projects/01JABCDEF0123456789ABCDEFG/memory/v1/topics")
+        );
+        assert_eq!(
+            resolver
+                .legacy_read_root("zenith-deadbeef")
+                .expect("legacy"),
+            PathBuf::from("/tmp/bamboo/memory/v1/scopes/projects/zenith-deadbeef")
+        );
+        assert!(resolver.legacy_read_root("../escape").is_err());
     }
 }

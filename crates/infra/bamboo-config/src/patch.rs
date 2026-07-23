@@ -1571,6 +1571,7 @@ mod tests {
     fn connect_platform(platform_type: &str, token: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
             id: None,
+            project_id: None,
             platform_type: platform_type.to_string(),
             token: Some(token.to_string()),
             token_encrypted: None,
@@ -1984,6 +1985,7 @@ mod tests {
     fn feishu_platform(app_secret: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
             id: None,
+            project_id: None,
             platform_type: "feishu".to_string(),
             token: None,
             token_encrypted: None,

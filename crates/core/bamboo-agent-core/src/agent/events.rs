@@ -502,6 +502,11 @@ pub enum AgentEvent {
     /// full `GET /sessions` poll.
     SessionCreated {
         session_id: String,
+        /// Stable Project membership at creation time. Explicit `null` means
+        /// Unassigned so replay consumers can recover grouping without a
+        /// follow-up session fetch.
+        #[serde(default)]
+        project_id: Option<String>,
         title: String,
         kind: bamboo_domain::SessionKind,
         created_at: chrono::DateTime<chrono::Utc>,
@@ -663,6 +668,25 @@ pub enum AgentEvent {
         scope: String,
     },
 
+    /// A first-class Project was created in the account registry.
+    ProjectCreated { project_id: String, revision: u64 },
+
+    /// A Project manifest or its shared resource inventory changed.
+    ProjectUpdated { project_id: String, revision: u64 },
+
+    /// A Project was archived. Sessions and resources are deliberately retained.
+    ProjectArchived { project_id: String, revision: u64 },
+
+    /// A session was explicitly reassigned to another Project (or unassigned).
+    SessionProjectUpdated {
+        session_id: String,
+        /// Explicit `null` means Unassigned. Keep the field present so account
+        /// feed replay consumers can recover session grouping without a fetch.
+        #[serde(default)]
+        project_id: Option<String>,
+        metadata_version: u64,
+    },
+
     /// A configuration section published a new last-known-good snapshot.
     #[serde(rename = "config.changed")]
     ConfigChanged { section: String, revision: u64 },
@@ -754,6 +778,7 @@ impl AgentEvent {
             | AgentEvent::BudgetExceeded { session_id, .. }
             | AgentEvent::WorkflowActivated { session_id, .. }
             | AgentEvent::WorkflowDeactivated { session_id, .. }
+            | AgentEvent::SessionProjectUpdated { session_id, .. }
             | AgentEvent::Notification { session_id, .. } => Some(session_id.as_str()),
             AgentEvent::SubAgentStarted {
                 parent_session_id, ..
@@ -814,6 +839,10 @@ impl AgentEvent {
                 | AgentEvent::Error { .. }
                 | AgentEvent::WorkflowChanged { .. }
                 | AgentEvent::WorkflowInvalid { .. }
+                | AgentEvent::ProjectCreated { .. }
+                | AgentEvent::ProjectUpdated { .. }
+                | AgentEvent::ProjectArchived { .. }
+                | AgentEvent::SessionProjectUpdated { .. }
                 | AgentEvent::ConfigChanged { .. }
                 | AgentEvent::ConfigInvalid { .. }
                 | AgentEvent::ConfigRecovered { .. }
@@ -949,6 +978,34 @@ mod tests {
         assert_eq!(value["type"], "task_list_updated");
         assert!(value.get("task_list").is_some());
         assert!(value.get("todo_list").is_none());
+    }
+
+    #[test]
+    fn session_project_updated_serializes_unassignment_as_explicit_null() {
+        let event = AgentEvent::SessionProjectUpdated {
+            session_id: "session-1".to_string(),
+            project_id: None,
+            metadata_version: 4,
+        };
+
+        let value = serde_json::to_value(&event).expect("event should serialize");
+        assert_eq!(value["type"], "session_project_updated");
+        assert!(
+            value
+                .get("project_id")
+                .is_some_and(serde_json::Value::is_null),
+            "unassignment must carry an explicit project_id: null"
+        );
+
+        let restored: AgentEvent = serde_json::from_value(value).expect("event should deserialize");
+        assert!(matches!(
+            restored,
+            AgentEvent::SessionProjectUpdated {
+                session_id,
+                project_id: None,
+                metadata_version: 4,
+            } if session_id == "session-1"
+        ));
     }
 
     #[test]

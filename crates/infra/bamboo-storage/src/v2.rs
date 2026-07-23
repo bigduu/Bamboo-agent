@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
-use bamboo_domain::{Role, Session, SessionKind, TokenBudgetUsage};
+use bamboo_domain::{ProjectId, Role, Session, SessionKind, TokenBudgetUsage};
 
 use crate::search_index::{should_index_session, SessionSearchIndex};
 use bamboo_domain::AttachmentReader;
@@ -43,6 +43,7 @@ pub(crate) fn other_io_error(message: impl Into<String>) -> io::Error {
 /// Filename of the runtime control-plane sidecar, stored alongside
 /// `session.json` in each session directory.
 const RUNTIME_SIDECAR_FILE: &str = "runtime.json";
+const SESSIONS_INDEX_VERSION: u32 = 4;
 
 /// Filename of the append-only per-LLM-call token-usage log, stored alongside
 /// `session.json` in each session directory. One JSON line per call.
@@ -74,6 +75,25 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
             side
         }
         None => main,
+    }
+}
+
+/// Normalize the persisted compatibility metadata through the authoritative
+/// typed Project id parser before mirroring it into the rebuildable index.
+/// Malformed legacy metadata is isolated to that session instead of poisoning
+/// the entire session index.
+fn normalized_project_id(session: &Session) -> Option<String> {
+    let raw = session.project_id_meta()?;
+    match raw.trim().parse::<ProjectId>() {
+        Ok(project_id) => Some(project_id.into_string()),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "ignoring malformed Project id while updating session index"
+            );
+            None
+        }
     }
 }
 
@@ -126,6 +146,9 @@ pub struct SessionIndexEntry {
     /// Workspace path mirrored from the session's typed runtime metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// Stable Project identity mirrored from typed session runtime metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Raw session-level Gold config JSON mirrored from `session.metadata["gold_config"]`.
     /// Kept as a string here to avoid making infrastructure depend on bamboo-engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,7 +228,7 @@ pub struct SessionsIndex {
 impl SessionsIndex {
     fn empty() -> Self {
         Self {
-            version: 3,
+            version: SESSIONS_INDEX_VERSION,
             updated_at: Utc::now(),
             sessions: HashMap::new(),
         }
@@ -249,18 +272,19 @@ impl SessionStoreV2 {
         let index = if index_path.exists() {
             let raw = fs::read_to_string(&index_path).await?;
             match serde_json::from_str::<SessionsIndex>(&raw) {
-                Ok(index) if index.version >= 3 => index,
+                Ok(index) if index.version >= SESSIONS_INDEX_VERSION => index,
                 Ok(index) => {
                     tracing::info!(
-                        "migrating sessions index from version {} to version 3 by rebuilding from session.json",
-                        index.version
+                        "migrating sessions index from version {} to version {} by rebuilding from session.json",
+                        index.version,
+                        SESSIONS_INDEX_VERSION,
                     );
                     needs_rebuild = true;
                     let mut rebuilding = SessionsIndex::empty();
                     // Keep an old-version marker on every incremental rebuild
                     // persist. If the process crashes mid-scan, the next boot
-                    // must resume instead of accepting a partial v3 index.
-                    rebuilding.version = index.version.min(2);
+                    // must resume instead of accepting a partial current index.
+                    rebuilding.version = index.version.min(SESSIONS_INDEX_VERSION - 1);
                     rebuilding
                 }
                 Err(error) => {
@@ -437,9 +461,9 @@ impl SessionStoreV2 {
         // have renamed the only copy to sessions.json.bak), so the "index file
         // always exists after boot" invariant holds.
         self.update_index(|index| {
-            // Publishing version 3 is the commit point for a complete rebuild.
+            // Publishing the current version is the commit point for a complete rebuild.
             // `persist_index_locked` writes a temp file and atomically renames it.
-            index.version = 3;
+            index.version = SESSIONS_INDEX_VERSION;
             Ok(())
         })
         .await?;
@@ -818,6 +842,7 @@ impl SessionStoreV2 {
             .workspace_path_meta()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let project_id = normalized_project_id(session);
         self.update_index(|index| {
             index.sessions.insert(
                 session.id.clone(),
@@ -835,6 +860,7 @@ impl SessionStoreV2 {
                     model_ref: session.model_ref.clone(),
                     reasoning_effort: session.reasoning_effort,
                     workspace_path,
+                    project_id,
                     gold_config_json,
                     created_by_schedule_id,
                     schedule_run_id,
@@ -1334,22 +1360,26 @@ impl Storage for SessionStoreV2 {
         let abs_dir = self.abs_path_from_rel(&rel);
         self.write_runtime_sidecar(&abs_dir, session).await?;
 
-        // Workspace ownership is part of the list/index API contract. Runtime
-        // workspace updates must therefore be reflected without waiting for a
-        // later full session save. Avoid rewriting the global index when the
-        // normalized value did not change.
+        // Workspace and Project ownership are part of the list/index API
+        // contract. Runtime updates must therefore be reflected without waiting
+        // for a later full session save. Avoid rewriting the global index when
+        // neither normalized value changed.
         let workspace_path = session
             .workspace_path_meta()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let workspace_changed = self
+        let project_id = normalized_project_id(session);
+        let runtime_index_changed = self
             .get_index_entry(&session.id)
             .await
-            .is_some_and(|entry| entry.workspace_path != workspace_path);
-        if workspace_changed {
+            .is_some_and(|entry| {
+                entry.workspace_path != workspace_path || entry.project_id != project_id
+            });
+        if runtime_index_changed {
             self.update_index(|index| {
                 if let Some(entry) = index.sessions.get_mut(&session.id) {
                     entry.workspace_path = workspace_path;
+                    entry.project_id = project_id;
                 }
                 Ok(())
             })
@@ -1819,7 +1849,77 @@ mod tests {
 
         let persisted: SessionsIndex = serde_json::from_slice(&tokio::fs::read(index_path).await?)
             .map_err(|error| other_io_error(error.to_string()))?;
-        assert_eq!(persisted.version, 3);
+        assert_eq!(persisted.version, SESSIONS_INDEX_VERSION);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v3_index_migrates_project_ids_from_root_and_child_sessions() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+
+        {
+            let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+            let mut root = Session::new("project-root", "m");
+            root.set_project_id_meta("01JROOTPROJECT00000000000000");
+            storage.save_session(&root).await?;
+
+            let mut child = Session::new_child_of("project-child", &root, "m", "child");
+            child.metadata.insert(
+                "project_id".to_string(),
+                "01JCHILDPROJECT000000000000".to_string(),
+            );
+            storage.save_session(&child).await?;
+
+            let unassigned = Session::new("project-unassigned", "m");
+            storage.save_session(&unassigned).await?;
+        }
+
+        let index_path = bamboo_home.join("sessions.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&index_path).await?)
+                .map_err(|error| other_io_error(error.to_string()))?;
+        legacy["version"] = serde_json::json!(3);
+        for entry in legacy["sessions"]
+            .as_object_mut()
+            .expect("sessions object")
+            .values_mut()
+        {
+            entry.as_object_mut().expect("entry").remove("project_id");
+        }
+        tokio::fs::write(
+            &index_path,
+            serde_json::to_vec_pretty(&legacy)
+                .map_err(|error| other_io_error(error.to_string()))?,
+        )
+        .await?;
+
+        let migrated = SessionStoreV2::new(bamboo_home.clone()).await?;
+        assert_eq!(
+            migrated
+                .get_index_entry("project-root")
+                .await
+                .and_then(|entry| entry.project_id),
+            Some("01JROOTPROJECT00000000000000".to_string())
+        );
+        assert_eq!(
+            migrated
+                .get_index_entry("project-child")
+                .await
+                .and_then(|entry| entry.project_id),
+            Some("01JCHILDPROJECT000000000000".to_string())
+        );
+        assert_eq!(
+            migrated
+                .get_index_entry("project-unassigned")
+                .await
+                .and_then(|entry| entry.project_id),
+            None
+        );
+
+        let persisted: SessionsIndex = serde_json::from_slice(&tokio::fs::read(index_path).await?)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        assert_eq!(persisted.version, SESSIONS_INDEX_VERSION);
         Ok(())
     }
 
@@ -1846,6 +1946,55 @@ mod tests {
                 .and_then(|entry| entry.workspace_path),
             Some("/workspaces/latest".to_string())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_id_updates_index_on_full_and_runtime_only_saves() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let mut session = Session::new("project-update", "m");
+        session.set_project_id_meta(" 01JPROJECTFIRST000000000000 ");
+        storage.save_session(&session).await?;
+        assert_eq!(
+            storage
+                .get_index_entry(&session.id)
+                .await
+                .and_then(|entry| entry.project_id),
+            Some("01JPROJECTFIRST000000000000".to_string())
+        );
+
+        session.set_project_id_meta(" 01JPROJECTLATEST00000000000 ");
+        storage.save_runtime_state(&session).await?;
+        assert_eq!(
+            storage
+                .get_index_entry(&session.id)
+                .await
+                .and_then(|entry| entry.project_id),
+            Some("01JPROJECTLATEST00000000000".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_project_id_isolated_from_session_index() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let mut malformed = Session::new("project-malformed", "m");
+        malformed
+            .metadata
+            .insert("project_id".to_string(), "../unsafe".to_string());
+        storage.save_session(&malformed).await?;
+
+        let healthy = Session::new("project-healthy", "m");
+        storage.save_session(&healthy).await?;
+
+        assert_eq!(
+            storage
+                .get_index_entry(&malformed.id)
+                .await
+                .and_then(|entry| entry.project_id),
+            None
+        );
+        assert!(storage.get_index_entry(&healthy.id).await.is_some());
         Ok(())
     }
 

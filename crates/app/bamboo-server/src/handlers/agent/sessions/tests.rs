@@ -22,6 +22,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         model_ref: None,
         reasoning_effort: Some(ReasoningEffort::High),
         workspace_path: Some("/workspaces/zenith".to_string()),
+        project_id: Some("project-1".to_string()),
         gold_config_json: None,
         created_by_schedule_id: None,
         schedule_run_id: Some("run-123".to_string()),
@@ -50,6 +51,10 @@ fn session_summary_from_entry_includes_last_run_fields() {
         summary.workspace_path.as_deref(),
         Some("/workspaces/zenith")
     );
+    assert_eq!(
+        summary.project_id.as_ref().map(ToString::to_string),
+        Some("project-1".to_string())
+    );
     assert_eq!(summary.subagent_type, None);
     assert!(summary.has_pending_question);
     assert_eq!(summary.running_child_count, 0);
@@ -72,6 +77,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
         model_ref: None,
         reasoning_effort: None,
         workspace_path: None,
+        project_id: Some("../malformed".to_string()),
         gold_config_json: None,
         created_by_schedule_id: None,
         schedule_run_id: None,
@@ -93,5 +99,6 @@ fn session_summary_from_entry_propagates_subagent_type() {
 
     let summary = SessionSummary::from_entry(entry, false);
     assert_eq!(summary.subagent_type.as_deref(), Some("plan"));
+    assert_eq!(summary.project_id, None);
     assert!(!summary.has_pending_question);
 }

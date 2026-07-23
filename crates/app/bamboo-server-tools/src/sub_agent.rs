@@ -275,6 +275,39 @@ fn tool_error_from_child_session(error: ChildSessionError) -> ToolError {
     }
 }
 
+fn require_resident_project_identity(
+    parent_project_id: Option<&bamboo_domain::ProjectId>,
+    child: &bamboo_agent_core::Session,
+) -> Result<(), ToolError> {
+    let child_project_id =
+        match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+            child,
+        ) {
+            bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                Some(project_id)
+            }
+            bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+            bamboo_engine::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(ToolError::InvalidArguments(format!(
+                    "resident session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        };
+    if child_project_id.as_ref() != parent_project_id {
+        return Err(ToolError::InvalidArguments(format!(
+            "resident_project_scope_conflict: resident Project '{}' does not match parent Project '{}'",
+            child_project_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unassigned".to_string()),
+            parent_project_id
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unassigned".to_string()),
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tool struct
 // ---------------------------------------------------------------------------
@@ -571,7 +604,7 @@ impl Tool for SubAgentTool {
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "worker".to_string());
                 // workspace is optional: default to the parent's workspace.
-                let workspace = workspace
+                let requested_workspace = workspace
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty())
                     .or_else(|| parent.workspace.clone())
@@ -581,6 +614,33 @@ impl Tool for SubAgentTool {
                                 .to_string(),
                         )
                     })?;
+                let parent_project_id =
+                    match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
+                        bamboo_engine::project_context::SessionProjectIdentity::Assigned(
+                            project_id,
+                        ) => Some(project_id),
+                        bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+                        bamboo_engine::project_context::SessionProjectIdentity::Invalid {
+                            raw,
+                            message,
+                        } => {
+                            return Err(ToolError::InvalidArguments(format!(
+                                "parent session carries an invalid Project identity '{raw}': {message}"
+                            )));
+                        }
+                    };
+                // This must precede resident lookup/cancellation and every
+                // child/session mutation. Reused residents bypass
+                // `create_child_action`, while new children and guardians use
+                // it as a second fail-closed boundary.
+                let workspace = self
+                    .sessions
+                    .validate_child_workspace(
+                        parent_project_id.as_ref(),
+                        &requested_workspace,
+                    )
+                    .await
+                    .map_err(tool_error_from_child_session)?;
 
                 if parent.model.trim().is_empty() {
                     return Err(ToolError::Execution(
@@ -622,6 +682,18 @@ impl Tool for SubAgentTool {
 
                 let (child_session_id, child_model, reused) =
                     if let Some(existing_id) = existing_resident {
+                        // A resident is stable Project identity. A root may
+                        // have been explicitly reassigned since this resident
+                        // was created; never silently pull the old child across
+                        // that boundary. This check precedes cancellation and
+                        // every child/session mutation.
+                        let mut child = self
+                            .sessions
+                            .load_child_for_parent(&parent.id, &existing_id)
+                            .await
+                            .map_err(tool_error_from_child_session)?;
+                        require_resident_project_identity(parent_project_id.as_ref(), &child)?;
+
                         // A resident processes tasks serially. If it is still running
                         // a previous task, stop it first: otherwise `reset` would
                         // truncate the session while the runner writes back (a
@@ -634,6 +706,15 @@ impl Tool for SubAgentTool {
                                 .cancel_child_run_and_wait(&existing_id)
                                 .await
                                 .map_err(tool_error_from_child_session)?;
+                            child = self
+                                .sessions
+                                .load_child_for_parent(&parent.id, &existing_id)
+                                .await
+                                .map_err(tool_error_from_child_session)?;
+                            require_resident_project_identity(
+                                parent_project_id.as_ref(),
+                                &child,
+                            )?;
                         }
                         // #74: re-seed the reused resident's posture from the LIVE
                         // parent. The resident-reuse path bypasses
@@ -643,30 +724,23 @@ impl Tool for SubAgentTool {
                         // flag when reused under another (e.g. parent flipped from
                         // headless to interactive, or toggled bypass). Mirror BOTH
                         // flags so the reused resident matches the current parent.
-                        {
-                            let mut child = self
-                                .sessions
-                                .load_child_for_parent(&parent.id, &existing_id)
-                                .await
-                                .map_err(tool_error_from_child_session)?;
-                            let (parent_bypass, parent_no_human) = parent
-                                .agent_runtime_state
-                                .as_ref()
-                                .map(|s| (s.bypass_permissions, s.no_human_approver))
-                                .unwrap_or((false, false));
-                            let rs = child
-                                .agent_runtime_state
-                                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
-                            rs.bypass_permissions = parent_bypass;
-                            rs.no_human_approver = parent_no_human;
-                            // Authoritative flag write: persist the freshly
-                            // mirrored posture as-is; the adopting save would
-                            // revert bypass to the child's stale disk value. #540/#74.
-                            self.sessions
-                                .save_child_session_authoritative_flags(&mut child)
-                                .await
-                                .map_err(tool_error_from_child_session)?;
-                        }
+                        let (parent_bypass, parent_no_human) = parent
+                            .agent_runtime_state
+                            .as_ref()
+                            .map(|s| (s.bypass_permissions, s.no_human_approver))
+                            .unwrap_or((false, false));
+                        let rs = child
+                            .agent_runtime_state
+                            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+                        rs.bypass_permissions = parent_bypass;
+                        rs.no_human_approver = parent_no_human;
+                        // Commit posture + the newly requested, already
+                        // authorized workspace before publishing runtime state
+                        // or enqueueing the next resident task.
+                        self.sessions
+                            .save_resident_reuse_state(&mut child, &workspace)
+                            .await
+                            .map_err(tool_error_from_child_session)?;
                         // Reuse: reset => update (truncate + new task) then rerun;
                         // accumulate => send the task as a new message (auto-runs).
                         if resident_context == "accumulate" {

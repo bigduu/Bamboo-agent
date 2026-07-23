@@ -31,19 +31,56 @@ pub async fn list_workflow_catalog(
             .load_session(session_id)
             .await
             .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
-        if let Some(workspace) = session.workspace_path_meta() {
-            let workspace = tokio::fs::canonicalize(workspace).await.map_err(|error| {
-                AppError::BadRequest(format!("Invalid session workspace: {error}"))
-            })?;
-            if !workspace.is_dir() {
-                return Err(AppError::BadRequest(
-                    "Session workspace must be a directory".to_string(),
-                ));
+        let project_id =
+            match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                &session,
+            ) {
+                bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                    Some(project_id)
+                }
+                bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+                bamboo_engine::project_context::SessionProjectIdentity::Invalid {
+                    raw,
+                    message,
+                } => {
+                    return Err(AppError::BadRequest(format!(
+                        "Session carries an invalid Project identity '{raw}': {message}"
+                    )));
+                }
+            };
+        let workspace = crate::project_context::validate_workspace_assignment(
+            &app_state.project_store,
+            project_id.as_ref(),
+            session.workspace_path_meta().as_deref(),
+        )
+        .map_err(|error| match error {
+            crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }
+            | crate::project_context::ProjectWorkspaceValidationError::Conflict { .. } => {
+                AppError::BadRequest(error.to_string())
             }
+            crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+                AppError::InternalError(anyhow::anyhow!(error))
+            }
+        })?;
+        if let Some(project_id) = project_id {
+            app_state.project_store.get(&project_id).map_err(|error| {
+                AppError::BadRequest(format!("Assigned Project is unavailable: {error}"))
+            })?;
+            let project_home = app_state.project_store.paths().project_home(&project_id);
+            app_state
+                .skill_manager
+                .workflow_catalog_for_project_workspace(
+                    &project_id,
+                    &project_home,
+                    workspace.as_deref(),
+                )
+                .await
+                .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
+        } else if let Some(workspace) = workspace.as_ref() {
             app_state
                 .skill_manager
                 .store()
-                .workflow_catalog_for_workspace(&workspace)
+                .workflow_catalog_for_workspace(workspace)
                 .await
                 .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
         } else {

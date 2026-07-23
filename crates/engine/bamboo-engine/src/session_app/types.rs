@@ -37,6 +37,11 @@ pub struct ExecutionConfigSnapshot {
 /// Input for the chat turn use case.
 pub struct ChatTurnInput {
     pub session_id: String,
+    /// Project membership observed and validated by the caller. The
+    /// authoritative load inside `prepare_chat_turn` must still match this
+    /// value before any prompt/workspace/message mutation. For a genuinely new
+    /// session this becomes its initial stable membership.
+    pub project_id: Option<bamboo_domain::ProjectId>,
     pub model: String,
     pub model_ref: Option<ProviderModelRef>,
     pub provider: Option<String>,
@@ -44,6 +49,10 @@ pub struct ChatTurnInput {
     pub system_prompt: Option<String>,
     pub enhance_prompt: Option<String>,
     pub workspace_path: Option<String>,
+    /// Caller-owned live-config default. This is distinct from an explicit
+    /// request field so an omitted workspace can still prefer the freshly
+    /// loaded durable session under the transaction lock.
+    pub default_workspace_path: Option<String>,
     pub selected_skill_ids: Option<Vec<String>>,
     pub workflow_selection: Option<bamboo_skills::WorkflowSelection>,
     pub orchestration_opt_in: Option<bool>,

@@ -25,6 +25,8 @@ use bamboo_domain::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 const WORKSPACE_CONTEXT_START_MARKER: &str = crate::context::WORKSPACE_CONTEXT_START_MARKER;
 const WORKSPACE_CONTEXT_END_MARKER: &str = crate::context::WORKSPACE_CONTEXT_END_MARKER;
 const WORKSPACE_CONTEXT_PREFIX: &str = crate::context::WORKSPACE_CONTEXT_PREFIX;
+const PROJECT_CONTEXT_START_MARKER: &str = crate::context::PROJECT_CONTEXT_START_MARKER;
+const PROJECT_CONTEXT_END_MARKER: &str = crate::context::PROJECT_CONTEXT_END_MARKER;
 
 const INSTRUCTION_CONTEXT_START_MARKER: &str =
     crate::context::instruction::INSTRUCTION_CONTEXT_START_MARKER;
@@ -84,8 +86,10 @@ pub fn build_system_prompt_snapshot(session: &Session, default_prompt: &str) -> 
     });
 
     let prompt_without_generated_sections = strip_generated_sections(&effective_system_prompt);
+    let (prompt_without_project, project_context) =
+        split_project_context(&prompt_without_generated_sections);
     let (prompt_without_workspace, workspace_from_prompt) =
-        split_workspace_context(&prompt_without_generated_sections);
+        split_workspace_context(&prompt_without_project);
     let (prompt_without_instruction, instruction_from_prompt) =
         split_instruction_context(&prompt_without_workspace);
     let (prompt_without_env, env_context) = split_env_context(&prompt_without_instruction);
@@ -125,6 +129,7 @@ pub fn build_system_prompt_snapshot(session: &Session, default_prompt: &str) -> 
     PromptSnapshot {
         base_system_prompt,
         enhancement_prompt,
+        project_context,
         workspace_context,
         instruction_context,
         env_context,
@@ -248,6 +253,23 @@ fn split_workspace_context(prompt: &str) -> (String, Option<String>) {
         return (stripped.trim().to_string(), marker_workspace);
     }
     split_legacy_workspace_context(prompt)
+}
+
+fn split_project_context(prompt: &str) -> (String, Option<String>) {
+    let project_context = extract_wrapped_section(
+        prompt,
+        PROJECT_CONTEXT_START_MARKER,
+        PROJECT_CONTEXT_END_MARKER,
+    );
+    if project_context.is_some() {
+        let stripped = strip_wrapped_sections(
+            prompt,
+            PROJECT_CONTEXT_START_MARKER,
+            PROJECT_CONTEXT_END_MARKER,
+        );
+        return (stripped.trim().to_string(), project_context);
+    }
+    (prompt.trim().to_string(), None)
 }
 
 fn split_instruction_context(prompt: &str) -> (String, Option<String>) {
@@ -519,6 +541,7 @@ mod tests {
             serde_json::to_string(&crate::runner::PromptSnapshot {
                 base_system_prompt: "Shared base".to_string(),
                 enhancement_prompt: Some("Shared enhancement".to_string()),
+                project_context: Some("Shared project".to_string()),
                 workspace_context: Some("Shared workspace".to_string()),
                 instruction_context: Some("Shared instruction".to_string()),
                 env_context: Some("Shared env".to_string()),

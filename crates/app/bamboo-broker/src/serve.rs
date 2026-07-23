@@ -636,6 +636,7 @@ where
         .run(
             RunSpec {
                 assignment: question.clone(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: prior,
@@ -1227,6 +1228,7 @@ mod tests {
 
         let spec = RunSpec {
             assignment: "ping pong".into(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],

@@ -22,6 +22,24 @@ pub async fn create_child_action(
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
 
+    let inherited_project_id =
+        match crate::project_context::ProjectContextResolver::session_project_identity(
+            &input.parent_session,
+        ) {
+            crate::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                Some(project_id)
+            }
+            crate::project_context::SessionProjectIdentity::Unassigned => None,
+            crate::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(ChildSessionError::InvalidArguments(format!(
+                    "parent session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        };
+    let final_workspace = port
+        .validate_child_workspace(inherited_project_id.as_ref(), &input.workspace)
+        .await?;
+
     // Use `new_child_of` so the child inherits the parent's tree root and a
     // depth of parent+1. For a root parent this is identical to the old
     // flat-tree behavior; for a child parent it enables nesting while keeping
@@ -37,6 +55,11 @@ pub async fn create_child_action(
             .unwrap_or_else(|| input.parent_session.model.clone()),
         input.title.clone(),
     );
+    // Project is stable tree identity: every child/resident/guardian inherits
+    // it even when the requested workspace differs from its parent.
+    if let Some(project_id) = inherited_project_id {
+        child.set_project_id_meta(project_id.to_string());
+    }
 
     if let Some(model_ref) = input.model_ref_override.clone() {
         child.model_ref = Some(model_ref.clone());
@@ -95,7 +118,7 @@ pub async fn create_child_action(
     // diverges from where tools actually run.
     let stored_workspace = bamboo_agent_core::workspace_state::set_workspace(
         &child.id,
-        std::path::PathBuf::from(&input.workspace),
+        std::path::PathBuf::from(final_workspace),
     );
     child.workspace = Some(stored_workspace.to_string_lossy().to_string());
 

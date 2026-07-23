@@ -25,6 +25,8 @@ use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LE
 use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
 use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
 
+use crate::project_context::{ProjectContextResolver, ProjectMemoryScope};
+
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
 // Auto-Dream tick cadence now lives in `MemoryConfig::auto_dream_interval_secs`
@@ -134,7 +136,7 @@ async fn collect_candidate_sessions(
 
 async fn resolve_session_project_key(
     ctx: &AutoDreamContext,
-    memory: &MemoryStore,
+    _memory: &MemoryStore,
     session_id: &str,
 ) -> Option<String> {
     ctx.storage
@@ -142,10 +144,7 @@ async fn resolve_session_project_key(
         .await
         .ok()
         .flatten()
-        .and_then(|session| session.workspace_path_meta())
-        .map(std::path::PathBuf::from)
-        .map(|path| bamboo_memory::memory_store::project_key_from_path(&path))
-        .or_else(|| memory.project_key_for_session(Some(session_id)))
+        .and_then(|session| ProjectContextResolver::memory_write_scope_for_session(&session))
 }
 
 async fn collect_candidate_sessions_for_project(
@@ -242,12 +241,31 @@ struct ExtractionWrites {
     ledger: usize,
 }
 
+#[cfg(test)]
 async fn extract_and_persist_durable_candidates(
+    ctx: &AutoDreamContext,
     provider: &Arc<dyn LLMProvider>,
     memory: &MemoryStore,
     ledger: &LedgerStore,
     model: &str,
     sessions: &[CandidateSessionContext],
+) -> Result<ExtractionWrites, String> {
+    extract_and_persist_durable_candidates_with_project_resolver(
+        ctx, provider, memory, ledger, model, sessions, None, false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn extract_and_persist_durable_candidates_with_project_resolver(
+    ctx: &AutoDreamContext,
+    provider: &Arc<dyn LLMProvider>,
+    memory: &MemoryStore,
+    ledger: &LedgerStore,
+    model: &str,
+    sessions: &[CandidateSessionContext],
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
 ) -> Result<ExtractionWrites, String> {
     if sessions.is_empty() {
         return Ok(ExtractionWrites::default());
@@ -295,17 +313,95 @@ async fn extract_and_persist_durable_candidates(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        if let (Some(_resolver), Some(session_id)) = (project_resolver, session_id) {
+            let source_session = ctx
+                .storage
+                .load_session(session_id)
+                .await
+                .map_err(|error| {
+                    format!("failed to load durable-memory source session '{session_id}': {error}")
+                })?;
+            if source_session.as_ref().is_some_and(|session| {
+                matches!(
+                    ProjectContextResolver::session_project_identity(session),
+                    crate::project_context::SessionProjectIdentity::Invalid { .. }
+                )
+            }) {
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "memory_candidate_skipped",
+                    session_id,
+                    reason = "invalid_project_identity",
+                    "Skipping AutoDream extraction from a session with malformed Project identity"
+                );
+                continue;
+            }
+        }
         let project_key = session_id
             .and_then(|id| session_project_keys.get(id))
             .and_then(|value| value.as_deref())
             .map(ToString::to_string);
         let scope = parse_candidate_scope(&candidate, project_key.as_deref());
+        let mut write_memory = memory.clone();
+        let mut write_project_key = project_key;
+        if scope == MemoryScope::Project && !current_store_is_project_scoped {
+            let Some(resolver) = project_resolver else {
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "project_candidate_skipped",
+                    session_id = session_id.unwrap_or(""),
+                    reason = "project_resolver_unavailable",
+                    "Skipping Project memory extraction because stable Project authority is unavailable"
+                );
+                continue;
+            };
+            let Some(session_id) = session_id else {
+                continue;
+            };
+            let session = ctx
+                .storage
+                .load_session(session_id)
+                .await
+                .map_err(|error| {
+                    format!("failed to load Project memory source session '{session_id}': {error}")
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "Project memory extraction source session '{session_id}' no longer exists"
+                    )
+                })?;
+            let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+            let resolved = resolver
+                .resolve_memory_read_scope(&session, workspace.as_deref())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to resolve Project memory scope for session '{session_id}': {error}"
+                    )
+                })?;
+            let Some(ProjectMemoryScope::Assigned {
+                project_id,
+                legacy_aliases,
+            }) = resolved
+            else {
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "project_candidate_skipped",
+                    session_id = session_id,
+                    reason = "session_unassigned",
+                    "Skipping Project memory extraction for an unassigned session"
+                );
+                continue;
+            };
+            write_project_key = Some(project_id.to_string());
+            write_memory = memory.for_project_with_legacy_read_roots(&project_id, legacy_aliases);
+        }
         let tags = candidate.tags;
         let _ = &candidate.confidence;
-        memory
+        write_memory
             .write_memory(
                 scope,
-                project_key.as_deref(),
+                write_project_key.as_deref(),
                 memory_type,
                 title,
                 content,
@@ -616,6 +712,7 @@ async fn run_auto_dream_once_for_scope(
     scope: MemoryScope,
     project_key: Option<&str>,
     require_auto_dream_enabled: bool,
+    project_resolver: Option<&ProjectContextResolver>,
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let scope_label = match scope {
         MemoryScope::Global => "global",
@@ -808,12 +905,15 @@ async fn run_auto_dream_once_for_scope(
         MemoryScope::Session => unreachable!("session scope handled above"),
     };
     let ledger = ledger_store_for_context(ctx);
-    let extraction_writes = extract_and_persist_durable_candidates(
+    let extraction_writes = extract_and_persist_durable_candidates_with_project_resolver(
+        ctx,
         &bg_provider,
         memory,
         &ledger,
         &model,
         &extraction_sessions,
+        project_resolver,
+        scope == MemoryScope::Project,
     )
     .await?;
     let notebook_chars = final_note.chars().count();
@@ -850,7 +950,7 @@ async fn run_auto_dream_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
 ) -> Result<Option<AutoDreamRunResult>, String> {
-    run_auto_dream_once_for_scope(ctx, memory, MemoryScope::Global, None, true).await
+    run_auto_dream_once_for_scope(ctx, memory, MemoryScope::Global, None, true, None).await
 }
 
 pub async fn run_auto_dream_once(
@@ -860,12 +960,51 @@ pub async fn run_auto_dream_once(
     run_auto_dream_once_with_store(ctx, &memory).await
 }
 
+pub async fn run_auto_dream_once_with_project_resolver(
+    ctx: &AutoDreamContext,
+    project_resolver: &ProjectContextResolver,
+) -> Result<Option<AutoDreamRunResult>, String> {
+    let memory = memory_store_for_context(ctx);
+    run_auto_dream_once_for_scope(
+        ctx,
+        &memory,
+        MemoryScope::Global,
+        None,
+        true,
+        Some(project_resolver),
+    )
+    .await
+}
+
 pub async fn run_project_auto_dream_once(
     ctx: &AutoDreamContext,
     project_key: &str,
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let memory = memory_store_for_context(ctx);
     run_project_auto_dream_once_with_store(ctx, &memory, project_key).await
+}
+
+/// Run Project Dream against the first-class Project-home memory layout.
+///
+/// The legacy string-key entrypoint above remains for migration-only callers;
+/// assigned sessions must call this typed entrypoint so new Dream writes cannot
+/// land in a path-hash scope.
+pub async fn run_project_auto_dream_once_for_project(
+    ctx: &AutoDreamContext,
+    project_id: &bamboo_domain::ProjectId,
+) -> Result<Option<AutoDreamRunResult>, String> {
+    let memory = memory_store_for_context(ctx).for_project(project_id);
+    run_project_auto_dream_once_with_store(ctx, &memory, project_id.as_str()).await
+}
+
+pub async fn run_project_auto_dream_once_for_project_with_read_roots(
+    ctx: &AutoDreamContext,
+    project_id: &bamboo_domain::ProjectId,
+    legacy_read_roots: Vec<bamboo_memory::memory_store::LegacyProjectMemoryReadRoot>,
+) -> Result<Option<AutoDreamRunResult>, String> {
+    let memory = memory_store_for_context(ctx)
+        .for_project_with_legacy_read_roots(project_id, legacy_read_roots);
+    run_project_auto_dream_once_with_store(ctx, &memory, project_id.as_str()).await
 }
 
 async fn run_project_auto_dream_once_with_store(
@@ -877,10 +1016,32 @@ async fn run_project_auto_dream_once_with_store(
     if project_key.is_empty() {
         return Err("project Dream generation requires a non-empty project_key".to_string());
     }
-    run_auto_dream_once_for_scope(ctx, memory, MemoryScope::Project, Some(project_key), false).await
+    run_auto_dream_once_for_scope(
+        ctx,
+        memory,
+        MemoryScope::Project,
+        Some(project_key),
+        false,
+        None,
+    )
+    .await
 }
 
 pub fn spawn_auto_dream_task(ctx: AutoDreamContext) {
+    spawn_auto_dream_task_inner(ctx, None);
+}
+
+pub fn spawn_auto_dream_task_with_project_resolver(
+    ctx: AutoDreamContext,
+    project_resolver: ProjectContextResolver,
+) {
+    spawn_auto_dream_task_inner(ctx, Some(project_resolver));
+}
+
+fn spawn_auto_dream_task_inner(
+    ctx: AutoDreamContext,
+    project_resolver: Option<ProjectContextResolver>,
+) {
     tokio::spawn(async move {
         let interval_secs = ctx
             .config
@@ -896,7 +1057,11 @@ pub fn spawn_auto_dream_task(ctx: AutoDreamContext) {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
-            if let Err(error) = run_auto_dream_once(&ctx).await {
+            let result = match project_resolver.as_ref() {
+                Some(resolver) => run_auto_dream_once_with_project_resolver(&ctx, resolver).await,
+                None => run_auto_dream_once(&ctx).await,
+            };
+            if let Err(error) = result {
                 tracing::warn!(
                     target: DREAM_TRACING_TARGET,
                     event = "run_failed",
@@ -919,7 +1084,23 @@ mod tests {
     use futures::stream;
 
     use bamboo_agent_core::storage::Storage;
+    use bamboo_domain::{ProjectId, ProjectResourceSummary, WorkspaceBinding};
     use bamboo_llm::{LLMError, LLMStream};
+
+    struct StaticProjectSource(crate::project_context::ProjectDescriptor);
+
+    #[async_trait]
+    impl crate::project_context::ProjectContextSource for StaticProjectSource {
+        async fn find_project(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<
+            Option<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            Ok((&self.0.id == project_id).then(|| self.0.clone()))
+        }
+    }
 
     fn config_with_memory(memory: bamboo_config::MemoryConfig) -> Config {
         let mut config = Config::default();
@@ -1103,6 +1284,7 @@ mod tests {
 
         let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
+            &context,
             &provider,
             &memory,
             &ledger,
@@ -1114,13 +1296,10 @@ mod tests {
         assert_eq!(writes.memory, 1);
         assert_eq!(writes.ledger, 0);
 
-        let project_key = bamboo_memory::memory_store::project_key_from_path(
-            &temp_dir.path().join("workspace-a"),
-        );
         let results = memory
             .query_scope(
-                MemoryScope::Project,
-                Some(&project_key),
+                MemoryScope::Global,
+                None,
                 Some("terse recap"),
                 None,
                 None,
@@ -1136,12 +1315,256 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(results.matched_count, 1);
         assert_eq!(results.items[0].title, "User prefers terse responses");
+        let legacy_project_key = bamboo_memory::memory_store::project_key_from_path(
+            &temp_dir.path().join("workspace-a"),
+        );
+        assert!(!temp_dir
+            .path()
+            .join("memory/v1/scopes/projects")
+            .join(legacy_project_key)
+            .exists());
 
         let state = memory
             .read_session_state("session-auto")
             .await
             .expect("read session state");
         assert!(state.last_extracted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_dream_does_not_write_candidates_from_malformed_project_session() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let workspace = temp_dir.path().join("workspace-malformed");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let project_id = ProjectId::parse("project-auto-dream-unused").expect("project id");
+        let project_home = temp_dir.path().join("projects").join(project_id.as_str());
+        let resolver = ProjectContextResolver::new(Arc::new(StaticProjectSource(
+            crate::project_context::ProjectDescriptor {
+                id: project_id.clone(),
+                name: "Unused".to_string(),
+                home: project_home.clone(),
+                workspace_bindings: Vec::new(),
+                resources: ProjectResourceSummary {
+                    project_id: project_id.clone(),
+                    resource_revision: 1,
+                    resources: Vec::new(),
+                },
+                memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
+                    primary: project_home.join("memory/v1"),
+                    legacy_aliases: Vec::new(),
+                },
+            },
+        )));
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+            "{\"candidates\":[{\"title\":\"Must not persist\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"MALFORMED PROJECT SESSION MUST NOT WRITE\",\"tags\":[\"secret\"],\"session_id\":\"session-malformed-auto-dream\"}]}".to_string(),
+        ]));
+        let context = AutoDreamContext {
+            session_store,
+            storage: storage.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(config_with_memory(
+                bamboo_config::MemoryConfig {
+                    background_model: Some("fast-model".to_string()),
+                    auto_dream_enabled: true,
+                    ..bamboo_config::MemoryConfig::default()
+                },
+            ))),
+            provider_registry: test_registry(),
+        };
+        let mut session = bamboo_agent_core::Session::new("session-malformed-auto-dream", "model");
+        session.set_project_id_meta("../malformed".to_string());
+        session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "Sensitive malformed session context.",
+            2,
+            80,
+        ));
+        session.add_message(Message::user("Remember this."));
+        storage.save_session(&session).await.expect("save session");
+        let memory = MemoryStore::new(temp_dir.path());
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 1);
+
+        let writes = extract_and_persist_durable_candidates_with_project_resolver(
+            &context,
+            &provider,
+            &memory,
+            &LedgerStore::new(temp_dir.path()),
+            "fast-model",
+            &contexts,
+            Some(&resolver),
+            false,
+        )
+        .await
+        .expect("malformed candidate should be skipped");
+        assert_eq!(writes, ExtractionWrites::default());
+        let global = memory
+            .query_scope(
+                MemoryScope::Global,
+                None,
+                Some("Must not persist"),
+                None,
+                None,
+                None,
+                &bamboo_memory::memory_store::MemoryQueryOptions::default(),
+            )
+            .await
+            .expect("query global");
+        assert_eq!(global.matched_count, 0);
+        let legacy_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+        assert!(!temp_dir
+            .path()
+            .join("memory/v1/scopes/projects")
+            .join(legacy_key)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn assigned_project_extraction_uses_project_home_across_workspace_switches() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let workspace_one = temp_dir.path().join("workspace-one");
+        let workspace_two = temp_dir.path().join("workspace-two");
+        std::fs::create_dir_all(&workspace_one).expect("workspace one");
+        std::fs::create_dir_all(&workspace_two).expect("workspace two");
+        let project_id = ProjectId::parse("project-auto-dream").expect("project id");
+        let project_home = temp_dir.path().join("projects").join(project_id.as_str());
+        let memory_root = project_home.join("memory/v1");
+        let resolver = ProjectContextResolver::new(Arc::new(StaticProjectSource(
+            crate::project_context::ProjectDescriptor {
+                id: project_id.clone(),
+                name: "Auto Dream".to_string(),
+                home: project_home.clone(),
+                workspace_bindings: vec![
+                    WorkspaceBinding {
+                        path: workspace_one.to_string_lossy().into_owned(),
+                        label: None,
+                        git_common_dir: None,
+                    },
+                    WorkspaceBinding {
+                        path: workspace_two.to_string_lossy().into_owned(),
+                        label: None,
+                        git_common_dir: None,
+                    },
+                ],
+                resources: ProjectResourceSummary {
+                    project_id: project_id.clone(),
+                    resource_revision: 1,
+                    resources: Vec::new(),
+                },
+                memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
+                    primary: memory_root.clone(),
+                    legacy_aliases: Vec::new(),
+                },
+            },
+        )));
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+            "{\"candidates\":[{\"title\":\"First Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The first stable Project fact.\",\"tags\":[\"project\"],\"session_id\":\"session-assigned\"}]}".to_string(),
+            "{\"candidates\":[{\"title\":\"Second Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The second stable Project fact after switching workspaces.\",\"tags\":[\"project\"],\"session_id\":\"session-assigned\"}]}".to_string(),
+        ]));
+        let context = AutoDreamContext {
+            session_store,
+            storage: storage.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(config_with_memory(
+                bamboo_config::MemoryConfig {
+                    background_model: Some("fast-model".to_string()),
+                    auto_dream_enabled: true,
+                    ..bamboo_config::MemoryConfig::default()
+                },
+            ))),
+            provider_registry: test_registry(),
+        };
+        let base_memory = MemoryStore::new(temp_dir.path());
+        let ledger = LedgerStore::new(temp_dir.path());
+        let mut session = bamboo_agent_core::Session::new("session-assigned", "model");
+        session.set_project_id_meta(project_id.to_string());
+        session.set_workspace_path_meta(workspace_one.to_string_lossy().into_owned());
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "Stable Project facts.",
+            2,
+            80,
+        ));
+        session.add_message(Message::user("Remember this for the Project."));
+        storage.save_session(&session).await.expect("save session");
+        base_memory
+            .write_session_topic("session-assigned", "default", "Project fact source.")
+            .await
+            .expect("write session topic");
+
+        for workspace in [&workspace_one, &workspace_two] {
+            session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+            storage
+                .save_session(&session)
+                .await
+                .expect("save switched session");
+            let contexts = collect_candidate_session_contexts(
+                &context,
+                &base_memory,
+                Utc::now() - chrono::Duration::hours(24),
+            )
+            .await;
+            let writes = extract_and_persist_durable_candidates_with_project_resolver(
+                &context,
+                &provider,
+                &base_memory,
+                &ledger,
+                "fast-model",
+                &contexts,
+                Some(&resolver),
+                false,
+            )
+            .await
+            .expect("Project extraction");
+            assert_eq!(writes.memory, 1);
+        }
+
+        let project_memory = base_memory.for_project(&project_id);
+        let results = project_memory
+            .query_scope(
+                MemoryScope::Project,
+                Some(project_id.as_str()),
+                Some("Project fact"),
+                None,
+                None,
+                None,
+                &bamboo_memory::memory_store::MemoryQueryOptions::default(),
+            )
+            .await
+            .expect("query Project memory");
+        assert_eq!(results.matched_count, 2);
+        assert!(memory_root.join("topics").is_dir());
+        assert!(!temp_dir
+            .path()
+            .join("memory/v1/scopes/projects")
+            .join(project_id.as_str())
+            .exists());
+        for workspace in [&workspace_one, &workspace_two] {
+            let legacy_key = bamboo_memory::memory_store::project_key_from_path(workspace);
+            assert!(!temp_dir
+                .path()
+                .join("memory/v1/scopes/projects")
+                .join(legacy_key)
+                .exists());
+        }
     }
 
     #[tokio::test]
@@ -1195,6 +1618,7 @@ mod tests {
         .await;
         let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
+            &context,
             &context.provider,
             &memory,
             &ledger,
@@ -1285,13 +1709,10 @@ mod tests {
         assert!(dream.contains("Bamboo Dream Notebook"));
         assert!(dream.contains("Durable signal found"));
 
-        let project_key = bamboo_memory::memory_store::project_key_from_path(
-            &temp_dir.path().join("workspace-run"),
-        );
         let results = memory
             .query_scope(
-                MemoryScope::Project,
-                Some(&project_key),
+                MemoryScope::Global,
+                None,
                 Some("concise answers"),
                 None,
                 None,
@@ -1548,6 +1969,7 @@ mod tests {
 
         let mut session_a = bamboo_agent_core::Session::new("session-project-a", "model");
         session_a.title = "Project A session".to_string();
+        session_a.set_project_id_meta(project_key_a.clone());
         session_a.metadata.insert(
             "workspace_path".to_string(),
             workspace_a.to_string_lossy().to_string(),
@@ -1749,6 +2171,7 @@ mod tests {
 
         let mut session = bamboo_agent_core::Session::new("session-manual-project-dream", "model");
         session.title = "Manual project dream session".to_string();
+        session.set_project_id_meta(project_key.clone());
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
@@ -1828,6 +2251,7 @@ mod tests {
 
         let mut session = bamboo_agent_core::Session::new("session-grounded-mode", "model");
         session.title = "Grounded mode test".to_string();
+        session.set_project_id_meta(project_key.clone());
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
@@ -1937,6 +2361,7 @@ mod tests {
 
         let mut session = bamboo_agent_core::Session::new("session-rebuild-mode", "model");
         session.title = "Rebuild mode test".to_string();
+        session.set_project_id_meta(project_key.clone());
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),

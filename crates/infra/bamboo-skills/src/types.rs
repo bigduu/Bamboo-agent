@@ -74,11 +74,15 @@ impl SkillDefinition {
 pub struct SkillStoreConfig {
     /// Global skills directory (for example: `${BAMBOO_DATA_DIR}/skills`).
     pub skills_dir: std::path::PathBuf,
-    /// Optional workspace root used for project-local skills discovery.
+    /// Optional workspace root used for workspace-local skills discovery.
     ///
     /// When set, Bamboo also discovers skills from:
     /// - `<project_dir>/.bamboo/skills`
     /// - `<project_dir>/.bamboo/skills-<active_mode>` (when `active_mode` is set)
+    ///
+    /// This compatibility field predates first-class Project identity. It is a
+    /// workspace overlay, not the stable Project home. New callers should use
+    /// `SkillManager::store_for_project_workspace`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<std::path::PathBuf>,
     /// Optional active mode slug for mode-specific skill overrides.

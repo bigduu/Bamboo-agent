@@ -238,6 +238,28 @@ pub(crate) fn build_external_memory_context_block(session: &Session) -> Option<C
     ))
 }
 
+/// Per-round redacted Project resource inventory.
+///
+/// This intentionally rides the volatile tail instead of the system field:
+/// watcher-driven `resource_revision` changes must not invalidate the
+/// cacheable Project identity prefix.
+pub(crate) fn build_project_resources_context_block(session: &Session) -> Option<ContextBlock> {
+    let content = session
+        .metadata
+        .get(crate::project_context::PROJECT_RESOURCES_RENDERED_KEY)?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(ContextBlock::new(
+        ContextBlockType::ProjectResources,
+        ContextBlockPriority::Medium,
+        ContextBlockStability::RoundDynamic,
+        "Project Shared Resources (redacted)",
+        trimmed,
+    ))
+}
+
 pub(crate) fn build_conversation_summary_context_block(session: &Session) -> Option<ContextBlock> {
     let summary = session.conversation_summary.as_ref()?;
     let trimmed = summary.content.trim();
@@ -346,6 +368,22 @@ mod tests {
         assert!(block.content.contains("Session note body"));
         // No external memory field → no block.
         assert!(build_external_memory_context_block(&Session::new("s2", "model")).is_none());
+    }
+
+    #[test]
+    fn project_resources_context_block_is_round_dynamic_and_redacted() {
+        let mut session = Session::new("project-resources", "model");
+        session.metadata.insert(
+            crate::project_context::PROJECT_RESOURCES_RENDERED_KEY.to_string(),
+            "Project ID: project-1\nResource revision: 3\n- Skills: status=available, items=2"
+                .to_string(),
+        );
+        let block =
+            build_project_resources_context_block(&session).expect("project resource block");
+        assert_eq!(block.block_type, ContextBlockType::ProjectResources);
+        assert_eq!(block.stability, ContextBlockStability::RoundDynamic);
+        assert!(block.content.contains("Resource revision: 3"));
+        assert!(!block.content.contains("secret"));
     }
 
     #[test]

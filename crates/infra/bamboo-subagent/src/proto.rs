@@ -3,6 +3,7 @@
 //! The session/event payloads are kept opaque (`serde_json::Value`) so this crate stays a leaf;
 //! the real `AgentEvent` serializes into [`ChildFrame::Event`] verbatim (design §6, zero mapping).
 
+use bamboo_domain::ProjectId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,10 @@ pub struct AgentRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub assignment: String,
+    /// Stable Project identity inherited from the parent session. The typed
+    /// wire value rejects unsafe/invalid identifiers during deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Effective permission policy captured by the host at this activation
@@ -184,6 +189,7 @@ mod tests {
         for f in [
             ParentFrame::Run(RunSpec {
                 assignment: "do x".into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
@@ -241,6 +247,7 @@ mod tests {
     fn run_frame_tag_is_stable() {
         let f = ParentFrame::Run(RunSpec {
             assignment: "a".into(),
+            project_id: None,
             reasoning_effort: Some("high".into()),
             permission_policy: None,
             messages: Vec::new(),
@@ -266,6 +273,7 @@ mod tests {
 
         let frame = ParentFrame::Run(RunSpec {
             assignment: "a".into(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
@@ -289,6 +297,7 @@ mod tests {
         };
         let frame = ParentFrame::Run(RunSpec {
             assignment: "work".into(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: Some(context.clone()),
             messages: Vec::new(),
@@ -313,5 +322,29 @@ mod tests {
             }
             other => panic!("expected run frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_frame_round_trips_typed_project_identity() {
+        let frame = ParentFrame::Run(RunSpec {
+            assignment: "work".into(),
+            project_id: Some(ProjectId::parse("project-1").unwrap()),
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: Vec::new(),
+            secrets: Default::default(),
+        });
+
+        let decoded = ParentFrame::from_text(&frame.to_text()).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn run_frame_rejects_unsafe_project_identity() {
+        let error =
+            ParentFrame::from_text(r#"{"kind":"run","assignment":"x","project_id":"../other"}"#)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("invalid project id"));
     }
 }

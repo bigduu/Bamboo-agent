@@ -106,6 +106,8 @@ struct TestHarness {
     child_session_id: String,
     parent_rx: broadcast::Receiver<AgentEvent>,
     notification_service: Arc<bamboo_notification::NotificationService>,
+    project_store: Arc<bamboo_projects::ProjectStore>,
+    workspace_path: PathBuf,
 }
 
 async fn build_test_harness() -> TestHarness {
@@ -117,8 +119,13 @@ async fn build_test_harness_with_resolver(
 ) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
+    let workspace_path = bamboo_home.join("workspace");
+    tokio::fs::create_dir_all(&workspace_path).await.unwrap();
+    let workspace_path = tokio::fs::canonicalize(workspace_path).await.unwrap();
 
     let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
+    let project_store =
+        Arc::new(bamboo_projects::ProjectStore::open(&bamboo_home).expect("Project store"));
     let storage_dir = bamboo_home.join("storage");
     tokio::fs::create_dir_all(&storage_dir).await.unwrap();
     let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
@@ -216,6 +223,7 @@ async fn build_test_harness_with_resolver(
         session_event_senders,
         subagent_model_resolver,
         config: Arc::new(RwLock::new(bamboo_llm::Config::default())),
+        project_store: Some(project_store.clone()),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
         notification_relay: Some(notification_relay_deps),
     });
@@ -230,12 +238,185 @@ async fn build_test_harness_with_resolver(
         child_session_id,
         parent_rx,
         notification_service,
+        project_store,
+        workspace_path,
     }
 }
 
 // -----------------------------------------------------------------------
 // ④ Batched parent-wait registration
 // -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn child_resident_and_guardian_reject_cross_project_workspace_without_side_effects() {
+    let harness = build_test_harness().await;
+    let workspace = tempfile::tempdir().expect("workspace");
+    let parent_project = harness
+        .project_store
+        .create("Parent Project", None)
+        .expect("Parent Project");
+    let _workspace_owner = harness
+        .project_store
+        .create_with_bindings(
+            "Workspace Owner",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("Workspace Owner");
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("load parent")
+        .expect("parent");
+    parent.set_project_id_meta(parent_project.id.to_string());
+    harness
+        .storage
+        .save_session(&parent)
+        .await
+        .expect("save parent");
+
+    for (role, lifecycle, resident_name) in [
+        ("explorer", None, None),
+        ("resident", Some("resident"), Some("stable")),
+        ("guardian", None, None),
+    ] {
+        let child_id = format!("cross-project-{role}");
+        let error = child_session::create_child_action(
+            harness.adapter.as_ref(),
+            child_session::CreateChildInput {
+                parent_session: parent.clone(),
+                child_id: child_id.clone(),
+                title: format!("{role} child"),
+                responsibility: "Inspect".to_string(),
+                assignment_prompt: "Inspect".to_string(),
+                subagent_type: role.to_string(),
+                workspace: workspace.path().to_string_lossy().into_owned(),
+                model_override: None,
+                model_ref_override: None,
+                runtime_metadata: HashMap::new(),
+                auto_run: false,
+                reasoning_effort: None,
+                lifecycle: lifecycle.map(str::to_string),
+                resident_name: resident_name.map(str::to_string),
+                resident_context: None,
+                disabled_tools: None,
+                context_fork: None,
+            },
+        )
+        .await
+        .expect_err("cross-Project child workspace must fail closed");
+        assert!(error.to_string().contains("belongs to Project"));
+        assert!(
+            harness
+                .storage
+                .load_session(&child_id)
+                .await
+                .expect("load child")
+                .is_none(),
+            "{role} conflict must not persist a child"
+        );
+        assert!(
+            harness
+                .adapter
+                .session_store
+                .get_index_entry(&child_id)
+                .await
+                .is_none(),
+            "{role} conflict must not index a child"
+        );
+        assert!(
+            bamboo_agent_core::workspace_state::get_workspace(&child_id).is_none(),
+            "{role} conflict must not mutate runtime workspace state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unassigned_child_rejects_stale_bound_workspace_without_persistence() {
+    let harness = build_test_harness().await;
+    let stale_workspace = tempfile::tempdir().expect("stale workspace");
+    let stale_path = stale_workspace.path().to_path_buf();
+    harness
+        .project_store
+        .create_with_bindings(
+            "Former Workspace Owner",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: stale_path.to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("bind workspace while it exists");
+    stale_workspace.close().expect("remove bound workspace");
+    assert!(!stale_path.exists());
+
+    let index_before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    let cache_len_before = harness.adapter.sessions_cache.len();
+    let runners_before = harness.agent_runners.read().await.len();
+    let parent_before = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("load parent")
+        .expect("parent");
+
+    let error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "title": "Must not be created",
+            "responsibility": "Inspect",
+            "prompt": "Inspect the stale workspace.",
+            "workspace": stale_path,
+            "auto_run": false
+        }),
+        ctx_for(&harness.parent_session_id, "stale-workspace").to_tool_ctx(),
+    )
+    .await
+    .expect_err("server adapter must always use authoritative workspace validation");
+    assert!(
+        matches!(error, ToolError::InvalidArguments(ref message) if message.contains("does not exist"))
+    );
+
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        index_before,
+        "rejected child must not be indexed"
+    );
+    assert_eq!(harness.adapter.sessions_cache.len(), cache_len_before);
+    assert_eq!(harness.agent_runners.read().await.len(), runners_before);
+    let parent_after = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("reload parent")
+        .expect("parent");
+    assert_eq!(
+        serde_json::to_value(parent_after).expect("parent after JSON"),
+        serde_json::to_value(parent_before).expect("parent before JSON"),
+        "rejected child must not mutate or persist its parent"
+    );
+}
 
 #[tokio::test]
 async fn concurrent_parent_wait_registrations_all_land_in_wait_set() {
@@ -389,7 +570,7 @@ async fn create_without_subagent_type_defaults_to_worker_label() {
             "title": "No Label Child",
             "responsibility": "Do work",
             "prompt": "Do the work",
-            "workspace": "/tmp/ws"
+            "workspace": harness.workspace_path.to_string_lossy()
             // subagent_type intentionally omitted
         }),
         ctx_for(&harness.parent_session_id, "tc_no_label").to_tool_ctx(),
@@ -417,7 +598,7 @@ async fn create_refused_at_max_spawn_depth() {
 
     let err = invoke_completed(
         &harness.tool,
-            json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":"/tmp/ws"}),
+            json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":harness.workspace_path.to_string_lossy()}),
             ctx_for(&harness.parent_session_id, "tc_depth_cap").to_tool_ctx(),
         )
         .await
@@ -443,7 +624,7 @@ async fn create_allowed_just_below_max_spawn_depth() {
 
     let result = invoke_completed(
         &harness.tool,
-            json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":"/tmp/ws"}),
+            json!({"action":"create","title":"X","responsibility":"Y","prompt":"Z","workspace":harness.workspace_path.to_string_lossy()}),
             ctx_for(&harness.parent_session_id, "tc_depth_ok").to_tool_ctx(),
         )
         .await;
@@ -464,7 +645,7 @@ async fn create_with_wait_true_suspends_and_registers_wait() {
             "responsibility": "Do one thing",
             "prompt": "Do it",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/ws",
+            "workspace": harness.workspace_path.to_string_lossy(),
             "wait": true
         }),
         ctx_for(&harness.parent_session_id, "tc_create_wait").to_tool_ctx(),
@@ -597,7 +778,7 @@ async fn create_requires_session_id_in_tool_context() {
             "responsibility": "do something",
             "prompt": "do something",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/test-workspace"
+            "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolCtx::none("tool_call"),
     )
@@ -624,7 +805,7 @@ async fn create_emits_sub_agent_started_event_after_queueing() {
             "responsibility": "Investigate one module",
             "prompt": "Read module and summarize",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/test-workspace"
+            "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
@@ -693,7 +874,7 @@ async fn create_uses_async_subagent_model_resolver() {
             "responsibility": "Implement a focused change",
             "prompt": "Patch one file",
             "subagent_type": "coder",
-            "workspace": "/tmp/test-workspace",
+            "workspace": harness.workspace_path.to_string_lossy(),
             "auto_run": false
         }),
         ToolExecutionContext {
@@ -741,6 +922,7 @@ async fn create_uses_async_subagent_model_resolver() {
 #[tokio::test]
 async fn resident_create_reuses_same_child_session() {
     let harness = build_test_harness().await;
+    let workspace = tempfile::tempdir().expect("workspace");
     let ctx = |tcid: &'static str| ToolExecutionContext {
         session_id: Some(harness.parent_session_id.as_str()),
         tool_call_id: tcid,
@@ -759,7 +941,7 @@ async fn resident_create_reuses_same_child_session() {
             "title": name_task,
             "responsibility": "Write a short essay",
             "prompt": prompt,
-            "workspace": "/tmp/test-workspace",
+            "workspace": workspace.path(),
             "auto_run": false
         })
     };
@@ -834,7 +1016,7 @@ async fn resident_create_reuses_same_child_session() {
             "title": "OneShot",
             "responsibility": "Independent task",
             "prompt": "Do something unrelated.",
-            "workspace": "/tmp/test-workspace",
+            "workspace": workspace.path(),
             "auto_run": false
         }),
         ctx("tc3").to_tool_ctx(),
@@ -850,6 +1032,385 @@ async fn resident_create_reuses_same_child_session() {
 }
 
 #[tokio::test]
+async fn resident_reuse_rejects_cross_project_workspace_before_mutating_resident() {
+    let harness = build_test_harness().await;
+    let workspace_a = tempfile::tempdir().expect("workspace A");
+    let workspace_b = tempfile::tempdir().expect("workspace B");
+    let project_a = harness
+        .project_store
+        .create_with_bindings(
+            "Project A",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace_a.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("Project A");
+    let project_b = harness
+        .project_store
+        .create_with_bindings(
+            "Project B",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace_b.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("Project B");
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("load parent")
+        .expect("parent");
+    parent.set_project_id_meta(project_a.id.to_string());
+    parent.set_workspace_path_meta(workspace_a.path().to_string_lossy().into_owned());
+    harness
+        .storage
+        .save_session(&parent)
+        .await
+        .expect("save parent");
+    let ctx = |tool_call_id: &'static str| {
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx()
+    };
+    let create_args = |workspace: &std::path::Path, title: &str| {
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "stable-reviewer",
+            "title": title,
+            "responsibility": "Review safely",
+            "prompt": "Inspect the assigned workspace.",
+            "workspace": workspace,
+            "auto_run": false
+        })
+    };
+
+    let created = invoke_completed(
+        &harness.tool,
+        create_args(workspace_a.path(), "Initial review"),
+        ctx("resident-create"),
+    )
+    .await
+    .expect("create resident in Project A");
+    let created: serde_json::Value = serde_json::from_str(&created.result).unwrap();
+    let resident_id = created["child_session_id"]
+        .as_str()
+        .expect("resident id")
+        .to_string();
+    let resident_before = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .expect("load resident")
+        .expect("resident");
+    harness
+        .adapter
+        .session_store
+        .save_session(&resident_before)
+        .await
+        .expect("index resident");
+    let runtime_before = bamboo_agent_core::workspace_state::get_workspace(&resident_id);
+
+    let error = invoke_completed(
+        &harness.tool,
+        create_args(workspace_b.path(), "Must not replace title"),
+        ctx("resident-reuse-conflict"),
+    )
+    .await
+    .expect_err("resident reuse must validate workspace before lookup/mutation");
+    assert!(
+        matches!(error, ToolError::InvalidArguments(ref message) if message.contains("belongs to Project"))
+    );
+    let resident_after = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .expect("reload resident")
+        .expect("resident");
+    assert_eq!(resident_after.title, resident_before.title);
+    assert_eq!(
+        serde_json::to_value(&resident_after.messages).expect("after messages JSON"),
+        serde_json::to_value(&resident_before.messages).expect("before messages JSON")
+    );
+    assert_eq!(resident_after.metadata, resident_before.metadata);
+    assert_eq!(
+        resident_after.metadata_version,
+        resident_before.metadata_version
+    );
+    assert_eq!(
+        bamboo_engine::project_context::ProjectContextResolver::project_id_from_session(
+            &resident_after
+        )
+        .as_ref(),
+        Some(&project_a.id)
+    );
+    assert_ne!(
+        bamboo_engine::project_context::ProjectContextResolver::project_id_from_session(
+            &resident_after
+        )
+        .as_ref(),
+        Some(&project_b.id)
+    );
+    assert_eq!(
+        bamboo_agent_core::workspace_state::get_workspace(&resident_id),
+        runtime_before
+    );
+}
+
+#[tokio::test]
+async fn resident_reuse_rejects_stale_project_after_root_reassignment_without_mutation() {
+    let harness = build_test_harness().await;
+    let workspace_a = tempfile::tempdir().expect("workspace A");
+    let workspace_b = tempfile::tempdir().expect("workspace B");
+    let project_a = harness
+        .project_store
+        .create_with_bindings(
+            "Project A",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace_a.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("Project A");
+    let project_b = harness
+        .project_store
+        .create_with_bindings(
+            "Project B",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace_b.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("Project B");
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.set_project_id_meta(project_a.id.to_string());
+    parent.set_workspace_path_meta(workspace_a.path().to_string_lossy().into_owned());
+    parent.workspace = Some(workspace_a.path().to_string_lossy().into_owned());
+    harness.storage.save_session(&parent).await.unwrap();
+    let context = |tool_call_id: &'static str| {
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx()
+    };
+    let args = |workspace: &std::path::Path, title: &str| {
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "project-stable-resident",
+            "title": title,
+            "responsibility": "Stay inside the parent Project",
+            "prompt": "Inspect the workspace.",
+            "workspace": workspace,
+            "auto_run": false
+        })
+    };
+
+    let created = invoke_completed(
+        &harness.tool,
+        args(workspace_a.path(), "Project A resident"),
+        context("resident-project-a"),
+    )
+    .await
+    .expect("create Project A resident");
+    let created: serde_json::Value = serde_json::from_str(&created.result).unwrap();
+    let resident_id = created["child_session_id"].as_str().unwrap().to_string();
+    let before = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .session_store
+        .save_session(&before)
+        .await
+        .expect("index resident");
+    let runtime_before = bamboo_agent_core::workspace_state::peek_workspace(&resident_id);
+
+    parent.set_project_id_meta(project_b.id.to_string());
+    parent.set_workspace_path_meta(workspace_b.path().to_string_lossy().into_owned());
+    parent.workspace = Some(workspace_b.path().to_string_lossy().into_owned());
+    harness.storage.save_session(&parent).await.unwrap();
+
+    let error = invoke_completed(
+        &harness.tool,
+        args(workspace_b.path(), "Must not cross Project"),
+        context("resident-project-b"),
+    )
+    .await
+    .expect_err("stale resident must not be silently reassigned");
+    assert!(
+        matches!(error, ToolError::InvalidArguments(ref message) if message.contains("resident_project_scope_conflict"))
+    );
+    let after = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    assert_eq!(
+        bamboo_agent_core::workspace_state::peek_workspace(&resident_id),
+        runtime_before
+    );
+}
+
+#[tokio::test]
+async fn same_project_resident_reuse_persists_and_publishes_changed_workspace() {
+    let harness = build_test_harness().await;
+    let workspace_a = tempfile::tempdir().expect("workspace A");
+    let workspace_b = tempfile::tempdir().expect("workspace B");
+    let project = harness
+        .project_store
+        .create_with_bindings(
+            "Shared Project",
+            None,
+            vec![
+                bamboo_domain::WorkspaceBinding {
+                    path: workspace_a.path().to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                },
+                bamboo_domain::WorkspaceBinding {
+                    path: workspace_b.path().to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                },
+            ],
+        )
+        .expect("Project");
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.set_project_id_meta(project.id.to_string());
+    parent.set_workspace_path_meta(workspace_a.path().to_string_lossy().into_owned());
+    parent.workspace = Some(workspace_a.path().to_string_lossy().into_owned());
+    harness.storage.save_session(&parent).await.unwrap();
+    let context = |tool_call_id: &'static str| {
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx()
+    };
+    let args = |workspace: &std::path::Path, title: &str| {
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "workspace-switcher",
+            "title": title,
+            "responsibility": "Inspect a Project workspace",
+            "prompt": "Inspect the requested workspace.",
+            "workspace": workspace,
+            "auto_run": false
+        })
+    };
+
+    let created = invoke_completed(
+        &harness.tool,
+        args(workspace_a.path(), "Workspace A"),
+        context("resident-workspace-a"),
+    )
+    .await
+    .expect("create resident");
+    let created: serde_json::Value = serde_json::from_str(&created.result).unwrap();
+    let resident_id = created["child_session_id"].as_str().unwrap().to_string();
+    let initial = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .session_store
+        .save_session(&initial)
+        .await
+        .expect("index resident");
+
+    let reused = invoke_completed(
+        &harness.tool,
+        args(workspace_b.path(), "Workspace B"),
+        context("resident-workspace-b"),
+    )
+    .await
+    .expect("reuse resident");
+    let reused: serde_json::Value = serde_json::from_str(&reused.result).unwrap();
+    assert_eq!(reused["child_session_id"], resident_id);
+    assert_eq!(reused["reused"], true);
+
+    let child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace_b = workspace_b.path().canonicalize().unwrap();
+    let workspace_b_display = bamboo_config::paths::path_to_display_string(&workspace_b);
+    assert_eq!(
+        child.workspace.as_deref(),
+        Some(workspace_b_display.as_str())
+    );
+    assert_eq!(
+        child.workspace_path_meta().as_deref(),
+        Some(workspace_b_display.as_str())
+    );
+    assert_eq!(
+        bamboo_agent_core::workspace_state::peek_workspace(&resident_id).as_deref(),
+        Some(workspace_b.as_path())
+    );
+    assert_eq!(
+        bamboo_engine::project_context::ProjectContextResolver::project_id_from_session(&child)
+            .as_ref(),
+        Some(&project.id)
+    );
+}
+
+#[tokio::test]
 async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create() {
     let harness = build_test_harness().await;
 
@@ -860,7 +1421,7 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
             "responsibility": "Test backward compat",
             "prompt": "Do something",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/test-workspace"
+            "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
@@ -1322,7 +1883,7 @@ async fn create_returns_duration_hint() {
             "responsibility": "Do something",
             "prompt": "Do something useful",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/test-workspace"
+            "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
@@ -1372,7 +1933,7 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
             "responsibility": "Investigate hard problem",
             "prompt": "Think carefully step by step",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/test-workspace",
+            "workspace": harness.workspace_path.to_string_lossy(),
             "auto_run": false,
             "reasoning_effort": "high"
         }),
@@ -1428,7 +1989,7 @@ async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
             "responsibility": "Quick lookup",
             "prompt": "Read a file and summarise",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/test-workspace",
+            "workspace": harness.workspace_path.to_string_lossy(),
             "auto_run": false
         }),
         ToolExecutionContext {
@@ -1607,7 +2168,7 @@ async fn create_sets_child_workspace() {
             "responsibility": "Test workspace propagation",
             "prompt": "Do something",
             "subagent_type": "general-purpose",
-            "workspace": "/tmp/test-workspace",
+            "workspace": harness.workspace_path.to_string_lossy(),
             "auto_run": false
         }),
         ToolExecutionContext {
@@ -1640,7 +2201,7 @@ async fn create_sets_child_workspace() {
         .expect("child session should exist");
     assert_eq!(
         child.workspace,
-        Some("/tmp/test-workspace".to_string()),
+        Some(harness.workspace_path.to_string_lossy().into_owned()),
         "child workspace should be set from create args"
     );
 }

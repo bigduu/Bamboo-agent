@@ -54,6 +54,18 @@ fn build_memory_tool(data_dir: &std::path::Path) -> MemoryTool {
     MemoryTool::new(session_repo, data_dir)
 }
 
+async fn build_memory_tool_with_session(
+    data_dir: &std::path::Path,
+    session: Session,
+) -> MemoryTool {
+    let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    storage.save_session(&session).await.expect("save session");
+    let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
+    let session_repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
+    MemoryTool::new(session_repo, data_dir)
+}
+
 #[tokio::test]
 async fn memory_session_actions_share_read_shape_and_limits() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -237,11 +249,10 @@ async fn query_action_filters_by_granularity() {
     tool.invoke(
         json!({
             "action": "write",
-            "scope": "project",
+            "scope": "global",
             "type": "project",
             "title": "This week's sprint priorities",
             "content": "Ship the granularity filter end to end.",
-            "project_key": "proj-1",
             "granularity": "week"
         }),
         test_context("session-granularity"),
@@ -251,11 +262,10 @@ async fn query_action_filters_by_granularity() {
     tool.invoke(
         json!({
             "action": "write",
-            "scope": "project",
+            "scope": "global",
             "type": "project",
             "title": "Long-term architecture direction",
             "content": "Move to a modular workspace layout over the year.",
-            "project_key": "proj-1",
             "granularity": "year"
         }),
         test_context("session-granularity"),
@@ -267,8 +277,7 @@ async fn query_action_filters_by_granularity() {
         .invoke(
             json!({
                 "action": "query",
-                "scope": "project",
-                "project_key": "proj-1",
+                "scope": "global",
                 "filters": {"granularity": ["week"]}
             }),
             test_context("session-granularity"),
@@ -296,8 +305,7 @@ async fn query_action_filters_by_granularity() {
         .invoke(
             json!({
                 "action": "query",
-                "scope": "project",
-                "project_key": "proj-1"
+                "scope": "global"
             }),
             test_context("session-granularity"),
         )
@@ -308,4 +316,50 @@ async fn query_action_filters_by_granularity() {
     };
     let value: serde_json::Value = serde_json::from_str(&result.result).expect("valid json");
     assert_eq!(value["data"]["matched_count"], 2);
+}
+
+#[tokio::test]
+async fn malformed_project_identity_cannot_read_path_derived_legacy_memory() {
+    let dir = tempfile::tempdir().expect("memory dir");
+    let workspace = tempfile::tempdir().expect("legacy workspace");
+    let legacy_key = bamboo_memory::memory_store::project_key_from_path(workspace.path());
+    let store = MemoryStore::new(dir.path());
+    store
+        .write_memory(
+            MemoryScope::Project,
+            Some(&legacy_key),
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Legacy secret",
+            "MUST NOT LEAK THROUGH MALFORMED PROJECT ID",
+            &[],
+            Some("seed-session"),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .expect("seed legacy memory");
+    let mut session = Session::new("malformed-project-memory-tool", "model");
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    session.set_project_id_meta("../malformed".to_string());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+
+    let error = tool
+        .invoke(
+            json!({
+                "action": "query",
+                "scope": "project",
+                "project_key": legacy_key,
+                "query": "Legacy secret"
+            }),
+            test_context("malformed-project-memory-tool"),
+        )
+        .await
+        .expect_err("malformed Project identity must fail before legacy lookup");
+    assert!(
+        matches!(error, ToolError::InvalidArguments(ref message) if message.contains("invalid Project identity"))
+    );
+    assert!(!error
+        .to_string()
+        .contains("MUST NOT LEAK THROUGH MALFORMED PROJECT ID"));
 }

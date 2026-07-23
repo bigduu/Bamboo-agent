@@ -111,6 +111,9 @@ const CHAT_PLACEHOLDER: &str = "Type a message... (Enter send · Alt+Enter newli
 
 pub struct ChatState {
     pub session_id: Option<String>,
+    /// Project inherited from the opened/selected session and propagated when
+    /// Ctrl+N creates a new root session.
+    pub project_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub textarea: TextArea<'static>,
     pub scroll_offset: u16,
@@ -143,6 +146,7 @@ impl ChatState {
         textarea.set_placeholder_text(CHAT_PLACEHOLDER);
         Self {
             session_id: None,
+            project_id: None,
             messages: Vec::new(),
             textarea,
             scroll_offset: 0,
@@ -168,6 +172,7 @@ impl ChatState {
 pub struct OpenedSession {
     pub messages: Vec<ChatMessage>,
     pub model: String,
+    pub project_id: Option<String>,
     pub is_running: bool,
     pub pending: Option<PendingQuestion>,
     /// The server dropped older messages to stay under its cold-fetch cap.
@@ -919,6 +924,7 @@ impl App {
                     // in-flight-turn state from a prior chat.
                     self.chat.session_id = Some(session_id.clone());
                     self.chat.model = opened.model;
+                    self.chat.project_id = opened.project_id;
                     self.chat.current_response.clear();
                     self.chat.current_tool_calls.clear();
                     self.chat.current_reasoning.clear();
@@ -1843,10 +1849,12 @@ impl App {
 
         let client = self.client.clone();
         let existing_session = self.chat.session_id.clone();
+        let project_id = self.chat.project_id.clone();
         tokio::spawn(async move {
             let req = ChatRequest {
                 message,
                 session_id: existing_session,
+                project_id,
                 model: Some(model),
             };
             let result = client
@@ -1949,6 +1957,7 @@ impl App {
             let opened = OpenedSession {
                 messages: map_history(history.messages),
                 model: summary.model,
+                project_id: summary.project_id,
                 is_running: summary.is_running,
                 pending,
                 truncated: history.truncated,
@@ -1961,8 +1970,9 @@ impl App {
         });
     }
 
-    /// `Ctrl+N`: start a fresh session. Keeps the current model (the operator
-    /// picked it for a reason) but drops everything session-scoped.
+    /// `Ctrl+N`: start a fresh session. Keeps the current model and Project
+    /// membership (the operator picked both deliberately) while dropping
+    /// per-session conversation state.
     fn new_session(&mut self) {
         self.chat.session_id = None;
         self.chat.messages.clear();
@@ -2486,6 +2496,11 @@ impl App {
                     },
                     enabled: true,
                     run_config: ScheduleRunConfigReq {
+                        project_id: self
+                            .sessions
+                            .sessions
+                            .get(self.sessions.selected)
+                            .and_then(|session| session.project_id.clone()),
                         task_message: Some(form.prompt.trim().to_string()),
                         auto_execute: true,
                     },
@@ -3062,6 +3077,7 @@ mod question_tests {
     fn bare_session(id: &str) -> SessionSummary {
         SessionSummary {
             id: id.into(),
+            project_id: None,
             title: String::new(),
             model: String::new(),
             is_running: false,
@@ -3562,6 +3578,7 @@ mod question_tests {
         OpenedSession {
             messages,
             model: "claude-sonnet-5".to_string(),
+            project_id: None,
             is_running: false,
             pending: None,
             truncated: false,
@@ -3707,12 +3724,14 @@ mod question_tests {
         assert_eq!(last.level, NoticeLevel::Error);
     }
 
-    /// `Ctrl+N` clears every session-scoped field but keeps the model.
+    /// `Ctrl+N` clears every session-scoped field but keeps the model and
+    /// stable Project membership.
     #[tokio::test]
     async fn ctrl_n_clears_session_but_keeps_model() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("s1".to_string());
         app.chat.model = "claude-sonnet-5".to_string();
+        app.chat.project_id = Some("project-tui".to_string());
         app.chat.messages = vec![asst_msg("leftover")];
         app.chat.current_response = "partial".to_string();
         app.chat.token_usage = Some(TokenUsage {
@@ -3744,6 +3763,11 @@ mod question_tests {
         assert_eq!(
             app.chat.model, "claude-sonnet-5",
             "model must survive a new session"
+        );
+        assert_eq!(
+            app.chat.project_id.as_deref(),
+            Some("project-tui"),
+            "Project membership must survive a new root session"
         );
         assert_eq!(app.status_message, "New session");
     }

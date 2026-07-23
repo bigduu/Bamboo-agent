@@ -163,9 +163,67 @@ pub async fn run_gardener_once(
     run_gardener_once_with_store(ctx, &memory).await
 }
 
+async fn gardener_targets(
+    memory: &MemoryStore,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) -> Vec<(MemoryScope, Option<String>, MemoryStore)> {
+    let mut targets = vec![(MemoryScope::Global, None, memory.clone())];
+    if let Some(resolver) = project_context_resolver {
+        match resolver.list_memory_read_scopes().await {
+            Ok(scopes) => {
+                targets.extend(scopes.into_iter().map(|scope| {
+                    (
+                        MemoryScope::Project,
+                        Some(scope.key().to_string()),
+                        scope.scoped_store(memory),
+                    )
+                }));
+            }
+            Err(error) => tracing::warn!(
+                target: GARDENER_TRACING_TARGET,
+                "failed to resolve first-class Project gardener scopes: {error}"
+            ),
+        }
+    } else {
+        targets.extend(
+            memory
+                .list_project_keys()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|key| (MemoryScope::Project, Some(key), memory.clone())),
+        );
+    }
+    targets
+}
+
+async fn count_gardener_memories(
+    memory: &MemoryStore,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) -> usize {
+    let mut total = 0;
+    for (scope, project_key, target_store) in
+        gardener_targets(memory, project_context_resolver).await
+    {
+        total += target_store
+            .count_scope_memories(scope, project_key.as_deref())
+            .await
+            .unwrap_or(0);
+    }
+    total
+}
+
 async fn run_gardener_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
+) -> Result<Option<GardenerRunResult>, String> {
+    run_gardener_once_with_store_and_resolver(ctx, memory, None).await
+}
+
+async fn run_gardener_once_with_store_and_resolver(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
 ) -> Result<Option<GardenerRunResult>, String> {
     let config_snapshot = ctx.config.read().await.clone();
     let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
@@ -177,22 +235,19 @@ async fn run_gardener_once_with_store(
     let min_sections = memory_cfg.gardener_min_sections;
 
     // Deterministic prefilter across global + every project scope (zero LLM).
-    let mut targets: Vec<(MemoryScope, Option<String>)> = vec![(MemoryScope::Global, None)];
-    for key in memory.list_project_keys().await.unwrap_or_default() {
-        targets.push((MemoryScope::Project, Some(key)));
-    }
+    let targets = gardener_targets(memory, project_context_resolver).await;
 
     let mut result = GardenerRunResult::default();
-    let mut worklist: Vec<(MemoryScope, Option<String>, BlobScanItem)> = Vec::new();
-    for (scope, project_key) in &targets {
-        let report = memory
+    let mut worklist: Vec<(MemoryStore, Option<String>, BlobScanItem)> = Vec::new();
+    for (scope, project_key, target_store) in &targets {
+        let report = target_store
             .scan_blob_candidates(*scope, project_key.as_deref(), min_sections, max_splits)
             .await
             .map_err(|error| format!("gardener scan failed: {error}"))?;
         result.scanned += report.scanned;
         result.flagged += report.flagged;
         for item in report.items {
-            worklist.push((*scope, project_key.clone(), item));
+            worklist.push((target_store.clone(), project_key.clone(), item));
         }
     }
     worklist.sort_by(|left, right| {
@@ -219,15 +274,18 @@ async fn run_gardener_once_with_store(
         return Ok(None);
     };
 
-    for (_scope, project_key, item) in worklist {
+    for (target_store, project_key, item) in worklist {
         let project_key = project_key.as_deref();
-        let Some(doc) = memory
+        let Some(doc) = target_store
             .get_memory(&item.id, project_key)
             .await
             .map_err(|error| format!("gardener get failed: {error}"))?
         else {
             continue;
         };
+        if target_store.is_read_only_project_memory_path(&doc.path) {
+            continue;
+        }
 
         let prompt = build_blob_split_prompt(&doc.frontmatter.title, &doc.body);
         let raw = match collect_model_json(
@@ -258,7 +316,7 @@ async fn run_gardener_once_with_store(
             }
         };
 
-        match memory
+        match target_store
             .split_memory(
                 &item.id,
                 project_key,
@@ -300,6 +358,14 @@ async fn run_dedup_gardener_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
 ) -> Result<Option<DedupGardenerRunResult>, String> {
+    run_dedup_gardener_once_with_store_and_resolver(ctx, memory, None).await
+}
+
+async fn run_dedup_gardener_once_with_store_and_resolver(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) -> Result<Option<DedupGardenerRunResult>, String> {
     let config_snapshot = ctx.config.read().await.clone();
     let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
     if !memory_cfg.dedup_gardener_enabled {
@@ -310,15 +376,12 @@ async fn run_dedup_gardener_once_with_store(
     let min_score = memory_cfg.dedup_gardener_min_score;
 
     // Deterministic prefilter across global + every project scope (zero LLM).
-    let mut targets: Vec<(MemoryScope, Option<String>)> = vec![(MemoryScope::Global, None)];
-    for key in memory.list_project_keys().await.unwrap_or_default() {
-        targets.push((MemoryScope::Project, Some(key)));
-    }
+    let targets = gardener_targets(memory, project_context_resolver).await;
 
     let mut result = DedupGardenerRunResult::default();
-    let mut worklist: Vec<(MemoryScope, Option<String>, DuplicateCluster)> = Vec::new();
-    for (scope, project_key) in &targets {
-        let report = memory
+    let mut worklist: Vec<(MemoryStore, Option<String>, DuplicateCluster)> = Vec::new();
+    for (scope, project_key, target_store) in &targets {
+        let report = target_store
             .scan_duplicate_clusters(
                 *scope,
                 project_key.as_deref(),
@@ -331,7 +394,7 @@ async fn run_dedup_gardener_once_with_store(
         result.scanned += report.scanned;
         result.clustered += report.clusters.len();
         for cluster in report.clusters {
-            worklist.push((*scope, project_key.clone(), cluster));
+            worklist.push((target_store.clone(), project_key.clone(), cluster));
         }
     }
     worklist.sort_by(|left, right| {
@@ -359,17 +422,21 @@ async fn run_dedup_gardener_once_with_store(
         return Ok(None);
     };
 
-    for (_scope, project_key, cluster) in worklist {
+    for (target_store, project_key, cluster) in worklist {
         let project_key = project_key.as_deref();
         // Re-fetch full bodies; drop members that vanished or were superseded since
         // the scan (e.g. by the blob pass) so we never consolidate a stale set.
         let mut members: Vec<(String, String, String)> = Vec::new();
         for member in &cluster.members {
-            if let Some(doc) = memory
+            if let Some(doc) = target_store
                 .get_memory(&member.id, project_key)
                 .await
                 .map_err(|error| format!("dedup get failed: {error}"))?
             {
+                if target_store.is_read_only_project_memory_path(&doc.path) {
+                    members.clear();
+                    break;
+                }
                 if doc.frontmatter.status == DurableMemoryStatus::Active {
                     members.push((
                         doc.frontmatter.id.clone(),
@@ -416,7 +483,7 @@ async fn run_dedup_gardener_once_with_store(
         };
 
         let ids: Vec<String> = members.iter().map(|(id, _, _)| id.clone()).collect();
-        match memory
+        match target_store
             .consolidate_memories(
                 &ids,
                 project_key,
@@ -467,6 +534,14 @@ async fn run_capacity_gardener_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
 ) -> Result<Option<CapacityGardenerRunResult>, String> {
+    run_capacity_gardener_once_with_store_and_resolver(ctx, memory, None).await
+}
+
+async fn run_capacity_gardener_once_with_store_and_resolver(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) -> Result<Option<CapacityGardenerRunResult>, String> {
     let memory_cfg = ctx.config.read().await.memory().clone().unwrap_or_default();
     let capacity = memory_cfg.memory_active_capacity;
     if capacity == 0 {
@@ -474,14 +549,11 @@ async fn run_capacity_gardener_once_with_store(
     }
     let max_archivals = memory_cfg.capacity_max_archivals_per_run.max(1);
 
-    let mut targets: Vec<(MemoryScope, Option<String>)> = vec![(MemoryScope::Global, None)];
-    for key in memory.list_project_keys().await.unwrap_or_default() {
-        targets.push((MemoryScope::Project, Some(key)));
-    }
+    let targets = gardener_targets(memory, project_context_resolver).await;
 
     let mut result = CapacityGardenerRunResult::default();
-    for (scope, project_key) in &targets {
-        let archived = memory
+    for (scope, project_key, target_store) in &targets {
+        let archived = target_store
             .enforce_scope_capacity(*scope, project_key.as_deref(), capacity, max_archivals)
             .await
             .map_err(|error| format!("capacity enforcement failed: {error}"))?;
@@ -521,19 +593,24 @@ async fn run_freshness_gardener_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
 ) -> Result<Option<FreshnessGardenerRunResult>, String> {
+    run_freshness_gardener_once_with_store_and_resolver(ctx, memory, None).await
+}
+
+async fn run_freshness_gardener_once_with_store_and_resolver(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) -> Result<Option<FreshnessGardenerRunResult>, String> {
     let memory_cfg = ctx.config.read().await.memory().clone().unwrap_or_default();
     if !memory_cfg.granularity_freshness_gardener_enabled {
         return Ok(None);
     }
 
-    let mut targets: Vec<(MemoryScope, Option<String>)> = vec![(MemoryScope::Global, None)];
-    for key in memory.list_project_keys().await.unwrap_or_default() {
-        targets.push((MemoryScope::Project, Some(key)));
-    }
+    let targets = gardener_targets(memory, project_context_resolver).await;
 
     let mut result = FreshnessGardenerRunResult::default();
-    for (scope, project_key) in &targets {
-        let expired = memory
+    for (scope, project_key, target_store) in &targets {
+        let expired = target_store
             .expire_stale_granularity(*scope, project_key.as_deref())
             .await
             .map_err(|error| format!("granularity freshness pass failed: {error}"))?;
@@ -579,8 +656,14 @@ fn should_run_gardener_pass(
 /// Run both gardener passes in order. Blob remediation first, then dedup: splitting
 /// a blob can expose fresh duplicates, and superseded blob sources drop out of the
 /// dedup scan.
-async fn run_gardener_passes(ctx: &AutoDreamContext) {
-    if let Err(error) = run_gardener_once(ctx).await {
+async fn run_gardener_passes(
+    ctx: &AutoDreamContext,
+    project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+) {
+    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    if let Err(error) =
+        run_gardener_once_with_store_and_resolver(ctx, &memory, project_context_resolver).await
+    {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "run_failed",
@@ -588,7 +671,10 @@ async fn run_gardener_passes(ctx: &AutoDreamContext) {
             error
         );
     }
-    if let Err(error) = run_dedup_gardener_once(ctx).await {
+    if let Err(error) =
+        run_dedup_gardener_once_with_store_and_resolver(ctx, &memory, project_context_resolver)
+            .await
+    {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "dedup_run_failed",
@@ -600,7 +686,10 @@ async fn run_gardener_passes(ctx: &AutoDreamContext) {
     // run are then discounted by `memory_value`'s stale_penalty, so the capacity
     // gardener's overflow scoring (if it runs right after) already reflects any
     // granularity-driven staleness from this pass.
-    if let Err(error) = run_freshness_gardener_once(ctx).await {
+    if let Err(error) =
+        run_freshness_gardener_once_with_store_and_resolver(ctx, &memory, project_context_resolver)
+            .await
+    {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "freshness_run_failed",
@@ -609,7 +698,10 @@ async fn run_gardener_passes(ctx: &AutoDreamContext) {
         );
     }
     // Capacity enforcement last, so it counts the post-consolidation library.
-    if let Err(error) = run_capacity_gardener_once(ctx).await {
+    if let Err(error) =
+        run_capacity_gardener_once_with_store_and_resolver(ctx, &memory, project_context_resolver)
+            .await
+    {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "capacity_run_failed",
@@ -625,6 +717,22 @@ async fn run_gardener_passes(ctx: &AutoDreamContext) {
 /// each pass reads config and returns immediately if its gardener is off, and the
 /// poll itself is just a cheap topic-file count.
 pub fn spawn_gardener_task(ctx: AutoDreamContext) {
+    spawn_gardener_task_inner(ctx, None);
+}
+
+pub fn spawn_gardener_task_with_project_resolver(
+    ctx: AutoDreamContext,
+    project_context_resolver: std::sync::Arc<crate::project_context::ProjectContextResolver>,
+) {
+    spawn_gardener_task_inner(ctx, Some(project_context_resolver));
+}
+
+fn spawn_gardener_task_inner(
+    ctx: AutoDreamContext,
+    project_context_resolver: Option<
+        std::sync::Arc<crate::project_context::ProjectContextResolver>,
+    >,
+) {
     tokio::spawn(async move {
         let (interval_secs, volume_trigger) = {
             let guard = ctx.config.read().await;
@@ -647,14 +755,16 @@ pub fn spawn_gardener_task(ctx: AutoDreamContext) {
         let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
         let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs));
         let mut last_run = Instant::now();
-        let mut last_run_count = memory.count_all_memories().await.unwrap_or(0);
+        let mut last_run_count =
+            count_gardener_memories(&memory, project_context_resolver.as_deref()).await;
         // Run once on startup (the first `interval` tick fired immediately before
         // this change), then let the time/volume conditions drive it.
         let mut force_first = true;
 
         loop {
             ticker.tick().await;
-            let current_count = memory.count_all_memories().await.unwrap_or(last_run_count);
+            let current_count =
+                count_gardener_memories(&memory, project_context_resolver.as_deref()).await;
             let elapsed_secs = last_run.elapsed().as_secs();
             if !force_first
                 && !should_run_gardener_pass(
@@ -668,14 +778,15 @@ pub fn spawn_gardener_task(ctx: AutoDreamContext) {
                 continue;
             }
             force_first = false;
-            run_gardener_passes(&ctx).await;
+            run_gardener_passes(&ctx, project_context_resolver.as_deref()).await;
             last_run = Instant::now();
             // Re-baseline the count AFTER the pass so the gardener's own file writes
             // don't re-trigger it. Superseded/archived sources are kept as tombstone
             // files, so a split or a dedup-consolidation actually GROWS the topic-file
             // count (a new canonical is written, sources retained); only a hard purge
             // shrinks it. Re-baselining absorbs all of that.
-            last_run_count = memory.count_all_memories().await.unwrap_or(current_count);
+            last_run_count =
+                count_gardener_memories(&memory, project_context_resolver.as_deref()).await;
         }
     });
 }

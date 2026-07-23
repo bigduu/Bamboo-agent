@@ -135,6 +135,7 @@ impl<'a> ToolExecutionContext<'a> {
     /// session flags onto the context, and the only constructor the agent loops
     /// use — keep both loops (`per_call.rs`, `result_handler.rs`) on it so a new
     /// per-session field reaches all dispatch paths without per-site edits.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_dispatch(
         session_id: &'a str,
         tool_call_id: &'a str,

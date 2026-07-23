@@ -1,3 +1,4 @@
+use crate::project_context::WorkspaceBindingStatus;
 use bamboo_agent_core::{Message, Session};
 
 use super::super::prompt_context::{strip_existing_external_memory, strip_existing_task_list};
@@ -17,7 +18,11 @@ const LEGACY_TOOL_GUIDE_MARKER: &str = "## Tool Usage Guidelines\n";
 const LEGACY_EXTERNAL_MEMORY_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n";
 const LEGACY_TASK_LIST_MARKER: &str = "\n\n## Current Task List:";
 
-pub(super) fn apply_workspace_path_to_session(session: &mut Session, workspace_path: &str) {
+pub(super) fn apply_workspace_path_to_session(
+    session: &mut Session,
+    workspace_path: &str,
+    binding_status: WorkspaceBindingStatus,
+) {
     let workspace_path = workspace_path.trim();
     if workspace_path.is_empty() {
         return;
@@ -33,25 +38,32 @@ pub(super) fn apply_workspace_path_to_session(session: &mut Session, workspace_p
         // Drop dynamic round sections first. They will be re-injected by the loop.
         let base_prompt =
             strip_existing_task_list(&strip_existing_external_memory(&system_message.content));
-        system_message.content = upsert_workspace_context(&base_prompt, workspace_path);
+        system_message.content =
+            upsert_workspace_context(&base_prompt, workspace_path, binding_status);
         crate::runtime::runner::refresh_prompt_snapshot(session);
     } else {
         session.messages.insert(
             0,
-            Message::system(upsert_workspace_context("", workspace_path)),
+            Message::system(upsert_workspace_context("", workspace_path, binding_status)),
         );
         crate::runtime::runner::refresh_prompt_snapshot(session);
     }
 }
 
-pub(super) fn upsert_workspace_context(prompt: &str, workspace_path: &str) -> String {
+pub(super) fn upsert_workspace_context(
+    prompt: &str,
+    workspace_path: &str,
+    binding_status: WorkspaceBindingStatus,
+) -> String {
     let workspace_path = workspace_path.trim();
     if workspace_path.is_empty() {
         return strip_existing_workspace_context(prompt);
     }
 
-    let Some(segment) = crate::runtime::context::build_workspace_prompt_context(workspace_path)
-    else {
+    let Some(segment) = crate::runtime::context::build_workspace_prompt_context_with_binding(
+        workspace_path,
+        binding_status,
+    ) else {
         return strip_existing_workspace_context(prompt);
     };
     let stripped = strip_existing_workspace_context(prompt);

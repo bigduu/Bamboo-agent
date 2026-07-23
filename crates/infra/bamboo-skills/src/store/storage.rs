@@ -91,7 +91,10 @@ pub enum SkillDirectorySource {
     /// Cross-agent user skills discovered from `~/.agents/skills`.
     Agents,
     Global,
+    /// Stable user-local `${BAMBOO_DATA_DIR}/projects/<id>/skills*`.
     Project,
+    /// Current repo/workspace-local `<workspace>/.bamboo/skills*` overlay.
+    Workspace,
     /// `~/.bamboo/plugins/<plugin-id>/skills` — an installed plugin's skills,
     /// discovered *in place* (no copy, no symlink). See
     /// [`discover_plugin_skill_dirs`].

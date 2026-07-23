@@ -1621,8 +1621,9 @@ pub(super) async fn run_pipeline(
             session,
             config.prompt_memory_flags,
             Some(&runtime_context),
+            config.project_context_resolver.as_deref(),
         )
-        .await;
+        .await?;
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {

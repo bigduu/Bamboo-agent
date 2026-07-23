@@ -41,12 +41,16 @@ pub fn create_schedule_session(
         "base_system_prompt".to_string(),
         base_system_prompt.to_string(),
     );
+    if let Some(project_id) = job.run_config.project_id.as_ref() {
+        session.set_project_id_meta(project_id.to_string());
+    }
     if let Some(path) = workspace_path {
-        session.set_workspace_path_meta(path);
-        bamboo_tools::tools::workspace_state::ensure_session_workspace(
+        let final_workspace = bamboo_tools::tools::workspace_state::set_workspace(
             &session_id,
-            Some(std::path::PathBuf::from(path)),
+            std::path::PathBuf::from(path),
         );
+        let final_workspace = bamboo_config::paths::path_to_display_string(&final_workspace);
+        session.set_workspace_path_meta(final_workspace);
     }
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());

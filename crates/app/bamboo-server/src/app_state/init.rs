@@ -487,6 +487,7 @@ pub fn build_schedule_manager(
     app_data_dir: Option<std::path::PathBuf>,
     account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     notification_relay: crate::app_state::session_events::NotificationRelayDeps,
+    project_store: Arc<bamboo_projects::ProjectStore>,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
         schedule_store,
@@ -500,6 +501,7 @@ pub fn build_schedule_manager(
         persistence,
         app_data_dir,
         trigger_engine: crate::schedule_app::default_trigger_engine(),
+        project_store,
         notification_relay,
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };
@@ -530,8 +532,51 @@ pub async fn build_connect_manager(
     config: Arc<RwLock<Config>>,
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
     permission_checker: Arc<PermissionChecker>,
-) -> crate::connect::ConnectManager {
+    project_store: Arc<bamboo_projects::ProjectStore>,
+) -> Result<crate::connect::ConnectManager, String> {
     let config_snapshot = config.read().await.clone();
+    let resolved_connect = bamboo_engine::resolved_defaults::resolve_default_run_config(
+        &config_snapshot,
+        &provider_registry,
+    );
+    let mut project_ids_by_platform = HashMap::new();
+    let start_guard = crate::connect::multi_bot_guard(&config_snapshot.connect.platforms);
+    for (platform, guard_allows) in config_snapshot.connect.platforms.iter().zip(start_guard) {
+        if !crate::connect::platform_config_will_start(platform, guard_allows) {
+            continue;
+        }
+        if let Some(project_id) = platform.project_id.clone() {
+            match project_store.get(&project_id) {
+                Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => {
+                    project_ids_by_platform
+                        .insert(platform.platform_type.clone(), project_id.clone());
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "connect platform '{}' references archived Project '{}'",
+                        platform.platform_type, project_id
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "connect platform '{}' references unavailable Project '{}': {error}",
+                        platform.platform_type, project_id
+                    ));
+                }
+            }
+        }
+        crate::project_context::validate_workspace_assignment(
+            &project_store,
+            platform.project_id.as_ref(),
+            resolved_connect.workspace_path.as_deref(),
+        )
+        .map_err(|error| {
+            format!(
+                "connect platform '{}' has an invalid Project/workspace assignment: {error}",
+                platform.platform_type
+            )
+        })?;
+    }
     let ctx = crate::connect::ConnectContext {
         agent,
         tools,
@@ -542,9 +587,87 @@ pub async fn build_connect_manager(
         app_data_dir: app_data_dir.clone(),
         config,
         provider_registry,
+        project_store,
+        project_ids_by_platform: Arc::new(project_ids_by_platform),
         permission_checker,
     };
-    crate::connect::ConnectManager::start(ctx, &config_snapshot, app_data_dir).await
+    Ok(crate::connect::ConnectManager::start(ctx, &config_snapshot, app_data_dir).await)
+}
+
+#[cfg(test)]
+mod connect_project_mapping_tests {
+    use super::*;
+
+    fn telegram(
+        token: &str,
+        project_id: bamboo_domain::ProjectId,
+    ) -> bamboo_config::ConnectPlatformConfig {
+        bamboo_config::ConnectPlatformConfig {
+            id: None,
+            project_id: Some(project_id),
+            platform_type: "telegram".to_string(),
+            token: Some(token.to_string()),
+            token_encrypted: None,
+            token_credential_ref: None,
+            token_configured: false,
+            app_id: None,
+            app_secret: None,
+            app_secret_encrypted: None,
+            app_secret_credential_ref: None,
+            app_secret_configured: false,
+            domain: None,
+            allow_from: vec!["allowed".to_string()],
+            admin_from: Vec::new(),
+        }
+    }
+
+    fn feishu(
+        app_id: &str,
+        secret: &str,
+        project_id: bamboo_domain::ProjectId,
+    ) -> bamboo_config::ConnectPlatformConfig {
+        bamboo_config::ConnectPlatformConfig {
+            app_id: Some(app_id.to_string()),
+            app_secret: Some(secret.to_string()),
+            platform_type: "feishu".to_string(),
+            token: None,
+            project_id: Some(project_id),
+            ..telegram("", bamboo_domain::ProjectId::new())
+        }
+    }
+
+    #[test]
+    fn duplicate_platform_project_mapping_follows_the_first_started_entry() {
+        let data = tempfile::tempdir().expect("data");
+        let store = bamboo_projects::ProjectStore::open(data.path()).expect("Project store");
+        let first_telegram = store.create("Telegram Active", None).unwrap();
+        let skipped_telegram = store.create("Telegram Skipped", None).unwrap();
+        let first_feishu = store.create("Feishu Active", None).unwrap();
+        let skipped_feishu = store.create("Feishu Skipped", None).unwrap();
+        let platforms = vec![
+            telegram("token-a", first_telegram.id.clone()),
+            telegram("token-b", skipped_telegram.id),
+            feishu("app-a", "secret-a", first_feishu.id.clone()),
+            feishu("app-b", "secret-b", skipped_feishu.id),
+        ];
+        let guard = crate::connect::multi_bot_guard(&platforms);
+        let mapped = platforms
+            .iter()
+            .zip(guard)
+            .filter(|(platform, allowed)| {
+                crate::connect::platform_config_will_start(platform, *allowed)
+            })
+            .filter_map(|(platform, _)| {
+                platform
+                    .project_id
+                    .clone()
+                    .map(|project_id| (platform.platform_type.clone(), project_id))
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(mapped.get("telegram"), Some(&first_telegram.id));
+        assert_eq!(mapped.get("feishu"), Some(&first_feishu.id));
+    }
 }
 
 #[cfg(test)]

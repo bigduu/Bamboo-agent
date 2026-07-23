@@ -186,6 +186,9 @@ pub struct AppState {
     pub mcp_config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
     #[allow(dead_code)]
     config_watcher: config_runtime::ConfigWatcherRuntime,
+    /// Project shared-resource watcher. Held for the server lifetime.
+    #[allow(dead_code)]
+    pub(crate) project_resource_watcher: project_watcher::ProjectResourceWatcher,
 
     /// Encrypted credential authority exposed only through metadata/replace/clear APIs.
     pub credential_store: Arc<bamboo_config::CredentialStore>,
@@ -231,6 +234,13 @@ pub struct AppState {
 
     /// Concrete session store implementation (for index/list/cleanup APIs).
     pub session_store: Arc<SessionStoreV2>,
+
+    /// Authoritative first-class Project registry and shared-resource paths.
+    pub project_store: Arc<bamboo_projects::ProjectStore>,
+
+    /// Redacted adapter used by HTTP creation paths and the agent runtime to
+    /// resolve one authoritative Project/workspace identity.
+    pub project_context_resolver: Arc<bamboo_engine::project_context::ProjectContextResolver>,
 
     /// Per-session write serialisation + metadata-merge persistence layer.
     ///
@@ -478,6 +488,7 @@ pub(crate) use config_runtime::ConfigSectionMutationError;
 pub mod init;
 pub mod parent_approval_reviewer;
 mod persistence;
+mod project_watcher;
 mod provider_api;
 pub mod resume_adapter;
 pub mod runner_lifecycle;

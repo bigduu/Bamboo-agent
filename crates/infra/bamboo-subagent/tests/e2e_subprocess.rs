@@ -43,6 +43,7 @@ async fn spawn_discover_run_stream_terminal() {
     client
         .send(ParentFrame::Run(RunSpec {
             assignment: "hello world".into(),
+            project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
@@ -113,6 +114,7 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
+                project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),

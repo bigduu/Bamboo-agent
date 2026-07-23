@@ -27,7 +27,30 @@ fn workspaces() -> &'static DashMap<String, WorkspaceEntry> {
 /// `preferred`/configured branches, child-session workspace inheritance) —
 /// see [`pin_workspace_path`] for the confinement policy itself.
 pub fn set_workspace(session_id: &str, workspace: PathBuf) -> PathBuf {
-    let workspace = pin_via_provider(workspace);
+    let workspace = resolve_workspace_path(workspace);
+    publish_resolved_workspace(session_id, workspace)
+}
+
+/// Publish a candidate that already passed pure confinement and Project owner
+/// validation. The exact supplied path is stored; confinement is not evaluated
+/// a second time, closing the preview/check/publish TOCTOU.
+pub fn publish_resolved_workspace(session_id: &str, workspace: PathBuf) -> PathBuf {
+    if !workspace.exists() {
+        if let Some(provider) = WORKSPACE_ROOT_PROVIDER.get() {
+            let cfg = provider();
+            let root = canonicalize_best_effort(&cfg.root);
+            let candidate = canonicalize_best_effort(&workspace);
+            if candidate.starts_with(&root) {
+                if let Err(error) = std::fs::create_dir_all(&candidate) {
+                    tracing::warn!(
+                        path = %candidate.display(),
+                        %error,
+                        "failed to materialize validated workspace"
+                    );
+                }
+            }
+        }
+    }
     let store = workspaces();
     store.insert(
         session_id.to_string(),
@@ -40,10 +63,42 @@ pub fn set_workspace(session_id: &str, workspace: PathBuf) -> PathBuf {
     workspace
 }
 
+/// Resolve the final path that [`set_workspace`] would store without mutating
+/// session state. Project-aware callers use this to run cross-Project binding
+/// conflict checks against the confinement-adjusted destination before the
+/// workspace change becomes visible.
+pub fn resolve_workspace_path(workspace: PathBuf) -> PathBuf {
+    pin_via_provider(workspace)
+}
+
+/// Preview the confinement-adjusted workspace without creating the workspace
+/// root or a relocated target. Validation and read-only prompt paths must use
+/// this; [`set_workspace`] materializes only after authorization succeeds.
+pub fn preview_workspace_path(workspace: PathBuf) -> PathBuf {
+    match WORKSPACE_ROOT_PROVIDER.get() {
+        Some(provider) => {
+            let cfg = provider();
+            preview_pin_workspace_path(&workspace, &cfg.root, cfg.confine)
+        }
+        None => workspace,
+    }
+}
+
 pub fn get_workspace(session_id: &str) -> Option<PathBuf> {
     let mut entry = workspaces().get_mut(session_id)?;
     entry.last_touched = Instant::now();
     Some(entry.workspace.clone())
+}
+
+/// Read the tracked workspace without creating/touching any workspace state.
+///
+/// Project-aware validation paths use this before deciding whether a
+/// candidate is allowed. Calling `ensure_session_workspace` for inspection is
+/// unsafe because it can publish an unvalidated configured default.
+pub fn peek_workspace(session_id: &str) -> Option<PathBuf> {
+    workspaces()
+        .get(session_id)
+        .map(|entry| entry.workspace.clone())
 }
 
 /// Resolver for the configured default workspace.
@@ -97,6 +152,28 @@ pub fn ensure_session_workspace(session_id: &str, preferred: Option<PathBuf>) ->
     }
 
     None
+}
+
+/// Resolve the workspace a session would use without publishing it.
+///
+/// Precedence is explicit/persisted caller input, existing runtime state,
+/// configured default, then the confinement provider's session-scoped
+/// fallback. The returned path has already passed through confinement, but no
+/// registry entry or directory is created.
+pub fn resolve_session_workspace_candidate(
+    session_id: &str,
+    preferred: Option<PathBuf>,
+) -> Option<PathBuf> {
+    preferred
+        .or_else(|| peek_workspace(session_id))
+        .or_else(get_configured_default_workspace)
+        .or_else(|| {
+            WORKSPACE_ROOT_PROVIDER.get().map(|provider| {
+                let cfg = provider();
+                preview_default_session_workspace_dir(&cfg.root, session_id)
+            })
+        })
+        .map(preview_workspace_path)
 }
 
 /// Resolve the working directory tools should use for `session_id`: the
@@ -237,15 +314,20 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     loop {
         match probe.parent() {
             Some(parent) => {
-                if let Some(name) = probe.file_name() {
-                    remainder.push(name.to_os_string());
+                if let Some(component) = probe.components().next_back() {
+                    match component {
+                        Component::Normal(_) | Component::ParentDir | Component::CurDir => {
+                            remainder.push(component.as_os_str().to_os_string());
+                        }
+                        Component::Prefix(_) | Component::RootDir => {}
+                    }
                 }
                 if let Ok(canon_parent) = std::fs::canonicalize(parent) {
                     let mut result = canon_parent;
                     for part in remainder.into_iter().rev() {
                         result.push(part);
                     }
-                    return result;
+                    return lexically_clean(&result);
                 }
                 probe = parent;
             }
@@ -287,6 +369,18 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// function of the input path — a relocated tenant's directory must not
 /// silently move when bamboo is rebuilt with a newer toolchain.
 fn relocate_under_root(root: &Path, original: &Path) -> PathBuf {
+    let target = preview_relocate_under_root(root, original);
+    if let Err(err) = std::fs::create_dir_all(&target) {
+        tracing::warn!(
+            path = %target.display(),
+            error = %err,
+            "relocate_under_root: failed to create relocated workspace directory"
+        );
+    }
+    target
+}
+
+fn preview_relocate_under_root(root: &Path, original: &Path) -> PathBuf {
     let hash = fnv1a_64(original.as_os_str().as_encoded_bytes());
     // Truncate to exactly 8 hex chars (32 bits) for the leaf-suffixed form —
     // short enough to stay a readable path component while still being
@@ -302,15 +396,7 @@ fn relocate_under_root(root: &Path, original: &Path) -> PathBuf {
         Some(leaf) => format!("{leaf}-{short_hash:08x}"),
         None => format!("relocated-{hash:x}"),
     };
-    let target = root.join(dir_name);
-    if let Err(err) = std::fs::create_dir_all(&target) {
-        tracing::warn!(
-            path = %target.display(),
-            error = %err,
-            "relocate_under_root: failed to create relocated workspace directory"
-        );
-    }
-    target
+    root.join(dir_name)
 }
 
 /// Resolve an explicitly-assigned workspace path against a root + policy
@@ -357,11 +443,25 @@ pub fn pin_workspace_path(requested: &Path, root: &Path, confine: bool) -> PathB
     relocate_under_root(&canon_root, requested)
 }
 
+/// Pure counterpart to [`pin_workspace_path`]. It derives the identical final
+/// path while leaving both `root` and any relocation target absent.
+pub fn preview_pin_workspace_path(requested: &Path, root: &Path, confine: bool) -> PathBuf {
+    if !confine {
+        return requested.to_path_buf();
+    }
+    let canon_root = canonicalize_best_effort(root);
+    let canon_requested = canonicalize_best_effort(requested);
+    if canon_requested.starts_with(&canon_root) {
+        return canon_requested;
+    }
+    preview_relocate_under_root(&canon_root, requested)
+}
+
 /// Default per-session workspace directory under `root` (issue #217
 /// acceptance criterion 1): `root/<sanitized-session-id>`, created if
 /// missing. Pure/directly-testable, mirroring [`pin_workspace_path`].
 pub fn default_session_workspace_dir(root: &Path, session_id: &str) -> PathBuf {
-    let dir = root.join(sanitize_path_component(session_id));
+    let dir = preview_default_session_workspace_dir(root, session_id);
     if let Err(err) = std::fs::create_dir_all(&dir) {
         tracing::warn!(
             path = %dir.display(),
@@ -370,6 +470,11 @@ pub fn default_session_workspace_dir(root: &Path, session_id: &str) -> PathBuf {
         );
     }
     dir
+}
+
+/// Pure path derivation for a session fallback workspace.
+pub fn preview_default_session_workspace_dir(root: &Path, session_id: &str) -> PathBuf {
+    root.join(sanitize_path_component(session_id))
 }
 
 fn evict_oldest_if_needed(store: &DashMap<String, WorkspaceEntry>, max_tracked_workspaces: usize) {
@@ -491,6 +596,56 @@ mod tests {
         // single path segment directly under it.
         assert_eq!(dir.parent().unwrap(), root);
         assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn preview_fallback_and_confinement_relocation_do_not_create_directories() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().join("workspaces");
+        let fallback = preview_default_session_workspace_dir(&root, "preview-session");
+        assert_eq!(fallback, root.join("preview-session"));
+        assert!(!root.exists());
+        assert!(!fallback.exists());
+
+        let outside = root_dir.path().join("outside/project");
+        std::fs::create_dir_all(&outside).unwrap();
+        let relocated = preview_pin_workspace_path(&outside, &root, true);
+        assert!(relocated.starts_with(canonicalize_best_effort(&root)));
+        assert!(!root.exists());
+        assert!(!relocated.exists());
+    }
+
+    #[test]
+    fn confinement_preview_matches_materialized_result_on_stable_filesystem() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().join("workspaces");
+        let outside = root_dir.path().join("outside/project");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let preview = preview_pin_workspace_path(&outside, &root, true);
+        assert!(!preview.exists());
+        let materialized = pin_workspace_path(&outside, &root, true);
+
+        assert_eq!(materialized, preview);
+        assert!(materialized.is_dir());
+    }
+
+    #[test]
+    fn confinement_preview_lexically_cleans_missing_parent_escapes() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().join("workspaces");
+        let inside = root.join("inside");
+        std::fs::create_dir_all(&inside).unwrap();
+        let escaping = inside
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("outside-new");
+
+        let preview = preview_pin_workspace_path(&escaping, &root, true);
+        assert!(preview.starts_with(canonicalize_best_effort(&root)));
+        assert_ne!(preview, lexically_clean(&escaping));
     }
 
     /// Acceptance criterion / back-compat: with confinement OFF (the

@@ -1,13 +1,13 @@
-use std::path::Path;
-
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 use bamboo_agent_core::Session;
-use bamboo_engine::auto_dream::{run_project_auto_dream_once, AutoDreamContext};
-use bamboo_memory::memory_store::MemoryStore;
+use bamboo_engine::auto_dream::{
+    run_project_auto_dream_once_for_project_with_read_roots, AutoDreamContext,
+};
+use bamboo_engine::project_context::ProjectContextResolver;
+use bamboo_memory::memory_store::LegacyProjectMemoryReadRoot;
 use bamboo_storage::{CleanupMode, CleanupResult};
-use bamboo_tools::tools::workspace_state;
 
 use super::super::types::CleanupRequest;
 
@@ -65,19 +65,6 @@ async fn load_session_from_state_or_storage(
         })
 }
 
-fn resolve_session_project_key(session_id: &str, session: &Session) -> Option<String> {
-    session
-        .workspace_path_meta()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .and_then(|path| MemoryStore::derive_project_key_from_workspace(Some(Path::new(&path))))
-        .or_else(|| {
-            workspace_state::get_workspace(session_id).and_then(|path| {
-                MemoryStore::derive_project_key_from_workspace(Some(path.as_path()))
-            })
-        })
-}
-
 /// `POST /api/v1/sessions/{session_id}/project-dream/run`
 pub async fn run_project_dream(
     state: web::Data<AppState>,
@@ -91,11 +78,24 @@ pub async fn run_project_dream(
         })));
     };
 
-    let Some(project_key) = resolve_session_project_key(&session_id, &session) else {
-        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": crate::error::error_value("Project scope unavailable for session"),
-            "session_id": session_id
-        })));
+    let project_id = match ProjectContextResolver::session_project_identity(&session) {
+        bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => project_id,
+        bamboo_engine::project_context::SessionProjectIdentity::Unassigned => {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": crate::error::error_value(
+                    "Project Dream writes require an assigned Project"
+                ),
+                "session_id": session_id
+            })));
+        }
+        bamboo_engine::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+            return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                "error": crate::error::error_value(format!(
+                    "Session carries an invalid Project identity '{raw}': {message}"
+                )),
+                "session_id": session_id
+            })));
+        }
     };
 
     let ctx = AutoDreamContext {
@@ -105,20 +105,40 @@ pub async fn run_project_dream(
         config: state.config.clone(),
         provider_registry: state.provider_registry.clone(),
     };
-
-    let result = run_project_auto_dream_once(&ctx, &project_key)
-        .await
+    let memory_roots = state
+        .project_store
+        .project_memory_read_roots(&project_id)
         .map_err(|error| {
             crate::error::json_internal_server_error(format!(
-                "Failed to run project Dream generation: {error}"
+                "Failed to resolve Project memory roots: {error}"
             ))
         })?;
+    let legacy_read_roots = memory_roots
+        .legacy_aliases
+        .into_iter()
+        .map(|legacy| LegacyProjectMemoryReadRoot {
+            project_key: legacy.legacy_project_key,
+            root: legacy.root,
+        })
+        .collect();
+
+    let result = run_project_auto_dream_once_for_project_with_read_roots(
+        &ctx,
+        &project_id,
+        legacy_read_roots,
+    )
+    .await
+    .map_err(|error| {
+        crate::error::json_internal_server_error(format!(
+            "Failed to run project Dream generation: {error}"
+        ))
+    })?;
 
     let response = match result {
         Some(result) => serde_json::json!({
             "success": true,
             "session_id": session_id,
-            "project_key": project_key,
+            "project_id": project_id,
             "dream_generated": true,
             "used_model": result.used_model,
             "session_count": result.session_count,
@@ -128,7 +148,7 @@ pub async fn run_project_dream(
         None => serde_json::json!({
             "success": true,
             "session_id": session_id,
-            "project_key": project_key,
+            "project_id": project_id,
             "dream_generated": false,
             "message": "No project Dream update was needed"
         }),
@@ -285,20 +305,29 @@ mod tests {
 
         let workspace = temp_dir.path().join("workspace-http-project-dream");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
 
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
             "## Current durable context\n- HTTP project dream generated\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
             "{\"candidates\":[]}".to_string(),
         ]));
         let app_state = build_test_app_state(temp_dir.path().to_path_buf(), provider).await;
+        let project = app_state
+            .project_store
+            .create_with_bindings(
+                "HTTP Project Dream",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: workspace.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .expect("create Project");
 
         let mut session = bamboo_agent_core::Session::new("session-http-project-dream", "model");
         session.title = "HTTP Project Dream".to_string();
-        session.metadata.insert(
-            "workspace_path".to_string(),
-            workspace.to_string_lossy().to_string(),
-        );
+        session.set_project_id_meta(project.id.to_string());
+        session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
         session.conversation_summary = Some(ConversationSummary::new(
             "Project-scoped session for manual dream generation.",
             3,
@@ -329,8 +358,8 @@ mod tests {
             Some("session-http-project-dream")
         );
         assert_eq!(
-            body.get("project_key").and_then(Value::as_str),
-            Some(project_key.as_str())
+            body.get("project_id").and_then(Value::as_str),
+            Some(project.id.as_str())
         );
         assert_eq!(
             body.get("dream_generated").and_then(Value::as_bool),
@@ -341,9 +370,10 @@ mod tests {
             Some("fast-model")
         );
 
-        let memory = MemoryStore::new(temp_dir.path());
+        let memory =
+            bamboo_memory::memory_store::MemoryStore::new(temp_dir.path()).for_project(&project.id);
         let project_dream = memory
-            .read_project_dream_view(&project_key)
+            .read_project_dream_view(project.id.as_str())
             .await
             .expect("read project dream")
             .expect("project dream should exist");
@@ -469,7 +499,7 @@ mod tests {
         assert_eq!(body["error"]["type"], "api_error");
         assert_eq!(
             body["error"]["message"].as_str(),
-            Some("Project scope unavailable for session")
+            Some("Project Dream writes require an assigned Project")
         );
         assert_eq!(
             body.get("session_id").and_then(Value::as_str),

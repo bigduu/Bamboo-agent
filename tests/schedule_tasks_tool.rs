@@ -108,6 +108,7 @@ fn clean_config(data_dir: &std::path::Path) -> Config {
 }
 
 fn new_schedule_tasks_tool(
+    data_dir: &std::path::Path,
     schedule_store: Arc<ScheduleStore>,
     manager: Arc<ScheduleManager>,
     store: Arc<SessionStoreV2>,
@@ -119,6 +120,7 @@ fn new_schedule_tasks_tool(
         store.clone(),
         store,
         Arc::new(RwLock::new(config)),
+        Arc::new(bamboo_projects::ProjectStore::open(data_dir).expect("Project store")),
     )
 }
 
@@ -189,6 +191,7 @@ fn build_manager(
         account_feed_inbox: None,
         app_data_dir: None,
         trigger_engine: bamboo_agent::server::schedule_app::default_trigger_engine(),
+        project_store: Arc::new(bamboo_projects::ProjectStore::open(dir).expect("Project store")),
         notification_relay:
             bamboo_agent::server::app_state::session_events::NotificationRelayDeps {
                 notification_service: Arc::new(bamboo_notification::NotificationService::new(
@@ -223,7 +226,13 @@ async fn schedule_tasks_requires_session_id() {
         clean_config(dir.path()),
     );
 
-    let tool = new_schedule_tasks_tool(schedule_store, manager, store, clean_config(dir.path()));
+    let tool = new_schedule_tasks_tool(
+        dir.path(),
+        schedule_store,
+        manager,
+        store,
+        clean_config(dir.path()),
+    );
 
     let err = tool
         .invoke(
@@ -252,6 +261,7 @@ async fn schedule_tasks_rejects_child_sessions() {
     );
 
     let tool = new_schedule_tasks_tool(
+        dir.path(),
         schedule_store,
         manager,
         store.clone(),
@@ -293,6 +303,7 @@ async fn schedule_tasks_rejects_invalid_create_arguments() {
     );
 
     let tool = new_schedule_tasks_tool(
+        dir.path(),
         schedule_store,
         manager,
         store.clone(),
@@ -364,6 +375,7 @@ async fn schedule_tasks_rejects_invalid_patch_arguments() {
     );
 
     let tool = new_schedule_tasks_tool(
+        dir.path(),
         schedule_store.clone(),
         manager,
         store.clone(),
@@ -436,6 +448,7 @@ async fn schedule_tasks_crud_and_list_sessions() {
     );
 
     let tool = new_schedule_tasks_tool(
+        dir.path(),
         schedule_store.clone(),
         manager,
         store.clone(),

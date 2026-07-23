@@ -45,17 +45,108 @@ pub async fn prepare_chat_turn(
     global_default_prompt: &str,
     builtin_fallback_prompt: &str,
 ) -> Result<Session, ChatError> {
-    let (mut session, session_start_source) = match repo.load_merged(&input.session_id).await? {
+    prepare_chat_turn_inner(
+        repo,
+        input,
+        global_default_prompt,
+        builtin_fallback_prompt,
+        true,
+    )
+    .await
+}
+
+/// Prepare a chat turn without persisting it.
+///
+/// The server uses this variant so its authoritative Project/workspace
+/// resolver can run after the second session load and before any session or
+/// runtime workspace side effect. Callers must save the returned session after
+/// their external invariants pass.
+pub async fn prepare_chat_turn_unpersisted(
+    repo: &dyn SessionAccess,
+    input: ChatTurnInput,
+    global_default_prompt: &str,
+    builtin_fallback_prompt: &str,
+) -> Result<Session, ChatError> {
+    prepare_chat_turn_inner(
+        repo,
+        input,
+        global_default_prompt,
+        builtin_fallback_prompt,
+        false,
+    )
+    .await
+}
+
+async fn prepare_chat_turn_inner(
+    repo: &dyn SessionAccess,
+    input: ChatTurnInput,
+    global_default_prompt: &str,
+    builtin_fallback_prompt: &str,
+    persist: bool,
+) -> Result<Session, ChatError> {
+    let existing = repo.load_merged(&input.session_id).await?;
+    let mut session = prepare_chat_turn_from_authoritative_session(
+        existing,
+        input,
+        global_default_prompt,
+        builtin_fallback_prompt,
+    )?;
+    if persist {
+        repo.save_and_cache(&mut session).await?;
+    }
+    Ok(session)
+}
+
+/// Prepare a turn from a caller-supplied authoritative durable snapshot.
+///
+/// HTTP transaction paths acquire their per-session persistence lock, load
+/// directly from `LockedSessionStore::storage()`, and call this function so a
+/// stale cache can never win the Project membership re-check.
+pub fn prepare_chat_turn_from_authoritative_session(
+    existing: Option<Session>,
+    input: ChatTurnInput,
+    global_default_prompt: &str,
+    builtin_fallback_prompt: &str,
+) -> Result<Session, ChatError> {
+    let (mut session, session_start_source) = match existing {
         Some(session) => (session, "resume"),
         None => (
-            repo.load_or_create(&input.session_id, &input.model).await?,
+            Session::new(input.session_id.clone(), input.model.clone()),
             "startup",
         ),
     };
+    match crate::project_context::ProjectContextResolver::session_project_identity(&session) {
+        crate::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+            return Err(ChatError::InvalidProjectIdentity { raw, message });
+        }
+        crate::project_context::SessionProjectIdentity::Assigned(actual)
+            if input.project_id.as_ref() != Some(&actual) =>
+        {
+            return Err(ChatError::ProjectIdentityConflict {
+                expected: input.project_id,
+                actual: Some(actual),
+            });
+        }
+        crate::project_context::SessionProjectIdentity::Unassigned
+            if session_start_source == "resume" && input.project_id.is_some() =>
+        {
+            return Err(ChatError::ProjectIdentityConflict {
+                expected: input.project_id,
+                actual: None,
+            });
+        }
+        crate::project_context::SessionProjectIdentity::Assigned(_)
+        | crate::project_context::SessionProjectIdentity::Unassigned => {}
+    }
     session.metadata.insert(
         SESSION_START_SOURCE_METADATA_KEY.to_string(),
         session_start_source.to_string(),
     );
+    if session_start_source == "startup" {
+        if let Some(project_id) = input.project_id.as_ref() {
+            session.set_project_id_meta(project_id.to_string());
+        }
+    }
 
     // ---- Resolve base prompt ----
     let base_prompt = resolve_base_prompt(
@@ -76,9 +167,10 @@ pub async fn prepare_chat_turn(
     );
 
     // ---- Resolve workspace path (metadata only, no filesystem) ----
-    let workspace_path = resolve_workspace_path(
+    let workspace_path = resolve_workspace_path_with_default(
         &mut session,
         input.workspace_path.as_deref(),
+        input.default_workspace_path.as_deref(),
         input.data_dir.as_deref(),
     );
 
@@ -142,9 +234,6 @@ pub async fn prepare_chat_turn(
             input.provider.as_deref(),
         );
     }
-
-    // ---- Save ----
-    repo.save_and_cache(&mut session).await?;
 
     Ok(session)
 }
@@ -217,14 +306,32 @@ pub fn resolve_workspace_path(
     workspace_path_from_request: Option<&str>,
     data_dir: Option<&Path>,
 ) -> Option<String> {
+    resolve_workspace_path_with_default(session, workspace_path_from_request, None, data_dir)
+}
+
+fn resolve_workspace_path_with_default(
+    session: &mut Session,
+    workspace_path_from_request: Option<&str>,
+    default_workspace_path: Option<&str>,
+    data_dir: Option<&Path>,
+) -> Option<String> {
     if let Some(path) = workspace_path_from_request {
         session.set_workspace_path_meta(path);
     }
 
-    workspace_path_from_request
+    let resolved = workspace_path_from_request
         .map(ToString::to_string)
         .or_else(|| session.workspace_path_meta())
-        .or_else(|| resolve_default_workspace(data_dir))
+        .or_else(|| default_workspace_path.map(ToString::to_string))
+        .or_else(|| resolve_default_workspace(data_dir));
+    if let Some(workspace) = resolved.as_ref() {
+        // Persist the effective post-lock choice, including a live-config or
+        // session-root fallback. Otherwise the subsequent Project resolver
+        // would see no metadata and independently pick a different global
+        // fallback.
+        session.set_workspace_path_meta(workspace.clone());
+    }
+    resolved
 }
 
 /// Resolve the configured default workspace (display string), preferring the
@@ -573,10 +680,19 @@ mod tests {
     use super::*;
     use crate::session_app::errors::{SessionLoadError, SessionSaveError};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     struct InMemorySessionAccess;
 
     struct ExistingSessionAccess(Session);
+
+    struct BarrierSessionAccess {
+        session: Mutex<Session>,
+        load_started: tokio::sync::Notify,
+        release_load: tokio::sync::Notify,
+        save_count: AtomicUsize,
+    }
 
     #[async_trait]
     impl SessionAccess for InMemorySessionAccess {
@@ -628,9 +744,41 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SessionAccess for BarrierSessionAccess {
+        async fn load_session(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
+            Ok(Some(self.session.lock().expect("session lock").clone()))
+        }
+
+        async fn load_or_create(
+            &self,
+            _id: &str,
+            _model: &str,
+        ) -> Result<Session, SessionLoadError> {
+            panic!("barrier session already exists")
+        }
+
+        async fn load_merged(&self, _id: &str) -> Result<Option<Session>, SessionLoadError> {
+            self.load_started.notify_one();
+            self.release_load.notified().await;
+            Ok(Some(self.session.lock().expect("session lock").clone()))
+        }
+
+        async fn save_session(&self, _session: &mut Session) -> Result<(), SessionSaveError> {
+            self.save_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn save_and_cache(&self, _session: &mut Session) -> Result<(), SessionSaveError> {
+            self.save_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     fn chat_turn_input(enhance_prompt: Option<&str>) -> super::super::types::ChatTurnInput {
         super::super::types::ChatTurnInput {
             session_id: "session-enhance".to_string(),
+            project_id: None,
             model: "gpt-5".to_string(),
             model_ref: None,
             provider: None,
@@ -638,6 +786,7 @@ mod tests {
             system_prompt: Some("Base prompt".to_string()),
             enhance_prompt: enhance_prompt.map(ToString::to_string),
             workspace_path: None,
+            default_workspace_path: None,
             selected_skill_ids: None,
             workflow_selection: None,
             orchestration_opt_in: None,
@@ -704,6 +853,63 @@ mod tests {
                 .map(String::as_str),
             Some("resume")
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_rechecks_project_identity_after_preflight_race() {
+        let project_a =
+            bamboo_domain::ProjectId::parse("project-chat-a").expect("Project A identity");
+        let project_b =
+            bamboo_domain::ProjectId::parse("project-chat-b").expect("Project B identity");
+        let workspace_a = tempfile::tempdir().expect("workspace A");
+        let workspace_b = tempfile::tempdir().expect("workspace B");
+        let mut session = Session::new("chat-project-race", "gpt-5");
+        session.set_project_id_meta(project_a.to_string());
+        session.set_workspace_path_meta(workspace_a.path().to_string_lossy().into_owned());
+        let repo = Arc::new(BarrierSessionAccess {
+            session: Mutex::new(session),
+            load_started: tokio::sync::Notify::new(),
+            release_load: tokio::sync::Notify::new(),
+            save_count: AtomicUsize::new(0),
+        });
+        let mut input = chat_turn_input(None);
+        input.session_id = "chat-project-race".to_string();
+        input.project_id = Some(project_a.clone());
+        input.workspace_path = Some(workspace_a.path().to_string_lossy().into_owned());
+
+        let task_repo = repo.clone();
+        let task = tokio::spawn(async move {
+            prepare_chat_turn(task_repo.as_ref(), input, "global", "builtin").await
+        });
+        repo.load_started.notified().await;
+        {
+            let mut raced = repo.session.lock().expect("session lock");
+            raced.set_project_id_meta(project_b.to_string());
+            raced.set_workspace_path_meta(workspace_b.path().to_string_lossy().into_owned());
+        }
+        repo.release_load.notify_one();
+
+        let error = task
+            .await
+            .expect("chat task")
+            .expect_err("membership race must fail closed");
+        assert!(matches!(
+            error,
+            ChatError::ProjectIdentityConflict {
+                expected: Some(expected),
+                actual: Some(actual),
+            } if expected == project_a && actual == project_b
+        ));
+        assert_eq!(repo.save_count.load(Ordering::SeqCst), 0);
+        let persisted = repo.session.lock().expect("session lock");
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(workspace_b.path().to_string_lossy().as_ref())
+        );
+        assert!(persisted.messages.is_empty());
+        assert!(!persisted
+            .metadata
+            .contains_key(SESSION_START_SOURCE_METADATA_KEY));
     }
 
     #[test]

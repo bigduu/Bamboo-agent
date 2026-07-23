@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use super::trigger_engine::{default_trigger_engine, TriggerEngine};
 use bamboo_domain::{
-    MisFirePolicy, OverlapPolicy, ScheduleRunConfig, ScheduleRunRecord, ScheduleRunStatus,
-    ScheduleSpec, ScheduleState, ScheduleTrigger, ScheduleWindow,
+    MisFirePolicy, OverlapPolicy, ProjectId, ScheduleRunConfig, ScheduleRunRecord,
+    ScheduleRunStatus, ScheduleSpec, ScheduleState, ScheduleTrigger, ScheduleWindow,
 };
 
 fn other_io_error(message: impl Into<String>) -> io::Error {
@@ -891,10 +891,51 @@ impl ScheduleStore {
         run_config: Option<ScheduleRunConfig>,
         definition: ScheduleDefinitionChanges,
     ) -> io::Result<Option<ScheduleEntry>> {
+        self.patch_schedule_with_definition_inner(id, name, enabled, run_config, definition, None)
+            .await
+    }
+
+    /// Patch only when the schedule still belongs to `expected_project_id` at
+    /// the instant the write lock is held. A scope mismatch is intentionally
+    /// indistinguishable from a missing schedule.
+    pub async fn patch_schedule_with_definition_in_project(
+        &self,
+        id: &str,
+        name: Option<String>,
+        enabled: Option<bool>,
+        run_config: Option<ScheduleRunConfig>,
+        definition: ScheduleDefinitionChanges,
+        expected_project_id: Option<&ProjectId>,
+    ) -> io::Result<Option<ScheduleEntry>> {
+        self.patch_schedule_with_definition_inner(
+            id,
+            name,
+            enabled,
+            run_config,
+            definition,
+            Some(expected_project_id.cloned()),
+        )
+        .await
+    }
+
+    async fn patch_schedule_with_definition_inner(
+        &self,
+        id: &str,
+        name: Option<String>,
+        enabled: Option<bool>,
+        run_config: Option<ScheduleRunConfig>,
+        definition: ScheduleDefinitionChanges,
+        expected_project_id: Option<Option<ProjectId>>,
+    ) -> io::Result<Option<ScheduleEntry>> {
         self.update_index(|index| {
             let Some(existing) = index.schedules.get_mut(id) else {
                 return Ok(None);
             };
+            if expected_project_id.as_ref().is_some_and(|expected| {
+                existing.run_config.project_id.as_ref() != expected.as_ref()
+            }) {
+                return Ok(None);
+            }
             let now = Utc::now();
             if let Some(name) = name {
                 existing.name = name;
@@ -948,7 +989,34 @@ impl ScheduleStore {
     }
 
     pub async fn delete_schedule(&self, id: &str) -> io::Result<bool> {
+        self.delete_schedule_inner(id, None).await
+    }
+
+    /// Delete only when the schedule still belongs to `expected_project_id`
+    /// while the write lock is held.
+    pub async fn delete_schedule_in_project(
+        &self,
+        id: &str,
+        expected_project_id: Option<&ProjectId>,
+    ) -> io::Result<bool> {
+        self.delete_schedule_inner(id, Some(expected_project_id.cloned()))
+            .await
+    }
+
+    async fn delete_schedule_inner(
+        &self,
+        id: &str,
+        expected_project_id: Option<Option<ProjectId>>,
+    ) -> io::Result<bool> {
         self.update_index(|index| {
+            if expected_project_id.as_ref().is_some_and(|expected| {
+                index
+                    .schedules
+                    .get(id)
+                    .is_none_or(|entry| entry.run_config.project_id.as_ref() != expected.as_ref())
+            }) {
+                return Ok(false);
+            }
             let deleted = index.schedules.remove(id).is_some();
             if deleted {
                 index
@@ -1197,10 +1265,53 @@ impl ScheduleStore {
 
     /// Create a run descriptor immediately (does not change the schedule cadence).
     pub async fn create_run_now(&self, id: &str) -> io::Result<Option<ClaimedScheduleRun>> {
+        self.create_run_now_inner(id, None, None).await
+    }
+
+    /// Claim a run only when the schedule still belongs to
+    /// `expected_project_id` while the write lock is held.
+    pub async fn create_run_now_in_project(
+        &self,
+        id: &str,
+        expected_project_id: Option<&ProjectId>,
+    ) -> io::Result<Option<ClaimedScheduleRun>> {
+        self.create_run_now_inner(id, Some(expected_project_id.cloned()), None)
+            .await
+    }
+
+    /// Claim a run only when the complete run configuration that was validated
+    /// by the caller is still current while the write lock is held. This keeps
+    /// a concurrent schedule PATCH from swapping in an unvalidated workspace,
+    /// Project, model, or auto-execute configuration between validation and
+    /// run creation.
+    pub async fn create_run_now_if_config(
+        &self,
+        id: &str,
+        expected_run_config: &ScheduleRunConfig,
+    ) -> io::Result<Option<ClaimedScheduleRun>> {
+        self.create_run_now_inner(id, None, Some(expected_run_config.clone()))
+            .await
+    }
+
+    async fn create_run_now_inner(
+        &self,
+        id: &str,
+        expected_project_id: Option<Option<ProjectId>>,
+        expected_run_config: Option<ScheduleRunConfig>,
+    ) -> io::Result<Option<ClaimedScheduleRun>> {
         self.update_index(|index| {
             let Some(entry) = index.schedules.get(id).cloned() else {
                 return Ok(None);
             };
+            if expected_project_id
+                .as_ref()
+                .is_some_and(|expected| entry.run_config.project_id.as_ref() != expected.as_ref())
+                || expected_run_config
+                    .as_ref()
+                    .is_some_and(|expected| &entry.run_config != expected)
+            {
+                return Ok(None);
+            }
             let now = Utc::now();
             let record = make_queued_run_record(&entry.id, now, now, false);
             let run_id = record.run_id.clone();
@@ -1374,6 +1485,35 @@ mod tests {
         assert_eq!(created.timezone.as_deref(), Some("Asia/Shanghai"));
         assert_eq!(created.misfire_policy, MisFirePolicy::RunOnce);
         assert_eq!(created.overlap_policy, OverlapPolicy::QueueOne);
+    }
+
+    #[tokio::test]
+    async fn schedule_project_identity_survives_store_restart() {
+        let dir = tempdir().unwrap();
+        let project_id: bamboo_domain::ProjectId = "project-scheduled".parse().unwrap();
+        let schedule_id = {
+            let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+            store
+                .create_schedule(
+                    "project schedule".to_string(),
+                    ScheduleTrigger::Interval {
+                        every_seconds: 300,
+                        anchor_at: None,
+                    },
+                    true,
+                    ScheduleRunConfig {
+                        project_id: Some(project_id.clone()),
+                        ..ScheduleRunConfig::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .id
+        };
+
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let persisted = reopened.get_schedule(&schedule_id).await.unwrap();
+        assert_eq!(persisted.run_config.project_id, Some(project_id));
     }
 
     #[tokio::test]
@@ -2003,6 +2143,107 @@ mod tests {
         assert_eq!(record.claimed_at, claimed.claimed_at);
         assert_eq!(record.scheduled_for, claimed.scheduled_for);
         assert!(!claimed.was_catch_up);
+    }
+
+    #[tokio::test]
+    async fn validated_run_now_rechecks_the_complete_config_under_the_write_lock() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let created = store
+            .create_schedule(
+                "run-now-config-cas".to_string(),
+                ScheduleTrigger::Interval {
+                    every_seconds: 60,
+                    anchor_at: None,
+                },
+                true,
+                ScheduleRunConfig {
+                    workspace_path: Some("/validated/workspace".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let validated = created.run_config.clone();
+
+        store
+            .patch_schedule_with_definition(
+                &created.id,
+                None,
+                None,
+                Some(ScheduleRunConfig {
+                    workspace_path: Some("/concurrently/replaced".to_string()),
+                    ..Default::default()
+                }),
+                ScheduleDefinitionChanges::default(),
+            )
+            .await
+            .unwrap()
+            .expect("schedule remains");
+
+        assert!(store
+            .create_run_now_if_config(&created.id, &validated)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_run_records_for_schedule(&created.id)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_scoped_mutations_recheck_scope_under_the_write_lock() {
+        let dir = tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let owner = ProjectId::parse("project-owner").unwrap();
+        let foreign = ProjectId::parse("project-foreign").unwrap();
+        let schedule = store
+            .create_schedule(
+                "owned".to_string(),
+                ScheduleTrigger::Interval {
+                    every_seconds: 60,
+                    anchor_at: None,
+                },
+                true,
+                ScheduleRunConfig {
+                    project_id: Some(owner.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let patched = store
+            .patch_schedule_with_definition_in_project(
+                &schedule.id,
+                Some("foreign mutation".to_string()),
+                Some(false),
+                None,
+                ScheduleDefinitionChanges::default(),
+                Some(&foreign),
+            )
+            .await
+            .unwrap();
+        assert!(patched.is_none());
+        assert!(store
+            .create_run_now_in_project(&schedule.id, Some(&foreign))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .delete_schedule_in_project(&schedule.id, Some(&foreign))
+            .await
+            .unwrap());
+
+        let unchanged = store.get_schedule(&schedule.id).await.unwrap();
+        assert_eq!(unchanged.name, "owned");
+        assert!(unchanged.enabled);
+        assert_eq!(unchanged.run_config.project_id.as_ref(), Some(&owner));
+        assert!(store
+            .list_run_records_for_schedule(&schedule.id)
+            .await
+            .is_empty());
     }
 
     #[tokio::test]
