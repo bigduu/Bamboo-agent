@@ -22,7 +22,7 @@ pub async fn clear_session(
         .clear_session(&session_id)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to clear session: {error}"))
+            crate::error::json_internal_server_error(format!("Failed to clear session: {error}"))
         })?;
 
     if !cleared {
@@ -61,7 +61,7 @@ async fn load_session_from_state_or_storage(
         .load_session(session_id)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to load session: {error}"))
+            crate::error::json_internal_server_error(format!("Failed to load session: {error}"))
         })
 }
 
@@ -109,7 +109,7 @@ pub async fn run_project_dream(
     let result = run_project_auto_dream_once(&ctx, &project_key)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!(
+            crate::error::json_internal_server_error(format!(
                 "Failed to run project Dream generation: {error}"
             ))
         })?;
@@ -159,7 +159,7 @@ pub async fn cleanup_sessions(
         .cleanup(mode, req.keep_pinned)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Cleanup failed: {error}"))
+            crate::error::json_internal_server_error(format!("Cleanup failed: {error}"))
         })?;
 
     if !result.deleted_session_ids.is_empty() {

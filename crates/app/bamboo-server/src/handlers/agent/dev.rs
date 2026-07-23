@@ -12,7 +12,7 @@ pub async fn reset(state: web::Data<AppState>) -> Result<HttpResponse> {
         .session_store
         .dev_reset()
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Reset failed: {e}")))?;
+        .map_err(|e| crate::error::json_internal_server_error(format!("Reset failed: {e}")))?;
 
     // Clear in-memory cache too.
     state.sessions.clear();

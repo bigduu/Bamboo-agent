@@ -1,4 +1,4 @@
-use actix_web::{error::ErrorInternalServerError, web, HttpResponse, Result};
+use actix_web::{web, HttpResponse, Result};
 use chrono::Utc;
 
 use crate::app_state::{AgentStatus, AppState};
@@ -25,11 +25,9 @@ pub(super) async fn load_session_or_404(
     state: &web::Data<AppState>,
     session_id: &str,
 ) -> Result<Option<Session>> {
-    state
-        .storage
-        .load_session(session_id)
-        .await
-        .map_err(|e| ErrorInternalServerError(format!("Failed to load session: {e}")))
+    state.storage.load_session(session_id).await.map_err(|e| {
+        crate::error::json_internal_server_error(format!("Failed to load session: {e}"))
+    })
 }
 
 pub(super) fn clear_derived_context_state(session: &mut Session) {
@@ -46,7 +44,9 @@ pub(super) async fn save_and_cache_session(
         .persistence
         .merge_save_runtime(&mut session)
         .await
-        .map_err(|e| ErrorInternalServerError(format!("Failed to save session: {e}")))?;
+        .map_err(|e| {
+            crate::error::json_internal_server_error(format!("Failed to save session: {e}"))
+        })?;
 
     state.sessions.insert(
         session_id.to_string(),

@@ -115,6 +115,13 @@ async fn body_json(response: actix_web::dev::ServiceResponse) -> serde_json::Val
     serde_json::from_slice(&bytes).expect("valid json body")
 }
 
+fn error_message(body: &serde_json::Value) -> &str {
+    assert_eq!(body["error"]["type"], "api_error");
+    body["error"]["message"]
+        .as_str()
+        .expect("canonical error.message string")
+}
+
 // ---------------------------------------------------------------------
 // install -> 201, list shows it, second install -> 409 AlreadyInstalled,
 // delete -> gone.
@@ -167,10 +174,7 @@ async fn install_list_reinstall_conflict_then_delete() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let error = body_json(resp).await;
     assert!(
-        error["error"]
-            .as_str()
-            .unwrap()
-            .contains("already installed"),
+        error_message(&error).contains("already installed"),
         "error message should mention already installed: {error}"
     );
 
@@ -213,7 +217,7 @@ async fn install_with_invalid_manifest_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let error = body_json(resp).await;
     assert!(
-        error["error"].as_str().unwrap().contains("invalid"),
+        error_message(&error).contains("invalid"),
         "error message should mention the manifest is invalid: {error}"
     );
 }
@@ -273,7 +277,7 @@ async fn install_with_foreign_mcp_conflict_returns_409() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let error = body_json(resp).await;
-    let message = error["error"].as_str().unwrap();
+    let message = error_message(&error);
     assert!(message.contains("mcp server"), "{message}");
     assert!(message.contains("shared-tool"), "{message}");
 
@@ -338,7 +342,7 @@ async fn update_with_mismatched_path_id_returns_400_and_rolls_back() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let error = body_json(resp).await;
-    let message = error["error"].as_str().unwrap();
+    let message = error_message(&error);
     assert!(message.contains("some-other-id"), "{message}");
     assert!(message.contains("hello-plugin"), "{message}");
 
@@ -453,7 +457,7 @@ async fn install_url_with_untrusted_host_returns_403_before_fetch() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let error = body_json(resp).await;
-    let message = error["error"].as_str().unwrap();
+    let message = error_message(&error);
     assert!(message.contains("trusted_hosts"), "{message}");
     assert!(
         message.contains("allow_untrusted_host") || message.contains("allow-untrusted-host"),
@@ -502,7 +506,7 @@ async fn install_url_with_no_checksum_or_allow_unverified_returns_400_after_host
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let error = body_json(resp).await;
-    let message = error["error"].as_str().unwrap();
+    let message = error_message(&error);
     assert!(message.contains("sha256"), "{message}");
     assert!(message.contains("allow_unverified"), "{message}");
 
@@ -536,10 +540,7 @@ async fn install_url_with_wrong_bundle_sha256_returns_400_and_installs_nothing()
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let error = body_json(resp).await;
-    assert!(
-        error["error"].as_str().unwrap().contains("mismatch"),
-        "{error}"
-    );
+    assert!(error_message(&error).contains("mismatch"), "{error}");
 
     let req = test::TestRequest::get().uri("/api/v1/plugins").to_request();
     let resp = test::call_service(&app, req).await;
@@ -676,10 +677,7 @@ async fn install_url_with_insecure_true_still_refuses_a_wrong_sha256() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let error = body_json(resp).await;
-    assert!(
-        error["error"].as_str().unwrap().contains("mismatch"),
-        "{error}"
-    );
+    assert!(error_message(&error).contains("mismatch"), "{error}");
 
     let req = test::TestRequest::get().uri("/api/v1/plugins").to_request();
     let resp = test::call_service(&app, req).await;

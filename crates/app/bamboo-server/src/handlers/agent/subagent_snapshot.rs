@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use actix_web::{error::ErrorInternalServerError, web, HttpResponse, Result};
+use actix_web::{web, HttpResponse, Result};
 use bamboo_engine::external_agents::approval_registry::{ApprovalState, DurableApproval};
 use serde::Serialize;
 
@@ -65,7 +65,7 @@ pub async fn handler(state: web::Data<AppState>) -> Result<HttpResponse> {
     let approval_snapshot = state
         .approval_registry
         .lock()
-        .map_err(|_| ErrorInternalServerError("approval registry lock poisoned"))?
+        .map_err(|_| crate::error::json_internal_server_error("approval registry lock poisoned"))?
         .unresolved_snapshot();
 
     let unresolved_by_child = unresolved_by_child(&approval_snapshot.approvals);
@@ -121,7 +121,7 @@ pub async fn handler(state: web::Data<AppState>) -> Result<HttpResponse> {
                     .storage
                     .load_runtime_control_plane(&entry.id)
                     .await
-                    .map_err(ErrorInternalServerError)?
+                    .map_err(|error| crate::error::json_internal_server_error(error.to_string()))?
                     .is_some_and(|session| {
                         session
                             .agent_runtime_state

@@ -64,7 +64,7 @@ pub async fn activate_discoverable_tools(
         .load_session(&session_id)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to load session: {error}"))
+            crate::error::json_internal_server_error(format!("Failed to load session: {error}"))
         })?
     else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
@@ -81,7 +81,7 @@ pub async fn activate_discoverable_tools(
         .merge_save_runtime(&mut session)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))
+            crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
         })?;
 
     state.sessions.insert(
@@ -111,7 +111,7 @@ pub async fn deactivate_discoverable_tools(
         .load_session(&session_id)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to load session: {error}"))
+            crate::error::json_internal_server_error(format!("Failed to load session: {error}"))
         })?
     else {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({
@@ -128,7 +128,7 @@ pub async fn deactivate_discoverable_tools(
         .merge_save_runtime(&mut session)
         .await
         .map_err(|error| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to save session: {error}"))
+            crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
         })?;
 
     state.sessions.insert(

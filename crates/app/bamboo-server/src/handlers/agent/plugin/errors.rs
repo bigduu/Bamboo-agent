@@ -6,11 +6,9 @@
 //! rule (neither the trait nor the type is local), short of adding an
 //! `actix-web` dependency to the `infra`-layer `bamboo-plugin` crate, which
 //! would be a much heavier coupling than one mapping fn. So this is a plain
-//! function, called at every plugin handler's error path — the same shape
-//! `handlers/agent/mcp` and `handlers/agent/prompt_presets` already use for
-//! their ad hoc `HttpResponse::X().json(json!({"error": ...}))` responses
-//! (a flat `{ "error": "<message>" }` body, NOT the nested
-//! `AppError`/`JsonErrorWrapper` shape `crate::error` uses elsewhere).
+//! function, called at every plugin handler's error path. Bodies use Bamboo's
+//! canonical nested `{ "error": { "message", "type" } }` envelope via
+//! [`crate::error::error_value`], matching every other native HTTP handler.
 //!
 //! # Status map (frozen — shared with the parallel CLI agent's expectations)
 //!
@@ -99,7 +97,9 @@ pub fn plugin_error_response(error: &PluginError) -> HttpResponse {
 
     match actionable_status {
         Some(status) => {
-            let body = serde_json::json!({ "error": error.to_string() });
+            let body = serde_json::json!({
+                "error": crate::error::error_value(error.to_string())
+            });
             HttpResponse::build(status).json(body)
         }
         None => {
@@ -107,7 +107,9 @@ pub fn plugin_error_response(error: &PluginError) -> HttpResponse {
             // can contain a local filesystem path) is logged server-side
             // only; the HTTP body is a fixed, generic message.
             tracing::error!(%error, "plugin operation failed with an internal error");
-            let body = serde_json::json!({ "error": GENERIC_INTERNAL_ERROR_MESSAGE });
+            let body = serde_json::json!({
+                "error": crate::error::error_value(GENERIC_INTERNAL_ERROR_MESSAGE)
+            });
             HttpResponse::InternalServerError().json(body)
         }
     }
@@ -195,7 +197,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn error_body_is_a_flat_error_string() {
+    async fn error_body_uses_the_canonical_nested_envelope() {
         let error = PluginError::NotFound("demo".to_string());
         let response = plugin_error_response(&error);
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -206,7 +208,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
         assert_eq!(
             json,
-            serde_json::json!({ "error": "plugin not found: demo" })
+            serde_json::json!({
+                "error": {
+                    "message": "plugin not found: demo",
+                    "type": "api_error"
+                }
+            })
         );
     }
 
@@ -240,7 +247,12 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
             assert_eq!(
                 json,
-                serde_json::json!({ "error": "internal error during plugin operation" }),
+                serde_json::json!({
+                    "error": {
+                        "message": "internal error during plugin operation",
+                        "type": "api_error"
+                    }
+                }),
                 "500 body must be the fixed generic message, not {error}'s own Display text"
             );
 
