@@ -126,15 +126,24 @@ impl ProviderInstanceSettingsData {
             responses_only_models: instance.responses_only_models.clone(),
             request_overrides: instance.request_overrides.clone(),
             enabled: instance.enabled,
-            target_provider: instance
-                .extra
-                .get("target_provider")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            thinking_replay_always: instance
-                .extra
-                .get("thinking_replay_always")
-                .and_then(Value::as_bool),
+            target_provider: (instance.provider_type == "bodhi")
+                .then(|| {
+                    instance
+                        .extra
+                        .get("target_provider")
+                        .and_then(Value::as_str)
+                        .filter(|target| matches!(*target, "openai" | "anthropic" | "gemini"))
+                        .map(str::to_string)
+                })
+                .flatten(),
+            thinking_replay_always: (instance.provider_type == "anthropic")
+                .then(|| {
+                    instance
+                        .extra
+                        .get("thinking_replay_always")
+                        .and_then(Value::as_bool)
+                })
+                .flatten(),
         }
     }
 
@@ -2338,6 +2347,43 @@ mod tests {
             .await;
             assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
         }
+
+        let invalid_server_value = "unclassified-invalid-target-value";
+        {
+            let mut config = state.config.write().await;
+            let bodhi = config.provider_instances.get_mut("bodhi-proxy").unwrap();
+            bodhi
+                .extra
+                .insert("target_provider".to_string(), json!(invalid_server_value));
+            bodhi
+                .extra
+                .insert("thinking_replay_always".to_string(), json!(true));
+            config
+                .provider_instances
+                .get_mut("glm-compat")
+                .unwrap()
+                .extra
+                .insert("target_provider".to_string(), json!("openai"));
+        }
+        let sanitized = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        assert!(sanitized.status().is_success());
+        let sanitized_body = String::from_utf8(test::read_body(sanitized).await.to_vec()).unwrap();
+        assert!(!sanitized_body.contains(invalid_server_value));
+        let sanitized: Value = serde_json::from_str(&sanitized_body).unwrap();
+        assert!(
+            sanitized["data"]["provider_instances"]["bodhi-proxy"]["target_provider"].is_null()
+        );
+        assert!(
+            sanitized["data"]["provider_instances"]["bodhi-proxy"]["thinking_replay_always"]
+                .is_null()
+        );
+        assert!(sanitized["data"]["provider_instances"]["glm-compat"]["target_provider"].is_null());
     }
 
     #[actix_web::test]
