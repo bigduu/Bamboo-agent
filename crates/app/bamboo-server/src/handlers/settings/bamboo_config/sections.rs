@@ -1,10 +1,11 @@
 use actix_web::{web, HttpResponse};
 use bamboo_config::{
-    patch::is_masked_api_key, ConfigStoreError, DefaultsConfig, FeatureFlags, HooksSection,
-    MemorySection, ModelLimitsSection, ModelPolicySection, ProviderConfigs, ProviderInstanceConfig,
-    RequestOverridesConfig, SectionEnvelope, SectionId, SubagentsSection, ToolsSkillsSection,
+    credential_ref, patch::is_masked_api_key, ConfigStoreError, CredentialRef, DefaultsConfig,
+    FeatureFlags, HooksSection, MemorySection, ModelLimitsSection, ModelPolicySection,
+    ProviderConfigs, ProviderInstanceConfig, RequestOverridesConfig, SectionEnvelope, SectionId,
+    SubagentsSection, ToolsSkillsSection,
 };
-use bamboo_mcp::McpConfig;
+use bamboo_mcp::{McpConfig, McpServerConfig, TransportConfig};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -26,8 +27,50 @@ pub struct PutProviderSectionRequest {
 #[serde(deny_unknown_fields)]
 pub struct PutMcpSectionRequest {
     pub expected_revision: u64,
-    #[serde(deserialize_with = "deserialize_mcp_candidate")]
-    pub data: McpConfig,
+    #[serde(deserialize_with = "deserialize_mcp_settings_candidate")]
+    pub data: McpSettingsData,
+    #[serde(default)]
+    pub credential_changes: McpCredentialChanges,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSettingsData {
+    #[serde(default = "default_mcp_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    pub credential_status: Value,
+}
+
+impl McpSettingsData {
+    fn into_config(self) -> McpConfig {
+        McpConfig {
+            version: self.version,
+            servers: self.servers,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCredentialChanges {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerCredentialChanges>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerCredentialChanges {
+    #[serde(default)]
+    pub env: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, Option<String>>,
+}
+
+fn default_mcp_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,21 +431,28 @@ pub async fn put_provider_settings_section(
     get_provider_settings_section(app_state).await
 }
 
-/// Read-only MCP section projection. Transport diagnostics remain visible,
-/// while environment/header values and legacy ciphertext never enter the DTO.
+/// Editable MCP section projection. Every transport field needed for a
+/// round-trip remains visible, while credential values and server-managed
+/// references never enter the DTO.
 pub async fn get_mcp_section(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let _io = app_state.config_io_lock.lock().await;
-    let config = app_state.config.read().await.clone();
-    let servers = config
-        .mcp
-        .servers
-        .iter()
-        .map(mcp_server_diagnostics)
-        .collect::<Vec<_>>();
-    let data = json!({
-        "version": config.mcp.version,
-        "servers": servers,
-    });
+    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
+        AppError::BadRequest(
+            "typed MCP settings require the modular configuration facade".to_string(),
+        )
+    })?;
+    let snapshot = facade.registry().mcp.snapshot();
+    let config = secret_free_mcp_config(&snapshot.data.0);
+    let statuses = app_state
+        .credential_store
+        .statuses_with_health()
+        .map_err(super::credentials::map_store_read_error)?
+        .0;
+    let data = McpSettingsData {
+        version: config.version,
+        credential_status: mcp_credential_status(&snapshot.data.0, &statuses),
+        servers: config.servers,
+    };
     let health = app_state
         .mcp_config_live_health
         .read()
@@ -428,8 +478,27 @@ pub async fn put_mcp_section(
     payload: web::Json<PutMcpSectionRequest>,
 ) -> Result<HttpResponse, AppError> {
     let payload = payload.into_inner();
+    let current = app_state
+        .config_facade
+        .as_ref()
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "typed MCP settings require the modular configuration facade".to_string(),
+            )
+        })?
+        .registry()
+        .mcp
+        .snapshot()
+        .data
+        .0
+        .clone();
+    let mut candidate = payload.data.into_config();
+    retain_mcp_server_managed_refs(&current, &mut candidate);
+    let intents =
+        apply_mcp_credential_changes(&current, &mut candidate, payload.credential_changes)
+            .map_err(map_mutation_error)?;
     app_state
-        .put_mcp_section(payload.expected_revision, payload.data)
+        .put_mcp_settings(payload.expected_revision, candidate, intents)
         .await
         .map_err(map_mutation_error)?;
     get_mcp_section(app_state).await
@@ -1068,21 +1137,23 @@ where
     Ok(candidate)
 }
 
-fn deserialize_mcp_candidate<'de, D>(deserializer: D) -> Result<McpConfig, D::Error>
+fn deserialize_mcp_settings_candidate<'de, D>(deserializer: D) -> Result<McpSettingsData, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = Value::deserialize(deserializer)?;
-    reject_secret_fields(&value, SecretPolicy::Mcp).map_err(D::Error::custom)?;
-    let candidate: McpConfig = serde_json::from_value(value).map_err(D::Error::custom)?;
-    validate_mcp_public_shape(&candidate).map_err(D::Error::custom)?;
+    let candidate: McpSettingsData = serde_json::from_value(value).map_err(D::Error::custom)?;
+    let config = McpConfig {
+        version: candidate.version,
+        servers: candidate.servers.clone(),
+    };
+    validate_mcp_settings_public_shape(&config).map_err(D::Error::custom)?;
     Ok(candidate)
 }
 
 #[derive(Clone, Copy)]
 enum SecretPolicy {
     Provider,
-    Mcp,
 }
 
 fn reject_secret_fields(value: &Value, policy: SecretPolicy) -> Result<(), String> {
@@ -1095,12 +1166,6 @@ fn reject_secret_fields(value: &Value, policy: SecretPolicy) -> Result<(), Strin
                         normalized.as_str(),
                         "api_key" | "api_key_encrypted" | "request_overrides"
                     ),
-                    SecretPolicy::Mcp => {
-                        matches!(normalized.as_str(), "env_encrypted" | "value_encrypted")
-                            || (matches!(normalized.as_str(), "env" | "headers")
-                                && !value.as_object().is_some_and(Map::is_empty)
-                                && !value.as_array().is_some_and(Vec::is_empty))
-                    }
                 };
                 if forbidden {
                     return Err(format!(
@@ -1179,6 +1244,56 @@ fn validate_mcp_public_shape(candidate: &McpConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_mcp_settings_public_shape(candidate: &McpConfig) -> Result<(), String> {
+    validate_mcp_public_shape(candidate)?;
+    let mut ids = BTreeSet::new();
+    for server in &candidate.servers {
+        if server.id.trim().is_empty() || !ids.insert(server.id.clone()) {
+            return Err("MCP server ids must be non-empty and unique".to_string());
+        }
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                if stdio.env.keys().any(|name| name.trim().is_empty()) {
+                    return Err("MCP environment variable names cannot be empty".to_string());
+                }
+                if stdio.env.values().any(|value| !value.is_empty())
+                    || !stdio.env_encrypted.is_empty()
+                    || !stdio.env_credential_refs.is_empty()
+                {
+                    return Err(
+                        "MCP config data cannot contain credential values or references; use credential_changes"
+                            .to_string(),
+                    );
+                }
+            }
+            TransportConfig::Sse(http) => validate_mcp_public_headers(&http.headers)?,
+            TransportConfig::StreamableHttp(http) => validate_mcp_public_headers(&http.headers)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_public_headers(headers: &[bamboo_mcp::HeaderConfig]) -> Result<(), String> {
+    let mut names = BTreeSet::new();
+    if headers
+        .iter()
+        .any(|header| header.name.trim().is_empty() || !names.insert(header.name.clone()))
+    {
+        return Err("MCP header names must be non-empty and unique".to_string());
+    }
+    if headers.iter().any(|header| {
+        !header.value.is_empty()
+            || header.value_encrypted.is_some()
+            || header.credential_ref.is_some()
+    }) {
+        return Err(
+            "MCP config data cannot contain credential values or references; use credential_changes"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_public_url(raw: &str) -> Result<(), String> {
     let url = url::Url::parse(raw).map_err(|_| "section URL is invalid".to_string())?;
     if !url.username().is_empty()
@@ -1194,10 +1309,7 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn section_envelope(
-    data: Value,
-    health: crate::app_state::ConfigLiveHealth,
-) -> SectionEnvelope<Value> {
+fn section_envelope<T>(data: T, health: crate::app_state::ConfigLiveHealth) -> SectionEnvelope<T> {
     SectionEnvelope {
         data,
         revision: health.revision,
@@ -1298,68 +1410,397 @@ fn safe_url_diagnostic(raw: Option<&str>) -> Option<String> {
     Some(url.to_string())
 }
 
-fn mcp_server_diagnostics(server: &bamboo_mcp::McpServerConfig) -> Value {
-    let transport = match &server.transport {
-        bamboo_mcp::TransportConfig::Stdio(stdio) => {
-            let mut env_keys = stdio.env.keys().cloned().collect::<Vec<_>>();
-            env_keys.extend(stdio.env_encrypted.keys().cloned());
-            env_keys.extend(stdio.env_credential_refs.keys().cloned());
-            env_keys.sort();
-            env_keys.dedup();
-            json!({
-                "type": "stdio",
-                "command": stdio.command,
-                "arg_count": stdio.args.len(),
-                "cwd_configured": stdio.cwd.is_some(),
-                "env_keys": env_keys,
-                "startup_timeout_ms": stdio.startup_timeout_ms,
-            })
+fn secret_free_mcp_config(config: &McpConfig) -> McpConfig {
+    let mut public = config.clone();
+    for server in &mut public.servers {
+        match &mut server.transport {
+            TransportConfig::Stdio(stdio) => {
+                let mut names = stdio.env.keys().cloned().collect::<BTreeSet<_>>();
+                names.extend(stdio.env_encrypted.keys().cloned());
+                names.extend(stdio.env_credential_refs.keys().cloned());
+                stdio.env = names
+                    .into_iter()
+                    .map(|name| (name, String::new()))
+                    .collect();
+                stdio.env_encrypted.clear();
+                stdio.env_credential_refs.clear();
+            }
+            TransportConfig::Sse(http) => {
+                http.url = safe_url_diagnostic(Some(&http.url)).unwrap_or_default();
+                make_headers_secret_free(&mut http.headers);
+            }
+            TransportConfig::StreamableHttp(http) => {
+                http.url = safe_url_diagnostic(Some(&http.url)).unwrap_or_default();
+                make_headers_secret_free(&mut http.headers);
+            }
         }
-        bamboo_mcp::TransportConfig::Sse(sse) => {
-            http_transport_diagnostics("sse", &sse.url, &sse.headers, sse.connect_timeout_ms)
-        }
-        bamboo_mcp::TransportConfig::StreamableHttp(http) => http_transport_diagnostics(
-            "streamable_http",
-            &http.url,
-            &http.headers,
-            http.connect_timeout_ms,
-        ),
-    };
-
-    json!({
-        "id": server.id,
-        "name": server.name,
-        "enabled": server.enabled,
-        "transport": transport,
-        "request_timeout_ms": server.request_timeout_ms,
-        "healthcheck_interval_ms": server.healthcheck_interval_ms,
-        "reconnect": server.reconnect,
-        "allowed_tools": server.allowed_tools,
-        "denied_tools": server.denied_tools,
-    })
+    }
+    public
 }
 
-fn http_transport_diagnostics(
-    kind: &str,
-    url: &str,
-    headers: &[bamboo_mcp::HeaderConfig],
-    connect_timeout_ms: u64,
+fn make_headers_secret_free(headers: &mut [bamboo_mcp::HeaderConfig]) {
+    for header in headers {
+        header.value.clear();
+        header.value_encrypted = None;
+        header.credential_ref = None;
+    }
+}
+
+fn mcp_credential_status(
+    config: &McpConfig,
+    statuses: &[bamboo_config::CredentialStatus],
 ) -> Value {
-    let mut header_names = headers
+    let by_ref = statuses
         .iter()
-        .filter_map(|header| {
-            let name = header.name.trim();
-            (!name.is_empty()).then(|| name.to_string())
+        .map(|status| (status.credential_ref.as_str(), status))
+        .collect::<BTreeMap<_, _>>();
+    let mut servers = Map::new();
+    for server in &config.servers {
+        let mut env = Map::new();
+        let mut headers = Map::new();
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                let mut names = stdio.env.keys().cloned().collect::<BTreeSet<_>>();
+                names.extend(stdio.env_encrypted.keys().cloned());
+                names.extend(stdio.env_credential_refs.keys().cloned());
+                for name in names {
+                    let status = stdio
+                        .env_credential_refs
+                        .get(&name)
+                        .and_then(|raw_reference| by_ref.get(raw_reference.as_str()).copied());
+                    env.insert(name, mcp_credential_status_value(status));
+                }
+            }
+            TransportConfig::Sse(http) => {
+                collect_mcp_header_status(&http.headers, &by_ref, &mut headers)
+            }
+            TransportConfig::StreamableHttp(http) => {
+                collect_mcp_header_status(&http.headers, &by_ref, &mut headers)
+            }
+        }
+        servers.insert(
+            server.id.clone(),
+            json!({
+                "env": env,
+                "headers": headers,
+            }),
+        );
+    }
+    Value::Object(servers)
+}
+
+fn collect_mcp_header_status<'a>(
+    headers_config: &[bamboo_mcp::HeaderConfig],
+    by_ref: &BTreeMap<&'a str, &'a bamboo_config::CredentialStatus>,
+    output: &mut Map<String, Value>,
+) {
+    for header in headers_config {
+        let status = header
+            .credential_ref
+            .as_deref()
+            .and_then(|raw_reference| by_ref.get(raw_reference).copied());
+        output.insert(header.name.clone(), mcp_credential_status_value(status));
+    }
+}
+
+fn mcp_credential_status_value(status: Option<&bamboo_config::CredentialStatus>) -> Value {
+    status.map_or_else(
+        || {
+            json!({
+                "configured": false,
+                "source": "missing",
+                "updated_at": null,
+            })
+        },
+        |status| {
+            json!({
+                "configured": status.configured,
+                "source": status.source,
+                "updated_at": status.updated_at,
+            })
+        },
+    )
+}
+
+fn retain_mcp_server_managed_refs(current: &McpConfig, candidate: &mut McpConfig) {
+    for candidate_server in &mut candidate.servers {
+        let Some(current_server) = current
+            .servers
+            .iter()
+            .find(|server| server.id == candidate_server.id)
+        else {
+            continue;
+        };
+        match (&current_server.transport, &mut candidate_server.transport) {
+            (TransportConfig::Stdio(current), TransportConfig::Stdio(candidate)) => {
+                candidate.env_credential_refs = current
+                    .env_credential_refs
+                    .iter()
+                    .filter(|(name, _)| candidate.env.contains_key(name.as_str()))
+                    .map(|(name, reference)| (name.clone(), reference.clone()))
+                    .collect();
+            }
+            (TransportConfig::Sse(current), TransportConfig::Sse(candidate)) => {
+                retain_mcp_header_refs(&current.headers, &mut candidate.headers)
+            }
+            (
+                TransportConfig::StreamableHttp(current),
+                TransportConfig::StreamableHttp(candidate),
+            ) => retain_mcp_header_refs(&current.headers, &mut candidate.headers),
+            _ => {}
+        }
+    }
+}
+
+fn retain_mcp_header_refs(
+    current: &[bamboo_mcp::HeaderConfig],
+    candidate: &mut [bamboo_mcp::HeaderConfig],
+) {
+    for candidate_header in candidate {
+        candidate_header.credential_ref = current
+            .iter()
+            .find(|header| header.name == candidate_header.name)
+            .and_then(|header| header.credential_ref.clone());
+    }
+}
+
+fn apply_mcp_credential_changes(
+    current: &McpConfig,
+    candidate: &mut McpConfig,
+    changes: McpCredentialChanges,
+) -> Result<BTreeSet<CredentialRef>, ConfigSectionMutationError> {
+    let current_refs = mcp_credential_refs(current)?;
+    let mut intents = BTreeSet::new();
+    for (server_id, server_changes) in changes.servers {
+        for (name, value) in server_changes.env {
+            let reference = current_mcp_env_ref(current, &server_id, &name)?.map_or_else(
+                || {
+                    credential_ref("mcp", &server_id, &format!("env_{name}"))
+                        .map_err(ConfigSectionMutationError::Store)
+                },
+                Ok,
+            )?;
+            apply_mcp_env_change(candidate, &server_id, &name, value, &reference)?;
+            intents.insert(reference);
+        }
+        for (name, value) in server_changes.headers {
+            let reference = current_mcp_header_ref(current, &server_id, &name)?.map_or_else(
+                || {
+                    credential_ref("mcp", &server_id, &format!("header_{name}"))
+                        .map_err(ConfigSectionMutationError::Store)
+                },
+                Ok,
+            )?;
+            apply_mcp_header_change(candidate, &server_id, &name, value, &reference)?;
+            intents.insert(reference);
+        }
+    }
+    let candidate_refs = mcp_credential_refs(candidate)?;
+    if current_refs
+        .symmetric_difference(&candidate_refs)
+        .any(|reference| !intents.contains(reference))
+    {
+        return Err(ConfigSectionMutationError::Invalid(
+            "MCP credentials require explicit replace or clear actions".to_string(),
+        ));
+    }
+    Ok(intents)
+}
+
+fn mcp_credential_refs(
+    config: &McpConfig,
+) -> Result<BTreeSet<CredentialRef>, ConfigSectionMutationError> {
+    let mut references = BTreeSet::new();
+    for server in &config.servers {
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                for raw in stdio.env_credential_refs.values() {
+                    references.insert(CredentialRef::parse(raw.clone()).map_err(|_| {
+                        ConfigSectionMutationError::Invalid(
+                            "MCP credential reference is invalid".to_string(),
+                        )
+                    })?);
+                }
+            }
+            TransportConfig::Sse(http) => collect_mcp_header_refs(&http.headers, &mut references)?,
+            TransportConfig::StreamableHttp(http) => {
+                collect_mcp_header_refs(&http.headers, &mut references)?
+            }
+        }
+    }
+    Ok(references)
+}
+
+fn collect_mcp_header_refs(
+    headers: &[bamboo_mcp::HeaderConfig],
+    output: &mut BTreeSet<CredentialRef>,
+) -> Result<(), ConfigSectionMutationError> {
+    for raw in headers
+        .iter()
+        .filter_map(|header| header.credential_ref.as_ref())
+    {
+        output.insert(CredentialRef::parse(raw.clone()).map_err(|_| {
+            ConfigSectionMutationError::Invalid("MCP credential reference is invalid".to_string())
+        })?);
+    }
+    Ok(())
+}
+
+fn current_mcp_env_ref(
+    config: &McpConfig,
+    server_id: &str,
+    name: &str,
+) -> Result<Option<CredentialRef>, ConfigSectionMutationError> {
+    let Some(server) = config.servers.iter().find(|server| server.id == server_id) else {
+        return Ok(None);
+    };
+    let TransportConfig::Stdio(stdio) = &server.transport else {
+        return Ok(None);
+    };
+    stdio
+        .env_credential_refs
+        .get(name)
+        .map(|raw| {
+            CredentialRef::parse(raw.clone()).map_err(|_| {
+                ConfigSectionMutationError::Invalid(
+                    "MCP credential reference is invalid".to_string(),
+                )
+            })
         })
-        .collect::<Vec<_>>();
-    header_names.sort();
-    header_names.dedup();
-    json!({
-        "type": kind,
-        "url": safe_url_diagnostic(Some(url)),
-        "header_names": header_names,
-        "connect_timeout_ms": connect_timeout_ms,
-    })
+        .transpose()
+}
+
+fn current_mcp_header_ref(
+    config: &McpConfig,
+    server_id: &str,
+    name: &str,
+) -> Result<Option<CredentialRef>, ConfigSectionMutationError> {
+    let Some(server) = config.servers.iter().find(|server| server.id == server_id) else {
+        return Ok(None);
+    };
+    let headers = match &server.transport {
+        TransportConfig::Sse(http) => &http.headers,
+        TransportConfig::StreamableHttp(http) => &http.headers,
+        TransportConfig::Stdio(_) => return Ok(None),
+    };
+    headers
+        .iter()
+        .find(|header| header.name == name)
+        .and_then(|header| header.credential_ref.as_ref())
+        .map(|raw| {
+            CredentialRef::parse(raw.clone()).map_err(|_| {
+                ConfigSectionMutationError::Invalid(
+                    "MCP credential reference is invalid".to_string(),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn apply_mcp_env_change(
+    candidate: &mut McpConfig,
+    server_id: &str,
+    name: &str,
+    value: Option<String>,
+    reference: &CredentialRef,
+) -> Result<(), ConfigSectionMutationError> {
+    if value.as_deref().is_some_and(is_masked_api_key) {
+        return Err(ConfigSectionMutationError::Invalid(
+            "masked MCP credential placeholders are not accepted".to_string(),
+        ));
+    }
+    let server = candidate
+        .servers
+        .iter_mut()
+        .find(|server| server.id == server_id);
+    match (server, value) {
+        (Some(server), Some(value)) if !value.is_empty() => {
+            let TransportConfig::Stdio(stdio) = &mut server.transport else {
+                return Err(ConfigSectionMutationError::Invalid(
+                    "MCP environment credentials require a stdio server".to_string(),
+                ));
+            };
+            stdio.env.insert(name.to_string(), value);
+            stdio
+                .env_credential_refs
+                .insert(name.to_string(), reference.as_str().to_string());
+        }
+        (_, Some(_)) => {
+            return Err(ConfigSectionMutationError::Invalid(
+                "MCP credential replacement cannot be empty".to_string(),
+            ))
+        }
+        (Some(server), None) => {
+            if let TransportConfig::Stdio(stdio) = &mut server.transport {
+                stdio.env.remove(name);
+                stdio.env_credential_refs.remove(name);
+            }
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+fn apply_mcp_header_change(
+    candidate: &mut McpConfig,
+    server_id: &str,
+    name: &str,
+    value: Option<String>,
+    reference: &CredentialRef,
+) -> Result<(), ConfigSectionMutationError> {
+    if value.as_deref().is_some_and(is_masked_api_key) {
+        return Err(ConfigSectionMutationError::Invalid(
+            "masked MCP credential placeholders are not accepted".to_string(),
+        ));
+    }
+    let server = candidate
+        .servers
+        .iter_mut()
+        .find(|server| server.id == server_id);
+    match (server, value) {
+        (Some(server), Some(value)) if !value.is_empty() => {
+            let headers = match &mut server.transport {
+                TransportConfig::Sse(http) => &mut http.headers,
+                TransportConfig::StreamableHttp(http) => &mut http.headers,
+                TransportConfig::Stdio(_) => {
+                    return Err(ConfigSectionMutationError::Invalid(
+                        "MCP header credentials require an HTTP server".to_string(),
+                    ))
+                }
+            };
+            let header = headers
+                .iter_mut()
+                .find(|header| header.name == name)
+                .ok_or_else(|| {
+                    ConfigSectionMutationError::Invalid(
+                        "MCP header credential target is missing from the server config"
+                            .to_string(),
+                    )
+                })?;
+            header.value = value;
+            header.credential_ref = Some(reference.as_str().to_string());
+        }
+        (_, Some(_)) => {
+            return Err(ConfigSectionMutationError::Invalid(
+                "MCP credential replacement cannot be empty".to_string(),
+            ))
+        }
+        (Some(server), None) => {
+            let headers = match &mut server.transport {
+                TransportConfig::Sse(http) => Some(&mut http.headers),
+                TransportConfig::StreamableHttp(http) => Some(&mut http.headers),
+                TransportConfig::Stdio(_) => None,
+            };
+            if let Some(headers) = headers {
+                if let Some(header) = headers.iter_mut().find(|header| header.name == name) {
+                    header.value.clear();
+                    header.credential_ref = None;
+                }
+            }
+        }
+        (None, None) => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1413,8 +1854,30 @@ mod tests {
 
     #[actix_web::test]
     async fn typed_sections_expose_health_and_diagnostics_without_secret_material() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x49; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let env_reference = bamboo_config::credential_ref("mcp", "stdio", "env_TOKEN").unwrap();
+        let header_reference =
+            bamboo_config::credential_ref("mcp", "http", "header_Authorization").unwrap();
+        state
+            .credential_store
+            .replace(
+                env_reference.clone(),
+                "mcp-env-plaintext-secret",
+                bamboo_config::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        state
+            .credential_store
+            .replace(
+                header_reference.clone(),
+                "mcp-header-plaintext-secret",
+                bamboo_config::CredentialSource::User,
+                1,
+            )
+            .unwrap();
         {
             let mut config = state.config.write().await;
             *config.providers_mut() = ProviderConfigs {
@@ -1450,34 +1913,38 @@ mod tests {
                             command: "diagnostic-command".to_string(),
                             args: vec!["mcp-argument-secret".to_string()],
                             cwd: Some("/safe/workspace".to_string()),
-                            env: HashMap::from([(
+                            env: HashMap::new(),
+                            env_encrypted: HashMap::new(),
+                            env_credential_refs: HashMap::from([(
                                 "TOKEN".to_string(),
-                                "mcp-env-plaintext-secret".to_string(),
+                                env_reference.as_str().to_string(),
                             )]),
-                            env_encrypted: HashMap::from([(
-                                "LEGACY_TOKEN".to_string(),
-                                "mcp-env-ciphertext-secret".to_string(),
-                            )]),
-                            env_credential_refs: HashMap::new(),
                             startup_timeout_ms: 4_000,
                         }),
                     ),
                     server(
                         "http",
                         TransportConfig::StreamableHttp(StreamableHttpConfig {
-                            url: "https://mcp-url-secret@mcp.example/rpc?token=mcp-query-secret"
-                                .to_string(),
+                            url: "https://mcp.example/rpc".to_string(),
                             headers: vec![HeaderConfig {
                                 name: "Authorization".to_string(),
-                                value: "mcp-header-plaintext-secret".to_string(),
-                                value_encrypted: Some("mcp-header-ciphertext-secret".to_string()),
-                                credential_ref: None,
+                                value: String::new(),
+                                value_encrypted: None,
+                                credential_ref: Some(header_reference.as_str().to_string()),
                             }],
                             connect_timeout_ms: 5_000,
                         }),
                     ),
                 ],
             };
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .mcp
+                .commit(0, bamboo_config::McpSection(config.mcp.clone()))
+                .unwrap();
         }
         {
             let mut health = state
@@ -1595,15 +2062,11 @@ mod tests {
         let mcp_body = String::from_utf8(test::read_body(mcp_response).await.to_vec()).unwrap();
         for forbidden in [
             "mcp-env-plaintext-secret",
-            "mcp-env-ciphertext-secret",
             "mcp-header-plaintext-secret",
-            "mcp-header-ciphertext-secret",
-            "mcp-argument-secret",
-            "mcp-url-secret",
-            "mcp-query-secret",
             "****...****",
             "value_encrypted",
             "env_encrypted",
+            "credential_ref",
         ] {
             assert!(!mcp_body.contains(forbidden), "leaked {forbidden}");
         }
@@ -1617,20 +2080,31 @@ mod tests {
         );
         assert_eq!(mcp["last_error"], "redacted runtime failure");
         assert_eq!(
-            mcp["data"]["servers"][0]["transport"]["env_keys"],
-            json!(["LEGACY_TOKEN", "TOKEN"])
+            mcp["data"]["servers"][0]["transport"]["env"],
+            json!({"TOKEN": ""})
         );
         assert_eq!(
-            mcp["data"]["servers"][1]["transport"]["header_names"],
-            json!(["Authorization"])
+            mcp["data"]["servers"][1]["transport"]["headers"][0],
+            json!({"name": "Authorization", "value": ""})
         );
         assert_eq!(
             mcp["data"]["servers"][1]["transport"]["url"],
             "https://mcp.example/rpc"
         );
-        assert_eq!(mcp["data"]["servers"][0]["transport"]["arg_count"], 1);
         assert_eq!(
-            mcp["data"]["servers"][0]["transport"]["cwd_configured"],
+            mcp["data"]["servers"][0]["transport"]["args"],
+            json!(["mcp-argument-secret"])
+        );
+        assert_eq!(
+            mcp["data"]["servers"][0]["transport"]["cwd"],
+            "/safe/workspace"
+        );
+        assert_eq!(
+            mcp["data"]["credential_status"]["stdio"]["env"]["TOKEN"]["configured"],
+            true
+        );
+        assert_eq!(
+            mcp["data"]["credential_status"]["http"]["headers"]["Authorization"]["configured"],
             true
         );
     }
@@ -1804,7 +2278,13 @@ mod tests {
                 .to_request(),
         )
         .await;
-        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+        let stale_status = stale.status();
+        let stale_body = String::from_utf8(test::read_body(stale).await.to_vec()).unwrap();
+        assert_eq!(
+            stale_status,
+            actix_web::http::StatusCode::CONFLICT,
+            "unexpected stale response: {stale_body}"
+        );
         assert_eq!(
             state
                 .config
@@ -2513,7 +2993,25 @@ mod tests {
                 ),
             ],
         };
-        state.config.write().await.mcp = current;
+        state.config.write().await.mcp = current.clone();
+        let mut durable_current = current;
+        let TransportConfig::Stdio(stdio) = &mut durable_current.servers[0].transport else {
+            unreachable!()
+        };
+        stdio.env.clear();
+        let TransportConfig::StreamableHttp(http) = &mut durable_current.servers[1].transport
+        else {
+            unreachable!()
+        };
+        http.headers[0].value.clear();
+        state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .commit(0, bamboo_config::McpSection(durable_current))
+            .unwrap();
         let mut feed = state.account_sink.subscribe();
 
         let app = test::init_service(
@@ -2531,7 +3029,7 @@ mod tests {
                         command: "updated-disabled-command".to_string(),
                         args: vec!["--safe".to_string()],
                         cwd: None,
-                        env: HashMap::new(),
+                        env: HashMap::from([("TOKEN".to_string(), String::new())]),
                         env_encrypted: HashMap::new(),
                         env_credential_refs: std::collections::HashMap::new(),
                         startup_timeout_ms: 500,
@@ -2541,7 +3039,12 @@ mod tests {
                     "preserved-http",
                     TransportConfig::StreamableHttp(StreamableHttpConfig {
                         url: "https://mcp.example/rpc".to_string(),
-                        headers: Vec::new(),
+                        headers: vec![HeaderConfig {
+                            name: "Authorization".to_string(),
+                            value: String::new(),
+                            value_encrypted: None,
+                            credential_ref: None,
+                        }],
                         connect_timeout_ms: 500,
                     }),
                 ),
@@ -2551,7 +3054,13 @@ mod tests {
             &app,
             test::TestRequest::put()
                 .uri("/mcp")
-                .set_json(json!({"expected_revision": 0, "data": candidate.clone()}))
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": {
+                        "version": candidate.version,
+                        "servers": candidate.servers,
+                    }
+                }))
                 .to_request(),
         )
         .await;
@@ -2582,7 +3091,7 @@ mod tests {
                     &event.event,
                     bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
                         | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
-                        if section == "mcp" && *revision == 1
+                        if section == "mcp" && *revision == 2
                 ) {
                     break;
                 }
@@ -2615,10 +3124,10 @@ mod tests {
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .revision,
-            1
+            2
         );
 
-        let mut failing = candidate;
+        let mut failing = state.config.read().await.mcp.clone();
         failing.servers[0].enabled = true;
         if let TransportConfig::Stdio(stdio) = &mut failing.servers[0].transport {
             stdio.command = "definitely-not-a-real-mcp-command-597".to_string();
@@ -2627,14 +3136,20 @@ mod tests {
             &app,
             test::TestRequest::put()
                 .uri("/mcp")
-                .set_json(json!({"expected_revision": 1, "data": failing}))
+                .set_json(json!({
+                    "expected_revision": 2,
+                    "data": {
+                        "version": failing.version,
+                        "servers": secret_free_mcp_config(&failing).servers,
+                    }
+                }))
                 .to_request(),
         )
         .await;
         assert_eq!(failure.status(), actix_web::http::StatusCode::BAD_REQUEST);
         let persisted: Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("mcp.json")).unwrap()).unwrap();
-        assert_eq!(persisted["revision"], 1);
+        assert_eq!(persisted["revision"], 2);
         assert!(
             !state.config.read().await.mcp.servers[0].enabled,
             "runtime failure must retain the last-known-good config"
@@ -2644,8 +3159,341 @@ mod tests {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        assert_eq!(health.revision, 1);
+        assert_eq!(health.revision, 2);
         assert_eq!(health.status, SectionStatus::Degraded);
+    }
+
+    #[actix_web::test]
+    async fn mcp_settings_credentials_replace_clear_and_stale_cas_are_atomic_and_secret_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let health = state
+                    .mcp_config_live_health
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if health.status == SectionStatus::Healthy && health.revision == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial MCP runtime reconciliation completes");
+        let mut feed = state.account_sink.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/mcp", web::get().to(get_mcp_section))
+                .route("/mcp", web::put().to(put_mcp_section)),
+        )
+        .await;
+        let first_env_secret = "mcp-env-first-secret-701";
+        let first_header_secret = "mcp-header-first-secret-701";
+        let initial = json!({
+            "version": 1,
+            "servers": [
+                {
+                    "id": "stdio",
+                    "name": "Editable stdio",
+                    "enabled": false,
+                    "transport": {
+                        "type": "stdio",
+                        "command": "node",
+                        "args": ["server.js", "--safe"],
+                        "cwd": "/tmp/mcp-701",
+                        "env": {"TOKEN": ""},
+                        "startup_timeout_ms": 500
+                    },
+                    "request_timeout_ms": 2_000,
+                    "healthcheck_interval_ms": 3_000,
+                    "reconnect": {"enabled": true, "max_attempts": 4, "delay_ms": 250},
+                    "allowed_tools": ["read"],
+                    "denied_tools": ["delete"]
+                },
+                {
+                    "id": "http",
+                    "name": "Editable HTTP",
+                    "enabled": false,
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.example/rpc",
+                        "headers": [{"name": "Authorization", "value": ""}],
+                        "connect_timeout_ms": 500
+                    }
+                }
+            ],
+            "credential_status": {}
+        });
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": initial,
+                    "credential_changes": {
+                        "servers": {
+                            "stdio": {"env": {"TOKEN": first_env_secret}},
+                            "http": {"headers": {"Authorization": first_header_secret}}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
+        for forbidden in [
+            first_env_secret,
+            first_header_secret,
+            "****...****",
+            "credential_ref",
+            "ciphertext",
+        ] {
+            assert!(!body.contains(forbidden), "response leaked {forbidden}");
+        }
+        let first: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(first["revision"], 1);
+        let first_servers = first["data"]["servers"].as_array().unwrap();
+        let first_stdio = first_servers
+            .iter()
+            .find(|server| server["id"] == "stdio")
+            .unwrap();
+        assert_eq!(
+            first_stdio["transport"]["args"],
+            json!(["server.js", "--safe"])
+        );
+        assert_eq!(first_stdio["transport"]["cwd"], "/tmp/mcp-701");
+        assert_eq!(first_stdio["reconnect"]["max_attempts"], 4);
+        assert_eq!(
+            first["data"]["credential_status"]["stdio"]["env"]["TOKEN"]["configured"],
+            true
+        );
+        assert_eq!(
+            first["data"]["credential_status"]["stdio"]["env"]["TOKEN"]["source"],
+            "user"
+        );
+        assert_eq!(
+            first["data"]["credential_status"]["http"]["headers"]["Authorization"]["configured"],
+            true
+        );
+        let mcp_disk = std::fs::read_to_string(dir.path().join("mcp.json")).unwrap();
+        let credential_disk = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
+        assert!(!mcp_disk.contains(first_env_secret));
+        assert!(!mcp_disk.contains(first_header_secret));
+        assert!(!credential_disk.contains(first_env_secret));
+        assert!(!credential_disk.contains(first_header_secret));
+        assert!(mcp_disk.contains("mcp.stdio.env_TOKEN"));
+        assert!(mcp_disk.contains("mcp.http.header_Authorization"));
+        let env_reference = bamboo_config::credential_ref("mcp", "stdio", "env_TOKEN").unwrap();
+        let header_reference =
+            bamboo_config::credential_ref("mcp", "http", "header_Authorization").unwrap();
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&env_reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            first_env_secret
+        );
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&header_reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            first_header_secret
+        );
+
+        let mut missing_explicit_clear = first["data"].clone();
+        missing_explicit_clear["servers"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|server| server["id"] == "stdio")
+            .unwrap()["transport"]["env"]
+            .as_object_mut()
+            .unwrap()
+            .remove("TOKEN");
+        let implicit_clear = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": missing_explicit_clear
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            implicit_clear.status(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+
+        let masked_replacement = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": first["data"].clone(),
+                    "credential_changes": {
+                        "servers": {
+                            "stdio": {"env": {"TOKEN": "****...****"}}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            masked_replacement.status(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+        let masked_header_replacement = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": first["data"].clone(),
+                    "credential_changes": {
+                        "servers": {
+                            "http": {"headers": {"Authorization": "****...****"}}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            masked_header_replacement.status(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .mcp
+                .snapshot()
+                .revision,
+            1
+        );
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": first["data"].clone()
+                }))
+                .to_request(),
+        )
+        .await;
+        let stale_status = stale.status();
+        let stale_body = String::from_utf8(test::read_body(stale).await.to_vec()).unwrap();
+        assert_eq!(
+            stale_status,
+            actix_web::http::StatusCode::CONFLICT,
+            "unexpected stale response: {stale_body}"
+        );
+
+        let second_env_secret = "mcp-env-second-secret-701";
+        let second_header_secret = "mcp-header-second-secret-701";
+        let replaced = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": first["data"].clone(),
+                    "credential_changes": {
+                        "servers": {
+                            "stdio": {"env": {"TOKEN": second_env_secret}},
+                            "http": {"headers": {"Authorization": second_header_secret}}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let replaced_body = String::from_utf8(test::read_body(replaced).await.to_vec()).unwrap();
+        assert!(!replaced_body.contains(second_env_secret));
+        assert!(!replaced_body.contains(second_header_secret));
+        let replaced: Value = serde_json::from_str(&replaced_body).unwrap();
+        assert_eq!(replaced["revision"], 2);
+
+        let cleared = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/mcp")
+                .set_json(json!({
+                    "expected_revision": 2,
+                    "data": replaced["data"].clone(),
+                    "credential_changes": {
+                        "servers": {
+                            "stdio": {"env": {"TOKEN": null}},
+                            "http": {"headers": {"Authorization": null}}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let cleared_status = cleared.status();
+        let cleared_body = String::from_utf8(test::read_body(cleared).await.to_vec()).unwrap();
+        assert!(
+            cleared_status.is_success(),
+            "unexpected response {cleared_status}: {cleared_body}"
+        );
+        let cleared: Value = serde_json::from_str(&cleared_body).unwrap();
+        assert_eq!(cleared["revision"], 3);
+        assert_eq!(
+            cleared["data"]["credential_status"]["http"]["headers"]["Authorization"]["configured"],
+            false
+        );
+        for reference in [env_reference, header_reference] {
+            assert!(state
+                .credential_store
+                .resolve(&reference)
+                .unwrap()
+                .is_none());
+        }
+        let disk_after_clear = std::fs::read_to_string(dir.path().join("mcp.json")).unwrap();
+        assert!(!disk_after_clear.contains("mcp.stdio.env_TOKEN"));
+        assert!(!disk_after_clear.contains("mcp.http.header_Authorization"));
+
+        for revision in 1..=3 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = feed.recv().await.unwrap();
+                    if matches!(
+                        &event.event,
+                        bamboo_agent_core::AgentEvent::ConfigChanged {
+                            section,
+                            revision: event_revision
+                        } | bamboo_agent_core::AgentEvent::ConfigRecovered {
+                            section,
+                            revision: event_revision
+                        } if section == "mcp" && *event_revision == revision
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("MCP section event is published");
+        }
     }
 
     #[::core::prelude::v1::test]
@@ -2658,8 +3506,22 @@ mod tests {
             assert!(serde_json::from_value::<PutProviderSectionRequest>(payload).is_err());
         }
         for payload in [
-            json!({"expected_revision": 0, "data": {"server": {"command": "cmd", "env": {"TOKEN": "secret"}}}}),
-            json!({"expected_revision": 0, "data": {"server": {"url": "https://example.test/mcp?token=secret"}}}),
+            json!({"expected_revision": 0, "data": {"servers": [{
+                "id": "stdio",
+                "transport": {"type": "stdio", "command": "cmd", "env": {"TOKEN": "secret"}}
+            }]}}),
+            json!({"expected_revision": 0, "data": {"servers": [{
+                "id": "http",
+                "transport": {"type": "streamable_http", "url": "https://example.test/mcp?token=secret"}
+            }]}}),
+            json!({"expected_revision": 0, "data": {"servers": [{
+                "id": "forged",
+                "transport": {
+                    "type": "stdio",
+                    "command": "cmd",
+                    "env_credential_refs": {"TOKEN": "mcp.forged.env_TOKEN"}
+                }
+            }]}}),
         ] {
             assert!(serde_json::from_value::<PutMcpSectionRequest>(payload).is_err());
         }
@@ -2671,7 +3533,10 @@ mod tests {
         .is_ok());
         assert!(serde_json::from_value::<PutMcpSectionRequest>(json!({
             "expected_revision": 0,
-            "data": {"server": {"command": "cmd****name"}}
+            "data": {"servers": [{
+                "id": "stdio",
+                "transport": {"type": "stdio", "command": "cmd****name"}
+            }]}
         }))
         .is_ok());
     }

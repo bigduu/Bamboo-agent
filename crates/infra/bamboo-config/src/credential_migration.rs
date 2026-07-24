@@ -1884,6 +1884,7 @@ pub fn persist_mcp_reset_credential_transaction_at_revision(
     config: &mut crate::Config,
     expected_revision: u64,
 ) -> ConfigStoreResult<u64> {
+    let intents = BTreeSet::new();
     persist_exact_credential_transaction_inner(
         data_dir.as_ref(),
         config,
@@ -1900,10 +1901,63 @@ pub fn persist_mcp_reset_credential_transaction_at_revision(
         None,
         None,
         None,
-        Some(expected_revision),
+        Some((&intents, expected_revision)),
         None,
         #[cfg(test)]
         None,
+    )
+}
+
+/// Persist MCP metadata and every explicitly touched environment/header
+/// credential in one recoverable exact transaction guarded by the MCP section
+/// revision.
+pub fn persist_mcp_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    intents: &BTreeSet<CredentialRef>,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    persist_mcp_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        intents,
+        expected_revision,
+        None,
+    )
+}
+
+fn persist_mcp_credential_transaction_inner(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    intents: &BTreeSet<CredentialRef>,
+    expected_revision: u64,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<u64> {
+    if !crate::section_layout_is_active(data_dir)? {
+        return Err(ConfigStoreError::Validation(
+            "MCP credential updates require the modular configuration layout".to_string(),
+        ));
+    }
+    persist_exact_credential_transaction_inner(
+        data_dir,
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((intents, expected_revision)),
+        None,
+        #[cfg(test)]
+        fault,
     )
 }
 
@@ -2069,7 +2123,7 @@ fn persist_exact_credential_transaction_inner(
     connect_transaction: Option<(&crate::patch::ConnectSecretIntents, u64)>,
     access_transaction: Option<(bool, &BTreeSet<String>, u64)>,
     provider_expected_revision: Option<u64>,
-    mcp_expected_revision: Option<u64>,
+    mcp_transaction: Option<(&BTreeSet<CredentialRef>, u64)>,
     reset_scope: Option<(ExactTransactionScope, u64)>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
@@ -2109,7 +2163,7 @@ fn persist_exact_credential_transaction_inner(
         && cluster_transaction.is_none()
         && connect_transaction.is_none()
         && (access_transaction.is_some() || reset_is(ExactTransactionScope::AccessControl));
-    let mcp_only = mcp_expected_revision.is_some()
+    let mcp_only = mcp_transaction.is_some()
         && provider_intents.is_empty()
         && provider_instance_intents.is_empty()
         && env_intents.is_empty()
@@ -2195,9 +2249,11 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if let (Some(expected), Some(section), Some(ExactTransactionScope::Mcp)) =
-        (mcp_expected_revision, active_section.as_ref(), exact_scope)
-    {
+    if let (Some(expected), Some(section), Some(ExactTransactionScope::Mcp)) = (
+        mcp_transaction.map(|(_, revision)| revision),
+        active_section.as_ref(),
+        exact_scope,
+    ) {
         if section.expected_revision != expected {
             return Err(ConfigStoreError::Conflict {
                 expected,
@@ -2395,8 +2451,12 @@ fn persist_exact_credential_transaction_inner(
             device_intents,
             &persisted_access_refs,
         )?
-    } else if mcp_only {
-        Some(store.prepare_clear_owned_references(config, &persisted_mcp_refs)?)
+    } else if let Some((intents, _)) = mcp_transaction {
+        if intents.is_empty() {
+            Some(store.prepare_clear_owned_references(config, &persisted_mcp_refs)?)
+        } else {
+            store.prepare_mcp_intents(config, intents, &persisted_mcp_refs)?
+        }
     } else {
         store.prepare_provider_api_key_intents(
             config,
@@ -2555,8 +2615,13 @@ fn persist_exact_credential_transaction_inner(
             original_data != candidate_data,
         )
     } else if let (Some(section), Some(scope)) = (active_section.as_ref(), exact_scope) {
-        let (bytes, changed) =
-            prepare_active_exact_section_document(section, scope, &config_bytes)?;
+        let credential_changed = mcp_only && prepared.revision != prepared.expected_revision;
+        let (bytes, changed) = prepare_active_exact_section_document(
+            section,
+            scope,
+            &config_bytes,
+            credential_changed,
+        )?;
         (
             section.name,
             section.original.as_slice(),
@@ -6262,6 +6327,7 @@ fn prepare_active_exact_section_document(
     section: &ActiveExactSection,
     scope: ExactTransactionScope,
     updated_legacy_root: &[u8],
+    force_revision: bool,
 ) -> ConfigStoreResult<(Vec<u8>, bool)> {
     let updated_root = parse_config_root_object(
         updated_legacy_root,
@@ -6350,7 +6416,7 @@ fn prepare_active_exact_section_document(
     let object = envelope.as_object_mut().ok_or_else(|| {
         ConfigStoreError::Validation("authoritative section envelope is invalid".to_string())
     })?;
-    let changed = object.get("data") != Some(&updated_data);
+    let changed = force_revision || object.get("data") != Some(&updated_data);
     let revision = if changed {
         section.expected_revision.checked_add(1).ok_or_else(|| {
             ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
@@ -13808,6 +13874,91 @@ mod tests {
         assert_eq!(manifest.files[1].name, authoritative_section_file(expected));
         assert!(!manifest.files.iter().any(|file| file.name == CONFIG_FILE));
         assert!(manifest.files[1].expected_revision.is_some());
+    }
+
+    #[test]
+    fn active_mcp_exact_transaction_recovers_metadata_and_credentials_together() {
+        let _key = crate::encryption::set_test_encryption_key([0x56; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let root_before = read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap();
+        let facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let expected_revision = facade.registry().mcp.snapshot().revision;
+        let mut candidate = facade.effective_config();
+        let reference = credential_ref("mcp", "recoverable", "env_TOKEN").unwrap();
+        candidate
+            .mcp
+            .servers
+            .push(bamboo_domain::mcp_config::McpServerConfig {
+                id: "recoverable".to_string(),
+                name: Some("Recoverable MCP".to_string()),
+                enabled: false,
+                transport: bamboo_domain::mcp_config::TransportConfig::Stdio(
+                    bamboo_domain::mcp_config::StdioConfig {
+                        command: "unused".to_string(),
+                        args: vec!["--safe".to_string()],
+                        cwd: Some("/tmp/mcp-recovery".to_string()),
+                        env: std::collections::HashMap::from([(
+                            "TOKEN".to_string(),
+                            "recoverable-mcp-secret".to_string(),
+                        )]),
+                        env_encrypted: Default::default(),
+                        env_credential_refs: std::collections::HashMap::from([(
+                            "TOKEN".to_string(),
+                            reference.as_str().to_string(),
+                        )]),
+                        startup_timeout_ms: 100,
+                    },
+                ),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: Default::default(),
+                allowed_tools: vec!["read".to_string()],
+                denied_tools: vec!["delete".to_string()],
+            });
+        let intents = BTreeSet::from([reference.clone()]);
+
+        assert!(persist_mcp_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            expected_revision,
+            Some(MigrationFault::AfterCredentials),
+        )
+        .is_err());
+        assert!(ensure_provider_mcp_migration_ready(dir.path()).is_err());
+
+        let outcome = migrate_with_fault(dir.path(), MigrationFault::None).unwrap();
+        assert!(outcome.resumed);
+        ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+        assert_active_exact_manifest(dir.path(), ExactTransactionScope::Mcp);
+        let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(fresh.registry().mcp.snapshot().revision, 1);
+        assert_eq!(fresh.registry().credentials.snapshot().revision, 1);
+        let mut hydrated = fresh.effective_config();
+        hydrated
+            .hydrate_mcp_credentials_from_store(dir.path())
+            .unwrap();
+        let bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) =
+            &hydrated.mcp.servers[0].transport
+        else {
+            panic!("expected stdio MCP transport");
+        };
+        assert_eq!(stdio.args, vec!["--safe"]);
+        assert_eq!(stdio.cwd.as_deref(), Some("/tmp/mcp-recovery"));
+        assert_eq!(stdio.env["TOKEN"], "recoverable-mcp-secret");
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "recoverable-mcp-secret"
+        );
+        assert_eq!(
+            read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap(),
+            root_before
+        );
     }
 
     #[test]

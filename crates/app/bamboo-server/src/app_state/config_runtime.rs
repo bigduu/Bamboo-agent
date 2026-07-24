@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1709,7 +1709,11 @@ impl AppState {
         let _io = self.config_io_lock.lock().await;
         ensure_provider_mcp_migration_ready(&self.app_data_dir)
             .map_err(ConfigSectionMutationError::Store)?;
-        retain_mcp_credentials(&self.config.read().await.mcp, &mut candidate);
+        retain_mcp_credentials(
+            &self.config.read().await.mcp,
+            &mut candidate,
+            &BTreeSet::new(),
+        );
         validate_mcp_config(&candidate).map_err(ConfigSectionMutationError::Invalid)?;
         let mut hydration_config = Config::default();
         hydration_config.mcp = candidate;
@@ -1789,6 +1793,119 @@ impl AppState {
             Some(revision),
         );
         Ok(revision)
+    }
+
+    /// Replace editable MCP metadata and explicitly touched credentials under
+    /// one section CAS. Runtime construction is staged first; credential and
+    /// MCP documents cross the durable boundary together.
+    pub(crate) async fn put_mcp_settings(
+        &self,
+        expected_revision: u64,
+        candidate: McpConfig,
+        credential_intents: BTreeSet<bamboo_config::CredentialRef>,
+    ) -> Result<u64, ConfigSectionMutationError> {
+        if credential_intents.is_empty() {
+            return self.put_mcp_section(expected_revision, candidate).await;
+        }
+
+        let config_io_lock = self.config_io_lock.clone();
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = config_io_lock.lock().await;
+            ensure_provider_mcp_migration_ready(&app_data_dir)
+                .map_err(ConfigSectionMutationError::Store)?;
+            let facade = config_facade.as_ref().ok_or_else(|| {
+                ConfigSectionMutationError::Invalid(
+                    "MCP settings require the modular configuration facade".to_string(),
+                )
+            })?;
+            let current = config.read().await.clone();
+            let mut runtime_candidate = candidate;
+            materialize_mcp_touched_replacements(&mut runtime_candidate, &credential_intents)
+                .map_err(ConfigSectionMutationError::Invalid)?;
+            retain_mcp_credentials(&current.mcp, &mut runtime_candidate, &credential_intents);
+            validate_mcp_config(&runtime_candidate).map_err(ConfigSectionMutationError::Invalid)?;
+
+            let mut transaction_error = None;
+            let transaction_dir = app_data_dir.clone();
+            let mut durable_candidate = current;
+            durable_candidate.mcp = runtime_candidate.clone();
+            let result = mcp_manager
+                .reconcile_from_config_transactional_after(&runtime_candidate, || async {
+                    let mut live_config = config.write().await;
+                    let commit = tokio::task::spawn_blocking(move || {
+                        bamboo_config::persist_mcp_credential_transaction_at_revision(
+                            &transaction_dir,
+                            &mut durable_candidate,
+                            &credential_intents,
+                            expected_revision,
+                        )?;
+                        load_committed_effective_config(&transaction_dir)
+                    })
+                    .await;
+                    match commit {
+                        Ok(Ok(committed)) => {
+                            *live_config = committed;
+                            Ok(())
+                        }
+                        Ok(Err(error)) => {
+                            transaction_error = Some(ConfigSectionMutationError::Store(error));
+                            Err(bamboo_mcp::McpError::InvalidConfig(
+                                "MCP settings durable transaction failed".to_string(),
+                            ))
+                        }
+                        Err(error) => {
+                            transaction_error = Some(ConfigSectionMutationError::Runtime(format!(
+                                "MCP settings transaction task failed: {error}"
+                            )));
+                            Err(bamboo_mcp::McpError::InvalidConfig(
+                                "MCP settings durable transaction failed".to_string(),
+                            ))
+                        }
+                    }
+                })
+                .await;
+            if let Some(error) = transaction_error {
+                return Err(error);
+            }
+            if result.is_err() {
+                let message =
+                    "MCP runtime initialization failed; retaining last-known-good runtime"
+                        .to_string();
+                publish_section_failure(
+                    &mcp_config_live_health,
+                    &account_sink,
+                    "mcp",
+                    SectionStatus::Degraded,
+                    message.clone(),
+                );
+                return Err(ConfigSectionMutationError::Runtime(message));
+            }
+
+            publish_exact_facade_commit(
+                Some(facade),
+                &account_sink,
+                &[SectionId::Credentials, SectionId::Mcp],
+            )
+            .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            let snapshot = facade.registry().mcp.snapshot();
+            set_live_health_revision(
+                &mcp_config_live_health,
+                snapshot.revision,
+                Some((snapshot.source_path.clone(), SectionSourceKind::File)),
+            );
+            Ok(snapshot.revision)
+        });
+        transaction.await.map_err(|error| {
+            ConfigSectionMutationError::Runtime(format!(
+                "MCP settings transaction task failed: {error}"
+            ))
+        })?
     }
 
     /// Reset MCP metadata and its owned credentials at the runtime manager's
@@ -2068,7 +2185,11 @@ fn retain_provider_credentials(current: &ProviderConfigs, candidate: &mut Provid
     }
 }
 
-fn retain_mcp_credentials(current: &McpConfig, candidate: &mut McpConfig) {
+fn retain_mcp_credentials(
+    current: &McpConfig,
+    candidate: &mut McpConfig,
+    touched: &BTreeSet<bamboo_config::CredentialRef>,
+) {
     for candidate_server in &mut candidate.servers {
         let Some(current_server) = current
             .servers
@@ -2077,29 +2198,183 @@ fn retain_mcp_credentials(current: &McpConfig, candidate: &mut McpConfig) {
         else {
             continue;
         };
-        match (&current_server.transport, &mut candidate_server.transport) {
-            (TransportConfig::Stdio(current), TransportConfig::Stdio(candidate)) => {
-                if candidate.env.is_empty()
-                    && candidate.env_encrypted.is_empty()
-                    && candidate.env_credential_refs.is_empty()
-                {
-                    candidate.env = current.env.clone();
-                    candidate.env_encrypted = current.env_encrypted.clone();
-                    candidate.env_credential_refs = current.env_credential_refs.clone();
+        if let (TransportConfig::Stdio(current), TransportConfig::Stdio(candidate)) =
+            (&current_server.transport, &mut candidate_server.transport)
+        {
+            if candidate.env.is_empty()
+                && candidate.env_encrypted.is_empty()
+                && candidate.env_credential_refs.is_empty()
+            {
+                for (name, reference) in &current.env_credential_refs {
+                    if mcp_credential_ref_is_touched(Some(reference), touched) {
+                        continue;
+                    }
+                    candidate
+                        .env_credential_refs
+                        .insert(name.clone(), reference.clone());
+                    if let Some(value) = current.env.get(name) {
+                        candidate.env.insert(name.clone(), value.clone());
+                    }
+                    if let Some(value) = current.env_encrypted.get(name) {
+                        candidate.env_encrypted.insert(name.clone(), value.clone());
+                    }
+                }
+            } else {
+                for (name, reference) in &current.env_credential_refs {
+                    if candidate.env_credential_refs.get(name) != Some(reference) {
+                        continue;
+                    }
+                    if candidate.env.get(name).is_none_or(|value| value.is_empty()) {
+                        if let Some(value) = current.env.get(name) {
+                            candidate.env.insert(name.clone(), value.clone());
+                        }
+                    }
                 }
             }
-            (TransportConfig::Sse(current), TransportConfig::Sse(candidate))
-                if candidate.headers.is_empty() =>
-            {
-                candidate.headers = current.headers.clone();
+        }
+        match (&current_server.transport, &mut candidate_server.transport) {
+            (TransportConfig::Sse(current), TransportConfig::Sse(candidate)) => {
+                retain_mcp_header_credentials(&current.headers, &mut candidate.headers)
             }
             (
                 TransportConfig::StreamableHttp(current),
                 TransportConfig::StreamableHttp(candidate),
-            ) if candidate.headers.is_empty() => {
-                candidate.headers = current.headers.clone();
-            }
+            ) => retain_mcp_header_credentials(&current.headers, &mut candidate.headers),
             _ => {}
+        }
+    }
+}
+
+fn materialize_mcp_touched_replacements(
+    candidate: &mut McpConfig,
+    touched: &BTreeSet<bamboo_config::CredentialRef>,
+) -> Result<(), String> {
+    let mut replacements = BTreeMap::<bamboo_config::CredentialRef, String>::new();
+    for server in &candidate.servers {
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                for (name, raw_reference) in &stdio.env_credential_refs {
+                    let reference = bamboo_config::CredentialRef::parse(raw_reference.clone())
+                        .map_err(|_| "MCP credential reference is invalid".to_string())?;
+                    if let Some(value) = stdio
+                        .env
+                        .get(name)
+                        .filter(|value| touched.contains(&reference) && !value.is_empty())
+                    {
+                        insert_mcp_replacement(&mut replacements, reference, value)?;
+                    }
+                }
+            }
+            TransportConfig::Sse(http) => {
+                collect_mcp_header_replacements(&http.headers, touched, &mut replacements)?
+            }
+            TransportConfig::StreamableHttp(http) => {
+                collect_mcp_header_replacements(&http.headers, touched, &mut replacements)?
+            }
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    for server in &mut candidate.servers {
+        match &mut server.transport {
+            TransportConfig::Stdio(stdio) => {
+                for (name, raw_reference) in &stdio.env_credential_refs {
+                    let reference = bamboo_config::CredentialRef::parse(raw_reference.clone())
+                        .map_err(|_| "MCP credential reference is invalid".to_string())?;
+                    if let Some(value) = replacements.get(&reference) {
+                        stdio.env.insert(name.clone(), value.clone());
+                    }
+                }
+            }
+            TransportConfig::Sse(http) => {
+                apply_mcp_header_replacements(&mut http.headers, &replacements)?
+            }
+            TransportConfig::StreamableHttp(http) => {
+                apply_mcp_header_replacements(&mut http.headers, &replacements)?
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_mcp_header_replacements(
+    headers: &[bamboo_mcp::HeaderConfig],
+    touched: &BTreeSet<bamboo_config::CredentialRef>,
+    replacements: &mut BTreeMap<bamboo_config::CredentialRef, String>,
+) -> Result<(), String> {
+    for header in headers {
+        let Some(raw_reference) = header.credential_ref.as_ref() else {
+            continue;
+        };
+        let reference = bamboo_config::CredentialRef::parse(raw_reference.clone())
+            .map_err(|_| "MCP credential reference is invalid".to_string())?;
+        if touched.contains(&reference) && !header.value.is_empty() {
+            insert_mcp_replacement(replacements, reference, &header.value)?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_mcp_replacement(
+    replacements: &mut BTreeMap<bamboo_config::CredentialRef, String>,
+    reference: bamboo_config::CredentialRef,
+    value: &str,
+) -> Result<(), String> {
+    match replacements.get(&reference) {
+        Some(existing) if existing != value => {
+            Err("MCP updates assign conflicting values to one credential reference".to_string())
+        }
+        Some(_) => Ok(()),
+        None => {
+            replacements.insert(reference, value.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn apply_mcp_header_replacements(
+    headers: &mut [bamboo_mcp::HeaderConfig],
+    replacements: &BTreeMap<bamboo_config::CredentialRef, String>,
+) -> Result<(), String> {
+    for header in headers {
+        let Some(raw_reference) = header.credential_ref.as_ref() else {
+            continue;
+        };
+        let reference = bamboo_config::CredentialRef::parse(raw_reference.clone())
+            .map_err(|_| "MCP credential reference is invalid".to_string())?;
+        if let Some(value) = replacements.get(&reference) {
+            header.value = value.clone();
+        }
+    }
+    Ok(())
+}
+
+fn mcp_credential_ref_is_touched(
+    raw_reference: Option<&String>,
+    touched: &BTreeSet<bamboo_config::CredentialRef>,
+) -> bool {
+    raw_reference
+        .and_then(|raw| bamboo_config::CredentialRef::parse(raw.clone()).ok())
+        .is_some_and(|reference| touched.contains(&reference))
+}
+
+fn retain_mcp_header_credentials(
+    current: &[bamboo_mcp::HeaderConfig],
+    candidate: &mut [bamboo_mcp::HeaderConfig],
+) {
+    for candidate_header in candidate {
+        let Some(current_header) = current
+            .iter()
+            .find(|header| header.name == candidate_header.name)
+        else {
+            continue;
+        };
+        if candidate_header.credential_ref == current_header.credential_ref
+            && candidate_header.value.is_empty()
+        {
+            candidate_header.value = current_header.value.clone();
+            candidate_header.value_encrypted = current_header.value_encrypted.clone();
         }
     }
 }
@@ -3286,6 +3561,113 @@ mod live_reload_tests {
             "data": config,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn touched_shared_mcp_refs_stage_replacements_and_preserve_surviving_clears() {
+        let shared =
+            bamboo_config::CredentialRef::parse("mcp.shared.env_token".to_string()).unwrap();
+        let mut current = disabled_mcp_config("first");
+        let mut second = current.servers[0].clone();
+        second.id = "second".to_string();
+        current.servers.push(second);
+        for server in &mut current.servers {
+            let TransportConfig::Stdio(stdio) = &mut server.transport else {
+                unreachable!()
+            };
+            stdio
+                .env
+                .insert("TOKEN".to_string(), "old-shared-secret".to_string());
+            stdio
+                .env_credential_refs
+                .insert("TOKEN".to_string(), shared.as_str().to_string());
+        }
+        let touched = BTreeSet::from([shared]);
+
+        let mut replace = current.clone();
+        for server in &mut replace.servers {
+            let TransportConfig::Stdio(stdio) = &mut server.transport else {
+                unreachable!()
+            };
+            stdio.env.get_mut("TOKEN").unwrap().clear();
+        }
+        let TransportConfig::Stdio(first) = &mut replace.servers[0].transport else {
+            unreachable!()
+        };
+        first
+            .env
+            .insert("TOKEN".to_string(), "new-shared-secret".to_string());
+        materialize_mcp_touched_replacements(&mut replace, &touched).unwrap();
+        retain_mcp_credentials(&current, &mut replace, &touched);
+        for server in &replace.servers {
+            let TransportConfig::Stdio(stdio) = &server.transport else {
+                unreachable!()
+            };
+            assert_eq!(stdio.env["TOKEN"], "new-shared-secret");
+        }
+
+        let mut clear_one = current.clone();
+        for server in &mut clear_one.servers {
+            let TransportConfig::Stdio(stdio) = &mut server.transport else {
+                unreachable!()
+            };
+            stdio.env.get_mut("TOKEN").unwrap().clear();
+        }
+        let TransportConfig::Stdio(first) = &mut clear_one.servers[0].transport else {
+            unreachable!()
+        };
+        first.env.remove("TOKEN");
+        first.env_credential_refs.remove("TOKEN");
+        materialize_mcp_touched_replacements(&mut clear_one, &touched).unwrap();
+        retain_mcp_credentials(&current, &mut clear_one, &touched);
+        let TransportConfig::Stdio(first) = &clear_one.servers[0].transport else {
+            unreachable!()
+        };
+        assert!(!first.env.contains_key("TOKEN"));
+        assert!(!first.env_credential_refs.contains_key("TOKEN"));
+        let TransportConfig::Stdio(second) = &clear_one.servers[1].transport else {
+            unreachable!()
+        };
+        assert_eq!(second.env["TOKEN"], "old-shared-secret");
+        assert_eq!(second.env_credential_refs["TOKEN"], "mcp.shared.env_token");
+
+        let header_ref =
+            bamboo_config::CredentialRef::parse("mcp.shared.header_token".to_string()).unwrap();
+        let current_http = McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: "http".to_string(),
+                name: None,
+                enabled: false,
+                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
+                    url: "https://example.test/sse".to_string(),
+                    headers: vec![bamboo_mcp::HeaderConfig {
+                        name: "Authorization".to_string(),
+                        value: "old-header-secret".to_string(),
+                        value_encrypted: None,
+                        credential_ref: Some(header_ref.as_str().to_string()),
+                    }],
+                    connect_timeout_ms: 100,
+                }),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        };
+        let mut delete_all_headers = current_http.clone();
+        let TransportConfig::Sse(candidate) = &mut delete_all_headers.servers[0].transport else {
+            unreachable!()
+        };
+        candidate.headers.clear();
+        let touched = BTreeSet::from([header_ref]);
+        materialize_mcp_touched_replacements(&mut delete_all_headers, &touched).unwrap();
+        retain_mcp_credentials(&current_http, &mut delete_all_headers, &touched);
+        let TransportConfig::Sse(candidate) = &delete_all_headers.servers[0].transport else {
+            unreachable!()
+        };
+        assert!(candidate.headers.is_empty());
     }
 
     fn install_unrecoverable_pending_provider_migration(dir: &Path) {
