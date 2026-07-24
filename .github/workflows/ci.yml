@@ -3,14 +3,35 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ dev, main ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ dev, main ]
+
+# Keep only the newest run for a branch or pull request. A promotion build can
+# still fan out to all three platforms within that run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  promotion-source:
+    name: Promotion Source
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the repository dev branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [[ "$HEAD_REF" != "dev" || "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::Pull requests into main must promote bigduu/Bamboo-agent:dev."
+            exit 1
+          fi
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -85,14 +106,34 @@ jobs:
           cache-on-failure: true
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A clippy::type_complexity -A dead-code -D warnings
+        run: |
+          cargo clippy --all-features -- \
+            -D warnings \
+            -A deprecated \
+            -A clippy::module_inception \
+            -A clippy::incompatible_msrv \
+            -A clippy::needless_borrows_for_generic_args \
+            -A clippy::too-many-arguments \
+            -A clippy::while-let-loop \
+            -A clippy::type_complexity \
+            -A dead-code
 
   build:
-    name: Build
+    name: Build (${{ matrix.os }})
+    # Integration work is validated on Linux. The release-grade platform
+    # matrix is reserved for promoting this repository's dev branch to main;
+    # workflow_dispatch remains an explicit escape hatch for manual validation.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.base_ref == 'main' &&
+       github.head_ref == 'dev' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
