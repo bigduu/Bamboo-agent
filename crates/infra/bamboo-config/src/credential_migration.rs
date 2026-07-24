@@ -1820,6 +1820,35 @@ pub fn persist_provider_instance_credential_transaction(
     .map(|_| ())
 }
 
+/// Persist a complete provider metadata/API-key mutation through the exact
+/// provider + credential transaction at the typed provider section revision.
+/// Metadata-only updates participate in the same CAS transaction even when
+/// the credential document itself has no changed entries.
+pub fn persist_provider_credential_transaction_at_revision(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    expected_revision: u64,
+) -> ConfigStoreResult<u64> {
+    persist_provider_credential_transaction_with_instances_at_revision_inner(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        Some(expected_revision),
+        #[cfg(test)]
+        None,
+    )
+}
+
 /// Reset the provider domain and its owned credentials under the provider
 /// section revision supplied by a typed client. Compatibility writes may
 /// rebase, but an explicit reset must fail when its section snapshot is stale.
@@ -2377,8 +2406,10 @@ fn persist_exact_credential_transaction_inner(
             &persisted_instance_refs,
         )?
     };
-    let Some(mut prepared) = prepared else {
-        return store.revision_unchecked();
+    let mut prepared = match prepared {
+        Some(prepared) => prepared,
+        None if provider_expected_revision.is_some() => store.prepare_provider_metadata_update()?,
+        None => return store.revision_unchecked(),
     };
     if proxy_only && reset_scope.is_none() {
         let expected = proxy_expected_revision.ok_or_else(|| {

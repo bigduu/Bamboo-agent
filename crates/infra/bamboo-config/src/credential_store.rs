@@ -222,6 +222,33 @@ impl CredentialCommitAuthority<'_> {
 }
 
 impl CredentialStore {
+    /// Prepare an unchanged credential document so a provider-metadata-only
+    /// exact transaction can still use the provider section revision as its
+    /// CAS authority. The transaction layer advances this revision only when
+    /// the provider domain itself changes.
+    pub(crate) fn prepare_provider_metadata_update(
+        &self,
+    ) -> ConfigStoreResult<PreparedProviderCredentialUpdate> {
+        let (document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for provider update".to_string(),
+            ));
+        }
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": health.revision,
+            "data": document,
+        }))?;
+        Ok(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            revision: health.revision,
+            touched_refs: Vec::new(),
+            required_refs: Vec::new(),
+        })
+    }
+
     pub fn open(data_dir: impl AsRef<Path>) -> Self {
         Self {
             store: AtomicJsonStore::new(

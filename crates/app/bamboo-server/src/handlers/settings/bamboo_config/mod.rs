@@ -23,8 +23,9 @@ pub use credentials::{
 pub use notifications::get_notification_config;
 pub use proxy_auth::{get_proxy_auth_status, set_proxy_auth};
 pub use sections::{
-    get_mcp_section, get_provider_section, get_typed_section, put_mcp_section,
-    put_provider_section, put_typed_section, reset_typed_section,
+    get_mcp_section, get_provider_section, get_provider_settings_section, get_typed_section,
+    put_mcp_section, put_provider_section, put_provider_settings_section, put_typed_section,
+    reset_typed_section,
 };
 pub use tools::get_bamboo_tools;
 pub use types::ProxyAuthPayload;

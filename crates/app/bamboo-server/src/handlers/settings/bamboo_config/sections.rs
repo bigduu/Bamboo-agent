@@ -1,12 +1,13 @@
 use actix_web::{web, HttpResponse};
 use bamboo_config::{
-    patch::is_masked_api_key, ConfigStoreError, HooksSection, MemorySection, ModelLimitsSection,
-    ModelPolicySection, ProviderConfigs, SectionEnvelope, SectionId, SubagentsSection,
-    ToolsSkillsSection,
+    patch::is_masked_api_key, ConfigStoreError, DefaultsConfig, FeatureFlags, HooksSection,
+    MemorySection, ModelLimitsSection, ModelPolicySection, ProviderConfigs, ProviderInstanceConfig,
+    SectionEnvelope, SectionId, SubagentsSection, ToolsSkillsSection,
 };
 use bamboo_mcp::McpConfig;
-use serde::{de::Error as _, Deserialize, Deserializer};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
     app_state::{AppState, ConfigSectionMutationError},
@@ -42,6 +43,62 @@ pub struct ResetTypedSectionRequest {
     pub expected_revision: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutProviderSettingsRequest {
+    pub expected_revision: u64,
+    #[serde(deserialize_with = "deserialize_provider_settings_candidate")]
+    pub data: ProviderSettingsData,
+    #[serde(default)]
+    pub credential_changes: ProviderCredentialChanges,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSettingsData {
+    pub provider: String,
+    #[serde(default)]
+    pub providers: ProviderConfigs,
+    #[serde(default)]
+    pub defaults: Option<DefaultsConfig>,
+    #[serde(default)]
+    pub features: FeatureFlags,
+    #[serde(default)]
+    pub provider_instances: HashMap<String, ProviderInstanceConfig>,
+    #[serde(default, alias = "default_provider_instance")]
+    pub default_provider_instance_id: Option<String>,
+    // Read-only response fields are accepted and ignored so the canonical
+    // response data can be round-tripped without client-side shape surgery.
+    #[serde(default)]
+    pub available_providers: Vec<String>,
+    #[serde(default)]
+    pub credential_status: Value,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCredentialChanges {
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderCredentialChange>,
+    #[serde(default)]
+    pub provider_instances: BTreeMap<String, ProviderCredentialChange>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ProviderCredentialChange {
+    Replace { value: String },
+    Clear,
+}
+
+#[derive(Serialize)]
+struct ProviderCredentialStatusView {
+    credential_ref: Option<String>,
+    configured: bool,
+    source: Option<String>,
+    updated_at: Option<String>,
+}
+
 /// Read-only, secret-free provider section projection. Credential values,
 /// ciphertext, UI masks, request override headers, and forward-compatible
 /// unknown fields are intentionally excluded; callers use the credential
@@ -63,6 +120,167 @@ pub async fn get_provider_section(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     Ok(HttpResponse::Ok().json(section_envelope(data, health)))
+}
+
+/// Canonical provider-settings projection for editable UI state. Unlike the
+/// compact diagnostics endpoint above, this contains every non-secret field
+/// owned by providers.json plus explicit credential status metadata.
+pub async fn get_provider_settings_section(
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, AppError> {
+    let _io = app_state.config_io_lock.lock().await;
+    let config = app_state.config.read().await.clone();
+    let providers = sanitized_provider_metadata(config.providers())?;
+    let provider_instances = sanitized_provider_instance_metadata(&config.provider_instances)?;
+    let mut builtin_status = Map::new();
+
+    macro_rules! builtin_status {
+        ($name:literal, $field:ident, $from_env:expr) => {
+            if let Some(provider) = config.providers().$field.as_ref() {
+                builtin_status.insert(
+                    $name.to_string(),
+                    serde_json::to_value(provider_credential_status(
+                        &app_state,
+                        provider.credential_ref.as_ref(),
+                        $from_env,
+                        !provider.api_key.trim().is_empty() || provider.api_key_encrypted.is_some(),
+                    )?)?,
+                );
+            }
+        };
+    }
+    builtin_status!(
+        "openai",
+        openai,
+        config
+            .providers()
+            .openai
+            .as_ref()
+            .is_some_and(|p| p.api_key_from_env)
+    );
+    builtin_status!(
+        "anthropic",
+        anthropic,
+        config
+            .providers()
+            .anthropic
+            .as_ref()
+            .is_some_and(|p| p.api_key_from_env)
+    );
+    builtin_status!(
+        "gemini",
+        gemini,
+        config
+            .providers()
+            .gemini
+            .as_ref()
+            .is_some_and(|p| p.api_key_from_env)
+    );
+    builtin_status!("bodhi", bodhi, false);
+
+    let mut instance_status = Map::new();
+    for (id, instance) in &config.provider_instances {
+        instance_status.insert(
+            id.clone(),
+            serde_json::to_value(provider_credential_status(
+                &app_state,
+                instance.credential_ref.as_ref(),
+                false,
+                !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some(),
+            )?)?,
+        );
+    }
+
+    let data = json!({
+        "provider": config.provider,
+        "providers": providers,
+        "defaults": config.defaults,
+        "features": config.features,
+        "provider_instances": provider_instances,
+        "default_provider_instance_id": config.default_provider_instance,
+        "available_providers": bamboo_llm::AVAILABLE_PROVIDERS,
+        "credential_status": {
+            "providers": builtin_status,
+            "provider_instances": instance_status,
+        },
+    });
+    let health = app_state
+        .config_live_health
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    Ok(HttpResponse::Ok().json(section_envelope(data, health)))
+}
+
+pub async fn put_provider_settings_section(
+    app_state: web::Data<AppState>,
+    payload: web::Json<PutProviderSettingsRequest>,
+) -> Result<HttpResponse, AppError> {
+    let payload = payload.into_inner();
+    validate_provider_shape(&payload.data.providers).map_err(AppError::BadRequest)?;
+    validate_provider_instance_shape(&payload.data.provider_instances)
+        .map_err(AppError::BadRequest)?;
+    let expected_revision = payload.expected_revision;
+    let data = payload.data;
+    let credential_changes = payload.credential_changes;
+    app_state
+        .put_provider_settings(expected_revision, move |current, candidate| {
+            let mut provider_intents = credential_changes
+                .providers
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let mut provider_instance_intents = credential_changes
+                .provider_instances
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+
+            let ProviderSettingsData {
+                provider,
+                providers,
+                defaults,
+                features,
+                provider_instances,
+                default_provider_instance_id,
+                available_providers: _,
+                credential_status: _,
+            } = data;
+
+            for name in ["openai", "anthropic", "gemini", "bodhi"] {
+                if provider_exists(current.providers(), name) && !provider_exists(&providers, name)
+                {
+                    provider_intents.insert(name.to_string());
+                }
+            }
+            provider_instance_intents.extend(
+                current
+                    .provider_instances
+                    .keys()
+                    .filter(|id| !provider_instances.contains_key(*id))
+                    .cloned(),
+            );
+
+            candidate.provider = provider;
+            *candidate.providers_mut() = providers;
+            candidate.defaults = defaults;
+            candidate.features = features;
+            candidate.provider_instances = provider_instances;
+            candidate.default_provider_instance = default_provider_instance_id;
+            retain_provider_settings_server_owned_fields(current, candidate);
+            apply_provider_credential_changes(candidate, &credential_changes.providers)?;
+            apply_provider_instance_credential_changes(
+                candidate,
+                &credential_changes.provider_instances,
+            )?;
+            bamboo_llm::validate_provider_config(candidate).map_err(|error| {
+                ConfigSectionMutationError::Invalid(format!("invalid provider settings: {error}"))
+            })?;
+            Ok((provider_intents, provider_instance_intents))
+        })
+        .await
+        .map_err(map_mutation_error)?;
+    get_provider_settings_section(app_state).await
 }
 
 /// Read-only MCP section projection. Transport diagnostics remain visible,
@@ -271,6 +489,444 @@ fn map_mutation_error(error: ConfigSectionMutationError) -> AppError {
     }
 }
 
+fn sanitized_provider_metadata(providers: &ProviderConfigs) -> Result<Value, AppError> {
+    let mut providers = providers.clone();
+    providers.extra.clear();
+    macro_rules! sanitize {
+        ($field:ident) => {
+            if let Some(provider) = providers.$field.as_mut() {
+                provider.api_key.clear();
+                provider.api_key_encrypted = None;
+                provider.credential_ref = None;
+                provider.base_url = safe_url_diagnostic(provider.base_url.as_deref());
+                provider.extra.clear();
+            }
+        };
+    }
+    sanitize!(openai);
+    sanitize!(anthropic);
+    sanitize!(gemini);
+    if let Some(provider) = providers.copilot.as_mut() {
+        provider.extra.clear();
+    }
+    if let Some(provider) = providers.bodhi.as_mut() {
+        provider.api_key.clear();
+        provider.api_key_encrypted = None;
+        provider.credential_ref = None;
+        provider.base_url = safe_url_diagnostic(provider.base_url.as_deref());
+        provider.extra.clear();
+    }
+    let mut value = serde_json::to_value(providers)?;
+    scrub_unsafe_request_override_literals(&mut value);
+    Ok(value)
+}
+
+fn sanitized_provider_instance_metadata(
+    instances: &HashMap<String, ProviderInstanceConfig>,
+) -> Result<Value, AppError> {
+    let mut instances = instances.clone();
+    for instance in instances.values_mut() {
+        instance.api_key.clear();
+        instance.api_key_encrypted = None;
+        instance.credential_ref = None;
+        instance.base_url = safe_url_diagnostic(instance.base_url.as_deref());
+        instance.extra.clear();
+    }
+    let mut value = serde_json::to_value(instances)?;
+    scrub_unsafe_request_override_literals(&mut value);
+    Ok(value)
+}
+
+fn scrub_unsafe_request_override_literals(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(headers) = object.get_mut("headers").and_then(Value::as_object_mut) {
+                headers.retain(|name, expression| {
+                    !is_sensitive_header_name(name) || is_external_template_reference(expression)
+                });
+            }
+            if let Some(patches) = object.get_mut("body_patch").and_then(Value::as_array_mut) {
+                patches.retain(|patch| {
+                    let Some(patch) = patch.as_object() else {
+                        return false;
+                    };
+                    !patch
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_sensitive_override_path)
+                        || patch
+                            .get("value")
+                            .is_none_or(is_external_template_reference)
+                });
+            }
+            for value in object.values_mut() {
+                scrub_unsafe_request_override_literals(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                scrub_unsafe_request_override_literals(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn provider_credential_status(
+    app_state: &AppState,
+    credential_ref: Option<&bamboo_config::CredentialRef>,
+    from_environment: bool,
+    runtime_configured: bool,
+) -> Result<ProviderCredentialStatusView, AppError> {
+    if let Some(reference) = credential_ref {
+        let status = app_state
+            .credential_store
+            .status(reference)
+            .map_err(|error| map_mutation_error(ConfigSectionMutationError::Store(error)))?;
+        let source = status.configured.then_some(match status.source {
+            bamboo_config::CredentialSource::User => "user",
+            bamboo_config::CredentialSource::Migrated => "migrated",
+            bamboo_config::CredentialSource::Environment => "environment",
+            bamboo_config::CredentialSource::ExternalStore => "external_store",
+        });
+        return Ok(ProviderCredentialStatusView {
+            credential_ref: Some(reference.as_str().to_string()),
+            configured: status.configured,
+            source: source.map(str::to_string),
+            updated_at: status.updated_at.map(|value| value.to_rfc3339()),
+        });
+    }
+    Ok(ProviderCredentialStatusView {
+        credential_ref: None,
+        configured: from_environment || runtime_configured,
+        source: if from_environment {
+            Some("environment".to_string())
+        } else if runtime_configured {
+            Some("migrated".to_string())
+        } else {
+            None
+        },
+        updated_at: None,
+    })
+}
+
+fn provider_exists(providers: &ProviderConfigs, name: &str) -> bool {
+    match name {
+        "openai" => providers.openai.is_some(),
+        "anthropic" => providers.anthropic.is_some(),
+        "gemini" => providers.gemini.is_some(),
+        "copilot" => providers.copilot.is_some(),
+        "bodhi" => providers.bodhi.is_some(),
+        _ => false,
+    }
+}
+
+fn retain_provider_settings_server_owned_fields(
+    current: &bamboo_config::Config,
+    candidate: &mut bamboo_config::Config,
+) {
+    // Unknown forward-compatible metadata is intentionally not exposed by the
+    // network DTO because its contents cannot be classified as non-secret.
+    // Preserve it from the process-owned snapshot just like credential refs.
+    candidate.providers_mut().extra = current.providers().extra.clone();
+    macro_rules! retain_env_provider {
+        ($field:ident) => {
+            if let (Some(current), Some(candidate)) = (
+                current.providers().$field.as_ref(),
+                candidate.providers_mut().$field.as_mut(),
+            ) {
+                candidate.api_key = current.api_key.clone();
+                candidate.api_key_encrypted = current.api_key_encrypted.clone();
+                candidate.credential_ref = current.credential_ref.clone();
+                candidate.api_key_from_env = current.api_key_from_env;
+                candidate.extra = current.extra.clone();
+            }
+        };
+    }
+    retain_env_provider!(openai);
+    retain_env_provider!(anthropic);
+    retain_env_provider!(gemini);
+    if let (Some(current), Some(candidate)) = (
+        current.providers().bodhi.as_ref(),
+        candidate.providers_mut().bodhi.as_mut(),
+    ) {
+        candidate.api_key = current.api_key.clone();
+        candidate.api_key_encrypted = current.api_key_encrypted.clone();
+        candidate.credential_ref = current.credential_ref.clone();
+        candidate.extra = current.extra.clone();
+    }
+    if let (Some(current), Some(candidate)) = (
+        current.providers().copilot.as_ref(),
+        candidate.providers_mut().copilot.as_mut(),
+    ) {
+        candidate.extra = current.extra.clone();
+    }
+    for (id, instance) in &mut candidate.provider_instances {
+        if let Some(current) = current.provider_instances.get(id) {
+            instance.api_key = current.api_key.clone();
+            instance.api_key_encrypted = current.api_key_encrypted.clone();
+            instance.credential_ref = current.credential_ref.clone();
+            instance.extra = current.extra.clone();
+        }
+    }
+}
+
+fn apply_provider_credential_changes(
+    candidate: &mut bamboo_config::Config,
+    changes: &BTreeMap<String, ProviderCredentialChange>,
+) -> Result<(), ConfigSectionMutationError> {
+    macro_rules! apply_env_provider {
+        ($name:literal, $field:ident) => {
+            if let Some(change) = changes.get($name) {
+                match candidate.providers_mut().$field.as_mut() {
+                    Some(provider) => match change {
+                        ProviderCredentialChange::Replace { value } if !value.trim().is_empty() => {
+                            provider.api_key = value.clone();
+                            provider.api_key_encrypted = None;
+                            provider.api_key_from_env = false;
+                        }
+                        ProviderCredentialChange::Replace { .. } => {
+                            return Err(ConfigSectionMutationError::Invalid(format!(
+                                "replacement credential for '{}' must not be empty",
+                                $name
+                            )));
+                        }
+                        ProviderCredentialChange::Clear => {
+                            provider.api_key.clear();
+                            provider.api_key_encrypted = None;
+                            provider.api_key_from_env = false;
+                        }
+                    },
+                    None if matches!(change, ProviderCredentialChange::Clear) => {}
+                    None => {
+                        return Err(ConfigSectionMutationError::Invalid(format!(
+                            "credential replacement targets missing provider '{}'",
+                            $name
+                        )));
+                    }
+                }
+            }
+        };
+    }
+    apply_env_provider!("openai", openai);
+    apply_env_provider!("anthropic", anthropic);
+    apply_env_provider!("gemini", gemini);
+    if let Some(change) = changes.get("bodhi") {
+        match candidate.providers_mut().bodhi.as_mut() {
+            Some(provider) => match change {
+                ProviderCredentialChange::Replace { value } if !value.trim().is_empty() => {
+                    provider.api_key = value.clone();
+                    provider.api_key_encrypted = None;
+                }
+                ProviderCredentialChange::Replace { .. } => {
+                    return Err(ConfigSectionMutationError::Invalid(
+                        "replacement credential for 'bodhi' must not be empty".to_string(),
+                    ));
+                }
+                ProviderCredentialChange::Clear => {
+                    provider.api_key.clear();
+                    provider.api_key_encrypted = None;
+                }
+            },
+            None if matches!(change, ProviderCredentialChange::Clear) => {}
+            None => {
+                return Err(ConfigSectionMutationError::Invalid(
+                    "credential replacement targets missing provider 'bodhi'".to_string(),
+                ));
+            }
+        }
+    }
+    if let Some(name) = changes
+        .keys()
+        .find(|name| !matches!(name.as_str(), "openai" | "anthropic" | "gemini" | "bodhi"))
+    {
+        return Err(ConfigSectionMutationError::Invalid(format!(
+            "unknown provider credential target '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn apply_provider_instance_credential_changes(
+    candidate: &mut bamboo_config::Config,
+    changes: &BTreeMap<String, ProviderCredentialChange>,
+) -> Result<(), ConfigSectionMutationError> {
+    for (id, change) in changes {
+        match candidate.provider_instances.get_mut(id) {
+            Some(instance) => match change {
+                ProviderCredentialChange::Replace { value } if !value.trim().is_empty() => {
+                    instance.api_key = value.clone();
+                    instance.api_key_encrypted = None;
+                }
+                ProviderCredentialChange::Replace { .. } => {
+                    return Err(ConfigSectionMutationError::Invalid(format!(
+                        "replacement credential for provider instance '{id}' must not be empty"
+                    )));
+                }
+                ProviderCredentialChange::Clear => {
+                    instance.api_key.clear();
+                    instance.api_key_encrypted = None;
+                }
+            },
+            None if matches!(change, ProviderCredentialChange::Clear) => {}
+            None => {
+                return Err(ConfigSectionMutationError::Invalid(format!(
+                    "credential replacement targets missing provider instance '{id}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_instance_shape(
+    instances: &HashMap<String, ProviderInstanceConfig>,
+) -> Result<(), String> {
+    for (id, instance) in instances {
+        if id.trim().is_empty() {
+            return Err("provider instance id must not be empty".to_string());
+        }
+        if !instance.extra.is_empty() {
+            return Err(format!(
+                "unknown fields are not accepted for provider instance '{id}'"
+            ));
+        }
+        if let Some(url) = instance.base_url.as_deref() {
+            validate_public_url(url)?;
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_provider_settings_candidate<'de, D>(
+    deserializer: D,
+) -> Result<ProviderSettingsData, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut value = Value::deserialize(deserializer)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("available_providers");
+        object.remove("credential_status");
+    }
+    reject_provider_settings_secret_fields(&value).map_err(D::Error::custom)?;
+    serde_json::from_value(value).map_err(D::Error::custom)
+}
+
+fn reject_provider_settings_secret_fields(value: &Value) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                let normalized = key.to_ascii_lowercase();
+                if matches!(
+                    normalized.as_str(),
+                    "api_key" | "api_key_encrypted" | "credential_ref"
+                ) {
+                    return Err(format!(
+                        "secret-bearing field '{key}' is not accepted; use credential_changes"
+                    ));
+                }
+                if normalized == "headers" {
+                    reject_sensitive_header_literals(value)?;
+                }
+                if normalized == "body_patch" {
+                    reject_sensitive_body_patch_literals(value)?;
+                }
+                reject_provider_settings_secret_fields(value)?;
+            }
+            Ok(())
+        }
+        Value::Array(values) => {
+            for value in values {
+                reject_provider_settings_secret_fields(value)?;
+            }
+            Ok(())
+        }
+        Value::String(value) if is_masked_api_key(value) => {
+            Err("masked secret placeholders are not accepted".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn reject_sensitive_header_literals(value: &Value) -> Result<(), String> {
+    let Some(headers) = value.as_object() else {
+        return Ok(());
+    };
+    for (name, expression) in headers {
+        if is_sensitive_header_name(name) && !is_external_template_reference(expression) {
+            return Err(format!(
+                "sensitive request override header '{name}' must use an env_ref or generated value"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_sensitive_body_patch_literals(value: &Value) -> Result<(), String> {
+    let Some(patches) = value.as_array() else {
+        return Ok(());
+    };
+    for patch in patches.iter().filter_map(Value::as_object) {
+        let sensitive_path = patch
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(is_sensitive_override_path);
+        if sensitive_path
+            && patch
+                .get("value")
+                .is_some_and(|value| !is_external_template_reference(value))
+        {
+            return Err(
+                "sensitive request override body values must use an env_ref or generated value"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_sensitive_header_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    [
+        "authorization",
+        "api-key",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+        "cookie",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn is_sensitive_override_path(path: &str) -> bool {
+    let normalized = path.to_ascii_lowercase();
+    [
+        "api_key",
+        "api-key",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+        "authorization",
+        "cookie",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn is_external_template_reference(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("env_ref") | Some("generated")
+    ) && object.get("fallback").is_none_or(Value::is_null)
+}
+
 fn deserialize_provider_candidate<'de, D>(deserializer: D) -> Result<ProviderConfigs, D::Error>
 where
     D: Deserializer<'de>,
@@ -345,9 +1001,9 @@ fn validate_provider_shape(candidate: &ProviderConfigs) -> Result<(), String> {
     macro_rules! validate {
         ($field:ident) => {
             if let Some(provider) = &candidate.$field {
-                if !provider.extra.is_empty() || provider.request_overrides.is_some() {
+                if !provider.extra.is_empty() {
                     return Err(
-                        "unknown provider fields and request overrides are not accepted by the typed endpoint"
+                        "unknown provider fields are not accepted by the typed endpoint"
                             .to_string(),
                     );
                 }
@@ -361,10 +1017,9 @@ fn validate_provider_shape(candidate: &ProviderConfigs) -> Result<(), String> {
     validate!(anthropic);
     validate!(gemini);
     if let Some(provider) = &candidate.copilot {
-        if !provider.extra.is_empty() || provider.request_overrides.is_some() {
+        if !provider.extra.is_empty() {
             return Err(
-                "unknown provider fields and request overrides are not accepted by the typed endpoint"
-                    .to_string(),
+                "unknown provider fields are not accepted by the typed endpoint".to_string(),
             );
         }
     }
@@ -603,6 +1258,29 @@ mod tests {
         }
     }
 
+    fn editable_provider_settings() -> Value {
+        json!({
+            "provider": "openai",
+            "providers": {
+                "openai": {
+                    "base_url": "https://openai.example.test/v1",
+                    "model": "gpt-initial"
+                },
+                "anthropic": {
+                    "base_url": "https://anthropic.example.test/v1",
+                    "model": "claude-initial"
+                }
+            },
+            "defaults": null,
+            "features": {
+                "provider_model_ref": false,
+                "dynamic_model_routing": false
+            },
+            "provider_instances": {},
+            "default_provider_instance_id": null
+        })
+    }
+
     #[actix_web::test]
     async fn typed_sections_expose_health_and_diagnostics_without_secret_material() {
         let dir = tempfile::tempdir().unwrap();
@@ -696,6 +1374,10 @@ mod tests {
             App::new()
                 .app_data(state)
                 .route("/providers", web::get().to(get_provider_section))
+                .route(
+                    "/provider-settings",
+                    web::get().to(get_provider_settings_section),
+                )
                 .route("/mcp", web::get().to(get_mcp_section)),
         )
         .await;
@@ -739,6 +1421,41 @@ mod tests {
         );
         assert_eq!(
             provider["data"]["providers"]["openai"]["base_url"],
+            "https://provider.example/v1"
+        );
+
+        let provider_settings_response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        assert!(provider_settings_response.status().is_success());
+        let provider_settings_body =
+            String::from_utf8(test::read_body(provider_settings_response).await.to_vec()).unwrap();
+        for forbidden in [
+            "provider-plaintext-secret",
+            "provider-ciphertext-secret",
+            "override-header-secret",
+            "unknown-provider-secret",
+            "provider-url-secret",
+            "query-secret",
+            "****...****",
+            "api_key_encrypted",
+        ] {
+            assert!(
+                !provider_settings_body.contains(forbidden),
+                "provider settings leaked {forbidden}"
+            );
+        }
+        let provider_settings: Value = serde_json::from_str(&provider_settings_body).unwrap();
+        assert_eq!(
+            provider_settings["data"]["providers"]["openai"]["model"],
+            "diagnostic-model"
+        );
+        assert_eq!(
+            provider_settings["data"]["providers"]["openai"]["base_url"],
             "https://provider.example/v1"
         );
 
@@ -1013,6 +1730,308 @@ mod tests {
             stale_after_external.status(),
             actix_web::http::StatusCode::CONFLICT
         );
+    }
+
+    #[actix_web::test]
+    async fn provider_settings_round_trip_is_full_cas_and_credentials_are_explicit_and_redacted() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x70; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+        let openai_secret = "provider-settings-openai-secret";
+        let anthropic_secret = "provider-settings-anthropic-secret";
+        let instance_secret = "provider-settings-instance-secret";
+        let deleted_instance_secret = "provider-settings-deleted-instance-secret";
+
+        let created = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": editable_provider_settings(),
+                    "credential_changes": {
+                        "providers": {
+                            "openai": {"action": "replace", "value": openai_secret},
+                            "anthropic": {"action": "replace", "value": anthropic_secret}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = created.status();
+        let created_body = String::from_utf8(test::read_body(created).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected provider settings response {status}: {created_body}"
+        );
+        for secret in [
+            openai_secret,
+            anthropic_secret,
+            instance_secret,
+            deleted_instance_secret,
+        ] {
+            assert!(!created_body.contains(secret), "response leaked {secret}");
+        }
+        for forbidden in ["\"api_key\":", "\"api_key_encrypted\":"] {
+            assert!(
+                !created_body.contains(forbidden),
+                "response leaked secret-bearing field {forbidden}"
+            );
+        }
+        let created: Value = serde_json::from_str(&created_body).unwrap();
+        assert_eq!(created["revision"], 1);
+        assert_eq!(
+            created["data"]["credential_status"]["providers"]["openai"]["configured"],
+            true
+        );
+        assert_eq!(
+            created["data"]["credential_status"]["providers"]["anthropic"]["source"],
+            "user"
+        );
+        let hidden_forward_value = "server-owned-forward-metadata";
+        state
+            .config
+            .write()
+            .await
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert(
+                "future_provider_metadata".to_string(),
+                json!(hidden_forward_value),
+            );
+
+        let mut edited = created["data"].clone();
+        edited["features"]["provider_model_ref"] = json!(true);
+        edited["defaults"] = json!({
+            "chat": {"provider": "openai", "model": "gpt-edited"},
+            "fast": {"provider": "openai", "model": "gpt-fast"}
+        });
+        edited["providers"]["openai"]["model"] = json!("gpt-edited");
+        edited["providers"]["openai"]["request_overrides"] = json!({
+            "common": {
+                "headers": {
+                    "Authorization": {"type": "env_ref", "name": "PROVIDER_AUTH"}
+                }
+            }
+        });
+        edited["provider_instances"]["work"] = json!({
+            "provider_type": "openai",
+            "label": "Work",
+            "model": "gpt-work",
+            "enabled": true
+        });
+        edited["provider_instances"]["personal"] = json!({
+            "provider_type": "openai",
+            "label": "Personal",
+            "model": "gpt-personal",
+            "enabled": false
+        });
+        edited["default_provider_instance_id"] = json!("work");
+
+        let updated = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": edited,
+                    "credential_changes": {
+                        "provider_instances": {
+                            "work": {"action": "replace", "value": instance_secret},
+                            "personal": {
+                                "action": "replace",
+                                "value": deleted_instance_secret
+                            }
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = updated.status();
+        let updated_body = String::from_utf8(test::read_body(updated).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected provider settings response {status}: {updated_body}"
+        );
+        for secret in [
+            openai_secret,
+            anthropic_secret,
+            instance_secret,
+            deleted_instance_secret,
+        ] {
+            assert!(!updated_body.contains(secret), "response leaked {secret}");
+        }
+        assert!(!updated_body.contains(hidden_forward_value));
+        let updated: Value = serde_json::from_str(&updated_body).unwrap();
+        assert_eq!(updated["revision"], 2);
+        assert_eq!(
+            updated["data"]["providers"]["openai"]["model"],
+            "gpt-edited"
+        );
+        assert_eq!(updated["data"]["defaults"]["fast"]["model"], "gpt-fast");
+        assert_eq!(updated["data"]["features"]["provider_model_ref"], true);
+        assert_eq!(updated["data"]["default_provider_instance_id"], "work");
+        assert_eq!(
+            updated["data"]["credential_status"]["provider_instances"]["work"]["configured"],
+            true
+        );
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": editable_provider_settings()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .defaults
+                .as_ref()
+                .unwrap()
+                .fast
+                .as_ref()
+                .unwrap()
+                .model,
+            "gpt-fast"
+        );
+
+        let mut cleared = updated["data"].clone();
+        cleared["provider_instances"] = json!({});
+        cleared["default_provider_instance_id"] = Value::Null;
+        let cleared = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 2,
+                    "data": cleared,
+                    "credential_changes": {
+                        "provider_instances": {
+                            "work": {"action": "clear"}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = cleared.status();
+        let cleared_body = String::from_utf8(test::read_body(cleared).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected provider settings response {status}: {cleared_body}"
+        );
+        let cleared: Value = serde_json::from_str(&cleared_body).unwrap();
+        assert_eq!(cleared["revision"], 3);
+        assert!(cleared["data"]["provider_instances"]["work"].is_null());
+        assert!(cleared["data"]["provider_instances"]["personal"].is_null());
+
+        let mut metadata_only = cleared["data"].clone();
+        metadata_only["providers"]["openai"]["model"] = json!("gpt-metadata-only");
+        metadata_only["features"]["dynamic_model_routing"] = json!(true);
+        let metadata_only = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 3,
+                    "data": metadata_only
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = metadata_only.status();
+        let metadata_only_body =
+            String::from_utf8(test::read_body(metadata_only).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected provider settings response {status}: {metadata_only_body}"
+        );
+        let metadata_only: Value = serde_json::from_str(&metadata_only_body).unwrap();
+        assert_eq!(metadata_only["revision"], 4);
+        assert_eq!(
+            metadata_only["data"]["providers"]["openai"]["model"],
+            "gpt-metadata-only"
+        );
+        assert_eq!(
+            metadata_only["data"]["features"]["dynamic_model_routing"],
+            true
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .extra["future_provider_metadata"],
+            hidden_forward_value
+        );
+
+        let mut unknown = metadata_only["data"].clone();
+        unknown["providers"]["openai"]["future_client_field"] = json!("must-reject");
+        let unknown = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 4,
+                    "data": unknown
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(unknown.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        let store = bamboo_config::CredentialStore::open(dir.path());
+        let openai_ref = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+        let work_ref =
+            bamboo_config::credential_ref("provider_instance", "work", "api_key").unwrap();
+        let personal_ref =
+            bamboo_config::credential_ref("provider_instance", "personal", "api_key").unwrap();
+        assert!(store.status(&openai_ref).unwrap().configured);
+        assert!(!store.status(&work_ref).unwrap().configured);
+        assert!(!store.status(&personal_ref).unwrap().configured);
+        assert_eq!(store.revision().unwrap(), 4);
+        for path in [
+            dir.path().join("providers.json"),
+            dir.path().join("credentials.json"),
+        ] {
+            let disk = std::fs::read_to_string(&path).unwrap();
+            for secret in [
+                openai_secret,
+                anthropic_secret,
+                instance_secret,
+                deleted_instance_secret,
+            ] {
+                assert!(!disk.contains(secret), "disk leaked {secret}");
+            }
+            if path.ends_with("providers.json") {
+                assert!(disk.contains(hidden_forward_value));
+            }
+        }
     }
 
     #[actix_web::test]
@@ -1301,6 +2320,40 @@ mod tests {
         assert!(serde_json::from_value::<PutMcpSectionRequest>(json!({
             "expected_revision": 0,
             "data": {"server": {"command": "cmd****name"}}
+        }))
+        .is_ok());
+    }
+
+    #[::core::prelude::v1::test]
+    fn provider_settings_accept_external_override_refs_and_reject_secret_literals() {
+        let mut literal = editable_provider_settings();
+        literal["providers"]["openai"]["request_overrides"] = json!({
+            "common": {"headers": {"Authorization": "Bearer secret"}}
+        });
+        assert!(serde_json::from_value::<PutProviderSettingsRequest>(json!({
+            "expected_revision": 0,
+            "data": literal
+        }))
+        .is_err());
+
+        let mut external = editable_provider_settings();
+        external["providers"]["openai"]["request_overrides"] = json!({
+            "common": {
+                "headers": {
+                    "Authorization": {"type": "env_ref", "name": "PROVIDER_AUTH"}
+                },
+                "body_patch": [{
+                    "path": "auth.token",
+                    "value": {"type": "generated", "generator": "uuid"}
+                }, {
+                    "path": "legacy.api_key",
+                    "op": "remove"
+                }]
+            }
+        });
+        assert!(serde_json::from_value::<PutProviderSettingsRequest>(json!({
+            "expected_revision": 0,
+            "data": external
         }))
         .is_ok());
     }
