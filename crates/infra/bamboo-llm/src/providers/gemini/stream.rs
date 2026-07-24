@@ -37,11 +37,12 @@ pub struct GeminiStreamState {
     /// Approximate characters contained in thought text chunks.
     pub thinking_text_chars: usize,
     /// Whether prompt-cache usage has already been emitted for this stream.
-    /// Gemini reports `usageMetadata` cumulatively; emitting the first reported
-    /// cache value once keeps the downstream accumulator from over-counting.
+    /// Non-terminal content events may carry partial cumulative metadata, so
+    /// only content-free or terminal events consume it; this flag prevents
+    /// repeated final metadata from being double-counted.
     cache_usage_emitted: bool,
     /// Whether an [`LLMChunk::UsageSummary`] has already been emitted for this
-    /// stream. Like cache usage, cumulative metadata is emitted only once.
+    /// stream. It follows the same terminal/content-free and emit-once rules.
     usage_summary_emitted: bool,
 }
 
@@ -124,8 +125,9 @@ fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<
 ///
 /// Returns:
 /// - `Ok(vec![chunk, ..])` for content-bearing events (text, tool calls) and
-///   usage events (a final `usageMetadata` may yield both a `CacheUsage` and a
-///   `UsageSummary`). Chunks have deterministic order: non-empty text/reasoning
+///   usage events. Only terminal content-bearing events consume cumulative
+///   `usageMetadata`; a final event may yield both a `CacheUsage` and a
+///   `UsageSummary`. Chunks have deterministic order: non-empty text/reasoning
 ///   tokens in part order, one `ToolCalls` chunk containing every function call
 ///   in part order, then `CacheUsage`, then `UsageSummary`
 /// - `Ok(vec![])` for non-content events (empty data, metadata already emitted)
@@ -200,12 +202,16 @@ pub fn parse_gemini_sse_event(
     // Get the first candidate (Gemini typically returns one)
     let candidate = &candidates[0];
 
-    // Check for finish reason
-    if let Some(finish_reason) = candidate.get("finishReason").and_then(|f| f.as_str()) {
-        if finish_reason == "STOP" || finish_reason == "MAX_TOKENS" {
-            // Still need to process any content, but this might be the last chunk
-        }
-    }
+    // Gemini defines an empty finishReason as "generation has not stopped".
+    // Any non-empty reason is terminal (including safety/filter/tool errors, not
+    // only STOP/MAX_TOKENS), so only such content-bearing events may consume the
+    // cumulative usageMetadata. Content-free usage events remain handled by the
+    // early-return paths below.
+    let is_terminal_content_event = candidate
+        .get("finishReason")
+        .and_then(Value::as_str)
+        .map(|finish_reason| !finish_reason.is_empty())
+        .unwrap_or(false);
 
     // Extract content
     let content = match candidate.get("content") {
@@ -302,10 +308,14 @@ pub fn parse_gemini_sse_event(
         chunks.push(LLMChunk::ToolCalls(tool_calls));
     }
 
-    // A final Gemini event can carry both content and cumulative usageMetadata.
-    // Preserve every content/tool chunk above, then append emit-once usage in
-    // the documented cache-before-summary order before the stream closes.
-    chunks.extend(take_gemini_event_usage(state, &value));
+    if is_terminal_content_event {
+        // A final Gemini event can carry both content and cumulative
+        // usageMetadata. Preserve every content/tool chunk above, then append
+        // emit-once usage in the documented cache-before-summary order before
+        // the stream closes. Intermediate cumulative totals are intentionally
+        // ignored so they cannot suppress the final totals.
+        chunks.extend(take_gemini_event_usage(state, &value));
+    }
 
     Ok(chunks)
 }
@@ -314,7 +324,7 @@ pub fn parse_gemini_sse_event(
 mod tests {
     use super::*;
 
-    async fn collect_single_sse_event(payload: &str) -> Vec<LLMChunk> {
+    async fn collect_sse_body(sse_body: String) -> Vec<LLMChunk> {
         use crate::providers::common::sse::llm_stream_from_sse_multi;
         use futures::StreamExt;
 
@@ -322,7 +332,7 @@ mod tests {
             http::Response::builder()
                 .status(200)
                 .header("content-type", "text/event-stream")
-                .body(format!("data: {payload}\n\n"))
+                .body(sse_body)
                 .expect("http response"),
         );
 
@@ -336,6 +346,10 @@ mod tests {
             chunks.push(item.expect("chunk"));
         }
         chunks
+    }
+
+    async fn collect_single_sse_event(payload: &str) -> Vec<LLMChunk> {
+        collect_sse_body(format!("data: {payload}\n\n")).await
     }
 
     #[test]
@@ -504,7 +518,7 @@ mod tests {
 
         // Repeated cumulative metadata must not double count, while new content
         // from the repeated event must still be delivered.
-        let repeated = r#"{"candidates":[{"content":{"parts":[{"text":"epilogue"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":1000,"candidatesTokenCount":42,"thoughtsTokenCount":7,"cachedContentTokenCount":555,"totalTokenCount":1049}}"#;
+        let repeated = r#"{"candidates":[{"content":{"parts":[{"text":"epilogue"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000,"candidatesTokenCount":42,"thoughtsTokenCount":7,"cachedContentTokenCount":555,"totalTokenCount":1049}}"#;
         let repeated_chunks = parse_gemini_sse_event(&mut state, "", repeated).unwrap();
         assert_eq!(
             repeated_chunks.len(),
@@ -797,6 +811,67 @@ mod tests {
                 thinking_tokens: 7
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn cumulative_usage_waits_for_terminal_content_event_without_done() {
+        // Gemini may attach monotonically cumulative usageMetadata to every
+        // content event. The first event has no finishReason and the second has
+        // an explicitly empty one: both are non-terminal and must preserve
+        // semantic chunks without consuming their partial 50/100-token totals.
+        // The final OTHER reason proves every non-empty finishReason is terminal,
+        // not just STOP/MAX_TOKENS. The body then closes without [DONE].
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"alpha\"}],\"role\":\"model\"}}],\"usageMetadata\":{\"promptTokenCount\":1000,\"candidatesTokenCount\":50,\"thoughtsTokenCount\":3,\"cachedContentTokenCount\":10,\"totalTokenCount\":1053}}\n",
+            "\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"plan\"},{\"functionCall\":{\"name\":\"search\",\"args\":{\"q\":\"rust\"}}}],\"role\":\"model\"},\"finishReason\":\"\"}],\"usageMetadata\":{\"promptTokenCount\":1000,\"candidatesTokenCount\":100,\"thoughtsTokenCount\":8,\"cachedContentTokenCount\":20,\"totalTokenCount\":1108}}\n",
+            "\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"omega\"}],\"role\":\"model\"},\"finishReason\":\"OTHER\"}],\"usageMetadata\":{\"promptTokenCount\":1000,\"candidatesTokenCount\":253,\"thoughtsTokenCount\":17,\"cachedContentTokenCount\":55,\"totalTokenCount\":1270}}\n",
+            "\n",
+        );
+
+        let chunks = collect_sse_body(sse_body.to_string()).await;
+        assert_eq!(
+            chunks.len(),
+            6,
+            "only final cumulative usage should be emitted: {chunks:?}"
+        );
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "alpha"));
+        assert!(matches!(
+            &chunks[1],
+            LLMChunk::ReasoningToken(text) if text == "plan"
+        ));
+        match &chunks[2] {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].function.name, "search");
+            }
+            other => panic!("expected intermediate ToolCalls, got {other:?}"),
+        }
+        assert!(matches!(&chunks[3], LLMChunk::Token(text) if text == "omega"));
+        match &chunks[4] {
+            LLMChunk::CacheUsage {
+                cache_read_input_tokens,
+                ..
+            } => assert_eq!(
+                *cache_read_input_tokens, 55,
+                "partial cache totals must not suppress the final total"
+            ),
+            other => panic!("expected final CacheUsage after all content, got {other:?}"),
+        }
+        match &chunks[5] {
+            LLMChunk::UsageSummary {
+                output_tokens,
+                thinking_tokens,
+            } => {
+                assert_eq!(
+                    *output_tokens, 253,
+                    "partial output totals must not suppress the final total"
+                );
+                assert_eq!(*thinking_tokens, 17);
+            }
+            other => panic!("expected final UsageSummary after cache usage, got {other:?}"),
+        }
     }
 
     #[test]
