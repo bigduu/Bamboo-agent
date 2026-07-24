@@ -911,6 +911,154 @@ impl CredentialStore {
         }))
     }
 
+    /// Prepare explicitly touched MCP environment/header secrets without
+    /// publishing either the credential document or MCP metadata. The exact
+    /// transaction owner stages both documents together after this returns.
+    pub(crate) fn prepare_mcp_intents(
+        &self,
+        config: &mut crate::Config,
+        intents: &BTreeSet<CredentialRef>,
+        persisted_refs: &BTreeSet<CredentialRef>,
+    ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
+        if intents.is_empty() {
+            return Ok(None);
+        }
+
+        let candidate_ref_counts = config_credential_ref_counts(config)?;
+        let mut secrets_by_ref = BTreeMap::<CredentialRef, String>::new();
+        for server in &config.mcp.servers {
+            match &server.transport {
+                bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
+                    for (name, raw_reference) in &stdio.env_credential_refs {
+                        let reference = CredentialRef::parse(raw_reference.clone())?;
+                        if !intents.contains(&reference) {
+                            continue;
+                        }
+                        if let Some(secret) = stdio.env.get(name).filter(|value| !value.is_empty())
+                        {
+                            match secrets_by_ref.get(&reference) {
+                                Some(existing) if existing != secret => {
+                                    return Err(ConfigStoreError::Validation(
+                                        "MCP updates assign conflicting values to one credential reference"
+                                            .to_string(),
+                                    ));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    secrets_by_ref.insert(reference, secret.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                bamboo_domain::mcp_config::TransportConfig::Sse(http) => {
+                    collect_mcp_header_secrets(
+                        http.headers.as_slice(),
+                        intents,
+                        &mut secrets_by_ref,
+                    )?
+                }
+                bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
+                    collect_mcp_header_secrets(
+                        http.headers.as_slice(),
+                        intents,
+                        &mut secrets_by_ref,
+                    )?
+                }
+            }
+        }
+
+        for reference in intents {
+            if !persisted_refs.contains(reference)
+                && !candidate_ref_counts.contains_key(reference)
+                && !secrets_by_ref.contains_key(reference)
+            {
+                return Err(ConfigStoreError::Validation(
+                    "MCP credential intent does not belong to the MCP section".to_string(),
+                ));
+            }
+        }
+
+        let required_refs = intents
+            .iter()
+            .filter(|reference| {
+                secrets_by_ref.contains_key(*reference)
+                    || candidate_ref_counts.get(*reference).copied().unwrap_or(0) > 0
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let (mut document, health) = self.load_document_with_health()?;
+        if health.status == SectionStatus::Degraded {
+            return Err(ConfigStoreError::Validation(
+                "credential document is unavailable for MCP update".to_string(),
+            ));
+        }
+
+        let mut changed = false;
+        for reference in intents {
+            if let Some(secret) = secrets_by_ref.get(reference) {
+                let ciphertext = crate::encryption::encrypt(secret).map_err(|_| {
+                    ConfigStoreError::Validation("credential encryption failed".to_string())
+                })?;
+                document.entries.insert(
+                    reference.clone(),
+                    CredentialEntry {
+                        ciphertext,
+                        source: CredentialSource::User,
+                        updated_at: Utc::now(),
+                        key_version: ENCRYPTION_KEY_VERSION,
+                        migration_generation: None,
+                    },
+                );
+                changed = true;
+            } else if candidate_ref_counts.get(reference).copied().unwrap_or(0) == 0 {
+                changed |= document.entries.remove(reference).is_some();
+            }
+        }
+
+        // Runtime candidates carry plaintext just long enough to stage the
+        // replacement runtime. The durable MCP document contains references
+        // only, including for untouched credentials copied from live state.
+        for server in &mut config.mcp.servers {
+            match &mut server.transport {
+                bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
+                    stdio.env_encrypted.clear();
+                    for name in stdio.env_credential_refs.keys() {
+                        stdio.env.remove(name);
+                    }
+                }
+                bamboo_domain::mcp_config::TransportConfig::Sse(http) => {
+                    clear_mcp_header_plaintext(&mut http.headers)
+                }
+                bamboo_domain::mcp_config::TransportConfig::StreamableHttp(http) => {
+                    clear_mcp_header_plaintext(&mut http.headers)
+                }
+            }
+        }
+
+        validate_document(&document).map_err(ConfigStoreError::Validation)?;
+        ensure_required_entries(&document, &required_refs)?;
+        let revision = if changed {
+            health.revision.checked_add(1).ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".to_string())
+            })?
+        } else {
+            health.revision
+        };
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": CREDENTIAL_SCHEMA_VERSION,
+            "revision": revision,
+            "data": document,
+        }))?;
+        Ok(Some(PreparedProviderCredentialUpdate {
+            bytes,
+            expected_revision: health.revision,
+            revision,
+            touched_refs: intents.iter().cloned().collect(),
+            required_refs,
+        }))
+    }
+
     /// Prepare the fixed proxy-auth credential update without publishing it.
     /// The caller commits these bytes together with root metadata through the
     /// recoverable exact transaction manifest.
@@ -2660,6 +2808,43 @@ pub(crate) fn config_credential_ref_counts(
         }
     }
     Ok(counts)
+}
+
+fn collect_mcp_header_secrets(
+    headers: &[bamboo_domain::mcp_config::HeaderConfig],
+    intents: &BTreeSet<CredentialRef>,
+    secrets_by_ref: &mut BTreeMap<CredentialRef, String>,
+) -> ConfigStoreResult<()> {
+    for header in headers {
+        let Some(raw_reference) = header.credential_ref.as_ref() else {
+            continue;
+        };
+        let reference = CredentialRef::parse(raw_reference.clone())?;
+        if !intents.contains(&reference) || header.value.is_empty() {
+            continue;
+        }
+        match secrets_by_ref.get(&reference) {
+            Some(existing) if existing != &header.value => {
+                return Err(ConfigStoreError::Validation(
+                    "MCP updates assign conflicting values to one credential reference".to_string(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                secrets_by_ref.insert(reference, header.value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_mcp_header_plaintext(headers: &mut [bamboo_domain::mcp_config::HeaderConfig]) {
+    for header in headers {
+        if header.credential_ref.is_some() {
+            header.value.clear();
+        }
+        header.value_encrypted = None;
+    }
 }
 
 fn parse_credential_ref_list(values: &[String]) -> ConfigStoreResult<Vec<CredentialRef>> {
