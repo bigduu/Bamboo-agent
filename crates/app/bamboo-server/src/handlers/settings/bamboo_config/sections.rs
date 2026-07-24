@@ -2,7 +2,7 @@ use actix_web::{web, HttpResponse};
 use bamboo_config::{
     patch::is_masked_api_key, ConfigStoreError, DefaultsConfig, FeatureFlags, HooksSection,
     MemorySection, ModelLimitsSection, ModelPolicySection, ProviderConfigs, ProviderInstanceConfig,
-    SectionEnvelope, SectionId, SubagentsSection, ToolsSkillsSection,
+    RequestOverridesConfig, SectionEnvelope, SectionId, SubagentsSection, ToolsSkillsSection,
 };
 use bamboo_mcp::McpConfig;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
@@ -64,7 +64,7 @@ pub struct ProviderSettingsData {
     #[serde(default)]
     pub features: FeatureFlags,
     #[serde(default)]
-    pub provider_instances: HashMap<String, ProviderInstanceConfig>,
+    pub provider_instances: HashMap<String, ProviderInstanceSettingsData>,
     #[serde(default, alias = "default_provider_instance")]
     pub default_provider_instance_id: Option<String>,
     // Read-only response fields are accepted and ignored so the canonical
@@ -73,6 +73,99 @@ pub struct ProviderSettingsData {
     pub available_providers: Vec<String>,
     #[serde(default)]
     pub credential_status: Value,
+}
+
+/// Secret-free, editable provider-instance contract. Provider-specific fields
+/// that the runtime historically stored in `ProviderInstanceConfig::extra`
+/// are explicit here so clients can round-trip them without gaining access to
+/// unclassified server-owned metadata.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInstanceSettingsData {
+    pub provider_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_only_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_overrides: Option<RequestOverridesConfig>,
+    #[serde(default = "provider_instance_enabled_default")]
+    pub enabled: bool,
+    /// Bodhi-only upstream routing target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_provider: Option<String>,
+    /// Anthropic-compatible upstream opt-in introduced by #520.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_replay_always: Option<bool>,
+}
+
+fn provider_instance_enabled_default() -> bool {
+    true
+}
+
+impl ProviderInstanceSettingsData {
+    fn from_config(instance: &ProviderInstanceConfig) -> Self {
+        Self {
+            provider_type: instance.provider_type.clone(),
+            label: instance.label.clone(),
+            base_url: instance.base_url.clone(),
+            model: instance.model.clone(),
+            fast_model: instance.fast_model.clone(),
+            vision_model: instance.vision_model.clone(),
+            reasoning_effort: instance.reasoning_effort,
+            responses_only_models: instance.responses_only_models.clone(),
+            request_overrides: instance.request_overrides.clone(),
+            enabled: instance.enabled,
+            target_provider: instance
+                .extra
+                .get("target_provider")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            thinking_replay_always: instance
+                .extra
+                .get("thinking_replay_always")
+                .and_then(Value::as_bool),
+        }
+    }
+
+    fn into_config(self) -> ProviderInstanceConfig {
+        let mut extra = BTreeMap::new();
+        if let Some(target_provider) = self.target_provider {
+            extra.insert("target_provider".to_string(), json!(target_provider));
+        }
+        if let Some(thinking_replay_always) = self.thinking_replay_always {
+            extra.insert(
+                "thinking_replay_always".to_string(),
+                json!(thinking_replay_always),
+            );
+        }
+        ProviderInstanceConfig {
+            provider_type: self.provider_type,
+            label: self.label,
+            api_key: String::new(),
+            api_key_encrypted: None,
+            credential_ref: None,
+            base_url: self.base_url,
+            model: self.model,
+            fast_model: self.fast_model,
+            vision_model: self.vision_model,
+            reasoning_effort: self.reasoning_effort,
+            responses_only_models: self.responses_only_models,
+            request_overrides: self.request_overrides,
+            enabled: self.enabled,
+            extra,
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -265,7 +358,10 @@ pub async fn put_provider_settings_section(
             *candidate.providers_mut() = providers;
             candidate.defaults = defaults;
             candidate.features = features;
-            candidate.provider_instances = provider_instances;
+            candidate.provider_instances = provider_instances
+                .into_iter()
+                .map(|(id, instance)| (id, instance.into_config()))
+                .collect();
             candidate.default_provider_instance = default_provider_instance_id;
             retain_provider_settings_server_owned_fields(current, candidate);
             apply_provider_credential_changes(candidate, &credential_changes.providers)?;
@@ -524,15 +620,13 @@ fn sanitized_provider_metadata(providers: &ProviderConfigs) -> Result<Value, App
 fn sanitized_provider_instance_metadata(
     instances: &HashMap<String, ProviderInstanceConfig>,
 ) -> Result<Value, AppError> {
-    let mut instances = instances.clone();
-    for instance in instances.values_mut() {
-        instance.api_key.clear();
-        instance.api_key_encrypted = None;
-        instance.credential_ref = None;
+    let mut data = HashMap::new();
+    for (id, instance) in instances {
+        let mut instance = ProviderInstanceSettingsData::from_config(instance);
         instance.base_url = safe_url_diagnostic(instance.base_url.as_deref());
-        instance.extra.clear();
+        data.insert(id.clone(), instance);
     }
-    let mut value = serde_json::to_value(instances)?;
+    let mut value = serde_json::to_value(data)?;
     scrub_unsafe_request_override_literals(&mut value);
     Ok(value)
 }
@@ -666,7 +760,16 @@ fn retain_provider_settings_server_owned_fields(
             instance.api_key = current.api_key.clone();
             instance.api_key_encrypted = current.api_key_encrypted.clone();
             instance.credential_ref = current.credential_ref.clone();
-            instance.extra = current.extra.clone();
+            let editable_extra = std::mem::take(&mut instance.extra);
+            instance.extra = current
+                .extra
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(key.as_str(), "target_provider" | "thinking_replay_always")
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            instance.extra.extend(editable_extra);
         }
     }
 }
@@ -780,19 +883,37 @@ fn apply_provider_instance_credential_changes(
 }
 
 fn validate_provider_instance_shape(
-    instances: &HashMap<String, ProviderInstanceConfig>,
+    instances: &HashMap<String, ProviderInstanceSettingsData>,
 ) -> Result<(), String> {
     for (id, instance) in instances {
         if id.trim().is_empty() {
             return Err("provider instance id must not be empty".to_string());
         }
-        if !instance.extra.is_empty() {
+        if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&instance.provider_type.as_str()) {
             return Err(format!(
-                "unknown fields are not accepted for provider instance '{id}'"
+                "unknown provider type '{}' for provider instance '{id}'",
+                instance.provider_type
             ));
         }
         if let Some(url) = instance.base_url.as_deref() {
             validate_public_url(url)?;
+        }
+        if let Some(target) = instance.target_provider.as_deref() {
+            if instance.provider_type != "bodhi" {
+                return Err(format!(
+                    "target_provider is only accepted for bodhi provider instance '{id}'"
+                ));
+            }
+            if !matches!(target, "openai" | "anthropic" | "gemini") {
+                return Err(format!(
+                    "unknown bodhi target provider '{target}' for provider instance '{id}'"
+                ));
+            }
+        }
+        if instance.thinking_replay_always.is_some() && instance.provider_type != "anthropic" {
+            return Err(format!(
+                "thinking_replay_always is only accepted for anthropic provider instance '{id}'"
+            ));
         }
     }
     Ok(())
@@ -2031,6 +2152,191 @@ mod tests {
             if path.ends_with("providers.json") {
                 assert!(disk.contains(hidden_forward_value));
             }
+        }
+    }
+
+    #[actix_web::test]
+    async fn provider_instance_runtime_fields_are_explicit_editable_and_preserve_unknown_metadata()
+    {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+        let data = json!({
+            "provider": "openai",
+            "providers": {
+                "openai": {
+                    "model": "gpt-test"
+                }
+            },
+            "defaults": null,
+            "features": {},
+            "provider_instances": {
+                "bodhi-proxy": {
+                    "provider_type": "bodhi",
+                    "label": "Bodhi proxy",
+                    "target_provider": "gemini",
+                    "enabled": false
+                },
+                "glm-compat": {
+                    "provider_type": "anthropic",
+                    "label": "GLM compatible",
+                    "thinking_replay_always": true,
+                    "enabled": false
+                }
+            },
+            "default_provider_instance_id": null
+        });
+
+        let created = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": data,
+                    "credential_changes": {
+                        "providers": {
+                            "openai": {
+                                "action": "replace",
+                                "value": "provider-instance-contract-test-secret"
+                            }
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = created.status();
+        let created_body = String::from_utf8(test::read_body(created).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected provider instance settings response {status}: {created_body}"
+        );
+        assert!(!created_body.contains("provider-instance-contract-test-secret"));
+        let created: Value = serde_json::from_str(&created_body).unwrap();
+        assert_eq!(
+            created["data"]["provider_instances"]["bodhi-proxy"]["target_provider"],
+            "gemini"
+        );
+        assert_eq!(
+            created["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"],
+            true
+        );
+
+        let hidden_value = "server-owned-provider-instance-metadata";
+        state
+            .config
+            .write()
+            .await
+            .provider_instances
+            .get_mut("bodhi-proxy")
+            .unwrap()
+            .extra
+            .insert("future_server_field".to_string(), json!(hidden_value));
+
+        let mut updated = created["data"].clone();
+        updated["provider_instances"]["bodhi-proxy"]["target_provider"] = json!("anthropic");
+        updated["provider_instances"]["glm-compat"]["thinking_replay_always"] = json!(false);
+        let updated = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({"expected_revision": 1, "data": updated}))
+                .to_request(),
+        )
+        .await;
+        assert!(updated.status().is_success());
+        let updated_body = String::from_utf8(test::read_body(updated).await.to_vec()).unwrap();
+        assert!(!updated_body.contains(hidden_value));
+        let updated: Value = serde_json::from_str(&updated_body).unwrap();
+        assert_eq!(updated["revision"], 2);
+        assert_eq!(
+            updated["data"]["provider_instances"]["bodhi-proxy"]["target_provider"],
+            "anthropic"
+        );
+        assert_eq!(
+            updated["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"],
+            false
+        );
+        {
+            let config = state.config.read().await;
+            assert_eq!(
+                config.provider_instances["bodhi-proxy"].extra["future_server_field"],
+                hidden_value
+            );
+            assert_eq!(
+                config.provider_instances["bodhi-proxy"].extra["target_provider"],
+                "anthropic"
+            );
+            assert_eq!(
+                config.provider_instances["glm-compat"].extra["thinking_replay_always"],
+                false
+            );
+        }
+
+        let mut removed = updated["data"].clone();
+        removed["provider_instances"]["bodhi-proxy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_provider");
+        removed["provider_instances"]["glm-compat"]
+            .as_object_mut()
+            .unwrap()
+            .remove("thinking_replay_always");
+        let removed = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({"expected_revision": 2, "data": removed}))
+                .to_request(),
+        )
+        .await;
+        assert!(removed.status().is_success());
+        let removed: Value = test::read_body_json(removed).await;
+        assert_eq!(removed["revision"], 3);
+        assert!(removed["data"]["provider_instances"]["bodhi-proxy"]["target_provider"].is_null());
+        assert!(
+            removed["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"].is_null()
+        );
+        {
+            let config = state.config.read().await;
+            assert_eq!(
+                config.provider_instances["bodhi-proxy"].extra["future_server_field"],
+                hidden_value
+            );
+            assert!(!config.provider_instances["bodhi-proxy"]
+                .extra
+                .contains_key("target_provider"));
+            assert!(!config.provider_instances["glm-compat"]
+                .extra
+                .contains_key("thinking_replay_always"));
+        }
+
+        for (id, field, value) in [
+            ("bodhi-proxy", "future_client_field", json!("must reject")),
+            ("bodhi-proxy", "thinking_replay_always", json!(true)),
+            ("bodhi-proxy", "target_provider", json!("copilot")),
+            ("glm-compat", "target_provider", json!("openai")),
+        ] {
+            let mut invalid = removed["data"].clone();
+            invalid["provider_instances"][id][field] = value;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::put()
+                    .uri("/provider-settings")
+                    .set_json(json!({"expected_revision": 3, "data": invalid}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
         }
     }
 
