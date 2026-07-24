@@ -138,6 +138,14 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::get().to(settings::get_live_config_health),
         )
         .route(
+            "/bamboo/config/provider-settings",
+            web::get().to(settings::get_provider_settings_section),
+        )
+        .route(
+            "/bamboo/config/provider-settings",
+            web::put().to(settings::put_provider_settings_section),
+        )
+        .route(
             "/bamboo/config/sections/providers",
             web::get().to(settings::get_provider_section),
         )

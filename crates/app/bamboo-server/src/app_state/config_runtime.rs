@@ -1479,6 +1479,117 @@ impl AppState {
         Ok(revision)
     }
 
+    /// Replace the complete provider-owned settings domain under the typed
+    /// provider section revision. Provider metadata and explicitly touched
+    /// built-in/instance credentials share one recoverable exact transaction;
+    /// runtime construction is staged before the durable CAS boundary.
+    pub(crate) async fn put_provider_settings<F>(
+        &self,
+        expected_revision: u64,
+        update: F,
+    ) -> Result<u64, ConfigSectionMutationError>
+    where
+        F: FnOnce(
+                &Config,
+                &mut Config,
+            )
+                -> Result<(BTreeSet<String>, BTreeSet<String>), ConfigSectionMutationError>
+            + Send
+            + 'static,
+    {
+        let config_io_lock = self.config_io_lock.clone();
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let config_live_health = self.config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = config_io_lock.lock().await;
+            ensure_provider_mcp_migration_ready(&app_data_dir)
+                .map_err(ConfigSectionMutationError::Store)?;
+            let facade = config_facade.as_ref().ok_or_else(|| {
+                ConfigSectionMutationError::Invalid(
+                    "provider settings require the modular configuration facade".to_string(),
+                )
+            })?;
+            let current = config.read().await.clone();
+            let mut candidate = current.clone();
+            let (provider_intents, provider_instance_intents) = update(&current, &mut candidate)?;
+
+            let (candidate, registry, candidate_provider) =
+                match prepare_provider_candidate(candidate, &app_data_dir).await {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        let message =
+                        "provider runtime initialization failed; retaining last-known-good runtime"
+                            .to_string();
+                        publish_section_failure(
+                            &config_live_health,
+                            &account_sink,
+                            "providers",
+                            SectionStatus::Degraded,
+                            message.clone(),
+                        );
+                        return Err(ConfigSectionMutationError::Runtime(message));
+                    }
+                };
+
+            // Acquire publication guards before the durable boundary. The
+            // detached task owns them until config and provider runtime are
+            // published, so request cancellation cannot strand disk ahead of
+            // process state.
+            let mut live_config = config.write().await;
+            let mut live_provider = provider.write().await;
+            let transaction_dir = app_data_dir.clone();
+            let committed = tokio::task::spawn_blocking(move || {
+                let mut durable_candidate = candidate;
+                bamboo_config::persist_provider_credential_transaction_at_revision(
+                    &transaction_dir,
+                    &mut durable_candidate,
+                    &provider_intents,
+                    &provider_instance_intents,
+                    expected_revision,
+                )?;
+                load_committed_effective_config(&transaction_dir)
+            })
+            .await
+            .map_err(|error| {
+                ConfigSectionMutationError::Runtime(format!(
+                    "provider settings transaction task failed: {error}"
+                ))
+            })?
+            .map_err(ConfigSectionMutationError::Store)?;
+
+            committed.publish_env_vars();
+            *live_config = committed;
+            provider_registry.replace_with(registry);
+            *live_provider = candidate_provider;
+            publish_exact_facade_commit(
+                Some(facade),
+                &account_sink,
+                &[SectionId::Credentials, SectionId::Providers],
+            )
+            .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            let provider_snapshot = facade.registry().providers.snapshot();
+            set_live_health_revision(
+                &config_live_health,
+                provider_snapshot.revision,
+                Some((
+                    provider_snapshot.source_path.clone(),
+                    SectionSourceKind::File,
+                )),
+            );
+            Ok(provider_snapshot.revision)
+        });
+        transaction.await.map_err(|error| {
+            ConfigSectionMutationError::Runtime(format!(
+                "provider settings transaction task failed: {error}"
+            ))
+        })?
+    }
+
     /// Reset the complete provider section and all provider-owned credentials
     /// in one recoverable exact transaction guarded by the typed section
     /// revision. Runtime publication remains last-known-good when the default
@@ -1541,6 +1652,15 @@ impl AppState {
                 &[SectionId::Credentials, SectionId::Providers],
             )
             .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            let provider_snapshot = facade.registry().providers.snapshot();
+            set_live_health_revision(
+                &config_live_health,
+                provider_snapshot.revision,
+                Some((
+                    provider_snapshot.source_path.clone(),
+                    SectionSourceKind::File,
+                )),
+            );
 
             match bamboo_llm::ProviderRegistry::from_config(&candidate, app_data_dir).await {
                 Ok(registry) => {
@@ -1569,8 +1689,7 @@ impl AppState {
                     );
                 }
             }
-
-            Ok(facade.registry().providers.snapshot().revision)
+            Ok(provider_snapshot.revision)
         });
         transaction.await.map_err(|error| {
             ConfigSectionMutationError::Runtime(format!(
@@ -3444,6 +3563,98 @@ mod live_reload_tests {
             "cancellation while waiting for publication guards must precede durable commit"
         );
         drop(held_provider);
+    }
+
+    #[test]
+    fn cancelled_provider_settings_request_finishes_exact_commit_and_live_publication() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let state = Arc::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+            wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+
+            let operation_state = state.clone();
+            let operation = tokio::spawn(async move {
+                operation_state
+                    .put_provider_settings(0, |_current, candidate| {
+                        candidate.provider = "openai".to_string();
+                        candidate.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+                            api_key: "provider-settings-cancel-secret".to_string(),
+                            model: Some("provider-settings-cancel-model".to_string()),
+                            ..Default::default()
+                        });
+                        Ok((BTreeSet::from(["openai".to_string()]), BTreeSet::new()))
+                    })
+                    .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if state.config_io_lock.try_lock().is_err() {
+                        break;
+                    }
+                    assert!(!operation.is_finished());
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("provider settings mutation acquires the config IO lock");
+            operation.abort();
+            let _ = operation.await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let committed = std::fs::read(dir.path().join("providers.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|value| {
+                            value["revision"] == 1
+                                && value["data"]["openai"]["model"]
+                                    == "provider-settings-cancel-model"
+                        });
+                    if committed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned provider settings transaction completes after cancellation");
+
+            let converged =
+                tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+                    .await
+                    .expect("owned provider runtime publication completes after cancellation");
+            drop(converged);
+            let live = state.config.read().await;
+            let openai = live.providers().openai.as_ref().unwrap();
+            assert_eq!(
+                openai.model.as_deref(),
+                Some("provider-settings-cancel-model")
+            );
+            assert_eq!(openai.api_key, "provider-settings-cancel-secret");
+            drop(live);
+            let providers = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
+            let credentials = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
+            assert!(!providers.contains("provider-settings-cancel-secret"));
+            assert!(!credentials.contains("provider-settings-cancel-secret"));
+        });
     }
 
     #[test]
