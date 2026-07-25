@@ -101,32 +101,66 @@ mod tests {
         dir
     }
 
-    /// Generate a throwaway self-signed cert + PKCS#8 key via openssl, returning
-    /// `None` (skip) if openssl is unavailable in the test environment.
-    fn gen_self_signed(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    /// Generate a throwaway X.509 v3 self-signed cert + PKCS#8 key via openssl.
+    ///
+    /// `Ok(None)` is reserved for an absent openssl executable. A present
+    /// executable that fails must fail the test instead of silently skipping
+    /// the rustls success path.
+    fn gen_self_signed(dir: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
-        let status = Command::new("openssl")
+        let output = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-keyout"])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
             .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                key.to_str().unwrap(),
-                "-out",
-                cert.to_str().unwrap(),
                 "-days",
                 "1",
                 "-nodes",
                 "-subj",
                 "/CN=localhost",
+                // An X.509 extension forces v3 output. macOS LibreSSL otherwise
+                // emits a v1 certificate that pinned rustls-webpki rejects.
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
             ])
-            .status();
-        match status {
-            Ok(s) if s.success() => Some((cert, key)),
-            _ => None,
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed to launch openssl: {error}")),
+        };
+        if !output.status.success() {
+            return Err(format!(
+                "openssl failed to generate the TLS fixture ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
+        Ok(Some((cert, key)))
+    }
+
+    fn assert_x509_v3(cert: &Path) {
+        let output = Command::new("openssl")
+            .args(["x509", "-in"])
+            .arg(cert)
+            .args(["-noout", "-text"])
+            .output()
+            .expect("openssl that generated the fixture should remain available");
+        assert!(
+            output.status.success(),
+            "openssl failed to inspect generated TLS fixture ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let certificate_text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            certificate_text
+                .lines()
+                .any(|line| line.trim() == "Version: 3 (0x2)"),
+            "expected generated TLS fixture to be X.509 v3:\n{certificate_text}"
+        );
     }
 
     #[test]
@@ -168,7 +202,9 @@ mod tests {
     fn build_rustls_config_errors_on_missing_key_in_keyfile() {
         let dir = tmp_dir();
         // A valid-looking cert file but a key file with no key block.
-        let Some((cert, _key)) = gen_self_signed(&dir) else {
+        let Some((cert, _key)) =
+            gen_self_signed(&dir).expect("present openssl should generate the TLS fixture")
+        else {
             eprintln!("skipping: openssl unavailable");
             return;
         };
@@ -195,10 +231,13 @@ mod tests {
         // cert/key pair) when openssl is available to mint a throwaway cert.
         // Skips gracefully on environments without openssl.
         let dir = tmp_dir();
-        let Some((cert, key)) = gen_self_signed(&dir) else {
+        let Some((cert, key)) =
+            gen_self_signed(&dir).expect("present openssl should generate the TLS fixture")
+        else {
             eprintln!("skipping build_rustls_config success test: openssl unavailable");
             return;
         };
+        assert_x509_v3(&cert);
         let tls = TlsConfig {
             cert_file: cert,
             key_file: key,
