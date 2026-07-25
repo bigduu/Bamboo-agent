@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 
 use super::hooks::HookRunner;
 
+/// The live disabled tool and skill-id sets resolved at a round boundary.
+pub type DisabledFilterSets = (BTreeSet<String>, BTreeSet<String>);
+
+/// Late-bound resolver for disabled tool and skill-id filters.
+pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct AuxiliaryModelConfig {
     pub fast_model_name: Option<String>,
@@ -501,8 +507,7 @@ pub struct AgentLoopConfig {
     /// `disabled_tools` / `disabled_skill_ids` fields below are used (#44 behavior).
     /// Re-resolved each round at the tool-schema filter, so disabling/re-enabling a
     /// tool mid-run takes effect on the next round. #136.
-    pub(crate) disabled_filter_resolver:
-        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
+    pub(crate) disabled_filter_resolver: Option<DisabledFilterResolver>,
     /// Server-level usage guidance contributed by the run's tool executor —
     /// chiefly the `instructions` connected MCP servers return from `initialize`.
     /// Captured once at config construction (from `ToolExecutor::tool_guidance`)

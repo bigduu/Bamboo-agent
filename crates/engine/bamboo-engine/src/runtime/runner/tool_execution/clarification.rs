@@ -289,16 +289,29 @@ pub(super) async fn suspend_for_pending_question(
     persist_session_after_question(config, session, session_id).await;
 }
 
-pub(super) async fn maybe_handle_user_question_tool(
-    tool_call: &ToolCall,
-    result: &ToolResult,
-    session: &mut Session,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    metrics_collector: Option<&MetricsCollector>,
-    session_id: &str,
-    round_id: &str,
-    config: &AgentLoopConfig,
-) -> bool {
+pub(super) struct UserQuestionToolContext<'a> {
+    pub(super) tool_call: &'a ToolCall,
+    pub(super) result: &'a ToolResult,
+    pub(super) session: &'a mut Session,
+    pub(super) event_tx: &'a mpsc::Sender<AgentEvent>,
+    pub(super) metrics_collector: Option<&'a MetricsCollector>,
+    pub(super) session_id: &'a str,
+    pub(super) round_id: &'a str,
+    pub(super) config: &'a AgentLoopConfig,
+}
+
+pub(super) async fn maybe_handle_user_question_tool(context: UserQuestionToolContext<'_>) -> bool {
+    let UserQuestionToolContext {
+        tool_call,
+        result,
+        session,
+        event_tx,
+        metrics_collector,
+        session_id,
+        round_id,
+        config,
+    } = context;
+
     if !should_handle_user_question_tool(tool_call, result) {
         return false;
     }

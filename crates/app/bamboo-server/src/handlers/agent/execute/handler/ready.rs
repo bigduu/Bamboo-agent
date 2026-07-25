@@ -45,17 +45,29 @@ pub(super) struct ReadyExecution<'a> {
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
 }
 
+pub(super) struct ExecuteReadyContext<'a> {
+    pub state: &'a web::Data<AppState>,
+    pub session_id: &'a str,
+    pub ready: ReadyExecution<'a>,
+    pub config: &'a ExecutionConfigSnapshot,
+    pub config_snapshot: &'a Config,
+    pub image_fallback: Option<ImageFallbackConfig>,
+    pub disabled_tools: Vec<String>,
+    pub disabled_skill_ids: Vec<String>,
+}
+
 /// Reserve the runner, persist, and spawn the agent loop for a ready session.
-pub(super) async fn handle_execute_ready(
-    state: &web::Data<AppState>,
-    session_id: &str,
-    ready: ReadyExecution<'_>,
-    config: &ExecutionConfigSnapshot,
-    config_snapshot: &Config,
-    image_fallback: Option<ImageFallbackConfig>,
-    disabled_tools_vec: Vec<String>,
-    disabled_skill_ids_vec: Vec<String>,
-) -> HttpResponse {
+pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> HttpResponse {
+    let ExecuteReadyContext {
+        state,
+        session_id,
+        ready,
+        config,
+        config_snapshot,
+        image_fallback,
+        disabled_tools,
+        disabled_skill_ids,
+    } = context;
     let mut session = ready.session;
 
     // #74: re-derive the "no interactive human approver" posture per
@@ -130,8 +142,8 @@ pub(super) async fn handle_execute_ready(
         );
     }
 
-    let disabled_tools: BTreeSet<String> = disabled_tools_vec.into_iter().collect();
-    let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids_vec.into_iter().collect();
+    let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();
+    let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids.into_iter().collect();
     let resolved_provider_name = session_effective_model_ref(&session)
         .map(|model_ref| model_ref.provider)
         .unwrap_or_else(|| config.provider_name.clone());

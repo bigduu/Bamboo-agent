@@ -17,7 +17,9 @@ use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::agent_spawn::{SessionExecutionArgs, SessionExecutionReservation};
-use bamboo_engine::{AuxiliaryModelConfig, ImageFallbackConfig, ModelRoster};
+use bamboo_engine::{
+    AuxiliaryModelConfig, DisabledFilterResolver, ImageFallbackConfig, ModelRoster,
+};
 use bamboo_llm::{Config, LLMProvider};
 
 use super::session_state;
@@ -131,7 +133,7 @@ pub(crate) fn make_auxiliary_model_resolver(
 /// freeze it as a floor and break re-enable.
 pub(crate) fn make_disabled_filter_resolver(
     state: &actix_web::web::Data<AppState>,
-) -> Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync> {
+) -> DisabledFilterResolver {
     let config = state.config.clone();
     let cached_config = Arc::new(StdRwLock::new(
         config

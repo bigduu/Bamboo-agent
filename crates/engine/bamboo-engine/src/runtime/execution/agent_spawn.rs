@@ -18,8 +18,8 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 
 use crate::runtime::config::{
-    AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, GoldConfig, GuardianConfig,
-    GuardianSpawner, ImageFallbackConfig,
+    AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, DisabledFilterResolver, GoldConfig,
+    GuardianConfig, GuardianSpawner, ImageFallbackConfig,
 };
 use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::runner_lifecycle::{
@@ -530,8 +530,7 @@ pub struct SessionExecutionArgs {
     /// Optional per-round live resolver for the disabled tool/skill sets (#136).
     /// When `None` the per-run snapshot is used (sub-agent spawns pass `None`, so
     /// short-lived children keep the spawn-time snapshot — by design).
-    pub disabled_filter_resolver:
-        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
+    pub disabled_filter_resolver: Option<DisabledFilterResolver>,
     pub disabled_tools: Option<BTreeSet<String>>,
     pub disabled_skill_ids: Option<BTreeSet<String>>,
     pub selected_skill_ids: Option<Vec<String>>,
@@ -590,8 +589,7 @@ struct ExecuteRequestParams {
     model_roster: ModelRoster,
     reasoning_effort: Option<ReasoningEffort>,
     auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
-    disabled_filter_resolver:
-        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
+    disabled_filter_resolver: Option<DisabledFilterResolver>,
     disabled_tools: Option<BTreeSet<String>>,
     disabled_skill_ids: Option<BTreeSet<String>>,
     selected_skill_ids: Option<Vec<String>>,

@@ -76,20 +76,22 @@ impl ToolManager for DefaultToolManager {
             biased;
             _ = cancel.cancelled() => return Err(AgentError::Cancelled),
             result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
-                tool_calls,
-                &frame,
-                session,
-                &mut runtime_state,
-                task_context,
-                config
-                    .summarization_model_name
-                    .as_deref()
-                    .or(config.background_model_name.as_deref()),
-                config
-                    .summarization_model_provider
-                    .as_ref()
-                    .or(config.background_model_provider.as_ref()),
-                tool_schemas,
+                crate::runtime::runner::tool_execution::RoundToolExecution {
+                    tool_calls,
+                    frame: &frame,
+                    session,
+                    runtime_state: &mut runtime_state,
+                    task_context,
+                    compression_model_name: config
+                        .summarization_model_name
+                        .as_deref()
+                        .or(config.background_model_name.as_deref()),
+                    compression_model_provider: config
+                        .summarization_model_provider
+                        .as_ref()
+                        .or(config.background_model_provider.as_ref()),
+                    tool_schemas,
+                },
             ) => result?,
         };
         if !config.hook_runner.is_empty() {

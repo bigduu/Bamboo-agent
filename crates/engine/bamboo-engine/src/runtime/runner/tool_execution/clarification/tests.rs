@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use super::maybe_handle_user_question_tool;
+use super::{maybe_handle_user_question_tool, UserQuestionToolContext};
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
 use bamboo_agent_core::{AgentEvent, Role, Session};
@@ -33,16 +33,16 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
     let (tx, mut rx) = mpsc::channel(8);
     let mut session = Session::new("session-1", "model");
 
-    let handled = maybe_handle_user_question_tool(
-        &tool_call,
-        &result,
-        &mut session,
-        &tx,
-        None,
-        "session-1",
-        "round-1",
-        &AgentLoopConfig::default(),
-    )
+    let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        tool_call: &tool_call,
+        result: &result,
+        session: &mut session,
+        event_tx: &tx,
+        metrics_collector: None,
+        session_id: "session-1",
+        round_id: "round-1",
+        config: &AgentLoopConfig::default(),
+    })
     .await;
 
     assert!(handled);
@@ -126,16 +126,16 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
     let (tx, mut rx) = mpsc::channel(8);
     let mut session = Session::new("session-perm", "model");
 
-    let handled = maybe_handle_user_question_tool(
-        &tool_call,
-        &result,
-        &mut session,
-        &tx,
-        None,
-        "session-perm",
-        "round-1",
-        &AgentLoopConfig::default(),
-    )
+    let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        tool_call: &tool_call,
+        result: &result,
+        session: &mut session,
+        event_tx: &tx,
+        metrics_collector: None,
+        session_id: "session-perm",
+        round_id: "round-1",
+        config: &AgentLoopConfig::default(),
+    })
     .await;
 
     assert!(
@@ -266,16 +266,16 @@ async fn maybe_handle_user_question_tool_persists_exit_plan_file_and_emits_updat
         updated_at: Utc::now(),
     });
 
-    let handled = maybe_handle_user_question_tool(
-        &tool_call,
-        &result,
-        &mut session,
-        &tx,
-        None,
-        "session-exit-plan",
-        "round-1",
-        &config,
-    )
+    let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        tool_call: &tool_call,
+        result: &result,
+        session: &mut session,
+        event_tx: &tx,
+        metrics_collector: None,
+        session_id: "session-exit-plan",
+        round_id: "round-1",
+        config: &config,
+    })
     .await;
 
     assert!(handled);
@@ -372,16 +372,16 @@ async fn maybe_handle_user_question_tool_ignores_unrelated_tool_calls() {
     let (tx, mut rx) = mpsc::channel(4);
     let mut session = Session::new("session-1", "model");
 
-    let handled = maybe_handle_user_question_tool(
-        &tool_call,
-        &result,
-        &mut session,
-        &tx,
-        None,
-        "session-1",
-        "round-1",
-        &AgentLoopConfig::default(),
-    )
+    let handled = maybe_handle_user_question_tool(UserQuestionToolContext {
+        tool_call: &tool_call,
+        result: &result,
+        session: &mut session,
+        event_tx: &tx,
+        metrics_collector: None,
+        session_id: "session-1",
+        round_id: "round-1",
+        config: &AgentLoopConfig::default(),
+    })
     .await;
 
     assert!(!handled);
