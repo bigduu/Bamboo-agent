@@ -147,8 +147,10 @@ impl Tool for BashInputTool {
 mod tests {
     use super::*;
     use bamboo_infrastructure::process::{
-        clear_command_environment_cache_for_tests, prime_command_environment_cache_for_tests,
         CommandEnvironmentDiagnostics, CommandEnvironmentSource, PythonDiscoveryDiagnostics,
+    };
+    use bamboo_infrastructure::test_support::{
+        override_command_environment, CommandEnvironmentOverrideGuard,
     };
     use std::collections::HashMap;
     use tokio::time::{sleep, Duration, Instant};
@@ -174,12 +176,11 @@ mod tests {
         }
     }
 
-    fn prime_test_command_environment() {
-        clear_command_environment_cache_for_tests();
-        prime_command_environment_cache_for_tests(
+    fn test_command_environment() -> CommandEnvironmentOverrideGuard {
+        override_command_environment(
             HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
             test_environment_diagnostics(),
-        );
+        )
     }
 
     /// Helper: poll `shell`'s output until a line containing `needle` appears,
@@ -202,7 +203,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_input_feeds_interactive_shell_and_output_appears() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         // `cat` echoes its stdin to stdout — perfect for round-trip verification.
         let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
@@ -236,7 +237,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn write_stdin_errors_on_non_interactive_shell() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
@@ -258,7 +259,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn write_stdin_errors_on_exited_interactive_shell() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = bash_runtime::spawn_background("true", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
@@ -295,7 +296,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn non_interactive_stdin_reader_gets_eof_and_terminates() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         // `cat` reads stdin; with Stdio::null() it receives immediate EOF and exits 0.
         let shell = bash_runtime::spawn_background("cat", None, None, None, false, None)
             .await
@@ -345,7 +346,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_input_errors_on_non_interactive_shell_via_tool() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = bash_runtime::spawn_background("sleep 5", None, None, None, false, None)
             .await
             .expect("spawn non-interactive shell");
@@ -385,7 +386,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_input_append_newline_false_sends_utf8_bytes() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
@@ -449,7 +450,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_input_eof_closes_stdin_and_lets_consumer_terminate() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");
@@ -497,7 +498,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_input_eof_allows_empty_input() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = bash_runtime::spawn_background("cat", None, None, None, true, None)
             .await
             .expect("spawn interactive shell");

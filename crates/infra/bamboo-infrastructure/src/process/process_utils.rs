@@ -1,9 +1,15 @@
+#[cfg(any(test, feature = "test-utils"))]
+use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-utils"))]
+use std::marker::PhantomData;
 #[cfg(target_os = "windows")]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(not(target_os = "windows"))]
 use std::process::Stdio;
+#[cfg(any(test, feature = "test-utils"))]
+use std::rc::Rc;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -132,6 +138,58 @@ struct ImportedCommandEnvironment {
     diagnostics: CommandEnvironmentDiagnostics,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    /// Test-only environment selection is deliberately separate from the
+    /// process-global production cache. Rust's test harness runs tests on
+    /// parallel OS threads, so a scoped thread-local override lets each test
+    /// observe its own fixture without clearing, priming, or racing a real
+    /// login-shell refresh.
+    static COMMAND_ENVIRONMENT_OVERRIDE_FOR_TESTS:
+        RefCell<Option<ImportedCommandEnvironment>> = const { RefCell::new(None) };
+}
+
+/// Restores the previous test-only command environment when its scope ends.
+///
+/// The `Rc` marker deliberately makes this guard `!Send` and `!Sync`: callers
+/// must execute `build_command_environment` on the same thread that installed
+/// the override. This matches the default current-thread Tokio test runtime and
+/// prevents a multi-threaded test from silently losing its thread-local fixture.
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use = "keep the guard alive for the full command-environment test scope"]
+pub(crate) struct CommandEnvironmentOverrideGuard {
+    previous: Option<ImportedCommandEnvironment>,
+    _same_thread: PhantomData<Rc<()>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Drop for CommandEnvironmentOverrideGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        COMMAND_ENVIRONMENT_OVERRIDE_FOR_TESTS.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn override_command_environment_for_tests(
+    env: HashMap<String, String>,
+    diagnostics: CommandEnvironmentDiagnostics,
+) -> CommandEnvironmentOverrideGuard {
+    let imported = ImportedCommandEnvironment { env, diagnostics };
+    let previous = COMMAND_ENVIRONMENT_OVERRIDE_FOR_TESTS.with(|slot| slot.replace(Some(imported)));
+    CommandEnvironmentOverrideGuard {
+        previous,
+        _same_thread: PhantomData,
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn read_command_environment_override_for_tests() -> Option<ImportedCommandEnvironment> {
+    COMMAND_ENVIRONMENT_OVERRIDE_FOR_TESTS.with(|slot| slot.borrow().clone())
+}
+
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone)]
 struct CachedUnixShellEnvironment {
@@ -181,6 +239,11 @@ pub async fn build_command_environment(
 }
 
 async fn imported_command_environment() -> ImportedCommandEnvironment {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(imported) = read_command_environment_override_for_tests() {
+        return imported;
+    }
+
     #[cfg(target_os = "windows")]
     {
         ImportedCommandEnvironment::from_process_env(None)
@@ -884,6 +947,14 @@ async fn import_unix_shell_environment() -> Result<ImportedCommandEnvironment, S
     Ok(ImportedCommandEnvironment { env, diagnostics })
 }
 
+/// Clear the process-global command-environment cache for legacy test callers.
+///
+/// New tests should prefer
+/// [`crate::test_support::override_command_environment`], whose scoped
+/// thread-local fixture cannot race parallel tests or an in-flight cache
+/// refresh. This compatibility helper intentionally retains its original
+/// global mutation semantics and is available only in test builds or with the
+/// `test-utils` feature.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn clear_command_environment_cache_for_tests() {
     #[cfg(not(target_os = "windows"))]
@@ -892,6 +963,14 @@ pub fn clear_command_environment_cache_for_tests() {
     }
 }
 
+/// Prime the process-global command-environment cache for legacy test callers.
+///
+/// New tests should prefer
+/// [`crate::test_support::override_command_environment`], whose scoped
+/// thread-local fixture cannot race parallel tests or an in-flight cache
+/// refresh. This compatibility helper intentionally retains its original
+/// global mutation semantics and is available only in test builds or with the
+/// `test-utils` feature.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn prime_command_environment_cache_for_tests(
     env: HashMap<String, String>,
@@ -899,6 +978,9 @@ pub fn prime_command_environment_cache_for_tests(
 ) {
     #[cfg(not(target_os = "windows"))]
     write_cached_unix_shell_environment(ImportedCommandEnvironment { env, diagnostics });
+
+    #[cfg(target_os = "windows")]
+    let _ = (env, diagnostics);
 }
 
 #[cfg(target_os = "windows")]
@@ -1112,6 +1194,144 @@ pub fn hide_window_for_tokio_command(command: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn overridden_environment(marker: &str) -> ImportedCommandEnvironment {
+        ImportedCommandEnvironment {
+            env: HashMap::from([
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+                ("BAMBOO_TEST_ENV_MARKER".to_string(), marker.to_string()),
+            ]),
+            diagnostics: CommandEnvironmentDiagnostics::inherited_process(Some(marker.to_string())),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_environment_override_restores_nested_scope() {
+        assert!(read_command_environment_override_for_tests().is_none());
+
+        let outer = overridden_environment("outer");
+        let outer_guard =
+            override_command_environment_for_tests(outer.env.clone(), outer.diagnostics.clone());
+        let prepared = build_command_environment(&HashMap::new()).await;
+        assert_eq!(
+            prepared.env.get("BAMBOO_TEST_ENV_MARKER"),
+            Some(&"outer".to_string())
+        );
+
+        {
+            let inner = overridden_environment("inner");
+            let _inner_guard = override_command_environment_for_tests(
+                inner.env.clone(),
+                inner.diagnostics.clone(),
+            );
+            let prepared = build_command_environment(&HashMap::new()).await;
+            assert_eq!(
+                prepared.env.get("BAMBOO_TEST_ENV_MARKER"),
+                Some(&"inner".to_string())
+            );
+        }
+
+        let prepared = build_command_environment(&HashMap::new()).await;
+        assert_eq!(
+            prepared.env.get("BAMBOO_TEST_ENV_MARKER"),
+            Some(&"outer".to_string())
+        );
+
+        drop(outer_guard);
+        assert!(read_command_environment_override_for_tests().is_none());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn command_environment_overrides_survive_parallel_real_cache_mutation() {
+        use std::sync::{Arc, Barrier};
+
+        const WORKERS: usize = 8;
+        const ITERATIONS: usize = 128;
+
+        // Keep any other process-global cache test out of this mutation window.
+        // Downstream tests do not need this lock: their scoped overrides never
+        // touch the production cache.
+        let _cache_test_guard = crate::test_support::env_cache_lock_acquire();
+        let previous_cache = unix_shell_env_cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+
+        let workers = (0..WORKERS)
+            .map(|worker| {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let marker = format!("worker-{worker}");
+                    let imported = overridden_environment(&marker);
+                    let guard =
+                        override_command_environment_for_tests(imported.env, imported.diagnostics);
+                    start.wait();
+
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build current-thread runtime");
+                    runtime.block_on(async {
+                        for _ in 0..ITERATIONS {
+                            let prepared = build_command_environment(&HashMap::new()).await;
+                            assert_eq!(
+                                prepared
+                                    .env
+                                    .get("BAMBOO_TEST_ENV_MARKER")
+                                    .map(String::as_str),
+                                Some(marker.as_str())
+                            );
+                            assert_eq!(
+                                prepared.diagnostics.import_error.as_deref(),
+                                Some(marker.as_str())
+                            );
+                            tokio::task::yield_now().await;
+                        }
+                    });
+
+                    drop(guard);
+                    assert!(read_command_environment_override_for_tests().is_none());
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mutator = std::thread::spawn({
+            let start = Arc::clone(&start);
+            move || {
+                start.wait();
+                for iteration in 0..(WORKERS * ITERATIONS) {
+                    if iteration % 2 == 0 {
+                        if let Ok(mut cache) = unix_shell_env_cache().write() {
+                            *cache = None;
+                        }
+                    } else {
+                        let mut imported = overridden_environment("production-cache");
+                        imported.diagnostics =
+                            CommandEnvironmentDiagnostics::unix_login_shell("/bin/sh".to_string());
+                        write_cached_unix_shell_environment(imported);
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let worker_results = workers
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect::<Vec<_>>();
+        let mutator_result = mutator.join();
+
+        *unix_shell_env_cache()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous_cache;
+
+        for result in worker_results {
+            result.expect("parallel command-environment worker");
+        }
+        mutator_result.expect("production cache mutator");
+    }
 
     #[test]
     fn parse_env_output_ignores_leading_noise_and_handles_multiline_values() {

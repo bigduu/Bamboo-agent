@@ -659,8 +659,10 @@ mod tests {
     use bamboo_agent_core::tools::ToolExecutionSessionFlags;
     use bamboo_agent_core::{AgentEvent, ToolExecutionContext};
     use bamboo_infrastructure::process::{
-        clear_command_environment_cache_for_tests, prime_command_environment_cache_for_tests,
         CommandEnvironmentDiagnostics, CommandEnvironmentSource, PythonDiscoveryDiagnostics,
+    };
+    use bamboo_infrastructure::test_support::{
+        override_command_environment, CommandEnvironmentOverrideGuard,
     };
     use serde_json::Value;
     use std::collections::HashMap;
@@ -713,17 +715,16 @@ mod tests {
         }
     }
 
-    fn prime_test_command_environment() {
-        clear_command_environment_cache_for_tests();
-        prime_command_environment_cache_for_tests(
+    fn test_command_environment() -> CommandEnvironmentOverrideGuard {
+        override_command_environment(
             HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
             test_environment_diagnostics(),
-        );
+        )
     }
 
     #[tokio::test]
     async fn bash_foreground_returns_stdout_stderr_and_streams_tokens() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let (tx, mut rx) = mpsc::channel(32);
 
@@ -797,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_foreground_tolerates_invalid_utf8_stderr() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let result = tool
             .invoke(
@@ -820,7 +821,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_foreground_failure_includes_full_python_tried_list() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let out = tool
             .invoke(
@@ -845,7 +846,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_foreground_sets_stdout_truncated_when_output_exceeds_cap() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let out = tool
             .invoke(
@@ -868,7 +869,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_background_honors_explicit_timeout() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let out = tool
             .invoke(
@@ -916,7 +917,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_background_emits_completion_event_with_exit_code() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
         let shell =
             super::bash_runtime::spawn_background("true", None, Some(tx), None, false, None)
@@ -950,7 +951,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_background_emits_completion_event_for_failing_command() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
         let shell =
             super::bash_runtime::spawn_background("false", None, Some(tx), None, false, None)
@@ -983,7 +984,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_background_emits_killed_when_shell_is_killed() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let (tx, mut rx) = mpsc::channel(8);
         let shell =
             super::bash_runtime::spawn_background("sleep 30", None, Some(tx), None, false, None)
@@ -1018,7 +1019,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_background_without_sender_still_completes() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = super::bash_runtime::spawn_background("true", None, None, None, false, None)
             .await
             .expect("background shell should spawn");
@@ -1043,7 +1044,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_background_drops_completion_when_channel_saturated() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         // Capacity-1 channel pre-filled so the single slot is occupied.
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(1);
         tx.try_send(AgentEvent::Token {
@@ -1090,7 +1091,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn bash_tool_background_dispatch_emits_completion_event() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolExecutionContext::for_dispatch(
@@ -1142,7 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_resolves_relative_workdir_from_session_workspace() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -1184,7 +1185,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_rejects_workdir_that_is_not_directory() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let file = tempfile::NamedTempFile::new().unwrap();
 
@@ -1209,7 +1210,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn running_shells_for_session_filters_by_session_and_status() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
 
         // Two long-running shells owned by sess-A.
         let a1 = super::bash_runtime::spawn_background(
@@ -1300,7 +1301,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn auto_path_fast_command_returns_synchronous_result() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let (tx, _rx) = mpsc::channel(32);
         let ctx = ToolExecutionContext {
@@ -1345,7 +1346,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn auto_path_promotes_long_command_to_background() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
         let session_id = "session_auto_promote";
         let (tx, mut rx) = mpsc::channel(8);
@@ -1414,7 +1415,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn force_sync_does_not_promote_and_times_out() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
 
         let out = tool
@@ -1451,7 +1452,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn auto_path_does_not_promote_when_not_resume_capable() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let tool = BashTool::new();
 
         let out = tool
@@ -1485,7 +1486,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn adopt_running_child_preserves_seeded_output() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let shell = bamboo_infrastructure::process::preferred_bash_shell();
         let mut cmd = tokio::process::Command::new(&shell.program);
         bamboo_infrastructure::process::hide_window_for_tokio_command(&mut cmd);
@@ -1564,7 +1565,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_completion_pushes_to_sink_with_output_tail() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let recorder = RecordingSink::default();
         let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
             std::sync::Arc::new(recorder.clone());
@@ -1596,7 +1597,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_completion_carries_nonzero_exit_code() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let recorder = RecordingSink::default();
         let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
             std::sync::Arc::new(recorder.clone());
@@ -1627,7 +1628,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn killed_background_shell_pushes_killed_to_sink() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let recorder = RecordingSink::default();
         let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
             std::sync::Arc::new(recorder.clone());
@@ -1656,7 +1657,7 @@ mod tests {
 
     #[tokio::test]
     async fn untagged_shell_does_not_invoke_sink() {
-        prime_test_command_environment();
+        let _command_environment = test_command_environment();
         let recorder = RecordingSink::default();
         let sink: std::sync::Arc<dyn bamboo_agent_core::BashCompletionSink> =
             std::sync::Arc::new(recorder.clone());
