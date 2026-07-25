@@ -466,10 +466,16 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-utils")]
     #[actix_web::test]
     async fn generic_mutations_reject_env_refs_without_changing_any_layer() {
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        // Keep both runtime-cache publications and reads in this Actix
+        // current-thread scope. Rejected handlers can still mutate the scoped
+        // cache (and fail the assertion), while parallel AppState tests cannot
+        // replace it from another test-harness thread.
+        let _env_cache = bamboo_config::test_support::isolate_env_vars_cache();
         let reference = CredentialRef::parse("env.TOKEN.value").unwrap();
         state
             .credential_store

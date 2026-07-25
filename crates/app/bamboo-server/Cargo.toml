@@ -150,6 +150,11 @@ notify = "8"
 prost = "0.13"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
 
+[features]
+# Test-only scoped access to bamboo-config's process-global env-cache fixtures.
+# Kept out of defaults so production builds retain the ordinary global path.
+test-utils = ["bamboo-config/test-utils"]
+
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
@@ -165,5 +170,14 @@ awc = { version = "3", features = ["rustls-0_23"] }
 actix-codec = "0.5"
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
 bamboo-llm = { path = "../../infra/bamboo-llm" }
+# Existing server unit tests use bamboo-config's encryption and transaction
+# fixtures under the default `cargo test` path. This dev-only edge keeps those
+# tests available; the package feature above separately selects integration
+# tests that must opt in to the scoped env-cache fixture.
 bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
+
+[[test]]
+name = "env_cache_isolation"
+path = "tests/env_cache_isolation.rs"
+required-features = ["test-utils"]
