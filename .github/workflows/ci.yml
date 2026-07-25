@@ -70,6 +70,32 @@ jobs:
         # drifting from the real API (bamboo-agent#255).
         run: cargo build --examples
 
+  msrv:
+    name: MSRV (Rust 1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-msrv-1.95-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Test MSRV graph audit
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Audit locked dependency MSRVs
+        run: python3 scripts/check-msrv.py
+
+      - name: Check workspace on MSRV
+        run: cargo check --locked --workspace --all-targets --all-features
+
   tls-fixture-test:
     name: TLS Fixture (${{ matrix.os }})
     # Keep the test-only certificate generator portable across the OpenSSL and

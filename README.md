@@ -122,6 +122,8 @@ Built-in skills live in `builtin_skills/`: `docx`, `pdf`, `pptx`, `xlsx`, `skill
 
 ## Quick Start & Development
 
+Building Bamboo from source requires **Rust 1.95 or newer**.
+
 ### First-run setup
 
 Configure a provider + API key without hand-editing JSON:
