@@ -116,14 +116,10 @@ base64 = "0.22"
 # `Verifier::verify`, and test keypairs use `SigningKey::from_bytes` (a fixed
 # 32-byte "secret"), so no CSPRNG feature (`rand_core`) is needed anywhere.
 #
-# Pinned to the exact prerelease `russh` (SSH deploy, `bamboo-broker`) already
-# requires (`=3.0.0-rc.1`) — a looser `"3"` requirement lets cargo prefer the
-# stable `3.0.0` release for THIS crate while russh is stuck on the `-rc.1`
-# exact pin, and cargo refuses to select two versions of the same crate for
-# one dependency graph; matching russh's exact pin keeps a single resolved
-# version (the one already in Cargo.lock, adding no new crate to the tree).
-# TODO: move to a stable release once russh's pin does.
-ed25519-dalek = { version = "=3.0.0-rc.1" }
+# Keep the direct pin aligned with the stable release selected by `russh`
+# (SSH deploy, `bamboo-broker`) so signature verification and SSH host-key
+# support share one resolved version.
+ed25519-dalek = { version = "=3.0.0" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Plugin source staging (`src/plugin_source.rs`): unpacking a local/remote
 # `.tar.gz`/`.tgz` plugin bundle or platform-artifact archive. `flate2` is
