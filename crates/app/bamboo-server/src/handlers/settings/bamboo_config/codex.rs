@@ -38,38 +38,23 @@ pub async fn detect_codex_cli(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
     use actix_web::{body::to_bytes, http::StatusCode};
 
     use super::*;
 
-    fn write_codex_stub() -> (tempfile::TempDir, String) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("codex");
-        let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, "#!/bin/sh").unwrap();
-        writeln!(
-            file,
-            r#"case "$*" in
-  "--version") echo 'codex-cli 0.144.5' ;;
-  "exec --help") echo '--json --output-last-message --config --sandbox --dangerously-bypass-approvals-and-sandbox prompt from stdin' ;;
-  "exec resume --help") echo '--json' ;;
-  "app-server --help") echo '--listen stdio:// --stdio' ;;
-  *) exit 2 ;;
-esac"#
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).unwrap();
-        (directory, path.to_string_lossy().into_owned())
+    fn codex_stub_fixture() -> String {
+        // During a parallel Linux suite, a concurrently spawned child can briefly inherit an
+        // O_CLOEXEC writer until its own exec. Never opening this tracked inode for writing
+        // prevents that transient descriptor from making the fixture text-busy.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/handlers/settings/bamboo_config/fixtures/codex-stub")
+            .to_string_lossy()
+            .into_owned()
     }
 
     #[actix_web::test]
     async fn detect_returns_the_shared_preflight_path_and_version() {
-        let (_directory, binary) = write_codex_stub();
+        let binary = codex_stub_fixture();
         let response = detect_codex_cli(web::Json(DetectCodexRequest {
             binary: Some(binary.clone()),
             mode: None,
@@ -97,7 +82,7 @@ esac"#
 
     #[actix_web::test]
     async fn app_server_detection_uses_the_extra_capability_gate() {
-        let (_directory, binary) = write_codex_stub();
+        let binary = codex_stub_fixture();
         let response = detect_codex_cli(web::Json(DetectCodexRequest {
             binary: Some(binary),
             mode: Some("app_server".to_string()),
@@ -105,5 +90,31 @@ esac"#
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn tracked_codex_stub_survives_repeated_parallel_detection() {
+        const STRESS_ITERATIONS: usize = 32;
+
+        for iteration in 0..STRESS_ITERATIONS {
+            let binary = codex_stub_fixture();
+            let exec_detection = detect_codex_cli(web::Json(DetectCodexRequest {
+                binary: Some(binary.clone()),
+                mode: None,
+            }));
+            let app_server_detection = detect_codex_cli(web::Json(DetectCodexRequest {
+                binary: Some(binary),
+                mode: Some("app_server".to_string()),
+            }));
+
+            let (exec_response, app_server_response) =
+                tokio::join!(exec_detection, app_server_detection);
+            for (mode, response) in [("exec", exec_response), ("app_server", app_server_response)] {
+                let response = response.unwrap_or_else(|error| {
+                    panic!("{mode} detection failed during stress iteration {iteration}: {error}")
+                });
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
     }
 }
