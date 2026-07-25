@@ -456,6 +456,7 @@ pub fn build_spawn_scheduler(
     completion_handler: Option<Arc<dyn bamboo_engine::execution::ChildCompletionHandler>>,
     app_data_dir: Option<std::path::PathBuf>,
     account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
+    child_run_launch_hook: Option<Arc<dyn bamboo_engine::execution::ChildRunLaunchHook>>,
 ) -> Arc<SpawnScheduler> {
     Arc::new(SpawnScheduler::new(SpawnContext {
         agent,
@@ -467,6 +468,7 @@ pub fn build_spawn_scheduler(
         provider_router,
         app_data_dir,
         completion_handler,
+        child_run_launch_hook,
         account_feed_inbox,
     }))
 }

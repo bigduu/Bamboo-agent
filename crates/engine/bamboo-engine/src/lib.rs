@@ -16,7 +16,9 @@ pub mod prompt_defaults;
 pub mod resolved_defaults;
 pub mod runtime;
 pub mod sdk;
+pub mod session_activation;
 pub mod session_app;
+pub mod session_messaging;
 pub mod session_repository;
 pub use session_repository::SessionRepository;
 pub mod title_gen;
@@ -31,7 +33,15 @@ pub use workflow_run::{
 
 pub use app_context::AgentSessionContext;
 pub use runtime::execution::agent_spawn::{read_cached_session, SessionCache};
+pub use session_activation::{
+    SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationRouter,
+    SessionActivationSpawner, SessionRunRegistration, SessionRunRegistrationError,
+};
 pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
+pub use session_messaging::{
+    SessionMessagingMetrics, SessionMessagingMetricsSnapshot, SessionMessenger,
+    SessionMessengerAdmission, SessionMessengerError, SessionMessengerReceipt,
+};
 
 // Re-export commonly used types from agent (via dependency)
 pub use bamboo_agent_core::{
@@ -45,7 +55,7 @@ pub use bamboo_agent_core::{
 pub use bamboo_domain::{
     AgentHookPoint, HookPayload, HookResult, HookToolOutcome, RuntimeSessionPersistence,
 };
-pub use runtime::agent::AgentBuilder;
+pub use runtime::agent::{AgentBuilder, DirectExecutionLease};
 // `AgentLoopConfig` is intentionally NOT re-exported: its fields are `pub(crate)`,
 // so it cannot be constructed outside the engine. Execution funnels solely through
 // `AgentRuntime::execute`.

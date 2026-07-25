@@ -43,10 +43,13 @@ async fn spawn_discover_run_stream_terminal() {
     client
         .send(ParentFrame::Run(RunSpec {
             assignment: "hello world".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
         .await
@@ -59,6 +62,9 @@ async fn spawn_discover_run_stream_terminal() {
         match frame {
             ChildFrame::Event { event } => events.push(event),
             ChildFrame::ApprovalRequest { .. } => {}
+            ChildFrame::SessionMessageAdmitted { confirmation } => {
+                panic!("echo run emitted unexpected SessionInbox confirmation: {confirmation:?}")
+            }
             ChildFrame::Terminal { status, result, .. } => {
                 terminal = Some((status, result));
                 break;
@@ -114,10 +120,13 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await

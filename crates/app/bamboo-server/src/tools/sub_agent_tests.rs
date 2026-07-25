@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 
@@ -11,6 +12,9 @@ use bamboo_agent_core::tools::{
     Tool, ToolCtx, ToolError, ToolExecutionContext, ToolOutcome, ToolResult,
 };
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
+use bamboo_domain::{
+    SessionActivationDisposition, SessionActivationError, SessionActivationPort, SessionInboxPort,
+};
 use bamboo_engine::session_app::child_session;
 
 use crate::app_state::{AgentRunner, AgentStatus};
@@ -69,6 +73,54 @@ impl ToolExecutor for NoopToolExecutor {
     }
 }
 
+#[derive(Default)]
+struct RecordingActivation {
+    calls: AtomicUsize,
+    failures_remaining: AtomicUsize,
+    delegate: StdRwLock<Option<Arc<dyn SessionActivationPort>>>,
+}
+
+impl RecordingActivation {
+    fn fail_next(&self) {
+        self.failures_remaining.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn set_delegate(&self, delegate: Arc<dyn SessionActivationPort>) {
+        *self.delegate.write().unwrap() = Some(delegate);
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionActivationPort for RecordingActivation {
+    async fn request_activation(
+        &self,
+        target_session_id: &str,
+        inbox_generation: u64,
+    ) -> Result<SessionActivationDisposition, SessionActivationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(SessionActivationError::Internal(
+                "injected activation failure".to_string(),
+            ));
+        }
+        let delegate = self.delegate.read().unwrap().clone();
+        match delegate {
+            Some(delegate) => {
+                delegate
+                    .request_activation(target_session_id, inbox_generation)
+                    .await
+            }
+            None => Ok(SessionActivationDisposition::ActiveNotified),
+        }
+    }
+}
+
 /// No-op child runner for these tool/adapter-level tests. Sub-agents always run
 /// as actors now (the in-process spawn path was removed), but these tests
 /// exercise the SubAgent tool + adapter + scheduler bookkeeping — event
@@ -106,6 +158,9 @@ struct TestHarness {
     child_session_id: String,
     parent_rx: broadcast::Receiver<AgentEvent>,
     notification_service: Arc<bamboo_notification::NotificationService>,
+    session_inbox: Arc<dyn SessionInboxPort>,
+    activation: Arc<RecordingActivation>,
+    activation_router: Arc<bamboo_engine::SessionActivationRouter>,
     project_store: Arc<bamboo_projects::ProjectStore>,
     workspace_path: PathBuf,
 }
@@ -131,6 +186,7 @@ async fn build_test_harness_with_resolver(
     let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
     jsonl.init().await.unwrap();
     let storage: Arc<dyn Storage> = Arc::new(jsonl);
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
 
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
     let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
@@ -170,39 +226,50 @@ async fn build_test_harness_with_resolver(
     storage.save_session(&child).await.unwrap();
     session_store.save_session(&child).await.unwrap();
 
+    let session_inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+        session_store.clone(),
+        bamboo_domain::SessionInboxLimits::default(),
+    ));
+    let activation_router = bamboo_engine::SessionActivationRouter::new();
+    let activation = Arc::new(RecordingActivation::default());
+    let activation_port: Arc<dyn SessionActivationPort> = activation.clone();
+    let session_messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+        storage.clone(),
+        session_inbox.clone(),
+        activation_port,
+    ));
+
+    let config = Arc::new(RwLock::new(bamboo_llm::Config::default()));
+    let provider: Arc<dyn LLMProvider> = Arc::new(NoopProvider);
+    let mut providers = HashMap::new();
+    providers.insert("test".to_string(), provider.clone());
+    let provider_registry = Arc::new(bamboo_llm::ProviderRegistry::new(
+        providers,
+        "test".to_string(),
+    ));
+    let provider_router = Arc::new(bamboo_llm::ProviderModelRouter::new(
+        provider_registry.clone(),
+    ));
     let agent_runtime = Arc::new(
         bamboo_engine::Agent::builder()
             .storage(storage.clone())
-            .persistence(Arc::new(bamboo_storage::LockedSessionStore::new(
-                storage.clone(),
-            )))
+            .persistence(persistence.clone())
+            .session_inbox(session_inbox.clone())
+            .activation_router(activation_router.clone())
+            .session_messenger(session_messenger.clone())
             .attachment_reader(session_store.clone())
             .skill_manager(Arc::new(SkillManager::new()))
             .metrics_collector(metrics_collector)
-            .config(Arc::new(RwLock::new(bamboo_llm::Config::default())))
-            .provider(Arc::new(NoopProvider))
+            .config(config.clone())
+            .provider(provider)
             .default_tools(Arc::new(NoopToolExecutor))
             .build()
             .expect("test agent should be fully configured"),
     );
 
-    let scheduler = Arc::new(SpawnScheduler::new(SpawnContext {
-        agent: agent_runtime,
-        tools: Arc::new(NoopToolExecutor),
-        sessions_cache: sessions_cache.clone(),
-        agent_runners: agent_runners.clone(),
-        session_event_senders: session_event_senders.clone(),
-        external_child_runner: Arc::new(NoopChildRunner),
-        provider_router: None,
-        app_data_dir: None,
-        completion_handler: None,
-        account_feed_inbox: None,
-    }));
-
-    // Real notification service + relay deps (not stubbed): lets tests verify
-    // `enqueue_child_run` actually starts the always-on relay for the child
-    // session, the same way `AppState::notification_relay_deps` bundles it
-    // for the execute handler / schedule manager in production.
+    // Real notification service + relay deps (not stubbed): the scheduler's
+    // canonical launch hook owns observer setup for both queued child creates
+    // and reserved idle SessionInbox activation.
     let notification_service = Arc::new(bamboo_notification::NotificationService::new(
         bamboo_home.join("notification_preferences.json"),
     ));
@@ -210,22 +277,58 @@ async fn build_test_harness_with_resolver(
         notification_service: notification_service.clone(),
         session_event_senders: session_event_senders.clone(),
         session_watchers: crate::app_state::watchers::SessionWatchers::new(),
-        config: Arc::new(RwLock::new(bamboo_llm::Config::default())),
+        config: config.clone(),
     };
+
+    let completion_coordinator = Arc::new(bamboo_engine::ChildCompletionCoordinator::new(
+        storage.clone(),
+        persistence.clone(),
+        sessions_cache.clone(),
+        agent_runners.clone(),
+        session_event_senders.clone(),
+        agent_runtime.clone(),
+        config.clone(),
+        provider_registry,
+        provider_router.clone(),
+        bamboo_home.clone(),
+        None,
+    ));
+    activation_router
+        .set_spawner(completion_coordinator.clone())
+        .await;
+    let scheduler = Arc::new(SpawnScheduler::new(SpawnContext {
+        agent: agent_runtime,
+        tools: Arc::new(NoopToolExecutor),
+        sessions_cache: sessions_cache.clone(),
+        agent_runners: agent_runners.clone(),
+        session_event_senders: session_event_senders.clone(),
+        external_child_runner: Arc::new(NoopChildRunner),
+        provider_router: Some(provider_router),
+        app_data_dir: Some(bamboo_home.clone()),
+        completion_handler: Some(completion_coordinator.clone()),
+        child_run_launch_hook: Some(Arc::new(
+            crate::app_state::session_events::NotificationRelayLaunchHook::new(
+                notification_relay_deps,
+            ),
+        )),
+        account_feed_inbox: None,
+    }));
+    completion_coordinator.set_spawn_scheduler(&scheduler).await;
+    activation.set_delegate(activation_router.clone());
 
     let adapter = Arc::new(ChildSessionAdapter {
         session_store,
         storage: storage.clone(),
-        persistence: Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone())),
+        persistence,
+        session_messenger: Some(session_messenger),
         scheduler,
         sessions_cache,
         agent_runners: agent_runners.clone(),
         session_event_senders,
         subagent_model_resolver,
-        config: Arc::new(RwLock::new(bamboo_llm::Config::default())),
+        config,
         project_store: Some(project_store.clone()),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
-        notification_relay: Some(notification_relay_deps),
     });
     let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
 
@@ -238,6 +341,9 @@ async fn build_test_harness_with_resolver(
         child_session_id,
         parent_rx,
         notification_service,
+        session_inbox,
+        activation,
+        activation_router,
         project_store,
         workspace_path,
     }
@@ -1495,17 +1601,37 @@ async fn send_message_appends_follow_up_without_replacing_history() {
         child.metadata.get("last_run_status").map(String::as_str),
         Some("pending")
     );
+    let backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        backlog.pending + backlog.claimed,
+        0,
+        "auto_run=false on an idle child must remain a draft and not activate"
+    );
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn send_message_queues_on_running_child_without_interrupt() {
     let harness = build_test_harness().await;
-    {
+    let run_id = {
         let mut runners = harness.agent_runners.write().await;
         let mut runner = AgentRunner::new();
         runner.status = AgentStatus::Running;
+        let run_id = runner.run_id.clone();
         runners.insert(harness.child_session_id.clone(), runner);
-    }
+        run_id
+    };
+    // The production execution core publishes the same logical owner into the
+    // activation router after reserving this exact shared runner slot.
+    let _owner_registration = harness
+        .activation_router
+        .register_run(&harness.child_session_id, &run_id)
+        .await
+        .unwrap();
 
     let result = invoke_completed(
         &harness.tool,
@@ -1531,7 +1657,8 @@ async fn send_message_queues_on_running_child_without_interrupt() {
 
     assert!(result.success);
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
-    assert_eq!(payload["status"], "message_queued");
+    assert_eq!(payload["status"], "message_delivered_live");
+    assert_eq!(payload["auto_run"], false);
     assert_eq!(payload["message"], "continue");
 
     let child = harness
@@ -1540,17 +1667,35 @@ async fn send_message_queues_on_running_child_without_interrupt() {
         .await
         .unwrap()
         .expect("child session should exist");
-    // Message is NOT appended to messages array while child is running;
-    // it is stored in metadata for the agent loop to merge at turn boundaries.
+    // The running snapshot is untouched. The typed envelope lives in the
+    // canonical durable SessionInbox and the active owner is notified once.
     assert_eq!(child.messages.len(), 3);
-    let pending_raw = child
-        .metadata
-        .get("pending_injected_messages")
-        .expect("pending_injected_messages should be set");
-    let pending: Vec<child_session::QueuedInjectedMessage> =
-        serde_json::from_str(pending_raw).expect("should parse queued messages");
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].content, "continue");
+    assert!(!child.has_pending_injected_messages());
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 1);
+    let claims = harness
+        .session_inbox
+        .claim(&harness.child_session_id, 1)
+        .await
+        .expect("typed SessionInbox claim");
+    assert_eq!(claims.len(), 1);
+    let envelope = &claims[0].envelope;
+    assert_eq!(envelope.target_session_id, harness.child_session_id);
+    assert_eq!(
+        envelope.source,
+        bamboo_domain::SessionMessageSource::Session {
+            session_id: harness.parent_session_id.clone()
+        }
+    );
+    assert_eq!(
+        envelope.kind,
+        bamboo_domain::SessionMessageKind::PeerMessage
+    );
+    assert_eq!(
+        envelope.body.clone(),
+        bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent::text(
+            "continue"
+        ))
+    );
 }
 
 #[tokio::test]
@@ -1624,6 +1769,17 @@ async fn send_message_can_interrupt_running_child() {
         child.metadata.get("last_run_status").map(String::as_str),
         Some("pending")
     );
+    let backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        backlog.pending + backlog.claimed,
+        0,
+        "interrupt=true + auto_run=false must remain a draft and not activate"
+    );
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1656,6 +1812,8 @@ async fn send_message_can_queue_child_immediately() {
         serde_json::from_str(&result.result).expect("tool result should be JSON");
     assert_eq!(payload["status"], "queued");
     assert_eq!(payload["auto_run"], true);
+    assert_eq!(payload["inbox_generation"], 1);
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 1);
 
     let started_event = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -1678,6 +1836,130 @@ async fn send_message_can_queue_child_immediately() {
 
     assert_eq!(started_event.0, harness.parent_session_id);
     assert_eq!(started_event.1, harness.child_session_id);
+    assert!(
+        !harness
+            .notification_service
+            .try_begin_relay(&harness.child_session_id),
+        "reserved idle SessionInbox activation should start the child relay"
+    );
+}
+
+#[tokio::test]
+async fn send_message_same_tool_call_retries_activation_without_duplicate_delivery() {
+    let harness = build_test_harness().await;
+    harness.activation.fail_next();
+
+    let args = json!({
+        "action": "send_message",
+        "child_session_id": harness.child_session_id,
+        "message": "retry the exact durable follow-up"
+    });
+    let context = || {
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_activation_retry",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx()
+    };
+
+    let first = invoke_completed(&harness.tool, args.clone(), context())
+        .await
+        .expect("durable delivery must be reported even when activation fails");
+    let first_payload: serde_json::Value =
+        serde_json::from_str(&first.result).expect("first tool result should be JSON");
+    assert_eq!(first_payload["status"], "activation_pending");
+    assert_eq!(first_payload["inbox_generation"], 1);
+    assert_eq!(
+        first_payload["activation_error"],
+        "session activation failed: injected activation failure"
+    );
+    let message_id = first_payload["message_id"]
+        .as_str()
+        .expect("stable message id")
+        .to_string();
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 1);
+    let first_backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .expect("inspect first durable delivery");
+    assert_eq!(first_backlog.pending + first_backlog.claimed, 1);
+    assert_eq!(first_backlog.generation, 1);
+    assert_eq!(first_backlog.activation_generation, 1);
+
+    let second = invoke_completed(&harness.tool, args, context())
+        .await
+        .expect("same tool call/body must retry activation");
+    let second_payload: serde_json::Value =
+        serde_json::from_str(&second.result).expect("second tool result should be JSON");
+    assert_eq!(second_payload["status"], "queued");
+    assert_eq!(second_payload["inbox_generation"], 1);
+    assert_eq!(second_payload["message_id"], message_id);
+    assert_eq!(second_payload["activation_error"], serde_json::Value::Null);
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 2);
+    let second_backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .expect("inspect idempotent retry");
+    assert_eq!(second_backlog.generation, 1);
+    assert_eq!(second_backlog.activation_generation, 1);
+    let message_id =
+        bamboo_domain::SessionMessageId::parse(message_id).expect("valid stable message id");
+    let second_admitted = harness
+        .session_inbox
+        .was_admitted(&harness.child_session_id, &message_id)
+        .await
+        .expect("inspect exact admission receipt");
+    assert!(
+        (second_backlog.pending + second_backlog.claimed == 1 && !second_admitted)
+            || (second_backlog.pending + second_backlog.claimed == 0 && second_admitted),
+        "the real activation may still own the one durable claim or may have \
+         permanently admitted it, but must not duplicate or lose it: \
+         backlog={second_backlog:?}, admitted={second_admitted}"
+    );
+
+    let conflicting = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": "different follow-up under the same tool-call id"
+        }),
+        context(),
+    )
+    .await
+    .expect_err("same tool-call id with different body must fail closed");
+    assert!(
+        conflicting
+            .to_string()
+            .contains("reused with different delivery semantics"),
+        "unexpected error: {conflicting}"
+    );
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 2);
+    let final_backlog = harness
+        .session_inbox
+        .inspect(&harness.child_session_id)
+        .await
+        .expect("inspect after conflicting retry");
+    assert_eq!(final_backlog.generation, 1);
+    let final_admitted = harness
+        .session_inbox
+        .was_admitted(&harness.child_session_id, &message_id)
+        .await
+        .expect("inspect exact admission receipt after conflict");
+    assert!(
+        (final_backlog.pending + final_backlog.claimed == 1 && !final_admitted)
+            || (final_backlog.pending + final_backlog.claimed == 0 && final_admitted),
+        "conflicting retry must neither duplicate nor lose the original \
+         delivery: backlog={final_backlog:?}, admitted={final_admitted}"
+    );
 }
 
 #[tokio::test]
@@ -1687,15 +1969,18 @@ async fn enqueue_child_run_starts_the_notification_relay_for_the_child() {
     // just the parent's — so events that only ever appear on the child's own
     // stream (e.g. a background Bash finishing, or critical context pressure
     // inside the child) are classified instead of silently dropped. See the
-    // `notification_relay` field doc on `ChildSessionAdapter`.
+    // scheduler-owned child launch hook.
     let harness = build_test_harness().await;
 
-    invoke_completed(
+    let result = invoke_completed(
         &harness.tool,
         json!({
-            "action": "send_message",
-            "child_session_id": harness.child_session_id,
-            "message": "retry with a narrower scope"
+            "action": "create",
+            "title": "Relay child",
+            "responsibility": "Exercise ordinary queued child launch",
+            "prompt": "Finish immediately",
+            "subagent_type": "general-purpose",
+            "workspace": harness.workspace_path.to_string_lossy()
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
@@ -1710,7 +1995,12 @@ async fn enqueue_child_run_starts_the_notification_relay_for_the_child() {
         .to_tool_ctx(),
     )
     .await
-    .expect("send_message should queue the child and start its relay");
+    .expect("create should enqueue the child and start its relay");
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.result).expect("create result should be JSON");
+    let child_session_id = payload["child_session_id"]
+        .as_str()
+        .expect("create result child id");
 
     // `try_begin_relay` only returns `true` the FIRST time it claims a
     // session id; a second call returning `false` proves a relay is already
@@ -1720,7 +2010,7 @@ async fn enqueue_child_run_starts_the_notification_relay_for_the_child() {
     assert!(
         !harness
             .notification_service
-            .try_begin_relay(&harness.child_session_id),
+            .try_begin_relay(child_session_id),
         "enqueue_child_run should have started a relay for the child session"
     );
 }

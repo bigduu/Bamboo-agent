@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::tools::{Tool, ToolExecutor};
+use bamboo_domain::{SessionInboxLimits, SessionInboxPort};
 use bamboo_engine::{AgentBuilder as EngineAgentBuilder, HookRunner};
 use bamboo_llm::{create_provider_with_dir, Config, LLMProvider};
 use bamboo_mcp::executor::{CompositeToolExecutor, McpToolExecutor};
@@ -198,6 +199,14 @@ pub struct AgentBuilder {
     session_store: Option<Arc<SessionStoreV2>>,
     project_store: Option<Arc<bamboo_projects::ProjectStore>>,
     project_sessions: Option<bamboo_engine::SessionRepository>,
+    /// Optional coherent logical-session delivery plane. The messenger is
+    /// assembled at build time from the exact defaults-backed session store,
+    /// so callers cannot accidentally inject three mutually inconsistent
+    /// handles.
+    session_delivery: Option<(
+        SessionInboxLimits,
+        Arc<bamboo_engine::SessionActivationRouter>,
+    )>,
 }
 
 impl AgentBuilder {
@@ -222,6 +231,7 @@ impl AgentBuilder {
             session_store: None,
             project_store: None,
             project_sessions: None,
+            session_delivery: None,
         }
     }
 
@@ -438,6 +448,38 @@ impl AgentBuilder {
         self
     }
 
+    /// Inject the SDK's coherent internal logical-session delivery plane.
+    ///
+    /// The limits and activation router are retained until [`build`](Self::build),
+    /// where the [`bamboo_storage::FileSessionInbox`] and one
+    /// [`bamboo_engine::SessionMessenger`] are constructed from the exact
+    /// session store assembled by
+    /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir). The
+    /// same inbox, router, and messenger are then installed on every execution
+    /// created by this agent. Call order relative to defaults assembly does not
+    /// matter.
+    ///
+    /// The caller must bind a real
+    /// [`bamboo_engine::SessionActivationSpawner`] to `activation_router`
+    /// before accepting messages; otherwise admission remains durable and
+    /// activation fails closed.
+    pub fn session_delivery(
+        self,
+        activation_router: Arc<bamboo_engine::SessionActivationRouter>,
+    ) -> Self {
+        self.session_delivery_with_limits(activation_router, SessionInboxLimits::default())
+    }
+
+    /// Configure logical-session delivery with explicit durable inbox bounds.
+    pub fn session_delivery_with_limits(
+        mut self,
+        activation_router: Arc<bamboo_engine::SessionActivationRouter>,
+        limits: SessionInboxLimits,
+    ) -> Self {
+        self.session_delivery = Some((limits, activation_router));
+        self
+    }
+
     // -- Explicit dependency injection (passthrough) ------------------------
 
     /// Inject a pre-built LLM provider, bypassing config-driven creation.
@@ -635,6 +677,34 @@ impl AgentBuilder {
     /// `instruction` and `model` are carried onto the `Agent` for
     /// [`Agent::run`](super::Agent::run).
     pub fn build(mut self) -> Result<Agent, SdkError> {
+        if let Some((limits, activation_router)) = self.session_delivery.take() {
+            let session_store = self
+                .session_store
+                .clone()
+                .ok_or_else(|| {
+                    SdkError::Unsupported(
+                        "session_delivery requires with_defaults_for_data_dir so the runtime and messenger share one session store"
+                        .to_string(),
+                    )
+                })?;
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                session_store.clone(),
+                limits,
+            ));
+            let sessions: Arc<dyn bamboo_agent_core::storage::Storage> = session_store;
+            let activation: Arc<dyn bamboo_domain::SessionActivationPort> =
+                activation_router.clone();
+            let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+                sessions,
+                inbox.clone(),
+                activation,
+            ));
+            self.inner = self
+                .inner
+                .session_inbox(inbox)
+                .activation_router(activation_router)
+                .session_messenger(messenger);
+        }
         let effective_config = self.assembled_config.as_ref().map(|assembled| {
             self.config_override
                 .clone()
@@ -837,8 +907,10 @@ mod tests {
     use bamboo_llm::{Config, LLMProvider, LLMStream};
     use bamboo_tools::permission::PermissionMode;
     use bamboo_tools::ToolRegistry;
+    use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Notify, RwLock};
 
     fn execution_context<'a>(
         session_id: &'a str,
@@ -964,6 +1036,404 @@ mod tests {
                     if actual == provider
             ));
         }
+    }
+
+    struct BlockingDoneProvider {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        calls: AtomicUsize,
+    }
+
+    struct PanickingProvider {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PanickingProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, bamboo_llm::LLMError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            panic!("injected direct SDK provider panic");
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for BlockingDoneProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, bamboo_llm::LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Box::pin(stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token("done".to_string())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct RecordingActivationSpawner {
+        reservations: AtomicUsize,
+        launches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl bamboo_engine::SessionActivationSpawner for RecordingActivationSpawner {
+        async fn reserve_activation(
+            &self,
+            _target_session_id: &str,
+            _inbox_generation: u64,
+        ) -> Result<
+            bamboo_engine::SessionActivationReserveOutcome,
+            bamboo_domain::SessionActivationError,
+        > {
+            let ordinal = self.reservations.fetch_add(1, Ordering::SeqCst) + 1;
+            let launches = self.launches.clone();
+            Ok(bamboo_engine::SessionActivationReserveOutcome::Reserved(
+                bamboo_engine::SessionActivationLaunch::new(
+                    format!("sdk-successor-{ordinal}"),
+                    move || {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                    },
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_delivery_injects_one_coherent_plane_for_every_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_config(tmp.path());
+        let router = bamboo_engine::SessionActivationRouter::new();
+
+        let agent = AgentBuilder::new()
+            .session_delivery(router.clone())
+            .with_defaults_for_data_dir(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let runtime_inbox = agent
+            .session_inbox()
+            .expect("SDK must inject the inbox into every execution");
+        assert!(Arc::ptr_eq(
+            agent
+                .activation_router()
+                .expect("SDK must inject the activation router"),
+            &router
+        ));
+        let messenger = agent
+            .session_messenger()
+            .expect("SDK must assemble one messenger from the same handles");
+        assert!(Arc::ptr_eq(messenger.inbox(), runtime_inbox));
+        let activation: Arc<dyn bamboo_domain::SessionActivationPort> = router;
+        assert!(Arc::ptr_eq(messenger.activation(), &activation));
+    }
+
+    #[tokio::test]
+    async fn direct_sdk_run_owns_delivery_and_terminal_race_launches_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_config(tmp.path());
+        let router = bamboo_engine::SessionActivationRouter::new();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(BlockingDoneProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let launches = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(RecordingActivationSpawner {
+            reservations: AtomicUsize::new(0),
+            launches: launches.clone(),
+        });
+        router.set_spawner(spawner.clone()).await;
+
+        let agent = AgentBuilder::new()
+            .model("test-model")
+            .provider(provider.clone())
+            .no_tools()
+            .session_delivery(router.clone())
+            .with_defaults_for_data_dir(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut session = agent.new_session("sdk-direct-delivery").unwrap();
+        session.add_message(Message::user("first"));
+        agent
+            .storage()
+            .save_session(&session)
+            .await
+            .expect("seed SDK session");
+
+        let mut events = agent.run_stream_session(session);
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("direct SDK provider must be active");
+        let messenger = agent.session_messenger().expect("configured SDK messenger");
+        let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
+            "sdk-direct-delivery",
+            "terminal window",
+        );
+        let receipt = messenger.send(envelope.clone()).await.unwrap();
+        assert_eq!(
+            receipt.activation,
+            bamboo_domain::SessionActivationDisposition::ActiveNotified
+        );
+        assert_eq!(
+            spawner.reservations.load(Ordering::SeqCst),
+            0,
+            "an active direct SDK execution owns the logical session"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while events.recv().await.is_some() {}
+        })
+        .await
+        .expect("direct SDK run must finalize");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+        // The launched successor deliberately leaves the poison claim pending.
+        // Replaying the same durable generation is bounded and cannot launch a
+        // recursive provider loop.
+        router
+            .begin_finalization("sdk-direct-delivery", "sdk-successor-1")
+            .await;
+        assert_eq!(
+            router
+                .finish_finalization("sdk-direct-delivery", "sdk-successor-1", 0,)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            bamboo_domain::SessionActivationPort::request_activation(
+                router.as_ref(),
+                "sdk-direct-delivery",
+                receipt.delivery.generation,
+            )
+            .await
+            .unwrap(),
+            bamboo_domain::SessionActivationDisposition::ActivationCoalesced
+        );
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_direct_sdk_run_releases_owner_and_launches_pending_successor() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_config(tmp.path());
+        let router = bamboo_engine::SessionActivationRouter::new();
+        let entered = Arc::new(Notify::new());
+        let provider = Arc::new(BlockingDoneProvider {
+            entered: entered.clone(),
+            release: Arc::new(Notify::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let launches = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(RecordingActivationSpawner {
+            reservations: AtomicUsize::new(0),
+            launches: launches.clone(),
+        });
+        router.set_spawner(spawner.clone()).await;
+
+        let agent = AgentBuilder::new()
+            .model("test-model")
+            .provider(provider)
+            .no_tools()
+            .session_delivery(router.clone())
+            .with_defaults_for_data_dir(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut session = agent.new_session("sdk-direct-abort").unwrap();
+        session.add_message(Message::user("block"));
+        agent.storage().save_session(&session).await.unwrap();
+
+        let running_agent = agent.clone();
+        let task = tokio::spawn(async move { running_agent.run_session(&mut session).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("direct SDK provider must be active before abort");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let receipt = agent
+            .session_messenger()
+            .unwrap()
+            .send(bamboo_domain::SessionMessageEnvelope::user_input(
+                "sdk-direct-abort",
+                "after abort",
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            receipt.activation,
+            bamboo_domain::SessionActivationDisposition::ActiveNotified
+                | bamboo_domain::SessionActivationDisposition::ActivationReserved
+                | bamboo_domain::SessionActivationDisposition::ActivationCoalesced
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while launches.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abandoned owner must hand durable work to one successor");
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert!(router.owns_run("sdk-direct-abort", "sdk-successor-1").await);
+    }
+
+    #[tokio::test]
+    async fn panicking_direct_sdk_run_releases_owner_and_launches_pending_successor_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_config(tmp.path());
+        let router = bamboo_engine::SessionActivationRouter::new();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let launches = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(RecordingActivationSpawner {
+            reservations: AtomicUsize::new(0),
+            launches: launches.clone(),
+        });
+        router.set_spawner(spawner.clone()).await;
+
+        let agent = AgentBuilder::new()
+            .model("test-model")
+            .provider(Arc::new(PanickingProvider {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .no_tools()
+            .session_delivery(router.clone())
+            .with_defaults_for_data_dir(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut session = agent.new_session("sdk-direct-panic").unwrap();
+        session.add_message(Message::user("panic after durable delivery"));
+        agent.storage().save_session(&session).await.unwrap();
+
+        let running_agent = agent.clone();
+        let task = tokio::spawn(async move { running_agent.run_session(&mut session).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("direct SDK provider must be active before panic");
+        let receipt = agent
+            .session_messenger()
+            .unwrap()
+            .send(bamboo_domain::SessionMessageEnvelope::user_input(
+                "sdk-direct-panic",
+                "survive provider panic",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.activation,
+            bamboo_domain::SessionActivationDisposition::ActiveNotified
+        );
+
+        release.notify_one();
+        assert!(task.await.unwrap_err().is_panic());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while launches.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panicking owner must hand durable work to one successor");
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert!(router.owns_run("sdk-direct-panic", "sdk-successor-1").await);
+    }
+
+    #[tokio::test]
+    async fn cloned_sdk_agents_cannot_run_one_logical_session_concurrently() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_config(tmp.path());
+        let router = bamboo_engine::SessionActivationRouter::new();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(BlockingDoneProvider {
+            entered: entered.clone(),
+            release: release.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let agent = AgentBuilder::new()
+            .model("test-model")
+            .provider(provider.clone())
+            .no_tools()
+            .session_delivery(router)
+            .with_defaults_for_data_dir(tmp.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut first_session = agent.new_session("sdk-direct-collision").unwrap();
+        first_session.add_message(Message::user("first"));
+        agent.storage().save_session(&first_session).await.unwrap();
+        let mut second_session = first_session.clone();
+
+        let first_agent = agent.clone();
+        let first = tokio::spawn(async move { first_agent.run_session(&mut first_session).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("first provider execution must start");
+
+        let second_error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run_session(&mut second_session),
+        )
+        .await
+        .expect("colliding SDK execution must fail promptly")
+        .unwrap_err();
+        assert!(
+            second_error
+                .to_string()
+                .contains("session activation owner collision"),
+            "unexpected collision error: {second_error}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "the rejected clone must never enter provider I/O"
+        );
+
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn session_delivery_fails_closed_without_defaults_store() {
+        let error = AgentBuilder::new()
+            .session_delivery(bamboo_engine::SessionActivationRouter::new())
+            .build()
+            .err()
+            .expect("session delivery without an authoritative SDK store must fail");
+        assert!(
+            matches!(error, super::SdkError::Unsupported(message) if message.contains("with_defaults_for_data_dir"))
+        );
     }
 
     #[test]

@@ -25,7 +25,10 @@ use tokio_tungstenite::{accept_async, accept_hdr_async, connect_async, MaybeTlsS
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::executor::{ChildExecutor, EventSink, HostBridge, HostRequestKind, SteerInbox};
+use crate::executor::{
+    ChildExecutor, EventSink, ExecutorControl, HostBridge, HostRequestKind, SteerInbox,
+    SteerMessage,
+};
 use crate::poison::PoisonRecover;
 use crate::proto::{ChildFrame, ParentFrame, RunSpec};
 
@@ -427,7 +430,7 @@ where
     let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
 
     let mut active_cancel: Option<CancellationToken> = None;
-    let mut active_steer: Option<mpsc::UnboundedSender<String>> = None;
+    let mut active_steer: Option<mpsc::UnboundedSender<SteerMessage>> = None;
     while let Some(msg) = ws_rx.next().await {
         match msg? {
             Message::Text(t) => match ParentFrame::from_text(t.as_str()) {
@@ -472,7 +475,12 @@ where
                     // In-band steering: hand to the active run's inbox; the
                     // executor admits it at its next safe point.
                     if let Some(steer) = &active_steer {
-                        let _ = steer.send(text);
+                        let _ = steer.send(SteerMessage::Text(text));
+                    }
+                }
+                Ok(ParentFrame::SessionMessage { delivery }) => {
+                    if let Some(steer) = &active_steer {
+                        let _ = steer.send(SteerMessage::SessionMessage(Box::new(delivery)));
                     }
                 }
                 Err(_) => { /* ignore malformed frame */ }
@@ -515,12 +523,25 @@ fn start_run<E: ChildExecutor + ?Sized>(
     out_tx: mpsc::UnboundedSender<ChildFrame>,
     pending: PendingReplies,
 ) {
-    let (sink, mut ev_rx) = EventSink::channel();
+    let (sink, mut ev_rx, mut control_rx) = EventSink::channel_with_control();
     let out_fwd = out_tx.clone();
     // forward executor events -> wire, ends when the executor drops the sink
     let fwd = tokio::spawn(async move {
         while let Some(e) = ev_rx.recv().await {
             if out_fwd.send(ChildFrame::Event { event: e }).is_err() {
+                break;
+            }
+        }
+    });
+    let out_control = out_tx.clone();
+    let control = tokio::spawn(async move {
+        while let Some(control) = control_rx.recv().await {
+            let frame = match control {
+                ExecutorControl::SessionMessageAdmitted(confirmation) => {
+                    ChildFrame::SessionMessageAdmitted { confirmation }
+                }
+            };
+            if out_control.send(frame).is_err() {
                 break;
             }
         }
@@ -557,6 +578,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
     tokio::spawn(async move {
         let outcome = executor.run(spec, sink, steer, cancel).await;
         let _ = fwd.await; // flush all events before the terminal frame
+        let _ = control.await; // flush durable-admission confirmations first
         pump.abort(); // no more host callbacks after the run ends
         let _ = out_tx.send(ChildFrame::Terminal {
             status: outcome.status,
@@ -697,10 +719,13 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "one two".into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await
@@ -712,6 +737,11 @@ mod tests {
             match frame {
                 ChildFrame::Event { event } => events.push(event),
                 ChildFrame::ApprovalRequest { .. } => {}
+                ChildFrame::SessionMessageAdmitted { confirmation } => {
+                    panic!(
+                        "echo run emitted unexpected SessionInbox confirmation: {confirmation:?}"
+                    )
+                }
                 ChildFrame::Terminal { status, result, .. } => {
                     terminal = Some((status, result));
                     break;
@@ -750,10 +780,13 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "go".into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await
@@ -799,15 +832,26 @@ mod tests {
         }
     }
 
-    async fn run_once(endpoint: &str, assignment: &str) -> (TerminalStatus, Option<String>) {
+    async fn run_once(
+        endpoint: &str,
+        assignment: &str,
+        logical_session_id: &str,
+    ) -> (TerminalStatus, Option<String>) {
         let mut client = ChildClient::connect(endpoint).await.unwrap();
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: assignment.into(),
+                logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    session_id: logical_session_id.to_string(),
+                    parent_session_id: Some("logical-parent".to_string()),
+                    root_session_id: "logical-root".to_string(),
+                }),
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await
@@ -827,27 +871,64 @@ mod tests {
     /// path), then reclaims itself once left idle past the timeout.
     #[tokio::test]
     async fn reusable_server_serves_sequential_connections_then_idles_out() {
+        use crate::executor::{ChildExecutor, ChildOutcome, SteerInbox};
         use std::time::Duration;
+
+        struct IdentityRecordingEcho {
+            seen: mpsc::UnboundedSender<crate::proto::LogicalSessionIdentity>,
+        }
+
+        #[async_trait::async_trait]
+        impl ChildExecutor for IdentityRecordingEcho {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                events: EventSink,
+                steer: SteerInbox,
+                cancel: CancellationToken,
+            ) -> ChildOutcome {
+                self.seen
+                    .send(
+                        spec.logical_session
+                            .clone()
+                            .expect("warm run must carry logical identity"),
+                    )
+                    .unwrap();
+                EchoExecutor.run(spec, events, steer, cancel).await
+            }
+        }
 
         let server = WsServer::bind_loopback().await.unwrap();
         let endpoint = server.ws_endpoint();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
         let srv = tokio::spawn(async move {
             server
                 .serve_reusable_with_idle_timeout(
-                    Arc::new(EchoExecutor),
+                    Arc::new(IdentityRecordingEcho { seen: seen_tx }),
                     Duration::from_millis(400),
                 )
                 .await
         });
 
         // Two SEQUENTIAL assignments land on the SAME warm worker.
-        let (s1, r1) = run_once(&endpoint, "first").await;
+        let (s1, r1) = run_once(&endpoint, "first", "logical-warm-first").await;
         assert_eq!(s1, TerminalStatus::Completed);
         assert_eq!(r1.as_deref(), Some("echo: first"));
 
-        let (s2, r2) = run_once(&endpoint, "second").await;
+        let (s2, r2) = run_once(&endpoint, "second", "logical-warm-second").await;
         assert_eq!(s2, TerminalStatus::Completed);
         assert_eq!(r2.as_deref(), Some("echo: second"));
+        assert_eq!(
+            [
+                seen_rx.recv().await.unwrap().session_id,
+                seen_rx.recv().await.unwrap().session_id,
+            ],
+            [
+                "logical-warm-first".to_string(),
+                "logical-warm-second".to_string(),
+            ],
+            "one warm worker must not reuse its mailbox or previous logical Session id"
+        );
 
         // No further connection: the worker idles out and exits cleanly.
         let exited = tokio::time::timeout(Duration::from_secs(5), srv).await;
@@ -887,10 +968,13 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "start".into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await
@@ -914,6 +998,100 @@ mod tests {
         assert_eq!(status, TerminalStatus::Completed);
         assert_eq!(result.as_deref(), Some("steered: change course"));
 
+        let _ = client.close().await;
+        let _ = srv.await;
+    }
+
+    #[tokio::test]
+    async fn typed_session_message_and_confirmation_cross_direct_ws() {
+        use crate::executor::{ChildExecutor, ChildOutcome, SteerInbox, SteerMessage};
+        use crate::proto::{SessionMessageAdmissionConfirmation, SessionMessageDelivery};
+        use bamboo_domain::{SessionMessageEnvelope, SessionMessageId};
+
+        struct TypedSteer;
+        #[async_trait::async_trait]
+        impl ChildExecutor for TypedSteer {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                events: EventSink,
+                mut steer: SteerInbox,
+                _cancel: CancellationToken,
+            ) -> ChildOutcome {
+                assert_eq!(
+                    spec.logical_session,
+                    Some(crate::proto::LogicalSessionIdentity {
+                        session_id: "logical-child".to_string(),
+                        parent_session_id: Some("logical-parent".to_string()),
+                        root_session_id: "logical-root".to_string(),
+                    })
+                );
+                let SteerMessage::SessionMessage(delivery) =
+                    steer.recv_message().await.expect("typed steer")
+                else {
+                    panic!("expected typed SessionInbox delivery");
+                };
+                events.confirm_session_message(SessionMessageAdmissionConfirmation {
+                    target_session_id: delivery.target_session_id,
+                    envelope_id: delivery.envelope.id.as_str().to_string(),
+                    canonical_claim_generation: delivery.canonical_claim_generation,
+                    activation_run_id: delivery.activation_run_id,
+                });
+                ChildOutcome::completed("confirmed")
+            }
+        }
+
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let srv = tokio::spawn(async move { server.serve_one(Arc::new(TypedSteer)).await });
+        let mut client = ChildClient::connect(&endpoint).await.unwrap();
+        client
+            .send(ParentFrame::Run(RunSpec {
+                assignment: "wait".into(),
+                logical_session: Some(crate::proto::LogicalSessionIdentity {
+                    session_id: "logical-child".to_string(),
+                    parent_session_id: Some("logical-parent".to_string()),
+                    root_session_id: "logical-root".to_string(),
+                }),
+                project_id: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
+                secrets: Default::default(),
+            }))
+            .await
+            .unwrap();
+        let mut envelope = SessionMessageEnvelope::user_input("logical-child", "hello");
+        envelope.id = SessionMessageId::parse("typed-direct-id").unwrap();
+        client
+            .send(ParentFrame::SessionMessage {
+                delivery: SessionMessageDelivery {
+                    target_session_id: "logical-child".to_string(),
+                    envelope,
+                    canonical_claim_generation: 41,
+                    activation_run_id: "activation-run-1".to_string(),
+                    activation_policy:
+                        bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                },
+            })
+            .await
+            .unwrap();
+
+        match client.next_frame().await.unwrap() {
+            Some(ChildFrame::SessionMessageAdmitted { confirmation }) => {
+                assert_eq!(confirmation.target_session_id, "logical-child");
+                assert_eq!(confirmation.envelope_id, "typed-direct-id");
+                assert_eq!(confirmation.canonical_claim_generation, 41);
+                assert_eq!(confirmation.activation_run_id, "activation-run-1");
+            }
+            other => panic!("expected admission confirmation, got {other:?}"),
+        }
+        assert!(matches!(
+            client.next_frame().await.unwrap(),
+            Some(ChildFrame::Terminal { .. })
+        ));
         let _ = client.close().await;
         let _ = srv.await;
     }
@@ -966,10 +1144,13 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "go".into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await
@@ -1020,10 +1201,13 @@ mod tests {
             client
                 .send(ParentFrame::Run(RunSpec {
                     assignment: "__sleep_ms:300 alpha only".into(),
+                    logical_session: None,
                     project_id: None,
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),
+                    activation_run_id: None,
+                    initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 }))
                 .await
@@ -1038,10 +1222,13 @@ mod tests {
             client
                 .send(ParentFrame::Run(RunSpec {
                     assignment: "beta only".into(),
+                    logical_session: None,
                     project_id: None,
                     reasoning_effort: None,
                     permission_policy: None,
                     messages: Vec::new(),
+                    activation_run_id: None,
+                    initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 }))
                 .await
@@ -1079,6 +1266,11 @@ mod tests {
                     }
                 }
                 ChildFrame::ApprovalRequest { .. } => {}
+                ChildFrame::SessionMessageAdmitted { confirmation } => {
+                    panic!(
+                        "echo run emitted unexpected SessionInbox confirmation: {confirmation:?}"
+                    )
+                }
                 ChildFrame::Terminal {
                     status, result: r, ..
                 } => {
@@ -1142,10 +1334,13 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "first".into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await
@@ -1162,10 +1357,13 @@ mod tests {
         client
             .send(ParentFrame::Run(RunSpec {
                 assignment: "second".into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
             .await

@@ -5,16 +5,21 @@
 //! policy is satisfied.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
 use std::time::Duration;
 
 use bamboo_domain::poison::PoisonRecover;
-use bamboo_domain::{AgentHookPoint, HookPayload, HookToolOutcome};
+use bamboo_domain::{
+    AgentHookPoint, HookPayload, HookToolOutcome, SessionChildOutcome, SessionMessageBody,
+    SessionMessageContent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    SessionMessageSource, SessionProviderMessage,
+};
 
 use crate::execution::{
-    create_event_forwarder, finalize_runner, spawn_session_execution, try_reserve_runner,
-    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, RunnerReservation,
-    SessionExecutionArgs,
+    create_event_forwarder, finalize_runner, reserve_runner_core, reserve_session_execution,
+    spawn_session_execution, AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler,
+    ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
+    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -26,7 +31,7 @@ use async_trait::async_trait;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{
-    AgentEvent, BashCompletionInfo, BashCompletionSink, Message, Role, Session,
+    AgentEvent, BashCompletionInfo, BashCompletionSink, Message, Role, Session, SessionKind,
 };
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForChildrenState,
@@ -34,11 +39,15 @@ use bamboo_domain::session::runtime_state::{
 use bamboo_llm::{Config, ProviderModelRouter, ProviderRegistry};
 use bamboo_storage::LockedSessionStore;
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, RwLock};
 
 use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
     resolve_fast_model, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
+};
+use crate::session_activation::{
+    SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationSpawner,
 };
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
@@ -49,6 +58,8 @@ use crate::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
 const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
 const RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: &str = "hidden_from_ui";
 const RUNTIME_RESUME_MESSAGE_KIND_KEY: &str = "runtime_kind";
+const CHILD_COMPLETION_INLINE_FIELD_BYTES: usize = 48 * 1024;
+const CHILD_COMPLETION_OVERSIZE_TAIL_BYTES: usize = 8 * 1024;
 
 fn read_runtime_state(session: &Session) -> AgentRuntimeState {
     session
@@ -72,6 +83,42 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
     }
 }
 
+/// Re-read and prepare an activation target under the same per-session
+/// persistence lock that commits the generic suspension clear.
+///
+/// The boolean is false when a specific child/Bash wait is present in the
+/// latest durable snapshot; callers must leave the activation unreserved.
+async fn prepare_session_inbox_activation(
+    persistence: &LockedSessionStore,
+    session_id: &str,
+    interrupt_specific_wait: bool,
+) -> std::io::Result<Option<(Session, bool)>> {
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready_for_mutation = ready.clone();
+    let saved = persistence
+        .update_runtime_config(session_id, move |latest| {
+            let mut runtime_state = read_runtime_state(latest);
+            let specifically_waiting = runtime_state.waiting_for_children.is_some()
+                || runtime_state.waiting_for_bash.is_some();
+            if specifically_waiting && !interrupt_specific_wait {
+                return;
+            }
+            // Explicit steering interrupts only this reasoning gate. The
+            // durable child/Bash wait remains owned so later terminal events
+            // still have exactly one coordinator and can authorize their
+            // staged outcomes. End-of-run bookkeeping re-suspends if that wait
+            // is still present.
+            runtime_state.status = AgentStatusState::Idle;
+            runtime_state.suspension = None;
+            write_runtime_state(latest, &runtime_state);
+            latest.metadata.remove("runtime.suspend_reason");
+            latest.updated_at = Utc::now();
+            ready_for_mutation.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .await?;
+    Ok(saved.map(|session| (session, ready.load(std::sync::atomic::Ordering::Acquire))))
+}
+
 fn is_error_like(status: &str) -> bool {
     matches!(status, "error" | "timeout" | "cancelled")
 }
@@ -82,6 +129,122 @@ fn is_terminal_child_status(status: &str) -> bool {
         status,
         "completed" | "error" | "timeout" | "cancelled" | "skipped"
     )
+}
+
+fn child_completion_envelope(
+    completion: &ChildCompletion,
+    wait_registered_at: chrono::DateTime<Utc>,
+    result: Option<String>,
+    provider_message: &Message,
+) -> SessionMessageEnvelope {
+    fn bounded_terminal_field(
+        label: &str,
+        child_session_id: &str,
+        value: Option<String>,
+    ) -> (Option<String>, serde_json::Value, bool) {
+        let Some(value) = value else {
+            return (None, serde_json::Value::Null, false);
+        };
+        if value.len() <= CHILD_COMPLETION_INLINE_FIELD_BYTES {
+            return (Some(value.clone()), serde_json::Value::String(value), false);
+        }
+        let digest = hex::encode(Sha256::digest(value.as_bytes()));
+        let mut tail_start = value
+            .len()
+            .saturating_sub(CHILD_COMPLETION_OVERSIZE_TAIL_BYTES);
+        while tail_start < value.len() && !value.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        let tail = &value[tail_start..];
+        let summary = format!(
+            "Child {label} exceeded the durable inline limit ({} UTF-8 bytes, sha256={digest}). \
+             Retrieve the full child transcript with SubAgent.get(child_session_id=\"{child_session_id}\").\
+             \n\nBounded tail:\n{tail}",
+            value.len()
+        );
+        (
+            Some(summary),
+            serde_json::json!({
+                "oversized": true,
+                "utf8_bytes": value.len(),
+                "sha256": digest,
+            }),
+            true,
+        )
+    }
+
+    let (stored_result, result_identity, _result_oversized) =
+        bounded_terminal_field("result", &completion.child_session_id, result);
+    let (stored_error, error_identity, _error_oversized) = bounded_terminal_field(
+        "error",
+        &completion.child_session_id,
+        completion.error.clone(),
+    );
+    let mut bounded_provider_message = provider_message.clone();
+    let provider_oversized = serde_json::to_vec(provider_message)
+        .map(|bytes| bytes.len() > CHILD_COMPLETION_INLINE_FIELD_BYTES)
+        .unwrap_or(true);
+    if provider_oversized {
+        let mut content = format!(
+            "Runtime notification: child session `{}` finished with status `{}`.",
+            completion.child_session_id, completion.status
+        );
+        if let Some(result) = stored_result.as_deref() {
+            content.push_str("\n\n");
+            content.push_str(result);
+        }
+        if let Some(error) = stored_error.as_deref() {
+            content.push_str("\n\n");
+            content.push_str(error);
+        }
+        bounded_provider_message.content = content;
+        bounded_provider_message.content_parts = None;
+    }
+    let body = SessionMessageBody::ChildOutcome(SessionChildOutcome {
+        child_session_id: completion.child_session_id.clone(),
+        status: completion.status.clone(),
+        result: stored_result,
+        error: stored_error,
+        provider_message: Some(session_provider_message(&bounded_provider_message)),
+    });
+    let semantic = serde_json::json!({
+        "parent_session_id": completion.parent_session_id,
+        "child_session_id": completion.child_session_id,
+        "status": completion.status,
+        "error": error_identity,
+        "result": result_identity,
+        "wait_registered_at": wait_registered_at,
+    });
+    SessionMessageEnvelope {
+        id: SessionMessageId::stable("session_child_completion", &semantic),
+        source: SessionMessageSource::Runtime {
+            subsystem: "child_completion_coordinator".to_string(),
+        },
+        target_session_id: completion.parent_session_id.clone(),
+        kind: SessionMessageKind::ChildOutcome,
+        body,
+        created_at: completion.completed_at,
+        thread_id: None,
+        in_reply_to: None,
+        attempt: None,
+        correlation_id: Some(format!("child_completion:{}", completion.child_session_id)),
+    }
+}
+
+fn session_provider_message(message: &Message) -> SessionProviderMessage {
+    SessionProviderMessage {
+        content: SessionMessageContent {
+            text: message.content.clone(),
+            parts: message.content_parts.clone().unwrap_or_default(),
+        },
+        metadata: message
+            .metadata
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+        never_compress: message.never_compress,
+    }
 }
 
 /// Reconstruct the set of completed child session ids for a parent from the
@@ -244,7 +407,6 @@ fn runtime_resume_message(
         "child_session_id": completion.child_session_id,
         "child_status": completion.status,
         "child_error": completion.error,
-        "completed_at": completion.completed_at,
         "child_final_response_included": final_response.is_some(),
     }));
     // Allow parent-side compaction to reclaim this (now untruncated) message if
@@ -289,7 +451,6 @@ fn guardian_resume_message(completion: &ChildCompletion, verdict: &GuardianVerdi
         "child_session_id": completion.child_session_id,
         "child_status": completion.status,
         "guardian_approved": verdict.approve,
-        "completed_at": completion.completed_at,
     }));
     message.never_compress = false;
     message
@@ -313,6 +474,10 @@ pub struct ChildCompletionCoordinator {
     /// (mirrors `root_tools`). Re-injected into resumed runs so a guardian's
     /// reject→fix verdict can be re-reviewed across the suspend/resume boundary.
     guardian_spawner: Arc<RwLock<Option<Arc<dyn GuardianSpawner>>>>,
+    /// Weak late binding avoids the scheduler -> completion handler ->
+    /// scheduler ownership cycle while still routing idle child activation
+    /// through the canonical placement-aware spawn core.
+    spawn_scheduler: Arc<RwLock<Weak<SpawnScheduler>>>,
 }
 
 impl ChildCompletionCoordinator {
@@ -344,11 +509,16 @@ impl ChildCompletionCoordinator {
             account_feed_inbox,
             root_tools: Arc::new(RwLock::new(None)),
             guardian_spawner: Arc::new(RwLock::new(None)),
+            spawn_scheduler: Arc::new(RwLock::new(Weak::new())),
         }
     }
 
     pub async fn set_root_tools(&self, tools: Arc<dyn ToolExecutor>) {
         *self.root_tools.write().await = Some(tools);
+    }
+
+    pub async fn set_spawn_scheduler(&self, scheduler: &Arc<SpawnScheduler>) {
+        *self.spawn_scheduler.write().await = Arc::downgrade(scheduler);
     }
 
     /// Wire the guardian reviewer spawner (server-provided), so resumed runs can
@@ -482,7 +652,8 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         let mut should_resume = false;
         let mut remaining_children = 0usize;
-        if let Some(wait) = runtime_state.waiting_for_children.clone() {
+        let active_wait = runtime_state.waiting_for_children.clone();
+        if let Some(wait) = active_wait.as_ref() {
             remaining_children = wait
                 .child_session_ids
                 .iter()
@@ -495,76 +666,69 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 &completion.child_session_id,
                 &completion.status,
             );
-            if should_resume {
-                runtime_state.waiting_for_children = None;
-                runtime_state.status = AgentStatusState::Idle;
-                runtime_state.suspension = None;
-            }
         }
 
-        if should_resume {
-            parent.metadata.remove("runtime.suspend_reason");
+        // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
+        // model-provided and unvalidated, and the watchdog unstrands a wait
+        // over a FOREIGN/unknown id by publishing a synthetic completion
+        // here. We must resume the parent (so it is not stranded) but MUST
+        // NOT fold that foreign session's transcript into the parent — that
+        // would be a cross-session disclosure primitive. Decide ownership
+        // from the child's OWN parent linkage (control-plane only, no
+        // messages loaded), and only load its full content when it is truly
+        // this parent's child. An unowned id resumes with the neutral/error
+        // message (`runtime_resume_message` falls back to `completion.error`
+        // when no child content is supplied).
+        let reported_child_owned = match self
+            .storage
+            .load_runtime_control_plane(&completion.child_session_id)
+            .await
+        {
+            Ok(Some(control_plane)) => completion_child_is_owned(
+                &completion.parent_session_id,
+                control_plane.parent_session_id.as_deref(),
+            ),
+            _ => false,
+        };
 
-            // READ-SIDE OWNERSHIP GUARD (issue #546): `SubAgent.wait` ids are
-            // model-provided and unvalidated, and the watchdog unstrands a wait
-            // over a FOREIGN/unknown id by publishing a synthetic completion
-            // here. We must resume the parent (so it is not stranded) but MUST
-            // NOT fold that foreign session's transcript into the parent — that
-            // would be a cross-session disclosure primitive. Decide ownership
-            // from the child's OWN parent linkage (control-plane only, no
-            // messages loaded), and only load its full content when it is truly
-            // this parent's child. An unowned id resumes with the neutral/error
-            // message (`runtime_resume_message` falls back to `completion.error`
-            // when no child content is supplied).
-            let reported_child_owned = match self
+        // Load the completed child once, ONLY when owned. The guardian
+        // branch inspects its subagent_type + final verdict; the generic
+        // path folds its final assistant content into the hidden resume
+        // message (avoiding an extra `SubAgent.get` round trip after resume).
+        let loaded_child = if reported_child_owned {
+            match self
                 .storage
-                .load_runtime_control_plane(&completion.child_session_id)
+                .load_session(&completion.child_session_id)
                 .await
             {
-                Ok(Some(control_plane)) => completion_child_is_owned(
-                    &completion.parent_session_id,
-                    control_plane.parent_session_id.as_deref(),
-                ),
-                _ => false,
-            };
-
-            // Load the completed child once, ONLY when owned. The guardian
-            // branch inspects its subagent_type + final verdict; the generic
-            // path folds its final assistant content into the hidden resume
-            // message (avoiding an extra `SubAgent.get` round trip after resume).
-            let loaded_child = if reported_child_owned {
-                match self
-                    .storage
-                    .load_session(&completion.child_session_id)
-                    .await
-                {
-                    Ok(child) => child,
-                    Err(error) => {
-                        tracing::warn!(
-                            child_session_id = %completion.child_session_id,
-                            %error,
-                            "failed to load child session for runtime resume message"
-                        );
-                        None
-                    }
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::warn!(
+                        child_session_id = %completion.child_session_id,
+                        %error,
+                        "failed to load child session for runtime resume message"
+                    );
+                    None
                 }
-            } else {
-                tracing::warn!(
-                    parent_session_id = %completion.parent_session_id,
-                    child_session_id = %completion.child_session_id,
-                    "completion child is not a child of this parent; resuming with a neutral \
-                     message and NOT folding its content"
-                );
-                None
-            };
+            }
+        } else {
+            tracing::warn!(
+                parent_session_id = %completion.parent_session_id,
+                child_session_id = %completion.child_session_id,
+                "completion child is not a child of this parent; resuming with a neutral \
+                 message and NOT folding its content"
+            );
+            None
+        };
 
-            // Guardian branch: a completing guardian reviewer that matches the
-            // parent's recorded review advances GuardianState (phase → Reviewed)
-            // and resumes with a verdict-tailored, findings-carrying message. Any
-            // id mismatch or unparseable verdict falls through to the generic
-            // resume, so the parent is never stranded.
+        let child_final_response = loaded_child.as_ref().and_then(child_final_assistant_text);
+        // Select the exact provider-facing resume message before durable
+        // admission. The typed body carries its content/parts and safe runtime
+        // metadata, so the canonical path is semantically identical to the
+        // rolling-upgrade transcript fallback.
+        let guardian_resume = if should_resume {
             let reviewed_round = runtime_state.round.current_round;
-            let guardian_resume = loaded_child.as_ref().and_then(|child| {
+            loaded_child.as_ref().and_then(|child| {
                 if child.subagent_type().as_deref() != Some("guardian") {
                     return None;
                 }
@@ -620,19 +784,75 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     "guardian verdict recorded; resuming parent"
                 );
                 Some(message)
-            });
+            })
+        } else {
+            None
+        };
+        let resume_message = guardian_resume.unwrap_or_else(|| {
+            runtime_resume_message(
+                &completion,
+                remaining_children,
+                child_final_response.as_deref(),
+            )
+        });
 
-            let resume_message = guardian_resume.unwrap_or_else(|| {
-                runtime_resume_message(
+        // Stage the typed child outcome before clearing any durable wait. A
+        // crash after this admission leaves the parent suspended with an
+        // inspectable envelope; only a durably committed policy transition
+        // below is allowed to activate it.
+        let messenger = self.agent.session_messenger().cloned();
+        let child_admission =
+            if let (Some(wait), Some(messenger)) = (active_wait.as_ref(), messenger.as_ref()) {
+                let envelope = child_completion_envelope(
                     &completion,
-                    remaining_children,
-                    loaded_child
-                        .as_ref()
-                        .and_then(child_final_assistant_text)
-                        .as_deref(),
-                )
-            });
-            parent.add_message(resume_message);
+                    wait.registered_at,
+                    child_final_response,
+                    &resume_message,
+                );
+                match messenger.admit(envelope).await {
+                    Ok(admission) => Some(admission),
+                    Err(error) => {
+                        tracing::warn!(
+                            parent_session_id = %completion.parent_session_id,
+                            child_session_id = %completion.child_session_id,
+                            %error,
+                            "child outcome SessionInbox admission failed; leaving parent wait armed"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+        if should_resume {
+            if let (Some(messenger), Some(admission)) =
+                (messenger.as_ref(), child_admission.as_ref())
+            {
+                if let Err(error) = messenger.prepare_activation(admission).await {
+                    tracing::warn!(
+                        parent_session_id = %completion.parent_session_id,
+                        child_session_id = %completion.child_session_id,
+                        %error,
+                        "child outcome activation watermark failed; leaving parent wait armed"
+                    );
+                    return;
+                }
+            }
+        }
+
+        if should_resume {
+            runtime_state.waiting_for_children = None;
+            runtime_state.status = AgentStatusState::Idle;
+            runtime_state.suspension = None;
+            parent.metadata.remove("runtime.suspend_reason");
+
+            if child_admission.is_none() {
+                // Rolling-upgrade fallback only. The canonical path keeps the
+                // child outcome solely in SessionInbox until the next safe
+                // reasoning boundary.
+                parent.add_message(resume_message);
+            }
         } else if runtime_state.waiting_for_children.is_some() {
             runtime_state.status = AgentStatusState::Suspended;
             runtime_state.suspension = Some(SuspensionState {
@@ -645,7 +865,23 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
 
         parent.updated_at = Utc::now();
         write_runtime_state(&mut parent, &runtime_state);
-        self.save_and_cache(&mut parent).await;
+        if let Err(error) = self
+            .persistence
+            .checkpoint_runtime_session(&mut parent)
+            .await
+        {
+            tracing::warn!(
+                parent_session_id = %completion.parent_session_id,
+                child_session_id = %completion.child_session_id,
+                %error,
+                "child outcome is durable but parent wait transition failed; leaving activation deferred"
+            );
+            return;
+        }
+        self.sessions.insert(
+            parent.id.clone(),
+            Arc::new(parking_lot::RwLock::new(parent.clone())),
+        );
 
         // Capture before releasing the per-parent lock so the borrow checker
         // is satisfied; `resume_parent` has its own retry loop and should not
@@ -655,7 +891,17 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         drop(_per_parent_guard);
 
         if should_resume {
-            self.resume_parent(resume_parent_id).await;
+            if let (Some(messenger), Some(admission)) = (messenger, child_admission) {
+                if let Err(error) = messenger.activate_prepared(&admission).await {
+                    tracing::warn!(
+                        parent_session_id = %resume_parent_id,
+                        %error,
+                        "child outcome and wait transition are durable but activation failed"
+                    );
+                }
+            } else {
+                self.resume_parent(resume_parent_id).await;
+            }
         }
     }
 }
@@ -684,23 +930,19 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         self.save_and_cache(session).await;
     }
 
-    async fn try_reserve_runner(
+    async fn reserve_session_execution(
         &self,
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
-    ) -> Option<RunnerReservation> {
-        try_reserve_runner(
+    ) -> SessionExecutionReserveOutcome {
+        reserve_session_execution(
+            &self.agent,
             &self.agent_runners,
             &self.session_event_senders,
             session_id,
             event_sender,
         )
         .await
-    }
-
-    async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String> {
-        let runners = self.agent_runners.read().await;
-        runners.get(session_id).map(|r| r.run_id.clone())
     }
 
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
@@ -715,11 +957,19 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         let ResumeSpawnRequest {
             session_id,
             session,
-            cancel_token,
-            run_id: _,
+            mut execution_reservation,
             event_sender,
             config,
         } = request;
+        if let Err(error) = execution_reservation.ensure_registered().await {
+            tracing::warn!(
+                %session_id,
+                run_id = %execution_reservation.run_id(),
+                %error,
+                "cannot resume after child completion without exact router ownership"
+            );
+            return;
+        }
 
         let Some(root_tools) = self.root_tools.read().await.clone() else {
             tracing::error!(%session_id, "cannot resume parent after child completion: root tool surface is not initialized");
@@ -825,6 +1075,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             agent: self.agent.clone(),
             session_id,
             session,
+            execution_reservation,
             tools_override: Some(root_tools),
             provider_override,
             model_roster,
@@ -838,7 +1089,6 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             disabled_skill_ids: Some(config.disabled_skill_ids),
             selected_skill_ids: None,
             selected_skill_mode: None,
-            cancel_token,
             mpsc_tx,
             image_fallback: config.image_fallback,
             gold_config,
@@ -866,6 +1116,296 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             // in turn (issue #546).
             child_completion_handler: Some(Arc::new(self.clone())),
         });
+    }
+}
+
+/// Real SessionInbox activation adapter. It reserves through the exact same
+/// runner registry as every existing resume path, but deliberately bypasses
+/// `has_pending_user_message`: the typed envelope is still in the durable inbox
+/// and will be admitted by the loop's first safe turn boundary.
+#[async_trait]
+impl SessionActivationSpawner for ChildCompletionCoordinator {
+    async fn reserve_activation(
+        &self,
+        target_session_id: &str,
+        _inbox_generation: u64,
+    ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError> {
+        let Some(inbox) = self.agent.session_inbox() else {
+            return Err(bamboo_domain::SessionActivationError::Internal(
+                "agent runtime has no SessionInbox".to_string(),
+            ));
+        };
+        let backlog = inbox
+            .inspect(target_session_id)
+            .await
+            .map_err(|error| bamboo_domain::SessionActivationError::Internal(error.to_string()))?;
+        if !backlog.activation_pending() {
+            return Ok(SessionActivationReserveOutcome::NoWork);
+        }
+        // Load and mutate under the persistence lock. A coordinator that armed
+        // a child/Bash wait immediately before this activation therefore wins.
+        let prepared = prepare_session_inbox_activation(
+            &self.persistence,
+            target_session_id,
+            backlog.interrupt_pending(),
+        )
+        .await
+        .map_err(|error| {
+            bamboo_domain::SessionActivationError::Internal(format!(
+                "persist resumable SessionInbox target: {error}"
+            ))
+        })?;
+        let Some((session, ready)) = prepared else {
+            return Ok(SessionActivationReserveOutcome::NotFound);
+        };
+        if !ready {
+            tracing::info!(
+                session_id = target_session_id,
+                "SessionInbox backlog is activation-eligible but a specific durable wait remains armed"
+            );
+            return Ok(SessionActivationReserveOutcome::NoWork);
+        }
+
+        enum LaunchPlan {
+            Root(Box<ResumeConfigSnapshot>),
+            Child {
+                scheduler: Arc<SpawnScheduler>,
+                parent_session_id: String,
+                model: String,
+                disabled_tools: Option<Vec<String>>,
+            },
+        }
+
+        // Derive every execution/security input from the latest locked session
+        // returned above, never from a stale pre-lock snapshot.
+        let launch_plan = match session.kind {
+            SessionKind::Root => {
+                if self.root_tools.read().await.is_none() {
+                    return Err(bamboo_domain::SessionActivationError::Internal(
+                        "root tool surface is not initialized".to_string(),
+                    ));
+                }
+                let config_snapshot = self.config.read().await.clone();
+                LaunchPlan::Root(Box::new(
+                    self.build_resume_config(&session, &config_snapshot),
+                ))
+            }
+            SessionKind::Child => {
+                let scheduler = self.spawn_scheduler.read().await.upgrade().ok_or_else(|| {
+                    bamboo_domain::SessionActivationError::Internal(
+                        "child spawn scheduler is not initialized".to_string(),
+                    )
+                })?;
+                let parent_session_id = session
+                    .parent_session_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        bamboo_domain::SessionActivationError::Internal(format!(
+                            "child SessionInbox target {target_session_id} has no parent owner"
+                        ))
+                    })?;
+                let parent = self
+                    .storage
+                    .load_session(&parent_session_id)
+                    .await
+                    .map_err(|error| {
+                        bamboo_domain::SessionActivationError::Internal(format!(
+                            "load parent owner {parent_session_id}: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        bamboo_domain::SessionActivationError::Internal(format!(
+                            "child SessionInbox parent owner {parent_session_id} disappeared"
+                        ))
+                    })?;
+                let child_root = if session.root_session_id.trim().is_empty() {
+                    parent_session_id.as_str()
+                } else {
+                    session.root_session_id.as_str()
+                };
+                let parent_root = if parent.root_session_id.trim().is_empty() {
+                    parent.id.as_str()
+                } else {
+                    parent.root_session_id.as_str()
+                };
+                if child_root != parent_root {
+                    return Err(bamboo_domain::SessionActivationError::Internal(format!(
+                        "child SessionInbox target {target_session_id} does not share its parent owner's root"
+                    )));
+                }
+                let model = if session.model.trim().is_empty() {
+                    parent.model.clone()
+                } else {
+                    session.model.clone()
+                };
+                if model.trim().is_empty() {
+                    return Err(bamboo_domain::SessionActivationError::Internal(format!(
+                        "child SessionInbox target {target_session_id} has no executable model"
+                    )));
+                }
+                let disabled_tools = match session.metadata.get("disabled_tools") {
+                    None => None,
+                    Some(raw) => {
+                        let tools = serde_json::from_str::<std::collections::BTreeSet<String>>(raw)
+                            .map_err(|error| {
+                                bamboo_domain::SessionActivationError::Internal(format!(
+                                    "child SessionInbox target {target_session_id} has malformed disabled_tools: {error}"
+                                ))
+                            })?;
+                        (!tools.is_empty()).then(|| tools.into_iter().collect())
+                    }
+                };
+                LaunchPlan::Child {
+                    scheduler,
+                    parent_session_id,
+                    model,
+                    disabled_tools,
+                }
+            }
+        };
+        let event_sender =
+            ResumeExecutionPort::get_or_create_event_sender(self, target_session_id).await;
+
+        let reservation = match reserve_runner_core(
+            &self.agent_runners,
+            &self.session_event_senders,
+            target_session_id,
+            &event_sender,
+        )
+        .await
+        {
+            ReserveOutcome::Reserved(reservation) => reservation,
+            ReserveOutcome::AlreadyRunning(run_id) => {
+                return Ok(SessionActivationReserveOutcome::AlreadyRunning { run_id });
+            }
+        };
+        let run_id = reservation.run_id.clone();
+        let launch = match launch_plan {
+            LaunchPlan::Root(config) => {
+                let execution_reservation =
+                    SessionExecutionReservation::from_activation_placeholder(
+                        target_session_id,
+                        reservation,
+                        self.agent
+                            .activation_router()
+                            .expect("SessionInbox activation requires an activation router")
+                            .clone(),
+                        self.agent_runners.clone(),
+                    );
+                // Launch and rollback share one exact RAII reservation. Dropping
+                // an unlaunched SessionActivationLaunch cannot race a raw slot
+                // removal against the reservation's router-placeholder cleanup.
+                let reservation_cell = Arc::new(StdMutex::new(Some(execution_reservation)));
+                let launch_reservation = reservation_cell.clone();
+                let rollback_reservation = reservation_cell;
+                let coordinator = self.clone();
+                let launch_sessions = self.sessions.clone();
+                let launch_session_id = session.id.clone();
+                let launch_session = session.clone();
+                let request_session_id = target_session_id.to_string();
+                SessionActivationLaunch::new_with_async_rollback(
+                    run_id,
+                    move || {
+                        let mut execution_reservation = launch_reservation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                            .expect("activation reservation launches or rolls back exactly once");
+                        execution_reservation.mark_activation_published();
+                        // The router publishes the exact owner before invoking
+                        // this closure, so only now may the prepared snapshot
+                        // replace the shared cache entry.
+                        launch_sessions.insert(
+                            launch_session_id,
+                            Arc::new(parking_lot::RwLock::new(launch_session)),
+                        );
+                        let request = ResumeSpawnRequest {
+                            session_id: request_session_id,
+                            session,
+                            execution_reservation,
+                            event_sender,
+                            config: *config,
+                        };
+                        tokio::spawn(async move {
+                            ResumeExecutionPort::spawn_resume_execution(&coordinator, request)
+                                .await;
+                        });
+                    },
+                    move || async move {
+                        let reservation = rollback_reservation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        if let Some(reservation) = reservation {
+                            reservation.rollback_unpublished_activation().await;
+                        }
+                    },
+                )
+            }
+            LaunchPlan::Child {
+                scheduler,
+                parent_session_id,
+                model,
+                disabled_tools,
+            } => {
+                let execution_reservation =
+                    SessionExecutionReservation::from_activation_placeholder(
+                        target_session_id,
+                        reservation,
+                        self.agent
+                            .activation_router()
+                            .expect("SessionInbox activation requires an activation router")
+                            .clone(),
+                        self.agent_runners.clone(),
+                    );
+                let reservation_cell = Arc::new(StdMutex::new(Some(execution_reservation)));
+                let launch_reservation = reservation_cell.clone();
+                let rollback_reservation = reservation_cell;
+                let job = SpawnJob {
+                    parent_session_id,
+                    child_session_id: target_session_id.to_string(),
+                    model,
+                    disabled_tools,
+                };
+                let launch_sessions = self.sessions.clone();
+                let launch_session_id = session.id.clone();
+                let launch_session = session;
+                SessionActivationLaunch::new_with_async_rollback(
+                    run_id,
+                    move || {
+                        let mut execution_reservation = launch_reservation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                            .expect("activation reservation launches or rolls back exactly once");
+                        execution_reservation.mark_activation_published();
+                        // As with root activation, publish the prepared cache
+                        // snapshot only after router ownership commits.
+                        launch_sessions.insert(
+                            launch_session_id,
+                            Arc::new(parking_lot::RwLock::new(launch_session)),
+                        );
+                        // Dropping a JoinHandle detaches the task. The captured
+                        // combined reservation remains RAII-protected if the
+                        // task is later aborted or unwinds during setup.
+                        drop(scheduler.launch_reserved(job, execution_reservation));
+                    },
+                    move || async move {
+                        let reservation = rollback_reservation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        if let Some(reservation) = reservation {
+                            reservation.rollback_unpublished_activation().await;
+                        }
+                    },
+                )
+            }
+        };
+        Ok(SessionActivationReserveOutcome::Reserved(launch))
     }
 }
 
@@ -935,6 +1475,31 @@ fn bash_completion_should_resume(
     all_waited_shells_done: bool,
 ) -> bool {
     loop_suspended_on_bash && all_waited_shells_done
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashCompletionDeliveryPlan {
+    /// Preserve the durable wait and do not reserve a successor. The last
+    /// sibling completion (or the wait backstop) activates the accumulated
+    /// inbox in order.
+    DurableOnly,
+    /// The loop is live/not waiting; notify its current owner after admission.
+    Activate,
+    /// The last waited shell finished: clear the wait durably, then activate.
+    ClearWaitThenActivate,
+}
+
+fn bash_completion_delivery_plan(
+    loop_suspended_on_bash: bool,
+    all_waited_shells_done: bool,
+) -> BashCompletionDeliveryPlan {
+    if bash_completion_should_resume(loop_suspended_on_bash, all_waited_shells_done) {
+        BashCompletionDeliveryPlan::ClearWaitThenActivate
+    } else if loop_suspended_on_bash {
+        BashCompletionDeliveryPlan::DurableOnly
+    } else {
+        BashCompletionDeliveryPlan::Activate
+    }
 }
 
 fn background_bash_post_tool_payload(info: &BashCompletionInfo) -> HookPayload {
@@ -1226,28 +1791,51 @@ fn bash_completion_injection_body(info: &BashCompletionInfo) -> String {
     body
 }
 
-/// Loop-facing background-Bash completion delivery (issue #84 Phase 2b
-/// follow-up). Pushes a completed shell's result into its owning session's loop,
-/// mirroring how a sub-agent completion reaches its parent — but via the
-/// running-loop channel, which children never exercise (a parent waiting on
-/// children is always suspended when one completes; bash is the first completion
-/// source that can land on a *live, iterating* loop).
-///
-/// The push enqueues onto `pending_injected_messages`, the same round-boundary
-/// steering channel `send_message` uses. That covers every reachable loop state:
-/// an actively-looping session drains it at its next round
-/// (`merge_pending_injected_messages`); a session suspended on `waiting_for_bash`
-/// drains it when the durable end-of-turn poll backstop (`bash_resume_hook`)
-/// resumes it at round 0. A wired-sink session is never idle-with-a-running-shell
-/// (ending a turn with one suspends), so no separate idle-wake path is needed —
-/// keeping the push a pure latency optimization that never races the backstop.
+fn bash_completion_envelope(info: &BashCompletionInfo) -> bamboo_domain::SessionMessageEnvelope {
+    let provider_message = bash_resume_message_from_info(info);
+    let data = serde_json::json!({
+        "session_id": info.session_id,
+        "bash_id": info.bash_id,
+        "command": info.command,
+        "exit_code": info.exit_code,
+        "status": info.status,
+        "output_tail": info.output_tail,
+    });
+    // The id covers the immutable completion snapshot. An exact delivery retry
+    // (whose transport timestamp may differ) is idempotent; a changed status,
+    // output tail, command, or exit code is a distinct correction rather than
+    // silently reusing one id with different semantics.
+    let identity = data.clone();
+    bamboo_domain::SessionMessageEnvelope {
+        id: bamboo_domain::SessionMessageId::stable("background_bash_completion", &identity),
+        source: bamboo_domain::SessionMessageSource::Runtime {
+            subsystem: "background_bash".to_string(),
+        },
+        target_session_id: info.session_id.clone(),
+        kind: bamboo_domain::SessionMessageKind::RuntimeInstruction,
+        body: bamboo_domain::SessionMessageBody::RuntimeInstruction(
+            bamboo_domain::SessionRuntimeInstruction {
+                instruction: "background_bash_completed".to_string(),
+                content: Some(bamboo_domain::SessionMessageContent::text(
+                    bash_completion_injection_body(info),
+                )),
+                data: Some(data),
+                provider_message: Some(session_provider_message(&provider_message)),
+            },
+        ),
+        created_at: Utc::now(),
+        thread_id: None,
+        in_reply_to: None,
+        attempt: None,
+        correlation_id: Some(info.bash_id.clone()),
+    }
+}
+
 /// Enqueue a completed shell's summary as a pending injected message on the
-/// owning session. Race-safe: `update_runtime_config` loads the freshest session
-/// under the per-session lock and re-saves, so it can never revert a message the
-/// live loop appended concurrently — unlike `merge_save_runtime` (which writes
-/// the caller's whole `messages` snapshot verbatim). Free fn so it is unit-
-/// testable without constructing a full coordinator. Returns the saved session,
-/// or `None` if the owning session no longer exists.
+/// owning session for the rolling-upgrade polling backstop. New push delivery
+/// uses [`SessionMessenger`]; this helper remains only so an older process that
+/// has not wired the typed delivery plane can still resume persisted sessions.
+/// Race-safe: `update_runtime_config` loads and saves under the per-session lock.
 async fn enqueue_bash_completion_injection(
     persistence: &LockedSessionStore,
     info: &BashCompletionInfo,
@@ -1292,10 +1880,9 @@ impl ChildCompletionCoordinator {
     ///   `waiting_for_bash` is set) AND every waited shell has now finished →
     ///   **resume the loop directly**, event-driven, appending the rich completion
     ///   notice as the resume message. This is the push's whole point: no polling.
-    /// - Otherwise (a live/iterating loop, or a suspend still waiting on OTHER
-    ///   shells) → **enqueue** the notice as a pending injected message, drained at
-    ///   the next round boundary (a live loop) or folded into the eventual resume
-    ///   when the last shell finishes.
+    /// - Every notice is then delivered through the same typed SessionMessenger
+    ///   as peer/user steering. The durable inbox and activation router decide
+    ///   whether to notify the current owner or reserve one successor.
     async fn deliver_bash_completion(&self, mut info: BashCompletionInfo) {
         // A background shell completes outside the originating tool call, so
         // fire its PostToolUse seam here before routing the completion into the
@@ -1334,37 +1921,128 @@ impl ChildCompletionCoordinator {
         let all_shells_done =
             bamboo_tools::tools::bash_runtime::running_shells_for_session(&info.session_id)
                 .is_empty();
+        let delivery_plan = bash_completion_delivery_plan(waiting, all_shells_done);
 
-        if bash_completion_should_resume(waiting, all_shells_done) {
+        // Stage 1: make the completion durable BEFORE clearing the wait. The
+        // activation is intentionally deferred until the wait-state mutation
+        // below is durably committed; otherwise a successor can observe the old
+        // suspension, while clear-before-deliver can lose the only wake on
+        // crash.
+        let messenger = self.agent.session_messenger().cloned();
+        let admission = match messenger.as_ref() {
+            Some(messenger) => match messenger.admit(bash_completion_envelope(&info)).await {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %info.session_id,
+                        bash_id = %info.bash_id,
+                        %error,
+                        "background bash completion: durable SessionInbox admission failed; leaving wait armed"
+                    );
+                    return;
+                }
+            },
+            None => {
+                tracing::warn!(
+                    session_id = %info.session_id,
+                    bash_id = %info.bash_id,
+                    "SessionMessenger unavailable; using compatibility injection before clearing wait"
+                );
+                match enqueue_bash_completion_injection(&self.persistence, &info).await {
+                    Ok(Some(_)) => None,
+                    Ok(None) => {
+                        tracing::warn!(
+                            session_id = %info.session_id,
+                            "background bash compatibility target disappeared"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %info.session_id,
+                            %error,
+                            "background bash compatibility admission failed; leaving wait armed"
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        if delivery_plan == BashCompletionDeliveryPlan::DurableOnly {
+            tracing::info!(
+                session_id = %info.session_id,
+                bash_id = %info.bash_id,
+                "background bash completion is durable; sibling shells still run, so wait remains armed"
+            );
+            return;
+        }
+
+        if let (Some(messenger), Some(admission)) = (messenger.as_ref(), admission.as_ref()) {
+            if let Err(error) = messenger.prepare_activation(admission).await {
+                tracing::warn!(
+                    session_id = %info.session_id,
+                    bash_id = %info.bash_id,
+                    %error,
+                    "background bash completion activation watermark failed; leaving wait armed"
+                );
+                return;
+            }
+        }
+
+        if delivery_plan == BashCompletionDeliveryPlan::ClearWaitThenActivate {
             tracing::info!(
                 session_id = %info.session_id,
                 bash_id = %info.bash_id,
                 status = %info.status,
                 "background bash completion: push-resuming suspended loop (event-driven)"
             );
-            self.perform_bash_resume(&info.session_id, bash_resume_message_from_info(&info))
-                .await;
-            return;
+            let mut resumable = session.clone();
+            let mut runtime_state = read_runtime_state(&resumable);
+            runtime_state.waiting_for_bash = None;
+            runtime_state.status = AgentStatusState::Idle;
+            runtime_state.suspension = None;
+            write_runtime_state(&mut resumable, &runtime_state);
+            resumable.metadata.remove("runtime.suspend_reason");
+            resumable.updated_at = Utc::now();
+            if let Err(error) = self.persistence.merge_save_runtime(&mut resumable).await {
+                tracing::warn!(
+                    session_id = %info.session_id,
+                    %error,
+                    "background bash completion is durable but wait-state clear failed; leaving activation to the wait backstop"
+                );
+                return;
+            }
+            self.sessions.insert(
+                resumable.id.clone(),
+                Arc::new(parking_lot::RwLock::new(resumable)),
+            );
         }
 
-        match enqueue_bash_completion_injection(&self.persistence, &info).await {
-            Ok(Some(_)) => tracing::info!(
+        // Stage 3: activation is allowed only after the durable wait-state
+        // clear. A crash before here leaves either the wait backstop or startup
+        // inbox reconciliation able to recover.
+        let (Some(messenger), Some(admission)) = (messenger, admission) else {
+            if delivery_plan == BashCompletionDeliveryPlan::ClearWaitThenActivate {
+                let _ = self.resume_parent(info.session_id.clone()).await;
+            }
+            return;
+        };
+        match messenger.activate_prepared(&admission).await {
+            Ok(receipt) => tracing::info!(
                 session_id = %info.session_id,
                 bash_id = %info.bash_id,
                 status = %info.status,
                 waiting,
-                "background bash completion queued for injection at the next round boundary"
-            ),
-            Ok(None) => tracing::warn!(
-                session_id = %info.session_id,
-                bash_id = %info.bash_id,
-                "background bash completion: owning session not found; nothing to notify"
+                generation = receipt.delivery.generation,
+                activation = ?receipt.activation,
+                "background bash completion delivered through SessionMessenger"
             ),
             Err(error) => tracing::warn!(
                 session_id = %info.session_id,
                 bash_id = %info.bash_id,
                 %error,
-                "background bash completion: failed to queue injection"
+                "background bash completion: SessionMessenger delivery failed"
             ),
         }
     }
@@ -2072,6 +2750,152 @@ impl ChildCompletionCoordinator {
 mod tests {
     use super::*;
     use bamboo_agent_core::Message;
+    use bamboo_domain::SessionInboxPort;
+    use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmptyTools;
+
+    #[async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for EmptyTools {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
+        {
+            Err(bamboo_agent_core::tools::ToolError::NotFound(
+                "no tools".to_string(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    struct CompletedTestProvider;
+
+    #[async_trait]
+    impl bamboo_llm::LLMProvider for CompletedTestProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            let chunks: Vec<bamboo_llm::provider::Result<bamboo_llm::LLMChunk>> = vec![
+                Ok(bamboo_llm::LLMChunk::Token("done".to_string())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ];
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct CountingActivationSpawner {
+        reservations: Arc<AtomicUsize>,
+        launches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SessionActivationSpawner for CountingActivationSpawner {
+        async fn reserve_activation(
+            &self,
+            target_session_id: &str,
+            inbox_generation: u64,
+        ) -> Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError>
+        {
+            self.reservations.fetch_add(1, Ordering::SeqCst);
+            let launches = self.launches.clone();
+            Ok(SessionActivationReserveOutcome::Reserved(
+                SessionActivationLaunch::new(
+                    format!("{target_session_id}-{inbox_generation}"),
+                    move || {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                    },
+                ),
+            ))
+        }
+    }
+
+    async fn completion_inbox_fixture() -> (
+        tempfile::TempDir,
+        Arc<bamboo_storage::SessionStoreV2>,
+        Arc<dyn SessionInboxPort>,
+        Arc<ChildCompletionCoordinator>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let locked = Arc::new(LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let router = crate::SessionActivationRouter::new();
+        let messenger = Arc::new(crate::SessionMessenger::new(
+            storage.clone(),
+            inbox.clone(),
+            router.clone(),
+        ));
+        let reservations = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+        router
+            .set_spawner(Arc::new(CountingActivationSpawner {
+                reservations: reservations.clone(),
+                launches: launches.clone(),
+            }))
+            .await;
+        let provider: Arc<dyn bamboo_llm::LLMProvider> = Arc::new(CompletedTestProvider);
+        let config = Arc::new(RwLock::new(Config::default()));
+        let metrics = bamboo_metrics::MetricsCollector::spawn(
+            Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                temp.path().join("metrics.db"),
+            )),
+            7,
+        );
+        let tools: Arc<dyn ToolExecutor> = Arc::new(EmptyTools);
+        let agent = Arc::new(
+            Agent::builder()
+                .storage(storage.clone())
+                .persistence(locked.clone())
+                .session_inbox(inbox.clone())
+                .activation_router(router)
+                .session_messenger(messenger)
+                .attachment_reader(store.clone())
+                .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+                .metrics_collector(metrics)
+                .config(config.clone())
+                .provider(provider.clone())
+                .default_tools(tools)
+                .build()
+                .unwrap(),
+        );
+        let mut providers = HashMap::new();
+        providers.insert("test".to_string(), provider);
+        let registry = Arc::new(ProviderRegistry::new(providers, "test".to_string()));
+        let provider_router = Arc::new(ProviderModelRouter::new(registry.clone()));
+        let coordinator = Arc::new(ChildCompletionCoordinator::new(
+            storage,
+            locked,
+            Arc::new(dashmap::DashMap::new()),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            agent,
+            config,
+            registry,
+            provider_router,
+            temp.path().to_path_buf(),
+            None,
+        ));
+        (temp, store, inbox, coordinator, reservations, launches)
+    }
 
     // ── child-wait watchdog pure helpers (issue #546) ────────────────────
 
@@ -2161,6 +2985,242 @@ mod tests {
             status: status.to_string(),
             error: None,
             completed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn oversized_child_outcome_is_bounded_and_keeps_full_content_identity() {
+        let mut completion = make_completion("completed");
+        let wait_registered_at = Utc::now();
+        let huge = format!("prefix-A-{}", "x".repeat(300 * 1024));
+        let presentation = runtime_resume_message(&completion, 0, Some(&huge));
+        let first = child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(huge.clone()),
+            &presentation,
+        );
+        assert!(
+            serde_json::to_vec(&first).unwrap().len()
+                < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        let SessionMessageBody::ChildOutcome(outcome) = &first.body else {
+            panic!("typed child outcome");
+        };
+        let stored = outcome.result.as_deref().unwrap();
+        assert!(stored.contains("sha256="));
+        assert!(stored.contains("SubAgent.get"));
+        assert!(stored.len() < CHILD_COMPLETION_INLINE_FIELD_BYTES);
+
+        // Retry-only completion timestamps and provider presentation do not
+        // change the logical id; full oversized content does.
+        completion.completed_at += chrono::Duration::seconds(1);
+        let exact_retry = child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(huge.clone()),
+            &runtime_resume_message(&completion, 9, Some(&huge)),
+        );
+        assert_eq!(exact_retry.id, first.id);
+        let changed = format!("prefix-B-{}", "x".repeat(300 * 1024));
+        let corrected = child_completion_envelope(
+            &completion,
+            wait_registered_at,
+            Some(changed.clone()),
+            &runtime_resume_message(&completion, 0, Some(&changed)),
+        );
+        assert_ne!(corrected.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn oversized_child_completion_clears_wait_and_activates_exactly_once() {
+        let (_temp, store, inbox, coordinator, reservations, launches) =
+            completion_inbox_fixture().await;
+        let parent_id = "oversized-parent";
+        let child_id = "oversized-child";
+        let now = Utc::now();
+        let mut parent = Session::new(parent_id, "model");
+        let mut parent_runtime = AgentRuntimeState::new("waiting-run");
+        parent_runtime.status = AgentStatusState::Suspended;
+        parent_runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec![child_id.to_string()],
+            ChildWaitPolicy::All,
+            now,
+        ));
+        parent_runtime.suspension = Some(SuspensionState {
+            reason: "waiting_for_children".to_string(),
+            suspended_at: now,
+            resumable: true,
+            hook_point: Some("ChildCompletion".to_string()),
+        });
+        write_runtime_state(&mut parent, &parent_runtime);
+        parent.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        store.save_session(&parent).await.unwrap();
+
+        let mut child = Session::new_child(child_id, parent_id, "model", "Child");
+        child.add_message(Message::assistant("z".repeat(300 * 1024), None));
+        child.set_last_run_status("completed");
+        store.save_session(&child).await.unwrap();
+        let completion = ChildCompletion {
+            parent_session_id: parent_id.to_string(),
+            child_session_id: child_id.to_string(),
+            status: "completed".to_string(),
+            error: None,
+            completed_at: Utc::now(),
+        };
+
+        ChildCompletionHandler::on_child_completed(coordinator.as_ref(), completion.clone()).await;
+        let durable_parent = store.load_session(parent_id).await.unwrap().unwrap();
+        let durable_runtime = read_runtime_state(&durable_parent);
+        assert!(durable_runtime.waiting_for_children.is_none());
+        assert_eq!(durable_runtime.status, AgentStatusState::Idle);
+        assert!(!durable_parent
+            .metadata
+            .contains_key("runtime.suspend_reason"));
+        let backlog = inbox.inspect(parent_id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 1);
+        assert!(backlog.activation_pending());
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+        let claim = inbox.claim(parent_id, 1).await.unwrap().remove(0);
+        assert!(
+            serde_json::to_vec(&claim.envelope).unwrap().len()
+                < bamboo_domain::SessionInboxLimits::default().max_payload_bytes
+        );
+        // Duplicate terminal notification after the wait was already cleared
+        // cannot enqueue or activate a second outcome.
+        ChildCompletionHandler::on_child_completed(coordinator.as_ref(), completion).await;
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(inbox.inspect(parent_id).await.unwrap().claimed, 1);
+    }
+
+    #[tokio::test]
+    async fn latest_locked_activation_mutation_preserves_wait_armed_after_stale_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let locked = LockedSessionStore::new(storage);
+        let mut session = Session::new("activation-stale-wait", "model");
+        session.agent_runtime_state = Some(AgentRuntimeState::new("old-run"));
+        store.save_session(&session).await.unwrap();
+
+        // The activation path has already loaded this stale, wait-free snapshot.
+        let stale = store.load_session(&session.id).await.unwrap().unwrap();
+        assert!(read_runtime_state(&stale).waiting_for_children.is_none());
+
+        locked
+            .update_runtime_config(&session.id, |latest| {
+                let mut state = read_runtime_state(latest);
+                state.status = AgentStatusState::Suspended;
+                state.waiting_for_children = Some(WaitingForChildrenState::for_children(
+                    vec!["child-new".to_string()],
+                    ChildWaitPolicy::All,
+                    Utc::now(),
+                ));
+                state.suspension = Some(SuspensionState {
+                    reason: "waiting_for_children".to_string(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: None,
+                });
+                write_runtime_state(latest, &state);
+                latest.metadata.insert(
+                    "runtime.suspend_reason".to_string(),
+                    "waiting_for_children".to_string(),
+                );
+            })
+            .await
+            .unwrap();
+
+        let (prepared, ready) = prepare_session_inbox_activation(&locked, &session.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!ready, "latest durable specific wait must block activation");
+        let state = read_runtime_state(&prepared);
+        assert!(state.waiting_for_children.is_some());
+        assert_eq!(state.status, AgentStatusState::Suspended);
+        assert_eq!(
+            prepared
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_child_and_bash_backlogs_remain_inert_after_inbox_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        store
+            .save_session(&Session::new("restart-child-parent", "model"))
+            .await
+            .unwrap();
+        store
+            .save_session(&Session::new("restart-bash-parent", "model"))
+            .await
+            .unwrap();
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+
+        let completion = ChildCompletion {
+            parent_session_id: "restart-child-parent".to_string(),
+            child_session_id: "child-a".to_string(),
+            status: "completed".to_string(),
+            error: None,
+            completed_at: Utc::now(),
+        };
+        let child_resume = runtime_resume_message(&completion, 1, Some("first child"));
+        inbox
+            .deliver(&child_completion_envelope(
+                &completion,
+                Utc::now(),
+                Some("first child".to_string()),
+                &child_resume,
+            ))
+            .await
+            .unwrap();
+        let bash = BashCompletionInfo {
+            session_id: "restart-bash-parent".to_string(),
+            bash_id: "bash-a".to_string(),
+            command: "true".to_string(),
+            exit_code: Some(0),
+            status: "completed".to_string(),
+            output_tail: String::new(),
+        };
+        inbox
+            .deliver(&bash_completion_envelope(&bash))
+            .await
+            .unwrap();
+
+        let reopened = bamboo_storage::FileSessionInbox::new(
+            store,
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        for session_id in ["restart-child-parent", "restart-bash-parent"] {
+            let backlog = reopened.inspect(session_id).await.unwrap();
+            assert_eq!(backlog.pending, 1);
+            assert_eq!(backlog.activation_generation, 0);
+            assert!(
+                !backlog.activation_pending(),
+                "startup must not run a partial wait backlog for {session_id}"
+            );
         }
     }
 
@@ -2584,6 +3644,58 @@ mod tests {
             .contains("Run the formatter before continuing"));
     }
 
+    #[tokio::test]
+    async fn bash_completion_payload_identity_matches_file_inbox_idempotency() {
+        let baseline = BashCompletionInfo {
+            session_id: "session".into(),
+            bash_id: "bg-7".into(),
+            command: "cargo test".into(),
+            exit_code: Some(0),
+            status: "completed".into(),
+            output_tail: "first tail".into(),
+        };
+        let mut retried = baseline.clone();
+        retried.output_tail = "first tail\nlater bytes\n<hook feedback>".into();
+        retried.status = "completed-after-hook".into();
+        let baseline_envelope = bash_completion_envelope(&baseline);
+        let exact_retry = bash_completion_envelope(&baseline);
+        let corrected_envelope = bash_completion_envelope(&retried);
+        assert_eq!(baseline_envelope.id, exact_retry.id);
+        assert_ne!(
+            baseline_envelope.id, corrected_envelope.id,
+            "changed payload semantics must receive a distinct id"
+        );
+
+        let mut other_shell = baseline.clone();
+        other_shell.bash_id = "bg-8".into();
+        assert_ne!(
+            bash_completion_envelope(&baseline).id,
+            bash_completion_envelope(&other_shell).id
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        store
+            .save_session(&Session::new("session", "model"))
+            .await
+            .unwrap();
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            store,
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let first = inbox.deliver(&baseline_envelope).await.unwrap();
+        let duplicate = inbox.deliver(&exact_retry).await.unwrap();
+        let corrected = inbox.deliver(&corrected_envelope).await.unwrap();
+        assert_eq!(duplicate, first, "exact payload retry is idempotent");
+        assert_ne!(corrected.id, first.id);
+        assert_eq!(corrected.generation, first.generation + 1);
+        assert_eq!(inbox.inspect("session").await.unwrap().pending, 2);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn background_completion_fires_configured_post_tool_use_command() {
@@ -2770,6 +3882,32 @@ mod tests {
         assert!(!bash_completion_should_resume(true, false)); // other shells still running
         assert!(!bash_completion_should_resume(false, true)); // live loop, not suspended
         assert!(!bash_completion_should_resume(false, false));
+    }
+
+    #[test]
+    fn two_shell_delivery_stages_backlog_before_one_final_activation() {
+        let mut waiting = true;
+        let mut durable_backlog = 0;
+        let mut reservations = 0;
+
+        // First shell: its completion is durable, but a sibling still runs.
+        durable_backlog += 1;
+        let first = bash_completion_delivery_plan(waiting, false);
+        assert_eq!(first, BashCompletionDeliveryPlan::DurableOnly);
+        assert!(waiting);
+        assert_eq!(durable_backlog, 1);
+        assert_eq!(reservations, 0);
+
+        // Last shell: its own completion joins the same ordered backlog, then
+        // the durable wait is cleared and exactly one activation is requested.
+        durable_backlog += 1;
+        let last = bash_completion_delivery_plan(waiting, true);
+        assert_eq!(last, BashCompletionDeliveryPlan::ClearWaitThenActivate);
+        waiting = false;
+        reservations += 1;
+        assert!(!waiting);
+        assert_eq!(durable_backlog, 2);
+        assert_eq!(reservations, 1);
     }
 
     /// The push's resume message carries the shell's identity + status + output

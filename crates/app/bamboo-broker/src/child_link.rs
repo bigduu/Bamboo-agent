@@ -92,6 +92,13 @@ impl BrokerChildLink {
                 );
                 self.client.deliver(&self.child, m).await?;
             }
+            ParentFrame::SessionMessage { delivery } => {
+                let body = serde_json::to_value(delivery).map_err(|e| {
+                    BrokerError::Transport(format!("encode SessionMessageDelivery: {e}"))
+                })?;
+                let m = self.msg(InboxKind::Steer, body, self.run_id.clone());
+                self.client.deliver(&self.child, m).await?;
+            }
             // Approval decision: the worker routes it to the waiting tool call by
             // the approval-request `id` carried in the body.
             ParentFrame::ApprovalReply { id, approved } => {
@@ -125,6 +132,14 @@ impl BrokerChildLink {
             }
             let frame = match msg.kind {
                 InboxKind::Event => Some(ChildFrame::Event { event: msg.body }),
+                InboxKind::SessionMessageAdmitted => {
+                    let confirmation = serde_json::from_value(msg.body).map_err(|e| {
+                        BrokerError::Transport(format!(
+                            "decode SessionMessageAdmissionConfirmation: {e}"
+                        ))
+                    })?;
+                    Some(ChildFrame::SessionMessageAdmitted { confirmation })
+                }
                 InboxKind::ApprovalRequest => {
                     // body = {"id": "...", "request": {...}}: the worker proxied a
                     // gated-tool approval up. Surface it for the host to decide.
@@ -232,10 +247,13 @@ mod tests {
 
         link.send(ParentFrame::Run(RunSpec {
             assignment: "hello world".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
         .await
@@ -328,6 +346,40 @@ mod tests {
         }
     }
 
+    struct TypedSteer;
+    #[async_trait::async_trait]
+    impl bamboo_subagent::ChildExecutor for TypedSteer {
+        async fn run(
+            &self,
+            spec: RunSpec,
+            events: bamboo_subagent::EventSink,
+            mut steer: bamboo_subagent::SteerInbox,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> bamboo_subagent::ChildOutcome {
+            assert_eq!(
+                spec.logical_session,
+                Some(bamboo_subagent::LogicalSessionIdentity {
+                    session_id: "logical-child".to_string(),
+                    parent_session_id: Some("logical-parent".to_string()),
+                    root_session_id: "logical-root".to_string(),
+                })
+            );
+            events.emit(serde_json::json!({ "type": "ready" }));
+            let bamboo_subagent::SteerMessage::SessionMessage(delivery) =
+                steer.recv_message().await.expect("typed delivery")
+            else {
+                panic!("expected typed delivery");
+            };
+            events.confirm_session_message(bamboo_subagent::SessionMessageAdmissionConfirmation {
+                target_session_id: delivery.target_session_id,
+                envelope_id: delivery.envelope.id.as_str().to_string(),
+                canonical_claim_generation: delivery.canonical_claim_generation,
+                activation_run_id: delivery.activation_run_id,
+            });
+            bamboo_subagent::ChildOutcome::completed("confirmed")
+        }
+    }
+
     /// An executor that proxies one gated-tool approval to the host and reports
     /// the decision — proving the approval round-trip works over the bus.
     struct AskApproval;
@@ -365,10 +417,17 @@ mod tests {
 
         link.send(ParentFrame::Run(RunSpec {
             assignment: "go".into(),
+            logical_session: Some(bamboo_subagent::LogicalSessionIdentity {
+                session_id: "logical-child".to_string(),
+                parent_session_id: Some("logical-parent".to_string()),
+                root_session_id: "logical-root".to_string(),
+            }),
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
         .await
@@ -405,6 +464,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn carries_typed_session_message_confirmation_over_the_bus() {
+        let (endpoint, _dir) = start_broker().await;
+        spawn_worker(&endpoint, Arc::new(TypedSteer));
+        let mut link = connect_parent(&endpoint).await;
+        link.send(ParentFrame::Run(RunSpec {
+            assignment: "go".into(),
+            logical_session: Some(bamboo_subagent::LogicalSessionIdentity {
+                session_id: "logical-child".to_string(),
+                parent_session_id: Some("logical-parent".to_string()),
+                root_session_id: "logical-root".to_string(),
+            }),
+            project_id: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: vec![],
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
+            secrets: Default::default(),
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), link.next_frame())
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(ChildFrame::Event { .. })
+        ));
+        let mut envelope =
+            bamboo_domain::SessionMessageEnvelope::user_input("logical-child", "typed");
+        envelope.id = bamboo_domain::SessionMessageId::parse("broker-typed-id").unwrap();
+        link.send(ParentFrame::SessionMessage {
+            delivery: bamboo_subagent::SessionMessageDelivery {
+                target_session_id: "logical-child".to_string(),
+                envelope,
+                canonical_claim_generation: 9,
+                activation_run_id: "run-broker-9".to_string(),
+                activation_policy: bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            },
+        })
+        .await
+        .unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(5), link.next_frame())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Some(ChildFrame::SessionMessageAdmitted { confirmation }) => {
+                assert_eq!(confirmation.target_session_id, "logical-child");
+                assert_eq!(confirmation.envelope_id, "broker-typed-id");
+                assert_eq!(confirmation.canonical_claim_generation, 9);
+                assert_eq!(confirmation.activation_run_id, "run-broker-9");
+            }
+            other => panic!("expected typed confirmation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn carries_an_approval_round_trip_over_the_bus() {
         let (endpoint, _dir) = start_broker().await;
         spawn_worker(&endpoint, Arc::new(AskApproval));
@@ -412,10 +530,13 @@ mod tests {
 
         link.send(ParentFrame::Run(RunSpec {
             assignment: "do the dangerous thing".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
         .await

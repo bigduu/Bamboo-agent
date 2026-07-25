@@ -3,7 +3,7 @@
 //! The session/event payloads are kept opaque (`serde_json::Value`) so this crate stays a leaf;
 //! the real `AgentEvent` serializes into [`ChildFrame::Event`] verbatim (design §6, zero mapping).
 
-use bamboo_domain::ProjectId;
+use bamboo_domain::{ProjectId, SessionActivationPolicy, SessionMessageEnvelope};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,11 @@ pub struct AgentRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub assignment: String,
+    /// Stable domain identity for the session being activated. Actor process,
+    /// mailbox, and pooled-worker ids are transport details and must never
+    /// replace these values in worker persistence or message routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_session: Option<LogicalSessionIdentity>,
     /// Stable Project identity inherited from the parent session. The typed
     /// wire value rejects unsafe/invalid identifiers during deserialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,10 +52,55 @@ pub struct RunSpec {
     /// across one-shot actor processes. Empty = first activation, no history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<serde_json::Value>,
+    /// Independently authoritative id of the host activation whose execution
+    /// this RunSpec starts. Initial and mid-run typed deliveries must match it;
+    /// a delivery's own run-id field is never accepted as self-authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_run_id: Option<String>,
+    /// Canonical logical-session deliveries that caused this idle actor
+    /// activation. The worker durably enqueues these before entering its first
+    /// provider boundary, then confirms admission over the child frame stream.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_session_messages: Vec<SessionMessageDelivery>,
     /// Secrets minted for this activation only. They are delivered in-memory
     /// over the actor transport and must never be persisted by the worker.
     #[serde(default, skip_serializing_if = "RunSecrets::is_empty")]
     pub secrets: RunSecrets,
+}
+
+/// Logical session ancestry carried across every actor placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalSessionIdentity {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    pub root_session_id: String,
+}
+
+/// One canonical inbox claim forwarded to an active actor. The activation run
+/// id and claim generation make the worker's confirmation unambiguous even if
+/// a stale connection delivers a late frame after a successor has taken over.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessageDelivery {
+    pub target_session_id: String,
+    pub envelope: SessionMessageEnvelope,
+    pub canonical_claim_generation: u64,
+    pub activation_run_id: String,
+    /// Durable host policy associated with the authorized claim prefix. The
+    /// worker mirrors it onto its local receipt before the safe-turn boundary.
+    #[serde(default)]
+    pub activation_policy: SessionActivationPolicy,
+}
+
+/// Worker proof that its local safe-turn path durably checkpointed and acked a
+/// forwarded envelope. The host still has to checkpoint the canonical logical
+/// transcript before it may ack the canonical claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessageAdmissionConfirmation {
+    pub target_session_id: String,
+    pub envelope_id: String,
+    pub canonical_claim_generation: u64,
+    pub activation_run_id: String,
 }
 
 /// Per-activation secret envelope. A Bamboo-routed Codex token lives here so a
@@ -113,6 +163,9 @@ pub enum ParentFrame {
     Message {
         text: String,
     },
+    SessionMessage {
+        delivery: SessionMessageDelivery,
+    },
     /// Reply to a [`ChildFrame::ApprovalRequest`] — the host's human/policy
     /// decision on a gated tool the worker proxied back (Phase 2 child→parent
     /// approval delegation). `id` correlates to the request. When
@@ -136,6 +189,11 @@ pub enum ChildFrame {
     /// host answers with [`ParentFrame::ApprovalReply`] carrying the same `id`.
     /// `body` carries `{tool_name, permission_type, resource, question}`.
     ApprovalRequest { id: String, body: serde_json::Value },
+    /// Emitted only after the worker's local SessionInbox transcript + cursor
+    /// checkpoint and admitted receipt are durable.
+    SessionMessageAdmitted {
+        confirmation: SessionMessageAdmissionConfirmation,
+    },
     Terminal {
         status: TerminalStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,10 +247,13 @@ mod tests {
         for f in [
             ParentFrame::Run(RunSpec {
                 assignment: "do x".into(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }),
             ParentFrame::Cancel,
@@ -247,10 +308,13 @@ mod tests {
     fn run_frame_tag_is_stable() {
         let f = ParentFrame::Run(RunSpec {
             assignment: "a".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: Some("high".into()),
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         });
         let v: serde_json::Value = serde_json::from_str(&f.to_text()).unwrap();
@@ -273,10 +337,13 @@ mod tests {
 
         let frame = ParentFrame::Run(RunSpec {
             assignment: "a".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: RunSecrets {
                 codex_provider_token: Some(secret),
             },
@@ -297,10 +364,13 @@ mod tests {
         };
         let frame = ParentFrame::Run(RunSpec {
             assignment: "work".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: Some(context.clone()),
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         });
         let decoded = ParentFrame::from_text(&frame.to_text()).unwrap();
@@ -328,10 +398,13 @@ mod tests {
     fn run_frame_round_trips_typed_project_identity() {
         let frame = ParentFrame::Run(RunSpec {
             assignment: "work".into(),
+            logical_session: None,
             project_id: Some(ProjectId::parse("project-1").unwrap()),
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         });
 

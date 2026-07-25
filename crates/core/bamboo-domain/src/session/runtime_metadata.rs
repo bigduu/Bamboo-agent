@@ -99,6 +99,11 @@ pub struct SessionRuntimeMetadata {
     /// Stable Project identity. This does not change when the workspace changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Durable, bounded SessionInbox admission cursor. This is checkpointed
+    /// together with the provider-facing transcript before an inbox claim is
+    /// acknowledged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_inbox_admission: Option<super::SessionInboxAdmissionState>,
 }
 
 impl SessionRuntimeMetadata {

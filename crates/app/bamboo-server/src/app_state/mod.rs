@@ -250,6 +250,12 @@ pub struct AppState {
     /// may race with a UI metadata update.
     pub persistence: Arc<LockedSessionStore>,
 
+    /// Durable logical-session delivery plane. These are internal runtime
+    /// capabilities; no public messaging endpoint is registered.
+    pub session_inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+    pub session_activation_router: Arc<bamboo_engine::SessionActivationRouter>,
+    pub session_messenger: Arc<bamboo_engine::SessionMessenger>,
+
     /// Framework-owned session coordinator (cache + storage + persistence).
     /// The canonical load/save coordination lives here in `bamboo-engine`, not
     /// on `AppState`; the inherent `AppState::load_session`/`save_and_cache_session`

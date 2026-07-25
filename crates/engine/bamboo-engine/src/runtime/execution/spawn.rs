@@ -12,12 +12,15 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort};
 use bamboo_llm::ProviderModelRouter;
 
 use crate::runtime::Agent;
 
+use super::agent_spawn::SessionExecutionReservation;
 use super::child_completion::{ChildCompletion, ChildCompletionHandler};
 use super::runner_state::AgentRunner;
 
@@ -29,6 +32,30 @@ pub struct SpawnJob {
     /// Tool names to hide from the LLM schema for this child session.
     /// Computed from the child's `subagent_type` profile policy.
     pub disabled_tools: Option<Vec<String>>,
+}
+
+/// Optional application-layer preparation for a child run launched through
+/// the canonical scheduler.
+///
+/// The engine owns runner reservation and execution. Applications may use
+/// this synchronous, no-fail hook to attach observers to the already-created
+/// child event sender (for example, the server's always-on notification
+/// relay) without introducing an engine dependency on application services.
+pub trait ChildRunLaunchHook: Send + Sync {
+    fn before_child_launch(&self, job: &SpawnJob, child_events: broadcast::Sender<AgentEvent>);
+}
+
+/// Runtime-scoped durable inbox resources used by external actor drivers.
+///
+/// The host store remains canonical. A worker confirmation is only permission
+/// for the driver to checkpoint that canonical logical Session and then ack the
+/// exact claim; it never turns transport state into authority.
+#[derive(Clone)]
+pub struct SessionInboxRuntimeBinding {
+    pub router: Arc<crate::SessionActivationRouter>,
+    pub inbox: Arc<dyn SessionInboxPort>,
+    pub storage: Arc<dyn Storage>,
+    pub persistence: Arc<dyn RuntimeSessionPersistence>,
 }
 
 /// Trait for external child session runtimes (e.g. A2A, CLI adapters).
@@ -56,6 +83,11 @@ pub trait ExternalChildRunner: Send + Sync {
     /// its parent run for its whole lifetime — even when it outlives the run that
     /// spawned it. Default no-op for runners that don't escalate (e.g. A2A).
     fn set_escalation_bridge(&self, _bridge: Option<bamboo_subagent::executor::HostBridge>) {}
+
+    /// Bind the owning runtime's canonical SessionInbox resources. Actor
+    /// runners use this to bridge active local/remote/warm workers without a
+    /// process-global live-session registry.
+    fn set_session_inbox_runtime(&self, _binding: Option<SessionInboxRuntimeBinding>) {}
 }
 
 #[derive(Clone)]
@@ -73,6 +105,9 @@ pub struct SpawnContext {
     /// server persist parent wait state and resume the parent runner without
     /// introducing an engine -> AppState dependency.
     pub completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
+    /// Optional application observer setup shared by queued tool launches and
+    /// reserved idle SessionInbox activation.
+    pub child_run_launch_hook: Option<Arc<dyn ChildRunLaunchHook>>,
     /// Optional inbox to the account-wide change feed. When present, durable
     /// change events from child-session execution are mirrored onto the feed
     /// for resumable multi-client sync.
@@ -82,11 +117,13 @@ pub struct SpawnContext {
 #[derive(Clone)]
 pub struct SpawnScheduler {
     tx: mpsc::Sender<SpawnJob>,
+    ctx: SpawnContext,
 }
 
 impl SpawnScheduler {
     pub fn new(ctx: SpawnContext) -> Self {
         let (tx, mut rx) = mpsc::channel::<SpawnJob>(128);
+        let worker_ctx = ctx.clone();
 
         // The worker loop is a single point of failure for ALL child spawning:
         // if it unwinds, queued jobs are dropped with no completion published
@@ -97,7 +134,7 @@ impl SpawnScheduler {
         // waiting parent is woken instead of stranded.
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                let job_ctx = ctx.clone();
+                let job_ctx = worker_ctx.clone();
                 let job_for_panic = job.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(err) = run_spawn_job(job_ctx, job).await {
@@ -112,13 +149,13 @@ impl SpawnScheduler {
                         "spawn job panicked; publishing terminal error completion"
                     );
                     let parent_tx = super::session_events::get_or_create_event_sender(
-                        &ctx.session_event_senders,
+                        &worker_ctx.session_event_senders,
                         &job_for_panic.parent_session_id,
                     )
                     .await;
                     publish_child_completion_parts(
                         &parent_tx,
-                        ctx.completion_handler.clone(),
+                        worker_ctx.completion_handler.clone(),
                         job_for_panic.parent_session_id.clone(),
                         job_for_panic.child_session_id.clone(),
                         "error".to_string(),
@@ -129,15 +166,96 @@ impl SpawnScheduler {
             }
         });
 
-        Self { tx }
+        Self { tx, ctx }
+    }
+
+    async fn prepare_child_launch(ctx: &SpawnContext, job: &SpawnJob) {
+        let child_tx = super::session_events::get_or_create_event_sender(
+            &ctx.session_event_senders,
+            &job.child_session_id,
+        )
+        .await;
+        invoke_child_run_launch_hook(ctx.child_run_launch_hook.as_ref(), job, child_tx);
     }
 
     pub async fn enqueue(&self, job: SpawnJob) -> Result<(), String> {
-        self.tx
-            .send(job)
-            .await
-            .map_err(|_| "spawn scheduler is not running".to_string())
+        let ctx = self.ctx.clone();
+        let preparation_job = job.clone();
+        reserve_prepare_and_send(&self.tx, job, async move {
+            Self::prepare_child_launch(&ctx, &preparation_job).await;
+        })
+        .await
     }
+
+    /// Launch through the canonical child core using a runner slot already
+    /// reserved by SessionInbox activation. This bypasses only queue mechanics;
+    /// placement and execution still flow through `run_child_spawn`.
+    pub(crate) fn launch_reserved(
+        &self,
+        job: SpawnJob,
+        reservation: SessionExecutionReservation,
+    ) -> tokio::task::JoinHandle<()> {
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            Self::prepare_child_launch(&ctx, &job).await;
+            let parent_tx = super::session_events::get_or_create_event_sender(
+                &ctx.session_event_senders,
+                &job.parent_session_id,
+            )
+            .await;
+            let _ = parent_tx.send(AgentEvent::SubAgentStarted {
+                parent_session_id: job.parent_session_id.clone(),
+                child_session_id: job.child_session_id.clone(),
+                title: None,
+            });
+            if let Err(error) =
+                crate::sdk::spawn::run_child_spawn_reserved(ctx, job.clone(), reservation).await
+            {
+                tracing::warn!(
+                    parent_session_id = %job.parent_session_id,
+                    child_session_id = %job.child_session_id,
+                    %error,
+                    "reserved child activation failed"
+                );
+            }
+        })
+    }
+}
+
+fn invoke_child_run_launch_hook(
+    hook: Option<&Arc<dyn ChildRunLaunchHook>>,
+    job: &SpawnJob,
+    child_tx: broadcast::Sender<AgentEvent>,
+) {
+    let Some(hook) = hook else {
+        return;
+    };
+    let invoked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hook.before_child_launch(job, child_tx);
+    }));
+    if invoked.is_err() {
+        tracing::error!(
+            parent_session_id = %job.parent_session_id,
+            child_session_id = %job.child_session_id,
+            "child launch hook panicked; continuing with canonical execution"
+        );
+    }
+}
+
+/// Reserve queue capacity before polling observer setup. A closed scheduler
+/// therefore cannot start a relay/observer for a child that will never launch.
+async fn reserve_prepare_and_send(
+    tx: &mpsc::Sender<SpawnJob>,
+    job: SpawnJob,
+    preparation: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let permit = tx
+        .reserve()
+        .await
+        .map_err(|_| "spawn scheduler is not running".to_string())?;
+    preparation.await;
+    permit.send(job);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -328,4 +446,63 @@ pub(crate) async fn watch_child_liveness(
 /// core so both the scheduler and the ergonomic `ChildRunner` funnel into it.
 async fn run_spawn_job(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
     crate::sdk::spawn::run_child_spawn(ctx, job).await
+}
+
+#[cfg(test)]
+mod launch_hook_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn job() -> SpawnJob {
+        SpawnJob {
+            parent_session_id: "parent".to_string(),
+            child_session_id: "child".to_string(),
+            model: "test".to_string(),
+            disabled_tools: None,
+        }
+    }
+
+    struct PanickingHook {
+        calls: AtomicUsize,
+    }
+
+    impl ChildRunLaunchHook for PanickingHook {
+        fn before_child_launch(
+            &self,
+            _job: &SpawnJob,
+            _child_events: broadcast::Sender<AgentEvent>,
+        ) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("injected launch hook panic");
+        }
+    }
+
+    #[test]
+    fn launch_hook_panic_is_contained() {
+        let hook = Arc::new(PanickingHook {
+            calls: AtomicUsize::new(0),
+        });
+        let hook_port: Arc<dyn ChildRunLaunchHook> = hook.clone();
+        let (child_tx, _child_rx) = broadcast::channel(1);
+
+        invoke_child_run_launch_hook(Some(&hook_port), &job(), child_tx);
+
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_scheduler_does_not_prepare_phantom_launch() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let preparations_for_future = preparations.clone();
+
+        let result = reserve_prepare_and_send(&tx, job(), async move {
+            preparations_for_future.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err(), "spawn scheduler is not running");
+        assert_eq!(preparations.load(Ordering::SeqCst), 0);
+    }
 }

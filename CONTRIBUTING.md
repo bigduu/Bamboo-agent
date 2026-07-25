@@ -55,8 +55,10 @@ Enhancement suggestions are tracked as GitHub issues. When creating an enhanceme
    cd bamboo
    ```
 
-2. Create a branch for your changes:
+2. Create a branch from the integration branch for your changes:
    ```bash
+   git checkout dev
+   git pull --ff-only
    git checkout -b feature/my-new-feature
    ```
 
@@ -204,7 +206,7 @@ bamboo/
 
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
-- **CI** (`.github/workflows/ci.yml`) -- Tests on Linux, macOS, and Windows. Runs `rustfmt` and `clippy`. Builds documentation. Runs `cargo-audit` for security.
+- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the Linux test suites plus `rustfmt` and Clippy gates. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows. Manual dispatches also run the platform matrix. Documentation, `cargo-audit`, and `cargo-deny` remain part of CI.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes the workspace crates to crates.io in dependency order. Normally dispatched by the Zenith release train with the unified date version and the `@bigduu/lotus` frontend version to embed; supports `dry_run`.
 - **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
 - **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.

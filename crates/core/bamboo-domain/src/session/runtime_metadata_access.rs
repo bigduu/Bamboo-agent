@@ -170,6 +170,22 @@ impl Session {
     }
 
     // ------------------------------------------------------------------
+    // typed durable SessionInbox admission state (no legacy mirror)
+    // ------------------------------------------------------------------
+
+    pub fn session_inbox_admission(&self) -> Option<&super::SessionInboxAdmissionState> {
+        self.runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.session_inbox_admission.as_ref())
+    }
+
+    pub fn session_inbox_admission_mut(&mut self) -> &mut super::SessionInboxAdmissionState {
+        self.runtime_metadata_mut()
+            .session_inbox_admission
+            .get_or_insert_with(Default::default)
+    }
+
+    // ------------------------------------------------------------------
     // selected_skill_ids (JSON-array-string on the legacy map)
     // ------------------------------------------------------------------
 

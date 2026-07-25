@@ -29,7 +29,10 @@ use crate::runtime::config::{
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::model_roster::{ModelRoster, RoleModel};
 use crate::runtime::runner::run_agent_loop_with_config;
-use bamboo_domain::RuntimeSessionPersistence;
+use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort};
+
+use crate::session_activation::SessionActivationRouter;
+use crate::session_messaging::SessionMessenger;
 
 // ---------------------------------------------------------------------------
 // AgentRuntime — shared resources (assembled once)
@@ -43,6 +46,9 @@ use bamboo_domain::RuntimeSessionPersistence;
 pub struct AgentRuntime {
     pub storage: Arc<dyn Storage>,
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
+    pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
+    pub activation_router: Option<Arc<SessionActivationRouter>>,
+    pub session_messenger: Option<Arc<SessionMessenger>>,
     pub attachment_reader: Arc<dyn AttachmentReader>,
     pub skill_manager: Arc<SkillManager>,
     pub project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
@@ -79,6 +85,9 @@ pub struct AgentRuntime {
 pub struct AgentRuntimeBuilder {
     storage: Option<Arc<dyn Storage>>,
     persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
+    session_inbox: Option<Arc<dyn SessionInboxPort>>,
+    activation_router: Option<Arc<SessionActivationRouter>>,
+    session_messenger: Option<Arc<SessionMessenger>>,
     attachment_reader: Option<Arc<dyn AttachmentReader>>,
     skill_manager: Option<Arc<SkillManager>>,
     project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
@@ -94,6 +103,9 @@ impl AgentRuntimeBuilder {
         Self {
             storage: None,
             persistence: None,
+            session_inbox: None,
+            activation_router: None,
+            session_messenger: None,
             attachment_reader: None,
             skill_manager: None,
             project_context_resolver: None,
@@ -112,6 +124,21 @@ impl AgentRuntimeBuilder {
 
     pub fn persistence(mut self, v: Arc<dyn RuntimeSessionPersistence>) -> Self {
         self.persistence = Some(v);
+        self
+    }
+
+    pub fn session_inbox(mut self, v: Arc<dyn SessionInboxPort>) -> Self {
+        self.session_inbox = Some(v);
+        self
+    }
+
+    pub fn activation_router(mut self, v: Arc<SessionActivationRouter>) -> Self {
+        self.activation_router = Some(v);
+        self
+    }
+
+    pub fn session_messenger(mut self, v: Arc<SessionMessenger>) -> Self {
+        self.session_messenger = Some(v);
         self
     }
 
@@ -160,11 +187,17 @@ impl AgentRuntimeBuilder {
     }
 
     pub fn build(self) -> Result<AgentRuntime, &'static str> {
+        if let (Some(router), Some(inbox)) = (&self.activation_router, &self.session_inbox) {
+            router.set_inbox(inbox.clone());
+        }
         Ok(AgentRuntime {
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
             persistence: self
                 .persistence
                 .ok_or_else(|| format_missing("persistence"))?,
+            session_inbox: self.session_inbox,
+            activation_router: self.activation_router,
+            session_messenger: self.session_messenger,
             attachment_reader: self
                 .attachment_reader
                 .ok_or_else(|| format_missing("attachment_reader"))?,
@@ -633,6 +666,12 @@ impl AgentRuntime {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        let session_activation_notifications = match self.activation_router.as_ref() {
+            Some(router) => Some(Arc::new(parking_lot::Mutex::new(
+                router.subscribe(&session.id).await,
+            ))),
+            None => None,
+        };
         let system_prompt = extract_system_prompt(session);
         let config = self.config.read().await;
         let ExecuteRequest {
@@ -696,6 +735,8 @@ impl AgentRuntime {
             skip_initial_user_message: true,
             storage: Some(self.storage.clone()),
             persistence: Some(self.persistence.clone()),
+            session_inbox: self.session_inbox.clone(),
+            session_activation_notifications,
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
             model_name: model,

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
+use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 use async_trait::async_trait;
 use bamboo_a2a::A2AJsonRpcClient;
 use bamboo_agent_core::{AgentError, AgentEvent};
@@ -125,6 +125,12 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
     fn set_escalation_bridge(&self, bridge: Option<bamboo_subagent::executor::HostBridge>) {
         for runner in &self.runners {
             runner.set_escalation_bridge(bridge.clone());
+        }
+    }
+
+    fn set_session_inbox_runtime(&self, binding: Option<SessionInboxRuntimeBinding>) {
+        for runner in &self.runners {
+            runner.set_session_inbox_runtime(binding.clone());
         }
     }
 }

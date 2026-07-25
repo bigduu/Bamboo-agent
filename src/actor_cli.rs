@@ -293,10 +293,13 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
     client
         .send(ParentFrame::Run(RunSpec {
             assignment: prompt.to_string(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
         .await
@@ -328,6 +331,10 @@ async fn connect_and_stream(endpoint: &str, prompt: &str, raw: bool) -> Result<(
                     Ok(Some(ChildFrame::ApprovalRequest { .. })) => {
                         // This CLI does not route gated-tool approvals; ignore.
                         // (The production host in actor_adapter answers these.)
+                    }
+                    Ok(Some(ChildFrame::SessionMessageAdmitted { .. })) => {
+                        // The standalone CLI never forwards canonical SessionInbox
+                        // claims, so no confirmation is expected here.
                     }
                     Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
                         println!();

@@ -22,15 +22,19 @@ pub mod session_events;
 pub mod spawn;
 
 pub use agent_spawn::{
-    log_base_system_prompt_snapshot, spawn_session_execution, SessionCompletionHook,
-    SessionExecutionArgs, SessionExecutionOutcome,
+    log_base_system_prompt_snapshot, reserve_session_execution, spawn_session_execution,
+    SessionCompletionHook, SessionExecutionArgs, SessionExecutionOutcome,
+    SessionExecutionReservation, SessionExecutionReserveOutcome,
 };
 pub use child_completion::{ChildCompletion, ChildCompletionHandler};
 pub use event_forwarder::{create_event_forwarder, AccountFeedInbox};
 pub use runner_lifecycle::{
-    finalize_runner, reserve_runner_core, status_from_execution_result, try_reserve_runner,
-    ReserveOutcome, RunnerReservation,
+    finalize_runner, finalize_runner_exact, reserve_runner_core, status_from_execution_result,
+    try_reserve_runner, ReserveOutcome, RunnerReservation,
 };
 pub use runner_state::{AgentRunner, AgentStatus};
 pub use session_events::{get_or_create_event_sender, SESSION_EVENT_CHANNEL_CAPACITY};
-pub use spawn::{ExternalChildRunner, SpawnContext, SpawnJob, SpawnScheduler};
+pub use spawn::{
+    ChildRunLaunchHook, ExternalChildRunner, SessionInboxRuntimeBinding, SpawnContext, SpawnJob,
+    SpawnScheduler,
+};

@@ -388,14 +388,12 @@ where
                     // In-band steer for a running Run: route to its steer inbox.
                     InboxKind::Steer => {
                         if let Some(run_id) = &msg.correlation_id {
-                            let text = msg
-                                .body
-                                .get("text")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            if let Some(coord) = coords.lock().await.get(run_id) {
-                                let _ = coord.steer_tx.send(text);
+                            let steer = decode_steer_body(&msg.body, Some(msg.id.as_str()));
+                            if let Some(steer) = steer {
+                                let coords = coords.lock().await;
+                                if let Some(coord) = coords.get(run_id) {
+                                    let _ = coord.steer_tx.send(steer);
+                                }
                             }
                         }
                         Handled::Ack
@@ -433,7 +431,7 @@ where
 /// Live steer channel for a running [`InboxKind::Run`], keyed by run id so an
 /// out-of-band [`InboxKind::Steer`] message can be pushed into the run's inbox.
 struct RunCoord {
-    steer_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    steer_tx: tokio::sync::mpsc::UnboundedSender<bamboo_subagent::SteerMessage>,
 }
 type RunCoords = Arc<tokio::sync::Mutex<HashMap<MsgId, RunCoord>>>;
 /// Pending gated-tool approvals a Run proxied up, keyed by approval-request id;
@@ -463,7 +461,7 @@ async fn handle_run<E>(
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
 {
-    use bamboo_subagent::{EventSink, HostBridge, RunSpec, SteerInbox};
+    use bamboo_subagent::{EventSink, ExecutorControl, HostBridge, RunSpec, SteerInbox};
 
     let spec: RunSpec = match serde_json::from_value(msg.body) {
         Ok(s) => s,
@@ -475,7 +473,7 @@ where
     let run_id = msg.id.clone();
     let parent = msg.from.session_id.clone();
 
-    let (sink, mut events) = EventSink::channel();
+    let (sink, mut events, mut controls) = EventSink::channel_with_control();
     // Steer: register this run's steer inbox so out-of-band Steer messages route in.
     let (steer_tx, steer_inbox) = SteerInbox::channel();
     coords
@@ -521,13 +519,39 @@ where
             created_at: Utc::now(),
             correlation_id: Some(run_id_fwd.clone()),
         };
-        while let Some(event) = events.recv().await {
-            if deliver
-                .deliver(&parent_fwd, emit(InboxKind::Event, event))
-                .await
-                .is_err()
-            {
-                return; // parent/connection gone — stop forwarding.
+        let mut events_open = true;
+        let mut controls_open = true;
+        while events_open || controls_open {
+            tokio::select! {
+                event = events.recv(), if events_open => match event {
+                    Some(event) => {
+                        if deliver
+                            .deliver(&parent_fwd, emit(InboxKind::Event, event))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    None => events_open = false,
+                },
+                control = controls.recv(), if controls_open => match control {
+                    Some(ExecutorControl::SessionMessageAdmitted(confirmation)) => {
+                        let body = serde_json::to_value(confirmation)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        if deliver
+                            .deliver(
+                                &parent_fwd,
+                                emit(InboxKind::SessionMessageAdmitted, body),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    None => controls_open = false,
+                },
             }
         }
         if let Ok(outcome) = outcome_rx.await {
@@ -636,10 +660,13 @@ where
         .run(
             RunSpec {
                 assignment: question.clone(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: prior,
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             },
             sink,
@@ -665,6 +692,57 @@ where
         }
     }
     Handled::Reply(answer)
+}
+
+fn decode_steer_body(
+    body: &serde_json::Value,
+    durable_message_id: Option<&str>,
+) -> Option<bamboo_subagent::SteerMessage> {
+    // Any typed-protocol marker makes this a typed frame. A partial/malformed
+    // typed frame must fail closed; it may never fall through to a coincidental
+    // `text` field and become an uncorrelated legacy steer.
+    let typed = [
+        "target_session_id",
+        "envelope",
+        "canonical_claim_generation",
+        "activation_run_id",
+    ]
+    .iter()
+    .any(|key| body.get(key).is_some());
+    if typed {
+        return match serde_json::from_value(body.clone()) {
+            Ok(delivery) => Some(bamboo_subagent::SteerMessage::SessionMessage(Box::new(
+                delivery,
+            ))),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "dropping malformed typed SessionInbox steer frame"
+                );
+                None
+            }
+        };
+    }
+
+    match body.get("text").and_then(|value| value.as_str()) {
+        Some(text) => {
+            tracing::info!(
+                telemetry_event = "session_inbox.legacy_broker_steer_ingress",
+                "observed legacy broker steer ingress"
+            );
+            Some(match durable_message_id {
+                Some(message_id) => bamboo_subagent::SteerMessage::DurableText {
+                    message_id: message_id.to_string(),
+                    text: text.to_string(),
+                },
+                None => bamboo_subagent::SteerMessage::Text(text.to_string()),
+            })
+        }
+        None => {
+            tracing::warn!("dropping malformed legacy steer frame");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -706,6 +784,34 @@ mod tests {
             created_at: Utc::now(),
             correlation_id: None,
         }
+    }
+
+    #[test]
+    fn malformed_typed_steer_never_falls_back_to_legacy_text() {
+        assert!(decode_steer_body(
+            &serde_json::json!({
+                "target_session_id": "logical-session",
+                "text": "must not be injected as legacy"
+            }),
+            Some("broker-id"),
+        )
+        .is_none());
+        assert!(decode_steer_body(
+            &serde_json::json!({
+                "envelope": {},
+                "text": "must not be injected as legacy"
+            }),
+            Some("broker-id"),
+        )
+        .is_none());
+        assert!(matches!(
+            decode_steer_body(
+                &serde_json::json!({"text": "legacy-compatible"}),
+                Some("broker-id"),
+            ),
+            Some(bamboo_subagent::SteerMessage::DurableText { message_id, text })
+                if message_id == "broker-id" && text == "legacy-compatible"
+        ));
     }
 
     #[tokio::test]
@@ -1228,10 +1334,13 @@ mod tests {
 
         let spec = RunSpec {
             assignment: "ping pong".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: vec![],
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         };
         let run = InboxMessage {

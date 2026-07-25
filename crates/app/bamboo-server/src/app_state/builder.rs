@@ -178,6 +178,17 @@ impl AppState {
             },
         )?);
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
+        let session_inbox: Arc<dyn bamboo_domain::SessionInboxPort> =
+            Arc::new(bamboo_storage::FileSessionInbox::new(
+                session_store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+        let session_activation_router = bamboo_engine::SessionActivationRouter::new();
+        let session_messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+            storage.clone(),
+            session_inbox.clone(),
+            session_activation_router.clone(),
+        ));
 
         // In-memory session cache (shared across handlers and background jobs).
         let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
@@ -467,6 +478,9 @@ impl AppState {
             bamboo_engine::Agent::builder()
                 .storage(storage.clone())
                 .persistence(Arc::new(session_repo.clone()))
+                .session_inbox(session_inbox.clone())
+                .activation_router(session_activation_router.clone())
+                .session_messenger(session_messenger.clone())
                 .attachment_reader(session_store.clone())
                 .skill_manager(skill_manager.clone())
                 .metrics_collector(metrics_service.collector())
@@ -492,6 +506,9 @@ impl AppState {
                 data_dir.clone(),
                 Some(account_sink.inbox()),
             ));
+        session_activation_router
+            .set_spawner(child_completion_coordinator.clone())
+            .await;
 
         // Initialize sub-session spawn scheduler (async background jobs).
         let config_snapshot = config.read().await.clone();
@@ -593,6 +610,14 @@ impl AppState {
                 permission_checker.permission_config(),
                 Some(codex_run_tokens.clone()),
             );
+        external_runner.set_session_inbox_runtime(Some(
+            bamboo_engine::execution::spawn::SessionInboxRuntimeBinding {
+                router: session_activation_router.clone(),
+                inbox: session_inbox.clone(),
+                storage: storage.clone(),
+                persistence: persistence.clone(),
+            },
+        ));
         let spawn_scheduler = build_spawn_scheduler(
             agent.clone(),
             child_tools,
@@ -604,7 +629,15 @@ impl AppState {
             Some(child_completion_coordinator.clone()),
             Some(data_dir.clone()),
             Some(account_sink.inbox()),
+            Some(Arc::new(
+                crate::app_state::session_events::NotificationRelayLaunchHook::new(
+                    notification_relay_deps.clone(),
+                ),
+            )),
         );
+        child_completion_coordinator
+            .set_spawn_scheduler(&spawn_scheduler)
+            .await;
 
         let tools_with_task = base_tools.clone();
 
@@ -730,6 +763,7 @@ impl AppState {
             session_store.clone(),
             storage.clone(),
             persistence.clone(),
+            session_messenger.clone(),
             spawn_scheduler.clone(),
             sessions.clone(),
             agent_runners.clone(),
@@ -739,7 +773,6 @@ impl AppState {
             provider_registry.clone(),
             config_snapshot.subagents().broker.clone(),
             fabric_deployer.clone(),
-            notification_relay_deps.clone(),
             project_store.clone(),
         );
         let workflow_run_tool =
@@ -751,6 +784,36 @@ impl AppState {
         child_completion_coordinator
             .set_root_tools(tools.clone())
             .await;
+
+        // Process restart recovery: only backlog covered by its producer's
+        // durable activation watermark requests a run. A child/Bash coordinator
+        // may intentionally stage sibling outcomes while a specific wait remains
+        // armed; admission by itself is not permission to execute.
+        for entry in session_store.list_index_entries().await {
+            match session_inbox.inspect(&entry.id).await {
+                Ok(backlog) if backlog.activation_pending() => {
+                    if let Err(error) = bamboo_domain::SessionActivationPort::request_activation(
+                        session_activation_router.as_ref(),
+                        &entry.id,
+                        backlog.activation_generation,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            session_id = %entry.id,
+                            %error,
+                            "failed to reactivate durable SessionInbox backlog during startup"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    session_id = %entry.id,
+                    %error,
+                    "failed to inspect SessionInbox during startup recovery"
+                ),
+            }
+        }
 
         let tool_factory =
             crate::tools::ToolSurfaceFactory::new(base_tools, tools_with_task, tools);
@@ -793,6 +856,7 @@ impl AppState {
             session_store: session_store.clone(),
             storage: storage.clone(),
             persistence: persistence.clone(),
+            session_messenger: Some(session_messenger.clone()),
             scheduler: spawn_scheduler.clone(),
             sessions_cache: sessions.clone(),
             agent_runners: agent_runners.clone(),
@@ -801,7 +865,6 @@ impl AppState {
             config: config.clone(),
             project_store: Some(project_store.clone()),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
-            notification_relay: Some(notification_relay_deps.clone()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         // Wire the spawner into the completion coordinator too, so a resumed run
@@ -890,6 +953,9 @@ impl AppState {
             project_context_resolver,
             session_repo,
             persistence,
+            session_inbox,
+            session_activation_router,
+            session_messenger,
             spawn_scheduler,
             child_completion_coordinator,
             guardian_spawner,

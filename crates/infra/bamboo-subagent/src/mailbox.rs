@@ -73,6 +73,9 @@ pub enum InboxKind {
     /// is the verbatim event JSON (the actor `ChildFrame::Event`). `reply_to`
     /// correlates it to the `Run` it belongs to.
     Event,
+    /// Child→parent: durable worker admission confirmation for a typed
+    /// SessionInbox delivery forwarded during a running actor activation.
+    SessionMessageAdmitted,
     /// Child→parent: the terminal result of a [`InboxKind::Run`]. `body` is a
     /// serialized [`crate::executor::ChildOutcome`]. `reply_to` correlates it to
     /// the `Run`.
@@ -92,6 +95,10 @@ pub enum InboxKind {
     /// `correlation_id` is the approval request `id`, so the worker routes it to
     /// the waiting tool call.
     ApprovalReply,
+    /// Typed logical-session envelope. This reuses the same Maildir
+    /// claim/recover/ack protocol without making a worker mailbox id the
+    /// durable address of a Bamboo Session.
+    SessionEnvelope,
 }
 
 /// How a sub-agent should answer an [`InboxKind::Ask`].

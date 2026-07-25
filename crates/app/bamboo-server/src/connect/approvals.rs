@@ -24,7 +24,8 @@ use tokio::sync::broadcast;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutionContext};
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_engine::execution::{
-    create_event_forwarder, get_or_create_event_sender, try_reserve_runner, RunnerReservation,
+    create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
+    SessionExecutionReserveOutcome,
 };
 use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
@@ -473,23 +474,19 @@ impl ResumeExecutionPort for ConnectResumePort {
         self.ctx.session_repo.save_and_cache(session).await;
     }
 
-    async fn try_reserve_runner(
+    async fn reserve_session_execution(
         &self,
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
-    ) -> Option<RunnerReservation> {
-        try_reserve_runner(
+    ) -> SessionExecutionReserveOutcome {
+        reserve_session_execution(
+            &self.ctx.agent,
             &self.ctx.agent_runners,
             &self.ctx.session_event_senders,
             session_id,
             event_sender,
         )
         .await
-    }
-
-    async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String> {
-        let runners = self.ctx.agent_runners.read().await;
-        runners.get(session_id).map(|runner| runner.run_id.clone())
     }
 
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
@@ -500,11 +497,19 @@ impl ResumeExecutionPort for ConnectResumePort {
         let ResumeSpawnRequest {
             session_id,
             session,
-            cancel_token,
-            run_id: _,
+            mut execution_reservation,
             event_sender,
             config,
         } = request;
+        if let Err(error) = execution_reservation.ensure_registered().await {
+            tracing::warn!(
+                %session_id,
+                run_id = %execution_reservation.run_id(),
+                %error,
+                "cannot resume connect session without exact router ownership"
+            );
+            return;
+        }
 
         let model = session.model.clone();
         let reasoning_effort = session.reasoning_effort;
@@ -547,6 +552,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 agent: self.ctx.agent.clone(),
                 session_id,
                 session,
+                execution_reservation,
                 tools_override: Some(self.ctx.tools.clone()),
                 provider_override: None,
                 model_roster,
@@ -558,7 +564,6 @@ impl ResumeExecutionPort for ConnectResumePort {
                 disabled_skill_ids: Some(config.disabled_skill_ids.clone()),
                 selected_skill_ids: None,
                 selected_skill_mode: None,
-                cancel_token,
                 mpsc_tx,
                 image_fallback: config.image_fallback.clone(),
                 gold_config: config.gold_config.clone(),
@@ -660,6 +665,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 agent: ctx.agent.clone(),
                 session_id,
                 session,
+                execution_reservation,
                 tools_override: Some(ctx.tools.clone()),
                 provider_override: None,
                 model_roster,
@@ -671,7 +677,6 @@ impl ResumeExecutionPort for ConnectResumePort {
                 disabled_skill_ids: Some(config.disabled_skill_ids.clone()),
                 selected_skill_ids: None,
                 selected_skill_mode: None,
-                cancel_token,
                 mpsc_tx,
                 image_fallback: config.image_fallback.clone(),
                 gold_config: config.gold_config.clone(),
