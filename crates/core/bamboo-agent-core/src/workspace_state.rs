@@ -342,6 +342,22 @@ impl WorkspaceResolver {
         }
     }
 
+    /// Preview this resolver's session-scoped root fallback only.
+    ///
+    /// Unlike [`Self::resolve_session_workspace_candidate`], this deliberately
+    /// does not consult the process-global runtime registry or a configured
+    /// default. Server transaction paths use it when their own live config
+    /// snapshot has authoritatively resolved no default workspace.
+    pub fn preview_session_fallback(&self, session_id: &str) -> Option<PathBuf> {
+        let config = self.workspace_root_config()?;
+        let fallback = preview_default_session_workspace_dir(&config.root, session_id);
+        Some(preview_pin_workspace_path(
+            &fallback,
+            &config.root,
+            config.confine,
+        ))
+    }
+
     /// Publish a previously validated candidate through this instance's root.
     ///
     /// Missing paths are materialized only when they are contained by this
@@ -755,6 +771,29 @@ mod tests {
             0,
             "publishing an existing directory must not evaluate the root provider"
         );
+    }
+
+    #[test]
+    fn instance_session_fallback_ignores_same_id_runtime_registry_state() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let root = state_dir.path().join("workspaces");
+        let foreign_workspace = tempfile::tempdir().unwrap();
+        let session_id = "instance-fallback-ignores-runtime";
+        publish_resolved_workspace(session_id, foreign_workspace.path().to_path_buf());
+        let resolver = WorkspaceResolver::new(|| None, {
+            let root = root.clone();
+            move || WorkspaceRootConfig {
+                root: root.clone(),
+                confine: false,
+            }
+        });
+
+        let fallback = resolver
+            .preview_session_fallback(session_id)
+            .expect("instance session fallback");
+
+        assert_eq!(fallback, root.join(session_id));
+        assert_ne!(fallback, foreign_workspace.path());
     }
 
     #[test]

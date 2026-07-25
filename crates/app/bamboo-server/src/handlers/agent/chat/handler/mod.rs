@@ -12,15 +12,28 @@ use bamboo_engine::session_app::metadata::SessionMetadataService;
 mod images;
 mod request;
 
-// Sync runtime workspace so tools can resolve the working directory.
-fn sync_runtime_workspace(session_id: &str, workspace_path: Option<&str>) {
+/// Publish the validated workspace after its session checkpoint is durable.
+///
+/// Project-context preview is AppState-scoped, so publication must use the
+/// same provider pair rather than a sibling state's process-global first-wins
+/// root. `workspace_source` is a non-secret diagnostic label.
+fn sync_runtime_workspace(
+    state: &AppState,
+    session_id: &str,
+    workspace_path: Option<&str>,
+    workspace_source: &str,
+) {
     if let Some(workspace) = workspace_path
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
     {
-        bamboo_tools::tools::workspace_state::publish_resolved_workspace(session_id, workspace);
+        state.workspace_resolver.publish_resolved_workspace(
+            session_id,
+            workspace,
+            workspace_source,
+        );
     }
 }
 
@@ -292,6 +305,15 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     let global_default_prompt =
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
     let builtin_fallback_prompt = crate::app_state::DEFAULT_BASE_PROMPT;
+    let configured_default_workspace = config_snapshot
+        .get_default_work_area_path()
+        .as_deref()
+        .map(bamboo_config::paths::path_to_display_string);
+    let session_fallback_path = state
+        .workspace_resolver
+        .preview_session_fallback(&session_id)
+        .as_deref()
+        .map(bamboo_config::paths::path_to_display_string);
 
     let data_dir = Some(state.app_data_dir.clone());
     let mut project_preflight = bamboo_agent_core::Session::new(&session_id, &model);
@@ -300,9 +322,12 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     }
     if let Some(workspace) = final_workspace_display.as_deref() {
         project_preflight.set_workspace_path_meta(workspace);
-    } else if let Some(workspace) = config_snapshot.get_default_work_area_path() {
-        project_preflight
-            .set_workspace_path_meta(bamboo_config::paths::path_to_display_string(&workspace));
+    } else if let Some(workspace) = configured_default_workspace.as_deref() {
+        project_preflight.set_workspace_path_meta(workspace);
+    } else if let Some(workspace) = session_fallback_path.as_deref() {
+        // This owning-state fallback is explicit so Project preflight cannot
+        // observe a same-id runtime entry published by another AppState.
+        project_preflight.set_workspace_path_meta(workspace);
     }
     if let Err(error) = state
         .project_context_resolver
@@ -328,10 +353,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         workspace_path: workspace_was_explicit
             .then(|| project_preflight.workspace_path_meta())
             .flatten(),
-        default_workspace_path: config_snapshot
-            .get_default_work_area_path()
-            .as_deref()
-            .map(bamboo_config::paths::path_to_display_string),
+        default_workspace_path: configured_default_workspace,
         selected_skill_ids: req.selected_skill_ids.clone(),
         workflow_selection: req.workflow_selection.clone(),
         orchestration_opt_in: req.orchestration_opt_in,
@@ -355,6 +377,9 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             );
         }
     };
+    let authoritative_workspace_present = authoritative_session
+        .as_ref()
+        .is_some_and(|session| session.workspace_path_meta().is_some());
     if req.project_id.is_none() {
         input.project_id = authoritative_session.as_ref().and_then(|session| {
             match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
@@ -418,14 +443,27 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     } else {
         input.workspace_path = None;
     }
+    let workspace_source = if workspace_was_explicit {
+        "request"
+    } else if authoritative_workspace_present {
+        "session"
+    } else if input.default_workspace_path.is_some() {
+        "configured_default"
+    } else {
+        "session_fallback"
+    };
+    let workspace_fallback_policy =
+        bamboo_engine::session_app::types::ChatWorkspaceFallbackPolicy::Authoritative {
+            session_fallback_path,
+        };
 
-    let mut session =
-        match bamboo_engine::session_app::chat::prepare_chat_turn_from_authoritative_session(
-            authoritative_session,
-            input,
-            global_default_prompt.as_str(),
-            builtin_fallback_prompt,
-        ) {
+    let mut session = match bamboo_engine::session_app::chat::prepare_chat_turn_from_authoritative_session_with_workspace_policy(
+        authoritative_session,
+        input,
+        global_default_prompt.as_str(),
+        builtin_fallback_prompt,
+        workspace_fallback_policy,
+    ) {
             Ok(session) => session,
             Err(bamboo_engine::session_app::errors::ChatError::InvalidWorkflowSelection(error)) => {
                 return HttpResponse::BadRequest().json(serde_json::json!({
@@ -483,7 +521,12 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
         return response;
     }
-    sync_runtime_workspace(&session_id, session.workspace_path_meta().as_deref());
+    sync_runtime_workspace(
+        state.as_ref(),
+        &session_id,
+        session.workspace_path_meta().as_deref(),
+        workspace_source,
+    );
     if session_was_created {
         state.account_sink.record(
             Some(&session_id),
