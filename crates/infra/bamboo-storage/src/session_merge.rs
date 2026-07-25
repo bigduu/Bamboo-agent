@@ -211,6 +211,7 @@ impl LockedSessionStore {
             let incoming_count = session.messages.len();
             let durable_count = latest.messages.len();
             let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
+            bamboo_domain::merge_session_inbox_admission(session, latest);
             tracing::debug!(
                 "[{}] append-safe runtime checkpoint: durable={}, incoming={}, appended={}, saved={}",
                 session.id,
@@ -284,6 +285,15 @@ impl LockedSessionStore {
 
         if let Some(latest) = latest.as_ref() {
             apply_authoritative_metadata(session, latest);
+            let restored = bamboo_domain::restore_missing_admitted_inbox_messages(session, latest);
+            if restored > 0 {
+                tracing::warn!(
+                    session_id = %session.id,
+                    restored,
+                    "restored durable SessionInbox transcript messages into stale runtime save"
+                );
+            }
+            bamboo_domain::merge_session_inbox_admission(session, latest);
             // Never let a running loop's save revert a concurrent mid-run
             // `PATCH /sessions {bypass_permissions}` flip. #540. Skipped for
             // authoritative flag writers (`save_runtime_authoritative_flags`).
@@ -339,6 +349,23 @@ impl RuntimeSessionPersistence for LockedSessionStore {
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.storage.load_session(session_id).await
     }
+
+    async fn clear_legacy_pending_messages(
+        &self,
+        session_id: &str,
+        expected: &[serde_json::Value],
+    ) -> std::io::Result<bool> {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_session(session_id).await? else {
+            return Ok(false);
+        };
+        if latest.pending_injected_messages().as_deref() != Some(expected) {
+            return Ok(false);
+        }
+        latest.clear_pending_injected_messages();
+        self.storage.save_runtime_state(&latest).await?;
+        Ok(true)
+    }
 }
 
 // ── Internal merge helper ─────────────────────────────────────────────
@@ -355,6 +382,8 @@ async fn merge_authoritative_metadata_into_stale(
 ) {
     if let Ok(Some(latest)) = storage.load_session(&session.id).await {
         apply_authoritative_metadata(session, &latest);
+        bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
+        bamboo_domain::merge_session_inbox_admission(session, &latest);
         adopt_disk_bypass_permissions(session, &latest);
     }
 }
@@ -560,6 +589,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_runtime_save_cannot_remove_admitted_inbox_transcript() {
+        use bamboo_domain::session::types::Message;
+        use bamboo_domain::SessionMessageId;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "stale-inbox-preserve";
+
+        let mut baseline = fresh(session_id);
+        let mut base = Message::user("base");
+        base.id = "base".to_string();
+        baseline.add_message(base);
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale = baseline.clone();
+        let mut later_assistant = Message::assistant("runner output", None);
+        later_assistant.id = "later-assistant".to_string();
+        stale.add_message(later_assistant);
+
+        let mut durable = baseline;
+        let inbox_id = SessionMessageId::parse("durable-inbox-id").unwrap();
+        let mut admitted = Message::user("durable inbox message");
+        admitted.id = inbox_id.as_str().to_string();
+        durable.add_message(admitted);
+        durable
+            .session_inbox_admission_mut()
+            .record(inbox_id.clone(), 7);
+        storage.save_session(&durable).await.unwrap();
+
+        store.merge_save_runtime(&mut stale).await.unwrap();
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        let ids = saved
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["base", "durable-inbox-id", "later-assistant"]);
+        assert_eq!(ids.iter().filter(|id| **id == inbox_id.as_str()).count(), 1);
+        assert!(saved
+            .session_inbox_admission()
+            .is_some_and(|state| state.contains(&inbox_id)));
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_save_preserves_typed_inbox_message_after_cursor_eviction() {
+        use bamboo_domain::{
+            SessionMessageEnvelope, SessionMessageId, SESSION_INBOX_ADMITTED_CAPACITY,
+        };
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "evicted-inbox-preserve";
+        let mut durable = fresh(session_id);
+        let mut envelope = SessionMessageEnvelope::user_input(session_id, "old durable inbox");
+        envelope.id = SessionMessageId::parse("old-inbox-id").unwrap();
+        durable.add_message(envelope.to_provider_message().unwrap());
+        durable
+            .session_inbox_admission_mut()
+            .record(envelope.id.clone(), 1);
+        for sequence in 2..=(SESSION_INBOX_ADMITTED_CAPACITY as u64 + 1) {
+            durable.session_inbox_admission_mut().record(
+                SessionMessageId::parse(format!("newer-{sequence}")).unwrap(),
+                sequence,
+            );
+        }
+        assert!(!durable
+            .session_inbox_admission()
+            .unwrap()
+            .contains(&envelope.id));
+        storage.save_session(&durable).await.unwrap();
+
+        let mut stale = fresh(session_id);
+        store.merge_save_runtime(&mut stale).await.unwrap();
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|message| message.id == envelope.id.as_str())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn checkpoint_runtime_session_preserves_disk_suffix_and_appends_live_messages() {
         use bamboo_domain::session::types::Message;
 
@@ -602,6 +715,61 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    #[tokio::test]
+    async fn activation_checkpoint_clears_presentation_without_shrinking_concurrent_turn() {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, AgentStatusState, WaitingForChildrenState,
+        };
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "activation-no-shrink";
+        let mut baseline = fresh(session_id);
+        baseline.add_message(Message::user("base"));
+        let mut state = AgentRuntimeState::new("activation-run");
+        state.status = AgentStatusState::Suspended;
+        state.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec!["child-1".to_string()],
+            bamboo_domain::session::runtime_state::ChildWaitPolicy::All,
+            chrono::Utc::now(),
+        ));
+        baseline.agent_runtime_state = Some(state);
+        baseline.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        storage.save_session(&baseline).await.unwrap();
+        let mut activation_snapshot = baseline.clone();
+
+        let mut concurrent = baseline;
+        let mut normal = Message::assistant("normal concurrent answer", None);
+        normal.id = "normal-concurrent".to_string();
+        concurrent.add_message(normal);
+        storage.save_session(&concurrent).await.unwrap();
+
+        let state = activation_snapshot.agent_runtime_state.as_mut().unwrap();
+        state.status = AgentStatusState::Idle;
+        state.suspension = None;
+        activation_snapshot
+            .metadata
+            .remove("runtime.suspend_reason");
+        store
+            .checkpoint_runtime_session(&mut activation_snapshot)
+            .await
+            .unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved
+            .messages
+            .iter()
+            .any(|message| message.id == "normal-concurrent"));
+        let state = saved.agent_runtime_state.unwrap();
+        assert_eq!(state.status, AgentStatusState::Idle);
+        assert!(state.waiting_for_children.is_some());
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
     }
 
     #[tokio::test]

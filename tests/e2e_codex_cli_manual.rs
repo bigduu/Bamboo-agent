@@ -73,10 +73,13 @@ async fn real_codex_completes_trivial_turn_and_reports_bootstrap_metadata() {
         executor.run(
             RunSpec {
                 assignment: "Reply with exactly PONG and nothing else.".to_string(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             },
             sink,
@@ -176,10 +179,13 @@ async fn real_workspace_write_denies_outside_write_and_emits_tool_error() {
                 assignment: format!(
                     "Run this exact shell command now: /bin/sh -c '{command}'\nThen report the sandbox failure, including its exit status and exact stderr."
                 ),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             },
             sink,
@@ -251,10 +257,13 @@ async fn real_codex_second_activation_resumes_and_recalls_native_context() {
                 assignment: format!(
                     "Remember this nonce for the next turn: {NONCE}. Reply with exactly STORED."
                 ),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             },
             sink,
@@ -281,6 +290,7 @@ async fn real_codex_second_activation_resumes_and_recalls_native_context() {
         executor.run(
             RunSpec {
                 assignment: current_task.to_string(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
@@ -288,6 +298,8 @@ async fn real_codex_second_activation_resumes_and_recalls_native_context() {
                 // activation discriminant non-empty but gives fallback
                 // rehydration no copy of NONCE, so only native resume can pass.
                 messages: vec![json!({"role": "user", "content": current_task})],
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             },
             sink,
@@ -355,10 +367,13 @@ async fn real_cancellation_kills_the_process_group_and_the_session_can_resume() 
     let first = executor.run(
         RunSpec {
             assignment: "Run this exact command now and wait for it to finish: /bin/sh -c 'echo $$ > ./cancel-child.pid; sleep 120'".to_string(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         },
         sink,
@@ -415,10 +430,13 @@ async fn real_cancellation_kills_the_process_group_and_the_session_can_resume() 
         executor.run(
             RunSpec {
                 assignment: assignment.to_string(),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: None,
                 messages: vec![json!({"role": "user", "content": assignment})],
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             },
             sink,

@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState;
 use crate::tools::ToolSurface;
@@ -17,7 +16,7 @@ use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 
 use bamboo_engine::config::GoldConfig;
-use bamboo_engine::execution::agent_spawn::SessionExecutionArgs;
+use bamboo_engine::execution::agent_spawn::{SessionExecutionArgs, SessionExecutionReservation};
 use bamboo_engine::{AuxiliaryModelConfig, ImageFallbackConfig, ModelRoster};
 use bamboo_llm::{Config, LLMProvider};
 
@@ -27,6 +26,7 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) state: actix_web::web::Data<AppState>,
     pub(crate) session_id: String,
     pub(crate) session: bamboo_agent_core::Session,
+    pub(crate) execution_reservation: SessionExecutionReservation,
     pub(crate) is_child_session: bool,
     /// Provider routing key for the primary model. Mirrors
     /// `model_roster.provider_name` but kept as a required `String` because the
@@ -40,7 +40,6 @@ pub(crate) struct SpawnAgentExecution {
     pub(crate) reasoning_effort_source: String,
     pub(crate) disabled_tools: BTreeSet<String>,
     pub(crate) disabled_skill_ids: BTreeSet<String>,
-    pub(crate) cancel_token: CancellationToken,
     pub(crate) mpsc_tx: mpsc::Sender<bamboo_agent_core::AgentEvent>,
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
     pub(crate) gold_config: Option<GoldConfig>,
@@ -198,6 +197,7 @@ pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
         agent: args.state.agent.clone(),
         session_id: args.session_id,
         session: args.session,
+        execution_reservation: args.execution_reservation,
         tools_override,
         provider_override,
         model_roster,
@@ -211,7 +211,6 @@ pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
         disabled_skill_ids: Some(args.disabled_skill_ids),
         selected_skill_ids,
         selected_skill_mode,
-        cancel_token: args.cancel_token,
         mpsc_tx: args.mpsc_tx,
         image_fallback: args.image_fallback,
         gold_config: args.gold_config,

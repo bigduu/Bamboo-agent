@@ -279,6 +279,44 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         self.try_load(session_id).await
     }
 
+    async fn clear_legacy_pending_messages(
+        &self,
+        session_id: &str,
+        expected: &[serde_json::Value],
+    ) -> std::io::Result<bool> {
+        // Do not use the trait default here: `load_runtime_session` is
+        // cache-first, so a stale cache could erase a message concurrently
+        // appended to the durable legacy queue. Delegate the compare-and-clear
+        // to LockedSessionStore's single per-session critical section.
+        let cleared = bamboo_domain::RuntimeSessionPersistence::clear_legacy_pending_messages(
+            self.persistence.as_ref(),
+            session_id,
+            expected,
+        )
+        .await?;
+        if !cleared {
+            return Ok(false);
+        }
+
+        // Refresh only after the durable CAS succeeds. A failed comparison or
+        // persistence error leaves the live cache untouched.
+        let latest = self
+            .storage
+            .load_session(session_id)
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("session disappeared after clearing legacy inbox: {session_id}"),
+                )
+            })?;
+        self.cache.insert(
+            session_id.to_string(),
+            Arc::new(parking_lot::RwLock::new(latest)),
+        );
+        Ok(true)
+    }
+
     async fn append_token_usage_record(
         &self,
         session_id: &str,
@@ -538,6 +576,85 @@ mod tests {
                 .get("skill_runtime_selected_skill_ids")
                 .map(String::as_str),
             Some("[\"plan\"]")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_clear_uses_durable_cas_and_never_erases_concurrent_append_from_stale_cache() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "legacy-cas-race";
+        let expected = vec![serde_json::json!({"content": "first"})];
+
+        let mut stale_cache = Session::new(id, "m");
+        stale_cache.set_pending_injected_messages(expected.clone());
+        cache_put(&repo, &stale_cache);
+
+        let mut durable = stale_cache.clone();
+        durable.set_pending_injected_messages(vec![
+            serde_json::json!({"content": "first"}),
+            serde_json::json!({"content": "concurrent"}),
+        ]);
+        storage.save_session(&durable).await.unwrap();
+
+        let cleared = bamboo_domain::RuntimeSessionPersistence::clear_legacy_pending_messages(
+            &repo, id, &expected,
+        )
+        .await
+        .unwrap();
+        assert!(!cleared, "the durable compare-and-clear must reject drift");
+        assert_eq!(
+            storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_injected_messages()
+                .unwrap(),
+            durable.pending_injected_messages().unwrap(),
+            "the concurrent durable append must remain intact"
+        );
+        assert_eq!(
+            read_cached_session(repo.cache(), id)
+                .unwrap()
+                .pending_injected_messages()
+                .unwrap(),
+            expected,
+            "a failed CAS must not mutate the existing cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_legacy_clear_refreshes_stale_cache_from_durable_state() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let id = "legacy-cas-success";
+        let expected = vec![serde_json::json!({"content": "first"})];
+
+        let mut stale_cache = Session::new(id, "stale-model");
+        stale_cache.set_pending_injected_messages(expected.clone());
+        cache_put(&repo, &stale_cache);
+
+        let mut durable = Session::new(id, "durable-model");
+        durable.set_pending_injected_messages(expected.clone());
+        durable
+            .metadata
+            .insert("durable-only".to_string(), "keep".to_string());
+        storage.save_session(&durable).await.unwrap();
+
+        assert!(
+            bamboo_domain::RuntimeSessionPersistence::clear_legacy_pending_messages(
+                &repo, id, &expected,
+            )
+            .await
+            .unwrap()
+        );
+        let cached = read_cached_session(repo.cache(), id).unwrap();
+        assert!(!cached.has_pending_injected_messages());
+        assert_eq!(cached.model, "durable-model");
+        assert_eq!(
+            cached.metadata.get("durable-only").map(String::as_str),
+            Some("keep")
         );
     }
 }

@@ -43,6 +43,7 @@ tracing = "0.1"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+futures = "0.3"
 # Test-only: asserting the exact `ParentFrame` a `child_approval` delivery
 # sends over the live actor channel (see reexecute_and_child_approval_tests).
 bamboo-subagent = { path = "../../infra/bamboo-subagent" }

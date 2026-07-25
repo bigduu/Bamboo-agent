@@ -10,7 +10,7 @@
 //! every sub-agent (the in-process runtime was removed). The expert `externalAgents`
 //! tables can additionally route specific roles to other actor/a2a agents.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,19 +18,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::poison::PoisonRecover;
+use bamboo_domain::SessionInboxClaim;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_subagent::fleet::{spawn_worker_on_bus, SpawnedChild};
 use bamboo_subagent::proto::{
-    AgentRecord, ChildFrame, ParentFrame, PermissionPolicyContext, RunSpec, TerminalStatus,
+    AgentRecord, ChildFrame, LogicalSessionIdentity, ParentFrame, PermissionPolicyContext, RunSpec,
+    SessionMessageDelivery, TerminalStatus,
 };
 use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
 };
 use bamboo_subagent::transport::{client_config_trusting_cert, ChildClient};
 
-use crate::runtime::execution::{ExternalChildRunner, SpawnJob};
+use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 
 /// Default cap on simultaneously running actor processes.
 pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 8;
@@ -285,6 +287,9 @@ pub struct ActorChildRunner {
     schedule_cursor: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     /// Optional server authority used only by `Codex` in `bamboo` auth mode.
     codex_run_tokens: Option<Arc<dyn CodexRunTokenAuthority>>,
+    /// Canonical logical-session inbox resources, late-bound by each owning
+    /// runtime. Kept per runner/runtime; never process-global.
+    session_inbox_runtime: Arc<std::sync::Mutex<Option<SessionInboxRuntimeBinding>>>,
 }
 
 /// Decides how the host answers a child worker's gated-tool approval request
@@ -389,6 +394,7 @@ impl ActorChildRunner {
             schedulable_placements: HashMap::new(),
             schedule_cursor: Arc::new(std::sync::Mutex::new(HashMap::new())),
             codex_run_tokens: None,
+            session_inbox_runtime: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -855,6 +861,10 @@ impl ExternalChildRunner for ActorChildRunner {
         *self.escalation_bridge.lock().recover_poison() = bridge;
     }
 
+    fn set_session_inbox_runtime(&self, binding: Option<SessionInboxRuntimeBinding>) {
+        *self.session_inbox_runtime.lock().recover_poison() = binding;
+    }
+
     async fn execute_external_child(
         &self,
         session: &mut Session,
@@ -871,6 +881,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // serves runs sequentially), and re-proxying through a closed bridge
         // fail-closed denies. Capturing at spawn pins the right bridge per run.
         let escalation = self.escalation_bridge.lock().recover_poison().clone();
+        let session_inbox_runtime = self.session_inbox_runtime.lock().recover_poison().clone();
         let assignment = extract_assignment(session);
         let mut spec = self.build_spec(session, job);
         // Mark the worker reusable + give it an idle timeout so it self-reaps if
@@ -892,16 +903,6 @@ impl ExternalChildRunner for ActorChildRunner {
                     .to_string(),
             ));
         }
-        // Rehydration: the child session in the parent's store is the actor's
-        // durable state. Ship the full conversation so a reactivation
-        // (send_message / update / rerun) carries its history. A reused worker is
-        // stateless between runs, so this is also what isolates each child's
-        // context on a shared process.
-        let messages: Vec<serde_json::Value> = session
-            .messages
-            .iter()
-            .filter_map(|m| serde_json::to_value(m).ok())
-            .collect();
         let project_id = project_id_for_actor_run(session)?;
         // Policy is captured per activation (not only when a worker is
         // provisioned), so reused local workers and resident remote/broker
@@ -1117,18 +1118,89 @@ impl ExternalChildRunner for ActorChildRunner {
                 }
             };
 
+            // Publish the actor delivery owner and claim the complete bounded
+            // authorized prefix before dispatching Run. These deliveries ride
+            // inside RunSpec, so the worker durably enqueues them before its
+            // first provider boundary rather than racing a later steer frame.
+            let (delivery_tx, mut delivery_rx) = mpsc::unbounded_channel::<u64>();
+            let bound_activation_run_id = match session_inbox_runtime.as_ref() {
+                Some(binding) => {
+                    let run_id = binding
+                        .router
+                        .attach_delivery_sink(&job.child_session_id, delivery_tx.clone())
+                        .await;
+                    if run_id.is_none() {
+                        tracing::debug!(
+                            session_id = %job.child_session_id,
+                            "actor driver had no current SessionInbox activation owner to bind"
+                        );
+                    }
+                    run_id
+                }
+                None => None,
+            };
+            drop(delivery_tx);
+            let initial_pairs = match (
+                session_inbox_runtime.as_ref(),
+                bound_activation_run_id.as_deref(),
+            ) {
+                (Some(binding), Some(run_id)) => {
+                    match claim_canonical_deliveries(binding, session, run_id, usize::MAX).await {
+                        Ok(deliveries) => deliveries,
+                        Err(error) => {
+                            binding
+                                .router
+                                .detach_delivery_sink(&job.child_session_id, run_id)
+                                .await;
+                            if !remote {
+                                actor.worker.kill().await;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            let initial_session_messages = initial_pairs
+                .iter()
+                .map(|(_, delivery)| delivery.clone())
+                .collect::<Vec<_>>();
+            let initial_inflight_claims = initial_pairs
+                .into_iter()
+                .map(|(claim, _)| claim)
+                .collect::<VecDeque<_>>();
+            // Recompute after claim reconciliation: a warm retry may have had a
+            // canonical receipt whose transcript proof was restored above.
+            let messages = session
+                .messages
+                .iter()
+                .filter_map(|message| serde_json::to_value(message).ok())
+                .collect();
+
             if let Err(e) = client
                 .send(ParentFrame::Run(RunSpec {
                     // Cloned (not moved) so a retry can re-dispatch to a fresh worker.
                     assignment: assignment.clone(),
+                    logical_session: Some(logical_identity_for_actor_run(session, job)),
                     project_id: project_id.clone(),
                     reasoning_effort: None,
                     permission_policy: permission_policy.clone(),
-                    messages: messages.clone(),
+                    messages,
+                    activation_run_id: bound_activation_run_id.clone(),
+                    initial_session_messages,
                     secrets: run_secrets.clone(),
                 }))
                 .await
             {
+                if let (Some(binding), Some(run_id)) = (
+                    session_inbox_runtime.as_ref(),
+                    bound_activation_run_id.as_deref(),
+                ) {
+                    binding
+                        .router
+                        .detach_delivery_sink(&job.child_session_id, run_id)
+                        .await;
+                }
                 if !remote {
                     actor.worker.kill().await;
                 }
@@ -1158,6 +1230,11 @@ impl ExternalChildRunner for ActorChildRunner {
                 &event_tx,
                 &cancel_token,
                 &mut live_rx,
+                &mut delivery_rx,
+                session,
+                session_inbox_runtime.as_ref(),
+                bound_activation_run_id.as_deref(),
+                initial_inflight_claims,
                 // First-frame watchdog for EVERY placement: a wedged-but-connected
                 // worker (subscribed ≠ serving — e.g. stuck on a prior LLM call) emits
                 // no first frame; without a deadline drive() blocks forever. Bounding it
@@ -1167,6 +1244,15 @@ impl ExternalChildRunner for ActorChildRunner {
                 Some(WORKER_FIRST_FRAME_TIMEOUT),
             )
             .await;
+            if let (Some(binding), Some(run_id)) = (
+                session_inbox_runtime.as_ref(),
+                bound_activation_run_id.as_deref(),
+            ) {
+                binding
+                    .router
+                    .detach_delivery_sink(&job.child_session_id, run_id)
+                    .await;
+            }
             // Unregister IMMEDIATELY: after drive returns nobody consumes live_rx,
             // so a send_message landing in the close/park window below must see
             // "not live" and take the durable-queue fallback instead of vanishing.
@@ -1271,6 +1357,368 @@ fn host_of_endpoint(endpoint: &str) -> String {
         .to_string()
 }
 
+async fn reconcile_already_admitted_claim(
+    binding: &SessionInboxRuntimeBinding,
+    session: &mut Session,
+    claim: &SessionInboxClaim,
+) -> crate::runtime::runner::Result<()> {
+    let latest = binding
+        .storage
+        .load_session(&session.id)
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "load canonical SessionInbox checkpoint for {}: {error}",
+                session.id
+            ))
+        })?
+        .ok_or_else(|| {
+            AgentError::LLM(format!(
+                "canonical SessionInbox target disappeared: {}",
+                session.id
+            ))
+        })?;
+    let Some(message) = latest
+        .messages
+        .iter()
+        .find(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope))
+        .cloned()
+    else {
+        return Err(AgentError::LLM(format!(
+            "canonical admitted receipt for {} exists without transcript message {}",
+            session.id, claim.envelope.id
+        )));
+    };
+    if let Some(existing) = session
+        .messages
+        .iter_mut()
+        .find(|existing| existing.id == message.id)
+    {
+        *existing = message;
+    } else {
+        session.add_message(message);
+    }
+    bamboo_domain::merge_session_inbox_admission(session, &latest);
+    binding
+        .inbox
+        .ack(&session.id, claim)
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "ack recovered canonical SessionInbox claim {}: {error}",
+                claim.envelope.id
+            ))
+        })
+}
+
+/// Checkpoint a worker-confirmed envelope into the canonical logical Session,
+/// then create the permanent host receipt/remove its exact claim. This order is
+/// the actor-side equivalent of the local state_bridge crash boundary.
+async fn checkpoint_and_ack_canonical_claim(
+    binding: &SessionInboxRuntimeBinding,
+    session: &mut Session,
+    claim: &SessionInboxClaim,
+) -> crate::runtime::runner::Result<()> {
+    if claim.envelope.target_session_id != session.id {
+        return Err(AgentError::LLM(format!(
+            "canonical SessionInbox claim target {} does not match active logical session {}",
+            claim.envelope.target_session_id, session.id
+        )));
+    }
+    if binding
+        .inbox
+        .was_admitted(&session.id, &claim.envelope.id)
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "inspect canonical admitted receipt {}: {error}",
+                claim.envelope.id
+            ))
+        })?
+    {
+        return reconcile_already_admitted_claim(binding, session, claim).await;
+    }
+
+    let transcript_has_id = session
+        .messages
+        .iter()
+        .any(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope));
+    if session
+        .messages
+        .iter()
+        .any(|message| message.id == claim.envelope.id.as_str())
+        && !transcript_has_id
+    {
+        return Err(AgentError::LLM(format!(
+            "canonical SessionInbox id {} collides with a non-matching transcript message",
+            claim.envelope.id
+        )));
+    }
+    let cursor_has_id = session
+        .session_inbox_admission()
+        .is_some_and(|state| state.contains(&claim.envelope.id));
+    if cursor_has_id && !transcript_has_id {
+        return Err(AgentError::LLM(format!(
+            "canonical SessionInbox cursor exists without transcript message {}",
+            claim.envelope.id
+        )));
+    }
+    let before = session.clone();
+    if !transcript_has_id {
+        let message = claim.envelope.to_provider_message().map_err(|error| {
+            AgentError::LLM(format!(
+                "translate canonical SessionInbox envelope {}: {error}",
+                claim.envelope.id
+            ))
+        })?;
+        session.add_message(message);
+    }
+    session
+        .session_inbox_admission_mut()
+        .record(claim.envelope.id.clone(), claim.generation);
+    session.updated_at = chrono::Utc::now();
+
+    if let Err(error) = binding
+        .persistence
+        .checkpoint_runtime_session(session)
+        .await
+    {
+        *session = before;
+        return Err(AgentError::LLM(format!(
+            "checkpoint canonical SessionInbox claim {}: {error}",
+            claim.envelope.id
+        )));
+    }
+    if !session
+        .messages
+        .iter()
+        .any(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope))
+    {
+        *session = before;
+        return Err(AgentError::LLM(format!(
+            "canonical SessionInbox checkpoint lost typed transcript proof for {}",
+            claim.envelope.id
+        )));
+    }
+    binding
+        .inbox
+        .ack(&session.id, claim)
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "ack canonical SessionInbox claim {} after checkpoint: {error}",
+                claim.envelope.id
+            ))
+        })
+}
+
+/// Durably seed claimed typed messages into the canonical host transcript
+/// before dispatching them to any actor worker, while deliberately leaving the
+/// admission cursor and `cur/` claims untouched.
+///
+/// This is the cross-placement lost-confirmation invariant: if worker A admits
+/// and reasons over the batch but its confirmations are lost, a retry on worker
+/// B receives a host snapshot already containing each stable typed message
+/// exactly once. Worker B's local safe boundary then records/acks the same ids
+/// without appending duplicates. Only an exact worker confirmation advances the
+/// host cursor; only a durable cursor checkpoint precedes host ack.
+async fn checkpoint_claim_context_before_dispatch(
+    binding: &SessionInboxRuntimeBinding,
+    session: &mut Session,
+    claims: &[SessionInboxClaim],
+) -> crate::runtime::runner::Result<()> {
+    if claims.is_empty() {
+        return Ok(());
+    }
+    let before = session.clone();
+    for claim in claims {
+        if claim.envelope.target_session_id != session.id {
+            return Err(AgentError::LLM(format!(
+                "canonical SessionInbox claim target {} does not match actor session {}",
+                claim.envelope.target_session_id, session.id
+            )));
+        }
+        let matching = session
+            .messages
+            .iter()
+            .any(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope));
+        if session
+            .messages
+            .iter()
+            .any(|message| message.id == claim.envelope.id.as_str())
+            && !matching
+        {
+            return Err(AgentError::LLM(format!(
+                "canonical SessionInbox id {} collides before actor dispatch",
+                claim.envelope.id
+            )));
+        }
+        if session
+            .session_inbox_admission()
+            .is_some_and(|state| state.contains(&claim.envelope.id))
+            && !matching
+        {
+            return Err(AgentError::LLM(format!(
+                "canonical SessionInbox cursor exists without transcript proof for {}",
+                claim.envelope.id
+            )));
+        }
+        if !matching {
+            let message = claim.envelope.to_provider_message().map_err(|error| {
+                AgentError::LLM(format!(
+                    "translate canonical SessionInbox envelope {} before actor dispatch: {error}",
+                    claim.envelope.id
+                ))
+            })?;
+            session.add_message(message);
+        }
+    }
+    session.updated_at = chrono::Utc::now();
+    if let Err(error) = binding
+        .persistence
+        .checkpoint_runtime_session(session)
+        .await
+    {
+        *session = before;
+        return Err(AgentError::LLM(format!(
+            "checkpoint canonical SessionInbox actor context: {error}"
+        )));
+    }
+    for claim in claims {
+        if !session
+            .messages
+            .iter()
+            .any(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope))
+        {
+            *session = before;
+            return Err(AgentError::LLM(format!(
+                "actor context checkpoint lost typed transcript proof for {}",
+                claim.envelope.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn claim_canonical_deliveries(
+    binding: &SessionInboxRuntimeBinding,
+    session: &mut Session,
+    activation_run_id: &str,
+    limit: usize,
+) -> crate::runtime::runner::Result<Vec<(SessionInboxClaim, SessionMessageDelivery)>> {
+    let claims = binding
+        .inbox
+        .claim(&session.id, limit)
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "claim canonical SessionInbox for active actor {}: {error}",
+                session.id
+            ))
+        })?;
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
+    let interrupt_generation = binding
+        .inbox
+        .inspect(&session.id)
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "inspect canonical SessionInbox activation policy for {}: {error}",
+                session.id
+            ))
+        })?
+        .interrupt_generation;
+    let mut unconfirmed = Vec::with_capacity(claims.len());
+    for claim in claims {
+        if binding
+            .inbox
+            .was_admitted(&session.id, &claim.envelope.id)
+            .await
+            .map_err(|error| {
+                AgentError::LLM(format!(
+                    "inspect canonical SessionInbox claim {}: {error}",
+                    claim.envelope.id
+                ))
+            })?
+        {
+            reconcile_already_admitted_claim(binding, session, &claim).await?;
+            continue;
+        }
+        unconfirmed.push(claim);
+    }
+    checkpoint_claim_context_before_dispatch(binding, session, &unconfirmed).await?;
+
+    let mut deliveries = Vec::with_capacity(unconfirmed.len());
+    for claim in unconfirmed {
+        // Cursor+transcript without the permanent tombstone is the recoverable
+        // crash window after an exact worker confirmation was checkpointed but
+        // before host ack removed `cur/`. Finish that ack without exposing the
+        // message to another provider run.
+        if session
+            .session_inbox_admission()
+            .is_some_and(|state| state.contains(&claim.envelope.id))
+        {
+            binding
+                .inbox
+                .ack(&session.id, &claim)
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!(
+                        "finish confirmed canonical SessionInbox ack {}: {error}",
+                        claim.envelope.id
+                    ))
+                })?;
+            continue;
+        }
+        let activation_policy = if claim.generation <= interrupt_generation {
+            bamboo_domain::SessionActivationPolicy::InterruptSpecificWait
+        } else {
+            bamboo_domain::SessionActivationPolicy::RespectSpecificWait
+        };
+        let delivery = SessionMessageDelivery {
+            target_session_id: session.id.clone(),
+            envelope: claim.envelope.clone(),
+            canonical_claim_generation: claim.generation,
+            activation_run_id: activation_run_id.to_string(),
+            activation_policy,
+        };
+        deliveries.push((claim, delivery));
+    }
+    Ok(deliveries)
+}
+
+async fn forward_next_canonical_claim(
+    client: &mut dyn bamboo_subagent::ChildLink,
+    binding: &SessionInboxRuntimeBinding,
+    session: &mut Session,
+    activation_run_id: &str,
+    inflight: &mut VecDeque<SessionInboxClaim>,
+) -> crate::runtime::runner::Result<()> {
+    if !inflight.is_empty() {
+        return Ok(());
+    }
+    let Some((claim, delivery)) =
+        claim_canonical_deliveries(binding, session, activation_run_id, 1)
+            .await?
+            .pop()
+    else {
+        return Ok(());
+    };
+    client
+        .send(ParentFrame::SessionMessage { delivery })
+        .await
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "forward canonical SessionInbox claim {} to active actor: {error}",
+                claim.envelope.id
+            ))
+        })?;
+    inflight.push_back(claim);
+    Ok(())
+}
+
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
 /// On success, yields the actor's final result text (for session write-back).
 /// `live_rx` carries in-band frames (steering messages) from the live registry.
@@ -1293,6 +1741,11 @@ async fn drive(
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel_token: &CancellationToken,
     live_rx: &mut mpsc::UnboundedReceiver<ParentFrame>,
+    delivery_rx: &mut mpsc::UnboundedReceiver<u64>,
+    logical_session: &mut Session,
+    session_inbox_runtime: Option<&SessionInboxRuntimeBinding>,
+    activation_run_id: Option<&str>,
+    initial_inflight_claims: VecDeque<SessionInboxClaim>,
     first_frame_timeout: Option<Duration>,
 ) -> crate::runtime::runner::Result<Option<String>> {
     // First-frame watchdog: a live worker emits its first frame (run-started /
@@ -1303,6 +1756,7 @@ async fn drive(
     // tool between tokens) never trips it.
     let mut got_first_frame = false;
     let mut first_frame_watch = first_frame_timeout.map(|d| Box::pin(tokio::time::sleep(d)));
+    let mut inflight_claims = initial_inflight_claims;
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -1319,6 +1773,18 @@ async fn drive(
                     "child {child_session_id} produced no frame within {:?}",
                     first_frame_timeout.unwrap_or_default()
                 )));
+            }
+            Some(_generation) = delivery_rx.recv(),
+                if session_inbox_runtime.is_some() && activation_run_id.is_some() =>
+            {
+                forward_next_canonical_claim(
+                    client,
+                    session_inbox_runtime.expect("guarded"),
+                    logical_session,
+                    activation_run_id.expect("guarded"),
+                    &mut inflight_claims,
+                )
+                .await?;
             }
             Some(frame) = live_rx.recv() => {
                 // Forward in-band steering to the worker over the existing WS.
@@ -1448,7 +1914,81 @@ async fn drive(
                             }
                         }
                     }
+                    Ok(Some(ChildFrame::SessionMessageAdmitted { confirmation })) => {
+                        let Some(binding) = session_inbox_runtime else {
+                            tracing::warn!(
+                                child_session_id,
+                                "ignoring SessionInbox confirmation without a runtime binding"
+                            );
+                            continue;
+                        };
+                        let Some(bound_run_id) = activation_run_id else {
+                            tracing::warn!(
+                                child_session_id,
+                                "ignoring SessionInbox confirmation without an activation owner"
+                            );
+                            continue;
+                        };
+                        let Some(claim) = inflight_claims.front() else {
+                            tracing::warn!(
+                                child_session_id,
+                                envelope_id = %confirmation.envelope_id,
+                                "rejecting stale SessionInbox confirmation with no in-flight canonical claim"
+                            );
+                            continue;
+                        };
+                        let exact = confirmation.target_session_id == logical_session.id
+                            && confirmation.envelope_id == claim.envelope.id.as_str()
+                            && confirmation.canonical_claim_generation == claim.generation
+                            && confirmation.activation_run_id == bound_run_id;
+                        if !exact
+                            || !binding
+                                .router
+                                .owns_run(&logical_session.id, bound_run_id)
+                                .await
+                        {
+                            tracing::warn!(
+                                child_session_id,
+                                expected_target = %logical_session.id,
+                                received_target = %confirmation.target_session_id,
+                                expected_envelope_id = %claim.envelope.id,
+                                received_envelope_id = %confirmation.envelope_id,
+                                expected_generation = claim.generation,
+                                received_generation = confirmation.canonical_claim_generation,
+                                expected_run_id = bound_run_id,
+                                received_run_id = %confirmation.activation_run_id,
+                                "rejecting stale or mismatched SessionInbox admission confirmation"
+                            );
+                            continue;
+                        }
+                        let claim = inflight_claims
+                            .pop_front()
+                            .expect("validated in-flight canonical claim");
+                        // On failure the durable canonical cur file remains
+                        // recoverable for the next owner.
+                        checkpoint_and_ack_canonical_claim(binding, logical_session, &claim)
+                            .await?;
+                        // Ordered single-consumer: only after the exact prior
+                        // claim is checkpointed+acked may the driver claim and
+                        // forward the next envelope.
+                        if inflight_claims.is_empty() {
+                            forward_next_canonical_claim(
+                                client,
+                                binding,
+                                logical_session,
+                                bound_run_id,
+                                &mut inflight_claims,
+                            )
+                            .await?;
+                        }
+                    }
                     Ok(Some(ChildFrame::Terminal { status, result, error, .. })) => {
+                        if let Some(claim) = inflight_claims.front() {
+                            return Err(AgentError::LLM(format!(
+                                "actor terminated before durably admitting SessionInbox message {}; canonical claim remains recoverable",
+                                claim.envelope.id
+                            )));
+                        }
                         return match status {
                             TerminalStatus::Completed => Ok(result),
                             TerminalStatus::Cancelled => Err(AgentError::Cancelled),
@@ -1500,6 +2040,21 @@ fn project_id_for_actor_run(
     }
 }
 
+fn logical_identity_for_actor_run(session: &Session, job: &SpawnJob) -> LogicalSessionIdentity {
+    LogicalSessionIdentity {
+        session_id: session.id.clone(),
+        parent_session_id: session
+            .parent_session_id
+            .clone()
+            .or_else(|| Some(job.parent_session_id.clone())),
+        root_session_id: if session.root_session_id.trim().is_empty() {
+            job.parent_session_id.clone()
+        } else {
+            session.root_session_id.clone()
+        },
+    }
+}
+
 fn extract_assignment(session: &Session) -> String {
     session
         .messages
@@ -1519,6 +2074,563 @@ fn extract_assignment(session: &Session) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionActivationRouter;
+    use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
+
+    struct ActorFaultingPersistence {
+        inner: Arc<bamboo_storage::LockedSessionStore>,
+        fail_checkpoint_once: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl RuntimeSessionPersistence for ActorFaultingPersistence {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.inner.merge_save_runtime(session).await
+        }
+
+        async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            if self
+                .fail_checkpoint_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected actor checkpoint failure"));
+            }
+            self.inner.checkpoint_runtime_session(session).await
+        }
+
+        async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.storage().load_session(session_id).await
+        }
+    }
+
+    struct ActorFailBeforeAckInbox {
+        inner: Arc<dyn SessionInboxPort>,
+        fail_once: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl SessionInboxPort for ActorFailBeforeAckInbox {
+        async fn deliver(
+            &self,
+            envelope: &bamboo_domain::SessionMessageEnvelope,
+        ) -> Result<bamboo_domain::SessionInboxReceipt, bamboo_domain::SessionInboxError> {
+            self.inner.deliver(envelope).await
+        }
+
+        async fn mark_activation_eligible(
+            &self,
+            target_session_id: &str,
+            generation: u64,
+            policy: bamboo_domain::SessionActivationPolicy,
+        ) -> Result<(), bamboo_domain::SessionInboxError> {
+            self.inner
+                .mark_activation_eligible(target_session_id, generation, policy)
+                .await
+        }
+
+        async fn claim(
+            &self,
+            target_session_id: &str,
+            limit: usize,
+        ) -> Result<Vec<SessionInboxClaim>, bamboo_domain::SessionInboxError> {
+            self.inner.claim(target_session_id, limit).await
+        }
+
+        async fn was_admitted(
+            &self,
+            target_session_id: &str,
+            id: &bamboo_domain::SessionMessageId,
+        ) -> Result<bool, bamboo_domain::SessionInboxError> {
+            self.inner.was_admitted(target_session_id, id).await
+        }
+
+        async fn ack(
+            &self,
+            target_session_id: &str,
+            claim: &SessionInboxClaim,
+        ) -> Result<(), bamboo_domain::SessionInboxError> {
+            if self
+                .fail_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(bamboo_domain::SessionInboxError::Storage(
+                    "injected actor pre-ack failure".to_string(),
+                ));
+            }
+            self.inner.ack(target_session_id, claim).await
+        }
+
+        async fn inspect(
+            &self,
+            target_session_id: &str,
+        ) -> Result<bamboo_domain::SessionInboxBacklog, bamboo_domain::SessionInboxError> {
+            self.inner.inspect(target_session_id).await
+        }
+    }
+
+    async fn actor_inbox_fixture(
+        session_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<bamboo_storage::SessionStoreV2>,
+        Arc<bamboo_storage::LockedSessionStore>,
+        Arc<dyn SessionInboxPort>,
+        Session,
+        SessionInboxClaim,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let session = Session::new(session_id, "model");
+        store.save_session(&session).await.unwrap();
+        let mut envelope =
+            bamboo_domain::SessionMessageEnvelope::user_input(session_id, "actor follow-up");
+        envelope.id =
+            bamboo_domain::SessionMessageId::parse(format!("{session_id}-message")).unwrap();
+        let receipt = inbox.deliver(&envelope).await.unwrap();
+        inbox
+            .mark_activation_eligible(
+                session_id,
+                receipt.generation,
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let claim = inbox.claim(session_id, 1).await.unwrap().remove(0);
+        (temp, store, locked, inbox, session, claim)
+    }
+
+    fn actor_binding(
+        store: Arc<bamboo_storage::SessionStoreV2>,
+        inbox: Arc<dyn SessionInboxPort>,
+        persistence: Arc<dyn RuntimeSessionPersistence>,
+    ) -> SessionInboxRuntimeBinding {
+        let storage: Arc<dyn Storage> = store;
+        SessionInboxRuntimeBinding {
+            router: SessionActivationRouter::new(),
+            inbox,
+            storage,
+            persistence,
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_mismatched_typed_marker_id_collision_never_acks() {
+        let (_temp, store, locked, inbox, mut session, claim) =
+            actor_inbox_fixture("actor-live-id-collision").await;
+        let mut forged = claim.envelope.to_provider_message().unwrap();
+        forged.metadata = Some(serde_json::json!({
+            "session_message": {
+                "id": claim.envelope.id,
+                "target_session_id": "different-session"
+            }
+        }));
+        session.add_message(forged);
+        let persistence: Arc<dyn RuntimeSessionPersistence> = locked;
+        let binding = actor_binding(store, inbox.clone(), persistence);
+
+        assert!(
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+                .await
+                .is_err()
+        );
+        assert_eq!(inbox.inspect(&session.id).await.unwrap().claimed, 1);
+        assert!(!inbox
+            .was_admitted(&session.id, &claim.envelope.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn actor_concurrent_durable_id_collision_after_claim_never_acks() {
+        let (_temp, store, locked, inbox, mut session, claim) =
+            actor_inbox_fixture("actor-durable-id-collision").await;
+        let mut concurrent = store.load_session(&session.id).await.unwrap().unwrap();
+        let mut forged = bamboo_agent_core::Message::user("concurrent actor collision");
+        forged.id = claim.envelope.id.to_string();
+        concurrent.add_message(forged);
+        store.save_session(&concurrent).await.unwrap();
+        let persistence: Arc<dyn RuntimeSessionPersistence> = locked;
+        let binding = actor_binding(store.clone(), inbox.clone(), persistence);
+
+        assert!(
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+                .await
+                .is_err()
+        );
+        assert_eq!(inbox.inspect(&session.id).await.unwrap().claimed, 1);
+        assert!(!inbox
+            .was_admitted(&session.id, &claim.envelope.id)
+            .await
+            .unwrap());
+        let durable = store.load_session(&session.id).await.unwrap().unwrap();
+        assert!(!durable.messages.iter().any(|message| {
+            bamboo_domain::is_matching_session_message(message, &claim.envelope)
+        }));
+    }
+
+    #[tokio::test]
+    async fn actor_concurrent_durable_typed_body_mismatch_never_acks() {
+        let (_temp, store, locked, inbox, mut session, claim) =
+            actor_inbox_fixture("actor-durable-typed-body-collision").await;
+        let mut different = claim.envelope.clone();
+        different.body = bamboo_domain::SessionMessageBody::Content(
+            bamboo_domain::SessionMessageContent::text("forged actor body"),
+        );
+        let mut concurrent = store.load_session(&session.id).await.unwrap().unwrap();
+        concurrent.add_message(different.to_provider_message().unwrap());
+        store.save_session(&concurrent).await.unwrap();
+        let persistence: Arc<dyn RuntimeSessionPersistence> = locked;
+        let binding = actor_binding(store.clone(), inbox.clone(), persistence);
+
+        assert!(
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+                .await
+                .is_err()
+        );
+        assert_eq!(inbox.inspect(&session.id).await.unwrap().claimed, 1);
+        assert!(!inbox
+            .was_admitted(&session.id, &claim.envelope.id)
+            .await
+            .unwrap());
+        let durable = store.load_session(&session.id).await.unwrap().unwrap();
+        assert!(!durable
+            .messages
+            .iter()
+            .any(|message| bamboo_domain::is_matching_session_message(message, &claim.envelope)));
+    }
+
+    #[tokio::test]
+    async fn actor_checkpoint_failure_rolls_back_and_restart_admits_once() {
+        let (_temp, store, locked, inbox, mut session, claim) =
+            actor_inbox_fixture("actor-checkpoint-failure").await;
+        let envelope_id = claim.envelope.id.clone();
+        let fault: Arc<dyn RuntimeSessionPersistence> = Arc::new(ActorFaultingPersistence {
+            inner: locked.clone(),
+            fail_checkpoint_once: std::sync::atomic::AtomicBool::new(true),
+        });
+        let binding = actor_binding(store.clone(), inbox.clone(), fault);
+
+        assert!(
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+                .await
+                .is_err()
+        );
+        assert!(!session
+            .messages
+            .iter()
+            .any(|message| message.id == envelope_id.as_str()));
+        assert_eq!(inbox.inspect(&session.id).await.unwrap().claimed, 1);
+        assert!(!inbox.was_admitted(&session.id, &envelope_id).await.unwrap());
+
+        let reopened: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let recovered = reopened.claim(&session.id, 1).await.unwrap().remove(0);
+        let persistence: Arc<dyn RuntimeSessionPersistence> = locked;
+        let binding = actor_binding(store.clone(), reopened.clone(), persistence);
+        let mut restarted = store.load_session(&session.id).await.unwrap().unwrap();
+        checkpoint_and_ack_canonical_claim(&binding, &mut restarted, &recovered)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted
+                .messages
+                .iter()
+                .filter(|message| message.id == envelope_id.as_str())
+                .count(),
+            1
+        );
+        assert!(reopened
+            .was_admitted(&session.id, &envelope_id)
+            .await
+            .unwrap());
+        let backlog = reopened.inspect(&session.id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+    }
+
+    #[tokio::test]
+    async fn actor_checkpoint_success_pre_ack_failure_recovers_without_duplicate() {
+        let (_temp, store, locked, real_inbox, mut session, claim) =
+            actor_inbox_fixture("actor-pre-ack-failure").await;
+        let envelope_id = claim.envelope.id.clone();
+        let faulted: Arc<dyn SessionInboxPort> = Arc::new(ActorFailBeforeAckInbox {
+            inner: real_inbox.clone(),
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+        });
+        let persistence: Arc<dyn RuntimeSessionPersistence> = locked.clone();
+        let binding = actor_binding(store.clone(), faulted, persistence);
+
+        assert!(
+            checkpoint_and_ack_canonical_claim(&binding, &mut session, &claim)
+                .await
+                .is_err()
+        );
+        let durable = store.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            durable
+                .messages
+                .iter()
+                .filter(|message| message.id == envelope_id.as_str())
+                .count(),
+            1
+        );
+        assert_eq!(real_inbox.inspect(&session.id).await.unwrap().claimed, 1);
+        assert!(!real_inbox
+            .was_admitted(&session.id, &envelope_id)
+            .await
+            .unwrap());
+
+        let reopened: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let recovered = reopened.claim(&session.id, 1).await.unwrap().remove(0);
+        let persistence: Arc<dyn RuntimeSessionPersistence> = locked;
+        let binding = actor_binding(store.clone(), reopened.clone(), persistence);
+        let mut restarted = durable;
+        checkpoint_and_ack_canonical_claim(&binding, &mut restarted, &recovered)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted
+                .messages
+                .iter()
+                .filter(|message| message.id == envelope_id.as_str())
+                .count(),
+            1
+        );
+        assert!(reopened
+            .was_admitted(&session.id, &envelope_id)
+            .await
+            .unwrap());
+        let backlog = reopened.inspect(&session.id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+    }
+
+    struct ConfirmationSequenceLink {
+        frames: VecDeque<ChildFrame>,
+        sent: Vec<ParentFrame>,
+    }
+
+    #[async_trait]
+    impl bamboo_subagent::ChildLink for ConfirmationSequenceLink {
+        async fn send(&mut self, frame: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+            self.sent.push(frame);
+            Ok(())
+        }
+
+        async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+            match self.frames.pop_front() {
+                Some(frame) => Ok(Some(frame)),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn admission_confirmation(
+        session_id: &str,
+        claim: &SessionInboxClaim,
+        run_id: &str,
+    ) -> bamboo_subagent::proto::SessionMessageAdmissionConfirmation {
+        bamboo_subagent::proto::SessionMessageAdmissionConfirmation {
+            target_session_id: session_id.to_string(),
+            envelope_id: claim.envelope.id.to_string(),
+            canonical_claim_generation: claim.generation,
+            activation_run_id: run_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_initial_batch_acks_in_order_and_rejects_stale_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let session_id = "actor-confirmation-order";
+        let run_id = "actor-run-current";
+        let mut session = Session::new(session_id, "model");
+        store.save_session(&session).await.unwrap();
+        for (id, text) in [("actor-first", "first"), ("actor-second", "second")] {
+            let mut envelope = bamboo_domain::SessionMessageEnvelope::user_input(session_id, text);
+            envelope.id = bamboo_domain::SessionMessageId::parse(id).unwrap();
+            inbox.deliver(&envelope).await.unwrap();
+        }
+        inbox
+            .mark_activation_eligible(
+                session_id,
+                2,
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        let router = SessionActivationRouter::new();
+        let mut owner_registration = router.register_run(session_id, run_id).await.unwrap();
+        let binding = SessionInboxRuntimeBinding {
+            router,
+            inbox: inbox.clone(),
+            storage,
+            persistence: locked,
+        };
+        let pairs = claim_canonical_deliveries(&binding, &mut session, run_id, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|(claim, _)| claim.envelope.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actor-first", "actor-second"]
+        );
+        let seeded = store.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            seeded
+                .messages
+                .iter()
+                .filter(|message| matches!(message.id.as_str(), "actor-first" | "actor-second"))
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actor-first", "actor-second"],
+            "host context must be durable before actor dispatch"
+        );
+        for (claim, _) in &pairs {
+            assert_eq!(
+                seeded
+                    .messages
+                    .iter()
+                    .filter(|message| bamboo_domain::is_matching_session_message(
+                        message,
+                        &claim.envelope
+                    ))
+                    .count(),
+                1,
+                "pre-dispatch host checkpoint must contain exactly one canonical marker for {}",
+                claim.envelope.id
+            );
+        }
+        assert!(
+            seeded.session_inbox_admission().is_none_or(|cursor| {
+                !cursor.contains(&pairs[0].0.envelope.id)
+                    && !cursor.contains(&pairs[1].0.envelope.id)
+            }),
+            "pre-dispatch transcript seeding must not forge worker confirmation"
+        );
+        assert_eq!(inbox.inspect(session_id).await.unwrap().claimed, 2);
+        let claims = pairs
+            .into_iter()
+            .map(|(claim, _)| claim)
+            .collect::<VecDeque<_>>();
+        let first = claims[0].clone();
+        let second = claims[1].clone();
+        let mut stale = admission_confirmation(session_id, &first, "stale-run");
+        stale.canonical_claim_generation = second.generation;
+        let mut link = ConfirmationSequenceLink {
+            frames: VecDeque::from([
+                ChildFrame::SessionMessageAdmitted {
+                    confirmation: stale,
+                },
+                ChildFrame::SessionMessageAdmitted {
+                    confirmation: admission_confirmation(session_id, &first, run_id),
+                },
+                ChildFrame::SessionMessageAdmitted {
+                    confirmation: admission_confirmation(session_id, &second, run_id),
+                },
+                ChildFrame::Terminal {
+                    status: TerminalStatus::Completed,
+                    result: Some("done".to_string()),
+                    error: None,
+                    transcript: Vec::new(),
+                },
+            ]),
+            sent: Vec::new(),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let (_live_tx, mut live_rx) = mpsc::unbounded_channel();
+        let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        let result = drive(
+            &mut link,
+            "parent",
+            session_id,
+            0,
+            None,
+            None,
+            None,
+            None,
+            &event_tx,
+            &cancel,
+            &mut live_rx,
+            &mut delivery_rx,
+            &mut session,
+            Some(&binding),
+            Some(run_id),
+            claims,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.as_deref(), Some("done"));
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| matches!(message.id.as_str(), "actor-first" | "actor-second"))
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actor-first", "actor-second"]
+        );
+        let backlog = inbox.inspect(session_id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        let confirmed = store.load_session(session_id).await.unwrap().unwrap();
+        let cursor = confirmed
+            .session_inbox_admission()
+            .expect("exact worker confirmation must checkpoint the admission cursor");
+        assert!(cursor.contains(&first.envelope.id));
+        assert!(cursor.contains(&second.envelope.id));
+        for claim in [&first, &second] {
+            assert_eq!(
+                confirmed
+                    .messages
+                    .iter()
+                    .filter(|message| bamboo_domain::is_matching_session_message(
+                        message,
+                        &claim.envelope
+                    ))
+                    .count(),
+                1,
+                "confirmation must retain one exact canonical marker for {}",
+                claim.envelope.id
+            );
+        }
+        assert!(inbox
+            .was_admitted(session_id, &first.envelope.id)
+            .await
+            .unwrap());
+        assert!(inbox
+            .was_admitted(session_id, &second.envelope.id)
+            .await
+            .unwrap());
+        owner_registration.begin_finalization().await;
+        owner_registration.finish(2).await.unwrap();
+    }
 
     #[derive(Default)]
     struct RecordingCodexTokenAuthority {
@@ -1857,6 +2969,52 @@ mod tests {
     }
 
     #[test]
+    fn logical_identity_is_invariant_across_local_remote_scheduled_and_warm_reuse() {
+        let mut session =
+            Session::new_child("logical-child-681", "logical-parent-681", "model", "child");
+        session.root_session_id = "logical-root-681".to_string();
+        let job = SpawnJob {
+            parent_session_id: "logical-parent-681".to_string(),
+            child_session_id: "logical-child-681".to_string(),
+            model: "model".to_string(),
+            disabled_tools: None,
+        };
+        let expected = LogicalSessionIdentity {
+            session_id: "logical-child-681".to_string(),
+            parent_session_id: Some("logical-parent-681".to_string()),
+            root_session_id: "logical-root-681".to_string(),
+        };
+
+        let placements_and_transport_ids = [
+            (Placement::Local, "local-mailbox-first"),
+            (
+                Placement::Remote {
+                    endpoint: "wss://remote.example/actor".to_string(),
+                },
+                "remote-process-44",
+            ),
+            (
+                Placement::Schedulable {
+                    pool: "gpu-pool".to_string(),
+                },
+                "scheduled-mailbox-9",
+            ),
+            // Same logical child reactivated on a different pooled mailbox.
+            (Placement::Local, "warm-mailbox-reused-77"),
+        ];
+        for (placement, transport_id) in placements_and_transport_ids {
+            let mut provision = spec_with("worker", "provider", "model", None, None);
+            provision.placement = placement;
+            provision.identity.child_id = transport_id.to_string();
+            assert_eq!(logical_identity_for_actor_run(&session, &job), expected);
+            assert_ne!(
+                provision.identity.child_id, expected.session_id,
+                "test fixture must prove transport identity is independent"
+            );
+        }
+    }
+
+    #[test]
     fn fingerprint_separates_distinct_runtimes() {
         let base = spec_with("explorer", "p", "m", Some("/ws"), None);
         let base_fp = ActorChildRunner::fingerprint(&base);
@@ -2070,6 +3228,8 @@ mod tests {
         });
         let cancel = CancellationToken::new();
         let (live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        let mut logical_session = Session::new("child-reviewer", "model");
         let live_guard = crate::external_agents::live::register("child-reviewer", live_tx, 0, None);
         let mut link = ApprovalRoundTripLink {
             step: 0,
@@ -2090,6 +3250,11 @@ mod tests {
                 &event_tx,
                 &cancel,
                 &mut live_rx,
+                &mut delivery_rx,
+                &mut logical_session,
+                None,
+                None,
+                VecDeque::new(),
                 None,
             ),
         )
@@ -2125,6 +3290,8 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
         let cancel = CancellationToken::new();
         let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        let mut logical_session = Session::new("child-no-reviewer", "model");
         let mut link = ApprovalRoundTripLink {
             step: 0,
             approval_reply: None,
@@ -2144,6 +3311,11 @@ mod tests {
                 &event_tx,
                 &cancel,
                 &mut live_rx,
+                &mut delivery_rx,
+                &mut logical_session,
+                None,
+                None,
+                VecDeque::new(),
                 None,
             ),
         )
@@ -2182,6 +3354,8 @@ mod tests {
         let (event_tx, _rx) = mpsc::channel::<AgentEvent>(8);
         let cancel = CancellationToken::new();
         let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        let mut logical_session = Session::new("child-x", "model");
         let mut link = SilentLink;
         let r = drive(
             &mut link,
@@ -2195,6 +3369,11 @@ mod tests {
             &event_tx,
             &cancel,
             &mut live_rx,
+            &mut delivery_rx,
+            &mut logical_session,
+            None,
+            None,
+            VecDeque::new(),
             Some(Duration::from_millis(100)),
         )
         .await;
@@ -2209,6 +3388,8 @@ mod tests {
         let (event_tx, _rx) = mpsc::channel::<AgentEvent>(8);
         let cancel = CancellationToken::new();
         let (_live_tx, mut live_rx) = mpsc::unbounded_channel::<ParentFrame>();
+        let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
+        let mut logical_session = Session::new("child-y", "model");
         let mut link = InstantTerminalLink { done: false };
         // Even a tiny timeout must NOT trip: the terminal frame arrives first and
         // disarms the watchdog.
@@ -2224,6 +3405,11 @@ mod tests {
             &event_tx,
             &cancel,
             &mut live_rx,
+            &mut delivery_rx,
+            &mut logical_session,
+            None,
+            None,
+            VecDeque::new(),
             Some(Duration::from_millis(50)),
         )
         .await;

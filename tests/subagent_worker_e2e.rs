@@ -51,10 +51,13 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
     client
         .send(ParentFrame::Run(RunSpec {
             assignment: "ping pong".into(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
         .await
@@ -70,6 +73,9 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
                 }
             }
             ChildFrame::ApprovalRequest { .. } => {}
+            ChildFrame::SessionMessageAdmitted { .. } => {
+                panic!("worker must not confirm an empty initial SessionInbox batch")
+            }
             ChildFrame::Terminal { status, result, .. } => {
                 terminal = Some((status, result));
                 break;

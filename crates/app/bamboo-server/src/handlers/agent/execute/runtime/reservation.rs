@@ -1,11 +1,11 @@
-use tokio_util::sync::CancellationToken;
-
 use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
-use bamboo_engine::execution::{reserve_runner_core, ReserveOutcome};
+use bamboo_engine::execution::{
+    reserve_session_execution, SessionExecutionReservation, SessionExecutionReserveOutcome,
+};
 
 pub(in crate::handlers::agent::execute) enum RunnerReservation {
-    Started(CancellationToken, String),
+    Started(SessionExecutionReservation),
     AlreadyRunning(String),
 }
 
@@ -22,7 +22,8 @@ pub(in crate::handlers::agent::execute) async fn reserve_runner(
     session_id: &str,
     session_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
 ) -> RunnerReservation {
-    match reserve_runner_core(
+    match reserve_session_execution(
+        &state.agent,
         &state.agent_runners,
         &state.session_event_senders,
         session_id,
@@ -30,10 +31,10 @@ pub(in crate::handlers::agent::execute) async fn reserve_runner(
     )
     .await
     {
-        ReserveOutcome::Reserved(reservation) => {
-            RunnerReservation::Started(reservation.cancel_token, reservation.run_id)
+        SessionExecutionReserveOutcome::Reserved(reservation) => {
+            RunnerReservation::Started(reservation)
         }
-        ReserveOutcome::AlreadyRunning(run_id) => {
+        SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
             tracing::debug!(
                 "[{}] Runner already running, returning status: already_running",
                 session_id

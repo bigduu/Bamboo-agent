@@ -9,11 +9,10 @@ use async_trait::async_trait;
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::Session;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use super::execute::{consume_pending_clarification_resume, has_pending_user_message};
 use super::types::{ResumeConfigSnapshot, ResumeOutcome};
-use crate::execution::runner_lifecycle::RunnerReservation;
+use crate::execution::{SessionExecutionReservation, SessionExecutionReserveOutcome};
 
 // ---------------------------------------------------------------------------
 // Port trait
@@ -34,16 +33,12 @@ pub trait ResumeExecutionPort: Send + Sync {
     /// from disk back into `session` (which is why this takes `&mut`).
     async fn save_and_cache_session(&self, session: &mut Session);
 
-    /// Try to reserve a runner slot for the given session.
-    /// Returns `None` if a runner is already active.
-    async fn try_reserve_runner(
+    /// Reserve the shared runner/router ownership for the given session.
+    async fn reserve_session_execution(
         &self,
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
-    ) -> Option<RunnerReservation>;
-
-    /// Get the run_id of an existing runner if one exists.
-    async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String>;
+    ) -> SessionExecutionReserveOutcome;
 
     /// Get or create the long-lived broadcast sender for session events.
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent>;
@@ -66,8 +61,7 @@ pub trait ResumeExecutionPort: Send + Sync {
 pub struct ResumeSpawnRequest {
     pub session_id: String,
     pub session: Session,
-    pub cancel_token: CancellationToken,
-    pub run_id: String,
+    pub execution_reservation: SessionExecutionReservation,
     pub event_sender: broadcast::Sender<AgentEvent>,
     pub config: ResumeConfigSnapshot,
 }
@@ -99,13 +93,16 @@ pub async fn resume_session_execution(
 
     // Reserve runner slot.
     let event_sender = port.get_or_create_event_sender(session_id).await;
-    let Some(reservation) = port.try_reserve_runner(session_id, &event_sender).await else {
-        // If already running, try to get the existing runner's run_id
-        let existing_run_id = port.get_existing_runner_run_id(session_id).await;
-        return ResumeOutcome::AlreadyRunning {
-            run_id: existing_run_id.unwrap_or_default(),
-        };
+    let reservation = match port
+        .reserve_session_execution(session_id, &event_sender)
+        .await
+    {
+        SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+        SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
+            return ResumeOutcome::AlreadyRunning { run_id };
+        }
     };
+    let run_id = reservation.run_id().to_string();
 
     consume_pending_clarification_resume(&mut session);
     port.save_and_cache_session(&mut session).await;
@@ -113,14 +110,11 @@ pub async fn resume_session_execution(
     port.spawn_resume_execution(ResumeSpawnRequest {
         session_id: session_id.to_string(),
         session,
-        cancel_token: reservation.cancel_token,
-        run_id: reservation.run_id.clone(),
+        execution_reservation: reservation,
         event_sender,
         config,
     })
     .await;
 
-    ResumeOutcome::Started {
-        run_id: reservation.run_id,
-    }
+    ResumeOutcome::Started { run_id }
 }

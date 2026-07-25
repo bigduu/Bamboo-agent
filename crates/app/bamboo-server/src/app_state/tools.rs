@@ -161,6 +161,7 @@ pub(super) fn build_root_tools(
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
+    session_messenger: Arc<bamboo_engine::SessionMessenger>,
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -172,7 +173,6 @@ pub(super) fn build_root_tools(
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
     broker: Option<bamboo_config::BrokerClientConfig>,
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
-    notification_relay: super::session_events::NotificationRelayDeps,
     project_store: Arc<bamboo_projects::ProjectStore>,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool.
@@ -180,6 +180,7 @@ pub(super) fn build_root_tools(
         session_store: session_store.clone(),
         storage: storage.clone(),
         persistence: persistence.clone(),
+        session_messenger: Some(session_messenger),
         scheduler: spawn_scheduler,
         sessions_cache: sessions,
         agent_runners: agent_runners.clone(),
@@ -188,7 +189,6 @@ pub(super) fn build_root_tools(
         config: config.clone(),
         project_store: Some(project_store.clone()),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
-        notification_relay: Some(notification_relay),
     });
 
     // Root sessions can create and manage child sessions via unified SubAgent tool.

@@ -75,17 +75,25 @@ pub use bamboo_agent_core::{
     TokenBudgetUsage, TokenUsage,
 };
 pub use bamboo_domain::{
-    AgentHookPoint, HookPayload, HookResult, HookToolOutcome, TaskItem, TaskItemStatus, TaskList,
+    AgentHookPoint, HookPayload, HookResult, HookToolOutcome, SessionActivationDisposition,
+    SessionActivationError, SessionActivationPolicy, SessionActivationPort, SessionChildOutcome,
+    SessionInboxBacklog, SessionInboxClaim, SessionInboxError, SessionInboxLimits,
+    SessionInboxPort, SessionInboxReceipt, SessionMessageBody, SessionMessageContent,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
+    SessionProviderMessage, SessionRuntimeInstruction, TaskItem, TaskItemStatus, TaskList,
 };
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
 pub use bamboo_engine::{
     Agent as RuntimeAgent, AgentBuilder as RuntimeAgentBuilder, ExecuteRequest, HookRunner,
-    ShellCommandHook, ShellHookEvent,
+    SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationRouter,
+    SessionActivationSpawner, SessionMessagingMetrics, SessionMessagingMetricsSnapshot,
+    SessionMessenger, SessionMessengerAdmission, SessionMessengerError, SessionMessengerReceipt,
+    SessionRunRegistration, SessionRunRegistrationError, ShellCommandHook, ShellHookEvent,
 };
 pub use bamboo_llm::LLMProvider;
 pub use bamboo_mcp::manager::McpServerManager;
 pub use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
-pub use bamboo_storage::SessionIndexEntry;
+pub use bamboo_storage::{FileSessionInbox, SessionIndexEntry};
 pub use bamboo_tools::permission::{PermissionChecker, PermissionMode, PermissionType};
 pub use bamboo_tools::{BuiltinToolExecutor, BuiltinToolExecutorBuilder, ToolOutputManager};
 
@@ -295,8 +303,14 @@ impl Agent {
         let agent = self.clone();
 
         tokio::spawn(async move {
+            // Keep one sender alive through the direct-execution terminal
+            // handshake. The engine consumes/drops the request sender when the
+            // provider loop returns, but the public stream must not close before
+            // finalization has handed any terminal-window inbox generation to
+            // its successor.
+            let execution_tx = event_tx.clone();
             if let Err(error) = agent
-                .execute_internal(&mut session, event_tx, cancel_token)
+                .execute_internal(&mut session, execution_tx, cancel_token)
                 .await
             {
                 tracing::warn!("Agent::run_stream execution failed: {error}");
@@ -332,7 +346,7 @@ impl Agent {
         session: &mut Session,
         request: ExecuteRequest,
     ) -> Result<(), AgentError> {
-        self.inner.execute(session, request).await
+        self.inner.execute_direct(session, request).await
     }
 
     /// Shared execution path: prepare the session (system prompt + model), build
@@ -344,6 +358,10 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
+        // Own the logical session before any pre-execution mutation or approved
+        // tool replay. Two cloned SDK Session values must collide before either
+        // can duplicate a mutating side effect.
+        let direct_lease = self.inner.begin_direct_execution(&session.id).await?;
         if session.project_id_meta().is_none() {
             if let Some(project_id) = self.project_id.as_ref() {
                 session.set_project_id_meta(project_id.to_string());
@@ -390,7 +408,9 @@ impl Agent {
             builder = builder.model(model);
         }
 
-        self.inner.execute(session, builder.build()).await
+        self.inner
+            .execute_direct_registered(session, builder.build(), direct_lease)
+            .await
     }
 
     /// Port of `bamboo-server`'s `resume_adapter.rs` re-execution logic: after
@@ -514,6 +534,24 @@ impl Agent {
     /// Access the runtime persistence adapter.
     pub fn persistence(&self) -> &Arc<dyn bamboo_domain::RuntimeSessionPersistence> {
         self.inner.persistence()
+    }
+
+    /// Submit typed logical-session messages through the coherent durable
+    /// delivery plane configured by
+    /// [`AgentBuilder::session_delivery`](AgentBuilder::session_delivery).
+    pub fn session_messenger(&self) -> Option<&Arc<bamboo_engine::SessionMessenger>> {
+        self.inner.session_messenger()
+    }
+
+    /// Inspect/claim the configured durable logical-session inbox.
+    pub fn session_inbox(&self) -> Option<&Arc<dyn bamboo_domain::SessionInboxPort>> {
+        self.inner.session_inbox()
+    }
+
+    /// Access the configured logical-session activation router for binding a
+    /// host-specific [`SessionActivationSpawner`].
+    pub fn activation_router(&self) -> Option<&Arc<bamboo_engine::SessionActivationRouter>> {
+        self.inner.activation_router()
     }
 
     // ------------------------------------------------------------------
@@ -1216,6 +1254,7 @@ mod reexecute_and_child_approval_tests {
     use super::*;
     use bamboo_agent_core::tools::{FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     /// A tool whose real output is trivially distinguishable from the
     /// synthetic "Selected response: Approve" placeholder `submit_pending_response`
@@ -1230,6 +1269,58 @@ mod reexecute_and_child_approval_tests {
             Self {
                 calls: AtomicUsize::new(0),
             }
+        }
+    }
+
+    struct BlockingRealOutputTool {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingRealOutputTool {
+        fn name(&self) -> &str {
+            "real_output_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test-only approved tool that blocks while ownership is challenged"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ToolOutcome::Completed(
+                bamboo_agent_core::tools::ToolResult::text(true, "BLOCKING REAL OUTPUT"),
+            ))
+        }
+    }
+
+    struct ImmediateDoneProvider;
+
+    #[async_trait]
+    impl bamboo_llm::LLMProvider for ImmediateDoneProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            Ok(Box::pin(futures::stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token("done".to_string())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
         }
     }
 
@@ -1462,6 +1553,84 @@ mod reexecute_and_child_approval_tests {
             .find(|m| m.tool_call_id.as_deref() == Some("call-reexec-1"))
             .expect("tool result message present");
         assert_eq!(reloaded_result.content, "REAL TOOL OUTPUT #0");
+    }
+
+    #[tokio::test]
+    async fn rejected_clone_never_enters_approved_mutating_tool_replay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_json = r#"{
+            "provider": "anthropic",
+            "providers": {
+                "anthropic": { "api_key": "test-key", "model": "claude-test" }
+            }
+        }"#;
+        std::fs::write(tmp.path().join("config.json"), config_json).expect("write config");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let tool = Arc::new(BlockingRealOutputTool {
+            calls: AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let router = bamboo_engine::SessionActivationRouter::new();
+        let agent = AgentBuilder::new()
+            .model("claude-test")
+            .instruction("test agent")
+            .provider(Arc::new(ImmediateDoneProvider))
+            .tool_shared(tool.clone())
+            .session_delivery(router)
+            .with_defaults_for_data_dir(tmp.path().to_path_buf())
+            .await
+            .expect("defaults should assemble")
+            .build()
+            .expect("agent should build");
+
+        let mut first_session = seed_gated_tool_session("approved-replay-owner", "approved-call");
+        first_session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "approved-call".to_string(),
+        );
+        first_session.add_message(Message::user("continue after approval"));
+        agent
+            .storage()
+            .save_session(&first_session)
+            .await
+            .expect("seed approved session");
+        let mut rejected_session = first_session.clone();
+
+        let first_agent = agent.clone();
+        let first = tokio::spawn(async move { first_agent.run_session(&mut first_session).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("first owner must enter approved tool replay");
+
+        let collision = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run_session(&mut rejected_session),
+        )
+        .await
+        .expect("rejected clone must fail promptly")
+        .expect_err("a second logical-session owner must collide");
+        assert!(
+            collision
+                .to_string()
+                .contains("session activation owner collision"),
+            "unexpected collision error: {collision}"
+        );
+        assert_eq!(
+            tool.calls.load(Ordering::SeqCst),
+            1,
+            "the rejected clone must collide before entering a mutating tool"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("first owner must finish")
+            .expect("first owner task must not panic")
+            .expect("first owner execution must succeed");
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

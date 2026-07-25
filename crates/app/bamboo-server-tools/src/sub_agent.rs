@@ -751,6 +751,7 @@ impl Tool for SubAgentTool {
                                 format!("# Task: {title}\n\n{responsibility}\n\n{prompt}"),
                                 Some(should_auto_run),
                                 Some(false),
+                                Some(ctx.tool_call_id.as_ref()),
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
@@ -1082,6 +1083,7 @@ impl Tool for SubAgentTool {
                     message,
                     auto_run,
                     interrupt_running,
+                    Some(ctx.tool_call_id.as_ref()),
                 )
                 .await
                 .map_err(tool_error_from_child_session)?;

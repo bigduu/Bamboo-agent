@@ -12,7 +12,6 @@ use super::helpers::{
 use super::DELEGATION_NOTE;
 use super::{
     ChildSessionEntry, ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult,
-    QueuedInjectedMessage,
 };
 
 pub async fn create_child_action(
@@ -544,12 +543,13 @@ pub async fn send_message_to_child_action(
     message: String,
     auto_run: Option<bool>,
     interrupt_running: Option<bool>,
+    idempotency_key: Option<&str>,
 ) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(&parent.id, &child_session_id)
         .await?;
 
-    let is_running = port.is_child_running(&child.id).await;
+    let mut is_running = port.is_child_running(&child.id).await;
     let should_interrupt = interrupt_running.unwrap_or(false);
 
     if is_running && should_interrupt {
@@ -557,90 +557,90 @@ pub async fn send_message_to_child_action(
         child = port
             .load_child_for_parent(&parent.id, &child_session_id)
             .await?;
+        // Cancellation changes the routing decision. In particular,
+        // auto_run=false means "leave a draft" after interrupting the old run,
+        // not "wake a successor" based on the pre-cancel snapshot.
+        is_running = port.is_child_running(&child.id).await;
     }
 
     let message = normalize_required_text(Some(message), "message")?;
 
-    if is_running && !should_interrupt {
-        // Actor child with a live WS connection: deliver in-band. The worker's
-        // agent loop admits it at the next round boundary — the same semantics
-        // as the queued path below, extended across the process boundary. The
-        // message is appended to the durable transcript immediately so the
-        // next activation rehydrates with it and nothing is delivered twice.
-        if crate::external_agents::live::deliver_message(&child.id, &message) {
-            child.add_message(bamboo_agent_core::Message::user(message.clone()));
-            port.save_child_session(&mut child).await?;
-            return Ok(json!({
-                "child_session_id": child.id,
-                "status": "message_delivered_live",
-                "auto_run": false,
-                "message": message,
-                "message_count": child.messages.len(),
-                "note": "Message delivered to the running actor in-band; it will be admitted at the next round boundary without canceling progress.",
-            }));
-        }
-
-        // Store the message in session runtime metadata so the running agent
-        // loop can merge it at the next turn boundary without canceling
-        // progress. Routed through the typed accessor (dual-writes the typed
-        // field + the legacy `pending_injected_messages` JSON string mirror).
-        let mut pending = child.pending_injected_messages().unwrap_or_default();
-        let queued = QueuedInjectedMessage {
-            content: message.clone(),
-            created_at: Some(chrono::Utc::now()),
+    let should_auto_run = auto_run.unwrap_or(true);
+    // `interrupt_running` is meaningful only for an actually-running child.
+    // On an idle child, `auto_run=false` must retain the historical draft-only
+    // behavior regardless of that otherwise-inert flag.
+    if should_route_child_message_through_inbox(is_running, should_auto_run) {
+        let delivery = port
+            .send_session_message(&parent.id, &child.id, &message, idempotency_key)
+            .await?;
+        let (delivery, activation, status, note, activation_error) = match delivery {
+            super::ChildSessionMessageDelivery::Activated(receipt) => {
+                let (status, note) = match receipt.activation {
+                    bamboo_domain::SessionActivationDisposition::ActiveNotified => (
+                        "message_delivered_live",
+                        "Message durably delivered and the owning active loop was notified.",
+                    ),
+                    bamboo_domain::SessionActivationDisposition::ActivationReserved => (
+                        "queued",
+                        "Message durably delivered and exactly one session activation was reserved.",
+                    ),
+                    bamboo_domain::SessionActivationDisposition::ActivationCoalesced => (
+                        "message_queued",
+                        "Message durably delivered; activation coalesced with existing session work.",
+                    ),
+                };
+                (
+                    receipt.delivery,
+                    Some(receipt.activation),
+                    status,
+                    note,
+                    None,
+                )
+            }
+            super::ChildSessionMessageDelivery::ActivationPending { delivery, error } => (
+                delivery,
+                None,
+                "activation_pending",
+                "Message is durable; activation is pending and will be retried from the inbox watermark.",
+                Some(error),
+            ),
         };
-        pending.push(serde_json::to_value(&queued).unwrap_or(serde_json::Value::Null));
-        child.set_pending_injected_messages(pending);
-        port.save_child_session(&mut child).await?;
-
-        // Race guard: the `is_running` snapshot above may be stale — if the
-        // child finished between that check and this queue write, nothing
-        // would ever drain the pending message. Re-check and schedule a run
-        // so the message is processed instead of stranding.
-        if !port.is_child_running(&child.id).await {
-            port.enqueue_child_run(parent, &child).await?;
-            return Ok(json!({
-                "child_session_id": child.id,
-                "status": "queued",
-                "auto_run": true,
-                "message": message,
-                "message_count": child.messages.len(),
-                "note": "Child finished while the message was being queued; a new run was scheduled to process it.",
-            }));
-        }
-
         return Ok(json!({
             "child_session_id": child.id,
-            "status": "message_queued",
-            "auto_run": false,
+            "status": status,
+            "auto_run": !matches!(
+                activation,
+                Some(bamboo_domain::SessionActivationDisposition::ActiveNotified)
+            ),
             "message": message,
+            "message_id": delivery.id.to_string(),
+            "inbox_generation": delivery.generation,
+            "activation_error": activation_error,
             "message_count": child.messages.len(),
-            "note": "Message queued for the child session. It will be picked up at the next turn boundary without canceling current progress.",
+            "note": note,
         }));
     }
 
+    // Explicit `auto_run=false` on an idle child retains its historical
+    // draft-only behavior. All runnable/live delivery paths above converge on
+    // SessionMessenger and never rewrite a snapshot to enqueue.
     child.add_message(bamboo_agent_core::Message::user(message.clone()));
     child.set_last_run_status("pending");
     child.clear_last_run_error();
     port.save_child_session(&mut child).await?;
 
-    let should_auto_run = auto_run.unwrap_or(true);
-    if should_auto_run {
-        port.enqueue_child_run(parent, &child).await?;
-    }
-
     Ok(json!({
         "child_session_id": child.id,
-        "status": if should_auto_run { "queued" } else { "pending" },
-        "auto_run": should_auto_run,
+        "status": "pending",
+        "auto_run": false,
         "message": message,
         "message_count": child.messages.len(),
-        "note": if should_auto_run {
-            "Follow-up message appended and child session queued."
-        } else {
-            "Follow-up message appended. Use action=run to execute the child session."
-        },
+        "note": "Follow-up message appended. Use action=run to execute the child session.",
     }))
+}
+
+fn should_route_child_message_through_inbox(is_running: bool, should_auto_run: bool) -> bool {
+    is_running || should_auto_run
 }
 
 pub async fn cancel_child_action(
@@ -769,5 +769,31 @@ mod tree_tests {
         let a2 = &b.children[0];
         assert_eq!(a2.session_id, "a");
         assert!(a2.children.is_empty(), "cycle must terminate as a leaf");
+    }
+}
+
+#[cfg(test)]
+mod send_message_tests {
+    use super::should_route_child_message_through_inbox;
+
+    #[test]
+    fn running_auto_run_interrupt_matrix_preserves_idle_draft_contract() {
+        for (is_running, auto_run, interrupt_running, expected_inbox) in [
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, true),
+            (false, true, true, true),
+            (true, false, false, true),
+            (true, false, true, false),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            let effective_running = is_running && !interrupt_running;
+            assert_eq!(
+                should_route_child_message_through_inbox(effective_running, auto_run),
+                expected_inbox,
+                "is_running={is_running} auto_run={auto_run} interrupt_running={interrupt_running}"
+            );
+        }
     }
 }

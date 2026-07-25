@@ -1417,6 +1417,7 @@ while IFS= read -r ignored; do :; done
             .run(
                 RunSpec {
                     assignment: "exercise approval".to_string(),
+                    logical_session: None,
                     project_id: None,
                     reasoning_effort: None,
                     permission_policy: Some(PermissionPolicyContext {
@@ -1428,6 +1429,8 @@ while IFS= read -r ignored; do :; done
                         policy: json!({}),
                     }),
                     messages: Vec::new(),
+                    activation_run_id: None,
+                    initial_session_messages: Vec::new(),
                     secrets: RunSecrets::default(),
                 },
                 sink.with_host_bridge(host),
@@ -1611,10 +1614,13 @@ while IFS= read -r ignored; do :; done
         .unwrap();
         let spec = RunSpec {
             assignment: "token lifecycle".to_string(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: RunSecrets {
                 codex_provider_token: Some(SecretValue::new("bcx1_app_server_secret")),
             },

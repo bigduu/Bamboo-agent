@@ -16,16 +16,96 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::{AgentEvent, Role, SessionKind};
+use bamboo_domain::{
+    AgentRuntimeState, AgentStatusState, SuspensionState, WaitingForBashState,
+    WaitingForChildrenState,
+};
 
 use crate::runtime::execution::event_forwarder::create_event_forwarder;
-use crate::runtime::execution::runner_lifecycle::{
-    finalize_runner, try_reserve_runner, RunnerReservation,
-};
+use crate::runtime::execution::runner_lifecycle::{finalize_runner, try_reserve_runner};
 use crate::runtime::execution::session_events::get_or_create_event_sender;
 use crate::runtime::execution::spawn::{
     publish_child_completion_parts, watch_child_liveness, watchdog_policy_for_session,
     SpawnContext, SpawnJob,
 };
+use crate::runtime::execution::SessionExecutionReservation;
+
+type HostWaitSnapshot = (Option<WaitingForChildrenState>, Option<WaitingForBashState>);
+
+fn host_wait_snapshot(session: &bamboo_agent_core::Session) -> HostWaitSnapshot {
+    crate::runtime::runner::state_bridge::read_runtime_state(session)
+        .map(|state| (state.waiting_for_children, state.waiting_for_bash))
+        .unwrap_or((None, None))
+}
+
+/// Reconcile actor execution with the host-owned durable wait control plane.
+///
+/// `Some` means the durable read succeeded and is authoritative, including
+/// `(None, None)` (a completion cleared the wait). `None` means the read was
+/// unavailable; preserve the prepared in-memory wait and fail closed by
+/// re-suspending rather than publishing a false terminal completion.
+fn reconcile_actor_host_wait(
+    session: &mut bamboo_agent_core::Session,
+    durable: Option<HostWaitSnapshot>,
+    run_id: &str,
+) {
+    if session
+        .metadata
+        .get("runtime.suspend_reason")
+        .is_some_and(|reason| !reason.trim().is_empty())
+    {
+        return;
+    }
+
+    let durable_available = durable.is_some();
+    let mut runtime_state = crate::runtime::runner::state_bridge::read_runtime_state(session)
+        .unwrap_or_else(|| AgentRuntimeState::new(run_id));
+    if let Some((waiting_for_children, waiting_for_bash)) = durable {
+        runtime_state.waiting_for_children = waiting_for_children;
+        runtime_state.waiting_for_bash = waiting_for_bash;
+    }
+    let reason = if runtime_state.waiting_for_children.is_some() {
+        Some(("waiting_for_children", "ChildCompletion"))
+    } else if runtime_state.waiting_for_bash.is_some() {
+        Some(("waiting_for_bash", "BashCompletion"))
+    } else {
+        None
+    };
+    if let Some((reason, hook_point)) = reason {
+        runtime_state.status = AgentStatusState::Suspended;
+        runtime_state.suspension = Some(SuspensionState {
+            reason: reason.to_string(),
+            suspended_at: Utc::now(),
+            resumable: true,
+            hook_point: Some(hook_point.to_string()),
+        });
+        session
+            .metadata
+            .insert("runtime.suspend_reason".to_string(), reason.to_string());
+    } else if durable_available
+        && runtime_state.suspension.as_ref().is_some_and(|suspension| {
+            matches!(
+                suspension.reason.as_str(),
+                "waiting_for_children" | "waiting_for_bash"
+            )
+        })
+    {
+        // A successful durable read that cleared the wait wins over a stale
+        // prepared snapshot.
+        runtime_state.suspension = None;
+        if runtime_state.status == AgentStatusState::Suspended {
+            runtime_state.status = AgentStatusState::Idle;
+        }
+    }
+    crate::runtime::runner::state_bridge::write_runtime_state(session, &runtime_state);
+    // Keep the rolling-upgrade/raw-reader mirror coherent with the typed
+    // control plane. A stale legacy Idle must never mask typed Suspended.
+    if let Ok(serialized) = serde_json::to_string(&runtime_state) {
+        session
+            .metadata
+            .insert("agent.runtime.state".to_string(), serialized);
+    }
+}
 
 /// Launch a single child spawn job.
 ///
@@ -37,11 +117,32 @@ use crate::runtime::execution::spawn::{
 /// not found) before the background task is spawned.
 ///
 /// Preserves EXACTLY the canonical behavior:
-/// - `SubAgentStarted` is emitted by the *adapter* before enqueue (not here).
+/// - Scheduler callers own launch announcements: queued adapter launches
+///   retain their titled event, while reserved SessionInbox activation emits
+///   an untitled event from [`crate::execution::SpawnScheduler`].
+///   Direct SDK callers remain responsible for their own announcement.
 /// - Event forwarder + 5s heartbeat tasks, watchdog, runner reservation.
 /// - Full real [`ExecuteRequest`] field set incl. split provider fields.
 /// - Terminal status strings `completed | cancelled | error | skipped | timeout`.
 pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), String> {
+    run_child_spawn_inner(ctx, job, None).await
+}
+
+/// Canonical child activation using a runner slot already reserved by the
+/// logical-session activation router.
+pub(crate) async fn run_child_spawn_reserved(
+    ctx: SpawnContext,
+    job: SpawnJob,
+    reservation: SessionExecutionReservation,
+) -> Result<(), String> {
+    run_child_spawn_inner(ctx, job, Some(reservation)).await
+}
+
+async fn run_child_spawn_inner(
+    ctx: SpawnContext,
+    job: SpawnJob,
+    reserved: Option<SessionExecutionReservation>,
+) -> Result<(), String> {
     // Ensure both session event streams exist.
     let parent_tx =
         get_or_create_event_sender(&ctx.session_event_senders, &job.parent_session_id).await;
@@ -84,19 +185,64 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         }
     };
 
-    // Register the child's workspace in the global state so tools
-    // (Read, Glob, Grep, Bash, etc.) can resolve relative paths. `set_workspace`
-    // returns the FINAL stored path, which may differ from the requested one
-    // when workspace-root confinement (#217) relocated it — store that back
-    // onto the domain field so `session.workspace` never diverges from where
-    // tools actually run.
-    if let Some(ref ws) = session.workspace {
-        let stored = bamboo_agent_core::workspace_state::set_workspace(
-            &session.id,
-            std::path::PathBuf::from(ws),
-        );
-        session.workspace = Some(stored.to_string_lossy().to_string());
-    }
+    // A reserved activation was published by the logical-session router before
+    // this task became runnable. Validate that exact ownership and the durable
+    // authorized prefix before mutating workspace/control state or writing a
+    // false running marker.
+    let reserved_identity = reserved.as_ref().map(|reservation| {
+        (
+            reservation.run_id().to_string(),
+            reservation.matches_execution_target(
+                &job.child_session_id,
+                &session.id,
+                &ctx.agent_runners,
+            ),
+        )
+    });
+    let reserved_activation = if let Some((reserved_run_id, exact_target)) = reserved_identity {
+        let exact_runner = ctx
+            .agent_runners
+            .read()
+            .await
+            .get(&job.child_session_id)
+            .is_some_and(|runner| {
+                runner.run_id == reserved_run_id
+                    && matches!(
+                        runner.status,
+                        crate::runtime::execution::AgentStatus::Running
+                    )
+            });
+        let exact_owner = match ctx.agent.activation_router() {
+            Some(router) => {
+                router
+                    .owns_run(&job.child_session_id, &reserved_run_id)
+                    .await
+            }
+            None => false,
+        };
+        let authorized_prefix = match ctx.agent.session_inbox() {
+            Some(inbox) => inbox
+                .inspect(&job.child_session_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "inspect reserved child SessionInbox {}: {error}",
+                        job.child_session_id
+                    )
+                })?
+                .activation_pending(),
+            None => false,
+        };
+        if !exact_target || !exact_runner || !exact_owner || !authorized_prefix {
+            return Err(format!(
+                "reserved child activation {} failed ownership/prefix validation for {}",
+                reserved_run_id, job.child_session_id
+            ));
+        }
+        true
+    } else {
+        false
+    };
 
     if session.kind != SessionKind::Child {
         let error = "spawn job child session is not kind=child".to_string();
@@ -104,13 +250,15 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         // child as pending/running — a wait registered over it later (or the
         // orphan safety net) would otherwise hang on a status that no future
         // completion can ever advance.
-        session.set_last_run_status("error");
-        session.set_last_run_error(error.clone());
-        let _ = ctx
-            .agent
-            .persistence()
-            .save_runtime_session(&mut session)
-            .await;
+        if !reserved_activation {
+            session.set_last_run_status("error");
+            session.set_last_run_error(error.clone());
+            let _ = ctx
+                .agent
+                .persistence()
+                .save_runtime_session(&mut session)
+                .await;
+        }
         publish_child_completion_parts(
             &parent_tx,
             ctx.completion_handler.clone(),
@@ -140,7 +288,7 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         .last()
         .map(|m| matches!(m.role, Role::User))
         .unwrap_or(false);
-    if !last_is_user {
+    if !last_is_user && !reserved_activation {
         session.set_last_run_status("skipped");
         session.set_last_run_error("No pending message to execute");
         let _ = ctx
@@ -164,7 +312,81 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         return Ok(());
     }
 
-    // Persist a running marker early so list_sessions can reconstruct status.
+    // Own runner and router registration as one RAII handoff before workspace
+    // publication, durable running markers, launch hooks, or actor execution.
+    let mut execution_reservation = if let Some(reservation) = reserved {
+        reservation
+    } else {
+        let Some(reservation) = try_reserve_runner(
+            &ctx.agent_runners,
+            &ctx.session_event_senders,
+            &job.child_session_id,
+            &child_tx,
+        )
+        .await
+        else {
+            // A Running runner already exists for this child (duplicate enqueue,
+            // or a stale entry left by a dead task). Publish nothing: if the
+            // earlier run is alive its own completion will fire; if it is a
+            // stale entry the child-wait watchdog will detect the dead child and
+            // synthesize an error completion.
+            tracing::warn!(
+                parent_session_id = %job.parent_session_id,
+                child_session_id = %job.child_session_id,
+                "child spawn skipped: runner already registered for this child"
+            );
+            return Ok(());
+        };
+        SessionExecutionReservation::from_pending_registration(
+            job.child_session_id.clone(),
+            reservation,
+            ctx.agent.activation_router().cloned(),
+            ctx.agent_runners.clone(),
+        )
+    };
+    let run_id = execution_reservation.run_id().to_string();
+    if let Err(error) = execution_reservation.ensure_registered().await {
+        let same_run_duplicate = error.existing_run_id() == run_id;
+        tracing::warn!(
+            parent_session_id = %job.parent_session_id,
+            child_session_id = %job.child_session_id,
+            run_id = %run_id,
+            %error,
+            "child runner registration collided with an existing logical-session owner"
+        );
+        if same_run_duplicate {
+            return Ok(());
+        }
+        let setup_error = error.to_string();
+        publish_child_completion_parts(
+            &parent_tx,
+            ctx.completion_handler.clone(),
+            job.parent_session_id.clone(),
+            job.child_session_id.clone(),
+            "error".to_string(),
+            Some(setup_error.clone()),
+        )
+        .await;
+        return Err(setup_error);
+    }
+    let (cancel_token, mut activation_registration) = execution_reservation.disarm_for_execution();
+
+    // Publish the child's process-global workspace only after this task owns
+    // both the exact runner slot and logical-session router. A rejected
+    // cross-entry caller must not overwrite a live owner's tool root or
+    // materialize a directory it was never authorized to use.
+    if let Some(ref ws) = session.workspace {
+        let stored = bamboo_agent_core::workspace_state::set_workspace(
+            &session.id,
+            std::path::PathBuf::from(ws),
+        );
+        session.workspace = Some(stored.to_string_lossy().to_string());
+    }
+
+    // Persist a running marker only after this task owns both the runner slot
+    // and the logical-session router. A distinct cross-entry collision is a
+    // synchronous setup failure and must never leave a false durable `running`
+    // state behind.
     session.set_last_run_status("running");
     session.clear_last_run_error();
     let _ = ctx
@@ -172,29 +394,6 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         .persistence()
         .save_runtime_session(&mut session)
         .await;
-
-    // Insert runner status.
-    let Some(RunnerReservation { cancel_token, .. }) = try_reserve_runner(
-        &ctx.agent_runners,
-        &ctx.session_event_senders,
-        &job.child_session_id,
-        &child_tx,
-    )
-    .await
-    else {
-        // A Running runner already exists for this child (duplicate enqueue, or
-        // a stale entry left by a dead task). Publish nothing: if the earlier
-        // run is alive its own completion will fire; if it is a stale entry the
-        // child-wait watchdog will detect the dead child and synthesize an
-        // error completion. Publishing "error" here would falsely satisfy the
-        // parent's wait while a genuine run is still in flight.
-        tracing::warn!(
-            parent_session_id = %job.parent_session_id,
-            child_session_id = %job.child_session_id,
-            "child spawn skipped: runner already registered for this child"
-        );
-        return Ok(());
-    };
 
     // Forward ALL child events to parent.
     let forwarder_done = CancellationToken::new();
@@ -282,6 +481,7 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
     let child_id_for_done = job.child_session_id.clone();
     let session_event_senders = ctx.session_event_senders.clone();
     let completion_handler = ctx.completion_handler.clone();
+    let activation_run_id = run_id;
 
     tokio::spawn(async move {
         // Set the child model via the single authoritative pre-execution
@@ -351,6 +551,26 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             )))
             };
 
+        // Actor execution owns provider I/O, but the host remains authoritative
+        // for child/Bash wait ownership. Explicit SessionInbox steering may
+        // interrupt one reasoning gate without clearing that durable wait.
+        // Reconcile the newest host control-plane state before terminal mapping
+        // so a still-armed wait re-suspends, while a concurrent completion that
+        // cleared it wins over this task's stale snapshot.
+        let durable_wait = match agent.storage().load_session(&session_id_clone).await {
+            Ok(Some(persisted)) => Some(host_wait_snapshot(&persisted)),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id_clone,
+                    %error,
+                    "could not reconcile host-persisted wait ownership after actor execution; preserving in-memory wait"
+                );
+                None
+            }
+        };
+        reconcile_actor_host_wait(&mut session, durable_wait, &activation_run_id);
+
         let timeout_error = timeout_reason.read().await.clone();
         // Phase 2: a child that suspended awaiting the PARENT's approval of a
         // gated tool is NOT done — publish a NON-terminal "suspended" status so
@@ -389,14 +609,73 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             }
         };
 
-        // Merge any queued injected messages that the pipeline didn't pick up
-        // (e.g. if the loop exited before the next turn boundary).
-        crate::runtime::runner::state_bridge::merge_pending_injected_messages(
+        // Preserve the cursor reached by an actual execution safe boundary.
+        // Terminal cleanup never claims/acks typed work; any newer durable
+        // generation therefore remains pending for a successor reasoning turn.
+        let executed_admitted_generation = session
+            .session_inbox_admission()
+            .map_or(0, |state| state.last_admitted_sequence);
+
+        // Rolling-upgrade producers may have written the legacy queue after the
+        // final provider boundary. Move those values into the durable typed
+        // inbox, but deliberately do not claim/ack them in terminal cleanup:
+        // they have not been presented to reasoning and require a successor.
+        let legacy_migration = crate::runtime::runner::state_bridge::migrate_legacy_pending_only(
             &mut session,
             Some(agent.storage()),
             Some(agent.persistence()),
+            agent.session_inbox(),
         )
         .await;
+        let pending_boundary_generation = session
+            .session_inbox_admission()
+            .and_then(|state| state.pending_activation_generation());
+        let pending_generation = match (
+            pending_boundary_generation,
+            legacy_migration.highest_generation,
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+        if let (Some(generation), Some(router)) = (pending_generation, agent.activation_router()) {
+            let activation_ready = if let Some(inbox) = agent.session_inbox() {
+                match inbox
+                    .mark_activation_eligible(
+                        &session_id_clone,
+                        generation,
+                        bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            session_id = %session_id_clone,
+                            %error,
+                            "failed to persist unadmitted SessionInbox activation watermark"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if activation_ready {
+                if let Err(error) = bamboo_domain::SessionActivationPort::request_activation(
+                    router.as_ref(),
+                    &session_id_clone,
+                    generation,
+                )
+                .await
+                {
+                    tracing::error!(
+                        session_id = %session_id_clone,
+                        %error,
+                        "failed to hand unadmitted SessionInbox generation to activation router"
+                    );
+                }
+            }
+        }
 
         // Persist final session snapshot.
         session.set_last_run_status(status.clone());
@@ -404,6 +683,13 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
             session.set_last_run_error(err.clone());
         } else {
             session.clear_last_run_error();
+        }
+        if let Some(registration) = activation_registration.as_mut() {
+            registration.begin_finalization().await;
+        } else if let Some(router) = agent.activation_router() {
+            router
+                .begin_finalization(&session_id_clone, &activation_run_id)
+                .await;
         }
         let _ = agent.persistence().save_runtime_session(&mut session).await;
         // Flip the runner registry to a terminal status (which makes session
@@ -414,6 +700,26 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
         // leaving a phantom "thinking" indicator for a few seconds after the
         // reply has already completed (notably on a session's first turn).
         finalize_runner(&agent_runners_for_status, &session_id_clone, &result).await;
+        let finalization = if let Some(registration) = activation_registration.take() {
+            registration.finish(executed_admitted_generation).await
+        } else if let Some(router) = agent.activation_router() {
+            router
+                .finish_finalization(
+                    &session_id_clone,
+                    &activation_run_id,
+                    executed_admitted_generation,
+                )
+                .await
+        } else {
+            Ok(None)
+        };
+        if let Err(error) = finalization {
+            tracing::error!(
+                session_id = %session_id_clone,
+                %error,
+                "failed to activate child successor for finalization-racing SessionInbox delivery"
+            );
+        }
         sessions_cache.insert(
             session_id_clone.clone(),
             Arc::new(parking_lot::RwLock::new(session)),
@@ -437,4 +743,103 @@ pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), Str
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod actor_host_wait_tests {
+    use super::*;
+    use bamboo_domain::ChildWaitPolicy;
+
+    fn prepared_waiting_session() -> bamboo_agent_core::Session {
+        let mut session =
+            bamboo_agent_core::Session::new_child("child", "parent", "model", "Child");
+        let mut runtime = AgentRuntimeState::new("prepared-run");
+        runtime.status = AgentStatusState::Idle;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec!["grandchild".to_string()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        ));
+        session.agent_runtime_state = Some(runtime);
+        session
+    }
+
+    #[test]
+    fn actor_host_read_failure_preserves_wait_and_non_terminal_status() {
+        let mut session = prepared_waiting_session();
+        reconcile_actor_host_wait(&mut session, None, "actor-run");
+
+        let runtime = session.agent_runtime_state.as_ref().unwrap();
+        assert!(runtime.waiting_for_children.is_some());
+        assert_eq!(runtime.status, AgentStatusState::Suspended);
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
+        );
+        let legacy: AgentRuntimeState =
+            serde_json::from_str(session.metadata.get("agent.runtime.state").unwrap()).unwrap();
+        assert_eq!(legacy.status, AgentStatusState::Suspended);
+        assert!(legacy.waiting_for_children.is_some());
+        let suspended_non_terminal = session
+            .metadata
+            .get("runtime.suspend_reason")
+            .is_some_and(|reason| !reason.trim().is_empty());
+        assert!(suspended_non_terminal);
+    }
+
+    #[test]
+    fn actor_host_successful_durable_clear_wins_over_prepared_wait() {
+        let mut session = prepared_waiting_session();
+        session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Suspended;
+        session.agent_runtime_state.as_mut().unwrap().suspension = Some(SuspensionState {
+            reason: "waiting_for_children".to_string(),
+            suspended_at: Utc::now(),
+            resumable: true,
+            hook_point: Some("ChildCompletion".to_string()),
+        });
+
+        reconcile_actor_host_wait(&mut session, Some((None, None)), "actor-run");
+
+        let runtime = session.agent_runtime_state.as_ref().unwrap();
+        assert!(runtime.waiting_for_children.is_none());
+        assert!(runtime.waiting_for_bash.is_none());
+        assert_eq!(runtime.status, AgentStatusState::Idle);
+        assert!(runtime.suspension.is_none());
+        assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+        let legacy: AgentRuntimeState =
+            serde_json::from_str(session.metadata.get("agent.runtime.state").unwrap()).unwrap();
+        assert_eq!(legacy, *runtime);
+    }
+
+    #[test]
+    fn actor_host_latest_legacy_only_wait_is_authoritative() {
+        let mut persisted =
+            bamboo_agent_core::Session::new_child("child", "parent", "model", "Child");
+        let mut legacy_runtime = AgentRuntimeState::new("legacy-run");
+        legacy_runtime.waiting_for_bash = Some(WaitingForBashState::for_bash(
+            vec!["shell-1".to_string()],
+            Utc::now(),
+        ));
+        persisted.metadata.insert(
+            "agent.runtime.state".to_string(),
+            serde_json::to_string(&legacy_runtime).unwrap(),
+        );
+        assert!(persisted.agent_runtime_state.is_none());
+
+        let mut live = bamboo_agent_core::Session::new_child("child", "parent", "model", "Child");
+        reconcile_actor_host_wait(&mut live, Some(host_wait_snapshot(&persisted)), "actor-run");
+
+        let runtime = live.agent_runtime_state.as_ref().unwrap();
+        assert!(runtime.waiting_for_bash.is_some());
+        assert_eq!(runtime.status, AgentStatusState::Suspended);
+        assert_eq!(
+            live.metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_bash")
+        );
+    }
 }

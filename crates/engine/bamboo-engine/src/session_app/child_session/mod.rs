@@ -80,6 +80,21 @@ pub struct ChildRunnerInfo {
     pub round_count: u32,
 }
 
+/// Result of a logical parent→child delivery.
+///
+/// Both variants mean the envelope is already durable. `ActivationPending`
+/// preserves the enqueue-success/wake-failure distinction so a tool caller can
+/// report success and let restart recovery retry the durable activation instead
+/// of generating a second message id.
+#[derive(Debug)]
+pub enum ChildSessionMessageDelivery {
+    Activated(crate::SessionMessengerReceipt),
+    ActivationPending {
+        delivery: bamboo_domain::SessionInboxReceipt,
+        error: String,
+    },
+}
+
 /// Short delegation note appended to the full root-style base prompt for a
 /// sub-agent. A sub-agent is a first-class agent (same base prompt + context
 /// enhancement as a top-level session); this note only frames the delegation
@@ -189,6 +204,26 @@ pub trait ChildSessionPort: Send + Sync {
         &self,
         child: &mut Session,
     ) -> Result<(), ChildSessionError>;
+    /// Deliver one parent→child peer message through the runtime-owned logical
+    /// SessionMessenger. Implementations must not mutate the Session snapshot
+    /// to enqueue.
+    async fn send_session_message(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<ChildSessionMessageDelivery, ChildSessionError> {
+        let _ = (
+            source_session_id,
+            target_session_id,
+            message,
+            idempotency_key,
+        );
+        Err(ChildSessionError::Execution(
+            "logical SessionMessenger is not configured for this runtime".to_string(),
+        ))
+    }
     /// Commit the live parent's posture plus a validated workspace when
     /// reusing a resident. Persistence happens before the runtime workspace is
     /// published, so a failed save cannot move tools onto an uncommitted path.
