@@ -27,13 +27,19 @@ pub mod transport;
 
 pub use discovery::{Discovery, Fabric, FileFabric};
 pub use error::{Result, StoreError};
-pub use executor::{ChildExecutor, ChildOutcome, EchoExecutor, EventSink, HostBridge, SteerInbox};
+pub use executor::{
+    ChildExecutor, ChildOutcome, EchoExecutor, EventSink, ExecutorControl, HostBridge, SteerInbox,
+    SteerMessage,
+};
 pub use fleet::{spawn_worker, spawn_worker_on_bus, SpawnedChild};
 pub use mailbox::{
     AdmittedSet, AgentRef, AskBody, AskMode, Delivered, InboxKind, InboxMessage, Mailbox, MsgId,
     ReplyBody, ADMITTED_SET_CAPACITY,
 };
-pub use proto::{AgentRecord, ChildFrame, ParentFrame, RunSpec, TerminalStatus};
+pub use proto::{
+    AgentRecord, ChildFrame, LogicalSessionIdentity, ParentFrame, RunSpec,
+    SessionMessageAdmissionConfirmation, SessionMessageDelivery, TerminalStatus,
+};
 pub use provision::{
     BusEndpoint, Capabilities, ChildIdentity, ExecutorSpec, Limits, McpProxyConfig, ModelRefSpec,
     Placement, ProvisionSpec, ScopedCredential, SecretsEnvelope, PROVISION_VERSION,

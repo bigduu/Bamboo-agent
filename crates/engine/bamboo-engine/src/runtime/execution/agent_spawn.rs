@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -22,11 +22,17 @@ use crate::runtime::config::{
     GuardianSpawner, ImageFallbackConfig,
 };
 use crate::runtime::execution::child_completion::ChildCompletion;
-use crate::runtime::execution::runner_lifecycle::finalize_runner;
+use crate::runtime::execution::runner_lifecycle::{
+    finalize_rejected_runner_if_distinct, finalize_runner, finalize_runner_exact,
+    reserve_runner_core, ReserveOutcome, RunnerReservation,
+};
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
 use crate::runtime::Agent;
 use crate::runtime::{ExecuteRequest, ExecuteRequestBuilder};
+use crate::session_activation::{
+    SessionActivationRouter, SessionRunRegistration, SessionRunRegistrationError,
+};
 
 /// Shared, per-session-locked session cache.
 ///
@@ -38,6 +44,395 @@ use crate::runtime::{ExecuteRequest, ExecuteRequestBuilder};
 pub type SessionCache = std::sync::Arc<
     dashmap::DashMap<String, std::sync::Arc<parking_lot::RwLock<bamboo_agent_core::Session>>>,
 >;
+
+enum SessionExecutionActivationOwnership {
+    /// This runtime was built without a SessionInbox activation router.
+    Unrouted,
+    /// The runtime spawner reserved an external runner, but the router has not
+    /// yet committed the matching owner or invoked the launch closure.
+    UnpublishedActivation(Arc<SessionActivationRouter>),
+    /// This exact raw runner is waiting to acquire or adopt its router
+    /// registration. Manual/server callers enter this state before awaiting an
+    /// in-flight activation token; router-dispatched launches enter it after
+    /// publishing their zero-registration placeholder.
+    RegistrationPending(Arc<SessionActivationRouter>),
+    /// Manual/server reservation acquired router ownership before any
+    /// execution-specific mutation or external side effect.
+    Registered(SessionRunRegistration),
+}
+
+/// One exact runner reservation plus its logical-session activation ownership.
+///
+/// Callers must obtain this through [`reserve_session_execution`]. The only
+/// exception is the router's own activation launcher, which uses the
+/// crate-private placeholder constructor while assembling its two-phase launch.
+pub struct SessionExecutionReservation {
+    session_id: String,
+    run_id: String,
+    cancel_token: CancellationToken,
+    runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    activation: SessionExecutionActivationOwnership,
+    armed: bool,
+}
+
+impl SessionExecutionReservation {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
+    }
+
+    /// Build the handoff owned by a router activation launch.
+    ///
+    /// The value starts unpublished. Its launch closure must call
+    /// [`mark_activation_published`](Self::mark_activation_published) after the
+    /// router commits the matching zero-registration owner.
+    pub(crate) fn from_activation_placeholder(
+        session_id: impl Into<String>,
+        reservation: RunnerReservation,
+        router: Arc<SessionActivationRouter>,
+        runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            run_id: reservation.run_id,
+            cancel_token: reservation.cancel_token,
+            runners,
+            activation: SessionExecutionActivationOwnership::UnpublishedActivation(router),
+            armed: true,
+        }
+    }
+
+    /// Build a manual/queued execution handoff immediately after reserving its
+    /// raw runner. If a router exists, Drop can safely wait for and adopt an
+    /// activation placeholder that observed this exact runner.
+    pub(crate) fn from_pending_registration(
+        session_id: impl Into<String>,
+        reservation: RunnerReservation,
+        router: Option<Arc<SessionActivationRouter>>,
+        runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    ) -> Self {
+        let activation = match router {
+            Some(router) => SessionExecutionActivationOwnership::RegistrationPending(router),
+            None => SessionExecutionActivationOwnership::Unrouted,
+        };
+        Self {
+            session_id: session_id.into(),
+            run_id: reservation.run_id,
+            cancel_token: reservation.cancel_token,
+            runners,
+            activation,
+            armed: true,
+        }
+    }
+
+    /// Mark that the router has published this exact owner and invoked its
+    /// launch closure.
+    pub(crate) fn mark_activation_published(&mut self) {
+        let activation = std::mem::replace(
+            &mut self.activation,
+            SessionExecutionActivationOwnership::Unrouted,
+        );
+        self.activation = match activation {
+            SessionExecutionActivationOwnership::UnpublishedActivation(router) => {
+                SessionExecutionActivationOwnership::RegistrationPending(router)
+            }
+            other => other,
+        };
+    }
+
+    /// Roll back an external runner whose router launch was never published.
+    ///
+    /// The router reservation lease exclusively owns token release and retry
+    /// ordering here, so this path removes only the exact raw runner slot.
+    pub(crate) async fn rollback_unpublished_activation(mut self) {
+        self.armed = false;
+        self.cancel_token.cancel();
+        let activation = std::mem::replace(
+            &mut self.activation,
+            SessionExecutionActivationOwnership::Unrouted,
+        );
+        debug_assert!(matches!(
+            activation,
+            SessionExecutionActivationOwnership::UnpublishedActivation(_)
+        ));
+        remove_runner_exact(&self.runners, &self.session_id, &self.run_id).await;
+    }
+
+    /// Adopt a router-published activation placeholder before any adapter-side
+    /// tool replay, workspace mutation, persistence, relay, or spawned task.
+    ///
+    /// Reservations returned by [`reserve_session_execution`] are already
+    /// registered, so calling this on the normal manual/server path is a no-op.
+    pub async fn ensure_registered(&mut self) -> Result<(), SessionRunRegistrationError> {
+        let router = match &self.activation {
+            SessionExecutionActivationOwnership::RegistrationPending(router) => router.clone(),
+            SessionExecutionActivationOwnership::UnpublishedActivation(_) => {
+                unreachable!("unpublished activation entered an execution adapter")
+            }
+            SessionExecutionActivationOwnership::Unrouted
+            | SessionExecutionActivationOwnership::Registered(_) => return Ok(()),
+        };
+        match register_reserved_activation(router, &self.runners, &self.session_id, &self.run_id)
+            .await
+        {
+            Ok(registration) => {
+                self.activation = SessionExecutionActivationOwnership::Registered(registration);
+                Ok(())
+            }
+            Err(error) => {
+                // The helper already terminalized only a distinct attempted
+                // runner. Disarm Drop here as part of the shared API so every
+                // adapter preserves a same-run live owner's cancellation
+                // token, even when it returns immediately on the collision.
+                self.disarm_after_registration_rejection(error.existing_run_id());
+                Err(error)
+            }
+        }
+    }
+
+    /// Release this exact runner/router reservation before a failed startup is
+    /// reported as retryable. The cleanup owns its state in a detached task so
+    /// cancellation of this explicit wait cannot strand either ownership plane.
+    pub async fn abandon(mut self) {
+        self.armed = false;
+        self.cancel_token.cancel();
+        let activation = std::mem::replace(
+            &mut self.activation,
+            SessionExecutionActivationOwnership::Unrouted,
+        );
+        let runners = self.runners.clone();
+        let session_id = self.session_id.clone();
+        let run_id = self.run_id.clone();
+        let cleanup_session_id = session_id.clone();
+        let cleanup_run_id = run_id.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_execution_reservation(activation, runners, cleanup_session_id, cleanup_run_id)
+                .await;
+        });
+        if let Err(error) = cleanup.await {
+            tracing::error!(
+                %session_id,
+                %run_id,
+                %error,
+                "detached execution-reservation cleanup failed"
+            );
+        }
+    }
+
+    fn disarm_after_registration_rejection(&mut self, existing_run_id: &str) {
+        if existing_run_id != self.run_id {
+            self.cancel_token.cancel();
+        }
+        self.armed = false;
+    }
+
+    pub(crate) fn matches_execution_target(
+        &self,
+        session_id: &str,
+        domain_session_id: &str,
+        runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    ) -> bool {
+        self.session_id == session_id
+            && domain_session_id == session_id
+            && Arc::ptr_eq(&self.runners, runners)
+    }
+
+    pub(crate) fn disarm_for_execution(
+        &mut self,
+    ) -> (CancellationToken, Option<SessionRunRegistration>) {
+        self.armed = false;
+        let registration = match std::mem::replace(
+            &mut self.activation,
+            SessionExecutionActivationOwnership::Unrouted,
+        ) {
+            SessionExecutionActivationOwnership::Registered(registration) => Some(registration),
+            SessionExecutionActivationOwnership::Unrouted => None,
+            SessionExecutionActivationOwnership::UnpublishedActivation(_) => {
+                unreachable!("unpublished activation cannot transfer to execution")
+            }
+            SessionExecutionActivationOwnership::RegistrationPending(_) => {
+                unreachable!("ensure_registered adopts every pending router registration")
+            }
+        };
+        (self.cancel_token.clone(), registration)
+    }
+}
+
+impl Drop for SessionExecutionReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.cancel_token.cancel();
+        let activation = std::mem::replace(
+            &mut self.activation,
+            SessionExecutionActivationOwnership::Unrouted,
+        );
+        let runners = self.runners.clone();
+        let session_id = self.session_id.clone();
+        let run_id = self.run_id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                cleanup_execution_reservation(activation, runners, session_id, run_id).await;
+            });
+        }
+    }
+}
+
+/// Combined runner/router reservation result.
+pub enum SessionExecutionReserveOutcome {
+    Reserved(SessionExecutionReservation),
+    AlreadyRunning { run_id: String },
+}
+
+async fn register_reserved_activation(
+    router: Arc<SessionActivationRouter>,
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: &str,
+    run_id: &str,
+) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
+    let mut registration = match router.register_run(session_id, run_id).await {
+        Ok(registration) => registration,
+        Err(error) => {
+            let collision = Err(AgentError::LLM(error.to_string()));
+            finalize_rejected_runner_if_distinct(
+                runners,
+                session_id,
+                error.existing_run_id(),
+                run_id,
+                &collision,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let cleanup_runners = runners.clone();
+    let cleanup_session_id = session_id.to_string();
+    let cleanup_run_id = run_id.to_string();
+    registration.set_abort_cleanup(move || async move {
+        let abandoned = Err(AgentError::Cancelled);
+        finalize_runner_exact(
+            &cleanup_runners,
+            &cleanup_session_id,
+            &cleanup_run_id,
+            &abandoned,
+        )
+        .await;
+    });
+    Ok(registration)
+}
+
+async fn cleanup_execution_reservation(
+    activation: SessionExecutionActivationOwnership,
+    runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: String,
+    run_id: String,
+) {
+    match activation {
+        SessionExecutionActivationOwnership::Registered(registration) => {
+            registration.abandon().await;
+        }
+        SessionExecutionActivationOwnership::RegistrationPending(router) => {
+            match register_reserved_activation(router, &runners, &session_id, &run_id).await {
+                Ok(registration) => registration.abandon().await,
+                Err(error) => {
+                    tracing::debug!(
+                        %session_id,
+                        %run_id,
+                        existing_run_id = %error.existing_run_id(),
+                        "abandoned activation placeholder was already adopted or superseded"
+                    );
+                }
+            }
+        }
+        SessionExecutionActivationOwnership::UnpublishedActivation(_) => {
+            remove_runner_exact(&runners, &session_id, &run_id).await;
+        }
+        SessionExecutionActivationOwnership::Unrouted => {
+            let abandoned = Err(AgentError::Cancelled);
+            finalize_runner_exact(&runners, &session_id, &run_id, &abandoned).await;
+        }
+    }
+}
+
+async fn remove_runner_exact(
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: &str,
+    run_id: &str,
+) -> bool {
+    let mut runners = runners.write().await;
+    if runners
+        .get(session_id)
+        .is_some_and(|runner| runner.run_id == run_id)
+    {
+        runners.remove(session_id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Reserve the shared runner slot and logical-session router as one handoff.
+///
+/// The raw runner reservation remains the common low-level primitive used by
+/// the router's own two-phase activation protocol. Every manual/server entry
+/// point uses this wrapper so an SDK owner or another entry surface collides
+/// before approved tools, workspace state, persistence, relays, or a
+/// background execution task can run.
+pub async fn reserve_session_execution(
+    agent: &Arc<Agent>,
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: &Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    session_id: &str,
+    event_sender: &broadcast::Sender<AgentEvent>,
+) -> SessionExecutionReserveOutcome {
+    let reservation = match reserve_runner_core(runners, senders, session_id, event_sender).await {
+        ReserveOutcome::AlreadyRunning(run_id) => {
+            return SessionExecutionReserveOutcome::AlreadyRunning { run_id };
+        }
+        ReserveOutcome::Reserved(reservation) => reservation,
+    };
+
+    // Construct the RAII handoff immediately after the raw runner mutation.
+    // If an activation router exists, publish `RegistrationPending` before the
+    // registration await. Cancellation cleanup then waits through any
+    // in-flight router token, adopts an exact placeholder if the activation
+    // observed this raw runner, and abandons both ownership planes together.
+    let mut execution_reservation = SessionExecutionReservation {
+        session_id: session_id.to_string(),
+        run_id: reservation.run_id,
+        cancel_token: reservation.cancel_token,
+        runners: runners.clone(),
+        activation: SessionExecutionActivationOwnership::Unrouted,
+        armed: true,
+    };
+
+    if let Some(router) = agent.activation_router().cloned() {
+        execution_reservation.activation =
+            SessionExecutionActivationOwnership::RegistrationPending(router);
+        if let Err(error) = execution_reservation.ensure_registered().await {
+            tracing::warn!(
+                %session_id,
+                attempted_run_id = %execution_reservation.run_id(),
+                existing_run_id = %error.existing_run_id(),
+                %error,
+                "runner reservation collided with an existing logical-session owner"
+            );
+            return SessionExecutionReserveOutcome::AlreadyRunning {
+                run_id: error.existing_run_id().to_string(),
+            };
+        }
+    }
+    SessionExecutionReserveOutcome::Reserved(execution_reservation)
+}
 
 /// Read a session out of the in-memory cache, cloning it out from under the
 /// brief sync read-lock. Returns `None` on a cache miss.
@@ -117,6 +512,9 @@ pub struct SessionExecutionArgs {
     pub agent: Arc<Agent>,
     pub session_id: String,
     pub session: Session,
+    /// Exact shared runner/router ownership acquired before caller-side
+    /// execution mutations.
+    pub execution_reservation: SessionExecutionReservation,
 
     // Execution parameters.
     pub tools_override: Option<Arc<dyn ToolExecutor>>,
@@ -138,7 +536,6 @@ pub struct SessionExecutionArgs {
     pub disabled_skill_ids: Option<BTreeSet<String>>,
     pub selected_skill_ids: Option<Vec<String>>,
     pub selected_skill_mode: Option<String>,
-    pub cancel_token: CancellationToken,
     pub mpsc_tx: mpsc::Sender<AgentEvent>,
     pub image_fallback: Option<ImageFallbackConfig>,
     pub gold_config: Option<GoldConfig>,
@@ -309,6 +706,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 agent,
                 session_id,
                 mut session,
+                mut execution_reservation,
                 tools_override,
                 provider_override,
                 model_roster,
@@ -320,7 +718,6 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 disabled_skill_ids,
                 selected_skill_ids,
                 selected_skill_mode,
-                cancel_token,
                 mpsc_tx,
                 image_fallback,
                 gold_config,
@@ -335,6 +732,30 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 on_complete,
                 child_completion_handler,
             } = args;
+
+            if !execution_reservation.matches_execution_target(&session_id, &session.id, &runners) {
+                tracing::error!(
+                    %session_id,
+                    domain_session_id = %session.id,
+                    reservation_session_id = %execution_reservation.session_id(),
+                    run_id = %execution_reservation.run_id(),
+                    same_runner_registry = Arc::ptr_eq(&execution_reservation.runners, &runners),
+                    "refusing mismatched session execution reservation"
+                );
+                execution_reservation.abandon().await;
+                return;
+            }
+            if let Err(error) = execution_reservation.ensure_registered().await {
+                tracing::warn!(
+                    %session_id,
+                    run_id = %execution_reservation.run_id(),
+                    %error,
+                    "session execution could not adopt its router activation owner"
+                );
+                return;
+            }
+            let (cancel_token, mut activation_registration) =
+                execution_reservation.disarm_for_execution();
 
             // The primary model is required for a spawn; the roster stores it as
             // `Option<String>` for uniformity, so recover the owned String here
@@ -483,6 +904,79 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 on_complete(SessionExecutionOutcome::from_result(&result), &mut session).await;
             }
 
+            // Freeze the generation actually consumed by provider reasoning.
+            // Terminal compatibility migration below may enqueue newer work,
+            // but must never make that work look executed.
+            let executed_admitted_generation = session
+                .session_inbox_admission()
+                .map_or(0, |state| state.last_admitted_sequence);
+            let legacy_migration =
+                crate::runtime::runner::state_bridge::migrate_legacy_pending_only(
+                    &mut session,
+                    Some(agent.storage()),
+                    Some(agent.persistence()),
+                    agent.session_inbox(),
+                )
+                .await;
+            let pending_boundary_generation = session
+                .session_inbox_admission()
+                .and_then(|state| state.pending_activation_generation());
+            let pending_generation = match (
+                pending_boundary_generation,
+                legacy_migration.highest_generation,
+            ) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            };
+            if let (Some(generation), Some(router)) =
+                (pending_generation, agent.activation_router())
+            {
+                let activation_ready = if let Some(inbox) = agent.session_inbox() {
+                    match inbox
+                        .mark_activation_eligible(
+                            &session_id,
+                            generation,
+                            bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                        )
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                %error,
+                                "failed to persist unadmitted SessionInbox activation watermark"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if activation_ready {
+                    if let Err(error) = bamboo_domain::SessionActivationPort::request_activation(
+                        router.as_ref(),
+                        &session_id,
+                        generation,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            session_id = %session_id,
+                            %error,
+                            "failed to hand unadmitted SessionInbox generation to activation router"
+                        );
+                    }
+                }
+            }
+
+            // Close the save→terminal race before the final persistence write:
+            // a delivery from this point onward is coalesced for a successor
+            // rather than being "notified" to a loop that has already exited.
+            if let Some(registration) = activation_registration.as_mut() {
+                registration.begin_finalization().await;
+            }
+
             // Save session via merge-save so any concurrent UI edits to
             // title / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
@@ -496,6 +990,22 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // visible together and the frontend settles immediately instead of
             // lingering in its optimistic-settle window.
             finalize_runner(&runners, &session_id, &result).await;
+
+            let finalization = if let Some(registration) = activation_registration.take() {
+                registration.finish(executed_admitted_generation).await
+            } else {
+                Ok(None)
+            };
+            if let Err(error) = finalization {
+                // Delivery is durable even if activation infrastructure is
+                // temporarily unavailable; startup/backlog reconciliation
+                // can retry without loss.
+                tracing::error!(
+                    session_id = %session_id,
+                    %error,
+                    "failed to activate successor for finalization-racing SessionInbox delivery"
+                );
+            }
 
             // A CHILD session finishing through this path (a resumed child, or
             // a nested child-parent woken by its own children) must wake its
@@ -623,5 +1133,75 @@ fn selected_skill_mode_for_session(session: &Session) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use crate::runtime::execution::runner_state::AgentStatus;
+
+    #[test]
+    fn reservation_target_requires_domain_id_and_exact_runner_registry() {
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let other_runners = Arc::new(RwLock::new(HashMap::new()));
+        let mut reservation = SessionExecutionReservation {
+            session_id: "session-a".to_string(),
+            run_id: "run-a".to_string(),
+            cancel_token: CancellationToken::new(),
+            runners: runners.clone(),
+            activation: SessionExecutionActivationOwnership::Unrouted,
+            armed: true,
+        };
+
+        assert!(reservation.matches_execution_target("session-a", "session-a", &runners));
+        assert!(!reservation.matches_execution_target("session-b", "session-a", &runners));
+        assert!(!reservation.matches_execution_target("session-a", "session-b", &runners));
+        assert!(!reservation.matches_execution_target("session-a", "session-a", &other_runners));
+        reservation.armed = false;
+    }
+
+    #[tokio::test]
+    async fn forced_same_run_registration_rejection_never_cancels_live_owner() {
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        let run_id = runner.run_id.clone();
+        let live_cancel_token = runner.cancel_token.clone();
+        runners.write().await.insert("same-run".to_string(), runner);
+
+        let router = SessionActivationRouter::new();
+        let mut live_registration = router
+            .register_run("same-run", &run_id)
+            .await
+            .expect("first registration owns the run");
+        let mut rejected = SessionExecutionReservation {
+            session_id: "same-run".to_string(),
+            run_id: run_id.clone(),
+            cancel_token: live_cancel_token.clone(),
+            runners: runners.clone(),
+            activation: SessionExecutionActivationOwnership::RegistrationPending(router.clone()),
+            armed: true,
+        };
+
+        let error = match rejected.ensure_registered().await {
+            Ok(()) => panic!("a duplicate registration for the same run must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.existing_run_id(), run_id);
+        drop(rejected);
+
+        assert!(!live_cancel_token.is_cancelled());
+        assert!(matches!(
+            runners
+                .read()
+                .await
+                .get("same-run")
+                .map(|runner| &runner.status),
+            Some(AgentStatus::Running)
+        ));
+        assert!(router.owns_run("same-run", &run_id).await);
+        live_registration.begin_finalization().await;
+        assert_eq!(live_registration.finish(0).await.unwrap(), None);
     }
 }

@@ -10,9 +10,9 @@ use bamboo_agent_core::{AgentEvent, Message, Role};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{
-    create_event_forwarder, get_or_create_event_sender, spawn_session_execution,
-    try_reserve_runner, AgentRunner, RunnerReservation, SessionCompletionHook,
-    SessionExecutionArgs,
+    create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
+    spawn_session_execution, AgentRunner, SessionCompletionHook, SessionExecutionArgs,
+    SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, ModelRoster};
 use bamboo_storage::LockedSessionStore;
@@ -496,6 +496,25 @@ async fn run_schedule_job(
 
     let session_tx = get_or_create_event_sender(&ctx.session_event_senders, &session_id).await;
 
+    // Reserve the shared runner and router before publishing any relay or
+    // execution-specific state.
+    let execution_reservation = match reserve_session_execution(
+        &ctx.agent,
+        &ctx.agent_runners,
+        &ctx.session_event_senders,
+        &session_id,
+        &session_tx,
+    )
+    .await
+    {
+        SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+        SessionExecutionReserveOutcome::AlreadyRunning { .. } => {
+            return Ok(ScheduleRunLifecycleResult::Terminal(
+                ScheduleRunStatus::Skipped,
+            ));
+        }
+    };
+
     // Always-on relay (the critical gap this closes): a scheduled/headless
     // run has no SSE/WS client subscribed at start — often ever — so nothing
     // used to spawn a notification relay for it, and approval/clarification/
@@ -507,20 +526,6 @@ async fn run_schedule_job(
         &session_id,
         session_tx.clone(),
     );
-
-    // Insert runner status (for cancellation/status introspection).
-    let Some(RunnerReservation { cancel_token, .. }) = try_reserve_runner(
-        &ctx.agent_runners,
-        &ctx.session_event_senders,
-        &session_id,
-        &session_tx,
-    )
-    .await
-    else {
-        return Ok(ScheduleRunLifecycleResult::Terminal(
-            ScheduleRunStatus::Skipped,
-        ));
-    };
 
     let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
         session_id.clone(),
@@ -641,6 +646,7 @@ async fn run_schedule_job(
         agent: ctx.agent.clone(),
         session_id,
         session,
+        execution_reservation,
         tools_override: Some(ctx.tools.clone()),
         provider_override: None,
         model_roster: resolved.model_roster.clone(),
@@ -654,7 +660,6 @@ async fn run_schedule_job(
         disabled_skill_ids: None,
         selected_skill_ids: None,
         selected_skill_mode: None,
-        cancel_token,
         mpsc_tx,
         image_fallback: None,
         gold_config: resolved.gold_config.clone(),

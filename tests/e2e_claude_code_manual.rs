@@ -32,10 +32,13 @@ use tokio_util::sync::CancellationToken;
 fn spec(assignment: &str, messages: Vec<serde_json::Value>) -> RunSpec {
     RunSpec {
         assignment: assignment.to_string(),
+        logical_session: None,
         project_id: None,
         reasoning_effort: None,
         permission_policy: None,
         messages,
+        activation_run_id: None,
+        initial_session_messages: Vec::new(),
         secrets: Default::default(),
     }
 }

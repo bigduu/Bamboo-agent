@@ -21,16 +21,21 @@ use chrono::{Duration as ChronoDuration, Utc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session, SessionKind};
+use bamboo_domain::{
+    SessionInboxLimits, SessionInboxPort, SessionMessageBody, SessionMessageContent,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
+    SessionRuntimeInstruction,
+};
 use bamboo_llm::{create_provider_by_name, Config, LLMChunk, LLMProvider};
 use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
 use bamboo_subagent::discovery::Fabric;
 use bamboo_subagent::executor::{
-    ChildExecutor, ChildOutcome, EchoExecutor, EventSink, HostBridge, SteerInbox,
+    ChildExecutor, ChildOutcome, EchoExecutor, EventSink, HostBridge, SteerInbox, SteerMessage,
 };
-use bamboo_subagent::proto::{AgentRecord, RunSpec};
+use bamboo_subagent::proto::{AgentRecord, RunSpec, SessionMessageAdmissionConfirmation};
 use bamboo_subagent::provision::{ExecutorSpec, ProvisionSpec};
 use bamboo_subagent::transport::WsServer;
 use futures::StreamExt;
@@ -272,10 +277,9 @@ pub async fn run() -> std::result::Result<(), String> {
 /// `ChildExecutor` backed by the real bamboo agent loop, assembled from a `ProvisionSpec`.
 pub struct BambooRuntimeExecutor {
     agent: Arc<bamboo_engine::Agent>,
-    /// Same store the agent persists to, kept as the concrete type so steering
-    /// can do a LOCKED read-modify-write (`update_runtime_config`) instead of
-    /// an unlocked load+save that could revert a concurrent loop save.
-    locked_store: Arc<LockedSessionStore>,
+    /// Worker-local durable inbox. The orchestrator's copy remains canonical;
+    /// this one drives the real local safe-turn admission/checkpoint boundary.
+    session_inbox: Arc<dyn SessionInboxPort>,
     model: Option<String>,
     workspace: Option<String>,
     disabled_tools: Option<BTreeSet<String>>,
@@ -369,6 +373,15 @@ impl BambooRuntimeExecutor {
         );
         let persistence = Arc::new(LockedSessionStore::new(store.clone()));
         let locked_store = persistence.clone();
+        let session_inbox: Arc<dyn SessionInboxPort> = Arc::new(
+            bamboo_storage::FileSessionInbox::new(store.clone(), SessionInboxLimits::default()),
+        );
+        let session_activation_router = bamboo_engine::SessionActivationRouter::new();
+        let session_messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+            store.clone(),
+            session_inbox.clone(),
+            session_activation_router.clone(),
+        ));
         // Synced skills dir (orchestrator's user/project skills) when provided,
         // else the worker's isolated (empty) dir — unchanged for actor children.
         let skills_dir = spec
@@ -512,9 +525,13 @@ impl BambooRuntimeExecutor {
         // read_skill_resource) over its synced skills_dir, so it can pull a
         // skill's full SKILL.md — not just see the description. The orchestrator's
         // root surface has these; the worker previously only had the builtin set.
+        let worker_sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+        let worker_runners = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let worker_event_senders =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = {
             let session_repo = bamboo_engine::SessionRepository::new(
-                Arc::new(dashmap::DashMap::new()),
+                worker_sessions.clone(),
                 store.clone(),
                 persistence.clone(),
             );
@@ -543,12 +560,30 @@ impl BambooRuntimeExecutor {
         let store_for_stack = store.clone();
         let config_for_stack = config.clone();
         let provider_for_review = provider.clone();
+        let mut worker_providers: std::collections::HashMap<
+            String,
+            Arc<dyn bamboo_llm::LLMProvider>,
+        > = std::collections::HashMap::new();
+        worker_providers.insert(provider_key.clone(), provider_for_review.clone());
+        worker_providers
+            .entry(factory_name.clone())
+            .or_insert_with(|| provider_for_review.clone());
+        let worker_provider_registry = Arc::new(bamboo_llm::ProviderRegistry::new(
+            worker_providers,
+            provider_key.clone(),
+        ));
+        let worker_provider_router = Arc::new(bamboo_llm::ProviderModelRouter::new(
+            worker_provider_registry.clone(),
+        ));
 
         let agent = Arc::new(
             bamboo_engine::Agent::builder()
                 .storage(store.clone())
-                .persistence(persistence)
-                .attachment_reader(store)
+                .persistence(persistence.clone())
+                .session_inbox(session_inbox.clone())
+                .activation_router(session_activation_router.clone())
+                .session_messenger(session_messenger.clone())
+                .attachment_reader(store.clone())
                 .skill_manager(skill_manager)
                 .metrics_collector(metrics_collector)
                 .config(config)
@@ -567,7 +602,7 @@ impl BambooRuntimeExecutor {
         // back to an interactive human prompt.
         let reviewer: Arc<dyn bamboo_engine::external_agents::ChildApprovalReviewer> =
             Arc::new(ModelApprovalReviewer {
-                provider: provider_for_review,
+                provider: provider_for_review.clone(),
                 model: spec
                     .model
                     .as_ref()
@@ -604,30 +639,60 @@ impl BambooRuntimeExecutor {
                         permission_config.clone(),
                     )
             };
+            external_runner.set_session_inbox_runtime(Some(
+                bamboo_engine::execution::spawn::SessionInboxRuntimeBinding {
+                    router: session_activation_router.clone(),
+                    inbox: session_inbox.clone(),
+                    storage: store_for_stack.clone(),
+                    persistence: persistence.clone(),
+                },
+            ));
             // #68: retain this exact runner so `run()` can bind its host
             // bridge onto it per-run (the runner the scheduler drives is the
             // one whose `ActorChildRunner`s capture the bridge at spawn).
             let child_runner = external_runner.clone();
+            let child_completion_coordinator =
+                Arc::new(bamboo_engine::ChildCompletionCoordinator::new(
+                    store_for_stack.clone(),
+                    locked_store.clone(),
+                    worker_sessions.clone(),
+                    worker_runners.clone(),
+                    worker_event_senders.clone(),
+                    agent.clone(),
+                    config_for_stack.clone(),
+                    worker_provider_registry.clone(),
+                    worker_provider_router.clone(),
+                    storage_dir.clone(),
+                    None,
+                ));
+            session_activation_router
+                .set_spawner(child_completion_coordinator.clone())
+                .await;
             let scheduler = bamboo_server::app_state::init::build_spawn_scheduler(
                 agent.clone(),
                 default_tools.clone(),
-                Arc::new(dashmap::DashMap::new()),
-                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                worker_sessions.clone(),
+                worker_runners.clone(),
+                worker_event_senders.clone(),
                 external_runner,
-                None,
-                None,
+                Some(worker_provider_router.clone()),
+                Some(child_completion_coordinator.clone()),
                 Some(storage_dir.clone()),
                 None,
+                None,
             );
+            child_completion_coordinator
+                .set_spawn_scheduler(&scheduler)
+                .await;
             let adapter = Arc::new(bamboo_server::tools::ChildSessionAdapter::new(
                 store_for_stack.clone(),
                 store_for_stack.clone(),
                 locked_store.clone(),
                 scheduler,
-                Arc::new(dashmap::DashMap::new()),
-                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                worker_sessions.clone(),
+                worker_runners.clone(),
+                worker_event_senders.clone(),
+                Some(session_messenger.clone()),
                 None,
                 config_for_stack.clone(),
             ));
@@ -639,6 +704,9 @@ impl BambooRuntimeExecutor {
                 default_tools,
                 sub_agent,
             )) as RunTools;
+            child_completion_coordinator
+                .set_root_tools(run_tools.clone())
+                .await;
             (Some(run_tools), Some(child_runner))
         } else {
             (None, None)
@@ -655,7 +723,7 @@ impl BambooRuntimeExecutor {
 
         Ok(Self {
             agent,
-            locked_store,
+            session_inbox,
             model: spec.model.as_ref().map(|m| m.model.clone()),
             workspace: spec.workspace.clone(),
             disabled_tools: spec
@@ -925,16 +993,74 @@ impl ChildExecutor for BambooRuntimeExecutor {
         mut steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
-        // Fresh session per run, in the worker's isolated store. When the parent
-        // ships prior conversation (a reactivation: send_message/update/rerun),
-        // rehydrate from it — the parent's store is the actor's durable state,
-        // this process is just its activation. The run id is unique so a
-        // long-running service agent can serve concurrent runs without
-        // storage collisions (stateless-RPC semantics: one session per call).
-        let mut session = Session::new(
-            format!("{}-run-{}", self.child_id, uuid::Uuid::new_v4()),
-            self.model.clone().unwrap_or_default(),
-        );
+        // Fresh activation snapshot in the worker's isolated store. Its id is
+        // the DOMAIN logical Session id carried by RunSpec; process/mailbox/pool
+        // identity is never used as persistence or routing identity.
+        let logical_identity = run.logical_session.clone();
+        let logical_session_id = logical_identity
+            .as_ref()
+            .map(|identity| identity.session_id.trim())
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            // Backward-compatible fallback for an older host protocol.
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    telemetry_event =
+                        "session_inbox.legacy_runspec_identity_fallback",
+                    worker_id = %self.child_id,
+                    "RunSpec omitted logical Session identity"
+                );
+                format!("{}-run-{}", self.child_id, uuid::Uuid::new_v4())
+            });
+        let expected_activation_run_id = run.activation_run_id.clone();
+        let initial_deliveries = run.initial_session_messages.clone();
+        if !initial_deliveries.is_empty()
+            && expected_activation_run_id
+                .as_deref()
+                .is_none_or(|run_id| run_id.trim().is_empty())
+        {
+            return ChildOutcome::error(
+                "initial SessionInbox deliveries require an authoritative RunSpec activation_run_id",
+            );
+        }
+        let mut prior_generation = 0;
+        for delivery in &initial_deliveries {
+            let exact_run = expected_activation_run_id
+                .as_deref()
+                .is_some_and(|run_id| delivery.activation_run_id == run_id);
+            if delivery.target_session_id != logical_session_id
+                || delivery.envelope.target_session_id != logical_session_id
+                || !exact_run
+                || delivery.canonical_claim_generation <= prior_generation
+            {
+                return ChildOutcome::error(format!(
+                    "invalid initial SessionInbox delivery for logical session {logical_session_id}"
+                ));
+            }
+            if let Err(error) = delivery.envelope.validate() {
+                return ChildOutcome::error(format!(
+                    "invalid initial SessionInbox envelope {}: {error}",
+                    delivery.envelope.id
+                ));
+            }
+            prior_generation = delivery.canonical_claim_generation;
+        }
+
+        // Rehydrate one activation of the domain logical Session in the
+        // worker's isolated store. The same Session.id intentionally survives
+        // local/remote scheduling and warm-worker reuse; Run/transport identity
+        // never replaces it. The host-provided prior conversation remains the
+        // canonical activation snapshot.
+        let mut session = Session::new(logical_session_id, self.model.clone().unwrap_or_default());
+        if let Some(identity) = logical_identity {
+            session.parent_session_id = identity.parent_session_id;
+            session.root_session_id = if identity.root_session_id.trim().is_empty() {
+                session.id.clone()
+            } else {
+                identity.root_session_id
+            };
+            session.kind = SessionKind::Child;
+        }
         if let Some(project_id) = run.project_id.as_ref() {
             session.set_project_id_meta(project_id.as_str());
         }
@@ -1028,44 +1154,383 @@ impl ChildExecutor for BambooRuntimeExecutor {
             self.model.as_deref(),
         );
 
-        // Seed the worker's local store so mid-run steering can read-modify-write
-        // the session's pending_injected_messages (the engine loop merges that
-        // queue from storage at every round boundary).
+        // A warm worker may already hold a permanent local receipt from an
+        // earlier attempt whose confirmation never reached the host. Capture
+        // that durable transcript proof before seeding the new host snapshot;
+        // receipt-only dedupe is never sufficient to confirm context.
+        let mut locally_admitted_before_run = BTreeSet::new();
+        for delivery in &initial_deliveries {
+            match self
+                .session_inbox
+                .was_admitted(&session.id, &delivery.envelope.id)
+                .await
+            {
+                Ok(true) => {
+                    locally_admitted_before_run.insert(delivery.envelope.id.to_string());
+                }
+                Ok(false) => {}
+                Err(bamboo_domain::SessionInboxError::TargetNotFound(target))
+                    if target == session.id =>
+                {
+                    // A fresh worker store has no logical-session directory
+                    // until the host snapshot is seeded below. That is the
+                    // absence of a warm receipt, not a failed activation.
+                }
+                Err(error) => {
+                    return ChildOutcome::error(format!(
+                        "inspect warm worker SessionInbox receipt {}: {error}",
+                        delivery.envelope.id
+                    ));
+                }
+            }
+        }
+        let durable_before_seed = if locally_admitted_before_run.is_empty() {
+            None
+        } else {
+            match self
+                .agent
+                .persistence()
+                .load_runtime_session(&session.id)
+                .await
+            {
+                Ok(Some(durable)) => Some(durable),
+                Ok(None) => {
+                    return ChildOutcome::error(
+                        "warm worker SessionInbox receipt exists without a durable session",
+                    );
+                }
+                Err(error) => {
+                    return ChildOutcome::error(format!(
+                        "load warm worker SessionInbox transcript: {error}"
+                    ));
+                }
+            }
+        };
+
+        // Seed the worker's local store before typed steering can enqueue.
         {
             let mut seed = session.clone();
-            let _ = self
+            if let Err(error) = self
                 .agent
                 .persistence()
                 .save_runtime_session(&mut seed)
-                .await;
+                .await
+            {
+                if !initial_deliveries.is_empty() {
+                    return ChildOutcome::error(format!(
+                        "seed worker session before initial SessionInbox delivery: {error}"
+                    ));
+                }
+            }
         }
 
-        // In-band steering: each ParentFrame::Message lands in the local store's
-        // pending queue; the running loop admits it at its next round boundary —
-        // exactly the in-process mechanism, reused across the process boundary.
-        let steer_store = self.locked_store.clone();
-        let steer_session_id = session.id.clone();
-        let steer_task = tokio::spawn(async move {
-            while let Some(text) = steer.recv().await {
-                // LOCKED read-modify-write: load + mutate + save all happen
-                // under the per-session lock, so a concurrent loop save can
-                // neither be reverted by this write nor revert it.
-                let queued = steer_store
-                    .update_runtime_config(&steer_session_id, |latest| {
-                        let mut pending = latest.pending_injected_messages().unwrap_or_default();
-                        pending.push(serde_json::json!({
-                            "content": text,
-                            "created_at": chrono::Utc::now(),
-                        }));
-                        latest.set_pending_injected_messages(pending);
+        if let Some(durable) = durable_before_seed.as_ref() {
+            for delivery in &initial_deliveries {
+                if !locally_admitted_before_run.contains(delivery.envelope.id.as_str()) {
+                    continue;
+                }
+                let Some(message) = durable
+                    .messages
+                    .iter()
+                    .find(|message| {
+                        bamboo_domain::is_matching_session_message(message, &delivery.envelope)
                     })
-                    .await;
-                match queued {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        tracing::warn!("steer message dropped: session not found in worker store")
+                    .cloned()
+                else {
+                    return ChildOutcome::error(format!(
+                        "warm worker receipt lacks transcript proof for {}",
+                        delivery.envelope.id
+                    ));
+                };
+                if let Some(existing) = session
+                    .messages
+                    .iter_mut()
+                    .find(|existing| existing.id == message.id)
+                {
+                    *existing = message;
+                } else {
+                    session.add_message(message);
+                }
+            }
+            bamboo_domain::merge_session_inbox_admission(&mut session, durable);
+            if let Err(error) = self
+                .agent
+                .persistence()
+                .checkpoint_runtime_session(&mut session)
+                .await
+            {
+                return ChildOutcome::error(format!(
+                    "checkpoint reconciled warm worker SessionInbox transcript: {error}"
+                ));
+            }
+            let reloaded = match self
+                .agent
+                .persistence()
+                .load_runtime_session(&session.id)
+                .await
+            {
+                Ok(Some(reloaded)) => reloaded,
+                Ok(None) => {
+                    return ChildOutcome::error(
+                        "reconciled warm worker transcript disappeared before confirmation",
+                    );
+                }
+                Err(error) => {
+                    return ChildOutcome::error(format!(
+                        "reload reconciled warm worker transcript: {error}"
+                    ));
+                }
+            };
+            for delivery in &initial_deliveries {
+                if locally_admitted_before_run.contains(delivery.envelope.id.as_str())
+                    && !reloaded.messages.iter().any(|message| {
+                        bamboo_domain::is_matching_session_message(message, &delivery.envelope)
+                    })
+                {
+                    return ChildOutcome::error(format!(
+                        "reconciled warm worker transcript lost durable proof for {}",
+                        delivery.envelope.id
+                    ));
+                }
+            }
+            session = reloaded;
+        }
+
+        // Initial actor deliveries are a startup barrier: enqueue the complete
+        // ordered authorized prefix and mirror its durable policy locally,
+        // then execute the real safe-turn checkpoint before starting provider
+        // reasoning.
+        for delivery in &initial_deliveries {
+            let receipt = match self.session_inbox.deliver(&delivery.envelope).await {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return ChildOutcome::error(format!(
+                        "enqueue initial worker SessionInbox message {}: {error}",
+                        delivery.envelope.id
+                    ));
+                }
+            };
+            if let Err(error) = self
+                .session_inbox
+                .mark_activation_eligible(
+                    &session.id,
+                    receipt.generation,
+                    delivery.activation_policy,
+                )
+                .await
+            {
+                return ChildOutcome::error(format!(
+                    "authorize initial worker SessionInbox message {}: {error}",
+                    delivery.envelope.id
+                ));
+            }
+        }
+        if !initial_deliveries.is_empty() {
+            self.agent
+                .admit_session_inbox_at_safe_boundary(&mut session)
+                .await;
+            for delivery in &initial_deliveries {
+                let transcript_proof = session.messages.iter().any(|message| {
+                    bamboo_domain::is_matching_session_message(message, &delivery.envelope)
+                });
+                let permanent_receipt = self
+                    .session_inbox
+                    .was_admitted(&session.id, &delivery.envelope.id)
+                    .await
+                    .unwrap_or(false);
+                if !transcript_proof || !permanent_receipt {
+                    return ChildOutcome::error(format!(
+                        "initial worker SessionInbox boundary did not durably admit {}",
+                        delivery.envelope.id
+                    ));
+                }
+                events.confirm_session_message(SessionMessageAdmissionConfirmation {
+                    target_session_id: delivery.target_session_id.clone(),
+                    envelope_id: delivery.envelope.id.as_str().to_string(),
+                    canonical_claim_generation: delivery.canonical_claim_generation,
+                    activation_run_id: delivery.activation_run_id.clone(),
+                });
+            }
+        }
+
+        // In-band steering: typed ParentFrame::SessionMessage values enter the
+        // worker-local durable SessionInbox. The real engine safe-turn bridge
+        // checkpoints transcript+cursor and acks locally. Only after its
+        // permanent admitted receipt is visible do we confirm to the host.
+        let steer_inbox = self.session_inbox.clone();
+        let steer_session_id = session.id.clone();
+        let steer_events = events.clone();
+        let steer_activation_run_id = expected_activation_run_id.clone();
+        let steer_done = CancellationToken::new();
+        let steer_done_task = steer_done.clone();
+        let steer_task = tokio::spawn(async move {
+            loop {
+                let message = tokio::select! {
+                    _ = steer_done_task.cancelled() => break,
+                    message = steer.recv_message() => message,
+                };
+                let Some(message) = message else {
+                    break;
+                };
+                let (envelope, confirmation, activation_policy) = match message {
+                    SteerMessage::Text(text) => {
+                        let envelope = SessionMessageEnvelope {
+                            id: SessionMessageId::new(),
+                            source: SessionMessageSource::Runtime {
+                                subsystem: "legacy_actor_steer".to_string(),
+                            },
+                            target_session_id: steer_session_id.clone(),
+                            kind: SessionMessageKind::RuntimeInstruction,
+                            body: SessionMessageBody::RuntimeInstruction(
+                                SessionRuntimeInstruction {
+                                    instruction: "legacy_actor_steer".to_string(),
+                                    content: Some(SessionMessageContent::text(text)),
+                                    data: None,
+                                    provider_message: None,
+                                },
+                            ),
+                            created_at: chrono::Utc::now(),
+                            thread_id: None,
+                            in_reply_to: None,
+                            attempt: None,
+                            correlation_id: None,
+                        };
+                        tracing::info!(
+                            telemetry_event =
+                                "session_inbox.legacy_actor_text_ingress",
+                            session_id = %steer_session_id,
+                            message_id = %envelope.id,
+                            "observed legacy actor text ingress"
+                        );
+                        (
+                            envelope,
+                            None,
+                            bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                        )
                     }
-                    Err(e) => tracing::warn!("steer message could not be queued: {e}"),
+                    SteerMessage::DurableText { message_id, text } => {
+                        let envelope = SessionMessageEnvelope {
+                            id: SessionMessageId::stable(
+                                "legacy_broker_steer",
+                                &serde_json::json!({"message_id": &message_id}),
+                            ),
+                            source: SessionMessageSource::Runtime {
+                                subsystem: "legacy_broker_steer".to_string(),
+                            },
+                            target_session_id: steer_session_id.clone(),
+                            kind: SessionMessageKind::RuntimeInstruction,
+                            body: SessionMessageBody::RuntimeInstruction(
+                                SessionRuntimeInstruction {
+                                    instruction: "legacy_actor_steer".to_string(),
+                                    content: Some(SessionMessageContent::text(text)),
+                                    data: Some(
+                                        serde_json::json!({"broker_message_id": &message_id}),
+                                    ),
+                                    provider_message: None,
+                                },
+                            ),
+                            created_at: chrono::Utc::now(),
+                            thread_id: None,
+                            in_reply_to: None,
+                            attempt: None,
+                            correlation_id: Some(message_id),
+                        };
+                        tracing::info!(
+                            telemetry_event = "session_inbox.legacy_broker_steer_ingress",
+                            session_id = %steer_session_id,
+                            message_id = %envelope.id,
+                            "admitting durable legacy broker steer ingress"
+                        );
+                        (
+                            envelope,
+                            None,
+                            bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                        )
+                    }
+                    SteerMessage::SessionMessage(delivery) => {
+                        if delivery.target_session_id != steer_session_id
+                            || delivery.envelope.target_session_id != steer_session_id
+                            || steer_activation_run_id
+                                .as_deref()
+                                .is_none_or(|run_id| delivery.activation_run_id != run_id)
+                        {
+                            tracing::warn!(
+                                expected_target = %steer_session_id,
+                                delivery_target = %delivery.target_session_id,
+                                envelope_target = %delivery.envelope.target_session_id,
+                                "rejecting actor SessionInbox delivery for the wrong logical target"
+                            );
+                            continue;
+                        }
+                        let confirmation = SessionMessageAdmissionConfirmation {
+                            target_session_id: delivery.target_session_id,
+                            envelope_id: delivery.envelope.id.as_str().to_string(),
+                            canonical_claim_generation: delivery.canonical_claim_generation,
+                            activation_run_id: delivery.activation_run_id,
+                        };
+                        (
+                            delivery.envelope,
+                            Some(confirmation),
+                            delivery.activation_policy,
+                        )
+                    }
+                };
+
+                let receipt = match steer_inbox.deliver(&envelope).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %steer_session_id,
+                            message_id = %envelope.id,
+                            %error,
+                            "actor SessionInbox delivery could not be admitted locally"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(error) = steer_inbox
+                    .mark_activation_eligible(
+                        &steer_session_id,
+                        receipt.generation,
+                        activation_policy,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %steer_session_id,
+                        message_id = %envelope.id,
+                        %error,
+                        "actor SessionInbox delivery could not authorize its local safe boundary"
+                    );
+                    continue;
+                }
+                let Some(confirmation) = confirmation else {
+                    continue;
+                };
+                loop {
+                    match steer_inbox
+                        .was_admitted(&steer_session_id, &envelope.id)
+                        .await
+                    {
+                        Ok(true) => {
+                            steer_events.confirm_session_message(confirmation);
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id = %steer_session_id,
+                                message_id = %envelope.id,
+                                %error,
+                                "actor could not inspect local SessionInbox admission receipt"
+                            );
+                            break;
+                        }
+                    }
+                    tokio::select! {
+                        _ = steer_done_task.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    }
                 }
             }
         });
@@ -1133,7 +1598,8 @@ impl ChildExecutor for BambooRuntimeExecutor {
             self.agent.execute(&mut session, builder.build()),
         )
         .await;
-        steer_task.abort();
+        steer_done.cancel();
+        let _ = steer_task.await;
         let _ = forward.await; // flush remaining events before the terminal frame
 
         match result {
@@ -1232,7 +1698,356 @@ fn build_isolated_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{ToolCall, ToolError, ToolResult, ToolSchema};
+    use bamboo_subagent::executor::ExecutorControl;
+    use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
+
+    struct NoTools;
+
+    #[async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for NoTools {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            Err(ToolError::NotFound("no test tools".to_string()))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingWorkerProvider {
+        calls: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RecordingWorkerProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.calls.lock().unwrap().push(messages.to_vec());
+            let chunks: Vec<bamboo_llm::provider::Result<LLMChunk>> =
+                vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)];
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    async fn worker_protocol_fixture(
+        provider: Arc<RecordingWorkerProvider>,
+    ) -> (
+        tempfile::TempDir,
+        BambooRuntimeExecutor,
+        Arc<SessionStoreV2>,
+        Arc<dyn SessionInboxPort>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let metrics = MetricsCollector::spawn(
+            Arc::new(SqliteMetricsStorage::new(temp.path().join("metrics.db"))),
+            7,
+        );
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(NoTools);
+        let agent = Arc::new(
+            bamboo_engine::Agent::builder()
+                .storage(storage)
+                .persistence(persistence)
+                .session_inbox(inbox.clone())
+                .attachment_reader(store.clone())
+                .skill_manager(Arc::new(SkillManager::new()))
+                .metrics_collector(metrics)
+                .config(Arc::new(tokio::sync::RwLock::new(Config::default())))
+                .provider(provider)
+                .default_tools(tools)
+                .build()
+                .unwrap(),
+        );
+        let executor = BambooRuntimeExecutor {
+            agent,
+            session_inbox: inbox.clone(),
+            model: Some("test-model".to_string()),
+            workspace: None,
+            disabled_tools: None,
+            child_id: "worker-transport".to_string(),
+            run_tools: None,
+            spawn_depth: 1,
+            bypass: false,
+            permission_config: None,
+            no_human_review: None,
+            child_runner: None,
+        };
+        (temp, executor, store, inbox)
+    }
+
+    fn protocol_run(
+        session_id: &str,
+        activation_run_id: &str,
+        deliveries: Vec<SessionMessageDelivery>,
+    ) -> RunSpec {
+        RunSpec {
+            assignment: "base task".to_string(),
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session_id.to_string(),
+                parent_session_id: Some("parent".to_string()),
+                root_session_id: "parent".to_string(),
+            }),
+            project_id: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            messages: vec![
+                serde_json::to_value(Message::system("system")).unwrap(),
+                serde_json::to_value(Message::user("base task")).unwrap(),
+            ],
+            activation_run_id: Some(activation_run_id.to_string()),
+            initial_session_messages: deliveries,
+            secrets: RunSecrets::default(),
+        }
+    }
+
+    fn delivery(
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+        generation: u64,
+        activation_run_id: &str,
+    ) -> SessionMessageDelivery {
+        let mut envelope = SessionMessageEnvelope::user_input(session_id, text);
+        envelope.id = SessionMessageId::parse(message_id).unwrap();
+        SessionMessageDelivery {
+            target_session_id: session_id.to_string(),
+            envelope,
+            canonical_claim_generation: generation,
+            activation_run_id: activation_run_id.to_string(),
+            activation_policy: bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+        }
+    }
+
+    async fn execute_protocol_run(
+        executor: &BambooRuntimeExecutor,
+        run: RunSpec,
+    ) -> (ChildOutcome, Vec<SessionMessageAdmissionConfirmation>) {
+        let (events, _event_rx, mut control_rx) = EventSink::channel_with_control();
+        let outcome = ChildExecutor::run(
+            executor,
+            run,
+            events,
+            SteerInbox::disconnected(),
+            CancellationToken::new(),
+        )
+        .await;
+        let mut confirmations = Vec::new();
+        while let Ok(control) = control_rx.try_recv() {
+            let ExecutorControl::SessionMessageAdmitted(confirmation) = control;
+            confirmations.push(confirmation);
+        }
+        (outcome, confirmations)
+    }
+
+    #[tokio::test]
+    async fn initial_actor_batch_is_ordered_and_admitted_before_first_provider_context() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, executor, store, inbox) = worker_protocol_fixture(provider.clone()).await;
+        let session_id = "ordered-initial-batch";
+        let run_id = "activation-ordered";
+        let first = delivery(session_id, "initial-1", "first steering", 11, run_id);
+        let second = delivery(session_id, "initial-2", "second steering", 12, run_id);
+
+        let (outcome, confirmations) = execute_protocol_run(
+            &executor,
+            protocol_run(session_id, run_id, vec![first.clone(), second.clone()]),
+        )
+        .await;
+        assert_eq!(
+            outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{outcome:?}"
+        );
+        assert_eq!(
+            confirmations
+                .iter()
+                .map(|confirmation| confirmation.envelope_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["initial-1", "initial-2"]
+        );
+        let calls = provider.calls.lock().unwrap();
+        let first_context = calls.first().expect("provider call");
+        let first_index = first_context
+            .iter()
+            .position(|message| message.id == "initial-1")
+            .expect("first initial delivery in first provider context");
+        let second_index = first_context
+            .iter()
+            .position(|message| message.id == "initial-2")
+            .expect("second initial delivery in first provider context");
+        assert!(first_index < second_index);
+        assert_eq!(
+            first_context
+                .iter()
+                .filter(|message| matches!(message.id.as_str(), "initial-1" | "initial-2"))
+                .count(),
+            2
+        );
+        drop(calls);
+        let durable = store.load_session(session_id).await.unwrap().unwrap();
+        for expected in [&first.envelope, &second.envelope] {
+            assert_eq!(
+                durable
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        bamboo_domain::is_matching_session_message(message, expected)
+                    })
+                    .count(),
+                1
+            );
+            assert!(inbox.was_admitted(session_id, &expected.id).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_lost_confirmation_reconciles_host_omission_before_reconfirming() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, executor, store, inbox) = worker_protocol_fixture(provider.clone()).await;
+        let session_id = "warm-lost-confirmation";
+        let envelope = delivery(
+            session_id,
+            "warm-message",
+            "durable once",
+            7,
+            "activation-one",
+        );
+
+        let (first_outcome, first_confirmations) = execute_protocol_run(
+            &executor,
+            protocol_run(session_id, "activation-one", vec![envelope.clone()]),
+        )
+        .await;
+        assert_eq!(
+            first_outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{first_outcome:?}"
+        );
+        assert_eq!(first_confirmations.len(), 1);
+        // Simulate the host losing that confirmation and retrying from a
+        // snapshot that omits the typed message, under a new exact run owner.
+        let mut retry = envelope.clone();
+        retry.activation_run_id = "activation-two".to_string();
+        let (retry_outcome, retry_confirmations) = execute_protocol_run(
+            &executor,
+            protocol_run(session_id, "activation-two", vec![retry]),
+        )
+        .await;
+        assert_eq!(
+            retry_outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{retry_outcome:?}"
+        );
+        assert_eq!(retry_confirmations.len(), 1);
+        assert_eq!(retry_confirmations[0].activation_run_id, "activation-two");
+        let calls = provider.calls.lock().unwrap();
+        assert!(calls.len() >= 2);
+        let retry_context = calls.last().unwrap();
+        assert_eq!(
+            retry_context
+                .iter()
+                .filter(|message| message.id == "warm-message")
+                .count(),
+            1,
+            "warm transcript reconciliation must happen before provider execution"
+        );
+        drop(calls);
+        let durable = store.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            durable
+                .messages
+                .iter()
+                .filter(|message| {
+                    bamboo_domain::is_matching_session_message(message, &envelope.envelope)
+                })
+                .count(),
+            1
+        );
+        assert!(inbox
+            .was_admitted(session_id, &envelope.envelope.id)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn lost_confirmation_retry_on_independent_worker_store_keeps_one_context_entry() {
+        let provider_a = Arc::new(RecordingWorkerProvider::default());
+        let provider_b = Arc::new(RecordingWorkerProvider::default());
+        let (_temp_a, worker_a, _store_a, _inbox_a) =
+            worker_protocol_fixture(provider_a.clone()).await;
+        let (_temp_b, worker_b, _store_b, _inbox_b) =
+            worker_protocol_fixture(provider_b.clone()).await;
+        let session_id = "cross-worker-lost-confirmation";
+        let first_delivery = delivery(
+            session_id,
+            "cross-worker-message",
+            "canonical once",
+            3,
+            "run-a",
+        );
+        // The host checkpoints this exact typed entry before dispatch but keeps
+        // its canonical cur claim until a worker confirms local admission.
+        let host_messages = vec![
+            serde_json::to_value(Message::system("system")).unwrap(),
+            serde_json::to_value(Message::user("base task")).unwrap(),
+            serde_json::to_value(first_delivery.envelope.to_provider_message().unwrap()).unwrap(),
+        ];
+        let mut run_a = protocol_run(session_id, "run-a", vec![first_delivery.clone()]);
+        run_a.messages = host_messages.clone();
+        let (outcome_a, confirmations_a) = execute_protocol_run(&worker_a, run_a).await;
+        assert_eq!(
+            outcome_a.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{outcome_a:?}"
+        );
+        assert_eq!(confirmations_a.len(), 1);
+        // Drop A's confirmation. Retry on a completely independent worker
+        // store with a successor run owner and the same host checkpoint.
+        let mut retry_delivery = first_delivery;
+        retry_delivery.activation_run_id = "run-b".to_string();
+        let mut run_b = protocol_run(session_id, "run-b", vec![retry_delivery]);
+        run_b.messages = host_messages;
+        let (outcome_b, confirmations_b) = execute_protocol_run(&worker_b, run_b).await;
+        assert_eq!(
+            outcome_b.status,
+            bamboo_subagent::proto::TerminalStatus::Completed,
+            "{outcome_b:?}"
+        );
+        assert_eq!(confirmations_b.len(), 1);
+
+        for provider in [provider_a, provider_b] {
+            let calls = provider.calls.lock().unwrap();
+            let context = calls.first().expect("provider context");
+            assert_eq!(
+                context
+                    .iter()
+                    .filter(|message| message.id == "cross-worker-message")
+                    .count(),
+                1,
+                "host-seeded typed entry and worker-local admission must converge"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn proxy_decides_locally_when_no_human_approver() {
@@ -1370,6 +2185,95 @@ mod tests {
         assert_eq!(config.provider, "openai");
         let slot = config.providers().openai.as_ref().expect("openai slot");
         assert_eq!(slot.api_key, "sk-oa");
+    }
+
+    #[tokio::test]
+    async fn nested_worker_idle_session_message_uses_real_resume_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider_addr = listener.local_addr().unwrap();
+        let provider_hold = tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                let _socket = socket;
+                std::future::pending::<()>().await;
+            }
+        });
+        let mut spec = spec_with("openai", "sk-test", Some(("openai", "gpt-test")));
+        spec.storage_dir = Some(temp.path().join("worker").to_string_lossy().into_owned());
+        spec.fabric_dir = temp.path().join("fabric").to_string_lossy().into_owned();
+        spec.capabilities.nested_spawn = true;
+        spec.secrets.provider_credentials[0].base_url = Some(format!("http://{provider_addr}/v1"));
+
+        let runtime = BambooRuntimeExecutor::build(&spec)
+            .await
+            .expect("build nested worker runtime");
+        let parent = Session::new("worker-parent", "gpt-test");
+        runtime
+            .agent
+            .storage()
+            .save_session(&parent)
+            .await
+            .expect("seed nested worker parent");
+        let mut child = Session::new("nested-idle-child", "gpt-test");
+        child.kind = SessionKind::Child;
+        child.parent_session_id = Some("worker-parent".to_string());
+        child.root_session_id = "worker-parent".to_string();
+        runtime
+            .agent
+            .storage()
+            .save_session(&child)
+            .await
+            .expect("seed idle nested child");
+
+        let envelope = SessionMessageEnvelope {
+            id: SessionMessageId::parse("nested-idle-message").unwrap(),
+            source: SessionMessageSource::Runtime {
+                subsystem: "worker-wiring-test".to_string(),
+            },
+            target_session_id: child.id.clone(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction {
+                instruction: "continue".to_string(),
+                content: Some(SessionMessageContent::text("continue nested work")),
+                data: None,
+                provider_message: None,
+            }),
+            created_at: Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        let messenger = runtime.agent.session_messenger().expect("worker messenger");
+        let admission = messenger
+            .admit(envelope)
+            .await
+            .expect("durable idle delivery");
+        let backlog = runtime
+            .session_inbox
+            .inspect(&child.id)
+            .await
+            .expect("durable worker backlog");
+        assert_eq!(backlog.pending + backlog.claimed, 1);
+
+        let receipt = messenger
+            .activate(&admission)
+            .await
+            .expect("worker router must reserve and launch the real resume path");
+        assert_eq!(
+            receipt.activation,
+            bamboo_domain::SessionActivationDisposition::ActivationReserved
+        );
+        let coalesced = messenger
+            .activate(&admission)
+            .await
+            .expect("duplicate wake must target the existing owner");
+        assert_eq!(
+            coalesced.activation,
+            bamboo_domain::SessionActivationDisposition::ActiveNotified,
+            "the same durable generation must not reserve or launch a second runner"
+        );
+        provider_hold.abort();
     }
 
     #[tokio::test]

@@ -66,15 +66,16 @@ pub(super) async fn handle_execute_ready(
 
     // ---- Reserve runner ----
     let session_tx = state.get_session_event_sender(session_id).await;
-    let (cancel_token, run_id) =
+    let (execution_reservation, run_id) =
         match reserve_runner(state.get_ref(), session_id, &session_tx).await {
-            RunnerReservation::Started(token, rid) => {
+            RunnerReservation::Started(reservation) => {
+                let rid = reservation.run_id().to_string();
                 tracing::debug!(
                     "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
                     session_id,
                     rid
                 );
-                (token, rid)
+                (reservation, rid)
             }
             RunnerReservation::AlreadyRunning(rid) => {
                 tracing::debug!(
@@ -96,6 +97,7 @@ pub(super) async fn handle_execute_ready(
 
     // ---- Save session before spawn (metadata-group merge) ----
     if let Err(error) = state.persistence.merge_save_runtime(&mut session).await {
+        execution_reservation.abandon().await;
         rollback_startup(
             state,
             session_id,
@@ -190,6 +192,7 @@ pub(super) async fn handle_execute_ready(
         state: state.clone(),
         session_id: session_id.to_string(),
         session,
+        execution_reservation,
         is_child_session: ready.is_child_session,
         provider_name: resolved_provider_name,
         provider_override: None,
@@ -198,7 +201,6 @@ pub(super) async fn handle_execute_ready(
         reasoning_effort_source: ready.reasoning_source.to_string(),
         disabled_tools,
         disabled_skill_ids,
-        cancel_token,
         mpsc_tx,
         image_fallback,
         gold_config,

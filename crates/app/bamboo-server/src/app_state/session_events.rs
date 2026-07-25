@@ -32,6 +32,29 @@ pub struct NotificationRelayDeps {
     pub config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
 }
 
+/// Server-owned observer setup injected into the engine's canonical child
+/// scheduler. Both queued tool launches and reserved SessionInbox activations
+/// therefore start the same always-on relay before child execution.
+pub struct NotificationRelayLaunchHook {
+    deps: NotificationRelayDeps,
+}
+
+impl NotificationRelayLaunchHook {
+    pub fn new(deps: NotificationRelayDeps) -> Self {
+        Self { deps }
+    }
+}
+
+impl bamboo_engine::execution::ChildRunLaunchHook for NotificationRelayLaunchHook {
+    fn before_child_launch(
+        &self,
+        job: &bamboo_engine::execution::SpawnJob,
+        child_events: broadcast::Sender<AgentEvent>,
+    ) {
+        ensure_notification_relay(&self.deps, &job.child_session_id, child_events);
+    }
+}
+
 /// Ensure a notification relay task is running for `session_id`.
 ///
 /// The relay subscribes to the session's event broadcast, runs the backend

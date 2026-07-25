@@ -61,14 +61,18 @@ pub async fn reserve_runner_core(
     session_id: &str,
     event_sender: &broadcast::Sender<AgentEvent>,
 ) -> ReserveOutcome {
-    let mut guard = runners.write().await;
-    if let Some(runner) = guard.get(session_id) {
+    let mut runners_guard = runners.write().await;
+    if let Some(runner) = runners_guard.get(session_id) {
         if matches!(runner.status, AgentStatus::Running) {
             return ReserveOutcome::AlreadyRunning(runner.run_id.clone());
         }
     }
 
-    guard.remove(session_id);
+    // Acquire every fallible/cancellation point before mutating the runner
+    // registry. In particular, cancellation while waiting for the sender map
+    // must not leave a `Running` slot with no task behind it.
+    let mut senders_guard = senders.write().await;
+    runners_guard.remove(session_id);
 
     let mut runner = AgentRunner::new();
     runner.status = AgentStatus::Running;
@@ -77,15 +81,13 @@ pub async fn reserve_runner_core(
         cancel_token: runner.cancel_token.clone(),
         run_id: runner.run_id.clone(),
     };
-    guard.insert(session_id.to_string(), runner);
+    runners_guard.insert(session_id.to_string(), runner);
 
     // (3) Re-assert the session sender under the held `runners` write lock. Same
     // channel as `event_sender`, so a no-op in the common case; restores the map
     // entry if the idle sweep removed it. Lock order (runners ⊃ senders) matches
     // the sweep, so this cannot deadlock.
-    senders
-        .write()
-        .await
+    senders_guard
         .entry(session_id.to_string())
         .or_insert_with(|| event_sender.clone());
 
@@ -139,6 +141,47 @@ pub async fn finalize_runner(
         runner.status = status_from_execution_result(result);
         runner.completed_at = Some(Utc::now());
     }
+}
+
+/// Finalize only the exact reserved runner.
+///
+/// Registration collisions can expose a stale caller after another entry
+/// point has become authoritative. That caller must release its own slot
+/// without ever terminalizing a newer runner stored under the same session id.
+pub async fn finalize_runner_exact(
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: &str,
+    run_id: &str,
+    result: &Result<(), AgentError>,
+) -> bool {
+    let mut guard = runners.write().await;
+    let Some(runner) = guard.get_mut(session_id) else {
+        return false;
+    };
+    if runner.run_id != run_id {
+        return false;
+    }
+    runner.status = status_from_execution_result(result);
+    runner.completed_at = Some(Utc::now());
+    true
+}
+
+/// Finalize a rejected caller only when it owns a distinct runner slot.
+///
+/// A duplicate task can race with the live task while both observe the same
+/// registry run id. Rejecting that duplicate must not terminalize the slot that
+/// still belongs to the registered owner.
+pub async fn finalize_rejected_runner_if_distinct(
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: &str,
+    existing_owner_run_id: &str,
+    attempted_run_id: &str,
+    result: &Result<(), AgentError>,
+) -> bool {
+    if existing_owner_run_id == attempted_run_id {
+        return false;
+    }
+    finalize_runner_exact(runners, session_id, attempted_run_id, result).await
 }
 
 #[cfg(test)]
@@ -198,6 +241,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_duplicate_does_not_terminalize_shared_owner_slot() {
+        let runners = new_runners();
+        let senders = new_senders();
+        let tx = new_broadcaster();
+        let reservation = try_reserve_runner(&runners, &senders, "s1", &tx)
+            .await
+            .unwrap();
+        let rejected = Err(AgentError::Cancelled);
+
+        assert!(
+            !finalize_rejected_runner_if_distinct(
+                &runners,
+                "s1",
+                &reservation.run_id,
+                &reservation.run_id,
+                &rejected,
+            )
+            .await
+        );
+        assert!(matches!(
+            runners.read().await.get("s1").map(|runner| &runner.status),
+            Some(AgentStatus::Running)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_distinct_runner_releases_only_its_exact_slot() {
+        let runners = new_runners();
+        let senders = new_senders();
+        let tx = new_broadcaster();
+        let reservation = try_reserve_runner(&runners, &senders, "s1", &tx)
+            .await
+            .unwrap();
+        let rejected = Err(AgentError::Cancelled);
+
+        assert!(
+            finalize_rejected_runner_if_distinct(
+                &runners,
+                "s1",
+                "different-live-owner",
+                &reservation.run_id,
+                &rejected,
+            )
+            .await
+        );
+        assert!(matches!(
+            runners.read().await.get("s1").map(|runner| &runner.status),
+            Some(AgentStatus::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
     async fn try_reserve_runner_reasserts_evicted_sender_so_late_subscriber_receives() {
         // Regression for #346: the resume path (`resume_session_execution`)
         // obtains the session sender, then reserves — and the idle sweep can
@@ -243,6 +338,49 @@ mod tests {
             "late subscriber must receive events from the resumed run; without the \
              re-assert, get_or_create mints a fresh channel and the event is lost"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_atomic_registry_commit_leaves_no_zombie_runner() {
+        let runners = new_runners();
+        let senders = new_senders();
+        let tx = new_broadcaster();
+        let held_senders = senders.write().await;
+
+        let task = {
+            let runners = runners.clone();
+            let senders = senders.clone();
+            let tx = tx.clone();
+            tokio::spawn(
+                async move { reserve_runner_core(&runners, &senders, "cancelled", &tx).await },
+            )
+        };
+
+        // Wait until the reservation owns the runners lock and is blocked on
+        // the sender lock. No registry mutation is allowed before that final
+        // cancellation point completes.
+        for _ in 0..100 {
+            if runners.try_write().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            runners.try_write().is_err(),
+            "reservation never reached the sender-lock barrier"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(held_senders);
+
+        assert!(
+            runners.read().await.get("cancelled").is_none(),
+            "a cancelled reservation must not leave a Running slot without a task"
+        );
+        assert!(matches!(
+            reserve_runner_core(&runners, &senders, "cancelled", &tx).await,
+            ReserveOutcome::Reserved(_)
+        ));
     }
 
     #[test]

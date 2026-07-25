@@ -1659,12 +1659,31 @@ pub(super) async fn run_pipeline(
         // take effect until the next run. Adopt the disk value onto BOTH the
         // live runtime state and the owned session so this round's per-tool-call
         // `ToolExecutionSessionFlags::from_session` sees it. #540.
-        let turn_refresh = state_bridge::refresh_turn_boundary_from_disk(
+        if let Some(notifications) = config.session_activation_notifications.as_ref() {
+            let mut receiver = notifications.lock();
+            if receiver.has_changed().unwrap_or(false) {
+                let generation = *receiver.borrow_and_update();
+                tracing::debug!(
+                    session_id = %session.id,
+                    generation,
+                    "active loop consumed SessionInbox wake notification at safe boundary"
+                );
+            }
+        }
+        let turn_refresh = state_bridge::refresh_turn_boundary_with_inbox(
             session,
             config.storage.as_ref(),
             config.persistence.as_ref(),
+            config.session_inbox.as_ref(),
         )
         .await;
+        if turn_refresh.merged > 0 {
+            tracing::debug!(
+                session_id = %session.id,
+                admitted_messages = turn_refresh.merged,
+                "turn boundary admitted durable SessionInbox work"
+            );
+        }
         if let Some(disk_bypass) = turn_refresh.disk_bypass_permissions {
             state.runtime_state.bypass_permissions = disk_bypass;
             session
@@ -2443,6 +2462,44 @@ pub(super) async fn run_pipeline(
     apply_completed_task_evaluation(session, event_tx, config, state).await;
     poll_completed_gold_evaluation(state).await;
     apply_completed_gold_evaluation(session, config, state).await;
+
+    // An explicit peer/user SessionInbox delivery may interrupt a specific
+    // child/Bash wait for one reasoning turn, but it never transfers or erases
+    // ownership of that wait. Re-read the durable control plane at terminal so
+    // a completion that cleared the wait during this run wins over the stale
+    // live snapshot; otherwise restore the suspended gate for the remaining
+    // work.
+    if !session.metadata.contains_key("runtime.suspend_reason") {
+        if let Some(storage) = config.storage.as_ref() {
+            if let Ok(Some(persisted)) = storage.load_session(&state.session_id).await {
+                if let Some(persisted_state) = persisted.agent_runtime_state {
+                    state.runtime_state.waiting_for_children = persisted_state.waiting_for_children;
+                    state.runtime_state.waiting_for_bash = persisted_state.waiting_for_bash;
+                }
+            }
+        }
+        let reason = if state.runtime_state.waiting_for_children.is_some() {
+            Some(("waiting_for_children", "ChildCompletion"))
+        } else if state.runtime_state.waiting_for_bash.is_some() {
+            Some(("waiting_for_bash", "BashCompletion"))
+        } else {
+            None
+        };
+        if let Some((reason, hook_point)) = reason {
+            state.runtime_state.status = AgentStatusState::Suspended;
+            state.runtime_state.suspension = Some(SuspensionState {
+                reason: reason.to_string(),
+                suspended_at: Utc::now(),
+                resumable: true,
+                hook_point: Some(hook_point.to_string()),
+            });
+            session
+                .metadata
+                .insert("runtime.suspend_reason".to_string(), reason.to_string());
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+        }
+    }
+
     let evaluation_stop_reason = if session.metadata.contains_key("runtime.suspend_reason") {
         "run_suspended"
     } else {

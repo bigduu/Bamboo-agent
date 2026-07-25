@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 regex = "1"
 async-trait = "0.1"
 tracing = "0.1"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [features]
 test-utils = []

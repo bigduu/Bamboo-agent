@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use bamboo_agent_core::AgentEvent;
+use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
@@ -17,7 +18,6 @@ use bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY;
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use tokio::sync::broadcast;
 
-use super::runner_lifecycle::{try_reserve_runner, RunnerReservation};
 use super::session_events::get_or_create_event_sender;
 use super::AppState;
 use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
@@ -40,23 +40,19 @@ impl ResumeExecutionPort for AppStateResumeRef {
         AppState::save_and_cache_session(&self.0, session).await;
     }
 
-    async fn try_reserve_runner(
+    async fn reserve_session_execution(
         &self,
         session_id: &str,
         event_sender: &broadcast::Sender<AgentEvent>,
-    ) -> Option<RunnerReservation> {
-        try_reserve_runner(
+    ) -> SessionExecutionReserveOutcome {
+        reserve_session_execution(
+            &self.0.agent,
             &self.0.agent_runners,
             &self.0.session_event_senders,
             session_id,
             event_sender,
         )
         .await
-    }
-
-    async fn get_existing_runner_run_id(&self, session_id: &str) -> Option<String> {
-        let runners = self.0.agent_runners.read().await;
-        runners.get(session_id).map(|r| r.run_id.clone())
     }
 
     async fn get_or_create_event_sender(&self, session_id: &str) -> broadcast::Sender<AgentEvent> {
@@ -67,11 +63,19 @@ impl ResumeExecutionPort for AppStateResumeRef {
         let ResumeSpawnRequest {
             session_id,
             session,
-            cancel_token,
-            run_id: _,
+            mut execution_reservation,
             event_sender,
             config,
         } = request;
+        if let Err(error) = execution_reservation.ensure_registered().await {
+            tracing::warn!(
+                %session_id,
+                run_id = %execution_reservation.run_id(),
+                %error,
+                "cannot resume server session without exact router ownership"
+            );
+            return;
+        }
 
         let model = session.model.clone();
         let resolved_provider_name = session_effective_model_ref(&session)
@@ -172,6 +176,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     state: state.clone(),
                     session_id,
                     session,
+                    execution_reservation,
                     is_child_session,
                     provider_name: resolved_provider_name,
                     provider_override: None,
@@ -180,7 +185,6 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     reasoning_effort_source,
                     disabled_tools: config.disabled_tools,
                     disabled_skill_ids: config.disabled_skill_ids,
-                    cancel_token,
                     mpsc_tx,
                     image_fallback,
                     gold_config,
@@ -277,6 +281,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 state: state.clone(),
                 session_id,
                 session,
+                execution_reservation,
                 is_child_session,
                 provider_name: resolved_provider_name,
                 provider_override: None,
@@ -285,7 +290,6 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 reasoning_effort_source,
                 disabled_tools: config.disabled_tools,
                 disabled_skill_ids: config.disabled_skill_ids,
-                cancel_token,
                 mpsc_tx,
                 image_fallback,
                 gold_config,

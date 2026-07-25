@@ -1134,10 +1134,13 @@ mod tests {
     fn run_spec(assignment: &str) -> RunSpec {
         RunSpec {
             assignment: assignment.to_string(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages: Vec::new(),
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }
     }
@@ -1145,10 +1148,13 @@ mod tests {
     fn run_spec_with_messages(assignment: &str, messages: Vec<Value>) -> RunSpec {
         RunSpec {
             assignment: assignment.to_string(),
+            logical_session: None,
             project_id: None,
             reasoning_effort: None,
             permission_policy: None,
             messages,
+            activation_run_id: None,
+            initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }
     }

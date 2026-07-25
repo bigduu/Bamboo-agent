@@ -18,8 +18,8 @@ use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::execution::runner_state::AgentRunner;
 use bamboo_engine::execution::{
-    create_event_forwarder, get_or_create_event_sender, spawn_session_execution,
-    try_reserve_runner, SessionExecutionArgs,
+    create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
+    spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
@@ -826,8 +826,34 @@ impl ConnectBridge {
             }
         };
 
-        session.add_message(Message::user(text.to_string()));
         let session_id = session.id.clone();
+        let session_tx =
+            get_or_create_event_sender(&self.ctx.session_event_senders, &session_id).await;
+        let execution_reservation = match reserve_session_execution(
+            &self.ctx.agent,
+            &self.ctx.agent_runners,
+            &self.ctx.session_event_senders,
+            &session_id,
+            &session_tx,
+        )
+        .await
+        {
+            SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
+            SessionExecutionReserveOutcome::AlreadyRunning { .. } => {
+                reply_text(
+                    &platform,
+                    reply_ctx,
+                    "This session is already running elsewhere; please wait for it to finish.",
+                )
+                .await;
+                return;
+            }
+        };
+        let rx = session_tx.subscribe();
+
+        // Only the exact shared runner/router owner may publish a new prompt or
+        // mutate process-global permission workspace state.
+        session.add_message(Message::user(text.to_string()));
         if let Some(config) = self.ctx.permission_checker.permission_config() {
             if let Some(workspace) = session.workspace.as_ref() {
                 config.register_session_workspace(session_id.clone(), workspace.clone());
@@ -843,28 +869,7 @@ impl ConnectBridge {
         }
         self.ctx.session_repo.save_and_cache(&mut session).await;
 
-        let session_tx =
-            get_or_create_event_sender(&self.ctx.session_event_senders, &session_id).await;
-        let rx = session_tx.subscribe();
-
-        let Some(reservation) = try_reserve_runner(
-            &self.ctx.agent_runners,
-            &self.ctx.session_event_senders,
-            &session_id,
-            &session_tx,
-        )
-        .await
-        else {
-            reply_text(
-                &platform,
-                reply_ctx,
-                "This session is already running elsewhere; please wait for it to finish.",
-            )
-            .await;
-            return;
-        };
-
-        self.set_cancel_token(key, reservation.cancel_token.clone())
+        self.set_cancel_token(key, execution_reservation.cancel_token().clone())
             .await;
 
         let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
@@ -897,6 +902,7 @@ impl ConnectBridge {
             agent: self.ctx.agent.clone(),
             session_id: session_id.clone(),
             session,
+            execution_reservation,
             tools_override: Some(self.ctx.tools.clone()),
             provider_override: None,
             model_roster: resolved.model_roster.clone(),
@@ -908,7 +914,6 @@ impl ConnectBridge {
             disabled_skill_ids: None,
             selected_skill_ids: None,
             selected_skill_mode: None,
-            cancel_token: reservation.cancel_token,
             mpsc_tx,
             image_fallback: None,
             gold_config: resolved.gold_config.clone(),

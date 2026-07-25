@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use uuid::Uuid;
 
 use bamboo_domain::ProviderModelRef;
@@ -52,6 +53,29 @@ const TOKEN_USAGE_FILE: &str = "token-usage.jsonl";
 /// Marker (under `bamboo_home_dir`) recording that the one-shot runtime sidecar
 /// migration has completed, so it is skipped on subsequent boots.
 const RUNTIME_SIDECAR_MIGRATION_MARKER: &str = ".runtime_sidecar_migrated";
+const SESSION_LIFECYCLE_LOCK_FILE: &str = ".session-lifecycle.lock";
+
+pub(crate) struct SessionLifecycleReadGuard {
+    _process: OwnedRwLockReadGuard<()>,
+    file: std::fs::File,
+}
+
+impl Drop for SessionLifecycleReadGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+pub(crate) struct SessionLifecycleWriteGuard {
+    _process: OwnedRwLockWriteGuard<()>,
+    file: std::fs::File,
+}
+
+impl Drop for SessionLifecycleWriteGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
 
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
@@ -59,6 +83,13 @@ const RUNTIME_SIDECAR_MIGRATION_MARKER: &str = ".runtime_sidecar_migrated";
 fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
+    if let Some(metadata) = snapshot.runtime_metadata.as_mut() {
+        // Admission ids must be committed atomically with their transcript
+        // messages in session.json. Duplicating them into runtime.json would
+        // allow a crash between the two files to expose dedupe state without
+        // the corresponding message.
+        metadata.session_inbox_admission = None;
+    }
     snapshot
 }
 
@@ -71,7 +102,18 @@ fn runtime_sidecar_snapshot(session: &Session) -> Session {
 fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     match sidecar {
         Some(mut side) => {
+            let admission = main
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.session_inbox_admission.clone());
             side.messages = main.messages;
+            if let Some(admission) = admission {
+                side.runtime_metadata
+                    .get_or_insert_with(Default::default)
+                    .session_inbox_admission = Some(admission);
+            } else if let Some(metadata) = side.runtime_metadata.as_mut() {
+                metadata.session_inbox_admission = None;
+            }
             side
         }
         None => main,
@@ -244,6 +286,10 @@ pub struct SessionStoreV2 {
     index: RwLock<SessionsIndex>,
     /// Serializes on-disk index writes (and any multi-step operations that must be atomic-ish).
     write_lock: Mutex<()>,
+    /// Coordinates destructive target lifecycle transitions with durable inbox
+    /// operations. The Tokio lock covers one runtime; the file lock covers
+    /// independent Bamboo processes sharing the same data directory.
+    session_lifecycle_lock: std::sync::Arc<RwLock<()>>,
 }
 
 impl SessionStoreV2 {
@@ -335,6 +381,7 @@ impl SessionStoreV2 {
             search_index,
             index: RwLock::new(index),
             write_lock: Mutex::new(()),
+            session_lifecycle_lock: std::sync::Arc::new(RwLock::new(())),
         };
 
         if needs_rebuild {
@@ -521,6 +568,46 @@ impl SessionStoreV2 {
 
     pub fn bamboo_home_dir(&self) -> &Path {
         &self.bamboo_home_dir
+    }
+
+    async fn open_session_lifecycle_file(&self, exclusive: bool) -> io::Result<std::fs::File> {
+        let path = self.bamboo_home_dir.join(SESSION_LIFECYCLE_LOCK_FILE);
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            if exclusive {
+                FileExt::lock_exclusive(&file)?;
+            } else {
+                FileExt::lock_shared(&file)?;
+            }
+            Ok(file)
+        })
+        .await
+        .map_err(|error| other_io_error(format!("join session lifecycle lock task: {error}")))?
+    }
+
+    pub(crate) async fn lock_session_lifecycle_shared(
+        &self,
+    ) -> io::Result<SessionLifecycleReadGuard> {
+        let process = self.session_lifecycle_lock.clone().read_owned().await;
+        let file = self.open_session_lifecycle_file(false).await?;
+        Ok(SessionLifecycleReadGuard {
+            _process: process,
+            file,
+        })
+    }
+
+    async fn lock_session_lifecycle_exclusive(&self) -> io::Result<SessionLifecycleWriteGuard> {
+        let process = self.session_lifecycle_lock.clone().write_owned().await;
+        let file = self.open_session_lifecycle_file(true).await?;
+        Ok(SessionLifecycleWriteGuard {
+            _process: process,
+            file,
+        })
     }
 
     pub fn index_path(&self) -> &Path {
@@ -1102,6 +1189,7 @@ impl SessionStoreV2 {
     /// - `bamboo_home_dir/sessions/`
     /// - `bamboo_home_dir/sessions.json` (rewritten to empty index)
     pub async fn dev_reset(&self) -> io::Result<()> {
+        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _guard = self.write_lock.lock().await;
 
         // Remove the sessions directory entirely.
@@ -1123,6 +1211,16 @@ impl SessionStoreV2 {
     ///
     /// `force=true` ignores pinned protection; callers must enforce confirmations at the API/UI layer.
     pub async fn delete_session_recursive(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> io::Result<bool> {
+        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        self.delete_session_recursive_locked(session_id, force)
+            .await
+    }
+
+    async fn delete_session_recursive_locked(
         &self,
         session_id: &str,
         force: bool,
@@ -1481,7 +1579,9 @@ impl AttachmentReader for SessionStoreV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_domain::{SessionInboxError, SessionInboxPort, SessionMessageEnvelope};
     use std::io;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn create_temp_storage() -> io::Result<(SessionStoreV2, TempDir)> {
@@ -2359,6 +2459,64 @@ mod tests {
         let (storage, _temp_dir) = create_temp_storage().await?;
         let deleted = storage.delete_session("nonexistent").await?;
         assert!(!deleted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_wins_before_delivery_without_recreating_an_orphan_inbox() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let storage = Arc::new(SessionStoreV2::new(temp_dir.path().to_path_buf()).await?);
+        let session = Session::new("delete-inbox-race", "model");
+        storage.save_session(&session).await?;
+        let rel_path = storage
+            .resolve_rel_path(&session.id)
+            .await
+            .expect("saved session has an indexed path");
+        let session_dir = storage.abs_path_from_rel(&rel_path);
+        // A second store instance models another Bamboo process: its in-memory
+        // index stays stale after the first instance deletes the target, so
+        // correctness also depends on the shared file lock and post-lock
+        // `session.json` validation.
+        let delivery_storage = Arc::new(SessionStoreV2::new(temp_dir.path().to_path_buf()).await?);
+        let inbox = crate::FileSessionInbox::new(
+            delivery_storage,
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+
+        // Hold the exact lifecycle exclusion that deletion owns. A delivery
+        // started now cannot resolve or recreate the target until the deletion
+        // and index removal have linearized.
+        let lifecycle = storage.lock_session_lifecycle_exclusive().await?;
+        let target = session.id.clone();
+        let delivery = tokio::spawn(async move {
+            inbox
+                .deliver(&SessionMessageEnvelope::user_input(target, "late"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!delivery.is_finished());
+
+        assert!(
+            storage
+                .delete_session_recursive_locked(&session.id, true)
+                .await?
+        );
+        assert!(!session_dir.exists());
+        drop(lifecycle);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), delivery)
+            .await
+            .expect("blocked delivery must resume after deletion")
+            .expect("delivery task must not panic")
+            .expect_err("a deleted target cannot acknowledge a new inbox");
+        assert!(matches!(
+            error,
+            SessionInboxError::TargetNotFound(ref id) if id == &session.id
+        ));
+        assert!(
+            !session_dir.exists(),
+            "failed delivery must not recreate an orphan session/inbox tree"
+        );
         Ok(())
     }
 

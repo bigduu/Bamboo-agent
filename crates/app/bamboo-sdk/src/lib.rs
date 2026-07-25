@@ -17,9 +17,18 @@ pub mod agent;
 pub use agent::ExecuteRequestBuilder;
 pub use agent::{
     Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
-    HookToolOutcome, PermissionMode, RuntimeAgent, RuntimeAgentBuilder, SdkError, ShellCommandHook,
-    ShellHookEvent,
+    HookToolOutcome, PermissionMode, RuntimeAgent, RuntimeAgentBuilder, SdkError,
+    SessionActivationDisposition, SessionActivationError, SessionActivationLaunch,
+    SessionActivationPolicy, SessionActivationPort, SessionActivationReserveOutcome,
+    SessionActivationRouter, SessionActivationSpawner, SessionChildOutcome, SessionInboxBacklog,
+    SessionInboxClaim, SessionInboxError, SessionInboxLimits, SessionInboxPort,
+    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope,
+    SessionMessageId, SessionMessageKind, SessionMessageSource, SessionMessagingMetrics,
+    SessionMessagingMetricsSnapshot, SessionMessenger, SessionMessengerAdmission,
+    SessionMessengerError, SessionMessengerReceipt, SessionProviderMessage, SessionRunRegistration,
+    SessionRunRegistrationError, SessionRuntimeInstruction, ShellCommandHook, ShellHookEvent,
 };
+pub use agent::{FileSessionInbox, SessionIndexEntry};
 
 // Tool catalog surfaced by `agent::mod`.
 pub use agent::{

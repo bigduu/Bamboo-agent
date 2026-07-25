@@ -72,6 +72,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
         executor.run(
             RunSpec {
                 assignment: prompt,
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: Some(PermissionPolicyContext {
@@ -83,6 +84,8 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                     policy: serde_json::json!({}),
                 }),
                 messages: Vec::new(),
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: RunSecrets::default(),
             },
             sink.with_host_bridge(host.clone()),
@@ -119,6 +122,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                     "Again use a shell command to create this exact file outside the workspace, then explain the result: {}",
                     denied_marker.display()
                 ),
+                logical_session: None,
                 project_id: None,
                 reasoning_effort: None,
                 permission_policy: Some(PermissionPolicyContext {
@@ -130,6 +134,8 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                     policy: serde_json::json!({}),
                 }),
                 messages: vec![serde_json::json!({"role": "user", "content": "prior turn"})],
+                activation_run_id: None,
+                initial_session_messages: Vec::new(),
                 secrets: RunSecrets::default(),
             },
             deny_sink.with_host_bridge(host),
