@@ -112,67 +112,6 @@ fn validate_workspace_assignment_with(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn confinement_final_path_is_the_authority_for_ownership_and_persistence() {
-        let data = tempfile::tempdir().expect("data");
-        let raw = tempfile::tempdir().expect("raw workspace");
-        let confined = tempfile::tempdir().expect("confined workspace");
-        std::fs::write(raw.path().join("raw-only.txt"), "RAW MUST NOT BE USED")
-            .expect("raw fixture");
-        std::fs::write(confined.path().join("final-only.txt"), "FINAL").expect("final fixture");
-        let store = ProjectStore::open(data.path()).expect("Project store");
-        let owner = store
-            .create_with_bindings(
-                "Owner",
-                None,
-                vec![bamboo_domain::WorkspaceBinding {
-                    path: confined.path().to_string_lossy().into_owned(),
-                    label: None,
-                    git_common_dir: None,
-                }],
-            )
-            .expect("owner Project");
-        let other = store.create("Other", None).expect("other Project");
-
-        let resolved = validate_workspace_assignment_with(
-            &store,
-            Some(&owner.id),
-            Some(raw.path().to_string_lossy().as_ref()),
-            |_| confined.path().to_path_buf(),
-        )
-        .expect("same owner");
-        assert_eq!(
-            resolved.as_deref(),
-            Some(confined.path().canonicalize().unwrap().as_path())
-        );
-        assert!(resolved
-            .as_ref()
-            .is_some_and(|path| path.join("final-only.txt").exists()));
-        assert!(!resolved
-            .as_ref()
-            .is_some_and(|path| path.join("raw-only.txt").exists()));
-
-        let conflict = validate_workspace_assignment_with(
-            &store,
-            Some(&other.id),
-            Some(raw.path().to_string_lossy().as_ref()),
-            |_| confined.path().to_path_buf(),
-        )
-        .expect_err("final workspace owner must win over the raw request");
-        assert!(matches!(
-            conflict,
-            ProjectWorkspaceValidationError::Conflict {
-                owner_project_id,
-                ..
-            } if owner_project_id == owner.id
-        ));
-    }
-}
-
 pub struct ProjectStoreContextSource {
     store: Arc<ProjectStore>,
 }
@@ -248,5 +187,66 @@ impl ProjectContextSource for ProjectStoreContextSource {
             .find_workspace_owner_for_path(&display)
             .map(|owner| owner.map(|project| project.id))
             .map_err(|error| ProjectContextError::Source(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confinement_final_path_is_the_authority_for_ownership_and_persistence() {
+        let data = tempfile::tempdir().expect("data");
+        let raw = tempfile::tempdir().expect("raw workspace");
+        let confined = tempfile::tempdir().expect("confined workspace");
+        std::fs::write(raw.path().join("raw-only.txt"), "RAW MUST NOT BE USED")
+            .expect("raw fixture");
+        std::fs::write(confined.path().join("final-only.txt"), "FINAL").expect("final fixture");
+        let store = ProjectStore::open(data.path()).expect("Project store");
+        let owner = store
+            .create_with_bindings(
+                "Owner",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: confined.path().to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .expect("owner Project");
+        let other = store.create("Other", None).expect("other Project");
+
+        let resolved = validate_workspace_assignment_with(
+            &store,
+            Some(&owner.id),
+            Some(raw.path().to_string_lossy().as_ref()),
+            |_| confined.path().to_path_buf(),
+        )
+        .expect("same owner");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(confined.path().canonicalize().unwrap().as_path())
+        );
+        assert!(resolved
+            .as_ref()
+            .is_some_and(|path| path.join("final-only.txt").exists()));
+        assert!(!resolved
+            .as_ref()
+            .is_some_and(|path| path.join("raw-only.txt").exists()));
+
+        let conflict = validate_workspace_assignment_with(
+            &store,
+            Some(&other.id),
+            Some(raw.path().to_string_lossy().as_ref()),
+            |_| confined.path().to_path_buf(),
+        )
+        .expect_err("final workspace owner must win over the raw request");
+        assert!(matches!(
+            conflict,
+            ProjectWorkspaceValidationError::Conflict {
+                owner_project_id,
+                ..
+            } if owner_project_id == owner.id
+        ));
     }
 }

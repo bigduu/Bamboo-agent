@@ -1291,19 +1291,21 @@ async fn handle_tool_calls_path(
         biased;
         _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
         result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
-            &stream_output.tool_calls,
-            frame,
-            session,
-            runtime_state,
-            task_context,
-            compression_model
-                .as_deref()
-                .or(auxiliary_models.background_model_name.as_deref()),
-            auxiliary_models
-                .summarization_model_provider
-                .as_ref()
-                .or(auxiliary_models.background_model_provider.as_ref()),
-            &tool_schemas,
+            crate::runtime::runner::tool_execution::RoundToolExecution {
+                tool_calls: &stream_output.tool_calls,
+                frame,
+                session,
+                runtime_state,
+                task_context,
+                compression_model_name: compression_model
+                    .as_deref()
+                    .or(auxiliary_models.background_model_name.as_deref()),
+                compression_model_provider: auxiliary_models
+                    .summarization_model_provider
+                    .as_ref()
+                    .or(auxiliary_models.background_model_provider.as_ref()),
+                tool_schemas: &tool_schemas,
+            },
         ) => result?,
     };
 
@@ -5496,18 +5498,18 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_round_tool_calls(
-                std::slice::from_ref(&single_read_call()),
-                &frame,
-                &mut session,
-                &mut runtime_state,
-                &mut task_context,
+            execute_round_tool_calls(crate::runtime::runner::tool_execution::RoundToolExecution {
+                tool_calls: std::slice::from_ref(&single_read_call()),
+                frame: &frame,
+                session: &mut session,
+                runtime_state: &mut runtime_state,
+                task_context: &mut task_context,
                 // No compression model -> mid-turn compression short-circuits, so
                 // the healthy path is exercised without any auxiliary LLM call.
-                None,
-                None,
-                &tool_schemas,
-            ),
+                compression_model_name: None,
+                compression_model_provider: None,
+                tool_schemas: &tool_schemas,
+            }),
         )
         .await
         .expect("normal tool batch did not complete within 10s");

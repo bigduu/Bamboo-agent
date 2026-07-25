@@ -564,12 +564,9 @@ mod tests {
         .await;
         assert_eq!(prompt.status(), StatusCode::OK);
         let prompt: Value = test::read_body_json(prompt).await;
-        assert_eq!(
-            prompt["project_context"]
-                .as_str()
-                .is_some_and(|value| value.contains(owner.id.as_str())),
-            true
-        );
+        assert!(prompt["project_context"]
+            .as_str()
+            .is_some_and(|value| value.contains(owner.id.as_str())));
         let effective = prompt["effective_system_prompt"]
             .as_str()
             .expect("effective prompt");

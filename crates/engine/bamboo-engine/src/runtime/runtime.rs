@@ -23,8 +23,9 @@ use bamboo_metrics::MetricsCollector;
 use bamboo_skills::SkillManager;
 
 use crate::runtime::config::{
-    AgentLoopConfig, AuxiliaryModelConfig, BashCompletionSink, BashResumeHook, GoldConfig,
-    GuardianConfig, GuardianSpawner, ImageFallbackConfig, PromptMemoryFlags,
+    AgentLoopConfig, AuxiliaryModelConfig, BashCompletionSink, BashResumeHook,
+    DisabledFilterResolver, GoldConfig, GuardianConfig, GuardianSpawner, ImageFallbackConfig,
+    PromptMemoryFlags,
 };
 use crate::runtime::hooks::HookRunner;
 use crate::runtime::model_roster::{ModelRoster, RoleModel};
@@ -276,8 +277,7 @@ pub struct ExecuteRequest {
     pub auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
     /// Optional per-round live resolver for the disabled tool/skill sets (#136).
     /// When `None`, the snapshotted `disabled_tools`/`disabled_skill_ids` are used.
-    pub disabled_filter_resolver:
-        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
+    pub disabled_filter_resolver: Option<DisabledFilterResolver>,
     /// When `None`, falls back to `Config::disabled_tool_names()`.
     pub disabled_tools: Option<BTreeSet<String>>,
     /// When `None`, falls back to `Config::disabled_skill_ids()`.
@@ -345,8 +345,7 @@ pub struct ExecuteRequestBuilder {
     summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     reasoning_effort: Option<ReasoningEffort>,
     auxiliary_model_resolver: Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
-    disabled_filter_resolver:
-        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
+    disabled_filter_resolver: Option<DisabledFilterResolver>,
     disabled_tools: Option<BTreeSet<String>>,
     disabled_skill_ids: Option<BTreeSet<String>>,
     selected_skill_ids: Option<Vec<String>>,
@@ -502,10 +501,7 @@ impl ExecuteRequestBuilder {
     }
 
     /// Set the per-round resolver for the live disabled tool/skill sets (#136).
-    pub fn disabled_filter_resolver(
-        mut self,
-        v: Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>,
-    ) -> Self {
+    pub fn disabled_filter_resolver(mut self, v: DisabledFilterResolver) -> Self {
         self.disabled_filter_resolver = Some(v);
         self
     }

@@ -1698,16 +1698,18 @@ mod reexecute_and_child_approval_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _live_guard = bamboo_engine::external_agents::live::register("child-x", tx, 0, None);
         let (approval_event_tx, _approval_event_rx) = tokio::sync::mpsc::channel(4);
-        bamboo_engine::external_agents::live::register_pending_approval_observed(
-            None,
-            "parent-x",
-            "child-x",
-            0,
-            "req-1",
-            "shell",
-            "execute",
-            "cargo test",
-            approval_event_tx,
+        bamboo_engine::external_agents::live::observe_pending_approval(
+            bamboo_engine::external_agents::live::PendingApprovalObservation {
+                registry: None,
+                parent_session_id: "parent-x",
+                child_id: "child-x",
+                child_attempt: 0,
+                request_id: "req-1",
+                tool_name: "shell",
+                permission: "execute",
+                resource: "cargo test",
+                event_tx: approval_event_tx,
+            },
         );
 
         assert!(agent.answer_child_approval("child-x", "req-1", true));

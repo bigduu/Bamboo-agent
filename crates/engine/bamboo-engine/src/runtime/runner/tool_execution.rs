@@ -410,16 +410,31 @@ async fn maybe_apply_mid_turn_context_compression_after_tool(
     }
 }
 
+pub(crate) struct RoundToolExecution<'a, 'frame> {
+    pub(crate) tool_calls: &'a [ToolCall],
+    pub(crate) frame: &'a crate::runtime::runner::round_frame::RoundFrame<'frame>,
+    pub(crate) session: &'a mut Session,
+    pub(crate) runtime_state: &'a mut AgentRuntimeState,
+    pub(crate) task_context: &'a mut Option<TaskLoopContext>,
+    pub(crate) compression_model_name: Option<&'a str>,
+    pub(crate) compression_model_provider: Option<&'a Arc<dyn LLMProvider>>,
+    pub(crate) tool_schemas: &'a [ToolSchema],
+}
+
 pub(crate) async fn execute_round_tool_calls(
-    tool_calls: &[ToolCall],
-    frame: &crate::runtime::runner::round_frame::RoundFrame<'_>,
-    session: &mut Session,
-    runtime_state: &mut AgentRuntimeState,
-    task_context: &mut Option<TaskLoopContext>,
-    compression_model_name: Option<&str>,
-    compression_model_provider: Option<&Arc<dyn LLMProvider>>,
-    tool_schemas: &[ToolSchema],
+    execution: RoundToolExecution<'_, '_>,
 ) -> Result<RoundToolExecutionResult, AgentError> {
+    let RoundToolExecution {
+        tool_calls,
+        frame,
+        session,
+        runtime_state,
+        task_context,
+        compression_model_name,
+        compression_model_provider,
+        tool_schemas,
+    } = execution;
+
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let metrics_collector = frame.metrics_collector;

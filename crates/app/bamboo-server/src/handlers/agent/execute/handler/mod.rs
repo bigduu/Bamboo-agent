@@ -191,10 +191,10 @@ pub async fn handler(
             is_child_session,
         } => {
             let session = *session;
-            ready::handle_execute_ready(
-                &state,
-                &session_id,
-                ready::ReadyExecution {
+            ready::handle_execute_ready(ready::ExecuteReadyContext {
+                state: &state,
+                session_id: &session_id,
+                ready: ready::ReadyExecution {
                     session,
                     startup_guard: &mut startup_guard,
                     startup_turn_id: startup_turn_id.clone(),
@@ -206,12 +206,12 @@ pub async fn handler(
                     no_human_approver: req.no_human_approver,
                     run_budget: req.run_budget,
                 },
-                &config,
-                &config_snapshot,
+                config: &config,
+                config_snapshot: &config_snapshot,
                 image_fallback,
-                disabled_tools_vec,
-                disabled_skill_ids_vec,
-            )
+                disabled_tools: disabled_tools_vec,
+                disabled_skill_ids: disabled_skill_ids_vec,
+            })
             .await
         }
 

@@ -1218,22 +1218,22 @@ impl ExternalChildRunner for ActorChildRunner {
                 self.approval_registry.clone(),
             );
 
-            let result = drive(
-                &mut *client,
-                &job.parent_session_id,
-                &job.child_session_id,
-                attempt as u32,
-                self.approval_registry.as_ref(),
-                self.approval_decider.as_ref(),
-                self.approval_reviewer.as_ref(),
-                escalation.clone(),
-                &event_tx,
-                &cancel_token,
-                &mut live_rx,
-                &mut delivery_rx,
-                session,
-                session_inbox_runtime.as_ref(),
-                bound_activation_run_id.as_deref(),
+            let result = drive(ActorDriveContext {
+                client: &mut *client,
+                parent_session_id: &job.parent_session_id,
+                child_session_id: &job.child_session_id,
+                child_attempt: attempt as u32,
+                approval_registry: self.approval_registry.as_ref(),
+                approval_decider: self.approval_decider.as_ref(),
+                approval_reviewer: self.approval_reviewer.as_ref(),
+                escalation_bridge: escalation.clone(),
+                event_tx: &event_tx,
+                cancel_token: &cancel_token,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: session,
+                session_inbox_runtime: session_inbox_runtime.as_ref(),
+                activation_run_id: bound_activation_run_id.as_deref(),
                 initial_inflight_claims,
                 // First-frame watchdog for EVERY placement: a wedged-but-connected
                 // worker (subscribed ≠ serving — e.g. stuck on a prior LLM call) emits
@@ -1241,8 +1241,8 @@ impl ExternalChildRunner for ActorChildRunner {
                 // turns the "running-but-unresponsive" hang into a recoverable
                 // WorkerUnresponsive (reap+respawn local / re-pick schedulable / error
                 // on a fixed remote endpoint).
-                Some(WORKER_FIRST_FRAME_TIMEOUT),
-            )
+                first_frame_timeout: Some(WORKER_FIRST_FRAME_TIMEOUT),
+            })
             .await;
             if let (Some(binding), Some(run_id)) = (
                 session_inbox_runtime.as_ref(),
@@ -1719,6 +1719,27 @@ async fn forward_next_canonical_claim(
     Ok(())
 }
 
+/// Borrowed and per-run-owned inputs for one actor frame pump.
+struct ActorDriveContext<'a> {
+    client: &'a mut dyn bamboo_subagent::ChildLink,
+    parent_session_id: &'a str,
+    child_session_id: &'a str,
+    child_attempt: u32,
+    approval_registry: Option<&'a super::approval_registry::SharedApprovalRegistry>,
+    approval_decider: Option<&'a Arc<dyn ChildApprovalDecider>>,
+    approval_reviewer: Option<&'a Arc<dyn ChildApprovalReviewer>>,
+    escalation_bridge: Option<bamboo_subagent::executor::HostBridge>,
+    event_tx: &'a mpsc::Sender<AgentEvent>,
+    cancel_token: &'a CancellationToken,
+    live_rx: &'a mut mpsc::UnboundedReceiver<ParentFrame>,
+    delivery_rx: &'a mut mpsc::UnboundedReceiver<u64>,
+    logical_session: &'a mut Session,
+    session_inbox_runtime: Option<&'a SessionInboxRuntimeBinding>,
+    activation_run_id: Option<&'a str>,
+    initial_inflight_claims: VecDeque<SessionInboxClaim>,
+    first_frame_timeout: Option<Duration>,
+}
+
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
 /// On success, yields the actor's final result text (for session write-back).
 /// `live_rx` carries in-band frames (steering messages) from the live registry.
@@ -1729,25 +1750,27 @@ async fn forward_next_canonical_claim(
 /// UP to the parent run. Owning it for the call's lifetime is what lets a
 /// fire-and-forget grandchild that outlives its spawning run still escalate to
 /// the correct (then-current) parent bridge rather than a stale/overwritten one.
-async fn drive(
-    client: &mut dyn bamboo_subagent::ChildLink,
-    parent_session_id: &str,
-    child_session_id: &str,
-    child_attempt: u32,
-    approval_registry: Option<&super::approval_registry::SharedApprovalRegistry>,
-    approval_decider: Option<&Arc<dyn ChildApprovalDecider>>,
-    approval_reviewer: Option<&Arc<dyn ChildApprovalReviewer>>,
-    escalation_bridge: Option<bamboo_subagent::executor::HostBridge>,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    cancel_token: &CancellationToken,
-    live_rx: &mut mpsc::UnboundedReceiver<ParentFrame>,
-    delivery_rx: &mut mpsc::UnboundedReceiver<u64>,
-    logical_session: &mut Session,
-    session_inbox_runtime: Option<&SessionInboxRuntimeBinding>,
-    activation_run_id: Option<&str>,
-    initial_inflight_claims: VecDeque<SessionInboxClaim>,
-    first_frame_timeout: Option<Duration>,
-) -> crate::runtime::runner::Result<Option<String>> {
+async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result<Option<String>> {
+    let ActorDriveContext {
+        client,
+        parent_session_id,
+        child_session_id,
+        child_attempt,
+        approval_registry,
+        approval_decider,
+        approval_reviewer,
+        escalation_bridge,
+        event_tx,
+        cancel_token,
+        live_rx,
+        delivery_rx,
+        logical_session,
+        session_inbox_runtime,
+        activation_run_id,
+        initial_inflight_claims,
+        first_frame_timeout,
+    } = context;
+
     // First-frame watchdog: a live worker emits its first frame (run-started /
     // first token) within seconds; total silence past the deadline means the
     // worker is dead (e.g. a pooled worker that exited right after checkout), so
@@ -2566,25 +2589,25 @@ mod tests {
         let cancel = CancellationToken::new();
         let (_live_tx, mut live_rx) = mpsc::unbounded_channel();
         let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
-        let result = drive(
-            &mut link,
-            "parent",
-            session_id,
-            0,
-            None,
-            None,
-            None,
-            None,
-            &event_tx,
-            &cancel,
-            &mut live_rx,
-            &mut delivery_rx,
-            &mut session,
-            Some(&binding),
-            Some(run_id),
-            claims,
-            Some(Duration::from_secs(1)),
-        )
+        let result = drive(ActorDriveContext {
+            client: &mut link,
+            parent_session_id: "parent",
+            child_session_id: session_id,
+            child_attempt: 0,
+            approval_registry: None,
+            approval_decider: None,
+            approval_reviewer: None,
+            escalation_bridge: None,
+            event_tx: &event_tx,
+            cancel_token: &cancel,
+            live_rx: &mut live_rx,
+            delivery_rx: &mut delivery_rx,
+            logical_session: &mut session,
+            session_inbox_runtime: Some(&binding),
+            activation_run_id: Some(run_id),
+            initial_inflight_claims: claims,
+            first_frame_timeout: Some(Duration::from_secs(1)),
+        })
         .await
         .unwrap();
         assert_eq!(result.as_deref(), Some("done"));
@@ -3238,25 +3261,25 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            drive(
-                &mut link,
-                "parent-reviewer",
-                "child-reviewer",
-                0,
-                None,
-                None,
-                Some(&reviewer),
-                None,
-                &event_tx,
-                &cancel,
-                &mut live_rx,
-                &mut delivery_rx,
-                &mut logical_session,
-                None,
-                None,
-                VecDeque::new(),
-                None,
-            ),
+            drive(ActorDriveContext {
+                client: &mut link,
+                parent_session_id: "parent-reviewer",
+                child_session_id: "child-reviewer",
+                child_attempt: 0,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: Some(&reviewer),
+                escalation_bridge: None,
+                event_tx: &event_tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut logical_session,
+                session_inbox_runtime: None,
+                activation_run_id: None,
+                initial_inflight_claims: VecDeque::new(),
+                first_frame_timeout: None,
+            }),
         )
         .await
         .expect("worker must receive the reviewer verdict before terminating");
@@ -3299,25 +3322,25 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            drive(
-                &mut link,
-                "parent-no-reviewer",
-                "child-no-reviewer",
-                0,
-                None,
-                None,
-                None,
-                None,
-                &event_tx,
-                &cancel,
-                &mut live_rx,
-                &mut delivery_rx,
-                &mut logical_session,
-                None,
-                None,
-                VecDeque::new(),
-                None,
-            ),
+            drive(ActorDriveContext {
+                client: &mut link,
+                parent_session_id: "parent-no-reviewer",
+                child_session_id: "child-no-reviewer",
+                child_attempt: 0,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: None,
+                escalation_bridge: None,
+                event_tx: &event_tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut logical_session,
+                session_inbox_runtime: None,
+                activation_run_id: None,
+                initial_inflight_claims: VecDeque::new(),
+                first_frame_timeout: None,
+            }),
         )
         .await
         .expect("fail-closed reply must unblock the child immediately");
@@ -3357,25 +3380,25 @@ mod tests {
         let (_delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
         let mut logical_session = Session::new("child-x", "model");
         let mut link = SilentLink;
-        let r = drive(
-            &mut link,
-            "parent-x",
-            "child-x",
-            0,
-            None,
-            None,
-            None,
-            None,
-            &event_tx,
-            &cancel,
-            &mut live_rx,
-            &mut delivery_rx,
-            &mut logical_session,
-            None,
-            None,
-            VecDeque::new(),
-            Some(Duration::from_millis(100)),
-        )
+        let r = drive(ActorDriveContext {
+            client: &mut link,
+            parent_session_id: "parent-x",
+            child_session_id: "child-x",
+            child_attempt: 0,
+            approval_registry: None,
+            approval_decider: None,
+            approval_reviewer: None,
+            escalation_bridge: None,
+            event_tx: &event_tx,
+            cancel_token: &cancel,
+            live_rx: &mut live_rx,
+            delivery_rx: &mut delivery_rx,
+            logical_session: &mut logical_session,
+            session_inbox_runtime: None,
+            activation_run_id: None,
+            initial_inflight_claims: VecDeque::new(),
+            first_frame_timeout: Some(Duration::from_millis(100)),
+        })
         .await;
         assert!(
             matches!(r, Err(AgentError::WorkerUnresponsive(_))),
@@ -3393,25 +3416,25 @@ mod tests {
         let mut link = InstantTerminalLink { done: false };
         // Even a tiny timeout must NOT trip: the terminal frame arrives first and
         // disarms the watchdog.
-        let r = drive(
-            &mut link,
-            "parent-y",
-            "child-y",
-            0,
-            None,
-            None,
-            None,
-            None,
-            &event_tx,
-            &cancel,
-            &mut live_rx,
-            &mut delivery_rx,
-            &mut logical_session,
-            None,
-            None,
-            VecDeque::new(),
-            Some(Duration::from_millis(50)),
-        )
+        let r = drive(ActorDriveContext {
+            client: &mut link,
+            parent_session_id: "parent-y",
+            child_session_id: "child-y",
+            child_attempt: 0,
+            approval_registry: None,
+            approval_decider: None,
+            approval_reviewer: None,
+            escalation_bridge: None,
+            event_tx: &event_tx,
+            cancel_token: &cancel,
+            live_rx: &mut live_rx,
+            delivery_rx: &mut delivery_rx,
+            logical_session: &mut logical_session,
+            session_inbox_runtime: None,
+            activation_run_id: None,
+            initial_inflight_claims: VecDeque::new(),
+            first_frame_timeout: Some(Duration::from_millis(50)),
+        })
         .await;
         assert_eq!(r.ok().flatten().as_deref(), Some("done"));
     }
