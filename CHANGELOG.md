@@ -13,6 +13,11 @@ cut by the release train, rather than SemVer point releases. Changes between
 nightlies are tracked in the git history and merged PRs (the source of truth);
 the SemVer sections below are retained for the historical `0.x` releases.
 
+### Changed
+
+- Raised the minimum supported Rust version from 1.84 to 1.95 to match the
+  locked dependency graph, with an explicit MSRV CI lane and graph audit.
+
 ## [0.3.0] - 2026-02-26
 
 ### Security

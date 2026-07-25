@@ -39,7 +39,7 @@ fn validate_access_verifier(hash: &str, salt: &str) -> crate::ConfigStoreResult<
     if hash.len() != 64
         || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
         || salt.is_empty()
-        || salt.len() % 2 != 0
+        || !salt.len().is_multiple_of(2)
         || !salt.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(crate::ConfigStoreError::Validation(
