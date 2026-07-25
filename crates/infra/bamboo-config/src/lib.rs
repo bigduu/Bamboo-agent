@@ -53,9 +53,104 @@ pub use subagents_config::SubagentsConfigModule;
 /// (env vars, the encryption-key var, the env-vars snapshot). Tests across
 /// `config`, `encryption` and `paths` acquire this single lock so they
 /// serialize instead of racing under parallel execution.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_support {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::marker::PhantomData;
+    use std::rc::Rc;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use crate::PromptSafeEnvVarEntry;
+
+    #[derive(Clone)]
+    pub(crate) struct EnvVarsCacheSnapshot {
+        env_vars: HashMap<String, String>,
+        prompt_safe_env_vars: Vec<PromptSafeEnvVarEntry>,
+    }
+
+    thread_local! {
+        /// Test-only env snapshots are deliberately separate from the
+        /// process-global runtime cache. Rust's test harness runs tests on
+        /// parallel OS threads, so each scoped test can publish and inspect its
+        /// own snapshot without racing unrelated server `AppState` publishers.
+        static ENV_VARS_CACHE_OVERRIDE_FOR_TESTS:
+            RefCell<Option<EnvVarsCacheSnapshot>> = const { RefCell::new(None) };
+    }
+
+    /// Restores the previous test-only env snapshot when its scope ends.
+    ///
+    /// The `Rc` marker deliberately makes this guard `!Send` and `!Sync`:
+    /// callers must poll code under test on the same thread that installed the
+    /// isolation scope. Default Tokio and Actix test runtimes are
+    /// current-thread, so in-scope `publish_env_vars` writes remain observable
+    /// while unrelated test threads continue to use the process-global cache.
+    #[must_use = "keep the guard alive for the full env-cache test scope"]
+    pub struct EnvVarsCacheIsolationGuard {
+        previous: Option<EnvVarsCacheSnapshot>,
+        _same_thread: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for EnvVarsCacheIsolationGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            ENV_VARS_CACHE_OVERRIDE_FOR_TESTS.with(|slot| {
+                slot.replace(previous);
+            });
+        }
+    }
+
+    /// Isolate `Config` env-cache reads and publications to the current thread.
+    ///
+    /// The isolated cache starts with the currently visible snapshot. Both
+    /// `Config::publish_env_vars` and the two snapshot readers honor it, so a
+    /// mutation performed by code under test on this thread is still detected;
+    /// only publishers from unrelated parallel test threads are excluded.
+    pub fn isolate_env_vars_cache() -> EnvVarsCacheIsolationGuard {
+        let snapshot = EnvVarsCacheSnapshot {
+            env_vars: crate::Config::current_env_vars(),
+            prompt_safe_env_vars: crate::Config::current_prompt_safe_env_vars(),
+        };
+        let previous = ENV_VARS_CACHE_OVERRIDE_FOR_TESTS.with(|slot| slot.replace(Some(snapshot)));
+        EnvVarsCacheIsolationGuard {
+            previous,
+            _same_thread: PhantomData,
+        }
+    }
+
+    pub(crate) fn env_vars_cache_override_is_active() -> bool {
+        ENV_VARS_CACHE_OVERRIDE_FOR_TESTS.with(|slot| slot.borrow().is_some())
+    }
+
+    pub(crate) fn publish_env_vars_to_override(
+        env_vars: HashMap<String, String>,
+        prompt_safe_env_vars: Vec<PromptSafeEnvVarEntry>,
+    ) {
+        ENV_VARS_CACHE_OVERRIDE_FOR_TESTS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let snapshot = slot
+                .as_mut()
+                .expect("env-cache override must be active before publication");
+            snapshot.env_vars = env_vars;
+            snapshot.prompt_safe_env_vars = prompt_safe_env_vars;
+        });
+    }
+
+    pub(crate) fn current_env_vars_override() -> Option<HashMap<String, String>> {
+        ENV_VARS_CACHE_OVERRIDE_FOR_TESTS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|snapshot| snapshot.env_vars.clone())
+        })
+    }
+
+    pub(crate) fn current_prompt_safe_env_vars_override() -> Option<Vec<PromptSafeEnvVarEntry>> {
+        ENV_VARS_CACHE_OVERRIDE_FOR_TESTS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|snapshot| snapshot.prompt_safe_env_vars.clone())
+        })
+    }
 
     pub fn env_cache_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

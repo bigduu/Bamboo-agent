@@ -4070,6 +4070,13 @@ impl Config {
     /// Update the global env vars cache (called on config load / reload).
     pub fn publish_env_vars(&self) {
         let map = self.env_vars_as_map();
+
+        #[cfg(any(test, feature = "test-utils"))]
+        if crate::test_support::env_vars_cache_override_is_active() {
+            crate::test_support::publish_env_vars_to_override(map, self.prompt_safe_env_vars());
+            return;
+        }
+
         let mut env_guard = env_vars_cache().write().recover_poison();
         *env_guard = map;
 
@@ -4080,11 +4087,21 @@ impl Config {
 
     /// Read the current env vars snapshot (called by Bash tool at process spawn time).
     pub fn current_env_vars() -> HashMap<String, String> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(env_vars) = crate::test_support::current_env_vars_override() {
+            return env_vars;
+        }
+
         env_vars_cache().read().recover_poison().clone()
     }
 
     /// Read the current prompt-safe env var snapshot (names + metadata only; no secret values).
     pub fn current_prompt_safe_env_vars() -> Vec<PromptSafeEnvVarEntry> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(env_vars) = crate::test_support::current_prompt_safe_env_vars_override() {
+            return env_vars;
+        }
+
         prompt_safe_env_vars_cache().read().recover_poison().clone()
     }
 
