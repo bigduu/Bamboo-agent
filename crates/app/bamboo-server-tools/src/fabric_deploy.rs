@@ -2627,7 +2627,9 @@ mod lifecycle_persistence_tests {
 
     #[tokio::test]
     async fn degraded_backup_cannot_mix_newer_credentials_into_revision_bound_preflight() {
-        let fixture = modular_password_fixture("/usr/bin/true", "generation-one-password");
+        let generation_one_secret = uuid::Uuid::new_v4().to_string();
+        let generation_two_secret = uuid::Uuid::new_v4().to_string();
+        let fixture = modular_password_fixture("/usr/bin/true", &generation_one_secret);
         let password_ref = bamboo_config::cluster_password_credential_ref("n1").unwrap();
         let external = ConfigFacade::open(fixture._data_dir.path()).unwrap();
         let mut winner = external.effective_config();
@@ -2639,7 +2641,7 @@ mod lifecycle_persistence_tests {
                 "n1".to_string(),
                 bamboo_config::ClusterNodeCredentialIntents {
                     password: bamboo_config::ClusterCredentialAction::Replace(
-                        "generation-two-password".to_string(),
+                        generation_two_secret.clone(),
                     ),
                     private_key: bamboo_config::ClusterCredentialAction::Clear,
                     passphrase: bamboo_config::ClusterCredentialAction::Clear,
@@ -2655,7 +2657,7 @@ mod lifecycle_persistence_tests {
                 .unwrap()
                 .unwrap()
                 .expose(),
-            "generation-two-password",
+            generation_two_secret,
             "the credential primary intentionally belongs to r2"
         );
         std::fs::write(
@@ -2700,7 +2702,7 @@ mod lifecycle_persistence_tests {
             panic!("expected password authentication")
         };
         assert_eq!(
-            password, "generation-one-password",
+            password, &generation_one_secret,
             "the rejected action must never hydrate r1 metadata with r2 credentials"
         );
         assert!(fixture.events.lock().unwrap().is_empty());
@@ -2708,7 +2710,9 @@ mod lifecycle_persistence_tests {
 
     #[tokio::test]
     async fn degraded_credential_backup_cannot_mix_with_current_cluster_preflight() {
-        let fixture = modular_password_fixture("/usr/bin/true", "generation-one-password");
+        let generation_one_secret = uuid::Uuid::new_v4().to_string();
+        let generation_two_secret = uuid::Uuid::new_v4().to_string();
+        let fixture = modular_password_fixture("/usr/bin/true", &generation_one_secret);
         let password_ref = bamboo_config::cluster_password_credential_ref("n1").unwrap();
         let external = ConfigFacade::open(fixture._data_dir.path()).unwrap();
         let mut winner = external.effective_config();
@@ -2720,7 +2724,7 @@ mod lifecycle_persistence_tests {
                 "n1".to_string(),
                 bamboo_config::ClusterNodeCredentialIntents {
                     password: bamboo_config::ClusterCredentialAction::Replace(
-                        "generation-two-password".to_string(),
+                        generation_two_secret.clone(),
                     ),
                     private_key: bamboo_config::ClusterCredentialAction::Clear,
                     passphrase: bamboo_config::ClusterCredentialAction::Clear,
@@ -2745,7 +2749,7 @@ mod lifecycle_persistence_tests {
                 .unwrap()
                 .unwrap()
                 .expose(),
-            "generation-two-password"
+            generation_two_secret
         );
         std::fs::write(
             fixture._data_dir.path().join("credentials.json"),
@@ -2776,7 +2780,7 @@ mod lifecycle_persistence_tests {
             panic!("expected password authentication")
         };
         assert_eq!(
-            password, "generation-one-password",
+            password, &generation_one_secret,
             "the rejected action must never hydrate r2 metadata with r1 credentials"
         );
         assert!(fixture.events.lock().unwrap().is_empty());
