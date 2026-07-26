@@ -991,7 +991,15 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn membership_replacement_creates_missing_cluster_in_candidate() {
-        let node = pw_node("", None);
+        let node = Node {
+            id: "n1".to_string(),
+            label: "n1".to_string(),
+            placement: NodePlacement::Local,
+            trust_level: TrustLevel::Trusted,
+            deploy: DeployProfile::default(),
+            state: None,
+            enabled: true,
+        };
         let mut fabric = ClusterFabricConfig {
             nodes: vec![node],
             clusters: vec![Cluster {
