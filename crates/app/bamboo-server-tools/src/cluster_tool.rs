@@ -45,6 +45,7 @@ fn to_tool_error(e: FabricError) -> ToolError {
         FabricError::Conflict { expected, actual } => ToolError::Execution(format!(
             "cluster configuration conflict: expected revision {expected}, current revision {actual}"
         )),
+        FabricError::Committed(m) => ToolError::Execution(m),
         FabricError::Internal(m) => ToolError::Execution(m),
     }
 }

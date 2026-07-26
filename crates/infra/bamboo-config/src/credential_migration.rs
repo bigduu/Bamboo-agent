@@ -1699,6 +1699,7 @@ pub fn persist_connect_credential_transaction_at_revision(
         None,
         None,
         None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1737,9 +1738,59 @@ pub fn persist_access_control_credential_transaction_at_revision(
         None,
         None,
         None,
+        None,
         #[cfg(test)]
         None,
     )
+}
+
+/// Result of a cluster-fabric compound commit whose process-local facade
+/// adoption was attempted before the cross-process transaction lock was
+/// released.
+pub struct ClusterFabricTransactionCommit {
+    pub revision: u64,
+    pub adoption: Option<ConfigStoreResult<crate::ConfigSectionEvent>>,
+    pub credential_adoption: Option<ConfigStoreResult<()>>,
+    /// Exact runtime and public credential metadata captured from one
+    /// immutable credential document before the transaction lock admitted
+    /// another writer. Present for changed and semantic no-op transactions.
+    pub runtime: ConfigStoreResult<ClusterFabricRuntimeSnapshot>,
+}
+
+pub struct ClusterFabricRuntimeSnapshot {
+    pub cluster_fabric: crate::ClusterFabricConfig,
+    pub credential_statuses: Vec<crate::CredentialStatus>,
+    pub credential_health: crate::CredentialStoreHealth,
+}
+
+struct ExactClusterRuntimeSnapshot {
+    runtime: ClusterFabricRuntimeSnapshot,
+    credential_lkg: crate::credential_store::CredentialDocumentLkg,
+}
+
+type ClusterPostCommit<'a> = &'a mut dyn FnMut(
+    u64,
+    bool,
+    &crate::ClusterFabricConfig,
+    ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+);
+
+fn materialize_cluster_runtime_under_migration_lock(
+    config: &crate::Config,
+    store: &CredentialStore,
+) -> ConfigStoreResult<ExactClusterRuntimeSnapshot> {
+    let (credential_lkg, credential_statuses, credential_health) =
+        store.snapshot_with_health_unchecked()?;
+    let mut runtime = config.clone();
+    runtime.hydrate_cluster_credentials_from_snapshot(&credential_lkg)?;
+    Ok(ExactClusterRuntimeSnapshot {
+        runtime: ClusterFabricRuntimeSnapshot {
+            cluster_fabric: runtime.cluster_fabric.clone(),
+            credential_statuses,
+            credential_health,
+        },
+        credential_lkg,
+    })
 }
 
 /// Persist node metadata and every explicitly touched SSH credential through
@@ -1757,7 +1808,76 @@ pub fn persist_cluster_fabric_credential_transaction_at_revision(
         node_intents,
         expected_revision,
         None,
+        None,
     )
+}
+
+/// Persist a cluster-fabric compound transaction and adopt its exact immutable
+/// candidate into the supplied process facade while the migration lock still
+/// excludes later cross-process commits. An adoption failure is returned as a
+/// post-commit outcome rather than being confused with a failed durable CAS.
+pub fn persist_cluster_fabric_credential_transaction_with_adoption<F>(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+    mut before_adoption: F,
+) -> ConfigStoreResult<ClusterFabricTransactionCommit>
+where
+    F: FnMut(u64, &crate::ClusterFabricConfig),
+{
+    let mut adoption = None;
+    let mut exact_runtime = None;
+    let mut transaction_changed = false;
+    let mut callback =
+        |revision: u64,
+         changed: bool,
+         candidate: &crate::ClusterFabricConfig,
+         runtime: ConfigStoreResult<ExactClusterRuntimeSnapshot>| {
+            exact_runtime = Some(runtime);
+            transaction_changed = changed;
+            if changed {
+                before_adoption(revision, candidate);
+                adoption = Some(facade.adopt_committed_cluster_fabric(
+                    expected_revision,
+                    revision,
+                    candidate.clone(),
+                ));
+            }
+        };
+    let revision = persist_cluster_fabric_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        node_intents,
+        expected_revision,
+        Some(&mut callback),
+        None,
+    )?;
+    let (runtime, credential_adoption) = match exact_runtime.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "cluster transaction omitted exact runtime materialization".to_string(),
+        ))
+    }) {
+        Ok(exact) => {
+            let runtime = exact.runtime;
+            let credential_adoption = transaction_changed.then(|| {
+                facade.adopt_captured_cluster_credentials(
+                    exact.credential_lkg,
+                    runtime.credential_statuses.clone(),
+                    runtime.credential_health.clone(),
+                )
+            });
+            (Ok(runtime), credential_adoption)
+        }
+        Err(error) => (Err(error), None),
+    };
+    Ok(ClusterFabricTransactionCommit {
+        revision,
+        adoption,
+        credential_adoption,
+        runtime,
+    })
 }
 
 fn persist_cluster_fabric_credential_transaction_inner(
@@ -1765,6 +1885,7 @@ fn persist_cluster_fabric_credential_transaction_inner(
     config: &mut crate::Config,
     node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
     expected_revision: u64,
+    cluster_post_commit: Option<ClusterPostCommit<'_>>,
     #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
     if !crate::section_layout_is_active(data_dir)? {
@@ -1790,6 +1911,7 @@ fn persist_cluster_fabric_credential_transaction_inner(
         None,
         None,
         None,
+        cluster_post_commit,
         #[cfg(test)]
         fault,
     )
@@ -1926,6 +2048,7 @@ pub fn persist_mcp_reset_credential_transaction_at_revision(
         None,
         Some((&intents, expected_revision)),
         None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1979,6 +2102,7 @@ fn persist_mcp_credential_transaction_inner(
         None,
         Some((intents, expected_revision)),
         None,
+        None,
         #[cfg(test)]
         fault,
     )
@@ -2025,9 +2149,94 @@ pub fn persist_credential_backed_section_reset_at_revision(
         None,
         None,
         Some((scope, expected_revision)),
+        None,
         #[cfg(test)]
         None,
     )
+}
+
+/// Reset cluster-fabric and adopt its exact committed snapshot into one
+/// process facade before the cross-process transaction lock is released.
+pub fn persist_cluster_fabric_reset_at_revision_with_adoption<F>(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+    mut before_adoption: F,
+) -> ConfigStoreResult<ClusterFabricTransactionCommit>
+where
+    F: FnMut(u64, &crate::ClusterFabricConfig),
+{
+    if !crate::section_layout_is_active(data_dir.as_ref())? {
+        return Err(ConfigStoreError::Validation(
+            "cluster reset requires the modular configuration layout".to_string(),
+        ));
+    }
+    let mut adoption = None;
+    let mut exact_runtime = None;
+    let mut transaction_changed = false;
+    let mut callback =
+        |revision: u64,
+         changed: bool,
+         candidate: &crate::ClusterFabricConfig,
+         runtime: ConfigStoreResult<ExactClusterRuntimeSnapshot>| {
+            exact_runtime = Some(runtime);
+            transaction_changed = changed;
+            if changed {
+                before_adoption(revision, candidate);
+                adoption = Some(facade.adopt_committed_cluster_fabric(
+                    expected_revision,
+                    revision,
+                    candidate.clone(),
+                ));
+            }
+        };
+    let revision = persist_exact_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((ExactTransactionScope::ClusterFabric, expected_revision)),
+        Some(&mut callback),
+        #[cfg(test)]
+        None,
+    )?;
+    let (runtime, credential_adoption) = match exact_runtime.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "cluster reset omitted exact runtime materialization".to_string(),
+        ))
+    }) {
+        Ok(exact) => {
+            let runtime = exact.runtime;
+            let credential_adoption = transaction_changed.then(|| {
+                facade.adopt_captured_cluster_credentials(
+                    exact.credential_lkg,
+                    runtime.credential_statuses.clone(),
+                    runtime.credential_health.clone(),
+                )
+            });
+            (Ok(runtime), credential_adoption)
+        }
+        Err(error) => (Err(error), None),
+    };
+    Ok(ClusterFabricTransactionCommit {
+        revision,
+        adoption,
+        credential_adoption,
+        runtime,
+    })
 }
 
 #[cfg(test)]
@@ -2124,6 +2333,7 @@ fn persist_provider_credential_transaction_with_instances_at_revision_inner(
         provider_expected_revision,
         None,
         None,
+        None,
         #[cfg(test)]
         fault,
     )
@@ -2148,6 +2358,7 @@ fn persist_exact_credential_transaction_inner(
     provider_expected_revision: Option<u64>,
     mcp_transaction: Option<(&BTreeSet<CredentialRef>, u64)>,
     reset_scope: Option<(ExactTransactionScope, u64)>,
+    mut cluster_post_commit: Option<ClusterPostCommit<'_>>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
     let reset_is = |scope| reset_scope.is_some_and(|(reset, _)| reset == scope);
@@ -2721,6 +2932,17 @@ fn persist_exact_credential_transaction_inner(
         && !exact_domain_changed
         && prepared.revision == prepared.expected_revision
     {
+        if cluster_only && active_section.is_some() {
+            if let Some(callback) = cluster_post_commit.as_mut() {
+                let runtime = materialize_cluster_runtime_under_migration_lock(config, &store);
+                callback(
+                    committed_authority_revision,
+                    false,
+                    &config.cluster_fabric,
+                    runtime,
+                );
+            }
+        }
         return Ok(committed_authority_revision);
     }
 
@@ -2930,6 +3152,15 @@ fn persist_exact_credential_transaction_inner(
     )?;
     finish_transaction(data_dir, manifest)?;
     if cluster_only && active_section.is_some() {
+        if let Some(callback) = cluster_post_commit.as_mut() {
+            let runtime = materialize_cluster_runtime_under_migration_lock(config, &store);
+            callback(
+                committed_authority_revision,
+                true,
+                &config.cluster_fabric,
+                runtime,
+            );
+        }
         Ok(committed_authority_revision)
     } else {
         // Credential-member rebases can advance beyond the initially staged
@@ -14537,6 +14768,7 @@ mod tests {
             &mut candidate,
             &intents,
             revision,
+            None,
             Some(MigrationFault::AfterExactCommitUnrelatedCredentialRace),
         )
         .unwrap();
@@ -14580,6 +14812,7 @@ mod tests {
             &mut candidate,
             &intents,
             revision,
+            None,
             Some(MigrationFault::BeforeExactCommitUnrelatedCredentialRace),
         )
         .unwrap();
@@ -14623,6 +14856,7 @@ mod tests {
             &mut candidate,
             &intents,
             revision,
+            None,
             Some(MigrationFault::BeforeExactStagingUnrelatedCredentialRace),
         )
         .unwrap();
@@ -14956,6 +15190,7 @@ mod tests {
             &mut failed,
             &failed_intents,
             revision,
+            None,
             Some(MigrationFault::AfterStaging),
         )
         .is_err());
@@ -15084,6 +15319,7 @@ mod tests {
                 &mut candidate,
                 &intents,
                 revision,
+                None,
                 Some(fault),
             )
             .unwrap_err();

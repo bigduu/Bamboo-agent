@@ -16,6 +16,7 @@ fn map_err(e: FabricError) -> AppError {
         FabricError::NotFound(m) => AppError::NotFound(m),
         FabricError::BadRequest(m) => AppError::BadRequest(m),
         FabricError::Conflict { expected, actual } => AppError::ConfigConflict { expected, actual },
+        FabricError::Committed(m) => AppError::InternalError(anyhow::anyhow!(m)),
         FabricError::Internal(m) => AppError::InternalError(anyhow::anyhow!(m)),
     }
 }

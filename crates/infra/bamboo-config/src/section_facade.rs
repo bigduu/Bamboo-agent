@@ -22,9 +22,9 @@ use crate::{
     AccessControlConfig, AnthropicModelMapping, AtomicJsonStore, BrokerClientConfig,
     ClusterFabricConfig, Config, ConfigSectionEvent, ConfigStoreResult, ConfigValues,
     ConnectConfig, CredentialRef, CredentialSource, CredentialStatus, CredentialStore,
-    DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry, FeatureFlags, GeminiModelMapping,
-    HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, MemoryConfig,
-    NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
+    CredentialStoreHealth, DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry, FeatureFlags,
+    GeminiModelMapping, HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig, LiveSection,
+    MemoryConfig, NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
     RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig,
     StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
 };
@@ -3463,6 +3463,85 @@ impl CredentialSection {
         }
     }
 
+    /// Silently adopt a credential snapshot captured by a compound
+    /// transaction while it held the migration lock. This method is called
+    /// only after that outer lock has been released, preserving the ordinary
+    /// credential mutation lock order (`operation_lock` then migration lock).
+    ///
+    /// A newer process-local snapshot always wins. Equal revisions must carry
+    /// identical public status data; otherwise the durable source reused a
+    /// revision and adoption fails closed.
+    fn adopt_captured(
+        &self,
+        document_lkg: CredentialDocumentLkg,
+        statuses: Vec<CredentialStatus>,
+        health: CredentialStoreHealth,
+    ) -> ConfigStoreResult<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.snapshot();
+        if current.revision > health.revision {
+            return Ok(());
+        }
+        if current.revision == health.revision && current.data.as_ref() != &statuses {
+            return Err(crate::ConfigStoreError::Validation(
+                "credential document reused the live revision with different data".to_string(),
+            ));
+        }
+        if current.revision == health.revision
+            && current.status == health.status
+            && current.source_kind == health.source
+            && current.last_error == health.last_error
+            && (health.status != SectionStatus::Healthy || health.source != SectionSourceKind::File)
+        {
+            // A cluster-only metadata commit still captures credential health
+            // under the transaction lock. Missing/default or degraded/backup
+            // snapshots need no adoption when the facade already owns that
+            // exact state.
+            return Ok(());
+        }
+        // Healthy/file snapshots continue through publication even when their
+        // public status projection is unchanged, so the facade's opaque LKG is
+        // the exact credential document captured by this compound commit.
+        if health.status != SectionStatus::Healthy
+            || health.source != SectionSourceKind::File
+            || document_lkg.revision() != health.revision
+        {
+            return Err(crate::ConfigStoreError::Validation(
+                "captured credential transaction snapshot is not healthy".to_string(),
+            ));
+        }
+
+        *self
+            .document_lkg
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(document_lkg));
+        *self
+            .repair_authority
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = CredentialRepairAuthority::None;
+        *self
+            .trusted_lkg
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(CredentialSectionSnapshot {
+                data: Arc::new(statuses),
+                revision: health.revision,
+                loaded_at: Utc::now(),
+                source_path: self.store.path().to_path_buf(),
+                source_kind: health.source,
+                status: health.status,
+                last_error: health.last_error,
+            });
+        Ok(())
+    }
+
     pub fn reload(&self) -> ConfigStoreResult<Arc<CredentialSectionSnapshot>> {
         let _operation = self
             .operation_lock
@@ -4228,6 +4307,37 @@ impl ConfigFacade {
 
     pub fn effective_config(&self) -> Config {
         self.registry.projection().into_config()
+    }
+
+    /// Publish the exact cluster-fabric snapshot installed by the credential
+    /// compound transaction. This is a process-local adoption only: the
+    /// transaction has already made both durable members authoritative and
+    /// must still hold its cross-process migration lock while calling here.
+    pub(crate) fn adopt_committed_cluster_fabric(
+        &self,
+        expected_revision: u64,
+        committed_revision: u64,
+        candidate: ClusterFabricConfig,
+    ) -> ConfigStoreResult<ConfigSectionEvent> {
+        let mut sanitized = Config::default();
+        sanitized.cluster_fabric = candidate;
+        sanitized.sanitize_cluster_fabric_for_disk();
+        self.registry.cluster_fabric.adopt_committed(
+            expected_revision,
+            committed_revision,
+            ClusterFabricSection(sanitized.cluster_fabric.clone()),
+        )
+    }
+
+    pub(crate) fn adopt_captured_cluster_credentials(
+        &self,
+        document_lkg: CredentialDocumentLkg,
+        statuses: Vec<CredentialStatus>,
+        health: CredentialStoreHealth,
+    ) -> ConfigStoreResult<()> {
+        self.registry
+            .credentials
+            .adopt_captured(document_lkg, statuses, health)
     }
 }
 

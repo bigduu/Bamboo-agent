@@ -189,6 +189,23 @@ impl CredentialDocumentLkg {
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
+
+    pub(crate) fn resolve(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<Option<SecretValue>> {
+        self.document
+            .entries
+            .get(credential_ref)
+            .map(|entry| {
+                crate::encryption::decrypt(&entry.ciphertext)
+                    .map(SecretValue)
+                    .map_err(|_| {
+                        ConfigStoreError::Validation("credential decryption failed".to_string())
+                    })
+            })
+            .transpose()
+    }
 }
 
 pub(crate) struct CredentialMutation {
