@@ -4310,6 +4310,177 @@ mod live_reload_tests {
     }
 
     #[tokio::test]
+    async fn stale_stopped_watcher_compatibility_writers_catch_up_without_overwriting_cluster() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x72; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "shared-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "shared-node".to_string(),
+                        label: "generation-one".to_string(),
+                        placement: bamboo_config::NodePlacement::Local,
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        stop_config_watcher(&mut state);
+
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .cluster_fabric
+            .node_mut("shared-node")
+            .unwrap()
+            .label = "external-generation-two".to_string();
+        assert_eq!(
+            bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external_candidate,
+                &BTreeMap::new(),
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let cluster_r2 = std::fs::read(&cluster_path).unwrap();
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "generation-one"
+        );
+
+        let published = state
+            .update_config(|_| Ok(()), ConfigUpdateEffects::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            published.cluster_fabric.node("shared-node").unwrap().label,
+            "external-generation-two"
+        );
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r2);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            2,
+            "compatibility publication must catch the stopped watcher up to r2"
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "external-generation-two"
+        );
+
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .cluster_fabric
+            .node_mut("shared-node")
+            .unwrap()
+            .label = "external-generation-three".to_string();
+        assert_eq!(
+            bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external_candidate,
+                &BTreeMap::new(),
+                2,
+            )
+            .unwrap(),
+            3
+        );
+        let cluster_r3 = std::fs::read(&cluster_path).unwrap();
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            2,
+            "the stopped watcher must remain stale before replace_config"
+        );
+
+        let mut replacement = state.config.read().await.clone();
+        replacement.server.port = 23_333;
+        let published = state
+            .replace_config(replacement, ConfigUpdateEffects::default())
+            .await
+            .unwrap();
+        assert_eq!(published.server.port, 23_333);
+        assert_eq!(
+            published.cluster_fabric.node("shared-node").unwrap().label,
+            "external-generation-three"
+        );
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r3);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            3
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "external-generation-three"
+        );
+    }
+
+    #[tokio::test]
     async fn cluster_commit_installs_runtime_before_one_authoritative_event() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
         let dir = tempfile::tempdir().unwrap();

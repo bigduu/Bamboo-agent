@@ -4530,6 +4530,10 @@ pub fn persist_facade_effective_config(
     // is not part of the compatibility Config wire shape. Preserve its current
     // durable projection across unrelated root writes.
     candidate.subagents.external_broker = current.subagents.external_broker.clone();
+    // Compatibility/root writers never own cluster CAS. Rebase this field on
+    // the freshly opened durable facade, not the caller's possibly stale
+    // process projection, before validation and change detection.
+    candidate.cluster_fabric = current.cluster_fabric.clone();
     validate_projection(&candidate)?;
 
     crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
@@ -8434,5 +8438,87 @@ mod tests {
             reopened.registry().tools_skills.snapshot().revision,
             tools_revision
         );
+    }
+
+    #[test]
+    fn stale_compatibility_config_never_overwrites_newer_exact_cluster_authority() {
+        let _key = crate::encryption::set_test_encryption_key([90; 32]);
+        let dir = TempDir::new().unwrap();
+        let initial_facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut initial = initial_facade.effective_config();
+        initial.cluster_fabric.nodes.push(crate::Node {
+            id: "owned-node".to_string(),
+            label: "generation-one".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = std::collections::BTreeMap::from([(
+            "owned-node".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        assert_eq!(
+            crate::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut initial,
+                &intents,
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let stale_caller = ConfigFacade::open(dir.path()).unwrap().effective_config();
+        let mut external = stale_caller.clone();
+        external
+            .cluster_fabric
+            .node_mut("owned-node")
+            .unwrap()
+            .label = "external-generation-two".to_string();
+        assert_eq!(
+            crate::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let cluster_r2 = std::fs::read(&cluster_path).unwrap();
+
+        assert!(
+            persist_facade_effective_config(dir.path(), &stale_caller)
+                .unwrap()
+                .is_empty(),
+            "a stale no-op must not manufacture a cluster revision"
+        );
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r2);
+
+        let mut unrelated = stale_caller;
+        unrelated.server.port = 22_222;
+        let events = persist_facade_effective_config(dir.path(), &unrelated).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConfigSectionEvent::Changed { section, .. } if section == "core"
+        ));
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r2);
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("owned-node")
+                .unwrap()
+                .label,
+            "external-generation-two"
+        );
+        assert_eq!(reopened.effective_config().server.port, 22_222);
     }
 }
