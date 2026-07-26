@@ -2491,7 +2491,8 @@ mod lifecycle_persistence_tests {
             Err(error) => error,
             Ok(_) => panic!("the injected persistent recovery failure must surface"),
         };
-        assert!(matches!(deploy_error, FabricError::Committed(_)));
+        assert!(matches!(&deploy_error, FabricError::Committed(_)));
+        assert!(deploy_error.to_string().contains("indeterminate"));
         assert!(
             deploy_fixture
                 .registry
@@ -2512,7 +2513,8 @@ mod lifecycle_persistence_tests {
                 .as_ref()
                 .unwrap()
                 .status,
-            NodeStatus::Running
+            NodeStatus::Deploying,
+            "process runtime must remain at the pre-final-persist authority"
         );
         assert_eq!(
             deploy_fixture
@@ -2521,20 +2523,15 @@ mod lifecycle_persistence_tests {
                 .cluster_fabric
                 .snapshot()
                 .revision,
-            3
+            2
         );
         assert_eq!(
             deploy_fixture.events.lock().unwrap().as_slice(),
-            &[
-                ConfigSectionEvent::Changed {
-                    section: "cluster-fabric".to_string(),
-                    revision: 2,
-                },
-                ConfigSectionEvent::Changed {
-                    section: "cluster-fabric".to_string(),
-                    revision: 3,
-                },
-            ]
+            &[ConfigSectionEvent::Changed {
+                section: "cluster-fabric".to_string(),
+                revision: 2,
+            }],
+            "an unproven final candidate must not publish an event"
         );
         let recovered_deploy = ConfigFacade::open_or_migrate(deploy_fixture._data_dir.path())
             .expect("later startup recovery");
@@ -2577,10 +2574,11 @@ mod lifecycle_persistence_tests {
             Err(error) => error,
             Ok(_) => panic!("the injected persistent recovery failure must surface"),
         };
-        assert!(matches!(stop_error, FabricError::Committed(_)));
+        assert!(matches!(&stop_error, FabricError::Committed(_)));
+        assert!(stop_error.to_string().contains("indeterminate"));
         assert!(
             stop_fixture.registry.lock().await.is_empty(),
-            "a committed Stopped candidate must still shut down the worker"
+            "an indeterminate Stopped candidate must preserve the completed shutdown"
         );
         assert_eq!(
             stop_fixture
@@ -2594,7 +2592,8 @@ mod lifecycle_persistence_tests {
                 .as_ref()
                 .unwrap()
                 .status,
-            NodeStatus::Stopped
+            NodeStatus::Running,
+            "process runtime must remain at the pre-final-persist authority"
         );
         assert_eq!(
             stop_fixture
@@ -2603,14 +2602,12 @@ mod lifecycle_persistence_tests {
                 .cluster_fabric
                 .snapshot()
                 .revision,
-            2
+            1
         );
         assert_eq!(
             stop_fixture.events.lock().unwrap().as_slice(),
-            &[ConfigSectionEvent::Changed {
-                section: "cluster-fabric".to_string(),
-                revision: 2,
-            }]
+            &[],
+            "an unproven final candidate must not publish an event"
         );
         let recovered_stop = ConfigFacade::open_or_migrate(stop_fixture._data_dir.path())
             .expect("later startup recovery");

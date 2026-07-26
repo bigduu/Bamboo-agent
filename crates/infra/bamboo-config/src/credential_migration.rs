@@ -2165,6 +2165,17 @@ fn report_cluster_committed_recovery_failure(
     Some(revision)
 }
 
+fn cluster_commit_indeterminate_error(
+    initial_error: &ConfigStoreError,
+    terminal_error: &ConfigStoreError,
+) -> ConfigStoreError {
+    ConfigStoreError::CommitIndeterminate(format!(
+        "cluster transaction has durable commit intent, but installed authority could not be \
+         proven; completion failed ({initial_error}), and recovery/inspection failed \
+         ({terminal_error})"
+    ))
+}
+
 /// One coherent durable cluster generation captured under the shared
 /// migration lock. The runtime fabric may contain hydrated SSH credentials,
 /// so this type deliberately does not implement `Debug` or `Serialize`.
@@ -3818,7 +3829,10 @@ fn persist_exact_credential_transaction_inner(
                 ) {
                     return Ok(revision);
                 }
-                return Err(inspection_error);
+                return Err(cluster_commit_indeterminate_error(
+                    &initial_error,
+                    &inspection_error,
+                ));
             }
         };
         let recovery = {
@@ -3871,7 +3885,10 @@ fn persist_exact_credential_transaction_inner(
                     ) {
                         return Ok(revision);
                     }
-                    return Err(load_error);
+                    return Err(cluster_commit_indeterminate_error(
+                        &initial_error,
+                        &load_error,
+                    ));
                 }
             },
             Err(recovery_error) => {
@@ -3898,7 +3915,10 @@ fn persist_exact_credential_transaction_inner(
                             ) {
                                 return Ok(revision);
                             }
-                            return Err(combined);
+                            return Err(cluster_commit_indeterminate_error(
+                                &initial_error,
+                                &combined,
+                            ));
                         }
                     };
                 if let Some(revision) = report_cluster_committed_recovery_failure(
@@ -3913,7 +3933,10 @@ fn persist_exact_credential_transaction_inner(
                 ) {
                     return Ok(revision);
                 }
-                return Err(recovery_error);
+                return Err(cluster_commit_indeterminate_error(
+                    &initial_error,
+                    &recovery_error,
+                ));
             }
         }
     }
@@ -16571,6 +16594,74 @@ mod tests {
             LiveClusterTransaction::Committed(_)
         ));
         clear_cluster_exact_commit_test_fault(dir.path());
+    }
+
+    #[test]
+    fn unproven_commit_recovery_failure_is_typed_without_callback_and_startup_recovers() {
+        let _key = crate::encryption::set_test_encryption_key([0xcc; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "startup-recovery-node".to_string(),
+            label: "startup-recovery-node".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "startup-recovery-node".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AfterManifestRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ConfigStoreError::CommitIndeterminate(_)));
+        assert_eq!(
+            callbacks, 0,
+            "an unproven candidate must not invoke the post-commit callback"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before,
+            "the durable authority must remain at the pre-final-persist generation"
+        );
+        assert!(dir.path().join(MANIFEST_FILE).exists());
+
+        let reopened = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            reopened.registry().cluster_fabric.snapshot().revision,
+            revision + 1
+        );
+        assert!(reopened
+            .effective_config()
+            .cluster_fabric
+            .node("startup-recovery-node")
+            .is_some());
+        assert_active_exact_manifest(dir.path(), ExactTransactionScope::ClusterFabric);
+        assert_eq!(callbacks, 0);
     }
 
     #[test]
