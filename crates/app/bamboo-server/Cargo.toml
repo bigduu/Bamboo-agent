@@ -120,7 +120,7 @@ base64 = "0.22"
 # (SSH deploy, `bamboo-broker`) so signature verification and SSH host-key
 # support share one resolved version.
 ed25519-dalek = { version = "=3.0.0" }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "6", default-features = false, features = ["deflate"] }
 # Plugin source staging (`src/plugin_source.rs`): unpacking a local/remote
 # `.tar.gz`/`.tgz` plugin bundle or platform-artifact archive. `flate2` is
 # already pulled in transitively by `actix-http`'s gzip support, but a crate
