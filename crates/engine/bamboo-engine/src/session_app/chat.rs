@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use super::errors::ChatError;
 use super::provider_model::{derive_model_ref, persist_legacy_model_provider, persist_model_ref};
 use super::repository::SessionAccess;
-use super::types::ChatTurnInput;
+use super::types::{ChatTurnInput, ChatWorkspaceFallbackPolicy};
 
 // ---- Metadata keys ----
 const BASE_SYSTEM_PROMPT_KEY: &str = "base_system_prompt";
@@ -108,6 +108,28 @@ pub fn prepare_chat_turn_from_authoritative_session(
     global_default_prompt: &str,
     builtin_fallback_prompt: &str,
 ) -> Result<Session, ChatError> {
+    prepare_chat_turn_from_authoritative_session_with_workspace_policy(
+        existing,
+        input,
+        global_default_prompt,
+        builtin_fallback_prompt,
+        ChatWorkspaceFallbackPolicy::Legacy,
+    )
+}
+
+/// Prepare a turn with an explicit caller-owned workspace fallback policy.
+///
+/// The server uses this entrypoint after loading its own live config snapshot
+/// and previewing its AppState-scoped session fallback. Existing callers use
+/// [`prepare_chat_turn_from_authoritative_session`] and preserve legacy
+/// process-global/data-directory fallback behavior.
+pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
+    existing: Option<Session>,
+    input: ChatTurnInput,
+    global_default_prompt: &str,
+    builtin_fallback_prompt: &str,
+    workspace_fallback_policy: ChatWorkspaceFallbackPolicy,
+) -> Result<Session, ChatError> {
     let (mut session, session_start_source) = match existing {
         Some(session) => (session, "resume"),
         None => (
@@ -171,6 +193,7 @@ pub fn prepare_chat_turn_from_authoritative_session(
         &mut session,
         input.workspace_path.as_deref(),
         input.default_workspace_path.as_deref(),
+        &workspace_fallback_policy,
         input.data_dir.as_deref(),
     );
 
@@ -306,13 +329,20 @@ pub fn resolve_workspace_path(
     workspace_path_from_request: Option<&str>,
     data_dir: Option<&Path>,
 ) -> Option<String> {
-    resolve_workspace_path_with_default(session, workspace_path_from_request, None, data_dir)
+    resolve_workspace_path_with_default(
+        session,
+        workspace_path_from_request,
+        None,
+        &ChatWorkspaceFallbackPolicy::Legacy,
+        data_dir,
+    )
 }
 
 fn resolve_workspace_path_with_default(
     session: &mut Session,
     workspace_path_from_request: Option<&str>,
     default_workspace_path: Option<&str>,
+    fallback_policy: &ChatWorkspaceFallbackPolicy,
     data_dir: Option<&Path>,
 ) -> Option<String> {
     if let Some(path) = workspace_path_from_request {
@@ -323,7 +353,9 @@ fn resolve_workspace_path_with_default(
         .map(ToString::to_string)
         .or_else(|| session.workspace_path_meta())
         .or_else(|| default_workspace_path.map(ToString::to_string))
-        .or_else(|| resolve_default_workspace(data_dir));
+        .or_else(|| {
+            resolve_workspace_fallback_with(fallback_policy, || resolve_default_workspace(data_dir))
+        });
     if let Some(workspace) = resolved.as_ref() {
         // Persist the effective post-lock choice, including a live-config or
         // session-root fallback. Otherwise the subsequent Project resolver
@@ -332,6 +364,21 @@ fn resolve_workspace_path_with_default(
         session.set_workspace_path_meta(workspace.clone());
     }
     resolved
+}
+
+fn resolve_workspace_fallback_with<L>(
+    fallback_policy: &ChatWorkspaceFallbackPolicy,
+    legacy_lookup: L,
+) -> Option<String>
+where
+    L: FnOnce() -> Option<String>,
+{
+    match fallback_policy {
+        ChatWorkspaceFallbackPolicy::Legacy => legacy_lookup(),
+        ChatWorkspaceFallbackPolicy::Authoritative {
+            session_fallback_path,
+        } => session_fallback_path.clone(),
+    }
 }
 
 /// Resolve the configured default workspace (display string), preferring the
@@ -1018,6 +1065,104 @@ mod tests {
             .metadata
             .get(PROMPT_COMPONENT_FLAGS_KEY)
             .is_some_and(|flags| flags.contains("enhance=0")));
+    }
+
+    #[test]
+    fn authoritative_none_uses_session_fallback_during_prompt_composition() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let foreign_default = fixture.path().join("foreign-default");
+        std::fs::create_dir_all(&foreign_default).expect("foreign default");
+        std::fs::write(
+            fixture.path().join("config.json"),
+            serde_json::json!({
+                "default_work_area": { "path": foreign_default.to_string_lossy() }
+            })
+            .to_string(),
+        )
+        .expect("write legacy config");
+        let session_fallback = fixture
+            .path()
+            .join("request-state-root/workspaces/session-enhance");
+        let session_fallback_display = path_to_display_string(&session_fallback);
+        let mut input = chat_turn_input(None);
+        input.data_dir = Some(fixture.path().to_path_buf());
+
+        let session = prepare_chat_turn_from_authoritative_session_with_workspace_policy(
+            None,
+            input,
+            "global",
+            "builtin",
+            ChatWorkspaceFallbackPolicy::Authoritative {
+                session_fallback_path: Some(session_fallback_display.clone()),
+            },
+        )
+        .expect("authoritative turn");
+
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(session_fallback_display.as_str())
+        );
+        let system_prompt = system_message_content(&session);
+        assert!(
+            system_prompt.contains(&session_fallback_display),
+            "session fallback must participate in prepare-stage prompt composition"
+        );
+        assert!(
+            !system_prompt.contains(foreign_default.to_string_lossy().as_ref()),
+            "authoritative None must suppress the legacy configured default"
+        );
+        assert!(
+            session
+                .prompt_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.workspace_context.as_deref())
+                .is_some_and(|context| context.contains(&session_fallback_display)),
+            "prompt snapshot must retain the authoritative session fallback"
+        );
+    }
+
+    #[test]
+    fn authoritative_none_without_session_fallback_skips_legacy_lookup() {
+        let resolved = resolve_workspace_fallback_with(
+            &ChatWorkspaceFallbackPolicy::Authoritative {
+                session_fallback_path: None,
+            },
+            || panic!("authoritative None must not read a process-global or disk default"),
+        );
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn legacy_policy_preserves_non_server_default_workspace_lookup() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let configured_default = fixture.path().join("configured-default");
+        std::fs::create_dir_all(&configured_default).expect("configured default");
+        std::fs::write(
+            fixture.path().join("config.json"),
+            serde_json::json!({
+                "default_work_area": { "path": configured_default.to_string_lossy() }
+            })
+            .to_string(),
+        )
+        .expect("write config");
+        let mut input = chat_turn_input(None);
+        input.data_dir = Some(fixture.path().to_path_buf());
+
+        let session =
+            prepare_chat_turn_from_authoritative_session(None, input, "global", "builtin")
+                .expect("legacy turn");
+        let resolved = session
+            .workspace_path_meta()
+            .map(PathBuf::from)
+            .expect("legacy configured default");
+
+        assert_eq!(
+            resolved.canonicalize().expect("resolved canonical"),
+            configured_default
+                .canonicalize()
+                .expect("configured canonical")
+        );
     }
 
     // The non-server disk fallback (`default_workspace_from_data_dir`) tested

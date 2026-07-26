@@ -7,17 +7,44 @@ use bamboo_engine::model_config_helper::normalize_gold_config_json;
 
 use super::super::super::types::{CreateSessionRequest, CreateSessionResponse, SessionSummary};
 
-/// Sync runtime workspace so tools can resolve the working directory. Mirrors
-/// `chat::handler::sync_runtime_workspace` — #480 gives `POST /sessions` the
-/// same `workspace_path` semantics as `POST /chat`.
-fn sync_runtime_workspace(session_id: &str, workspace_path: Option<&str>) {
+/// Sync runtime workspace so tools can resolve the working directory. #480
+/// gives `POST /sessions` the same `workspace_path` semantics as `POST /chat`;
+/// this create path additionally uses its AppState-scoped provider pair so
+/// preview and post-persistence materialization cannot cross test states.
+fn sync_runtime_workspace(
+    state: &AppState,
+    session_id: &str,
+    workspace_path: Option<&str>,
+    workspace_source: &str,
+) {
     if let Some(workspace) = workspace_path
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
     {
-        bamboo_tools::tools::workspace_state::publish_resolved_workspace(session_id, workspace);
+        let workspace_root = state
+            .workspace_resolver
+            .workspace_root_config()
+            .map(|config| config.root);
+        let workspace_root_display = workspace_root
+            .as_deref()
+            .map(bamboo_config::paths::path_to_display_string)
+            .unwrap_or_else(|| "<unregistered>".to_string());
+        let published = state.workspace_resolver.publish_resolved_workspace(
+            session_id,
+            workspace,
+            workspace_source,
+        );
+        if !published.is_dir() {
+            tracing::warn!(
+                session_id,
+                path = %published.display(),
+                workspace_root = %workspace_root_display,
+                workspace_source,
+                "create-session workspace publication did not produce a usable directory"
+            );
+        }
     }
 }
 
@@ -126,11 +153,16 @@ pub async fn create_session(
         global_default_prompt.as_str(),
         &config_snapshot,
     );
-    if let Some(workspace) = final_workspace_display.as_deref() {
+    let configured_default_workspace = config_snapshot.get_default_work_area_path();
+    let workspace_source = if let Some(workspace) = final_workspace_display.as_deref() {
         session.set_workspace_path_meta(workspace);
-    } else if let Some(workspace) = config_snapshot.get_default_work_area_path() {
+        "request"
+    } else if let Some(workspace) = configured_default_workspace {
         session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(&workspace));
-    }
+        "configured_default"
+    } else {
+        "session_fallback"
+    };
     if let Err(error) = state
         .project_context_resolver
         .refresh_session_prompt_read_only(&mut session)
@@ -200,7 +232,12 @@ pub async fn create_session(
     // and only after the authoritative session is durable. A storage failure
     // must not leave an orphan runtime workspace entry for an ID the API never
     // created.
-    sync_runtime_workspace(&id, session.workspace_path_meta().as_deref());
+    sync_runtime_workspace(
+        state.get_ref(),
+        &id,
+        session.workspace_path_meta().as_deref(),
+        workspace_source,
+    );
 
     // Publish onto the account change feed so other clients insert the new
     // session into their list without polling `GET /sessions`.
@@ -431,15 +468,21 @@ mod tests {
         let workspace = session
             .workspace_path_meta()
             .expect("validated session fallback workspace");
+        let workspace_root = bamboo_config::paths::resolve_workspace_root_in(&state.app_data_dir);
         assert!(
             std::path::Path::new(&workspace).is_dir(),
-            "authoritative create must materialize the validated fallback"
+            "authoritative create must materialize the validated fallback: \
+             resolved={workspace}, root={}, source=session_fallback",
+            workspace_root.display(),
         );
         assert_eq!(
             bamboo_agent_core::workspace_state::get_workspace(&session_id)
                 .as_deref()
                 .map(bamboo_config::paths::path_to_display_string),
-            Some(workspace)
+            Some(workspace.clone()),
+            "runtime publication drifted: resolved={workspace}, root={}, \
+             source=session_fallback",
+            workspace_root.display(),
         );
         assert!(
             bamboo_tools::tools::workspace_state::workspace_or_process_cwd(Some(&session_id))
