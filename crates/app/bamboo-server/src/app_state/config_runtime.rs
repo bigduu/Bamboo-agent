@@ -2097,8 +2097,20 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let deployed_registry = self.fabric_deployer.registry();
         let transaction = tokio::spawn(async move {
             let _io = config_io_lock.lock().await;
+            if id == SectionId::ClusterFabric {
+                let deployed = deployed_registry.lock().await;
+                if let Some(node_id) = deployed.keys().find_map(|key| {
+                    let (source, node_id) = bamboo_server_tools::registry_keys::split(key);
+                    (source == "node").then(|| node_id.to_string())
+                }) {
+                    return Err(ConfigSectionMutationError::Invalid(format!(
+                        "node '{node_id}' is deployed; stop it before resetting cluster-fabric"
+                    )));
+                }
+            }
             ensure_provider_mcp_migration_ready(&app_data_dir)
                 .map_err(ConfigSectionMutationError::Store)?;
             let facade = config_facade.as_ref().ok_or_else(|| {
@@ -3321,13 +3333,70 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
     {
+        self.update_cluster_fabric_credentials_guarded(
+            expected_revision,
+            node_intents,
+            None,
+            update,
+        )
+        .await
+    }
+
+    /// Delete one cluster node only while its lifecycle registry entry is
+    /// absent. The guard is evaluated after acquiring `config_io_lock`, the
+    /// same lock used by deploy/stop, so the check and durable mutation cannot
+    /// race a worker lifecycle transition.
+    pub(crate) async fn delete_cluster_node_credentials<F>(
+        &self,
+        expected_revision: u64,
+        node_id: String,
+        node_intents: std::collections::BTreeMap<
+            String,
+            bamboo_config::ClusterNodeCredentialIntents,
+        >,
+        update: F,
+    ) -> Result<bamboo_server_tools::FabricCommitSnapshot, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
+    {
+        self.update_cluster_fabric_credentials_guarded(
+            expected_revision,
+            node_intents,
+            Some(node_id),
+            update,
+        )
+        .await
+    }
+
+    async fn update_cluster_fabric_credentials_guarded<F>(
+        &self,
+        expected_revision: u64,
+        node_intents: std::collections::BTreeMap<
+            String,
+            bamboo_config::ClusterNodeCredentialIntents,
+        >,
+        required_stopped_node: Option<String>,
+        update: F,
+    ) -> Result<bamboo_server_tools::FabricCommitSnapshot, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
+    {
         let config_io_lock = self.config_io_lock.clone();
         let config = self.config.clone();
         let app_data_dir = self.app_data_dir.clone();
         let account_sink = self.account_sink.clone();
         let config_facade = self.config_facade.clone();
+        let deployed_registry = self.fabric_deployer.registry();
         let transaction = tokio::spawn(async move {
             let _io = config_io_lock.lock().await;
+            if let Some(node_id) = required_stopped_node.as_deref() {
+                let deployed = deployed_registry.lock().await;
+                if deployed.contains_key(&bamboo_server_tools::registry_keys::node_key(node_id)) {
+                    return Err(AppError::BadRequest(format!(
+                        "node '{node_id}' is deployed; stop it before deleting it"
+                    )));
+                }
+            }
             let facade = config_facade.as_ref().ok_or_else(|| {
                 AppError::BadRequest(
                     "cluster mutations require the modular configuration facade".to_string(),
@@ -3336,10 +3405,58 @@ impl AppState {
             let mut candidate = {
                 let current = config.read().await;
                 reject_if_recovery_pending(&current)?;
-                let mut candidate = current.clone();
-                update(&mut candidate)?;
-                candidate
+                current.clone()
             };
+            // A process-local runtime can lag a commit from another process.
+            // Build the request from the exact durable generation named by the
+            // client. `None` deliberately selects the secret-free read: using
+            // `Some(expected_revision)` would hydrate first and prevent an
+            // explicit Clear/Replace from repairing corrupt ciphertext. The
+            // returned status metadata is still crypto-validated. An untouched
+            // corrupt active ref retains the established commit-first contract:
+            // a metadata change can durably commit and then report its exact
+            // runtime materialization error (covered by
+            // `changed_cluster_commit_publishes_secret_free_runtime_before_materialization_error`).
+            // The compound writer rechecks the same revision before committing,
+            // so an intervening winner becomes a conflict.
+            let snapshot_dir = app_data_dir.clone();
+            let exact = tokio::task::spawn_blocking(move || {
+                bamboo_config::read_exact_cluster_fabric_snapshot(&snapshot_dir, None)
+            })
+            .await
+            .map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!("cluster snapshot task failed: {error}"))
+            })?
+            .map_err(|error| match error {
+                ConfigStoreError::Conflict { expected, actual } => {
+                    AppError::ConfigConflict { expected, actual }
+                }
+                ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::Io(error) => AppError::StorageError(error),
+                ConfigStoreError::Json(_) => {
+                    AppError::BadRequest("configuration document is invalid".to_string())
+                }
+                ConfigStoreError::Watch(error) => {
+                    AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
+                }
+            })?;
+            if exact.section.revision != expected_revision {
+                return Err(AppError::ConfigConflict {
+                    expected: expected_revision,
+                    actual: exact.section.revision,
+                });
+            }
+            if exact.section.status != SectionStatus::Healthy
+                || exact.section.source_kind != SectionSourceKind::File
+                || exact.credential_health.status == SectionStatus::Degraded
+            {
+                return Err(AppError::BadRequest(
+                    "revision-bound cluster mutations require healthy primary authorities"
+                        .to_string(),
+                ));
+            }
+            candidate.cluster_fabric = exact.cluster_fabric;
+            update(&mut candidate)?;
             let transaction_dir = app_data_dir.clone();
             let commit_facade = facade.clone();
             let (mut candidate, commit) = tokio::task::spawn_blocking(move || {
@@ -3831,6 +3948,36 @@ mod live_reload_tests {
 
     struct WorkingProvider;
 
+    fn stop_config_watcher(state: &mut AppState) {
+        state.config_watcher.stop.store(true, Ordering::Relaxed);
+        if let Some(task) = state.config_watcher.apply_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.config_watcher.watcher_task.take() {
+            task.join().unwrap();
+        }
+    }
+
+    async fn insert_registry_worker(state: &AppState, key: String, worker_id: &str) {
+        #[cfg(unix)]
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = tokio::process::Command::new("cmd")
+            .args(["/C", "timeout", "/T", "30", "/NOBREAK"])
+            .spawn()
+            .unwrap();
+        state.fabric_deployer.registry().lock().await.insert(
+            key,
+            bamboo_server_tools::Deployed {
+                env: "test".to_string(),
+                handle: bamboo_broker::DeployedAgent::from_parts(worker_id, child, None),
+            },
+        );
+    }
+
     fn disabled_mcp_config(id: &str) -> McpConfig {
         McpConfig {
             version: 1,
@@ -4236,6 +4383,324 @@ mod live_reload_tests {
             .count();
         assert_eq!(cluster_events, 1);
         assert_eq!(credential_events, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_process_cluster_candidate_rebases_on_exact_durable_client_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "shared-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "shared-node".to_string(),
+                        label: "generation-one".to_string(),
+                        placement: bamboo_config::NodePlacement::Local,
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        stop_config_watcher(&mut state);
+
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .cluster_fabric
+            .clusters
+            .push(bamboo_config::Cluster {
+                name: "external-cluster".to_string(),
+                description: Some("durable-r2-field".to_string()),
+                node_ids: vec!["shared-node".to_string()],
+            });
+        assert_eq!(
+            bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external_candidate,
+                &BTreeMap::new(),
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .cluster("external-cluster")
+                .is_none(),
+            "the process runtime is intentionally stale at r1"
+        );
+
+        let committed = state
+            .update_cluster_fabric_credentials(2, BTreeMap::new(), |config| {
+                config.cluster_fabric.node_mut("shared-node").unwrap().label =
+                    "client-r3-edit".to_string();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(committed.section.revision, 3);
+        assert_eq!(
+            committed
+                .config
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "client-r3-edit"
+        );
+        assert_eq!(
+            committed
+                .config
+                .cluster_fabric
+                .cluster("external-cluster")
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("durable-r2-field")
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            3,
+            "compound adoption must safely catch the stale r1 facade up to r3"
+        );
+
+        let runtime_before_conflict = state.config.read().await.cluster_fabric.clone();
+        let conflict = state
+            .update_cluster_fabric_credentials(2, BTreeMap::new(), |config| {
+                config.cluster_fabric.nodes.clear();
+                config.cluster_fabric.clusters.clear();
+                Ok(())
+            })
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(AppError::ConfigConflict {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert_eq!(
+            state.config.read().await.cluster_fabric,
+            runtime_before_conflict,
+            "a durable CAS conflict must not overwrite the process runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn deployed_node_delete_and_cluster_reset_reject_before_commit_and_remain_stoppable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "live-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "live-node".to_string(),
+                        label: "live-node".to_string(),
+                        placement: bamboo_config::NodePlacement::Local,
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: Some(bamboo_config::NodeState {
+                            status: bamboo_config::NodeStatus::Running,
+                            worker_id: Some("live-worker".to_string()),
+                            ..Default::default()
+                        }),
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        insert_registry_worker(
+            &state,
+            bamboo_server_tools::registry_keys::node_key("live-node"),
+            "live-worker",
+        )
+        .await;
+        let transaction_marker = dir.path().join("config-credential-migration.json");
+        let marker_before_guard = std::fs::read(&transaction_marker).ok();
+        bamboo_config::set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            bamboo_config::ClusterExactCommitTestFault::AfterManifestRecoveryFailure,
+        );
+
+        let delete = state
+            .delete_cluster_node_credentials(
+                1,
+                "live-node".to_string(),
+                BTreeMap::from([(
+                    "live-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config
+                        .cluster_fabric
+                        .nodes
+                        .retain(|node| node.id != "live-node");
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(delete, Err(AppError::BadRequest(_))));
+        let reset = state
+            .reset_credential_backed_section(SectionId::ClusterFabric, 1)
+            .await;
+        assert!(matches!(reset, Err(ConfigSectionMutationError::Invalid(_))));
+        assert_eq!(
+            std::fs::read(&transaction_marker).ok(),
+            marker_before_guard,
+            "registry guards must reject before opening a new durable transaction"
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        assert!(state
+            .config
+            .read()
+            .await
+            .cluster_fabric
+            .node("live-node")
+            .is_some());
+        assert!(state
+            .fabric_deployer
+            .registry()
+            .lock()
+            .await
+            .contains_key(&bamboo_server_tools::registry_keys::node_key("live-node")));
+
+        bamboo_config::clear_cluster_exact_commit_test_fault(dir.path());
+        let stopped = state
+            .fabric_deployer
+            .stop_at_revision("live-node", 1)
+            .await
+            .unwrap();
+        assert_eq!(stopped.snapshot.section.revision, 2);
+        assert!(!state
+            .fabric_deployer
+            .registry()
+            .lock()
+            .await
+            .contains_key(&bamboo_server_tools::registry_keys::node_key("live-node")));
+        let deleted = state
+            .delete_cluster_node_credentials(
+                2,
+                "live-node".to_string(),
+                BTreeMap::from([(
+                    "live-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config
+                        .cluster_fabric
+                        .nodes
+                        .retain(|node| node.id != "live-node");
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.section.revision, 3);
+        assert!(deleted.config.cluster_fabric.node("live-node").is_none());
+    }
+
+    #[tokio::test]
+    async fn unrelated_agent_registry_entry_does_not_block_cluster_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "reset-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "reset-node".to_string(),
+                        label: "reset-node".to_string(),
+                        placement: bamboo_config::NodePlacement::Local,
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let agent_key = bamboo_server_tools::registry_keys::agent_key("unrelated-agent");
+        insert_registry_worker(&state, agent_key.clone(), "unrelated-agent").await;
+
+        state
+            .reset_credential_backed_section(SectionId::ClusterFabric, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            2
+        );
+        assert!(state.config.read().await.cluster_fabric.nodes.is_empty());
+        let unrelated = state
+            .fabric_deployer
+            .registry()
+            .lock()
+            .await
+            .remove(&agent_key)
+            .expect("agent registry entry must survive cluster reset");
+        unrelated.handle.shutdown().await;
     }
 
     #[tokio::test]

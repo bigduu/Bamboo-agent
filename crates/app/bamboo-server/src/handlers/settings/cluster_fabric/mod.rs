@@ -717,8 +717,9 @@ pub async fn delete_node(
     let id_for_update = id.clone();
 
     let snapshot = app_state
-        .update_cluster_fabric_credentials(
+        .delete_cluster_node_credentials(
             expected_revision,
+            id.clone(),
             BTreeMap::from([(id.clone(), ClusterNodeCredentialIntents::clear_all())]),
             move |cfg| {
                 let before = cfg.cluster_fabric.nodes.len();
@@ -1302,6 +1303,29 @@ mod tests {
             "generation-one",
             "the read must not depend on or silently mutate the stale process runtime"
         );
+
+        let credentials_path = dir.path().join("credentials.json");
+        let credential_primary = std::fs::read(&credentials_path).unwrap();
+        let password_ref = bamboo_config::cluster_password_credential_ref("coherent-node").unwrap();
+        let mut corrupt_ciphertext: Value = serde_json::from_slice(&credential_primary).unwrap();
+        corrupt_ciphertext["data"]["entries"][password_ref.as_str()]["ciphertext"] =
+            Value::String("nonempty-but-undecryptable".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_vec_pretty(&corrupt_ciphertext).unwrap(),
+        )
+        .unwrap();
+        let corrupt_status = cluster_section_envelope(&state)
+            .await
+            .expect("GET must project corrupt ciphertext as status metadata");
+        assert_eq!(
+            corrupt_status.data["credential_status"]["coherent-node"]["password"]["state"],
+            "error"
+        );
+        assert!(!serde_json::to_string(&corrupt_status)
+            .unwrap()
+            .contains("generation-two-password"));
+        std::fs::write(&credentials_path, credential_primary).unwrap();
 
         let cluster_primary = std::fs::read(dir.path().join("cluster-fabric.json")).unwrap();
         std::fs::write(dir.path().join("cluster-fabric.json"), b"{invalid-primary").unwrap();

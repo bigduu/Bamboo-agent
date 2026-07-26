@@ -206,6 +206,38 @@ impl CredentialDocumentLkg {
             })
             .transpose()
     }
+
+    /// Project secret-free status metadata while cryptographically validating
+    /// only the references owned by the active cluster generation.
+    ///
+    /// Decrypted values are dropped inside this authority and never returned
+    /// to GET/status callers. A present but undecryptable entry is represented
+    /// as `configured = false`, which the cluster projection renders as
+    /// `error` when durable metadata still says the field is configured.
+    pub(crate) fn statuses_with_cluster_crypto_validation(
+        &self,
+        active_refs: &BTreeSet<CredentialRef>,
+    ) -> Vec<CredentialStatus> {
+        self.document
+            .entries
+            .iter()
+            .map(|(credential_ref, entry)| {
+                let configured = if active_refs.contains(credential_ref) {
+                    crate::encryption::decrypt(&entry.ciphertext)
+                        .map(drop)
+                        .is_ok()
+                } else {
+                    true
+                };
+                CredentialStatus {
+                    credential_ref: credential_ref.clone(),
+                    configured,
+                    source: entry.source,
+                    updated_at: Some(entry.updated_at),
+                }
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct CredentialMutation {
@@ -544,13 +576,21 @@ impl CredentialStore {
     /// after every config-owned reference has been removed through its owning
     /// domain transaction. This is the final step of a section-by-section
     /// reset; it must never detach a live config reference from its secret.
+    ///
+    /// `config` is retained for API compatibility only. It is deliberately not
+    /// an ownership authority: another process may have committed a newer
+    /// section generation than this process-local runtime has observed.
     pub fn clear_all_unreferenced(
         &self,
-        config: &crate::Config,
+        _config: &crate::Config,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, Vec<CredentialStatus>)> {
         self.with_transaction_lock(|| {
-            let referenced = config_credential_ref_counts(config)?;
+            let durable =
+                crate::section_facade::load_durable_effective_config_under_migration_lock(
+                    self.data_dir(),
+                )?;
+            let referenced = config_credential_ref_counts(&durable)?;
             if !referenced.is_empty() {
                 return Err(ConfigStoreError::Validation(
                     "credentials still referenced by configuration must be reset through their owning sections"
@@ -2857,6 +2897,14 @@ pub(crate) fn config_credential_ref_counts(
             add(reference);
         }
     }
+    if let Some(reference) = config
+        .subagents()
+        .broker
+        .as_ref()
+        .and_then(|broker| broker.credential_ref.as_ref())
+    {
+        add(reference);
+    }
     for server in &config.mcp.servers {
         match &server.transport {
             bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
@@ -3067,6 +3115,107 @@ mod tests {
         assert_eq!(revision, 2);
         assert!(!status.configured);
         assert!(store.resolve(&reference).unwrap().is_none());
+    }
+
+    #[test]
+    fn generic_reset_uses_durable_cluster_owners_not_stale_runtime() {
+        let _key = crate::encryption::set_test_encryption_key([0x32; 32]);
+        let dir = TempDir::new().unwrap();
+        let facade = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = facade.effective_config();
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "durable-owner".to_string(),
+            label: "durable-owner".to_string(),
+            placement: crate::NodePlacement::Ssh(crate::SshTarget {
+                host: "durable.example.test".to_string(),
+                port: 22,
+                username: "operator".to_string(),
+                auth: crate::SshAuth::Password {
+                    password: String::new(),
+                    password_encrypted: None,
+                },
+                host_key_fingerprint: None,
+            }),
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let password_ref = crate::cluster_password_credential_ref("durable-owner").unwrap();
+        let durable_secret = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            crate::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeMap::from([(
+                    "durable-owner".to_string(),
+                    crate::ClusterNodeCredentialIntents {
+                        password: crate::ClusterCredentialAction::Replace(durable_secret.clone(),),
+                        private_key: crate::ClusterCredentialAction::Clear,
+                        passphrase: crate::ClusterCredentialAction::Clear,
+                    },
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let store = CredentialStore::open(dir.path());
+        let stale_runtime = crate::Config::default();
+        let error = store.clear_all_unreferenced(&stale_runtime, 1).unwrap_err();
+        assert!(
+            matches!(error, ConfigStoreError::Validation(_)),
+            "a durable owner must reject generic reset"
+        );
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.resolve(&password_ref).unwrap().unwrap().expose(),
+            durable_secret.as_str()
+        );
+    }
+
+    #[test]
+    fn generic_reset_uses_durable_broker_owner_not_stale_runtime() {
+        let _key = crate::encryption::set_test_encryption_key([0x34; 32]);
+        let dir = TempDir::new().unwrap();
+        let broker_secret = uuid::Uuid::new_v4().to_string();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            dir.path().join("broker.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "endpoint": "wss://broker.example.test/ws",
+                "token": broker_secret.clone()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let facade = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let reference = facade
+            .registry()
+            .subagents
+            .snapshot()
+            .data
+            .external_broker
+            .as_ref()
+            .and_then(|broker| broker.credential_ref.clone())
+            .expect("durable broker must own its migrated credential");
+
+        let store = CredentialStore::open(dir.path());
+        let revision = store.revision().unwrap();
+        let stale_runtime = crate::Config::default();
+        let error = store
+            .clear_all_unreferenced(&stale_runtime, revision)
+            .unwrap_err();
+        assert!(
+            matches!(error, ConfigStoreError::Validation(_)),
+            "a durable broker owner must reject generic reset"
+        );
+        assert_eq!(store.revision().unwrap(), revision);
+        assert_eq!(
+            store.resolve(&reference).unwrap().unwrap().expose(),
+            broker_secret.as_str()
+        );
     }
 
     #[test]

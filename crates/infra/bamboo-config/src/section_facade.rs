@@ -4255,6 +4255,47 @@ impl SectionRegistry {
     }
 }
 
+/// Reconstruct the effective configuration from the coherent modular
+/// authorities while the caller owns the shared migration lock.
+///
+/// Credential ownership checks must use these durable snapshots rather than a
+/// process-local runtime that may lag a commit made by another process.
+pub(crate) fn load_durable_effective_config_under_migration_lock(
+    data_dir: &Path,
+) -> ConfigStoreResult<Config> {
+    if !section_layout_is_active(data_dir)? {
+        return Err(crate::ConfigStoreError::Validation(
+            "durable credential ownership requires the modular configuration layout".to_string(),
+        ));
+    }
+    let registry = SectionRegistry::open_configured(data_dir, true)?;
+    let health = registry.health()?;
+    for id in [
+        SectionId::Core,
+        SectionId::Providers,
+        SectionId::Mcp,
+        SectionId::Notifications,
+        SectionId::Connect,
+        SectionId::ClusterFabric,
+        SectionId::Env,
+        SectionId::AccessControl,
+        SectionId::Subagents,
+    ] {
+        let health = health
+            .iter()
+            .find(|health| health.section == id)
+            .expect("every durable credential owner has section health");
+        if health.status != SectionStatus::Healthy || health.source_kind != SectionSourceKind::File
+        {
+            return Err(crate::ConfigStoreError::Validation(format!(
+                "durable {} credential ownership is unavailable",
+                id.descriptor().name
+            )));
+        }
+    }
+    Ok(registry.projection().into_config())
+}
+
 /// Effective compatibility facade assembled from immutable section snapshots.
 pub struct ConfigFacade {
     registry: Arc<SectionRegistry>,
@@ -4322,11 +4363,13 @@ impl ConfigFacade {
         let mut sanitized = Config::default();
         sanitized.cluster_fabric = candidate;
         sanitized.sanitize_cluster_fabric_for_disk();
-        self.registry.cluster_fabric.adopt_committed(
-            expected_revision,
-            committed_revision,
-            ClusterFabricSection(sanitized.cluster_fabric.clone()),
-        )
+        self.registry
+            .cluster_fabric
+            .adopt_committed_from_durable_base(
+                expected_revision,
+                committed_revision,
+                ClusterFabricSection(sanitized.cluster_fabric.clone()),
+            )
     }
 
     pub(crate) fn adopt_captured_cluster_credentials(

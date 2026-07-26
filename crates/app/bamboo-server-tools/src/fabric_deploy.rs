@@ -357,13 +357,6 @@ impl FabricDeployer {
     async fn snapshot_locked(&self, expected_revision: u64) -> FabricResult<FabricCommitSnapshot> {
         let mut config = self.config.read().await.clone();
         if self.config_facade.is_some() {
-            let actual = self.cluster_revision_locked();
-            if expected_revision != actual {
-                return Err(FabricError::Conflict {
-                    expected: expected_revision,
-                    actual,
-                });
-            }
             let data_dir = self.data_dir.clone();
             let exact = tokio::task::spawn_blocking(move || {
                 bamboo_config::read_exact_cluster_fabric_snapshot(
@@ -514,15 +507,37 @@ impl FabricDeployer {
         F: FnOnce(&mut Config) -> FabricResult<()> + Send,
     {
         if let Some(facade) = &self.config_facade {
-            let actual = self.cluster_revision_locked();
-            if expected_revision != actual {
+            let mut candidate = self.config.read().await.clone();
+            let snapshot_dir = self.data_dir.clone();
+            // Lifecycle persistence starts from the exact durable metadata
+            // generation without hydrating secrets. In particular, stop must
+            // remain able to clear live state when an unrelated active
+            // credential is corrupt; materialization is reported explicitly
+            // after a changed commit.
+            let exact = tokio::task::spawn_blocking(move || {
+                bamboo_config::read_exact_cluster_fabric_snapshot(&snapshot_dir, None)
+            })
+            .await
+            .map_err(|error| {
+                FabricError::Internal(format!("cluster snapshot task failed: {error}"))
+            })?
+            .map_err(map_config_store_error)?;
+            if exact.section.revision != expected_revision {
                 return Err(FabricError::Conflict {
                     expected: expected_revision,
-                    actual,
+                    actual: exact.section.revision,
                 });
             }
-
-            let mut candidate = self.config.read().await.clone();
+            if exact.section.status != SectionStatus::Healthy
+                || exact.section.source_kind != SectionSourceKind::File
+                || exact.credential_health.status == SectionStatus::Degraded
+            {
+                return Err(FabricError::BadRequest(
+                    "revision-bound cluster mutations require healthy primary authorities"
+                        .to_string(),
+                ));
+            }
+            candidate.cluster_fabric = exact.cluster_fabric;
             update(&mut candidate)?;
             let data_dir = self.data_dir.clone();
             let commit_facade = facade.clone();
@@ -2058,6 +2073,90 @@ mod lifecycle_persistence_tests {
                 },
             )]),
         )
+    }
+
+    #[tokio::test]
+    async fn stale_lifecycle_candidate_starts_from_exact_durable_generation() {
+        let fixture = modular_running_fixture("/usr/bin/true");
+        let external = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .cluster_fabric
+            .clusters
+            .push(bamboo_config::Cluster {
+                name: "external-cluster".to_string(),
+                description: Some("durable-r2-field".to_string()),
+                node_ids: vec!["n1".to_string()],
+            });
+        assert_eq!(
+            bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                fixture._data_dir.path(),
+                &mut external_candidate,
+                &BTreeMap::new(),
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            fixture.facade.registry().cluster_fabric.snapshot().revision,
+            1
+        );
+        assert!(fixture
+            .config
+            .read()
+            .await
+            .cluster_fabric
+            .cluster("external-cluster")
+            .is_none());
+
+        let committed = fixture
+            .deployer
+            .persist_node_update_at_revision(2, |config| {
+                config.cluster_fabric.node_mut("n1").unwrap().label = "engine-r3-edit".to_string();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(committed.section.revision, 3);
+        assert_eq!(
+            committed.config.cluster_fabric.node("n1").unwrap().label,
+            "engine-r3-edit"
+        );
+        assert_eq!(
+            committed
+                .config
+                .cluster_fabric
+                .cluster("external-cluster")
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("durable-r2-field")
+        );
+        assert_eq!(
+            fixture.facade.registry().cluster_fabric.snapshot().revision,
+            3
+        );
+
+        let runtime_before_conflict = fixture.config.read().await.cluster_fabric.clone();
+        let conflict = fixture
+            .deployer
+            .persist_node_update_at_revision(2, |config| {
+                config.cluster_fabric.nodes.clear();
+                Ok(())
+            })
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(FabricError::Conflict {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert_eq!(
+            fixture.config.read().await.cluster_fabric,
+            runtime_before_conflict
+        );
     }
 
     #[tokio::test]

@@ -879,20 +879,23 @@ mod tests {
             .credential_store
             .replace(active.clone(), "active-secret", CredentialSource::User, 1)
             .unwrap();
+        let durable_env = bamboo_config::EnvSection(vec![bamboo_config::EnvVarEntry {
+            name: "ACTIVE".to_string(),
+            value: String::new(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: Some(active),
+            configured: true,
+            description: None,
+        }]);
         state
-            .config
-            .write()
-            .await
-            .env_vars
-            .push(bamboo_config::EnvVarEntry {
-                name: "ACTIVE".to_string(),
-                value: "active-secret".to_string(),
-                secret: true,
-                value_encrypted: None,
-                credential_ref: Some(active),
-                configured: true,
-                description: None,
-            });
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .env
+            .commit(0, durable_env)
+            .unwrap();
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
@@ -911,7 +914,14 @@ mod tests {
         assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
         assert_eq!(state.credential_store.statuses().unwrap().len(), 2);
 
-        state.config.write().await.env_vars.clear();
+        state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .env
+            .commit(1, bamboo_config::EnvSection::default())
+            .unwrap();
         let reset = test::call_service(
             &app,
             test::TestRequest::post()
