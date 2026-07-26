@@ -482,7 +482,7 @@ fn cluster_section_envelope(app_state: &AppState) -> Result<SectionEnvelope<Valu
     project_cluster_section(fabric, envelope, statuses, store_healthy)
 }
 
-fn committed_cluster_section(
+pub(super) fn committed_cluster_section(
     snapshot: FabricCommitSnapshot,
 ) -> Result<SectionEnvelope<Value>, AppError> {
     let store_healthy = snapshot.credential_health.status != SectionStatus::Degraded;

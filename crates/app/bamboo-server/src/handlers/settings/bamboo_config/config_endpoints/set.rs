@@ -175,15 +175,39 @@ async fn remove_unchanged_cluster_fabric_echo(
     let current = app_state.config.read().await.clone();
     let current_value = current.to_compatibility_value()?;
     let redacted_current = redact_config_for_api(current_value, &current);
-    if redacted_current.get("cluster_fabric") != Some(incoming) {
+    let Some(current_cluster) = redacted_current.get("cluster_fabric") else {
+        return Err(cluster_fabric_patch_error());
+    };
+    if cluster_fabric_without_runtime_state(current_cluster)
+        != cluster_fabric_without_runtime_state(incoming)
+    {
         return Err(cluster_fabric_patch_error());
     }
 
-    // Compatibility clients POST the complete redacted GET payload. Ignore an
-    // exact cluster echo before routing any other dedicated domain, but never
-    // merge it: the redacted shape omits server-owned credential references.
+    // Compatibility clients POST the complete redacted GET payload. Ignore a
+    // semantically unchanged operator-owned cluster echo before routing any
+    // other domain. Runtime node state may advance between GET and POST, and is
+    // ignored here as well as on persistence; all other cluster fields must
+    // still match exactly.
     patch_obj.remove("cluster_fabric");
     Ok(())
+}
+
+fn cluster_fabric_without_runtime_state(cluster: &Value) -> Value {
+    let mut cluster = cluster.clone();
+    let Some(nodes) = cluster
+        .as_object_mut()
+        .and_then(|object| object.get_mut("nodes"))
+        .and_then(Value::as_array_mut)
+    else {
+        return cluster;
+    };
+    for node in nodes {
+        if let Some(node) = node.as_object_mut() {
+            node.remove("state");
+        }
+    }
+    cluster
 }
 
 fn cluster_fabric_patch_error() -> AppError {
@@ -637,6 +661,14 @@ mod tests {
             )
             .await
             .unwrap();
+        let cluster_revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .revision;
         let cluster_path = dir.path().join("cluster-fabric.json");
         let cluster_before = std::fs::read(&cluster_path).unwrap();
         let credentials_before = std::fs::read(state.credential_store.path()).unwrap();
@@ -674,11 +706,87 @@ mod tests {
         let response: Value = test::read_body_json(response).await;
         assert_eq!(response["cluster_fabric"], cluster_echo);
         assert_eq!(response["server"]["port"], 19_999);
-        assert_eq!(std::fs::read(cluster_path).unwrap(), cluster_before);
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_before);
         assert_eq!(
             std::fs::read(state.credential_store.path()).unwrap(),
             credentials_before
         );
+
+        {
+            let mut config = state.config.write().await;
+            config.cluster_fabric.node_mut("echo-node").unwrap().state =
+                Some(bamboo_config::NodeState {
+                    status: bamboo_config::NodeStatus::Running,
+                    worker_id: Some("heartbeat-worker".to_string()),
+                    last_health: Some("runtime-only-heartbeat".to_string()),
+                    ..Default::default()
+                });
+        }
+        let mut heartbeat_echo: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/config").to_request(),
+        )
+        .await;
+        assert_eq!(
+            heartbeat_echo["cluster_fabric"]["nodes"][0]["state"]["last_health"],
+            "runtime-only-heartbeat"
+        );
+        state
+            .config
+            .write()
+            .await
+            .cluster_fabric
+            .node_mut("echo-node")
+            .unwrap()
+            .state
+            .as_mut()
+            .unwrap()
+            .last_health = Some("newer-runtime-only-heartbeat".to_string());
+        heartbeat_echo["server"]["port"] = serde_json::json!(20_000);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config")
+                .set_json(&heartbeat_echo)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["server"]["port"], 20_000);
+        assert!(!response.to_string().contains("runtime-only-heartbeat"));
+        assert!(!response
+            .to_string()
+            .contains("newer-runtime-only-heartbeat"));
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            cluster_revision
+        );
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_before);
+        assert_eq!(
+            std::fs::read(state.credential_store.path()).unwrap(),
+            credentials_before
+        );
+        assert!(state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .data
+            .0
+            .node("echo-node")
+            .unwrap()
+            .state
+            .is_none());
     }
 
     #[actix_web::test]

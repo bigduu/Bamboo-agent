@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
-    app_state::{AppState, ConfigSectionMutationError},
+    app_state::{AppState, ConfigSectionMutationError, CredentialBackedResetCommit},
     error::AppError,
 };
 
@@ -589,10 +589,13 @@ pub async fn reset_typed_section(
         | SectionId::Env
         | SectionId::ClusterFabric
         | SectionId::AccessControl => {
-            app_state
+            let commit = app_state
                 .reset_credential_backed_section(id, expected_revision)
                 .await
                 .map_err(map_mutation_error)?;
+            if let CredentialBackedResetCommit::Cluster(snapshot) = commit {
+                return cluster_reset_response(*snapshot);
+            }
         }
         SectionId::Providers => {
             app_state
@@ -623,6 +626,13 @@ pub async fn reset_typed_section(
     }
 
     get_typed_section(app_state, web::Path::from(name)).await
+}
+
+fn cluster_reset_response(
+    snapshot: bamboo_server_tools::FabricCommitSnapshot,
+) -> Result<HttpResponse, AppError> {
+    let section = super::super::cluster_fabric::committed_cluster_section(snapshot)?;
+    Ok(HttpResponse::Ok().json(section))
 }
 
 fn default_section_value(id: SectionId) -> Result<Value, AppError> {
@@ -3691,6 +3701,130 @@ mod tests {
         assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
         assert_eq!(std::fs::read(cluster_path).unwrap(), before);
         assert!(state.config.read().await.cluster_fabric.nodes.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn delayed_cluster_reset_response_stays_bound_to_its_exact_commit() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x67; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let reference = bamboo_config::cluster_password_credential_ref("reset-race-node").unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "reset-race-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents {
+                        password: bamboo_config::ClusterCredentialAction::Replace(
+                            "reset-race-secret".to_string(),
+                        ),
+                        private_key: bamboo_config::ClusterCredentialAction::Clear,
+                        passphrase: bamboo_config::ClusterCredentialAction::Clear,
+                    },
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "reset-race-node".to_string(),
+                        label: "reset-race-node".to_string(),
+                        placement: bamboo_config::NodePlacement::Ssh(bamboo_config::SshTarget {
+                            host: "reset.example.test".to_string(),
+                            port: 22,
+                            username: "deploy".to_string(),
+                            auth: bamboo_config::SshAuth::Password {
+                                password: String::new(),
+                                password_encrypted: None,
+                            },
+                            host_key_fingerprint: None,
+                        }),
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+
+        let reset = state
+            .reset_credential_backed_section(SectionId::ClusterFabric, 1)
+            .await
+            .unwrap();
+        let CredentialBackedResetCommit::Cluster(reset_snapshot) = reset else {
+            panic!("cluster reset must return its exact committed snapshot");
+        };
+        assert!(
+            !state
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+
+        let (release_response, wait_for_second_commit) = tokio::sync::oneshot::channel();
+        let response = async move {
+            wait_for_second_commit.await.unwrap();
+            let response = cluster_reset_response(*reset_snapshot).unwrap();
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+        let second_commit = async {
+            let result = state
+                .update_cluster_fabric_credentials(
+                    2,
+                    BTreeMap::from([(
+                        "queued-node".to_string(),
+                        bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                    )]),
+                    |config| {
+                        config.cluster_fabric.nodes.push(bamboo_config::Node {
+                            id: "queued-node".to_string(),
+                            label: "queued-second-commit".to_string(),
+                            placement: bamboo_config::NodePlacement::Local,
+                            trust_level: bamboo_config::TrustLevel::Trusted,
+                            deploy: bamboo_config::DeployProfile::default(),
+                            state: None,
+                            enabled: true,
+                        });
+                        Ok(())
+                    },
+                )
+                .await;
+            release_response.send(()).unwrap();
+            result
+        };
+        let (body, second) = tokio::join!(response, second_commit);
+        let second = second.unwrap();
+        let body_value: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(body_value["revision"], 2);
+        assert_eq!(body_value["data"]["nodes"], json!([]));
+        assert!(body_value["data"].get("clusters").is_none());
+        assert!(!body.contains("reset-race-secret"));
+        assert!(!body.contains(reference.as_str()));
+        assert!(!body.contains("credential_ref"));
+        assert_eq!(second.section.revision, 3);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("queued-node")
+                .unwrap()
+                .label,
+            "queued-second-commit"
+        );
     }
 
     #[actix_web::test]

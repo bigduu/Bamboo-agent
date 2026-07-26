@@ -497,6 +497,7 @@ mod builder;
 mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
 pub(crate) use config_runtime::ConfigSectionMutationError;
+pub(crate) use config_runtime::CredentialBackedResetCommit;
 pub mod init;
 pub mod parent_approval_reviewer;
 mod persistence;

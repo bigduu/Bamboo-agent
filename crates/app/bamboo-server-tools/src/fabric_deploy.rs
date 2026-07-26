@@ -229,7 +229,7 @@ impl FabricDeployer {
     async fn snapshot_locked(&self, expected_revision: u64) -> FabricResult<FabricCommitSnapshot> {
         let mut config = self.config.read().await.clone();
         let section = if let Some(facade) = &self.config_facade {
-            let actual = facade.registry().cluster_fabric.snapshot().revision;
+            let actual = self.cluster_revision_locked();
             if expected_revision != actual {
                 return Err(FabricError::Conflict {
                     expected: expected_revision,
@@ -269,13 +269,61 @@ impl FabricDeployer {
         })
     }
 
-    pub async fn current_cluster_revision(&self) -> FabricResult<u64> {
-        let _io = self.config_io_lock.lock().await;
-        Ok(self
-            .config_facade
+    fn cluster_revision_locked(&self) -> u64 {
+        self.config_facade
             .as_ref()
             .map(|facade| facade.registry().cluster_fabric.snapshot().revision)
-            .unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    pub async fn current_cluster_revision(&self) -> FabricResult<u64> {
+        let _io = self.config_io_lock.lock().await;
+        Ok(self.cluster_revision_locked())
+    }
+
+    /// Reconcile stale process-bound worker states during server startup using
+    /// the process-owned section authority. The durable section commit happens
+    /// before runtime adoption and event publication, and the same config lock
+    /// prevents the health monitor or an operator mutation from racing boot.
+    pub async fn reconcile_stale_nodes_on_boot(&self) -> FabricResult<usize> {
+        let _io = self.config_io_lock.lock().await;
+        let stale = {
+            let config = self.config.read().await;
+            config
+                .cluster_fabric
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.state.as_ref().is_some_and(|state| {
+                        matches!(state.status, NodeStatus::Running | NodeStatus::Deploying)
+                    })
+                })
+                .count()
+        };
+        if stale == 0 {
+            return Ok(0);
+        }
+
+        let expected_revision = self.cluster_revision_locked();
+        self.persist_node_update_locked(expected_revision, |config| {
+            for node in &mut config.cluster_fabric.nodes {
+                if let Some(state) = node.state.as_mut() {
+                    if matches!(state.status, NodeStatus::Running | NodeStatus::Deploying) {
+                        state.status = NodeStatus::Unreachable;
+                        state.last_error =
+                            Some("orchestrator restarted; worker no longer tracked".to_string());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        tracing::info!(
+            reconciled = stale,
+            revision = expected_revision + 1,
+            "cluster-fabric: marked stale Running nodes Unreachable on boot"
+        );
+        Ok(stale)
     }
 
     /// Commit one engine-owned node mutation through the cluster-fabric
@@ -308,7 +356,7 @@ impl FabricDeployer {
         F: FnOnce(&mut Config) -> FabricResult<()> + Send,
     {
         if let Some(facade) = &self.config_facade {
-            let actual = facade.registry().cluster_fabric.snapshot().revision;
+            let actual = self.cluster_revision_locked();
             if expected_revision != actual {
                 return Err(FabricError::Conflict {
                     expected: expected_revision,
@@ -826,11 +874,13 @@ impl FabricDeployer {
         node_id: &str,
         probe_timeout: Duration,
     ) -> FabricResult<NodeState> {
-        let (node, broker) = {
+        let (node, broker, observed_revision) = {
+            let _io = self.config_io_lock.lock().await;
             let cfg = self.config.read().await;
             (
                 self.node_snapshot(&cfg, node_id)?,
                 cfg.subagents().broker.clone(),
+                self.cluster_revision_locked(),
             )
         };
         let current = node.state.clone().unwrap_or_default();
@@ -873,17 +923,42 @@ impl FabricDeployer {
             ))
         };
 
-        // Re-check after the unlocked probe. A status flip is an authoritative
-        // section mutation; a steady heartbeat remains runtime-only to avoid
-        // revision churn.
-        let live = {
+        // Bind the unlocked probe to the section revision and worker identity
+        // captured before it started. A redeploy or node edit that wins while
+        // the probe is in flight makes this observation stale; discard it
+        // rather than applying it against the winner's newer revision.
+        let _io = self.config_io_lock.lock().await;
+        let actual_revision = self.cluster_revision_locked();
+        let (live, identity_matches) = {
             let cfg = self.config.read().await;
             let Some(node) = cfg.cluster_fabric.node(node_id) else {
                 return Ok(current);
             };
-            node.state.clone().unwrap_or_default()
+            let live = node.state.clone().unwrap_or_default();
+            let live_worker_id = live
+                .worker_id
+                .clone()
+                .unwrap_or_else(|| worker_id_for(node));
+            let live_role = node
+                .deploy
+                .default_role
+                .clone()
+                .unwrap_or_else(|| "general-purpose".to_string());
+            let live_broker = cfg
+                .subagents()
+                .broker
+                .clone()
+                .filter(|candidate| !candidate.endpoint.trim().is_empty());
+            let identity_matches = actual_revision == observed_revision
+                && live.status == current.status
+                && live_worker_id == worker_id
+                && live_role == role
+                && live_broker.as_ref() == Some(&broker);
+            (live, identity_matches)
         };
-        if !matches!(live.status, NodeStatus::Running | NodeStatus::Unreachable) {
+        if !identity_matches
+            || !matches!(live.status, NodeStatus::Running | NodeStatus::Unreachable)
+        {
             return Ok(live);
         }
         let from = live.status;
@@ -891,23 +966,17 @@ impl FabricDeployer {
             status: new_status,
             last_health: Some(chrono::Utc::now().to_rfc3339()),
             last_error: new_error,
-            ..live
+            ..live.clone()
         };
         if from != new_status {
-            let expected_revision = self.current_cluster_revision().await?;
             let committed_next = next.clone();
             let snapshot = self
-                .persist_node_update_at_revision(expected_revision, |config| {
-                    let Some(node) = config.cluster_fabric.node_mut(node_id) else {
-                        return Ok(());
-                    };
+                .persist_node_update_locked(observed_revision, |config| {
+                    let node = config
+                        .cluster_fabric
+                        .node_mut(node_id)
+                        .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
                     let current = node.state.clone().unwrap_or_default();
-                    if !matches!(
-                        current.status,
-                        NodeStatus::Running | NodeStatus::Unreachable
-                    ) {
-                        return Ok(());
-                    }
                     node.state = Some(NodeState {
                         status: committed_next.status,
                         last_health: committed_next.last_health.clone(),
@@ -922,7 +991,7 @@ impl FabricDeployer {
                 .cluster_fabric
                 .node(node_id)
                 .and_then(|node| node.state.clone())
-                .unwrap_or(current);
+                .unwrap_or(live);
             tracing::info!(
                 audit = "cluster_fabric.health",
                 node = node_id,
@@ -934,17 +1003,22 @@ impl FabricDeployer {
             return Ok(adopted);
         }
 
-        let _io = self.config_io_lock.lock().await;
         let mut cfg = self.config.write().await;
         let Some(node) = cfg.cluster_fabric.node_mut(node_id) else {
             return Ok(current);
         };
-        let current = node.state.clone().unwrap_or_default();
-        if !matches!(
-            current.status,
-            NodeStatus::Running | NodeStatus::Unreachable
-        ) {
-            return Ok(current);
+        let latest = node.state.clone().unwrap_or_default();
+        let latest_worker_id = latest
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| worker_id_for(node));
+        let latest_role = node
+            .deploy
+            .default_role
+            .clone()
+            .unwrap_or_else(|| "general-purpose".to_string());
+        if latest.status != live.status || latest_worker_id != worker_id || latest_role != role {
+            return Ok(latest);
         }
         node.state = Some(next.clone());
         Ok(next)
@@ -1911,7 +1985,7 @@ mod health_check_tests {
     };
     use bamboo_config::{BrokerClientConfig, Config};
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::{Mutex, RwLock};
 
     async fn start_broker() -> (String, tempfile::TempDir) {
@@ -1977,6 +2051,129 @@ mod health_check_tests {
             Arc::new(Mutex::new(HashMap::new())),
             "/usr/bin/true",
         ))
+    }
+
+    struct ModularDeployerFixture {
+        deployer: Arc<FabricDeployer>,
+        facade: Arc<ConfigFacade>,
+        data_dir: tempfile::TempDir,
+        events: Arc<StdMutex<Vec<ConfigSectionEvent>>>,
+    }
+
+    fn modular_deployer_with(nodes: Vec<Node>, endpoint: &str) -> ModularDeployerFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let facade = Arc::new(ConfigFacade::open_or_migrate(dir.path()).unwrap());
+        let mut candidate = facade.effective_config();
+        candidate.cluster_fabric.nodes = nodes;
+        let revision = bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeMap::new(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(revision, 1);
+        assert!(facade
+            .registry()
+            .reload_if_changed(SectionId::ClusterFabric)
+            .is_some());
+
+        let mut runtime = facade.effective_config();
+        runtime.subagents_mut().broker = Some(BrokerClientConfig {
+            endpoint: endpoint.into(),
+            token: "t".into(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: false,
+        });
+        let config = Arc::new(RwLock::new(runtime));
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let event_log = events.clone();
+        let deployer = Arc::new(
+            FabricDeployer::new(
+                config,
+                Arc::new(Mutex::new(())),
+                dir.path().to_path_buf(),
+                Arc::new(Mutex::new(HashMap::new())),
+                "/usr/bin/true",
+            )
+            .with_modular_persistence(
+                facade.clone(),
+                Arc::new(CredentialStore::open(dir.path())),
+                Arc::new(move |event| event_log.lock().unwrap().push(event.clone())),
+            ),
+        );
+        ModularDeployerFixture {
+            deployer,
+            facade,
+            data_dir: dir,
+            events,
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_reconcile_advances_the_process_facade_before_runtime_and_event() {
+        let node = running_node("a", "node-a", "mon");
+        let fixture = modular_deployer_with(vec![node], "");
+
+        assert_eq!(
+            fixture
+                .deployer
+                .reconcile_stale_nodes_on_boot()
+                .await
+                .unwrap(),
+            1
+        );
+        let process_snapshot = fixture.facade.registry().cluster_fabric.snapshot();
+        assert_eq!(process_snapshot.revision, 2);
+        assert_eq!(
+            process_snapshot
+                .data
+                .0
+                .node("a")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
+        assert_eq!(
+            fixture
+                .deployer
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("a")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
+        let reopened = ConfigFacade::open(fixture.data_dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("a")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
+        assert_eq!(
+            fixture.events.lock().unwrap().as_slice(),
+            &[ConfigSectionEvent::Changed {
+                section: "cluster-fabric".to_string(),
+                revision: 2,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2069,6 +2266,58 @@ mod health_check_tests {
             NodeStatus::Stopped,
             "Stopped not overwritten to Unreachable"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_probe_does_not_overwrite_a_newer_redeploy_revision() {
+        let (endpoint, _dir) = start_broker().await;
+        let fixture =
+            modular_deployer_with(vec![running_node("a", "old-worker", "old-role")], &endpoint);
+        let deployer = fixture.deployer.clone();
+        let probe = {
+            let deployer = deployer.clone();
+            tokio::spawn(async move {
+                deployer
+                    .health_check_within("a", Duration::from_millis(1500))
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let winning_revision = deployer.current_cluster_revision().await.unwrap();
+        let winner = deployer
+            .persist_node_update_at_revision(winning_revision, |config| {
+                let node = config.cluster_fabric.node_mut("a").unwrap();
+                node.deploy.default_role = Some("new-role".to_string());
+                node.state = Some(NodeState {
+                    status: NodeStatus::Running,
+                    worker_id: Some("new-worker".to_string()),
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(winner.section.revision, 2);
+
+        let observed = probe.await.unwrap().unwrap();
+        assert_eq!(observed.status, NodeStatus::Running);
+        assert_eq!(observed.worker_id.as_deref(), Some("new-worker"));
+        let process_snapshot = fixture.facade.registry().cluster_fabric.snapshot();
+        assert_eq!(
+            process_snapshot.revision, 2,
+            "the stale probe must not create revision 3"
+        );
+        let node = deployer
+            .config
+            .read()
+            .await
+            .cluster_fabric
+            .node("a")
+            .cloned()
+            .unwrap();
+        assert_eq!(node.deploy.default_role.as_deref(), Some("new-role"));
+        assert_eq!(node.state.unwrap().worker_id.as_deref(), Some("new-worker"));
     }
 }
 

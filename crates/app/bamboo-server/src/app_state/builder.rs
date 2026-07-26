@@ -779,6 +779,12 @@ impl AppState {
                 }),
             );
         }
+        if let Err(error) = fabric_deployer.reconcile_stale_nodes_on_boot().await {
+            tracing::warn!(
+                error = %error,
+                "cluster-fabric boot reconcile failed; retaining the last adopted state"
+            );
+        }
         let fabric_deployer = Arc::new(fabric_deployer);
         // Cluster health monitor: periodically probe deployed workers on the bus and
         // flip node status live (Running↔Unreachable) + auto-recover. Server-scoped
@@ -919,12 +925,6 @@ impl AppState {
         // spawn scheduler, clobbered resume, expired wait lease, ...). Spawned
         // AFTER `set_root_tools` above so a boot-time parent resume can spawn.
         child_completion_coordinator.spawn_child_wait_watchdog();
-
-        // Cluster-fabric reconcile: session-bound workers died with the previous
-        // bamboo process (kill-on-drop child / in-memory russh session), so any
-        // persisted `Running`/`Deploying` node state is stale on boot. Flip it to
-        // `Unreachable` so the UI/agent see reality (a redeploy brings it back).
-        reconcile_fabric_on_boot(&config, &bamboo_home_dir).await;
 
         // `ServiceManager` (issue #479 / epic #477 prereq): supervises
         // long-running "service" plugins. Always constructed — fully inert
@@ -1208,41 +1208,108 @@ async fn broker_endpoint_reachable(endpoint: &str) -> bool {
     )
 }
 
-/// On boot, mark stale cluster-fabric node state as `Unreachable`: workers
-/// deployed by the previous process were session-bound (they died with it), so a
-/// persisted `Running`/`Deploying` status no longer reflects reality. Best-effort
-/// + persisted so the UI and `cluster status` don't show phantom-running nodes.
-async fn reconcile_fabric_on_boot(
-    config: &Arc<RwLock<bamboo_llm::Config>>,
-    data_dir: &std::path::Path,
-) {
-    use bamboo_config::cluster_fabric::NodeStatus;
-
-    let snapshot = {
-        let mut cfg = config.write().await;
-        let mut changed = 0usize;
-        for node in &mut cfg.cluster_fabric.nodes {
-            if let Some(state) = node.state.as_mut() {
-                if matches!(state.status, NodeStatus::Running | NodeStatus::Deploying) {
-                    state.status = NodeStatus::Unreachable;
-                    state.last_error =
-                        Some("orchestrator restarted; worker no longer tracked".to_string());
-                    changed += 1;
-                }
-            }
-        }
-        if changed == 0 {
-            return;
-        }
-        tracing::info!(
-            reconciled = changed,
-            "cluster-fabric: marked stale Running nodes Unreachable on boot"
-        );
-        cfg.clone()
+#[cfg(test)]
+mod fabric_boot_reconcile_tests {
+    use super::*;
+    use bamboo_config::cluster_fabric::{
+        DeployProfile, Node, NodePlacement, NodeState, NodeStatus, TrustLevel,
     };
+    use bamboo_config::{ClusterNodeCredentialIntents, ConfigFacade};
+    use std::collections::BTreeMap;
 
-    if let Err(e) = snapshot.save_to_dir(data_dir.to_path_buf()) {
-        tracing::warn!("cluster-fabric boot reconcile: failed to persist: {e}");
+    #[tokio::test]
+    async fn restart_reconcile_keeps_runtime_process_facade_and_disk_on_one_revision() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x7b; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let first = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        first
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "boot-node".to_string(),
+                    ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(Node {
+                        id: "boot-node".to_string(),
+                        label: "boot-node".to_string(),
+                        placement: NodePlacement::Local,
+                        trust_level: TrustLevel::Trusted,
+                        deploy: DeployProfile::default(),
+                        state: Some(NodeState {
+                            status: NodeStatus::Running,
+                            worker_id: Some("stale-worker".to_string()),
+                            ..Default::default()
+                        }),
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        drop(first);
+
+        let restarted = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let process_snapshot = restarted
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot();
+        assert_eq!(process_snapshot.revision, 2);
+        assert_eq!(
+            process_snapshot
+                .data
+                .0
+                .node("boot-node")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
+        assert_eq!(
+            restarted
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("boot-node")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("boot-node")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
     }
 }
 
