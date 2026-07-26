@@ -147,6 +147,21 @@ enum ExactTransactionScope {
     ClusterFabric,
 }
 
+impl ExactTransactionScope {
+    fn section_id(self) -> crate::SectionId {
+        match self {
+            Self::Providers => crate::SectionId::Providers,
+            Self::Mcp => crate::SectionId::Mcp,
+            Self::ProxyAuth => crate::SectionId::Core,
+            Self::EnvVars => crate::SectionId::Env,
+            Self::Notifications => crate::SectionId::Notifications,
+            Self::Connect => crate::SectionId::Connect,
+            Self::AccessControl => crate::SectionId::AccessControl,
+            Self::ClusterFabric => crate::SectionId::ClusterFabric,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum MigrationScope {
@@ -1900,6 +1915,7 @@ pub fn persist_connect_credential_transaction_at_revision(
         None,
         None,
         None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1939,6 +1955,7 @@ pub fn persist_access_control_credential_transaction_at_revision(
         None,
         None,
         None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1965,6 +1982,226 @@ pub struct ClusterFabricRuntimeSnapshot {
     pub cluster_fabric: crate::ClusterFabricConfig,
     pub credential_statuses: Vec<crate::CredentialStatus>,
     pub credential_health: crate::CredentialStoreHealth,
+}
+
+/// Secret-free metadata returned after installing an exact owned-section
+/// runtime snapshot. The secret-bearing runtime and credential document LKG
+/// remain opaque and have no `Debug` or serialization implementation.
+pub struct CredentialSectionRuntimeMetadata {
+    pub credential_statuses: Vec<crate::CredentialStatus>,
+    pub credential_health: crate::CredentialStoreHealth,
+}
+
+impl CredentialSectionRuntimeMetadata {
+    pub fn status(&self, reference: &crate::CredentialRef) -> crate::CredentialStatus {
+        self.credential_statuses
+            .iter()
+            .find(|status| &status.credential_ref == reference)
+            .cloned()
+            .unwrap_or_else(|| crate::CredentialStatus {
+                credential_ref: reference.clone(),
+                configured: false,
+                source: crate::CredentialSource::User,
+                updated_at: None,
+            })
+    }
+}
+
+/// Exact runtime projection for one non-cluster credential-backed section.
+///
+/// Callers can install only the owned section into an existing process
+/// [`crate::Config`]; unrelated sections cannot be observed or replaced from
+/// this value.
+pub struct CredentialSectionRuntimeSnapshot {
+    section: crate::SectionId,
+    runtime: crate::Config,
+    credential_statuses: Vec<crate::CredentialStatus>,
+    credential_health: crate::CredentialStoreHealth,
+}
+
+impl CredentialSectionRuntimeSnapshot {
+    pub fn install_into(self, target: &mut crate::Config) -> CredentialSectionRuntimeMetadata {
+        crate::section_facade::apply_runtime_section(self.section, &self.runtime, target);
+        CredentialSectionRuntimeMetadata {
+            credential_statuses: self.credential_statuses,
+            credential_health: self.credential_health,
+        }
+    }
+}
+
+/// Result of a non-cluster exact credential transaction whose owned section
+/// was adopted while the shared migration lock still excluded later writers.
+pub struct CredentialSectionTransactionCommit {
+    pub revision: u64,
+    pub section_adoption: Option<ConfigStoreResult<crate::ConfigSectionEvent>>,
+    pub credential_adoption: Option<ConfigStoreResult<Option<crate::ConfigSectionEvent>>>,
+    pub runtime: ConfigStoreResult<CredentialSectionRuntimeSnapshot>,
+}
+
+struct ExactSectionRuntimeSnapshot {
+    runtime: CredentialSectionRuntimeSnapshot,
+    credential_lkg: crate::credential_store::CredentialDocumentLkg,
+}
+
+type SectionPostCommit<'a> = &'a mut dyn FnMut(
+    ExactTransactionScope,
+    u64,
+    u64,
+    bool,
+    Option<&crate::Config>,
+    ConfigStoreResult<ExactSectionRuntimeSnapshot>,
+);
+
+fn materialize_section_runtime_under_migration_lock(
+    mut runtime: crate::Config,
+    scope: ExactTransactionScope,
+    store: &CredentialStore,
+) -> ConfigStoreResult<ExactSectionRuntimeSnapshot> {
+    let (credential_lkg, credential_statuses, credential_health) =
+        store.snapshot_with_health_unchecked()?;
+    match scope {
+        ExactTransactionScope::Providers => {
+            runtime.hydrate_provider_credentials_from_snapshot(&credential_lkg)?;
+        }
+        ExactTransactionScope::Mcp => {
+            runtime.hydrate_mcp_credentials_from_snapshot(&credential_lkg)?;
+        }
+        ExactTransactionScope::ProxyAuth => {
+            runtime.hydrate_proxy_auth_from_snapshot(&credential_lkg)?;
+        }
+        ExactTransactionScope::EnvVars => {
+            runtime.hydrate_env_var_credentials_from_snapshot(&credential_lkg)?;
+        }
+        ExactTransactionScope::Notifications => {
+            runtime.hydrate_notification_credentials_from_snapshot(&credential_lkg)?;
+        }
+        ExactTransactionScope::Connect => {
+            runtime.hydrate_connect_credentials_from_snapshot(&credential_lkg)?;
+        }
+        ExactTransactionScope::AccessControl => {
+            runtime.hydrate_access_control_credentials_from_snapshot(&credential_lkg)?;
+        }
+        ExactTransactionScope::ClusterFabric => {
+            return Err(ConfigStoreError::Validation(
+                "cluster runtime uses its dedicated transaction snapshot".to_string(),
+            ));
+        }
+    }
+    runtime.apply_runtime_env_overrides();
+    Ok(ExactSectionRuntimeSnapshot {
+        runtime: CredentialSectionRuntimeSnapshot {
+            section: scope.section_id(),
+            runtime,
+            credential_statuses,
+            credential_health,
+        },
+        credential_lkg,
+    })
+}
+
+fn capture_section_post_commit(
+    data_dir: &Path,
+    scope: ExactTransactionScope,
+    expected_revision: u64,
+    committed_revision: u64,
+    changed: bool,
+    store: &CredentialStore,
+    callback: &mut SectionPostCommit<'_>,
+) {
+    match crate::section_facade::load_durable_effective_section_under_migration_lock(
+        data_dir,
+        scope.section_id(),
+    ) {
+        Ok(candidate) => {
+            let runtime =
+                materialize_section_runtime_under_migration_lock(candidate.clone(), scope, store);
+            callback(
+                scope,
+                expected_revision,
+                committed_revision,
+                changed,
+                Some(&candidate),
+                runtime,
+            );
+        }
+        Err(error) => callback(
+            scope,
+            expected_revision,
+            committed_revision,
+            changed,
+            None,
+            Err(error),
+        ),
+    }
+}
+
+fn persist_section_transaction_with_adoption<F>(
+    facade: &crate::ConfigFacade,
+    operation: F,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit>
+where
+    F: FnOnce(SectionPostCommit<'_>) -> ConfigStoreResult<u64>,
+{
+    let mut section_adoption = None;
+    let mut exact_runtime = None;
+    let mut callback =
+        |scope: ExactTransactionScope,
+         expected_revision: u64,
+         committed_revision: u64,
+         changed: bool,
+         candidate: Option<&crate::Config>,
+         runtime: ConfigStoreResult<ExactSectionRuntimeSnapshot>| {
+            // Do not advance the process facade unless the exact runtime can
+            // also be installed. Otherwise the watcher would observe the
+            // already-adopted revision as unchanged and could never converge
+            // the live AppState after this post-commit failure.
+            if runtime.is_ok() {
+                section_adoption = if changed {
+                    Some(match candidate {
+                        Some(candidate) => facade.adopt_committed_section(
+                            scope.section_id(),
+                            expected_revision,
+                            committed_revision,
+                            candidate,
+                        ),
+                        None => Err(ConfigStoreError::Validation(
+                            "committed section candidate is unavailable for process adoption"
+                                .to_string(),
+                        )),
+                    })
+                } else {
+                    facade
+                        .catch_up_committed_section(scope.section_id())
+                        .map(Ok)
+                };
+            }
+            exact_runtime = Some(runtime);
+        };
+    let revision = operation(&mut callback)?;
+    let exact_runtime = exact_runtime.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "exact section transaction omitted runtime materialization".to_string(),
+        ))
+    });
+    let (runtime, credential_adoption) = match exact_runtime {
+        Ok(exact) => {
+            let statuses = exact.runtime.credential_statuses.clone();
+            let health = exact.runtime.credential_health.clone();
+            let adoption = Some(facade.adopt_captured_credentials_with_event(
+                exact.credential_lkg,
+                statuses,
+                health,
+            ));
+            (Ok(exact.runtime), adoption)
+        }
+        Err(error) => (Err(error), None),
+    };
+    Ok(CredentialSectionTransactionCommit {
+        revision,
+        section_adoption,
+        credential_adoption,
+        runtime,
+    })
 }
 
 struct ExactClusterRuntimeSnapshot {
@@ -2438,6 +2675,7 @@ fn persist_cluster_fabric_credential_transaction_inner(
         None,
         None,
         None,
+        None,
         cluster_post_commit,
         #[cfg(test)]
         fault,
@@ -2576,6 +2814,7 @@ pub fn persist_mcp_reset_credential_transaction_at_revision(
         Some((&intents, expected_revision)),
         None,
         None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -2630,6 +2869,7 @@ fn persist_mcp_credential_transaction_inner(
         Some((intents, expected_revision)),
         None,
         None,
+        None,
         #[cfg(test)]
         fault,
     )
@@ -2677,8 +2917,364 @@ pub fn persist_credential_backed_section_reset_at_revision(
         None,
         Some((scope, expected_revision)),
         None,
+        None,
         #[cfg(test)]
         None,
+    )
+}
+
+fn require_modular_exact_adoption(data_dir: &Path) -> ConfigStoreResult<()> {
+    if crate::section_layout_is_active(data_dir)? {
+        Ok(())
+    } else {
+        Err(ConfigStoreError::Validation(
+            "exact process adoption requires the modular configuration layout".to_string(),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_provider_family_with_adoption(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    proxy_expected_revision: Option<u64>,
+    env_intents: &BTreeSet<String>,
+    env_expected_revision: Option<u64>,
+    notification_transaction: bool,
+    notification_intents: &BTreeSet<String>,
+    notification_reset: bool,
+    notification_expected_revision: Option<u64>,
+    provider_expected_revision: Option<u64>,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    require_modular_exact_adoption(data_dir)?;
+    persist_section_transaction_with_adoption(facade, |post_commit| {
+        persist_exact_credential_transaction_inner(
+            data_dir,
+            config,
+            provider_intents,
+            provider_instance_intents,
+            proxy_expected_revision,
+            env_intents,
+            env_expected_revision,
+            notification_transaction,
+            notification_intents,
+            notification_reset,
+            notification_expected_revision,
+            None,
+            None,
+            None,
+            provider_expected_revision,
+            None,
+            None,
+            Some(post_commit),
+            None,
+            #[cfg(test)]
+            None,
+        )
+    })
+}
+
+pub fn persist_provider_instance_credential_transaction_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    if provider_intents.contains("__proxy_auth") {
+        return Err(ConfigStoreError::Validation(
+            "proxy auth requires the dedicated revisioned credential transaction".to_string(),
+        ));
+    }
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        facade,
+    )
+}
+
+pub fn persist_provider_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        Some(expected_revision),
+        facade,
+    )
+}
+
+pub fn persist_provider_reset_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_credential_transaction_at_revision_with_adoption(
+        data_dir,
+        config,
+        provider_intents,
+        provider_instance_intents,
+        expected_revision,
+        facade,
+    )
+}
+
+pub fn persist_proxy_auth_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::from(["__proxy_auth".to_string()]),
+        &BTreeSet::new(),
+        Some(expected_revision),
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        facade,
+    )
+}
+
+pub fn persist_env_var_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    env_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        env_intents,
+        Some(expected_revision),
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        facade,
+    )
+}
+
+pub fn persist_notification_credential_transaction_at_revision_with_reset_and_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    secret_intents: &BTreeSet<String>,
+    reset_domain: bool,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        true,
+        secret_intents,
+        reset_domain,
+        Some(expected_revision),
+        None,
+        facade,
+    )
+}
+
+enum ScopedSectionMutation<'a> {
+    Mcp(&'a BTreeSet<CredentialRef>),
+    Connect(&'a crate::patch::ConnectSecretIntents),
+    AccessControl {
+        password: bool,
+        devices: &'a BTreeSet<String>,
+    },
+    Reset,
+}
+
+fn persist_scoped_section_with_adoption(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    scope: ExactTransactionScope,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+    mutation: ScopedSectionMutation<'_>,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    require_modular_exact_adoption(data_dir)?;
+    let (connect_transaction, access_transaction, mcp_transaction, reset) = match mutation {
+        ScopedSectionMutation::Mcp(intents) => (None, None, Some(intents), false),
+        ScopedSectionMutation::Connect(intents) => (Some(intents), None, None, false),
+        ScopedSectionMutation::AccessControl { password, devices } => {
+            (None, Some((password, devices)), None, false)
+        }
+        ScopedSectionMutation::Reset => (None, None, None, true),
+    };
+    persist_section_transaction_with_adoption(facade, |post_commit| {
+        persist_exact_credential_transaction_inner(
+            data_dir,
+            config,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            &BTreeSet::new(),
+            None,
+            false,
+            &BTreeSet::new(),
+            false,
+            None,
+            None,
+            connect_transaction.map(|intents| (intents, expected_revision)),
+            access_transaction
+                .as_ref()
+                .map(|(password, devices)| (*password, *devices, expected_revision)),
+            None,
+            mcp_transaction.map(|intents| (intents, expected_revision)),
+            reset.then_some((scope, expected_revision)),
+            Some(post_commit),
+            None,
+            #[cfg(test)]
+            None,
+        )
+    })
+}
+
+pub fn persist_mcp_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    intents: &BTreeSet<CredentialRef>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::Mcp,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Mcp(intents),
+    )
+}
+
+pub fn persist_mcp_reset_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    let intents = BTreeSet::new();
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::Mcp,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Mcp(&intents),
+    )
+}
+
+pub fn persist_connect_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    intents: &crate::patch::ConnectSecretIntents,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::Connect,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Connect(intents),
+    )
+}
+
+pub fn persist_access_control_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    password_intent: bool,
+    device_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::AccessControl,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::AccessControl {
+            password: password_intent,
+            devices: device_intents,
+        },
+    )
+}
+
+pub fn persist_credential_backed_section_reset_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    section: crate::SectionId,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    let scope = match section {
+        crate::SectionId::Core => ExactTransactionScope::ProxyAuth,
+        crate::SectionId::Notifications => ExactTransactionScope::Notifications,
+        crate::SectionId::Connect => ExactTransactionScope::Connect,
+        crate::SectionId::Env => ExactTransactionScope::EnvVars,
+        crate::SectionId::AccessControl => ExactTransactionScope::AccessControl,
+        _ => {
+            return Err(ConfigStoreError::Validation(
+                "section is not a non-cluster credential-backed reset domain".to_string(),
+            ))
+        }
+    };
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        scope,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Reset,
     )
 }
 
@@ -2738,6 +3334,7 @@ where
         None,
         None,
         Some((ExactTransactionScope::ClusterFabric, expected_revision)),
+        None,
         Some(&mut callback),
         #[cfg(test)]
         None,
@@ -2868,6 +3465,7 @@ fn persist_provider_credential_transaction_with_instances_at_revision_inner(
         None,
         None,
         None,
+        None,
         #[cfg(test)]
         fault,
     )
@@ -2892,6 +3490,7 @@ fn persist_exact_credential_transaction_inner(
     provider_expected_revision: Option<u64>,
     mcp_transaction: Option<(&BTreeSet<CredentialRef>, u64)>,
     reset_scope: Option<(ExactTransactionScope, u64)>,
+    mut section_post_commit: Option<SectionPostCommit<'_>>,
     mut cluster_post_commit: Option<ClusterPostCommit<'_>>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
@@ -3249,6 +3848,35 @@ fn persist_exact_credential_transaction_inner(
         None if provider_expected_revision.is_some() || cluster_transaction.is_some() => {
             store.prepare_provider_metadata_update()?
         }
+        None if section_post_commit.is_some() && active_section.is_some() => {
+            let expected_credential_revision = proxy_expected_revision
+                .or(env_expected_revision)
+                .or(notification_expected_revision)
+                .or_else(|| connect_transaction.map(|(_, revision)| revision))
+                .or_else(|| access_transaction.map(|(_, _, revision)| revision));
+            if let Some(expected) = expected_credential_revision {
+                let actual = store.revision_unchecked()?;
+                if actual != expected {
+                    return Err(ConfigStoreError::Conflict { expected, actual });
+                }
+            }
+            let scope = exact_scope.expect("active exact section has a scope");
+            let section = active_section
+                .as_ref()
+                .expect("guarded by active-section presence");
+            capture_section_post_commit(
+                data_dir,
+                scope,
+                section.expected_revision,
+                section.expected_revision,
+                false,
+                &store,
+                section_post_commit
+                    .as_mut()
+                    .expect("guarded by post-commit callback presence"),
+            );
+            return store.revision_unchecked();
+        }
         None => return store.revision_unchecked(),
     };
     if proxy_only && reset_scope.is_none() {
@@ -3429,7 +4057,7 @@ fn persist_exact_credential_transaction_inner(
     if exact_domain_changed && !cluster_only {
         prepared.advance_revision_for_domain_change()?;
     }
-    let committed_authority_revision = if cluster_only && active_section.is_some() {
+    let committed_authority_revision = if active_section.is_some() {
         crate::section_facade::validate_section_envelope(authority_name, &authority_bytes, 0)?
     } else {
         prepared.revision
@@ -3477,8 +4105,26 @@ fn persist_exact_credential_transaction_inner(
                     Ok(()),
                 );
             }
+        } else if let (Some(scope), Some(section), Some(callback)) = (
+            exact_scope,
+            active_section.as_ref(),
+            section_post_commit.as_mut(),
+        ) {
+            capture_section_post_commit(
+                data_dir,
+                scope,
+                section.expected_revision,
+                committed_authority_revision,
+                false,
+                &store,
+                callback,
+            );
         }
-        return Ok(committed_authority_revision);
+        return if cluster_only && active_section.is_some() {
+            Ok(committed_authority_revision)
+        } else {
+            store.revision_unchecked()
+        };
     }
 
     let transaction_id = Uuid::new_v4().to_string();
@@ -3960,6 +4606,24 @@ fn persist_exact_credential_transaction_inner(
             );
         }
         Ok(actual_revision)
+    } else if let (Some(scope), Some(section), Some(callback)) = (
+        exact_scope,
+        active_section.as_ref(),
+        section_post_commit.as_mut(),
+    ) {
+        capture_section_post_commit(
+            data_dir,
+            scope,
+            section.expected_revision,
+            committed_authority_revision,
+            committed_authority_revision != section.expected_revision,
+            &store,
+            callback,
+        );
+        // Credential-member rebases can advance beyond the initially staged
+        // revision. Keep the public credential revision distinct from the
+        // exact owned-section envelope revision passed to adoption above.
+        store.revision_unchecked()
     } else {
         // Credential-member rebases can advance beyond the initially staged
         // revision. Preserve the existing exact-transaction return contract
@@ -15587,6 +16251,106 @@ mod tests {
         assert_eq!(
             read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap(),
             root_before
+        );
+    }
+
+    #[test]
+    fn adopted_env_semantic_noop_catches_up_only_the_stale_owned_generation() {
+        let _key = crate::encryption::set_test_encryption_key([0x5a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(process_facade.registry().env.snapshot().revision, 0);
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 0);
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut external = external_facade.effective_config();
+        external.env_vars.push(crate::EnvVarEntry {
+            name: "PUBLIC_VALUE".to_string(),
+            value: "durable-value".to_string(),
+            secret: false,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: Some("external generation".to_string()),
+        });
+        let intents = BTreeSet::from(["PUBLIC_VALUE".to_string()]);
+        let revision = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut external,
+            &intents,
+            0,
+        )
+        .unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(
+            process_facade.registry().env.snapshot().revision,
+            0,
+            "the process facade is intentionally stale before its no-op write"
+        );
+
+        let env_before = std::fs::read(dir.path().join(ENV_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut retry = fresh.effective_config();
+        let commit = persist_env_var_credential_transaction_at_revision_with_adoption(
+            dir.path(),
+            &mut retry,
+            &intents,
+            revision,
+            &process_facade,
+        )
+        .unwrap();
+        let CredentialSectionTransactionCommit {
+            revision: committed_revision,
+            section_adoption,
+            credential_adoption,
+            runtime,
+        } = commit;
+        assert_eq!(committed_revision, revision);
+        assert!(matches!(
+            section_adoption.unwrap().unwrap(),
+            crate::ConfigSectionEvent::Changed {
+                ref section,
+                revision: 1
+            } if section == "env"
+        ));
+        assert!(matches!(
+            credential_adoption.unwrap().unwrap().unwrap(),
+            crate::ConfigSectionEvent::Changed {
+                ref section,
+                revision: 1
+            } if section == "credentials"
+        ));
+
+        let mut live = crate::Config::default();
+        live.server.port = 42_424;
+        live.cluster_fabric.nodes.push(crate::Node {
+            id: "process-only-node".to_string(),
+            label: "process-only-node".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        runtime.unwrap().install_into(&mut live);
+        assert_eq!(live.server.port, 42_424);
+        assert_eq!(live.cluster_fabric.nodes[0].id, "process-only-node");
+        assert!(live.env_vars.iter().any(|entry| {
+            entry.name == "PUBLIC_VALUE"
+                && entry.value == "durable-value"
+                && entry.description.as_deref() == Some("external generation")
+        }));
+        assert_eq!(process_facade.registry().env.snapshot().revision, 1);
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 1);
+        assert_eq!(
+            std::fs::read(dir.path().join(ENV_FILE)).unwrap(),
+            env_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
         );
     }
 

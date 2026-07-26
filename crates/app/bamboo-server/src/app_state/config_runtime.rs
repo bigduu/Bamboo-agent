@@ -73,6 +73,41 @@ fn run_cluster_after_commit_before_adoption_test_hook(data_dir: &Path, expected_
     }
 }
 
+#[cfg(test)]
+type CredentialCommitTestHook = Box<dyn FnOnce() + Send + 'static>;
+#[cfg(test)]
+type CredentialCommitTestHooks =
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, SectionId), CredentialCommitTestHook>>;
+
+#[cfg(test)]
+fn credential_after_commit_before_live_test_hooks() -> &'static CredentialCommitTestHooks {
+    static HOOKS: std::sync::OnceLock<CredentialCommitTestHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_credential_after_commit_before_live_test_hook(
+    data_dir: &Path,
+    section: SectionId,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    credential_after_commit_before_live_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((data_dir.to_path_buf(), section), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_credential_after_commit_before_live_test_hook(data_dir: &Path, section: SectionId) {
+    let hook = credential_after_commit_before_live_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(data_dir.to_path_buf(), section));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct FacadeRuntimeMaterialization {
     config: Config,
     failures: BTreeSet<SectionId>,
@@ -714,31 +749,6 @@ pub(super) fn publish_registry_event(
     account_sink.record(None, &event);
 }
 
-/// Reload exact durable authorities into the process facade without making the
-/// resulting events externally observable yet. Compatibility writers use this
-/// phase to materialize and install the same facade generation in AppState
-/// before publishing Changed/Recovered.
-fn capture_exact_facade_commit_events(
-    facade: Option<&std::sync::Arc<bamboo_config::ConfigFacade>>,
-    sections: &[SectionId],
-) -> Vec<ConfigSectionEvent> {
-    let Some(facade) = facade else {
-        return Vec::new();
-    };
-    let mut events = Vec::new();
-    for section in sections {
-        let Some(event) = facade.registry().reload_if_changed(*section) else {
-            continue;
-        };
-        let invalid = matches!(&event, ConfigSectionEvent::Invalid { .. });
-        events.push(event);
-        if invalid {
-            break;
-        }
-    }
-    events
-}
-
 fn publish_exact_facade_events(
     account_sink: &bamboo_engine::events::AccountEventSink,
     events: &[ConfigSectionEvent],
@@ -754,13 +764,48 @@ fn publish_exact_facade_events(
     Ok(())
 }
 
-fn publish_exact_facade_commit(
-    facade: Option<&std::sync::Arc<bamboo_config::ConfigFacade>>,
-    account_sink: &bamboo_engine::events::AccountEventSink,
-    sections: &[SectionId],
-) -> Result<(), AppError> {
-    let events = capture_exact_facade_commit_events(facade, sections);
-    publish_exact_facade_events(account_sink, &events)
+struct InstalledCredentialSectionCommit {
+    events: Vec<ConfigSectionEvent>,
+    metadata: bamboo_config::CredentialSectionRuntimeMetadata,
+}
+
+fn install_credential_section_commit(
+    commit: bamboo_config::CredentialSectionTransactionCommit,
+    target: &mut Config,
+) -> Result<InstalledCredentialSectionCommit, ConfigStoreError> {
+    let bamboo_config::CredentialSectionTransactionCommit {
+        revision: _,
+        section_adoption,
+        credential_adoption,
+        runtime,
+    } = commit;
+    let metadata = runtime?.install_into(target);
+    let mut events = Vec::new();
+    if let Some(adoption) = credential_adoption {
+        if let Some(event) = adoption? {
+            events.push(event);
+        }
+    }
+    if let Some(adoption) = section_adoption {
+        events.push(adoption?);
+    }
+    Ok(InstalledCredentialSectionCommit { events, metadata })
+}
+
+fn install_facade_config_commit(
+    commit: bamboo_config::FacadeConfigCommit,
+    target: &mut Config,
+) -> Result<Vec<ConfigSectionEvent>, ConfigStoreError> {
+    let bamboo_config::FacadeConfigCommit {
+        section_adoption,
+        runtime,
+    } = commit;
+    if let Some(runtime) = runtime? {
+        runtime.install_into(target);
+    }
+    section_adoption
+        .map(|adoption| adoption.map(|event| vec![event]))
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
 fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
@@ -1649,16 +1694,19 @@ impl AppState {
             let mut live_config = config.write().await;
             let mut live_provider = provider.write().await;
             let transaction_dir = app_data_dir.clone();
-            let committed = tokio::task::spawn_blocking(move || {
+            let commit_facade = facade.clone();
+            let (mut committed, commit) = tokio::task::spawn_blocking(move || {
                 let mut durable_candidate = candidate;
-                bamboo_config::persist_provider_credential_transaction_at_revision(
+                let commit =
+                    bamboo_config::persist_provider_credential_transaction_at_revision_with_adoption(
                     &transaction_dir,
                     &mut durable_candidate,
                     &provider_intents,
                     &provider_instance_intents,
                     expected_revision,
+                    commit_facade.as_ref(),
                 )?;
-                load_committed_effective_config(&transaction_dir)
+                Ok::<_, ConfigStoreError>((durable_candidate, commit))
             })
             .await
             .map_err(|error| {
@@ -1668,16 +1716,14 @@ impl AppState {
             })?
             .map_err(ConfigSectionMutationError::Store)?;
 
+            let installed = install_credential_section_commit(commit, &mut committed)
+                .map_err(ConfigSectionMutationError::Store)?;
             committed.publish_env_vars();
             *live_config = committed;
             provider_registry.replace_with(registry);
             *live_provider = candidate_provider;
-            publish_exact_facade_commit(
-                Some(facade),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Providers],
-            )
-            .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            publish_exact_facade_events(&account_sink, &installed.events)
+                .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
             let provider_snapshot = facade.registry().providers.snapshot();
             set_live_health_revision(
                 &config_live_health,
@@ -1733,15 +1779,18 @@ impl AppState {
             apply_runtime_section(SectionId::Providers, &Config::default(), &mut candidate);
 
             let transaction_dir = app_data_dir.clone();
-            let candidate = tokio::task::spawn_blocking(move || {
-                bamboo_config::persist_provider_reset_credential_transaction_at_revision(
+            let commit_facade = facade.clone();
+            let (mut candidate, commit) = tokio::task::spawn_blocking(move || {
+                let commit =
+                    bamboo_config::persist_provider_reset_credential_transaction_at_revision_with_adoption(
                     &transaction_dir,
                     &mut candidate,
                     &provider_intents,
                     &provider_instance_intents,
                     expected_revision,
+                    commit_facade.as_ref(),
                 )?;
-                load_committed_effective_config(&transaction_dir)
+                Ok::<_, ConfigStoreError>((candidate, commit))
             })
             .await
             .map_err(|error| {
@@ -1751,13 +1800,9 @@ impl AppState {
             })?
             .map_err(ConfigSectionMutationError::Store)?;
 
+            let installed = install_credential_section_commit(commit, &mut candidate)
+                .map_err(ConfigSectionMutationError::Store)?;
             *config.write().await = candidate.clone();
-            publish_exact_facade_commit(
-                Some(facade),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Providers],
-            )
-            .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
             let provider_snapshot = facade.registry().providers.snapshot();
             set_live_health_revision(
                 &config_live_health,
@@ -1767,33 +1812,40 @@ impl AppState {
                     SectionSourceKind::File,
                 )),
             );
+            publish_exact_facade_events(&account_sink, &installed.events)
+                .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
 
-            match bamboo_llm::ProviderRegistry::from_config(&candidate, app_data_dir).await {
+            let runtime_failure = match bamboo_llm::ProviderRegistry::from_config(
+                &candidate,
+                app_data_dir,
+            )
+            .await
+            {
                 Ok(registry) => {
                     if let Some(candidate_provider) = registry.get_default() {
                         provider_registry.replace_with(registry);
                         *provider.write().await = candidate_provider;
+                        None
                     } else {
-                        publish_section_failure(
-                            &config_live_health,
-                            &account_sink,
-                            "providers",
-                            SectionStatus::Degraded,
+                        Some(
                             "provider reset committed; default provider is not initialized"
                                 .to_string(),
-                        );
+                        )
                     }
                 }
                 Err(error) => {
                     tracing::warn!(error = %error, "provider reset committed but runtime initialization failed");
-                    publish_section_failure(
-                        &config_live_health,
-                        &account_sink,
-                        "providers",
-                        SectionStatus::Degraded,
-                        "provider reset committed; retaining last-known-good runtime".to_string(),
-                    );
+                    Some("provider reset committed; retaining last-known-good runtime".to_string())
                 }
+            };
+            if let Some(message) = runtime_failure {
+                publish_section_failure(
+                    &config_live_health,
+                    &account_sink,
+                    "providers",
+                    SectionStatus::Degraded,
+                    message,
+                );
             }
             Ok(provider_snapshot.revision)
         });
@@ -1938,25 +1990,41 @@ impl AppState {
             validate_mcp_config(&runtime_candidate).map_err(ConfigSectionMutationError::Invalid)?;
 
             let mut transaction_error = None;
+            let mut commit_events = Vec::new();
             let transaction_dir = app_data_dir.clone();
+            let commit_facade = facade.clone();
             let mut durable_candidate = current;
             durable_candidate.mcp = runtime_candidate.clone();
             let result = mcp_manager
                 .reconcile_from_config_transactional_after(&runtime_candidate, || async {
                     let mut live_config = config.write().await;
                     let commit = tokio::task::spawn_blocking(move || {
-                        bamboo_config::persist_mcp_credential_transaction_at_revision(
+                        let commit =
+                            bamboo_config::persist_mcp_credential_transaction_at_revision_with_adoption(
                             &transaction_dir,
                             &mut durable_candidate,
                             &credential_intents,
                             expected_revision,
+                            commit_facade.as_ref(),
                         )?;
-                        load_committed_effective_config(&transaction_dir)
+                        Ok::<_, ConfigStoreError>((durable_candidate, commit))
                     })
                     .await;
                     match commit {
-                        Ok(Ok(committed)) => {
+                        Ok(Ok((mut committed, commit))) => {
+                            let installed =
+                                match install_credential_section_commit(commit, &mut committed) {
+                                    Ok(installed) => installed,
+                                    Err(error) => {
+                                        transaction_error =
+                                            Some(ConfigSectionMutationError::Store(error));
+                                        return Err(bamboo_mcp::McpError::InvalidConfig(
+                                            "MCP settings process adoption failed".to_string(),
+                                        ));
+                                    }
+                                };
                             *live_config = committed;
+                            commit_events = installed.events;
                             Ok(())
                         }
                         Ok(Err(error)) => {
@@ -1993,12 +2061,8 @@ impl AppState {
                 return Err(ConfigSectionMutationError::Runtime(message));
             }
 
-            publish_exact_facade_commit(
-                Some(facade),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Mcp],
-            )
-            .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            publish_exact_facade_events(&account_sink, &commit_events)
+                .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
             let snapshot = facade.registry().mcp.snapshot();
             set_live_health_revision(
                 &mcp_config_live_health,
@@ -2032,23 +2096,34 @@ impl AppState {
         let candidate_mcp = McpConfig::default();
         let mut candidate_config = self.config.read().await.clone();
         candidate_config.mcp = candidate_mcp.clone();
-        let mut committed_config = None;
+        let mut committed = false;
+        let mut commit_events = Vec::new();
         let mut store_error = None;
         let data_dir = self.app_data_dir.clone();
         let result = self
             .mcp_manager
             .reconcile_from_config_transactional_after(&candidate_mcp, || async {
                 let mut live_config = self.config.write().await;
-                match bamboo_config::persist_mcp_reset_credential_transaction_at_revision(
+                match bamboo_config::persist_mcp_reset_credential_transaction_at_revision_with_adoption(
                     &data_dir,
                     &mut candidate_config,
                     expected_revision,
-                )
-                .and_then(|_| load_committed_effective_config(&data_dir))
-                {
-                    Ok(committed) => {
-                        *live_config = committed.clone();
-                        committed_config = Some(committed);
+                    facade.as_ref(),
+                ) {
+                    Ok(commit) => {
+                        match install_credential_section_commit(commit, &mut candidate_config) {
+                            Ok(installed) => {
+                                *live_config = candidate_config.clone();
+                                commit_events = installed.events;
+                                committed = true;
+                            }
+                            Err(error) => {
+                                store_error = Some(error);
+                                return Err(bamboo_mcp::McpError::InvalidConfig(
+                                    "MCP reset process adoption failed".to_string(),
+                                ));
+                            }
+                        }
                         Ok(())
                     }
                     Err(error) => {
@@ -2063,7 +2138,7 @@ impl AppState {
         if let Some(error) = store_error {
             return Err(ConfigSectionMutationError::Store(error));
         }
-        if result.is_err() || committed_config.is_none() {
+        if result.is_err() || !committed {
             let message =
                 "MCP reset runtime initialization failed; retaining last-known-good runtime"
                     .to_string();
@@ -2076,12 +2151,8 @@ impl AppState {
             );
             return Err(ConfigSectionMutationError::Runtime(message));
         }
-        publish_exact_facade_commit(
-            Some(facade),
-            &self.account_sink,
-            &[SectionId::Credentials, SectionId::Mcp],
-        )
-        .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+        publish_exact_facade_events(&self.account_sink, &commit_events)
+            .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
         let revision = facade.registry().mcp.snapshot().revision;
         publish_section_success(
             &self.mcp_config_live_health,
@@ -2149,7 +2220,7 @@ impl AppState {
             apply_runtime_section(id, &Config::default(), &mut candidate);
             let transaction_dir = app_data_dir.clone();
             let commit_facade = facade.clone();
-            let (mut candidate, revision, cluster_commit) =
+            let (mut candidate, revision, cluster_commit, section_commit) =
                 tokio::task::spawn_blocking(move || {
                     if id == SectionId::ClusterFabric {
                         let commit =
@@ -2161,17 +2232,18 @@ impl AppState {
                                 |_, _| {},
                             )?;
                         let revision = commit.revision;
-                        Ok::<_, ConfigStoreError>((candidate, revision, Some(commit)))
+                        Ok::<_, ConfigStoreError>((candidate, revision, Some(commit), None))
                     } else {
-                        let revision =
-                            bamboo_config::persist_credential_backed_section_reset_at_revision(
+                        let commit =
+                            bamboo_config::persist_credential_backed_section_reset_at_revision_with_adoption(
                                 &transaction_dir,
                                 &mut candidate,
                                 id,
                                 expected_revision,
+                                commit_facade.as_ref(),
                             )?;
-                        let committed = load_committed_effective_config(&transaction_dir)?;
-                        Ok((committed, revision, None))
+                        let revision = commit.revision;
+                        Ok((candidate, revision, None, Some(commit)))
                     }
                 })
                 .await
@@ -2218,10 +2290,22 @@ impl AppState {
                 }
                 None => None,
             };
+            let section_events = match section_commit {
+                Some(commit) => {
+                    install_credential_section_commit(commit, &mut candidate)
+                        .map_err(ConfigSectionMutationError::Store)?
+                        .events
+                }
+                None => Vec::new(),
+            };
             if id == SectionId::Env {
                 candidate.publish_env_vars();
             }
             *config.write().await = candidate.clone();
+            if id != SectionId::ClusterFabric {
+                publish_exact_facade_events(&account_sink, &section_events)
+                    .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            }
             let commit = if id == SectionId::ClusterFabric {
                 let (cluster_adoption, credential_adoption, committed_recovery, cluster_runtime) =
                     cluster_runtime.expect("cluster reset captures an exact runtime");
@@ -2285,12 +2369,6 @@ impl AppState {
                     },
                 ))
             } else {
-                publish_exact_facade_commit(
-                    Some(facade),
-                    &account_sink,
-                    &[SectionId::Credentials, id],
-                )
-                .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
                 facade
                     .registry()
                     .envelope_value(id)
@@ -2820,27 +2898,25 @@ impl AppState {
     async fn persist_config_snapshot(
         &self,
         config: Config,
-    ) -> anyhow::Result<Vec<ConfigSectionEvent>> {
+    ) -> anyhow::Result<Option<bamboo_config::FacadeConfigCommit>> {
         let data_dir = self.app_data_dir.clone();
-        if self.config_facade.is_some() {
+        if let Some(facade) = self.config_facade.clone() {
             tokio::task::spawn_blocking(move || {
-                bamboo_config::persist_facade_effective_config(data_dir, &config)
+                bamboo_config::persist_facade_effective_config_with_adoption(
+                    data_dir,
+                    &config,
+                    facade.as_ref(),
+                )
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
-            let sections = bamboo_config::SECTION_DESCRIPTORS
-                .iter()
-                .map(|descriptor| descriptor.id)
-                .collect::<Vec<_>>();
-            Ok(capture_exact_facade_commit_events(
-                self.config_facade.as_ref(),
-                &sections,
-            ))
+            .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))?
+            .map(Some)
+            .map_err(Into::into)
         } else {
             tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
                 .await
                 .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
-            Ok(Vec::new())
+            Ok(None)
         }
     }
 
@@ -2863,9 +2939,9 @@ impl AppState {
         // before we persist and then clobber this mutation with the stale copy
         // (#126). The lock is dropped before apply_config_effects — slow side
         // effects (provider reload) don't need to block reloads/other updates.
-        let snapshot = {
+        let (snapshot, events) = {
             let _io = self.config_io_lock.lock().await;
-            let (snapshot, enforcement_newly_off) = {
+            let (mut snapshot, live_base, enforcement_newly_off) = {
                 let cfg = self.config.read().await;
                 // Refuse the whole operation (no in-memory mutation, no disk
                 // write) while a config-corruption recovery is pending
@@ -2875,6 +2951,7 @@ impl AppState {
                 // instead of silently drifting further from what's on disk.
                 reject_if_recovery_pending(&cfg)?;
                 let was_off = cfg.plugin_trust.enforcement_is_off();
+                let live_base = cfg.clone();
                 let mut candidate = cfg.clone();
                 restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut candidate);
                 update(&mut candidate)?;
@@ -2899,7 +2976,7 @@ impl AppState {
                     ))
                 })?;
                 let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
-                (candidate, newly_off)
+                (candidate, live_base, newly_off)
             };
             // Loud signal at the MOMENT plugin_trust.enforcement is flipped off
             // live (e.g. via `bamboo config set plugin_trust.enforcement off`
@@ -2910,29 +2987,35 @@ impl AppState {
             if enforcement_newly_off {
                 warn_plugin_trust_enforcement_off();
             }
-            let events = self
+            let commit = self
                 .persist_config_snapshot(snapshot.clone())
                 .await
                 .map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
                 })?;
-            let snapshot = self
-                .config_facade
-                .as_ref()
-                .map(|facade| load_facade_effective_config(facade, &self.app_data_dir))
-                .unwrap_or(snapshot);
+            let events = match commit {
+                Some(commit) => {
+                    let mut published = live_base;
+                    let events =
+                        install_facade_config_commit(commit, &mut published).map_err(|e| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "failed to install committed configuration section: {e}"
+                            ))
+                        })?;
+                    snapshot = published;
+                    events
+                }
+                None => Vec::new(),
+            };
             {
                 let mut cfg = self.config.write().await;
                 snapshot.publish_env_vars();
                 *cfg = snapshot.clone();
             }
-            // Preserve the established ordering relative to optional runtime
-            // effects: config events precede those effects, but now only after
-            // the matching materialized snapshot is live.
-            publish_exact_facade_events(&self.account_sink, &events)?;
-            snapshot
+            (snapshot, events)
         };
 
+        publish_exact_facade_events(&self.account_sink, &events)?;
         self.apply_config_effects(snapshot.clone(), effects).await?;
         Ok(snapshot)
     }
@@ -2954,12 +3037,13 @@ impl AppState {
         }
         let config_facade = self.config_facade.clone();
         let account_sink = self.account_sink.clone();
-        let (snapshot, enforcement_newly_off) = {
+        let (snapshot, enforcement_newly_off, events) = {
             let _io = self.config_io_lock.lock().await;
-            let (mut candidate, enforcement_newly_off) = {
+            let (mut candidate, live_base, enforcement_newly_off) = {
                 let cfg = self.config.read().await;
                 reject_if_recovery_pending(&cfg)?;
                 let was_off = cfg.plugin_trust.enforcement_is_off();
+                let live_base = cfg.clone();
                 let mut candidate = cfg.clone();
                 restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
                 update(&mut candidate)?;
@@ -3008,17 +3092,30 @@ impl AppState {
                     ))
                 })?;
                 let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
-                (candidate, newly_off)
+                (candidate, live_base, newly_off)
             };
             let data_dir = self.app_data_dir.clone();
-            let candidate = tokio::task::spawn_blocking(move || {
-                bamboo_config::persist_provider_instance_credential_transaction(
-                    &data_dir,
-                    &mut candidate,
-                    &provider_intents,
-                    &provider_instance_intents,
-                )?;
-                load_committed_effective_config(&data_dir)
+            let commit_facade = config_facade.clone();
+            let (candidate, commit) = tokio::task::spawn_blocking(move || {
+                if let Some(facade) = commit_facade {
+                    let commit =
+                        bamboo_config::persist_provider_instance_credential_transaction_with_adoption(
+                            &data_dir,
+                            &mut candidate,
+                            &provider_intents,
+                            &provider_instance_intents,
+                            facade.as_ref(),
+                        )?;
+                    Ok::<_, ConfigStoreError>((candidate, Some(commit)))
+                } else {
+                    bamboo_config::persist_provider_instance_credential_transaction(
+                        &data_dir,
+                        &mut candidate,
+                        &provider_intents,
+                        &provider_instance_intents,
+                    )?;
+                    Ok((load_committed_effective_config(&data_dir)?, None))
+                }
             })
             .await
             .map_err(|error| {
@@ -3042,21 +3139,30 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            publish_exact_facade_commit(
-                config_facade.as_ref(),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Providers],
-            )?;
+            let (snapshot, events) = match commit {
+                Some(commit) => {
+                    let mut published = live_base;
+                    let installed = install_credential_section_commit(commit, &mut published)
+                        .map_err(|error| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "provider process adoption failed: {error}"
+                            ))
+                        })?;
+                    (published, installed.events)
+                }
+                None => (candidate, Vec::new()),
+            };
             {
                 let mut cfg = self.config.write().await;
-                candidate.publish_env_vars();
-                *cfg = candidate.clone();
+                snapshot.publish_env_vars();
+                *cfg = snapshot.clone();
             }
-            (candidate, enforcement_newly_off)
+            (snapshot, enforcement_newly_off, events)
         };
         if enforcement_newly_off {
             warn_plugin_trust_enforcement_off();
         }
+        publish_exact_facade_events(&account_sink, &events)?;
         self.apply_config_effects(snapshot.clone(), effects).await?;
         Ok(snapshot)
     }
@@ -3089,17 +3195,38 @@ impl AppState {
                 candidate
             };
             let transaction_dir = app_data_dir.clone();
-            let (candidate, revision) = tokio::task::spawn_blocking(move || {
-                let revision = bamboo_config::persist_env_var_credential_transaction_at_revision(
-                    &transaction_dir,
-                    &mut candidate,
-                    &env_intents,
-                    expected_revision,
-                )?;
-                // Reload from the durable authority selected by the layout.
-                // Active modular layouts never publish stale config.json.
-                let committed = load_committed_effective_config(&transaction_dir)?;
-                Ok::<_, ConfigStoreError>((committed, revision))
+            let commit_facade = config_facade.clone();
+            let (mut candidate, revision, commit) = tokio::task::spawn_blocking(move || {
+                if let Some(facade) = commit_facade {
+                    let commit =
+                        bamboo_config::persist_env_var_credential_transaction_at_revision_with_adoption(
+                            &transaction_dir,
+                            &mut candidate,
+                            &env_intents,
+                            expected_revision,
+                            facade.as_ref(),
+                        )?;
+                    #[cfg(test)]
+                    run_credential_after_commit_before_live_test_hook(
+                        &transaction_dir,
+                        SectionId::Env,
+                    );
+                    let revision = commit.revision;
+                    Ok::<_, ConfigStoreError>((candidate, revision, Some(commit)))
+                } else {
+                    let revision =
+                        bamboo_config::persist_env_var_credential_transaction_at_revision(
+                            &transaction_dir,
+                            &mut candidate,
+                            &env_intents,
+                            expected_revision,
+                        )?;
+                    Ok((
+                        load_committed_effective_config(&transaction_dir)?,
+                        revision,
+                        None,
+                    ))
+                }
             })
             .await
             .map_err(|error| {
@@ -3123,13 +3250,21 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            publish_exact_facade_commit(
-                config_facade.as_ref(),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Env],
-            )?;
+            let events = match commit {
+                Some(commit) => {
+                    install_credential_section_commit(commit, &mut candidate)
+                        .map_err(|error| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "env process adoption failed: {error}"
+                            ))
+                        })?
+                        .events
+                }
+                None => Vec::new(),
+            };
             candidate.publish_env_vars();
             *config.write().await = candidate.clone();
+            publish_exact_facade_events(&account_sink, &events)?;
             Ok::<_, AppError>((candidate, revision))
         });
         transaction.await.map_err(|error| {
@@ -3168,17 +3303,35 @@ impl AppState {
                 candidate
             };
             let transaction_dir = app_data_dir.clone();
-            let (candidate, revision) = tokio::task::spawn_blocking(move || {
-                let revision =
-                    bamboo_config::persist_notification_credential_transaction_at_revision_with_reset(
+            let commit_facade = config_facade.clone();
+            let (mut candidate, revision, commit) = tokio::task::spawn_blocking(move || {
+                if let Some(facade) = commit_facade {
+                    let commit =
+                        bamboo_config::persist_notification_credential_transaction_at_revision_with_reset_and_adoption(
+                            &transaction_dir,
+                            &mut candidate,
+                            &secret_intents,
+                            reset_domain,
+                            expected_revision,
+                            facade.as_ref(),
+                        )?;
+                    let revision = commit.revision;
+                    Ok::<_, ConfigStoreError>((candidate, revision, Some(commit)))
+                } else {
+                    let revision =
+                        bamboo_config::persist_notification_credential_transaction_at_revision_with_reset(
                             &transaction_dir,
                             &mut candidate,
                             &secret_intents,
                             reset_domain,
                             expected_revision,
                         )?;
-                let committed = load_committed_effective_config(&transaction_dir)?;
-                Ok::<_, ConfigStoreError>((committed, revision))
+                    Ok((
+                        load_committed_effective_config(&transaction_dir)?,
+                        revision,
+                        None,
+                    ))
+                }
             })
             .await
             .map_err(|error| {
@@ -3204,12 +3357,20 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            publish_exact_facade_commit(
-                config_facade.as_ref(),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Notifications],
-            )?;
+            let events = match commit {
+                Some(commit) => {
+                    install_credential_section_commit(commit, &mut candidate)
+                        .map_err(|error| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "notification process adoption failed: {error}"
+                            ))
+                        })?
+                        .events
+                }
+                None => Vec::new(),
+            };
             *config.write().await = candidate.clone();
+            publish_exact_facade_events(&account_sink, &events)?;
             Ok::<_, AppError>((candidate, revision))
         });
         transaction.await.map_err(|error| {
@@ -3248,15 +3409,33 @@ impl AppState {
                 candidate
             };
             let transaction_dir = app_data_dir.clone();
-            let (candidate, revision) = tokio::task::spawn_blocking(move || {
-                let revision = bamboo_config::persist_connect_credential_transaction_at_revision(
-                    &transaction_dir,
-                    &mut candidate,
-                    &secret_intents,
-                    expected_revision,
-                )?;
-                let committed = load_committed_effective_config(&transaction_dir)?;
-                Ok::<_, ConfigStoreError>((committed, revision))
+            let commit_facade = config_facade.clone();
+            let (mut candidate, revision, commit) = tokio::task::spawn_blocking(move || {
+                if let Some(facade) = commit_facade {
+                    let commit =
+                        bamboo_config::persist_connect_credential_transaction_at_revision_with_adoption(
+                            &transaction_dir,
+                            &mut candidate,
+                            &secret_intents,
+                            expected_revision,
+                            facade.as_ref(),
+                        )?;
+                    let revision = commit.revision;
+                    Ok::<_, ConfigStoreError>((candidate, revision, Some(commit)))
+                } else {
+                    let revision =
+                        bamboo_config::persist_connect_credential_transaction_at_revision(
+                            &transaction_dir,
+                            &mut candidate,
+                            &secret_intents,
+                            expected_revision,
+                        )?;
+                    Ok((
+                        load_committed_effective_config(&transaction_dir)?,
+                        revision,
+                        None,
+                    ))
+                }
             })
             .await
             .map_err(|error| {
@@ -3280,12 +3459,20 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            publish_exact_facade_commit(
-                config_facade.as_ref(),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Connect],
-            )?;
+            let events = match commit {
+                Some(commit) => {
+                    install_credential_section_commit(commit, &mut candidate)
+                        .map_err(|error| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "connect process adoption failed: {error}"
+                            ))
+                        })?
+                        .events
+                }
+                None => Vec::new(),
+            };
             *config.write().await = candidate.clone();
+            publish_exact_facade_events(&account_sink, &events)?;
             Ok::<_, AppError>((candidate, revision))
         });
         transaction.await.map_err(|error| {
@@ -3322,17 +3509,35 @@ impl AppState {
                 candidate
             };
             let transaction_dir = app_data_dir.clone();
-            let (candidate, revision) = tokio::task::spawn_blocking(move || {
-                let revision =
-                    bamboo_config::persist_access_control_credential_transaction_at_revision(
+            let commit_facade = config_facade.clone();
+            let (mut candidate, revision, commit) = tokio::task::spawn_blocking(move || {
+                if let Some(facade) = commit_facade {
+                    let commit =
+                        bamboo_config::persist_access_control_credential_transaction_at_revision_with_adoption(
                         &transaction_dir,
                         &mut candidate,
                         password_intent,
                         &device_intents,
                         expected_revision,
+                        facade.as_ref(),
                     )?;
-                let committed = load_committed_effective_config(&transaction_dir)?;
-                Ok::<_, ConfigStoreError>((committed, revision))
+                    let revision = commit.revision;
+                    Ok::<_, ConfigStoreError>((candidate, revision, Some(commit)))
+                } else {
+                    let revision =
+                        bamboo_config::persist_access_control_credential_transaction_at_revision(
+                            &transaction_dir,
+                            &mut candidate,
+                            password_intent,
+                            &device_intents,
+                            expected_revision,
+                        )?;
+                    Ok((
+                        load_committed_effective_config(&transaction_dir)?,
+                        revision,
+                        None,
+                    ))
+                }
             })
             .await
             .map_err(|error| {
@@ -3356,12 +3561,20 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            publish_exact_facade_commit(
-                config_facade.as_ref(),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::AccessControl],
-            )?;
+            let events = match commit {
+                Some(commit) => {
+                    install_credential_section_commit(commit, &mut candidate)
+                        .map_err(|error| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "access-control process adoption failed: {error}"
+                            ))
+                        })?
+                        .events
+                }
+                None => Vec::new(),
+            };
             *config.write().await = candidate.clone();
+            publish_exact_facade_events(&account_sink, &events)?;
             Ok::<_, AppError>((candidate, revision))
         });
         transaction.await.map_err(|error| {
@@ -3722,16 +3935,29 @@ impl AppState {
                         bamboo_config::CredentialRef::parse("proxy.default.auth")
                             .expect("canonical proxy credential reference is valid")
                     });
-            let (candidate, reference) = tokio::task::spawn_blocking(move || {
-                bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
-                    &transaction_dir,
-                    &mut candidate,
-                    expected_revision,
-                )?;
-                Ok::<_, ConfigStoreError>((
-                    load_committed_effective_config(&transaction_dir)?,
-                    status_reference,
-                ))
+            let commit_facade = config_facade.clone();
+            let (mut candidate, reference, commit) = tokio::task::spawn_blocking(move || {
+                if let Some(facade) = commit_facade {
+                    let commit =
+                        bamboo_config::persist_proxy_auth_credential_transaction_at_revision_with_adoption(
+                            &transaction_dir,
+                            &mut candidate,
+                            expected_revision,
+                            facade.as_ref(),
+                        )?;
+                    Ok::<_, ConfigStoreError>((candidate, status_reference, Some(commit)))
+                } else {
+                    bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
+                        &transaction_dir,
+                        &mut candidate,
+                        expected_revision,
+                    )?;
+                    Ok((
+                        load_committed_effective_config(&transaction_dir)?,
+                        status_reference,
+                        None,
+                    ))
+                }
             })
             .await
             .map_err(|error| {
@@ -3755,18 +3981,26 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-
-            publish_exact_facade_commit(
-                config_facade.as_ref(),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::Core],
-            )?;
+            let installed = match commit {
+                Some(commit) => Some(
+                    install_credential_section_commit(commit, &mut candidate).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "proxy process adoption failed: {error}"
+                        ))
+                    })?,
+                ),
+                None => None,
+            };
 
             // No fallible metadata read occurs before publication. Once the
             // transaction commits, a response error can no longer leave live
             // config behind its durable credential/config pair.
             candidate.publish_env_vars();
             *config.write().await = candidate.clone();
+
+            if let Some(installed) = installed.as_ref() {
+                publish_exact_facade_events(&account_sink, &installed.events)?;
+            }
 
             if effects.reload_provider {
                 match bamboo_llm::ProviderRegistry::from_config(&candidate, app_data_dir.clone())
@@ -3796,7 +4030,12 @@ impl AppState {
                 mcp_manager.reconcile_from_config(&candidate.mcp).await;
             }
 
-            let (status, health) =
+            let (status, health) = if let Some(installed) = installed {
+                (
+                    installed.metadata.status(&reference),
+                    installed.metadata.credential_health,
+                )
+            } else {
                 credential_store
                     .status_with_health(&reference)
                     .map_err(|error| match error {
@@ -3812,7 +4051,8 @@ impl AppState {
                         ConfigStoreError::Watch(error) => AppError::InternalError(anyhow::anyhow!(
                             "configuration watch failed: {error}"
                         )),
-                    })?;
+                    })?
+            };
             Ok::<_, AppError>((candidate, status, health))
         });
         transaction.await.map_err(|error| {
@@ -3842,42 +4082,50 @@ impl AppState {
 
         // Same #126 serialization as update_config: mutate + persist under the
         // config-IO lock so a reload can't interleave; effects run unlocked.
-        let new_config = {
+        let (new_config, events) = {
             let _io = self.config_io_lock.lock().await;
             restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut new_config);
-            let was_off = {
+            let (was_off, live_base) = {
                 let cfg = self.config.read().await;
                 // Same guard as `update_config` (#153): a full-config replace
                 // must not silently blow away an unconfirmed recovery either.
                 reject_if_recovery_pending(&cfg)?;
-                cfg.plugin_trust.enforcement_is_off()
+                (cfg.plugin_trust.enforcement_is_off(), cfg.clone())
             };
-            let events = self
+            let commit = self
                 .persist_config_snapshot(new_config.clone())
                 .await
                 .map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
                 })?;
-            let published = self
-                .config_facade
-                .as_ref()
-                .map(|facade| load_facade_effective_config(facade, &self.app_data_dir))
-                .unwrap_or(new_config);
+            let mut published = if commit.is_some() {
+                live_base
+            } else {
+                new_config
+            };
+            let events = match commit {
+                Some(commit) => {
+                    install_facade_config_commit(commit, &mut published).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "failed to install committed configuration section: {error}"
+                        ))
+                    })?
+                }
+                None => Vec::new(),
+            };
             let enforcement_newly_off = !was_off && published.plugin_trust.enforcement_is_off();
             published.publish_env_vars();
             *self.config.write().await = published.clone();
-            // `record` is nonblocking, so this must remain after the live
-            // AppState write rather than inside persistence/reload capture.
-            publish_exact_facade_events(&self.account_sink, &events)?;
             // Same live signal as `update_config` — a full-config replace (JSON
             // merge / PATCH endpoints) that transitions plugin_trust.enforcement
             // into `Off` must warn just as loudly as a targeted set.
             if enforcement_newly_off {
                 warn_plugin_trust_enforcement_off();
             }
-            published
+            (published, events)
         };
 
+        publish_exact_facade_events(&self.account_sink, &events)?;
         self.apply_config_effects(new_config.clone(), effects)
             .await?;
         Ok(new_config)
@@ -4288,28 +4536,6 @@ mod live_reload_tests {
         next_config_event(feed, "mcp").await
     }
 
-    async fn wait_for_cluster_facade_revision(state: &AppState, expected: u64) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if state
-                    .config_facade
-                    .as_ref()
-                    .unwrap()
-                    .registry()
-                    .cluster_fabric
-                    .snapshot()
-                    .revision
-                    == expected
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("cluster facade revision did not advance");
-    }
-
     #[tokio::test]
     async fn compatibility_update_cannot_reintroduce_an_unrevisioned_cluster_mutation() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x70; 32]);
@@ -4373,7 +4599,7 @@ mod live_reload_tests {
     }
 
     #[tokio::test]
-    async fn stale_stopped_watcher_compatibility_writers_catch_up_without_overwriting_cluster() {
+    async fn stopped_watcher_compatibility_writers_install_only_their_owned_section() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x72; 32]);
         let dir = tempfile::tempdir().unwrap();
         let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
@@ -4444,69 +4670,53 @@ mod live_reload_tests {
             "generation-one"
         );
 
-        let mut feed = state.account_sink.subscribe();
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut core_feed = state.account_sink.subscribe();
+        let mut cluster_feed = state.account_sink.subscribe();
         let stale_runtime = state.config.read().await;
         let updating = {
             let state = state.clone();
             tokio::spawn(async move {
                 state
-                    .update_config(|_| Ok(()), ConfigUpdateEffects::default())
+                    .update_config(
+                        |config| {
+                            config.server.port = 23_332;
+                            Ok(())
+                        },
+                        ConfigUpdateEffects::default(),
+                    )
                     .await
             })
         };
-        wait_for_cluster_facade_revision(&state, 2).await;
         assert!(
             tokio::time::timeout(
-                Duration::from_millis(300),
-                next_config_event(&mut feed, "cluster-fabric"),
+                Duration::from_millis(100),
+                next_config_event(&mut core_feed, "core"),
             )
             .await
             .is_err(),
-            "r2 event became observable while live AppState config was still r1"
+            "core event became observable while the old AppState snapshot was held"
         );
-        assert_eq!(
-            stale_runtime
-                .cluster_fabric
-                .node("shared-node")
-                .unwrap()
-                .label,
-            "generation-one"
-        );
+        assert_ne!(stale_runtime.server.port, 23_332);
         drop(stale_runtime);
-
-        let event = next_config_event(&mut feed, "cluster-fabric").await;
-        assert!(matches!(
-            event,
-            AgentEvent::ConfigChanged {
-                section,
-                revision: 2
-            } if section == "cluster-fabric"
-        ));
-        assert_eq!(
-            state
-                .config
-                .read()
-                .await
-                .cluster_fabric
-                .node("shared-node")
-                .unwrap()
-                .label,
-            "external-generation-two",
-            "r2 must be live before its event is observable"
-        );
         let published = updating.await.unwrap().unwrap();
+        assert!(matches!(
+            next_config_event(&mut core_feed, "core").await,
+            AgentEvent::ConfigChanged { section, .. } if section == "core"
+        ));
+        assert_eq!(state.config.read().await.server.port, 23_332);
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(300),
-                next_config_event(&mut feed, "cluster-fabric"),
+                next_config_event(&mut cluster_feed, "cluster-fabric"),
             )
             .await
             .is_err(),
-            "r2 catch-up published a duplicate cluster event"
+            "an unrelated compatibility update published a cluster event"
         );
         assert_eq!(
             published.cluster_fabric.node("shared-node").unwrap().label,
-            "external-generation-two"
+            "generation-one"
         );
         assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r2);
         assert_eq!(
@@ -4518,8 +4728,8 @@ mod live_reload_tests {
                 .cluster_fabric
                 .snapshot()
                 .revision,
-            2,
-            "compatibility publication must catch the stopped watcher up to r2"
+            1,
+            "an unrelated compatibility update must not catch up cluster"
         );
         assert_eq!(
             state
@@ -4530,8 +4740,28 @@ mod live_reload_tests {
                 .node("shared-node")
                 .unwrap()
                 .label,
-            "external-generation-two"
+            "generation-one"
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, .. } if section == "core"
+                ))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::ConfigChanged { section, .. } if section == "cluster-fabric"
+        )));
 
         let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
         let mut external_candidate = external.effective_config();
@@ -4560,13 +4790,15 @@ mod live_reload_tests {
                 .cluster_fabric
                 .snapshot()
                 .revision,
-            2,
+            1,
             "the stopped watcher must remain stale before replace_config"
         );
 
         let mut replacement = state.config.read().await.clone();
         replacement.server.port = 23_333;
-        let mut feed = state.account_sink.subscribe();
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut core_feed = state.account_sink.subscribe();
+        let mut cluster_feed = state.account_sink.subscribe();
         let stale_runtime = state.config.read().await;
         let replacing = {
             let state = state.clone();
@@ -4576,60 +4808,36 @@ mod live_reload_tests {
                     .await
             })
         };
-        wait_for_cluster_facade_revision(&state, 3).await;
         assert!(
             tokio::time::timeout(
-                Duration::from_millis(300),
-                next_config_event(&mut feed, "cluster-fabric"),
+                Duration::from_millis(100),
+                next_config_event(&mut core_feed, "core"),
             )
             .await
             .is_err(),
-            "r3 event became observable while live AppState config was still r2"
+            "replacement event became observable while the old AppState snapshot was held"
         );
-        assert_eq!(
-            stale_runtime
-                .cluster_fabric
-                .node("shared-node")
-                .unwrap()
-                .label,
-            "external-generation-two"
-        );
+        assert_ne!(stale_runtime.server.port, 23_333);
         drop(stale_runtime);
-
-        let event = next_config_event(&mut feed, "cluster-fabric").await;
-        assert!(matches!(
-            event,
-            AgentEvent::ConfigChanged {
-                section,
-                revision: 3
-            } if section == "cluster-fabric"
-        ));
-        assert_eq!(
-            state
-                .config
-                .read()
-                .await
-                .cluster_fabric
-                .node("shared-node")
-                .unwrap()
-                .label,
-            "external-generation-three",
-            "r3 must be live before its event is observable"
-        );
         let published = replacing.await.unwrap().unwrap();
+        assert!(matches!(
+            next_config_event(&mut core_feed, "core").await,
+            AgentEvent::ConfigChanged { section, .. } if section == "core"
+        ));
+        assert_eq!(state.config.read().await.server.port, 23_333);
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(300),
-                next_config_event(&mut feed, "cluster-fabric"),
+                next_config_event(&mut cluster_feed, "cluster-fabric"),
             )
             .await
             .is_err(),
-            "r3 catch-up published a duplicate cluster event"
+            "an unrelated compatibility replacement published a cluster event"
         );
         assert_eq!(published.server.port, 23_333);
         assert_eq!(
             published.cluster_fabric.node("shared-node").unwrap().label,
-            "external-generation-three"
+            "generation-one"
         );
         assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r3);
         assert_eq!(
@@ -4641,7 +4849,7 @@ mod live_reload_tests {
                 .cluster_fabric
                 .snapshot()
                 .revision,
-            3
+            1
         );
         assert_eq!(
             state
@@ -4652,8 +4860,211 @@ mod live_reload_tests {
                 .node("shared-node")
                 .unwrap()
                 .label,
-            "external-generation-three"
+            "generation-one"
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, .. } if section == "core"
+                ))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::ConfigChanged { section, .. } if section == "cluster-fabric"
+        )));
+    }
+
+    #[tokio::test]
+    async fn env_credential_commit_installs_owned_runtime_before_exact_events() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x73; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "shared-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "shared-node".to_string(),
+                        label: "generation-one".to_string(),
+                        placement: bamboo_config::NodePlacement::Local,
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .cluster_fabric
+            .node_mut("shared-node")
+            .unwrap()
+            .label = "external-generation-two".to_string();
+        bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut external_candidate,
+            &BTreeMap::new(),
+            1,
+        )
+        .unwrap();
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let cluster_r2 = std::fs::read(&cluster_path).unwrap();
+        let expected_revision = state.credential_store.revision().unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        set_credential_after_commit_before_live_test_hook(dir.path(), SectionId::Env, move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut credential_feed = state.account_sink.subscribe();
+        let mut env_feed = state.account_sink.subscribe();
+        let mut cluster_feed = state.account_sink.subscribe();
+        let updating = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_env_var_credentials(
+                        expected_revision,
+                        BTreeSet::from(["TOKEN".to_string()]),
+                        |config| {
+                            config.env_vars.push(bamboo_config::EnvVarEntry {
+                                name: "TOKEN".to_string(),
+                                value: "exact-secret".to_string(),
+                                secret: true,
+                                value_encrypted: None,
+                                credential_ref: None,
+                                configured: true,
+                                description: None,
+                            });
+                            Ok(())
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let stale_runtime = state.config.read().await;
+        release_tx.send(()).unwrap();
+        for (feed, section) in [
+            (&mut credential_feed, "credentials"),
+            (&mut env_feed, "env"),
+            (&mut cluster_feed, "cluster-fabric"),
+        ] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), next_config_event(feed, section),)
+                    .await
+                    .is_err(),
+                "{section} event became observable before the owned runtime install"
+            );
+        }
+        assert!(
+            stale_runtime
+                .env_vars
+                .iter()
+                .all(|entry| entry.name != "TOKEN"),
+            "the held runtime must still be the pre-commit env generation"
+        );
+        assert_eq!(
+            stale_runtime
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "generation-one"
+        );
+        drop(stale_runtime);
+
+        let (published, revision) = updating.await.unwrap().unwrap();
+        assert!(revision > expected_revision);
+        assert!(published
+            .env_vars
+            .iter()
+            .any(|entry| entry.name == "TOKEN" && entry.value == "exact-secret"));
+        assert_eq!(
+            published.cluster_fabric.node("shared-node").unwrap().label,
+            "generation-one"
+        );
+        assert!(matches!(
+            next_config_event(&mut credential_feed, "credentials").await,
+            AgentEvent::ConfigChanged { section, .. } if section == "credentials"
+        ));
+        assert!(matches!(
+            next_config_event(&mut env_feed, "env").await,
+            AgentEvent::ConfigChanged { section, .. } if section == "env"
+        ));
+        assert!(tokio::time::timeout(
+            Duration::from_millis(300),
+            next_config_event(&mut cluster_feed, "cluster-fabric"),
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read(cluster_path).unwrap(), cluster_r2);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, .. } if section == "credentials"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, .. } if section == "env"
+                ))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::ConfigChanged { section, .. } if section == "cluster-fabric"
+        )));
     }
 
     #[tokio::test]

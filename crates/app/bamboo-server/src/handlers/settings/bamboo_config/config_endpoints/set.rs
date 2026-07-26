@@ -124,7 +124,18 @@ pub async fn set_bamboo_config(
         }
     }
 
-    Ok(HttpResponse::Ok().json(redacted_config_json(&new_config, &app_state.app_data_dir).await?))
+    // The live config deliberately retains the current node heartbeat/runtime
+    // state while this unrelated compatibility write installs only its owned
+    // section. Preserve the established POST contract by returning the
+    // operator-owned cluster projection, not a transient runtime heartbeat
+    // that was ignored rather than committed by this request.
+    let mut response_config = new_config;
+    for node in &mut response_config.cluster_fabric.nodes {
+        node.state = None;
+    }
+    response_config.sanitize_cluster_fabric_for_disk();
+    Ok(HttpResponse::Ok()
+        .json(redacted_config_json(&response_config, &app_state.app_data_dir).await?))
 }
 
 pub(super) fn remove_unchanged_access_control_echo(
