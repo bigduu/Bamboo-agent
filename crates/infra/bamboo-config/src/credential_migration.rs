@@ -2593,10 +2593,17 @@ where
                         candidate: &crate::ClusterFabricConfig,
                         runtime: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
                         recovery: ConfigStoreResult<()>| {
+        let runtime_ready = runtime.is_ok();
         exact_runtime = Some(runtime);
         committed_recovery = Some(recovery);
         transaction_changed = changed;
-        if changed {
+        if revision == expected_revision {
+            if runtime_ready {
+                adoption = facade
+                    .catch_up_committed_section(crate::SectionId::ClusterFabric)
+                    .map(Ok);
+            }
+        } else if changed {
             before_adoption(revision, candidate);
             adoption = Some(facade.adopt_committed_cluster_fabric(
                 expected_revision,
@@ -3304,10 +3311,17 @@ where
                         candidate: &crate::ClusterFabricConfig,
                         runtime: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
                         recovery: ConfigStoreResult<()>| {
+        let runtime_ready = runtime.is_ok();
         exact_runtime = Some(runtime);
         committed_recovery = Some(recovery);
         transaction_changed = changed;
-        if changed {
+        if revision == expected_revision {
+            if runtime_ready {
+                adoption = facade
+                    .catch_up_committed_section(crate::SectionId::ClusterFabric)
+                    .map(Ok);
+            }
+        } else if changed {
             before_adoption(revision, candidate);
             adoption = Some(facade.adopt_committed_cluster_fabric(
                 expected_revision,

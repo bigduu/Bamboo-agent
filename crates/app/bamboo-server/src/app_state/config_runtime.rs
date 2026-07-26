@@ -108,6 +108,37 @@ fn run_credential_after_commit_before_live_test_hook(data_dir: &Path, section: S
     }
 }
 
+#[cfg(test)]
+type GenericBeforeEventTestHook = Box<dyn FnOnce() + Send + 'static>;
+#[cfg(test)]
+type GenericBeforeEventTestHooks =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, GenericBeforeEventTestHook>>;
+
+#[cfg(test)]
+fn generic_before_event_test_hooks() -> &'static GenericBeforeEventTestHooks {
+    static HOOKS: std::sync::OnceLock<GenericBeforeEventTestHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_generic_before_event_test_hook(data_dir: &Path, hook: impl FnOnce() + Send + 'static) {
+    generic_before_event_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_generic_before_event_test_hook(data_dir: &Path) {
+    let hook = generic_before_event_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(data_dir);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct FacadeRuntimeMaterialization {
     config: Config,
     failures: BTreeSet<SectionId>,
@@ -2939,7 +2970,7 @@ impl AppState {
         // before we persist and then clobber this mutation with the stale copy
         // (#126). The lock is dropped before apply_config_effects — slow side
         // effects (provider reload) don't need to block reloads/other updates.
-        let (snapshot, events) = {
+        let snapshot = {
             let _io = self.config_io_lock.lock().await;
             let (mut snapshot, live_base, enforcement_newly_off) = {
                 let cfg = self.config.read().await;
@@ -3012,10 +3043,16 @@ impl AppState {
                 snapshot.publish_env_vars();
                 *cfg = snapshot.clone();
             }
-            (snapshot, events)
+            // Keep synchronous event enqueue inside the same serialization
+            // boundary as durable commit and live installation. Otherwise a
+            // later local writer can enqueue r2 while this task is preempted
+            // after unlocking, then this task can enqueue stale r1.
+            #[cfg(test)]
+            run_generic_before_event_test_hook(&self.app_data_dir);
+            publish_exact_facade_events(&self.account_sink, &events)?;
+            snapshot
         };
 
-        publish_exact_facade_events(&self.account_sink, &events)?;
         self.apply_config_effects(snapshot.clone(), effects).await?;
         Ok(snapshot)
     }
@@ -3037,7 +3074,7 @@ impl AppState {
         }
         let config_facade = self.config_facade.clone();
         let account_sink = self.account_sink.clone();
-        let (snapshot, enforcement_newly_off, events) = {
+        let (snapshot, enforcement_newly_off) = {
             let _io = self.config_io_lock.lock().await;
             let (mut candidate, live_base, enforcement_newly_off) = {
                 let cfg = self.config.read().await;
@@ -3157,12 +3194,12 @@ impl AppState {
                 snapshot.publish_env_vars();
                 *cfg = snapshot.clone();
             }
-            (snapshot, enforcement_newly_off, events)
+            publish_exact_facade_events(&account_sink, &events)?;
+            (snapshot, enforcement_newly_off)
         };
         if enforcement_newly_off {
             warn_plugin_trust_enforcement_off();
         }
-        publish_exact_facade_events(&account_sink, &events)?;
         self.apply_config_effects(snapshot.clone(), effects).await?;
         Ok(snapshot)
     }
@@ -4082,7 +4119,7 @@ impl AppState {
 
         // Same #126 serialization as update_config: mutate + persist under the
         // config-IO lock so a reload can't interleave; effects run unlocked.
-        let (new_config, events) = {
+        let new_config = {
             let _io = self.config_io_lock.lock().await;
             restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut new_config);
             let (was_off, live_base) = {
@@ -4122,10 +4159,10 @@ impl AppState {
             if enforcement_newly_off {
                 warn_plugin_trust_enforcement_off();
             }
-            (published, events)
+            publish_exact_facade_events(&self.account_sink, &events)?;
+            published
         };
 
-        publish_exact_facade_events(&self.account_sink, &events)?;
         self.apply_config_effects(new_config.clone(), effects)
             .await?;
         Ok(new_config)
@@ -5300,6 +5337,298 @@ mod live_reload_tests {
             runtime_before_conflict,
             "a durable CAS conflict must not overwrite the process runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_process_cluster_noop_catches_up_exact_durable_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .cluster_fabric
+            .nodes
+            .push(bamboo_config::Node {
+                id: "external-node".to_string(),
+                label: "external-r1".to_string(),
+                placement: bamboo_config::NodePlacement::Local,
+                trust_level: bamboo_config::TrustLevel::Trusted,
+                deploy: bamboo_config::DeployProfile::default(),
+                state: None,
+                enabled: true,
+            });
+        assert_eq!(
+            bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external_candidate,
+                &BTreeMap::from([(
+                    "external-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            0
+        );
+        let baseline_seq = state.account_sink.latest_seq();
+
+        let committed = state
+            .update_cluster_fabric_credentials(1, BTreeMap::new(), |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(committed.section.revision, 1);
+        assert_eq!(
+            committed
+                .config
+                .cluster_fabric
+                .node("external-node")
+                .unwrap()
+                .label,
+            "external-r1"
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("external-node")
+                .unwrap()
+                .label,
+            "external-r1"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        let revisions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ConfigChanged { section, revision } if section == "cluster-fabric" => {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(revisions, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn stale_process_cluster_reset_noop_catches_up_exact_durable_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .cluster_fabric
+            .nodes
+            .push(bamboo_config::Node {
+                id: "reset-node".to_string(),
+                label: "reset-node".to_string(),
+                placement: bamboo_config::NodePlacement::Local,
+                trust_level: bamboo_config::TrustLevel::Trusted,
+                deploy: bamboo_config::DeployProfile::default(),
+                state: None,
+                enabled: true,
+            });
+        assert_eq!(
+            bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external_candidate,
+                &BTreeMap::from([(
+                    "reset-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+        let reset_facade = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut reset_candidate = reset_facade.effective_config();
+        reset_candidate.cluster_fabric = bamboo_config::ClusterFabricConfig::default();
+        let external_reset = bamboo_config::persist_cluster_fabric_reset_at_revision_with_adoption(
+            dir.path(),
+            &mut reset_candidate,
+            1,
+            &reset_facade,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(external_reset.revision, 2);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            0
+        );
+        let baseline_seq = state.account_sink.latest_seq();
+
+        let committed = state
+            .reset_credential_backed_section(SectionId::ClusterFabric, 2)
+            .await
+            .unwrap();
+        let CredentialBackedResetCommit::Cluster(committed) = committed else {
+            panic!("cluster reset must return its exact snapshot")
+        };
+        assert_eq!(committed.section.revision, 2);
+        assert!(committed.config.cluster_fabric.nodes.is_empty());
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            2
+        );
+        assert!(state.config.read().await.cluster_fabric.nodes.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        let revisions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ConfigChanged { section, revision } if section == "cluster-fabric" => {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(revisions, vec![2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generic_events_follow_serialized_local_commit_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let baseline_seq = state.account_sink.latest_seq();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_event_test_hook(dir.path(), move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_config(
+                        |config| {
+                            config.server.port = 22_231;
+                            Ok(())
+                        },
+                        ConfigUpdateEffects::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let second = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_config(
+                        |config| {
+                            config.server.port = 22_232;
+                            Ok(())
+                        },
+                        ConfigUpdateEffects::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !second.is_finished(),
+            "the later writer must remain behind the first writer's event"
+        );
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        assert!(
+            events.iter().all(|event| !matches!(
+                &event.event,
+                AgentEvent::ConfigChanged { section, .. } if section == "core"
+            )),
+            "neither local commit can publish while the first owns config_io_lock"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(first.await.unwrap().unwrap().server.port, 22_231);
+        assert_eq!(second.await.unwrap().unwrap().server.port, 22_232);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let events = bamboo_engine::events::journal::read_since(
+                    state.account_sink.events_dir(),
+                    baseline_seq,
+                )
+                .unwrap();
+                let revisions = events
+                    .iter()
+                    .filter_map(|event| match &event.event {
+                        AgentEvent::ConfigChanged { section, revision } if section == "core" => {
+                            Some(*revision)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if revisions.len() == 2 {
+                    break revisions;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map(|revisions| assert_eq!(revisions, vec![1, 2]))
+        .expect("both serialized core events must reach the journal");
     }
 
     #[tokio::test]
