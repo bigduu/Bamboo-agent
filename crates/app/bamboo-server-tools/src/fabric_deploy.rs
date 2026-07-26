@@ -58,6 +58,14 @@ impl std::fmt::Display for FabricError {
 
 type FabricResult<T> = Result<T, FabricError>;
 
+async fn join_fabric_task<T>(
+    context: &'static str,
+    task: tokio::task::JoinHandle<FabricResult<T>>,
+) -> FabricResult<T> {
+    task.await
+        .map_err(|error| FabricError::Internal(format!("{context} task failed: {error}")))?
+}
+
 fn map_config_store_error(error: ConfigStoreError) -> FabricError {
     match error {
         ConfigStoreError::Conflict { expected, actual } => {
@@ -97,8 +105,43 @@ pub struct FabricActionResult<T> {
 
 type FabricEventPublisher = Arc<dyn Fn(&ConfigSectionEvent) + Send + Sync>;
 
+#[cfg(test)]
+type DeployBeforeFinalPersistTestHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(test)]
+fn deploy_before_final_persist_test_hooks(
+) -> &'static std::sync::Mutex<HashMap<PathBuf, DeployBeforeFinalPersistTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, DeployBeforeFinalPersistTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_deploy_before_final_persist_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce(&Path) + Send + 'static,
+) {
+    deploy_before_final_persist_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_deploy_before_final_persist_test_hook(data_dir: &Path) {
+    let hook = deploy_before_final_persist_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(data_dir);
+    if let Some(hook) = hook {
+        hook(data_dir);
+    }
+}
+
 /// The shared fabric deploy engine: turns persisted nodes into running
 /// `broker-agent` workers, holding their handles + persisting `NodeState`.
+#[derive(Clone)]
 pub struct FabricDeployer {
     config: Arc<RwLock<Config>>,
     /// Serializes the mutate+persist of a fabric config write (same guarantee as
@@ -285,7 +328,19 @@ impl FabricDeployer {
     /// the process-owned section authority. The durable section commit happens
     /// before runtime adoption and event publication, and the same config lock
     /// prevents the health monitor or an operator mutation from racing boot.
+    /// The detached task owns the whole transaction so cancellation of the
+    /// server-construction future cannot strand disk ahead of the process
+    /// facade/runtime publication.
     pub async fn reconcile_stale_nodes_on_boot(&self) -> FabricResult<usize> {
+        let deployer = self.clone();
+        join_fabric_task(
+            "cluster-fabric boot reconcile",
+            tokio::spawn(async move { deployer.reconcile_stale_nodes_on_boot_inner().await }),
+        )
+        .await
+    }
+
+    async fn reconcile_stale_nodes_on_boot_inner(&self) -> FabricResult<usize> {
         let _io = self.config_io_lock.lock().await;
         let stale = {
             let config = self.config.read().await;
@@ -336,11 +391,19 @@ impl FabricDeployer {
         update: F,
     ) -> FabricResult<FabricCommitSnapshot>
     where
-        F: FnOnce(&mut Config) -> FabricResult<()> + Send,
+        F: FnOnce(&mut Config) -> FabricResult<()> + Send + 'static,
     {
-        let _io = self.config_io_lock.lock().await;
-        self.persist_node_update_locked(expected_revision, update)
-            .await
+        let deployer = self.clone();
+        join_fabric_task(
+            "cluster-fabric state transaction",
+            tokio::spawn(async move {
+                let _io = deployer.config_io_lock.lock().await;
+                deployer
+                    .persist_node_update_locked(expected_revision, update)
+                    .await
+            }),
+        )
+        .await
     }
 
     /// Locked half of [`Self::persist_node_update_at_revision`]. Lifecycle
@@ -468,6 +531,25 @@ impl FabricDeployer {
         echo: bool,
         expected_revision: u64,
     ) -> FabricResult<FabricActionResult<NodeState>> {
+        let deployer = self.clone();
+        let node_id = node_id.to_string();
+        join_fabric_task(
+            "cluster-fabric deploy",
+            tokio::spawn(async move {
+                deployer
+                    .deploy_at_revision_inner(&node_id, echo, expected_revision)
+                    .await
+            }),
+        )
+        .await
+    }
+
+    async fn deploy_at_revision_inner(
+        &self,
+        node_id: &str,
+        echo: bool,
+        expected_revision: u64,
+    ) -> FabricResult<FabricActionResult<NodeState>> {
         let _io = self.config_io_lock.lock().await;
         let action_snapshot = self.snapshot_locked(expected_revision).await?;
         let (mut node, broker) = {
@@ -556,6 +638,26 @@ impl FabricDeployer {
             tls_ca_cert: None,
         };
 
+        // Publish a durable deployment intent before replacing any live worker.
+        // If the external action or its final state commit fails, the last
+        // durable state is therefore Deploying (or the subsequently committed
+        // Failed state), never the old Running claim with an empty registry.
+        let mut deploying = node.state.clone().unwrap_or_default();
+        deploying.status = NodeStatus::Deploying;
+        deploying.last_error = None;
+        let deployment_revision = self
+            .persist_node_update_locked(expected_revision, |config| {
+                let node = config
+                    .cluster_fabric
+                    .node_mut(node_id)
+                    .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
+                node.state = Some(deploying);
+                Ok(())
+            })
+            .await?
+            .section
+            .revision;
+
         // Release any prior worker FIRST so its reverse tunnel frees the broker
         // port before the new deploy requests the same forward. Remove under the
         // lock, shut down outside it: shutdown is graceful now (SIGTERM + drain
@@ -577,7 +679,7 @@ impl FabricDeployer {
                     last_error: Some(e.to_string()),
                     ..Default::default()
                 };
-                self.persist_node_update_locked(expected_revision, |config| {
+                self.persist_node_update_locked(deployment_revision, |config| {
                     let node = config
                         .cluster_fabric
                         .node_mut(node_id)
@@ -664,7 +766,7 @@ impl FabricDeployer {
                 last_error: Some(msg.clone()),
                 ..Default::default()
             };
-            self.persist_node_update_locked(expected_revision, |config| {
+            self.persist_node_update_locked(deployment_revision, |config| {
                 let node = config
                     .cluster_fabric
                     .node_mut(node_id)
@@ -702,8 +804,10 @@ impl FabricDeployer {
         };
         let response_state = state.clone();
         let placement = node.placement.clone();
+        #[cfg(test)]
+        run_deploy_before_final_persist_test_hook(&self.data_dir);
         let snapshot = match self
-            .persist_node_update_locked(expected_revision, move |config| {
+            .persist_node_update_locked(deployment_revision, move |config| {
                 let target = config
                     .cluster_fabric
                     .node_mut(node_id)
@@ -756,6 +860,24 @@ impl FabricDeployer {
 
     /// Stop against an operator-captured cluster-fabric revision.
     pub async fn stop_at_revision(
+        &self,
+        node_id: &str,
+        expected_revision: u64,
+    ) -> FabricResult<FabricActionResult<NodeState>> {
+        let deployer = self.clone();
+        let node_id = node_id.to_string();
+        join_fabric_task(
+            "cluster-fabric stop",
+            tokio::spawn(async move {
+                deployer
+                    .stop_at_revision_inner(&node_id, expected_revision)
+                    .await
+            }),
+        )
+        .await
+    }
+
+    async fn stop_at_revision_inner(
         &self,
         node_id: &str,
         expected_revision: u64,
@@ -870,6 +992,24 @@ impl FabricDeployer {
     /// config.json every tick. Presence is checked (never a task ping), so a live
     /// LLM worker is never disturbed — same rationale as the deploy verify.
     async fn health_check_within(
+        &self,
+        node_id: &str,
+        probe_timeout: Duration,
+    ) -> FabricResult<NodeState> {
+        let deployer = self.clone();
+        let node_id = node_id.to_string();
+        join_fabric_task(
+            "cluster-fabric health check",
+            tokio::spawn(async move {
+                deployer
+                    .health_check_within_inner(&node_id, probe_timeout)
+                    .await
+            }),
+        )
+        .await
+    }
+
+    async fn health_check_within_inner(
         &self,
         node_id: &str,
         probe_timeout: Duration,
@@ -1203,10 +1343,11 @@ impl FabricDeployer {
         state: Option<NodeState>,
         expected_revision: u64,
     ) -> FabricResult<FabricCommitSnapshot> {
-        self.persist_node_update_at_revision(expected_revision, |config| {
+        let node_id = node_id.to_string();
+        self.persist_node_update_at_revision(expected_revision, move |config| {
             let node = config
                 .cluster_fabric
-                .node_mut(node_id)
+                .node_mut(&node_id)
                 .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
             node.state = state;
             Ok(())
@@ -1618,6 +1759,150 @@ fn build_russh(node: &Node, target: &SshTarget) -> Result<RusshDeployer, String>
 mod lifecycle_persistence_tests {
     use super::*;
     use bamboo_config::cluster_fabric::{DeployProfile, TrustLevel};
+    use std::sync::Mutex as StdMutex;
+
+    struct ModularFixture {
+        _data_dir: tempfile::TempDir,
+        facade: Arc<ConfigFacade>,
+        config: Arc<RwLock<Config>>,
+        config_io_lock: Arc<Mutex<()>>,
+        registry: DeployedRegistry,
+        deployer: Arc<FabricDeployer>,
+        events: Arc<StdMutex<Vec<ConfigSectionEvent>>>,
+    }
+
+    fn modular_running_fixture(bamboo_bin: &str) -> ModularFixture {
+        let data_dir = tempfile::tempdir().unwrap();
+        let facade = Arc::new(ConfigFacade::open_or_migrate(data_dir.path()).unwrap());
+        let mut candidate = facade.effective_config();
+        candidate.cluster_fabric.nodes.push(Node {
+            id: "n1".to_string(),
+            label: "node".to_string(),
+            placement: NodePlacement::Local,
+            trust_level: TrustLevel::Trusted,
+            deploy: DeployProfile::default(),
+            state: Some(NodeState {
+                status: NodeStatus::Running,
+                worker_id: Some("cluster-node-n1".to_string()),
+                ..Default::default()
+            }),
+            enabled: true,
+        });
+        let revision = bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+            data_dir.path(),
+            &mut candidate,
+            &BTreeMap::new(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(revision, 1);
+        assert!(facade
+            .registry()
+            .reload_if_changed(SectionId::ClusterFabric)
+            .is_some());
+
+        let mut runtime = facade.effective_config();
+        runtime.subagents_mut().broker = Some(BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:9".to_string(),
+            token: "test-token".to_string(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: false,
+        });
+        let config = Arc::new(RwLock::new(runtime));
+        let config_io_lock = Arc::new(Mutex::new(()));
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let event_log = events.clone();
+        let deployer = Arc::new(
+            FabricDeployer::new(
+                config.clone(),
+                config_io_lock.clone(),
+                data_dir.path().to_path_buf(),
+                registry.clone(),
+                bamboo_bin,
+            )
+            .with_modular_persistence(
+                facade.clone(),
+                Arc::new(CredentialStore::open(data_dir.path())),
+                Arc::new(move |event| event_log.lock().unwrap().push(event.clone())),
+            ),
+        );
+        ModularFixture {
+            _data_dir: data_dir,
+            facade,
+            config,
+            config_io_lock,
+            registry,
+            deployer,
+            events,
+        }
+    }
+
+    async fn start_broker() -> (String, tempfile::TempDir) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(bamboo_broker::BrokerCore::new(data_dir.path()));
+        let server = Arc::new(bamboo_broker::BrokerServer::new(core, "test-token"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (format!("ws://{address}"), data_dir)
+    }
+
+    async fn join_expected_worker(
+        fixture: &ModularFixture,
+        endpoint: &str,
+    ) -> bamboo_broker::BrokerClient {
+        fixture.config.write().await.subagents_mut().broker = Some(BrokerClientConfig {
+            endpoint: endpoint.to_string(),
+            token: "test-token".to_string(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: false,
+        });
+        let node = fixture
+            .config
+            .read()
+            .await
+            .cluster_fabric
+            .node("n1")
+            .cloned()
+            .unwrap();
+        let worker_id = worker_id_for(&node);
+        let role = node
+            .deploy
+            .default_role
+            .clone()
+            .unwrap_or_else(|| "general-purpose".to_string());
+        let mut worker = bamboo_broker::BrokerClient::connect(
+            endpoint,
+            AgentRef {
+                session_id: worker_id,
+                role: Some(role),
+            },
+            "test-token",
+        )
+        .await
+        .unwrap();
+        worker.subscribe().await.unwrap();
+        worker
+    }
+
+    async fn insert_prior_worker(fixture: &ModularFixture) {
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        fixture.registry.lock().await.insert(
+            crate::registry_keys::node_key("n1"),
+            Deployed {
+                env: "local".to_string(),
+                handle: bamboo_broker::DeployedAgent::from_parts("old-worker", child, None),
+            },
+        );
+    }
 
     #[tokio::test]
     async fn failed_durable_state_write_does_not_advance_runtime() {
@@ -1665,6 +1950,388 @@ mod lifecycle_persistence_tests {
                 .state
                 .is_none(),
             "runtime must retain the pre-commit state when persistence fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_state_caller_still_finishes_disk_runtime_facade_and_event_publication() {
+        let fixture = modular_running_fixture("/usr/bin/true");
+        let guard = fixture.config_io_lock.lock().await;
+        let caller = {
+            let deployer = fixture.deployer.clone();
+            tokio::spawn(async move {
+                deployer
+                    .persist_state_at_revision(
+                        "n1",
+                        Some(NodeState {
+                            status: NodeStatus::Stopped,
+                            ..Default::default()
+                        }),
+                        1,
+                    )
+                    .await
+            })
+        };
+
+        // Let the public future spawn its transaction owner, then cancel only
+        // the caller while that owner is blocked behind the shared config lock.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller.abort();
+        let join_error = match caller.await {
+            Err(error) => error,
+            Ok(_) => panic!("the caller must be cancelled while its transaction stays alive"),
+        };
+        assert!(join_error.is_cancelled());
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let revision = fixture.facade.registry().cluster_fabric.snapshot().revision;
+                let status = fixture
+                    .config
+                    .read()
+                    .await
+                    .cluster_fabric
+                    .node("n1")
+                    .and_then(|node| node.state.as_ref())
+                    .map(|state| state.status);
+                if revision == 2
+                    && status == Some(NodeStatus::Stopped)
+                    && fixture.events.lock().unwrap().len() == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached lifecycle state transaction must finish after caller cancellation");
+
+        let reopened = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Stopped
+        );
+        assert_eq!(
+            fixture.events.lock().unwrap().as_slice(),
+            &[ConfigSectionEvent::Changed {
+                section: "cluster-fabric".to_string(),
+                revision: 2,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_caller_still_commits_and_shuts_down_the_registered_worker() {
+        let fixture = modular_running_fixture("/usr/bin/true");
+        insert_prior_worker(&fixture).await;
+        let guard = fixture.config_io_lock.lock().await;
+        let caller = {
+            let deployer = fixture.deployer.clone();
+            tokio::spawn(async move { deployer.stop_at_revision("n1", 1).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller.abort();
+        let join_error = match caller.await {
+            Err(error) => error,
+            Ok(_) => panic!("the request-facing stop caller must be cancelled"),
+        };
+        assert!(join_error.is_cancelled());
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let revision = fixture.facade.registry().cluster_fabric.snapshot().revision;
+                let status = fixture
+                    .config
+                    .read()
+                    .await
+                    .cluster_fabric
+                    .node("n1")
+                    .and_then(|node| node.state.as_ref())
+                    .map(|state| state.status);
+                if revision == 2
+                    && status == Some(NodeStatus::Stopped)
+                    && fixture.registry.lock().await.is_empty()
+                    && fixture.events.lock().unwrap().len() == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached stop must finish commit and worker shutdown");
+
+        let reopened = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_redeploy_never_leaves_the_old_running_claim_after_worker_replacement() {
+        let fixture = modular_running_fixture("/definitely/missing/bamboo");
+        insert_prior_worker(&fixture).await;
+
+        let error = match fixture.deployer.deploy_at_revision("n1", true, 1).await {
+            Err(error) => error,
+            Ok(_) => panic!("the replacement binary does not exist"),
+        };
+        assert!(matches!(error, FabricError::Internal(_)));
+        assert!(fixture.registry.lock().await.is_empty());
+        let process_snapshot = fixture.facade.registry().cluster_fabric.snapshot();
+        assert_eq!(
+            process_snapshot.revision, 3,
+            "Deploying intent and Failed result are distinct durable commits"
+        );
+        assert_eq!(
+            process_snapshot
+                .data
+                .0
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Failed
+        );
+        assert_eq!(
+            fixture
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Failed
+        );
+        assert_eq!(
+            fixture.events.lock().unwrap().as_slice(),
+            &[
+                ConfigSectionEvent::Changed {
+                    section: "cluster-fabric".to_string(),
+                    revision: 2,
+                },
+                ConfigSectionEvent::Changed {
+                    section: "cluster-fabric".to_string(),
+                    revision: 3,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_deploy_caller_cannot_strand_a_verified_worker_before_final_publication() {
+        let (endpoint, _broker_dir) = start_broker().await;
+        let fixture = modular_running_fixture("/usr/bin/true");
+        let _worker = join_expected_worker(&fixture, &endpoint).await;
+        insert_prior_worker(&fixture).await;
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_deploy_before_final_persist_test_hook(fixture._data_dir.path(), move |_| {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let caller = {
+            let deployer = fixture.deployer.clone();
+            tokio::spawn(async move { deployer.deploy_at_revision("n1", false, 1).await })
+        };
+        tokio::task::spawn_blocking(move || {
+            reached_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("deploy must reach the final persistence boundary")
+        })
+        .await
+        .unwrap();
+
+        caller.abort();
+        let join_error = match caller.await {
+            Err(error) => error,
+            Ok(_) => panic!("the request-facing deploy caller must be cancelled"),
+        };
+        assert!(join_error.is_cancelled());
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .await
+                .contains_key(&crate::registry_keys::node_key("n1")),
+            "the detached owner still controls the verified replacement"
+        );
+        release_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let revision = fixture.facade.registry().cluster_fabric.snapshot().revision;
+                let status = fixture
+                    .config
+                    .read()
+                    .await
+                    .cluster_fabric
+                    .node("n1")
+                    .and_then(|node| node.state.as_ref())
+                    .map(|state| state.status);
+                if revision == 3
+                    && status == Some(NodeStatus::Running)
+                    && fixture.events.lock().unwrap().len() == 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached deploy must finish final durable/runtime/event publication");
+        let reopened = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 3);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Running
+        );
+
+        let replacement = fixture
+            .registry
+            .lock()
+            .await
+            .remove(&crate::registry_keys::node_key("n1"));
+        if let Some(replacement) = replacement {
+            replacement.handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn final_redeploy_cas_loss_leaves_durable_deploying_intent_not_stale_running() {
+        let (endpoint, _broker_dir) = start_broker().await;
+        let fixture = modular_running_fixture("/usr/bin/true");
+        let _worker = join_expected_worker(&fixture, &endpoint).await;
+        insert_prior_worker(&fixture).await;
+
+        set_deploy_before_final_persist_test_hook(fixture._data_dir.path(), move |data_dir| {
+            let external = ConfigFacade::open(data_dir).unwrap();
+            let mut winner = external.effective_config();
+            let node = winner.cluster_fabric.node_mut("n1").unwrap();
+            assert_eq!(
+                node.state.as_ref().unwrap().status,
+                NodeStatus::Deploying,
+                "the destructive replacement must follow a durable intent"
+            );
+            node.label = "external-winner".to_string();
+            let revision =
+                bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                    data_dir,
+                    &mut winner,
+                    &BTreeMap::new(),
+                    2,
+                )
+                .unwrap();
+            assert_eq!(revision, 3);
+        });
+
+        let error = match fixture.deployer.deploy_at_revision("n1", false, 1).await {
+            Err(error) => error,
+            Ok(_) => panic!("the cross-process revision winner must reject the final deploy CAS"),
+        };
+        assert!(matches!(
+            error,
+            FabricError::Conflict {
+                expected: 2,
+                actual: 3
+            }
+        ));
+        assert!(
+            fixture.registry.lock().await.is_empty(),
+            "the rejected replacement worker must be compensated"
+        );
+        assert_eq!(
+            fixture
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Deploying,
+            "runtime must never retain the destroyed old Running claim"
+        );
+        assert_eq!(
+            fixture
+                .facade
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .data
+                .0
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Deploying
+        );
+        let reopened = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        let durable = reopened.effective_config();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 3);
+        assert_eq!(
+            durable
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Deploying
+        );
+        assert_eq!(
+            durable.cluster_fabric.node("n1").unwrap().label,
+            "external-winner"
+        );
+        assert_eq!(
+            fixture.events.lock().unwrap().as_slice(),
+            &[ConfigSectionEvent::Changed {
+                section: "cluster-fabric".to_string(),
+                revision: 2,
+            }]
         );
     }
 }
