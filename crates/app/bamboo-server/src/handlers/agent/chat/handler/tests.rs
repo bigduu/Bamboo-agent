@@ -197,18 +197,31 @@ fn resolve_workspace_path_uses_request_then_metadata() {
 // disk fallback is unit-tested directly + deterministically in bamboo-engine's
 // session_app::chat (default_workspace_from_data_dir_reads_configured_work_area).
 
-#[test]
-fn sync_runtime_workspace_persists_workspace_for_tools() {
-    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-    let workspace = temp_dir.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace should exist");
+#[actix_web::test]
+async fn sync_runtime_workspace_materializes_with_the_states_provider() {
+    let app_home = tempfile::tempdir().expect("app home");
+    let state = crate::AppState::new(app_home.path().to_path_buf())
+        .await
+        .expect("app state");
+    let root = bamboo_config::paths::resolve_workspace_root_in(app_home.path());
+    let workspace = root.join("session-runtime-workspace");
     let session_id = "session-runtime-workspace";
+    assert!(!workspace.exists());
 
-    sync_runtime_workspace(session_id, Some(workspace.to_string_lossy().as_ref()));
+    sync_runtime_workspace(
+        &state,
+        session_id,
+        Some(workspace.to_string_lossy().as_ref()),
+        "session_fallback",
+    );
 
     let resolved = bamboo_tools::tools::workspace_state::get_workspace(session_id)
         .expect("workspace should be stored");
-    assert_eq!(resolved, workspace.canonicalize().unwrap_or(workspace));
+    assert_eq!(resolved, workspace);
+    assert!(
+        resolved.is_dir(),
+        "instance root should materialize fallback"
+    );
 }
 
 #[test]

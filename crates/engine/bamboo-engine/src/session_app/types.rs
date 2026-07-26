@@ -34,6 +34,23 @@ pub struct ExecutionConfigSnapshot {
 
 // ---- Chat types ----
 
+/// Fallback policy used after request, durable-session, and caller-configured
+/// workspace candidates are absent.
+///
+/// Existing SDK/CLI call paths retain [`Self::Legacy`], including their
+/// process-global provider or data-directory config lookup. The server uses
+/// [`Self::Authoritative`] because its live config snapshot is authoritative
+/// even when it contains no configured default; it supplies the owning
+/// AppState's session-root fallback without consulting process-global state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ChatWorkspaceFallbackPolicy {
+    #[default]
+    Legacy,
+    Authoritative {
+        session_fallback_path: Option<String>,
+    },
+}
+
 /// Input for the chat turn use case.
 pub struct ChatTurnInput {
     pub session_id: String,
