@@ -2994,6 +2994,9 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                ),
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3072,6 +3075,9 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                ),
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3148,6 +3154,11 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "configuration commit outcome is indeterminate: {message}"
+                    ))
+                }
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3221,6 +3232,9 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                ),
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3294,6 +3308,9 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                ),
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3432,6 +3449,9 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                ),
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3488,6 +3508,9 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                ),
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3684,6 +3707,9 @@ impl AppState {
                     AppError::ConfigConflict { expected, actual }
                 }
                 ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                ),
                 ConfigStoreError::Io(error) => AppError::StorageError(error),
                 ConfigStoreError::Json(_) => {
                     AppError::BadRequest("configuration document is invalid".to_string())
@@ -3740,11 +3766,11 @@ impl AppState {
                         ConfigStoreError::Conflict { expected, actual } => {
                             AppError::ConfigConflict { expected, actual }
                         }
-                        ConfigStoreError::Validation(_) | ConfigStoreError::Json(_) => {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "credential store validation failed"
-                            ))
-                        }
+                        ConfigStoreError::Validation(_)
+                        | ConfigStoreError::CommitIndeterminate(_)
+                        | ConfigStoreError::Json(_) => AppError::InternalError(anyhow::anyhow!(
+                            "credential store validation failed"
+                        )),
                         ConfigStoreError::Io(error) => AppError::StorageError(error),
                         ConfigStoreError::Watch(error) => AppError::InternalError(anyhow::anyhow!(
                             "configuration watch failed: {error}"

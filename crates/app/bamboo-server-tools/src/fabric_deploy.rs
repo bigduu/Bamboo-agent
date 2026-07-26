@@ -80,6 +80,10 @@ fn map_config_store_error(error: ConfigStoreError) -> FabricError {
             FabricError::Conflict { expected, actual }
         }
         ConfigStoreError::Validation(message) => FabricError::BadRequest(message),
+        ConfigStoreError::CommitIndeterminate(message) => FabricError::Committed(format!(
+            "cluster configuration outcome is indeterminate; preserve the external lifecycle \
+             action until recovery resolves it: {message}"
+        )),
         ConfigStoreError::Io(error) => {
             FabricError::Internal(format!("cluster configuration storage failed: {error}"))
         }
@@ -1945,6 +1949,17 @@ mod lifecycle_persistence_tests {
     use super::*;
     use bamboo_config::cluster_fabric::{DeployProfile, TrustLevel};
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn indeterminate_config_commit_maps_to_non_compensating_lifecycle_error() {
+        let error = map_config_store_error(ConfigStoreError::CommitIndeterminate(
+            "recovery may still commit".to_string(),
+        ));
+        assert!(matches!(error, FabricError::Committed(_)));
+        assert!(error
+            .to_string()
+            .contains("preserve the external lifecycle action"));
+    }
 
     struct ModularFixture {
         _data_dir: tempfile::TempDir,

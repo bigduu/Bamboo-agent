@@ -41,6 +41,11 @@ pub enum ConfigStoreError {
     Conflict { expected: u64, actual: u64 },
     #[error("configuration validation failed: {0}")]
     Validation(String),
+    /// The caller cannot prove whether the durable commit point won. Callers
+    /// that own an external side effect must retain it until recovery resolves
+    /// the transaction instead of compensating as if commit definitely failed.
+    #[error("configuration commit outcome is indeterminate: {0}")]
+    CommitIndeterminate(String),
     #[error("configuration watch failed")]
     Watch(#[from] notify::Error),
 }
@@ -55,6 +60,7 @@ pub(crate) fn repairable_live_lkg_error(error: &ConfigStoreError) -> bool {
         }
         ConfigStoreError::Io(_)
         | ConfigStoreError::Conflict { .. }
+        | ConfigStoreError::CommitIndeterminate(_)
         | ConfigStoreError::Watch(_) => false,
     }
 }

@@ -239,6 +239,9 @@ pub(super) fn map_store_read_error(error: ConfigStoreError) -> AppError {
         ConfigStoreError::Validation(_) => {
             AppError::InternalError(anyhow::anyhow!("credential store validation failed"))
         }
+        ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(anyhow::anyhow!(
+            "credential transaction outcome is indeterminate: {message}"
+        )),
         ConfigStoreError::Json(_) => {
             AppError::InternalError(anyhow::anyhow!("credential store document is invalid"))
         }

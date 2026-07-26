@@ -479,7 +479,9 @@ async fn cluster_section_envelope(
     })?
     .map_err(|error| match error {
         ConfigStoreError::Io(error) => AppError::StorageError(error),
-        ConfigStoreError::Json(_) | ConfigStoreError::Validation(_) => {
+        ConfigStoreError::Json(_)
+        | ConfigStoreError::Validation(_)
+        | ConfigStoreError::CommitIndeterminate(_) => {
             AppError::InternalError(anyhow::anyhow!("cluster section snapshot is unavailable"))
         }
         ConfigStoreError::Conflict { .. } => AppError::InternalError(anyhow::anyhow!(

@@ -3921,6 +3921,9 @@ fn error_category(error: &crate::ConfigStoreError) -> String {
         crate::ConfigStoreError::Json(_) => "credential document is invalid",
         crate::ConfigStoreError::Conflict { .. } => "credential revision conflict",
         crate::ConfigStoreError::Validation(_) => "credential document failed validation",
+        crate::ConfigStoreError::CommitIndeterminate(_) => {
+            "credential transaction outcome is indeterminate"
+        }
         crate::ConfigStoreError::Watch(_) => "credential store watch failed",
     }
     .to_string()

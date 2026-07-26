@@ -665,6 +665,11 @@ fn map_mutation_error(error: ConfigSectionMutationError) -> AppError {
         ConfigSectionMutationError::Store(ConfigStoreError::Validation(message))
         | ConfigSectionMutationError::Invalid(message)
         | ConfigSectionMutationError::Runtime(message) => AppError::BadRequest(message),
+        ConfigSectionMutationError::Store(ConfigStoreError::CommitIndeterminate(message)) => {
+            AppError::InternalError(anyhow::anyhow!(
+                "section transaction outcome is indeterminate: {message}"
+            ))
+        }
         ConfigSectionMutationError::Store(ConfigStoreError::Io(error)) => {
             AppError::StorageError(error)
         }
