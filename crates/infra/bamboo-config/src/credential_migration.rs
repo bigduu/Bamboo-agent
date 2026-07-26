@@ -877,12 +877,21 @@ pub enum ClusterExactCommitTestFault {
     AfterCredentialInstall,
     BeforeFinish,
     AbortMarkerRecoveryFailure,
+    AbortJournalMarkerAndCleanupRecoveryFailure,
+    AbortBothMarkersRecoveryFailure,
     AbortCleanupRecoveryFailure,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy)]
+struct ClusterExactCommitTestFaultState {
+    fault: ClusterExactCommitTestFault,
+    cleanup_failure_observed: bool,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 static CLUSTER_EXACT_COMMIT_TEST_FAULTS: LazyLock<
-    Mutex<BTreeMap<PathBuf, ClusterExactCommitTestFault>>,
+    Mutex<BTreeMap<PathBuf, ClusterExactCommitTestFaultState>>,
 > = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// Install a one-shot hook immediately after an env exact manifest commits.
@@ -904,7 +913,13 @@ pub fn set_cluster_exact_commit_test_fault(
     CLUSTER_EXACT_COMMIT_TEST_FAULTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(data_dir.into(), fault);
+        .insert(
+            data_dir.into(),
+            ClusterExactCommitTestFaultState {
+                fault,
+                cleanup_failure_observed: false,
+            },
+        );
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -923,7 +938,10 @@ fn take_cluster_exact_commit_test_fault(
     let mut faults = CLUSTER_EXACT_COMMIT_TEST_FAULTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if faults.get(data_dir) == Some(&fault) {
+    if faults
+        .get(data_dir)
+        .is_some_and(|state| state.fault == fault)
+    {
         faults.remove(data_dir);
         true
     } else {
@@ -936,7 +954,7 @@ fn take_cluster_exact_after_manifest_test_fault(data_dir: &Path) -> bool {
     let mut faults = CLUSTER_EXACT_COMMIT_TEST_FAULTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match faults.get(data_dir).copied() {
+    match faults.get(data_dir).map(|state| state.fault) {
         Some(ClusterExactCommitTestFault::AfterManifest) => {
             faults.remove(data_dir);
             true
@@ -950,11 +968,22 @@ fn take_cluster_exact_after_manifest_test_fault(data_dir: &Path) -> bool {
 
 #[cfg(any(test, feature = "test-utils"))]
 fn cluster_abort_cleanup_test_fault(data_dir: &Path) -> bool {
-    CLUSTER_EXACT_COMMIT_TEST_FAULTS
+    let mut faults = CLUSTER_EXACT_COMMIT_TEST_FAULTS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(data_dir)
-        == Some(&ClusterExactCommitTestFault::AbortCleanupRecoveryFailure)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(state) = faults.get_mut(data_dir) else {
+        return false;
+    };
+    match state.fault {
+        ClusterExactCommitTestFault::AbortCleanupRecoveryFailure => true,
+        ClusterExactCommitTestFault::AbortJournalMarkerAndCleanupRecoveryFailure
+            if !state.cleanup_failure_observed =>
+        {
+            state.cleanup_failure_observed = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -963,7 +992,28 @@ fn cluster_abort_marker_test_fault(data_dir: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(data_dir)
-        == Some(&ClusterExactCommitTestFault::AbortMarkerRecoveryFailure)
+        .is_some_and(|state| {
+            matches!(
+                state.fault,
+                ClusterExactCommitTestFault::AbortMarkerRecoveryFailure
+                    | ClusterExactCommitTestFault::AbortBothMarkersRecoveryFailure
+            )
+        })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn cluster_abort_journal_marker_test_fault(data_dir: &Path) -> bool {
+    CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(data_dir)
+        .is_some_and(|state| {
+            matches!(
+                state.fault,
+                ClusterExactCommitTestFault::AbortJournalMarkerAndCleanupRecoveryFailure
+                    | ClusterExactCommitTestFault::AbortBothMarkersRecoveryFailure
+            )
+        })
 }
 
 /// Extract provider/MCP/root secrets into the isolated credential store.
@@ -1945,6 +1995,7 @@ enum LiveClusterTransaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClusterInstallOutcome {
     CommitIntent,
+    AbortAttempt,
     Aborting,
 }
 
@@ -1953,6 +2004,10 @@ struct ClusterInstallTracker(Cell<ClusterInstallOutcome>);
 impl ClusterInstallTracker {
     fn new() -> Self {
         Self(Cell::new(ClusterInstallOutcome::CommitIntent))
+    }
+
+    fn mark_abort_attempt(&self) {
+        self.0.set(ClusterInstallOutcome::AbortAttempt);
     }
 
     fn mark_aborting(&self) {
@@ -3682,11 +3737,13 @@ fn persist_exact_credential_transaction_inner(
     if let Err(initial_error) = completion {
         if cluster_install_tracker
             .as_ref()
-            .is_some_and(|tracker| tracker.outcome() == ClusterInstallOutcome::Aborting)
+            .is_some_and(|tracker| tracker.outcome() != ClusterInstallOutcome::CommitIntent)
         {
-            // An intentional abort is a typed non-commit result. Never infer
-            // commit from a still-Pending manifest when persisting the durable
-            // Aborting marker or rollback cleanup itself failed.
+            // Once an intentional abort has started, never infer commit or
+            // publish the staged candidate in this process. `AbortAttempt`
+            // covers the indeterminate case where neither redundant durable
+            // marker could be confirmed; `Aborting` covers either marker
+            // succeeding before rollback or cleanup failed.
             return Err(initial_error);
         }
         if !adopted_cluster_transaction {
@@ -8099,6 +8156,12 @@ fn persist_cluster_abort_journal(
         ));
     }
     if journal.state != MigrationState::Aborting {
+        #[cfg(any(test, feature = "test-utils"))]
+        if cluster_abort_journal_marker_test_fault(data_dir) {
+            return Err(ConfigStoreError::Validation(
+                "injected persistent cluster abort journal marker failure".to_string(),
+            ));
+        }
         journal.state = MigrationState::Aborting;
         write_manifest(path, &journal)?;
     }
@@ -8670,28 +8733,60 @@ fn abort_cluster_exact_transaction(
             "a complete cluster transaction cannot enter abort rollback".to_string(),
         ));
     }
-    // First persist non-commit intent into the immutable rollback journal. If
-    // this write fails, the transaction remains indeterminate/commit-intent
-    // and must not be reported through the typed non-commit path.
-    persist_cluster_abort_journal(data_dir, manifest)?;
-    if let Some(tracker) = install_tracker {
-        // The journal is now durable, so this process can safely classify the
-        // result as non-commit even if the mutable main marker write fails.
-        tracker.mark_aborting();
-    }
     let mut aborting = manifest.clone();
     aborting.state = MigrationState::Aborting;
-    if manifest.state != MigrationState::Aborting {
-        // Persist non-commit intent before touching either installed member.
-        // From this boundary onward recovery must resume rollback, never
-        // install or adopt the staged candidate.
-        #[cfg(any(test, feature = "test-utils"))]
-        if cluster_abort_marker_test_fault(data_dir) {
-            return Err(ConfigStoreError::Validation(
-                "injected persistent cluster abort marker failure".to_string(),
-            ));
+
+    if manifest.state == MigrationState::Aborting {
+        // A restart may arrive here after the main manifest was the successful
+        // fallback marker while the immutable journal remained Pending. The
+        // durable main state is already sufficient non-commit evidence; leave
+        // the journal's original rollback members untouched.
+        if let Some(tracker) = install_tracker {
+            tracker.mark_aborting();
         }
-        write_manifest(data_dir.join(MANIFEST_FILE), &aborting)?;
+    } else {
+        if let Some(tracker) = install_tracker {
+            // This process has chosen abort, even though neither durable marker
+            // is confirmed yet. A double write failure must not fall back into
+            // committed-candidate adoption in the caller.
+            tracker.mark_abort_attempt();
+        }
+
+        // Prefer the journal marker because it preserves a fallback if the
+        // mutable main marker cannot be written. If the journal transition
+        // fails, the main manifest is the redundant durable abort marker.
+        let journal_durable = persist_cluster_abort_journal(data_dir, manifest).is_ok();
+        if journal_durable {
+            if let Some(tracker) = install_tracker {
+                tracker.mark_aborting();
+            }
+        }
+
+        #[cfg(any(test, feature = "test-utils"))]
+        let main_marker = if cluster_abort_marker_test_fault(data_dir) {
+            Err(ConfigStoreError::Validation(
+                "injected persistent cluster abort marker failure".to_string(),
+            ))
+        } else {
+            write_manifest(data_dir.join(MANIFEST_FILE), &aborting)
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let main_marker = write_manifest(data_dir.join(MANIFEST_FILE), &aborting);
+
+        match main_marker {
+            Ok(()) => {
+                if let Some(tracker) = install_tracker {
+                    tracker.mark_aborting();
+                }
+            }
+            Err(error) if journal_durable => return Err(error),
+            Err(_) => {
+                return Err(ConfigStoreError::Validation(
+                    "cluster abort intent could not be persisted to either durable marker"
+                        .to_string(),
+                ));
+            }
+        }
     }
     #[cfg(any(test, feature = "test-utils"))]
     if cluster_abort_cleanup_test_fault(data_dir) {
@@ -15893,6 +15988,213 @@ mod tests {
             }
         }
         assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn abort_journal_marker_failure_falls_back_to_main_abort_across_restart() {
+        let _key = crate::encryption::set_test_encryption_key([0xc5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let providers_path = dir.path().join(PROVIDERS_FILE);
+        let providers_before = std::fs::read(&providers_path).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "journal-marker-failure-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let abort_secret = Uuid::new_v4().to_string();
+        let intents = BTreeMap::from([(
+            "journal-marker-failure-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                abort_secret.clone(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AbortJournalMarkerAndCleanupRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persistent cluster abort cleanup failure"));
+        assert_eq!(callbacks, 0);
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.state,
+            MigrationState::Aborting,
+            "the main manifest must be the redundant durable abort marker"
+        );
+        let journal_path = dir.path().join(JOURNAL_FILE);
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(
+            journal.state,
+            MigrationState::Pending,
+            "journal marker failure must preserve the original rollback journal"
+        );
+        let stage_dir = dir.path().join(&journal.stage_dir);
+        let backup_dir = dir
+            .path()
+            .join(format!("{BACKUP_PREFIX}{}", journal.transaction_id));
+        assert!(stage_dir.exists());
+        assert!(backup_dir.exists());
+        assert_ne!(std::fs::read(&providers_path).unwrap(), providers_before);
+
+        // The original conflict disappears before restart. Keep the injected
+        // journal failure active: recovery can succeed only if the durable main
+        // Aborting marker skips any attempt to mutate the Pending journal.
+        std::fs::write(&providers_path, &providers_before).unwrap();
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Aborting
+        ));
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(
+            !recover_pending_config_transaction(dir.path()).unwrap(),
+            "restart recovery must roll back from the main abort marker"
+        );
+        clear_cluster_exact_commit_test_fault(dir.path());
+        assert!(!recover_pending_config_transaction(dir.path()).unwrap());
+
+        assert!(!manifest_path.exists());
+        assert!(!journal_path.exists());
+        assert!(!stage_dir.exists());
+        assert!(!backup_dir.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        let password_ref =
+            crate::cluster_password_credential_ref("journal-marker-failure-node").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&password_ref)
+            .unwrap()
+            .is_none());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh
+            .cluster_fabric
+            .node("journal-marker-failure-node")
+            .is_none());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap())
+                        .contains(&abort_secret),
+                    "aborted cluster plaintext remained in {}",
+                    entry.path().display()
+                );
+            }
+        }
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn abort_double_marker_failure_never_adopts_in_current_process() {
+        let _key = crate::encryption::set_test_encryption_key([0xc6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "double-marker-failure-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let intents = BTreeMap::from([(
+            "double-marker-failure-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "double-marker-secret".to_string(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AbortBothMarkersRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("either durable marker"));
+        assert_eq!(
+            callbacks, 0,
+            "an undurable abort attempt must bypass committed reporting"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap()).unwrap();
+        assert_eq!(manifest.state, MigrationState::Pending);
+        assert_eq!(journal.state, MigrationState::Pending);
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Committed(_)
+        ));
+        clear_cluster_exact_commit_test_fault(dir.path());
     }
 
     #[test]
