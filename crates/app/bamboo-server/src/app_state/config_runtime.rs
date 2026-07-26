@@ -714,19 +714,37 @@ pub(super) fn publish_registry_event(
     account_sink.record(None, &event);
 }
 
-fn publish_exact_facade_commit(
+/// Reload exact durable authorities into the process facade without making the
+/// resulting events externally observable yet. Compatibility writers use this
+/// phase to materialize and install the same facade generation in AppState
+/// before publishing Changed/Recovered.
+fn capture_exact_facade_commit_events(
     facade: Option<&std::sync::Arc<bamboo_config::ConfigFacade>>,
-    account_sink: &bamboo_engine::events::AccountEventSink,
     sections: &[SectionId],
-) -> Result<(), AppError> {
+) -> Vec<ConfigSectionEvent> {
     let Some(facade) = facade else {
-        return Ok(());
+        return Vec::new();
     };
+    let mut events = Vec::new();
     for section in sections {
         let Some(event) = facade.registry().reload_if_changed(*section) else {
             continue;
         };
-        publish_registry_event(account_sink, &event);
+        let invalid = matches!(&event, ConfigSectionEvent::Invalid { .. });
+        events.push(event);
+        if invalid {
+            break;
+        }
+    }
+    events
+}
+
+fn publish_exact_facade_events(
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    events: &[ConfigSectionEvent],
+) -> Result<(), AppError> {
+    for event in events {
+        publish_registry_event(account_sink, event);
         if matches!(event, ConfigSectionEvent::Invalid { .. }) {
             return Err(AppError::InternalError(anyhow::anyhow!(
                 "committed configuration section became invalid before publication"
@@ -734,6 +752,15 @@ fn publish_exact_facade_commit(
         }
     }
     Ok(())
+}
+
+fn publish_exact_facade_commit(
+    facade: Option<&std::sync::Arc<bamboo_config::ConfigFacade>>,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    sections: &[SectionId],
+) -> Result<(), AppError> {
+    let events = capture_exact_facade_commit_events(facade, sections);
+    publish_exact_facade_events(account_sink, &events)
 }
 
 fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
@@ -2790,7 +2817,10 @@ impl AppState {
         new_config
     }
 
-    async fn persist_config_snapshot(&self, config: Config) -> anyhow::Result<()> {
+    async fn persist_config_snapshot(
+        &self,
+        config: Config,
+    ) -> anyhow::Result<Vec<ConfigSectionEvent>> {
         let data_dir = self.app_data_dir.clone();
         if self.config_facade.is_some() {
             tokio::task::spawn_blocking(move || {
@@ -2802,14 +2832,16 @@ impl AppState {
                 .iter()
                 .map(|descriptor| descriptor.id)
                 .collect::<Vec<_>>();
-            publish_exact_facade_commit(self.config_facade.as_ref(), &self.account_sink, &sections)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok(capture_exact_facade_commit_events(
+                self.config_facade.as_ref(),
+                &sections,
+            ))
         } else {
             tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
                 .await
                 .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
+            Ok(Vec::new())
         }
-        Ok(())
     }
 
     /// Unified config update entrypoint.
@@ -2878,7 +2910,8 @@ impl AppState {
             if enforcement_newly_off {
                 warn_plugin_trust_enforcement_off();
             }
-            self.persist_config_snapshot(snapshot.clone())
+            let events = self
+                .persist_config_snapshot(snapshot.clone())
                 .await
                 .map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
@@ -2893,6 +2926,10 @@ impl AppState {
                 snapshot.publish_env_vars();
                 *cfg = snapshot.clone();
             }
+            // Preserve the established ordering relative to optional runtime
+            // effects: config events precede those effects, but now only after
+            // the matching materialized snapshot is live.
+            publish_exact_facade_events(&self.account_sink, &events)?;
             snapshot
         };
 
@@ -3815,7 +3852,8 @@ impl AppState {
                 reject_if_recovery_pending(&cfg)?;
                 cfg.plugin_trust.enforcement_is_off()
             };
-            self.persist_config_snapshot(new_config.clone())
+            let events = self
+                .persist_config_snapshot(new_config.clone())
                 .await
                 .map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
@@ -3828,6 +3866,9 @@ impl AppState {
             let enforcement_newly_off = !was_off && published.plugin_trust.enforcement_is_off();
             published.publish_env_vars();
             *self.config.write().await = published.clone();
+            // `record` is nonblocking, so this must remain after the live
+            // AppState write rather than inside persistence/reload capture.
+            publish_exact_facade_events(&self.account_sink, &events)?;
             // Same live signal as `update_config` — a full-config replace (JSON
             // merge / PATCH endpoints) that transitions plugin_trust.enforcement
             // into `Off` must warn just as loudly as a targeted set.
@@ -4247,6 +4288,28 @@ mod live_reload_tests {
         next_config_event(feed, "mcp").await
     }
 
+    async fn wait_for_cluster_facade_revision(state: &AppState, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state
+                    .config_facade
+                    .as_ref()
+                    .unwrap()
+                    .registry()
+                    .cluster_fabric
+                    .snapshot()
+                    .revision
+                    == expected
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cluster facade revision did not advance");
+    }
+
     #[tokio::test]
     async fn compatibility_update_cannot_reintroduce_an_unrevisioned_cluster_mutation() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x70; 32]);
@@ -4337,6 +4400,7 @@ mod live_reload_tests {
             .await
             .unwrap();
         stop_config_watcher(&mut state);
+        let state = Arc::new(state);
 
         let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
         let mut external_candidate = external.effective_config();
@@ -4380,10 +4444,66 @@ mod live_reload_tests {
             "generation-one"
         );
 
-        let published = state
-            .update_config(|_| Ok(()), ConfigUpdateEffects::default())
+        let mut feed = state.account_sink.subscribe();
+        let stale_runtime = state.config.read().await;
+        let updating = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_config(|_| Ok(()), ConfigUpdateEffects::default())
+                    .await
+            })
+        };
+        wait_for_cluster_facade_revision(&state, 2).await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                next_config_event(&mut feed, "cluster-fabric"),
+            )
             .await
-            .unwrap();
+            .is_err(),
+            "r2 event became observable while live AppState config was still r1"
+        );
+        assert_eq!(
+            stale_runtime
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "generation-one"
+        );
+        drop(stale_runtime);
+
+        let event = next_config_event(&mut feed, "cluster-fabric").await;
+        assert!(matches!(
+            event,
+            AgentEvent::ConfigChanged {
+                section,
+                revision: 2
+            } if section == "cluster-fabric"
+        ));
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "external-generation-two",
+            "r2 must be live before its event is observable"
+        );
+        let published = updating.await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                next_config_event(&mut feed, "cluster-fabric"),
+            )
+            .await
+            .is_err(),
+            "r2 catch-up published a duplicate cluster event"
+        );
         assert_eq!(
             published.cluster_fabric.node("shared-node").unwrap().label,
             "external-generation-two"
@@ -4446,10 +4566,66 @@ mod live_reload_tests {
 
         let mut replacement = state.config.read().await.clone();
         replacement.server.port = 23_333;
-        let published = state
-            .replace_config(replacement, ConfigUpdateEffects::default())
+        let mut feed = state.account_sink.subscribe();
+        let stale_runtime = state.config.read().await;
+        let replacing = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .replace_config(replacement, ConfigUpdateEffects::default())
+                    .await
+            })
+        };
+        wait_for_cluster_facade_revision(&state, 3).await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                next_config_event(&mut feed, "cluster-fabric"),
+            )
             .await
-            .unwrap();
+            .is_err(),
+            "r3 event became observable while live AppState config was still r2"
+        );
+        assert_eq!(
+            stale_runtime
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "external-generation-two"
+        );
+        drop(stale_runtime);
+
+        let event = next_config_event(&mut feed, "cluster-fabric").await;
+        assert!(matches!(
+            event,
+            AgentEvent::ConfigChanged {
+                section,
+                revision: 3
+            } if section == "cluster-fabric"
+        ));
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("shared-node")
+                .unwrap()
+                .label,
+            "external-generation-three",
+            "r3 must be live before its event is observable"
+        );
+        let published = replacing.await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                next_config_event(&mut feed, "cluster-fabric"),
+            )
+            .await
+            .is_err(),
+            "r3 catch-up published a duplicate cluster event"
+        );
         assert_eq!(published.server.port, 23_333);
         assert_eq!(
             published.cluster_fabric.node("shared-node").unwrap().label,
