@@ -1519,8 +1519,11 @@ pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> Config
         )
     })?;
     if manifest.state != MigrationState::Complete {
+        let journal_aborting = manifest.state == MigrationState::Pending
+            && matching_cluster_abort_journal(data_dir.as_ref(), &manifest)?;
         if manifest.migration_scope == Some(MigrationScope::ClusterFabric)
             && manifest.state == MigrationState::Pending
+            && !journal_aborting
             && provider_mcp_documents_are_migration_free(data_dir.as_ref())?
             && pending_cluster_refs_are_exclusive(data_dir.as_ref())?
         {
@@ -1984,6 +1987,11 @@ fn load_live_cluster_transaction_manifest(
         return Err(ConfigStoreError::Validation(
             "cluster transaction manifest no longer matches its commit".to_string(),
         ));
+    }
+    if manifest.state == MigrationState::Pending
+        && matching_cluster_abort_journal(data_dir, &manifest)?
+    {
+        return Ok(LiveClusterTransaction::Aborting);
     }
     if manifest.state == MigrationState::Aborting {
         return Ok(LiveClusterTransaction::Aborting);
@@ -4069,8 +4077,12 @@ fn pending_cluster_migration(data_dir: &Path) -> ConfigStoreResult<bool> {
     };
     let manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&manifest)?;
-    Ok(manifest.state == MigrationState::Pending
-        && manifest.migration_scope == Some(MigrationScope::ClusterFabric))
+    let pending = manifest.state == MigrationState::Pending
+        && manifest.migration_scope == Some(MigrationScope::ClusterFabric);
+    if pending && matching_cluster_abort_journal(data_dir, &manifest)? {
+        return Ok(false);
+    }
+    Ok(pending)
 }
 
 fn pending_cluster_refs_are_exclusive(data_dir: &Path) -> ConfigStoreResult<bool> {
@@ -8028,6 +8040,71 @@ fn write_manifest(path: PathBuf, manifest: &MigrationManifest) -> ConfigStoreRes
     AtomicFileStore::new(path).write_bytes_without_backup(&serde_json::to_vec_pretty(manifest)?)
 }
 
+fn validate_matching_cluster_journal(
+    manifest: &MigrationManifest,
+    journal: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+        || journal.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+        || journal.transaction_id != manifest.transaction_id
+        || journal.stage_dir != manifest.stage_dir
+        || journal.migration_scope != manifest.migration_scope
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster abort journal does not match its committed manifest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Return whether the immutable transaction journal carries durable non-commit
+/// intent for this exact cluster transaction.
+///
+/// The journal's original file members are the rollback authority and may
+/// differ from a rebased main manifest. Matching therefore compares identity
+/// and scope only, never candidate member metadata.
+fn matching_cluster_abort_journal(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<bool> {
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(JOURNAL_FILE))? else {
+        return Ok(false);
+    };
+    let journal: MigrationManifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&journal)?;
+    if journal.state != MigrationState::Aborting {
+        return Ok(false);
+    }
+    validate_matching_cluster_journal(manifest, &journal)?;
+    Ok(true)
+}
+
+/// Persist durable abort intent into the immutable journal before the mutable
+/// main manifest is transitioned. Only `state` changes; original staged-member
+/// metadata remains available for exact rollback after rebases or restart.
+fn persist_cluster_abort_journal(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let path = data_dir.join(JOURNAL_FILE);
+    let bytes = read_optional_migration_file(&path)?.ok_or_else(|| {
+        ConfigStoreError::Validation("cluster abort journal is missing".to_string())
+    })?;
+    let mut journal: MigrationManifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&journal)?;
+    validate_matching_cluster_journal(manifest, &journal)?;
+    if journal.state == MigrationState::Complete {
+        return Err(ConfigStoreError::Validation(
+            "a complete cluster journal cannot enter abort rollback".to_string(),
+        ));
+    }
+    if journal.state != MigrationState::Aborting {
+        journal.state = MigrationState::Aborting;
+        write_manifest(path, &journal)?;
+    }
+    Ok(())
+}
+
 fn recover_committed(
     data_dir: &Path,
     #[cfg(test)] fault: Option<MigrationFault>,
@@ -8045,6 +8122,15 @@ fn recover_committed(
         }
         cleanup_transaction_dirs(data_dir, &manifest)?;
         remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+        return Ok(None);
+    }
+    if manifest.state == MigrationState::Pending
+        && matching_cluster_abort_journal(data_dir, &manifest)?
+    {
+        // The journal was durably marked before a failed main-manifest abort
+        // transition. Resume rollback before any install validation; the
+        // original conflict may no longer exist after restart.
+        abort_cluster_exact_transaction(data_dir, &manifest, None)?;
         return Ok(None);
     }
     if manifest.state == MigrationState::Aborting {
@@ -8584,9 +8670,13 @@ fn abort_cluster_exact_transaction(
             "a complete cluster transaction cannot enter abort rollback".to_string(),
         ));
     }
+    // First persist non-commit intent into the immutable rollback journal. If
+    // this write fails, the transaction remains indeterminate/commit-intent
+    // and must not be reported through the typed non-commit path.
+    persist_cluster_abort_journal(data_dir, manifest)?;
     if let Some(tracker) = install_tracker {
-        // The caller must know this is a non-commit outcome even if persisting
-        // the durable Aborting marker itself fails.
+        // The journal is now durable, so this process can safely classify the
+        // result as non-commit even if the mutable main marker write fails.
         tracker.mark_aborting();
     }
     let mut aborting = manifest.clone();
@@ -15668,6 +15758,8 @@ mod tests {
         let _key = crate::encryption::set_test_encryption_key([0xbe; 32]);
         let dir = tempfile::tempdir().unwrap();
         crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let providers_path = dir.path().join(PROVIDERS_FILE);
+        let providers_before = std::fs::read(&providers_path).unwrap();
         let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
         candidate.cluster_fabric.nodes.push(cluster_test_node(
             "marker-failure-node",
@@ -15679,7 +15771,9 @@ mod tests {
         let abort_secret = Uuid::new_v4().to_string();
         let intents = BTreeMap::from([(
             "marker-failure-node".to_string(),
-            password_intents(crate::ClusterCredentialAction::Replace(abort_secret)),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                abort_secret.clone(),
+            )),
         )]);
         let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
         let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
@@ -15729,28 +15823,49 @@ mod tests {
             MigrationState::Pending,
             "the injected marker failure must exercise the typed fallback"
         );
-        assert!(recover_committed(
-            dir.path(),
-            #[cfg(test)]
-            None,
-        )
-        .is_err());
-        let still_pending: MigrationManifest =
-            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        assert_eq!(still_pending.state, MigrationState::Pending);
-        assert_eq!(callbacks, 0);
+        let journal_path = dir.path().join(JOURNAL_FILE);
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(
+            journal.state,
+            MigrationState::Aborting,
+            "the immutable journal must retain durable non-commit intent"
+        );
+        let stage_dir = dir.path().join(&journal.stage_dir);
+        let backup_dir = dir
+            .path()
+            .join(format!("{BACKUP_PREFIX}{}", journal.transaction_id));
+        assert!(stage_dir.exists());
+        assert!(backup_dir.exists());
+        assert_ne!(
+            std::fs::read(&providers_path).unwrap(),
+            providers_before,
+            "the conflict must still be present before restart"
+        );
+
+        // Simulate a restart after the external conflict has disappeared. The
+        // Pending main manifest alone would now be installable, so recovery
+        // must honor the durable Aborting journal instead.
+        std::fs::write(&providers_path, &providers_before).unwrap();
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Aborting
+        ));
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
 
         clear_cluster_exact_commit_test_fault(dir.path());
-        let recovered_abort = recover_committed(
-            dir.path(),
-            #[cfg(test)]
-            None,
-        )
-        .unwrap_err();
-        assert!(recovered_abort
-            .to_string()
-            .contains("shared by another consumer"));
+        assert!(
+            !recover_pending_config_transaction(dir.path()).unwrap(),
+            "restart recovery must roll back rather than report a committed candidate"
+        );
+        assert!(
+            !recover_pending_config_transaction(dir.path()).unwrap(),
+            "completed abort recovery must be idempotent"
+        );
         assert!(!manifest_path.exists());
+        assert!(!journal_path.exists());
+        assert!(!stage_dir.exists());
+        assert!(!backup_dir.exists());
         assert_eq!(
             std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
             cluster_before
@@ -15759,6 +15874,24 @@ mod tests {
             std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
             credentials_before
         );
+        let password_ref = crate::cluster_password_credential_ref("marker-failure-node").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&password_ref)
+            .unwrap()
+            .is_none());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh.cluster_fabric.node("marker-failure-node").is_none());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap())
+                        .contains(&abort_secret),
+                    "aborted cluster plaintext remained in {}",
+                    entry.path().display()
+                );
+            }
+        }
         assert_eq!(callbacks, 0);
     }
 
