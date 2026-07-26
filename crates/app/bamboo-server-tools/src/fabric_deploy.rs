@@ -20,7 +20,7 @@ use bamboo_broker::{
     RusshDeployer, SshDeployer, UploadSpec, ORCHESTRATOR_ID,
 };
 use bamboo_config::cluster_fabric::{
-    ClusterFabricConfig, Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget,
+    Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget,
 };
 use bamboo_config::{
     BrokerClientConfig, Config, ConfigFacade, ConfigSectionEvent, ConfigStoreError,
@@ -354,27 +354,9 @@ impl FabricDeployer {
         }
     }
 
-    async fn hydrate_cluster_fabric(
-        &self,
-        fabric: ClusterFabricConfig,
-    ) -> FabricResult<ClusterFabricConfig> {
-        let data_dir = self.data_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut config = Config::default();
-            config.cluster_fabric = fabric;
-            config.hydrate_cluster_credentials_from_store(&data_dir)?;
-            Ok::<_, ConfigStoreError>(config.cluster_fabric.clone())
-        })
-        .await
-        .map_err(|error| {
-            FabricError::Internal(format!("credential hydration task failed: {error}"))
-        })?
-        .map_err(map_config_store_error)
-    }
-
     async fn snapshot_locked(&self, expected_revision: u64) -> FabricResult<FabricCommitSnapshot> {
         let mut config = self.config.read().await.clone();
-        let section = if let Some(facade) = &self.config_facade {
+        if self.config_facade.is_some() {
             let actual = self.cluster_revision_locked();
             if expected_revision != actual {
                 return Err(FabricError::Conflict {
@@ -382,21 +364,36 @@ impl FabricDeployer {
                     actual,
                 });
             }
-            config.cluster_fabric = self
-                .hydrate_cluster_fabric(facade.effective_config().cluster_fabric.clone())
-                .await?;
-            facade
-                .registry()
-                .envelope_value(SectionId::ClusterFabric)
-                .map_err(map_config_store_error)?
-        } else {
-            if expected_revision != 0 {
-                return Err(FabricError::Conflict {
-                    expected: expected_revision,
-                    actual: 0,
-                });
-            }
-            SectionEnvelope {
+            let data_dir = self.data_dir.clone();
+            let exact = tokio::task::spawn_blocking(move || {
+                bamboo_config::read_exact_cluster_fabric_snapshot(
+                    &data_dir,
+                    Some(expected_revision),
+                )
+            })
+            .await
+            .map_err(|error| {
+                FabricError::Internal(format!("cluster snapshot task failed: {error}"))
+            })?
+            .map_err(map_config_store_error)?;
+            config.cluster_fabric = exact.cluster_fabric;
+            return Ok(FabricCommitSnapshot {
+                config,
+                section: exact.section,
+                credential_statuses: exact.credential_statuses,
+                credential_health: exact.credential_health,
+            });
+        }
+        if expected_revision != 0 {
+            return Err(FabricError::Conflict {
+                expected: expected_revision,
+                actual: 0,
+            });
+        }
+        let (credential_statuses, credential_health) = self.credential_snapshot();
+        Ok(FabricCommitSnapshot {
+            config,
+            section: SectionEnvelope {
                 data: serde_json::Value::Null,
                 revision: 0,
                 loaded_at: chrono::Utc::now(),
@@ -404,12 +401,7 @@ impl FabricDeployer {
                 source_kind: SectionSourceKind::Default,
                 status: SectionStatus::Healthy,
                 last_error: None,
-            }
-        };
-        let (credential_statuses, credential_health) = self.credential_snapshot();
-        Ok(FabricCommitSnapshot {
-            config,
-            section,
+            },
             credential_statuses,
             credential_health,
         })
@@ -563,6 +555,7 @@ impl FabricDeployer {
                 revision,
                 adoption,
                 credential_adoption,
+                committed_recovery,
                 runtime,
             } = commit;
             let runtime = match runtime {
@@ -619,6 +612,11 @@ impl FabricDeployer {
 
             if let (Some(event), Some(publish)) = (event.as_ref(), self.publish_event.as_ref()) {
                 publish(event);
+            }
+            if let Err(error) = committed_recovery {
+                return Err(FabricError::Committed(format!(
+                    "cluster configuration committed at revision {revision} but transaction recovery failed: {error}"
+                )));
             }
             if let Some(Err(error)) = credential_adoption {
                 return Err(FabricError::Committed(format!(
@@ -1943,27 +1941,19 @@ mod lifecycle_persistence_tests {
         events: Arc<StdMutex<Vec<ConfigSectionEvent>>>,
     }
 
-    fn modular_running_fixture(bamboo_bin: &str) -> ModularFixture {
+    fn modular_fixture_with_node(
+        bamboo_bin: &str,
+        node: Node,
+        node_intents: BTreeMap<String, bamboo_config::ClusterNodeCredentialIntents>,
+    ) -> ModularFixture {
         let data_dir = tempfile::tempdir().unwrap();
         let facade = Arc::new(ConfigFacade::open_or_migrate(data_dir.path()).unwrap());
         let mut candidate = facade.effective_config();
-        candidate.cluster_fabric.nodes.push(Node {
-            id: "n1".to_string(),
-            label: "node".to_string(),
-            placement: NodePlacement::Local,
-            trust_level: TrustLevel::Trusted,
-            deploy: DeployProfile::default(),
-            state: Some(NodeState {
-                status: NodeStatus::Running,
-                worker_id: Some("cluster-node-n1".to_string()),
-                ..Default::default()
-            }),
-            enabled: true,
-        });
+        candidate.cluster_fabric.nodes.push(node);
         let revision = bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
             data_dir.path(),
             &mut candidate,
-            &BTreeMap::new(),
+            &node_intents,
             0,
         )
         .unwrap();
@@ -1974,6 +1964,9 @@ mod lifecycle_persistence_tests {
             .is_some());
 
         let mut runtime = facade.effective_config();
+        runtime
+            .hydrate_cluster_credentials_from_store(data_dir.path())
+            .unwrap();
         runtime.subagents_mut().broker = Some(BrokerClientConfig {
             endpoint: "ws://127.0.0.1:9".to_string(),
             token: "test-token".to_string(),
@@ -2009,6 +2002,62 @@ mod lifecycle_persistence_tests {
             deployer,
             events,
         }
+    }
+
+    fn modular_running_fixture(bamboo_bin: &str) -> ModularFixture {
+        modular_fixture_with_node(
+            bamboo_bin,
+            Node {
+                id: "n1".to_string(),
+                label: "node".to_string(),
+                placement: NodePlacement::Local,
+                trust_level: TrustLevel::Trusted,
+                deploy: DeployProfile::default(),
+                state: Some(NodeState {
+                    status: NodeStatus::Running,
+                    worker_id: Some("cluster-node-n1".to_string()),
+                    ..Default::default()
+                }),
+                enabled: true,
+            },
+            BTreeMap::new(),
+        )
+    }
+
+    fn modular_password_fixture(bamboo_bin: &str, password: &str) -> ModularFixture {
+        modular_fixture_with_node(
+            bamboo_bin,
+            Node {
+                id: "n1".to_string(),
+                label: "password-generation-one".to_string(),
+                placement: NodePlacement::Ssh(SshTarget {
+                    host: "preflight-must-not-run.invalid".to_string(),
+                    port: 22,
+                    username: "operator".to_string(),
+                    auth: SshAuth::Password {
+                        password: String::new(),
+                        password_encrypted: None,
+                    },
+                    host_key_fingerprint: None,
+                }),
+                trust_level: TrustLevel::Trusted,
+                deploy: DeployProfile::default(),
+                state: Some(NodeState {
+                    status: NodeStatus::Running,
+                    worker_id: Some("cluster-node-n1".to_string()),
+                    ..Default::default()
+                }),
+                enabled: true,
+            },
+            BTreeMap::from([(
+                "n1".to_string(),
+                bamboo_config::ClusterNodeCredentialIntents {
+                    password: bamboo_config::ClusterCredentialAction::Replace(password.to_string()),
+                    private_key: bamboo_config::ClusterCredentialAction::Clear,
+                    passphrase: bamboo_config::ClusterCredentialAction::Clear,
+                },
+            )]),
+        )
     }
 
     #[tokio::test]
@@ -2216,6 +2265,521 @@ mod lifecycle_persistence_tests {
                 handle: bamboo_broker::DeployedAgent::from_parts("old-worker", child, None),
             },
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deploy_recovers_after_manifest_without_compensating_verified_worker() {
+        let (endpoint, _broker_dir) = start_broker().await;
+        let fixture = modular_running_fixture("/usr/bin/true");
+        let _worker = join_expected_worker(&fixture, &endpoint).await;
+        insert_prior_worker(&fixture).await;
+
+        set_deploy_before_final_persist_test_hook(fixture._data_dir.path(), move |data_dir| {
+            bamboo_config::set_cluster_exact_commit_test_fault(
+                data_dir.to_path_buf(),
+                bamboo_config::ClusterExactCommitTestFault::AfterManifest,
+            );
+        });
+
+        let result = fixture
+            .deployer
+            .deploy_at_revision("n1", false, 1)
+            .await
+            .expect("the committed Running transaction must recover in place");
+        assert_eq!(result.snapshot.section.revision, 3);
+        assert_eq!(result.value.status, NodeStatus::Running);
+        assert!(
+            fixture
+                .registry
+                .lock()
+                .await
+                .contains_key(&crate::registry_keys::node_key("n1")),
+            "post-manifest recovery must not compensate the verified worker"
+        );
+        assert_eq!(
+            fixture
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Running
+        );
+        assert_eq!(
+            fixture.facade.registry().cluster_fabric.snapshot().revision,
+            3
+        );
+        assert_eq!(
+            fixture.events.lock().unwrap().as_slice(),
+            &[
+                ConfigSectionEvent::Changed {
+                    section: "cluster-fabric".to_string(),
+                    revision: 2,
+                },
+                ConfigSectionEvent::Changed {
+                    section: "cluster-fabric".to_string(),
+                    revision: 3,
+                },
+            ]
+        );
+        let reopened = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 3);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Running
+        );
+        bamboo_config::ensure_provider_mcp_migration_ready(fixture._data_dir.path()).unwrap();
+
+        let replacement = fixture
+            .registry
+            .lock()
+            .await
+            .remove(&crate::registry_keys::node_key("n1"));
+        if let Some(replacement) = replacement {
+            replacement.handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistent_recovery_failure_remains_committed_for_deploy_and_stop() {
+        let (endpoint, _broker_dir) = start_broker().await;
+        let deploy_fixture = modular_running_fixture("/usr/bin/true");
+        let _worker = join_expected_worker(&deploy_fixture, &endpoint).await;
+        insert_prior_worker(&deploy_fixture).await;
+        set_deploy_before_final_persist_test_hook(
+            deploy_fixture._data_dir.path(),
+            move |data_dir| {
+                bamboo_config::set_cluster_exact_commit_test_fault(
+                    data_dir.to_path_buf(),
+                    bamboo_config::ClusterExactCommitTestFault::AfterManifestRecoveryFailure,
+                );
+            },
+        );
+
+        let deploy_error = match deploy_fixture
+            .deployer
+            .deploy_at_revision("n1", false, 1)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the injected persistent recovery failure must surface"),
+        };
+        assert!(matches!(deploy_error, FabricError::Committed(_)));
+        assert!(
+            deploy_fixture
+                .registry
+                .lock()
+                .await
+                .contains_key(&crate::registry_keys::node_key("n1")),
+            "a committed Running candidate must retain its verified worker"
+        );
+        assert_eq!(
+            deploy_fixture
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Running
+        );
+        assert_eq!(
+            deploy_fixture
+                .facade
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            3
+        );
+        assert_eq!(
+            deploy_fixture.events.lock().unwrap().as_slice(),
+            &[
+                ConfigSectionEvent::Changed {
+                    section: "cluster-fabric".to_string(),
+                    revision: 2,
+                },
+                ConfigSectionEvent::Changed {
+                    section: "cluster-fabric".to_string(),
+                    revision: 3,
+                },
+            ]
+        );
+        let recovered_deploy = ConfigFacade::open_or_migrate(deploy_fixture._data_dir.path())
+            .expect("later startup recovery");
+        assert_eq!(
+            recovered_deploy
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            3
+        );
+        assert_eq!(
+            recovered_deploy
+                .effective_config()
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Running
+        );
+        let replacement = deploy_fixture
+            .registry
+            .lock()
+            .await
+            .remove(&crate::registry_keys::node_key("n1"));
+        if let Some(replacement) = replacement {
+            replacement.handle.shutdown().await;
+        }
+
+        let stop_fixture = modular_running_fixture("/usr/bin/true");
+        insert_prior_worker(&stop_fixture).await;
+        bamboo_config::set_cluster_exact_commit_test_fault(
+            stop_fixture._data_dir.path().to_path_buf(),
+            bamboo_config::ClusterExactCommitTestFault::AfterManifestRecoveryFailure,
+        );
+        let stop_error = match stop_fixture.deployer.stop_at_revision("n1", 1).await {
+            Err(error) => error,
+            Ok(_) => panic!("the injected persistent recovery failure must surface"),
+        };
+        assert!(matches!(stop_error, FabricError::Committed(_)));
+        assert!(
+            stop_fixture.registry.lock().await.is_empty(),
+            "a committed Stopped candidate must still shut down the worker"
+        );
+        assert_eq!(
+            stop_fixture
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Stopped
+        );
+        assert_eq!(
+            stop_fixture
+                .facade
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            2
+        );
+        assert_eq!(
+            stop_fixture.events.lock().unwrap().as_slice(),
+            &[ConfigSectionEvent::Changed {
+                section: "cluster-fabric".to_string(),
+                revision: 2,
+            }]
+        );
+        let recovered_stop = ConfigFacade::open_or_migrate(stop_fixture._data_dir.path())
+            .expect("later startup recovery");
+        assert_eq!(
+            recovered_stop.registry().cluster_fabric.snapshot().revision,
+            2
+        );
+        assert_eq!(
+            recovered_stop
+                .effective_config()
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_recovers_after_credential_install_and_still_shuts_down_worker() {
+        let fixture = modular_running_fixture("/usr/bin/true");
+        insert_prior_worker(&fixture).await;
+        bamboo_config::set_cluster_exact_commit_test_fault(
+            fixture._data_dir.path().to_path_buf(),
+            bamboo_config::ClusterExactCommitTestFault::AfterCredentialInstall,
+        );
+
+        let result = fixture
+            .deployer
+            .stop_at_revision("n1", 1)
+            .await
+            .expect("the committed Stopped transaction must recover in place");
+        assert_eq!(result.snapshot.section.revision, 2);
+        assert_eq!(result.value.status, NodeStatus::Stopped);
+        assert!(
+            fixture.registry.lock().await.is_empty(),
+            "post-install recovery must still perform the authoritative shutdown"
+        );
+        assert_eq!(
+            fixture
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Stopped
+        );
+        assert_eq!(
+            fixture.facade.registry().cluster_fabric.snapshot().revision,
+            2
+        );
+        assert_eq!(
+            fixture.events.lock().unwrap().as_slice(),
+            &[ConfigSectionEvent::Changed {
+                section: "cluster-fabric".to_string(),
+                revision: 2,
+            }]
+        );
+        let reopened = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Stopped
+        );
+        bamboo_config::ensure_provider_mcp_migration_ready(fixture._data_dir.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_local_facade_cannot_authorize_preflight_over_newer_durable_revision() {
+        let fixture = modular_running_fixture("/usr/bin/true");
+        let external = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        let mut winner = external.effective_config();
+        winner.cluster_fabric.node_mut("n1").unwrap().label = "durable-generation-two".to_string();
+        let revision = bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+            fixture._data_dir.path(),
+            &mut winner,
+            &BTreeMap::new(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(
+            fixture.facade.registry().cluster_fabric.snapshot().revision,
+            1,
+            "the first process facade intentionally remains stale"
+        );
+
+        let error = match fixture.deployer.test_at_revision("n1", 1).await {
+            Err(error) => error,
+            Ok(_) => panic!("a stale process facade must not authorize local preflight"),
+        };
+        assert!(matches!(
+            error,
+            FabricError::Conflict {
+                expected: 1,
+                actual: 2
+            }
+        ));
+        assert_eq!(
+            fixture
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .label,
+            "node",
+            "the rejected preflight must not adopt a later generation implicitly"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_backup_cannot_mix_newer_credentials_into_revision_bound_preflight() {
+        let fixture = modular_password_fixture("/usr/bin/true", "generation-one-password");
+        let password_ref = bamboo_config::cluster_password_credential_ref("n1").unwrap();
+        let external = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        let mut winner = external.effective_config();
+        winner.cluster_fabric.node_mut("n1").unwrap().label = "password-generation-two".to_string();
+        let revision = bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+            fixture._data_dir.path(),
+            &mut winner,
+            &BTreeMap::from([(
+                "n1".to_string(),
+                bamboo_config::ClusterNodeCredentialIntents {
+                    password: bamboo_config::ClusterCredentialAction::Replace(
+                        "generation-two-password".to_string(),
+                    ),
+                    private_key: bamboo_config::ClusterCredentialAction::Clear,
+                    passphrase: bamboo_config::ClusterCredentialAction::Clear,
+                },
+            )]),
+            1,
+        )
+        .unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(
+            CredentialStore::open(fixture._data_dir.path())
+                .resolve(&password_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "generation-two-password",
+            "the credential primary intentionally belongs to r2"
+        );
+        std::fs::write(
+            fixture._data_dir.path().join("cluster-fabric.json"),
+            b"{invalid-generation-two-primary",
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.facade.registry().cluster_fabric.snapshot().revision,
+            1,
+            "the action process intentionally retains its r1 facade"
+        );
+        let exact_error = match bamboo_config::read_exact_cluster_fabric_snapshot(
+            fixture._data_dir.path(),
+            Some(2),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a backup is never the r2 CAS authority"),
+        };
+        assert!(
+            matches!(exact_error, ConfigStoreError::Validation(message)
+                if message.contains("healthy primary section")),
+            "degraded authority must fail closed before comparing its backup revision"
+        );
+
+        let error = match fixture.deployer.test_at_revision("n1", 1).await {
+            Err(error) => error,
+            Ok(_) => panic!("a degraded section backup must not authorize preflight"),
+        };
+        match error {
+            FabricError::BadRequest(message) => {
+                assert!(message.contains("require a healthy primary"));
+            }
+            other => panic!("degraded exact read returned the wrong error: {other}"),
+        }
+        let runtime = fixture.config.read().await;
+        let NodePlacement::Ssh(target) = &runtime.cluster_fabric.node("n1").unwrap().placement
+        else {
+            panic!("expected SSH placement")
+        };
+        let SshAuth::Password { password, .. } = &target.auth else {
+            panic!("expected password authentication")
+        };
+        assert_eq!(
+            password, "generation-one-password",
+            "the rejected action must never hydrate r1 metadata with r2 credentials"
+        );
+        assert!(fixture.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn degraded_credential_backup_cannot_mix_with_current_cluster_preflight() {
+        let fixture = modular_password_fixture("/usr/bin/true", "generation-one-password");
+        let password_ref = bamboo_config::cluster_password_credential_ref("n1").unwrap();
+        let external = ConfigFacade::open(fixture._data_dir.path()).unwrap();
+        let mut winner = external.effective_config();
+        winner.cluster_fabric.node_mut("n1").unwrap().label = "password-generation-two".to_string();
+        let revision = bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+            fixture._data_dir.path(),
+            &mut winner,
+            &BTreeMap::from([(
+                "n1".to_string(),
+                bamboo_config::ClusterNodeCredentialIntents {
+                    password: bamboo_config::ClusterCredentialAction::Replace(
+                        "generation-two-password".to_string(),
+                    ),
+                    private_key: bamboo_config::ClusterCredentialAction::Clear,
+                    passphrase: bamboo_config::ClusterCredentialAction::Clear,
+                },
+            )]),
+            1,
+        )
+        .unwrap();
+        assert_eq!(revision, 2);
+        assert!(fixture
+            .facade
+            .registry()
+            .reload_if_changed(SectionId::ClusterFabric)
+            .is_some());
+        assert_eq!(
+            fixture.facade.registry().cluster_fabric.snapshot().revision,
+            2
+        );
+        assert_eq!(
+            CredentialStore::open(fixture._data_dir.path())
+                .resolve(&password_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "generation-two-password"
+        );
+        std::fs::write(
+            fixture._data_dir.path().join("credentials.json"),
+            b"{invalid-generation-two-primary",
+        )
+        .unwrap();
+
+        let error = match fixture.deployer.test_at_revision("n1", 2).await {
+            Err(error) => error,
+            Ok(_) => panic!("a degraded credential backup must not authorize preflight"),
+        };
+        match error {
+            FabricError::BadRequest(message) => {
+                assert!(message.contains("healthy primary credential"));
+            }
+            other => panic!("degraded exact credential read returned the wrong error: {other}"),
+        }
+        let runtime = fixture.config.read().await;
+        let node = runtime.cluster_fabric.node("n1").unwrap();
+        assert_eq!(
+            node.label, "password-generation-one",
+            "the rejected action must not adopt current metadata implicitly"
+        );
+        let NodePlacement::Ssh(target) = &node.placement else {
+            panic!("expected SSH placement")
+        };
+        let SshAuth::Password { password, .. } = &target.auth else {
+            panic!("expected password authentication")
+        };
+        assert_eq!(
+            password, "generation-one-password",
+            "the rejected action must never hydrate r2 metadata with r1 credentials"
+        );
+        assert!(fixture.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -22,8 +22,8 @@ use bamboo_config::cluster_fabric::{
     ClusterNodeCredentialRefs, DeployProfile, Node, NodePlacement, SshAuth, SshTarget, TrustLevel,
 };
 use bamboo_config::{
-    patch::is_masked_api_key, CredentialSource, CredentialStatus, SectionEnvelope, SectionId,
-    SectionStatus,
+    patch::is_masked_api_key, ConfigStoreError, CredentialSource, CredentialStatus,
+    SectionEnvelope, SectionStatus,
 };
 use bamboo_server_tools::FabricCommitSnapshot;
 
@@ -461,31 +461,49 @@ fn project_cluster_section(
     Ok(envelope)
 }
 
-fn cluster_section_envelope(app_state: &AppState) -> Result<SectionEnvelope<Value>, AppError> {
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
+async fn cluster_section_envelope(
+    app_state: &AppState,
+) -> Result<SectionEnvelope<Value>, AppError> {
+    app_state.config_facade.as_ref().ok_or_else(|| {
         AppError::BadRequest(
             "cluster settings require the modular configuration facade".to_string(),
         )
     })?;
-    let snapshot = facade.registry().cluster_fabric.snapshot();
-    let fabric = snapshot.data.0.clone();
-    let (statuses, store_healthy) = match app_state.credential_store.statuses_with_health() {
-        Ok((statuses, health)) => (statuses, health.status != SectionStatus::Degraded),
-        Err(_) => (Vec::new(), false),
-    };
-    let envelope = facade
-        .registry()
-        .envelope_value(SectionId::ClusterFabric)
-        .map_err(|_| {
-            AppError::InternalError(anyhow::anyhow!("cluster section envelope is unavailable"))
-        })?;
-    project_cluster_section(fabric, envelope, statuses, store_healthy)
+    let data_dir = app_state.app_data_dir.clone();
+    let exact = tokio::task::spawn_blocking(move || {
+        bamboo_config::read_exact_cluster_fabric_snapshot(&data_dir, None)
+    })
+    .await
+    .map_err(|error| {
+        AppError::InternalError(anyhow::anyhow!("cluster snapshot task failed: {error}"))
+    })?
+    .map_err(|error| match error {
+        ConfigStoreError::Io(error) => AppError::StorageError(error),
+        ConfigStoreError::Json(_) | ConfigStoreError::Validation(_) => {
+            AppError::InternalError(anyhow::anyhow!("cluster section snapshot is unavailable"))
+        }
+        ConfigStoreError::Conflict { .. } => AppError::InternalError(anyhow::anyhow!(
+            "cluster section snapshot returned an unexpected conflict"
+        )),
+        ConfigStoreError::Watch(error) => AppError::InternalError(anyhow::anyhow!(
+            "cluster section snapshot watch failed: {error}"
+        )),
+    })?;
+    let store_healthy = exact.section.status != SectionStatus::Degraded
+        && exact.credential_health.status != SectionStatus::Degraded;
+    project_cluster_section(
+        exact.cluster_fabric,
+        exact.section,
+        exact.credential_statuses,
+        store_healthy,
+    )
 }
 
 pub(super) fn committed_cluster_section(
     snapshot: FabricCommitSnapshot,
 ) -> Result<SectionEnvelope<Value>, AppError> {
-    let store_healthy = snapshot.credential_health.status != SectionStatus::Degraded;
+    let store_healthy = snapshot.section.status != SectionStatus::Degraded
+        && snapshot.credential_health.status != SectionStatus::Degraded;
     project_cluster_section(
         snapshot.config.cluster_fabric.clone(),
         snapshot.section,
@@ -498,7 +516,7 @@ pub(super) async fn get_cluster_section(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
     let _io = app_state.config_io_lock.lock().await;
-    Ok(HttpResponse::Ok().json(cluster_section_envelope(&app_state)?))
+    Ok(HttpResponse::Ok().json(cluster_section_envelope(&app_state).await?))
 }
 
 fn replace_node_membership(
@@ -1173,6 +1191,166 @@ mod tests {
                 .label,
             "second-commit"
         );
+    }
+
+    #[actix_web::test]
+    async fn cluster_get_reads_one_newer_durable_metadata_and_credential_generation() {
+        // Credential hydration runs on the blocking pool, so use the stable
+        // key-file path instead of the test-only thread-local key override.
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "coherent-node".to_string(),
+                    ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(Node {
+                        id: "coherent-node".to_string(),
+                        label: "generation-one".to_string(),
+                        placement: NodePlacement::Local,
+                        trust_level: TrustLevel::Trusted,
+                        deploy: DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        // Hold the process publication lock so the first facade/runtime stay
+        // at r1 while a second facade commits r2 to durable storage.
+        let guard = state.config_io_lock.lock().await;
+        let local_facade = state.config_facade.as_ref().unwrap();
+        assert_eq!(
+            local_facade.registry().cluster_fabric.snapshot().revision,
+            1
+        );
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut winner = external.effective_config();
+        let node = winner.cluster_fabric.node_mut("coherent-node").unwrap();
+        node.label = "generation-two".to_string();
+        node.placement = NodePlacement::Ssh(SshTarget {
+            host: "generation-two.example.test".to_string(),
+            port: 22,
+            username: "operator".to_string(),
+            auth: SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+            host_key_fingerprint: None,
+        });
+        let revision = bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut winner,
+            &BTreeMap::from([(
+                "coherent-node".to_string(),
+                ClusterNodeCredentialIntents {
+                    password: ClusterCredentialAction::Replace(
+                        "generation-two-password".to_string(),
+                    ),
+                    private_key: ClusterCredentialAction::Clear,
+                    passphrase: ClusterCredentialAction::Clear,
+                },
+            )]),
+            1,
+        )
+        .unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(
+            local_facade.registry().cluster_fabric.snapshot().revision,
+            1,
+            "the local facade remains intentionally stale behind the held publication lock"
+        );
+
+        if let Err(error) = bamboo_config::read_exact_cluster_fabric_snapshot(dir.path(), None) {
+            panic!("exact durable cluster read failed before GET projection: {error}");
+        }
+        let envelope = cluster_section_envelope(&state)
+            .await
+            .expect("GET projection must read the coherent durable generation");
+        assert_eq!(envelope.revision, 2);
+        let node = envelope.data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == "coherent-node")
+            .unwrap();
+        assert_eq!(node["label"], "generation-two");
+        assert_eq!(node["placement"]["type"], "ssh");
+        assert_eq!(node["placement"]["auth"]["method"], "password");
+        assert_eq!(
+            envelope.data["credential_status"]["coherent-node"]["password"]["state"],
+            "configured"
+        );
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        assert!(!encoded.contains("generation-two-password"));
+        assert!(!encoded.contains("credential_ref"));
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("coherent-node")
+                .unwrap()
+                .label,
+            "generation-one",
+            "the read must not depend on or silently mutate the stale process runtime"
+        );
+
+        let cluster_primary = std::fs::read(dir.path().join("cluster-fabric.json")).unwrap();
+        std::fs::write(dir.path().join("cluster-fabric.json"), b"{invalid-primary").unwrap();
+        let degraded = cluster_section_envelope(&state)
+            .await
+            .expect("GET must retain the validated durable backup LKG");
+        assert_eq!(degraded.revision, 1);
+        assert_eq!(
+            degraded.source_kind,
+            bamboo_config::SectionSourceKind::Backup
+        );
+        assert_eq!(degraded.status, SectionStatus::Degraded);
+        assert_eq!(
+            degraded.last_error.as_deref(),
+            Some("cluster configuration is unavailable")
+        );
+        assert_eq!(
+            degraded.data["nodes"][0]["label"], "generation-one",
+            "the degraded envelope must identify the exact backup generation"
+        );
+        assert_eq!(
+            degraded.data["credential_status"]["coherent-node"]["password"]["state"], "missing",
+            "the r1 backup metadata truthfully has no password configured"
+        );
+
+        std::fs::write(dir.path().join("cluster-fabric.json"), cluster_primary).unwrap();
+        for suffix in ["bak", "bak.1", "bak.2"] {
+            let path = dir.path().join(format!("credentials.json.{suffix}"));
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove credential backup: {error}"),
+            }
+        }
+        std::fs::write(
+            dir.path().join("credentials.json"),
+            b"{invalid-credential-primary",
+        )
+        .unwrap();
+        let unavailable_credentials = cluster_section_envelope(&state)
+            .await
+            .expect("GET must remain available with redacted credential errors");
+        assert_eq!(unavailable_credentials.revision, 2);
+        assert_eq!(unavailable_credentials.status, SectionStatus::Healthy);
+        assert_eq!(
+            unavailable_credentials.data["credential_status"]["coherent-node"]["password"]["state"],
+            "error"
+        );
+        drop(guard);
     }
 
     #[actix_web::test]

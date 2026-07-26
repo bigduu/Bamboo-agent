@@ -2149,6 +2149,7 @@ impl AppState {
                         revision: _,
                         adoption,
                         credential_adoption,
+                        committed_recovery,
                         runtime,
                     } = commit;
                     let runtime = match runtime {
@@ -2174,7 +2175,7 @@ impl AppState {
                             Err(error)
                         }
                     };
-                    Some((adoption, credential_adoption, runtime))
+                    Some((adoption, credential_adoption, committed_recovery, runtime))
                 }
                 None => None,
             };
@@ -2183,7 +2184,7 @@ impl AppState {
             }
             *config.write().await = candidate.clone();
             let commit = if id == SectionId::ClusterFabric {
-                let (cluster_adoption, credential_adoption, cluster_runtime) =
+                let (cluster_adoption, credential_adoption, committed_recovery, cluster_runtime) =
                     cluster_runtime.expect("cluster reset captures an exact runtime");
                 let event = match cluster_adoption {
                     Some(Ok(event)) => Some(event),
@@ -2219,6 +2220,11 @@ impl AppState {
                 }
                 if let Some(event) = event.as_ref() {
                     publish_registry_event(&account_sink, event);
+                }
+                if let Err(error) = committed_recovery {
+                    return Err(ConfigSectionMutationError::Runtime(format!(
+                        "cluster reset committed at revision {revision} but transaction recovery failed: {error}"
+                    )));
                 }
                 if let Some(Err(error)) = credential_adoption {
                     return Err(ConfigSectionMutationError::Runtime(format!(
@@ -3377,6 +3383,7 @@ impl AppState {
                 revision,
                 adoption,
                 credential_adoption,
+                committed_recovery,
                 runtime,
             } = commit;
             let runtime = match runtime {
@@ -3432,6 +3439,11 @@ impl AppState {
             }
             if let Some(event) = event.as_ref() {
                 publish_registry_event(&account_sink, event);
+            }
+            if let Err(error) = committed_recovery {
+                return Err(AppError::InternalError(anyhow::anyhow!(
+                    "cluster configuration committed at revision {revision} but transaction recovery failed: {error}"
+                )));
             }
             if let Some(Err(error)) = credential_adoption {
                 return Err(AppError::InternalError(anyhow::anyhow!(
@@ -4224,6 +4236,109 @@ mod live_reload_tests {
             .count();
         assert_eq!(cluster_events, 1);
         assert_eq!(credential_events, 0);
+    }
+
+    #[tokio::test]
+    async fn operator_cluster_crud_recovers_before_finish_and_converges_once() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x72; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let baseline_seq = state.account_sink.latest_seq();
+        bamboo_config::set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            bamboo_config::ClusterExactCommitTestFault::BeforeFinish,
+        );
+
+        let committed = state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "recovered-crud-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "recovered-crud-node".to_string(),
+                        label: "recovered-crud-node".to_string(),
+                        placement: bamboo_config::NodePlacement::Local,
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .expect("operator CRUD must recover the committed transaction");
+        assert_eq!(committed.section.revision, 1);
+        assert_eq!(
+            committed
+                .config
+                .cluster_fabric
+                .node("recovered-crud-node")
+                .unwrap()
+                .label,
+            "recovered-crud-node"
+        );
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("recovered-crud-node")
+                .unwrap()
+                .label,
+            "recovered-crud-node"
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        let reopened = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 1);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("recovered-crud-node")
+                .unwrap()
+                .label,
+            "recovered-crud-node"
+        );
+        bamboo_config::ensure_provider_mcp_migration_ready(dir.path()).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        let cluster_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, revision }
+                        if section == "cluster-fabric" && *revision == 1
+                )
+            })
+            .count();
+        assert_eq!(cluster_events, 1);
+        assert!(!events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ConfigChanged { section, .. } if section == "credentials"
+            )
+        }));
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use crate::{
     StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
 };
 
-const SECTION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_FILE: &str = "config-sections.json";
 const SECTION_LAYOUT_COMPLETION_VERSION: u32 = 1;
@@ -992,7 +992,7 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
     validate_provider_override_credentials(value).map_err(crate::ConfigStoreError::Validation)
 }
 
-fn validate_ordinary_section_raw(value: &Value) -> Result<(), String> {
+pub(crate) fn validate_ordinary_section_raw(value: &Value) -> Result<(), String> {
     validate_ordinary_section_json(value).map_err(|error| error.to_string())
 }
 
@@ -1814,7 +1814,7 @@ pub(crate) fn validate_connect_isolated(value: &ConnectConfig) -> Result<(), Str
     Ok(())
 }
 
-fn validate_cluster_fabric(value: &ClusterFabricSection) -> Result<(), String> {
+pub(crate) fn validate_cluster_fabric(value: &ClusterFabricSection) -> Result<(), String> {
     use crate::cluster_fabric::{NodePlacement, SshAuth};
 
     let mut node_ids = BTreeSet::new();

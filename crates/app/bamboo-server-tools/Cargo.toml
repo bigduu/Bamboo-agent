@@ -35,6 +35,7 @@ sha2 = "0.11"
 hex = "0.4"
 
 [dev-dependencies]
+bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
 tempfile = "3"
 futures = "0.3"
 tokio-util = "0.7"
