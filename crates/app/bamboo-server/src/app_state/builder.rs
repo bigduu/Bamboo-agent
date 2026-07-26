@@ -761,13 +761,25 @@ impl AppState {
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let fabric_bamboo_bin =
             std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
-        let fabric_deployer = Arc::new(bamboo_server_tools::FabricDeployer::new(
+        let credential_store = Arc::new(bamboo_config::CredentialStore::open(&bamboo_home_dir));
+        let mut fabric_deployer = bamboo_server_tools::FabricDeployer::new(
             config.clone(),
             config_io_lock.clone(),
             bamboo_home_dir.clone(),
             fabric_registry,
             fabric_bamboo_bin,
-        ));
+        );
+        if let Some(facade) = config_facade.clone() {
+            let event_sink = account_sink.clone();
+            fabric_deployer = fabric_deployer.with_modular_persistence(
+                facade,
+                credential_store.clone(),
+                Arc::new(move |event| {
+                    super::config_runtime::publish_registry_event(&event_sink, event);
+                }),
+            );
+        }
+        let fabric_deployer = Arc::new(fabric_deployer);
         // Cluster health monitor: periodically probe deployed workers on the bus and
         // flip node status live (Running↔Unreachable) + auto-recover. Server-scoped
         // — it runs under BOTH the embedded and an external broker (it reads the
@@ -951,8 +963,6 @@ impl AppState {
                 mcp_manager.clone(),
                 account_sink.clone(),
             );
-        let credential_store = Arc::new(bamboo_config::CredentialStore::open(&bamboo_home_dir));
-
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,

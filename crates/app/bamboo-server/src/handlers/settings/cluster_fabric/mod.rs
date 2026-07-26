@@ -25,6 +25,7 @@ use bamboo_config::{
     patch::is_masked_api_key, CredentialSource, CredentialStatus, SectionEnvelope, SectionId,
     SectionStatus,
 };
+use bamboo_server_tools::FabricCommitSnapshot;
 
 use crate::app_state::AppState;
 use crate::error::AppError;
@@ -415,24 +416,16 @@ fn node_credential_status(
     }
 }
 
-fn cluster_section_envelope(app_state: &AppState) -> Result<SectionEnvelope<Value>, AppError> {
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
-        AppError::BadRequest(
-            "cluster settings require the modular configuration facade".to_string(),
-        )
-    })?;
-    let snapshot = facade.registry().cluster_fabric.snapshot();
-    let fabric = snapshot.data.0.clone();
-    let (statuses, store_healthy) = match app_state.credential_store.statuses_with_health() {
-        Ok((statuses, health)) => (
-            statuses
-                .into_iter()
-                .map(|status| (status.credential_ref.as_str().to_string(), status))
-                .collect::<BTreeMap<_, _>>(),
-            health.status != SectionStatus::Degraded,
-        ),
-        Err(_) => (BTreeMap::new(), false),
-    };
+fn project_cluster_section(
+    fabric: ClusterFabricConfig,
+    mut envelope: SectionEnvelope<Value>,
+    statuses: Vec<CredentialStatus>,
+    store_healthy: bool,
+) -> Result<SectionEnvelope<Value>, AppError> {
+    let statuses = statuses
+        .into_iter()
+        .map(|status| (status.credential_ref.as_str().to_string(), status))
+        .collect::<BTreeMap<_, _>>();
     let mut credential_status = BTreeMap::new();
     for node in &fabric.nodes {
         credential_status.insert(
@@ -461,17 +454,44 @@ fn cluster_section_envelope(app_state: &AppState) -> Result<SectionEnvelope<Valu
         serde_json::to_value(credential_status)
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
     );
-    let mut envelope = facade
-        .registry()
-        .envelope_value(SectionId::ClusterFabric)
-        .map_err(|_| {
-            AppError::InternalError(anyhow::anyhow!("cluster section envelope is unavailable"))
-        })?;
     envelope.data = data;
     if envelope.last_error.is_some() {
         envelope.last_error = Some("cluster configuration is unavailable".to_string());
     }
     Ok(envelope)
+}
+
+fn cluster_section_envelope(app_state: &AppState) -> Result<SectionEnvelope<Value>, AppError> {
+    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
+        AppError::BadRequest(
+            "cluster settings require the modular configuration facade".to_string(),
+        )
+    })?;
+    let snapshot = facade.registry().cluster_fabric.snapshot();
+    let fabric = snapshot.data.0.clone();
+    let (statuses, store_healthy) = match app_state.credential_store.statuses_with_health() {
+        Ok((statuses, health)) => (statuses, health.status != SectionStatus::Degraded),
+        Err(_) => (Vec::new(), false),
+    };
+    let envelope = facade
+        .registry()
+        .envelope_value(SectionId::ClusterFabric)
+        .map_err(|_| {
+            AppError::InternalError(anyhow::anyhow!("cluster section envelope is unavailable"))
+        })?;
+    project_cluster_section(fabric, envelope, statuses, store_healthy)
+}
+
+fn committed_cluster_section(
+    snapshot: FabricCommitSnapshot,
+) -> Result<SectionEnvelope<Value>, AppError> {
+    let store_healthy = snapshot.credential_health.status != SectionStatus::Degraded;
+    project_cluster_section(
+        snapshot.config.cluster_fabric.clone(),
+        snapshot.section,
+        snapshot.credential_statuses,
+        store_healthy,
+    )
 }
 
 pub(super) async fn get_cluster_section(
@@ -529,13 +549,12 @@ struct ClusterMutationResponse {
     section: SectionEnvelope<Value>,
 }
 
-async fn cluster_mutation_response(
-    app_state: web::Data<AppState>,
+fn cluster_mutation_response(
     status: StatusCode,
     node_id: Option<String>,
+    snapshot: FabricCommitSnapshot,
 ) -> Result<HttpResponse, AppError> {
-    let _io = app_state.config_io_lock.lock().await;
-    let section = cluster_section_envelope(&app_state)?;
+    let section = committed_cluster_section(snapshot)?;
     Ok(HttpResponse::build(status).json(ClusterMutationResponse { node_id, section }))
 }
 
@@ -601,7 +620,7 @@ pub async fn create_node(
     let node_id_for_update = node_id.clone();
     let node_intents = BTreeMap::from([(node_id.clone(), credential_changes.into_domain())]);
 
-    app_state
+    let snapshot = app_state
         .update_cluster_fabric_credentials(expected_revision, node_intents, move |cfg| {
             cfg.cluster_fabric.nodes.push(node.clone());
             replace_node_membership(
@@ -613,7 +632,7 @@ pub async fn create_node(
         })
         .await?;
 
-    cluster_mutation_response(app_state, StatusCode::CREATED, Some(node_id)).await
+    cluster_mutation_response(StatusCode::CREATED, Some(node_id), snapshot)
 }
 
 /// `PUT /v1/bamboo/settings/nodes/{id}` — update a node (secret-preserving).
@@ -639,7 +658,7 @@ pub async fn update_node(
     let placement = placement.into_domain();
     let node_intents = BTreeMap::from([(id.clone(), credential_changes.into_domain())]);
 
-    app_state
+    let snapshot = app_state
         .update_cluster_fabric_credentials(expected_revision, node_intents, move |cfg| {
             let existing = cfg
                 .cluster_fabric
@@ -666,7 +685,7 @@ pub async fn update_node(
         })
         .await?;
 
-    cluster_mutation_response(app_state, StatusCode::OK, Some(id_for_response)).await
+    cluster_mutation_response(StatusCode::OK, Some(id_for_response), snapshot)
 }
 
 /// `DELETE /v1/bamboo/settings/nodes/{id}` — remove a node.
@@ -679,7 +698,7 @@ pub async fn delete_node(
     let expected_revision = query.expected_revision;
     let id_for_update = id.clone();
 
-    app_state
+    let snapshot = app_state
         .update_cluster_fabric_credentials(
             expected_revision,
             BTreeMap::from([(id.clone(), ClusterNodeCredentialIntents::clear_all())]),
@@ -699,7 +718,7 @@ pub async fn delete_node(
         )
         .await?;
 
-    cluster_mutation_response(app_state, StatusCode::OK, Some(id)).await
+    cluster_mutation_response(StatusCode::OK, Some(id), snapshot)
 }
 
 // ─── Cluster handlers ──────────────────────────────────────────────────
@@ -715,7 +734,7 @@ pub async fn create_cluster(
     }
     let expected_revision = req.expected_revision;
 
-    app_state
+    let snapshot = app_state
         .update_cluster_fabric_credentials(expected_revision, BTreeMap::new(), move |cfg| {
             if cfg.cluster_fabric.cluster(&req.name).is_some() {
                 return Err(AppError::BadRequest(format!(
@@ -732,7 +751,7 @@ pub async fn create_cluster(
         })
         .await?;
 
-    cluster_mutation_response(app_state, StatusCode::CREATED, None).await
+    cluster_mutation_response(StatusCode::CREATED, None, snapshot)
 }
 
 /// `PUT /v1/bamboo/settings/clusters/{name}` — update a cluster.
@@ -748,7 +767,7 @@ pub async fn update_cluster(
     }
     let expected_revision = req.expected_revision;
 
-    app_state
+    let snapshot = app_state
         .update_cluster_fabric_credentials(expected_revision, BTreeMap::new(), move |cfg| {
             if req.name != name && cfg.cluster_fabric.cluster(&req.name).is_some() {
                 return Err(AppError::BadRequest(format!(
@@ -769,7 +788,7 @@ pub async fn update_cluster(
         })
         .await?;
 
-    cluster_mutation_response(app_state, StatusCode::OK, None).await
+    cluster_mutation_response(StatusCode::OK, None, snapshot)
 }
 
 /// `DELETE /v1/bamboo/settings/clusters/{name}` — remove a cluster (nodes kept).
@@ -781,7 +800,7 @@ pub async fn delete_cluster(
     let name = path.into_inner();
     let expected_revision = query.expected_revision;
 
-    app_state
+    let snapshot = app_state
         .update_cluster_fabric_credentials(expected_revision, BTreeMap::new(), move |cfg| {
             let before = cfg.cluster_fabric.clusters.len();
             cfg.cluster_fabric.clusters.retain(|c| c.name != name);
@@ -792,7 +811,7 @@ pub async fn delete_cluster(
         })
         .await?;
 
-    cluster_mutation_response(app_state, StatusCode::OK, None).await
+    cluster_mutation_response(StatusCode::OK, None, snapshot)
 }
 
 // ─── Lifecycle ─────────────────────────────────────────────────────────
@@ -818,9 +837,33 @@ pub async fn node_status(
 /// Query params for `node_deploy`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployQuery {
+    pub expected_revision: u64,
     /// Deploy the no-LLM echo executor (connectivity smoke test).
     #[serde(default)]
     pub echo: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleQuery {
+    pub expected_revision: u64,
+}
+
+#[derive(Serialize)]
+struct NodeStateMutationResponse {
+    id: String,
+    state: bamboo_config::cluster_fabric::NodeState,
+    #[serde(flatten)]
+    section: SectionEnvelope<Value>,
+}
+
+#[derive(Serialize)]
+struct NodeTestResponse {
+    id: String,
+    ok: bool,
+    preflight: String,
+    #[serde(flatten)]
+    section: SectionEnvelope<Value>,
 }
 
 /// `POST /v1/bamboo/settings/nodes/{id}/deploy` — deploy a worker for the node.
@@ -830,28 +873,46 @@ pub async fn node_deploy(
     query: web::Query<DeployQuery>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
-    let state = deploy::deploy_node(&app_state, &id, query.echo).await?;
-    Ok(HttpResponse::Ok().json(json!({ "id": id, "state": state })))
+    let result = deploy::deploy_node(&app_state, &id, query.echo, query.expected_revision).await?;
+    let section = committed_cluster_section(result.snapshot)?;
+    Ok(HttpResponse::Ok().json(NodeStateMutationResponse {
+        id,
+        state: result.value,
+        section,
+    }))
 }
 
 /// `POST /v1/bamboo/settings/nodes/{id}/stop` — stop the node's worker.
 pub async fn node_stop(
     app_state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<LifecycleQuery>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
-    let state = deploy::stop_node(&app_state, &id).await?;
-    Ok(HttpResponse::Ok().json(json!({ "id": id, "state": state })))
+    let result = deploy::stop_node(&app_state, &id, query.expected_revision).await?;
+    let section = committed_cluster_section(result.snapshot)?;
+    Ok(HttpResponse::Ok().json(NodeStateMutationResponse {
+        id,
+        state: result.value,
+        section,
+    }))
 }
 
 /// `POST /v1/bamboo/settings/nodes/{id}/test` — connectivity preflight (no deploy).
 pub async fn node_test(
     app_state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<LifecycleQuery>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
-    let info = deploy::test_node(&app_state, &id).await?;
-    Ok(HttpResponse::Ok().json(json!({ "id": id, "ok": true, "preflight": info })))
+    let result = deploy::test_node(&app_state, &id, query.expected_revision).await?;
+    let section = committed_cluster_section(result.snapshot)?;
+    Ok(HttpResponse::Ok().json(NodeTestResponse {
+        id,
+        ok: true,
+        preflight: result.value,
+        section,
+    }))
 }
 
 /// Query params for `node_logs`.
@@ -1050,6 +1111,71 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn delayed_mutation_response_stays_bound_to_its_own_commit_snapshot() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x73; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let first = state
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "race-node".to_string(),
+                    ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(Node {
+                        id: "race-node".to_string(),
+                        label: "first-commit".to_string(),
+                        placement: NodePlacement::Local,
+                        trust_level: TrustLevel::Trusted,
+                        deploy: DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                1,
+                BTreeMap::from([(
+                    "race-node".to_string(),
+                    ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.node_mut("race-node").unwrap().label =
+                        "second-commit".to_string();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        let response =
+            cluster_mutation_response(StatusCode::OK, Some("race-node".to_string()), first)
+                .unwrap();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["revision"], 1);
+        assert_eq!(body["data"]["nodes"][0]["label"], "first-commit");
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("race-node")
+                .unwrap()
+                .label,
+            "second-commit"
+        );
+    }
+
+    #[actix_web::test]
     async fn node_api_returns_one_redacted_section_revision_and_canonical_conflicts() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x72; 32]);
         let dir = tempfile::tempdir().unwrap();
@@ -1059,6 +1185,7 @@ mod tests {
                 .app_data(state.clone())
                 .route("/nodes", web::post().to(create_node))
                 .route("/nodes/{id}", web::put().to(update_node))
+                .route("/nodes/{id}/stop", web::post().to(node_stop))
                 .route("/clusters", web::post().to(create_cluster))
                 .route("/clusters/{name}", web::put().to(update_cluster))
                 .route("/clusters/{name}", web::delete().to(delete_cluster)),
@@ -1313,5 +1440,32 @@ mod tests {
             .unwrap()
             .iter()
             .any(|cluster| cluster["name"] == "crud-cluster"));
+
+        let stale_stop = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/nodes/{node_id}/stop?expected_revision=4"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale_stop.status(), StatusCode::CONFLICT);
+
+        let stopped = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/nodes/{node_id}/stop?expected_revision=5"))
+                .to_request(),
+        )
+        .await;
+        let stopped_status = stopped.status();
+        let stopped_body = String::from_utf8(test::read_body(stopped).await.to_vec()).unwrap();
+        assert_eq!(stopped_status, StatusCode::OK, "{stopped_body}");
+        assert!(!stopped_body.contains(create_secret));
+        assert!(!stopped_body.contains("credential_ref"));
+        assert!(!stopped_body.contains("****"));
+        let stopped: Value = serde_json::from_str(&stopped_body).unwrap();
+        assert_eq!(stopped["revision"], 6);
+        assert_eq!(stopped["state"]["status"], "stopped");
+        assert_eq!(stopped["data"]["nodes"][0]["state"]["status"], "stopped");
     }
 }

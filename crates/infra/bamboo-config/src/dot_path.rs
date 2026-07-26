@@ -256,6 +256,10 @@ fn guard_reserved_paths(segments: &[&str], key: &str) -> Result<(), DotPathError
             reason: "environment variables are managed by the dedicated revisioned env API"
                 .to_string(),
         }),
+        ["cluster_fabric", ..] => Err(DotPathError::Unsupported {
+            key: key.to_string(),
+            reason: "cluster fabric is managed by the dedicated revisioned cluster API".to_string(),
+        }),
         ["notifications", "ntfy", "token"] | ["notifications", "bark", "device_key"] => {
             Err(DotPathError::SecretPath {
                 key: key.to_string(),
@@ -580,6 +584,9 @@ mod tests {
             "providers.anthropic.api_key_encrypted",
             "proxy_auth_encrypted",
             "subagents.broker.token",
+            "cluster_fabric",
+            "cluster_fabric.nodes",
+            "cluster_fabric.nodes.0.label",
         ] {
             let err = apply_dot_path_set(&config, key, json!("x")).unwrap_err();
             assert!(

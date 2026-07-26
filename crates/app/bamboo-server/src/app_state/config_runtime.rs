@@ -635,7 +635,7 @@ async fn wait_for_section_file_settle(data_dir: &Path, id: SectionId) {
     }
 }
 
-fn publish_registry_event(
+pub(super) fn publish_registry_event(
     account_sink: &bamboo_engine::events::AccountEventSink,
     event: &ConfigSectionEvent,
 ) {
@@ -3152,7 +3152,7 @@ impl AppState {
             bamboo_config::ClusterNodeCredentialIntents,
         >,
         update: F,
-    ) -> Result<(Config, u64), AppError>
+    ) -> Result<bamboo_server_tools::FabricCommitSnapshot, AppError>
     where
         F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
     {
@@ -3161,6 +3161,7 @@ impl AppState {
         let app_data_dir = self.app_data_dir.clone();
         let account_sink = self.account_sink.clone();
         let config_facade = self.config_facade.clone();
+        let credential_store = self.credential_store.clone();
         let transaction = tokio::spawn(async move {
             let _io = config_io_lock.lock().await;
             let mut candidate = {
@@ -3209,7 +3210,38 @@ impl AppState {
                     "committed cluster revision did not match the published revision"
                 )));
             }
-            Ok::<_, AppError>((candidate, published_revision))
+            let facade = config_facade.as_ref().ok_or_else(|| {
+                AppError::BadRequest(
+                    "cluster mutations require the modular configuration facade".to_string(),
+                )
+            })?;
+            let section = facade
+                .registry()
+                .envelope_value(SectionId::ClusterFabric)
+                .map_err(|error| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "committed cluster section envelope is unavailable: {error}"
+                    ))
+                })?;
+            let (credential_statuses, credential_health) =
+                match credential_store.statuses_with_health() {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => (
+                        Vec::new(),
+                        bamboo_config::CredentialStoreHealth {
+                            revision: 0,
+                            status: SectionStatus::Degraded,
+                            source: SectionSourceKind::Default,
+                            last_error: Some("credential status is unavailable".to_string()),
+                        },
+                    ),
+                };
+            Ok::<_, AppError>(bamboo_server_tools::FabricCommitSnapshot {
+                config: candidate,
+                section,
+                credential_statuses,
+                credential_health,
+            })
         });
         transaction.await.map_err(|error| {
             AppError::InternalError(anyhow::anyhow!(
@@ -3877,7 +3909,7 @@ mod live_reload_tests {
             state: None,
             enabled: true,
         };
-        let (_, committed) = state
+        let committed = state
             .update_cluster_fabric_credentials(
                 revision,
                 BTreeMap::from([(
@@ -3891,6 +3923,7 @@ mod live_reload_tests {
             )
             .await
             .unwrap();
+        let committed = committed.section.revision;
         assert_eq!(committed, revision + 1);
         assert_eq!(observer.await.unwrap(), committed);
 

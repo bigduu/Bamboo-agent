@@ -73,6 +73,18 @@ fn redact_config_removes_all_cluster_fabric_secret_representations() {
     let config = Config::default();
     let input = json!({
         "cluster_fabric": {
+            "credential_refs": {
+                "password-node": {
+                    "password_credential_ref": "cluster.password-node.password",
+                    "password_configured": true
+                },
+                "key-node": {
+                    "private_key_credential_ref": "cluster.key-node.private_key",
+                    "private_key_configured": true,
+                    "passphrase_credential_ref": "cluster.key-node.passphrase",
+                    "passphrase_configured": true
+                }
+            },
             "nodes": [
                 {
                     "id": "password-node",
@@ -103,6 +115,10 @@ fn redact_config_removes_all_cluster_fabric_secret_representations() {
     });
 
     let redacted = redact_config_for_api(input, &config);
+    assert!(
+        redacted["cluster_fabric"].get("credential_refs").is_none(),
+        "legacy root responses must not expose cluster credential references"
+    );
     let nodes = redacted["cluster_fabric"]["nodes"]
         .as_array()
         .expect("cluster nodes should remain visible");
@@ -131,6 +147,9 @@ fn redact_config_removes_all_cluster_fabric_secret_representations() {
         "encrypted-private-key",
         "plain-passphrase",
         "encrypted-passphrase",
+        "cluster.password-node.password",
+        "cluster.key-node.private_key",
+        "cluster.key-node.passphrase",
         "****...****",
     ] {
         assert!(

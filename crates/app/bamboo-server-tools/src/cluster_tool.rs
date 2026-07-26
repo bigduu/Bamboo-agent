@@ -42,6 +42,9 @@ impl ClusterTool {
 fn to_tool_error(e: FabricError) -> ToolError {
     match e {
         FabricError::NotFound(m) | FabricError::BadRequest(m) => ToolError::InvalidArguments(m),
+        FabricError::Conflict { expected, actual } => ToolError::Execution(format!(
+            "cluster configuration conflict: expected revision {expected}, current revision {actual}"
+        )),
         FabricError::Internal(m) => ToolError::Execution(m),
     }
 }

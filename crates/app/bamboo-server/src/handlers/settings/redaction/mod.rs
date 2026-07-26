@@ -242,26 +242,30 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
     // Cluster-fabric credentials are represented by status metadata on the
     // section endpoint. Never expose plaintext, ciphertext, or mask markers
     // through the legacy root configuration response.
-    if let Some(nodes) = root
+    if let Some(fabric) = root
         .get_mut("cluster_fabric")
-        .and_then(|f| f.get_mut("nodes"))
-        .and_then(|v| v.as_array_mut())
+        .and_then(Value::as_object_mut)
     {
-        for node in nodes.iter_mut() {
-            if let Some(auth) = node
-                .get_mut("placement")
-                .and_then(|p| p.get_mut("auth"))
-                .and_then(|a| a.as_object_mut())
-            {
-                for field in [
-                    "password",
-                    "password_encrypted",
-                    "private_key",
-                    "private_key_encrypted",
-                    "passphrase",
-                    "passphrase_encrypted",
-                ] {
-                    auth.remove(field);
+        // Stable references reveal the existence and storage layout of
+        // credentials. The dedicated cluster section exposes only status.
+        fabric.remove("credential_refs");
+        if let Some(nodes) = fabric.get_mut("nodes").and_then(Value::as_array_mut) {
+            for node in nodes.iter_mut() {
+                if let Some(auth) = node
+                    .get_mut("placement")
+                    .and_then(|p| p.get_mut("auth"))
+                    .and_then(|a| a.as_object_mut())
+                {
+                    for field in [
+                        "password",
+                        "password_encrypted",
+                        "private_key",
+                        "private_key_encrypted",
+                        "passphrase",
+                        "passphrase_encrypted",
+                    ] {
+                        auth.remove(field);
+                    }
                 }
             }
         }

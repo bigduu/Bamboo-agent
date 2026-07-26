@@ -36,10 +36,11 @@ pub struct ResetCredentialsRequest {
 }
 
 pub async fn list_credentials(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let (statuses, health) = app_state
+    let (mut statuses, health) = app_state
         .credential_store
         .statuses_with_health()
         .map_err(map_store_read_error)?;
+    statuses.retain(|status| !is_cluster_credential_ref(&status.credential_ref));
     Ok(HttpResponse::Ok().json(envelope(statuses, health)))
 }
 
@@ -48,6 +49,7 @@ pub async fn get_credential_status(
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let credential_ref = parse_credential_ref(path.into_inner())?;
+    reject_cluster_credential_ref(&credential_ref)?;
     let (status, health) = app_state
         .credential_store
         .status_with_health(&credential_ref)
@@ -160,6 +162,7 @@ async fn reject_managed_credential_ref(
     app_state: &AppState,
     credential_ref: &CredentialRef,
 ) -> Result<(), AppError> {
+    reject_cluster_credential_ref(credential_ref)?;
     let config = app_state.config.read().await;
     if config.proxy_auth_credential_ref.as_ref() == Some(credential_ref) {
         return Err(AppError::BadRequest(
@@ -196,6 +199,20 @@ async fn reject_managed_credential_ref(
     {
         return Err(AppError::BadRequest(
             "active cluster credentials must be changed through the dedicated revisioned cluster-fabric API"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_cluster_credential_ref(credential_ref: &CredentialRef) -> bool {
+    credential_ref.as_str().starts_with("cluster.")
+}
+
+fn reject_cluster_credential_ref(credential_ref: &CredentialRef) -> Result<(), AppError> {
+    if is_cluster_credential_ref(credential_ref) {
+        return Err(AppError::BadRequest(
+            "cluster credential references are reserved for the dedicated revisioned cluster-fabric API"
                 .to_string(),
         ));
     }
@@ -485,6 +502,103 @@ mod tests {
                 .as_ref()
                 .map(|auth| auth.username.as_str()),
             Some("active")
+        );
+    }
+
+    #[actix_web::test]
+    async fn cluster_credential_namespace_is_hidden_and_reserved_without_an_owner() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x66; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let cluster_ref = CredentialRef::parse("cluster.unowned.password").unwrap();
+        let ordinary_ref = CredentialRef::parse("custom.visible.token").unwrap();
+        state
+            .credential_store
+            .replace(
+                cluster_ref.clone(),
+                "unowned-cluster-secret",
+                CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        state
+            .credential_store
+            .replace(
+                ordinary_ref.clone(),
+                "ordinary-secret",
+                CredentialSource::User,
+                1,
+            )
+            .unwrap();
+        assert!(state
+            .config
+            .read()
+            .await
+            .cluster_fabric
+            .credential_refs
+            .is_empty());
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/credentials", web::get().to(list_credentials))
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::get().to(get_credential_status),
+                )
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::put().to(replace_credential),
+                )
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::delete().to(clear_credential),
+                ),
+        )
+        .await;
+
+        let list: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/credentials").to_request(),
+        )
+        .await;
+        assert_eq!(list["revision"], 2);
+        assert_eq!(list["data"].as_array().unwrap().len(), 1);
+        assert!(list.to_string().contains(ordinary_ref.as_str()));
+        assert!(!list.to_string().contains(cluster_ref.as_str()));
+
+        let uri = format!("/credentials/{}", cluster_ref.as_str());
+        for request in [
+            test::TestRequest::get().uri(&uri).to_request(),
+            test::TestRequest::put()
+                .uri(&uri)
+                .set_json(serde_json::json!({
+                    "expected_revision": 2,
+                    "value": "generic-replacement"
+                }))
+                .to_request(),
+            test::TestRequest::delete()
+                .uri(&uri)
+                .set_json(serde_json::json!({"expected_revision": 2}))
+                .to_request(),
+        ] {
+            let response = test::call_service(&app, request).await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved"));
+        }
+        assert_eq!(state.credential_store.revision().unwrap(), 2);
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&cluster_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "unowned-cluster-secret"
         );
     }
 

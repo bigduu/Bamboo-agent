@@ -8,7 +8,7 @@
 //! `bamboo-config`'s `Node` and `bamboo-broker`'s deployers) keeps placement/
 //! auth handling in one place.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,9 +20,13 @@ use bamboo_broker::{
     RusshDeployer, SshDeployer, UploadSpec, ORCHESTRATOR_ID,
 };
 use bamboo_config::cluster_fabric::{
-    Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget,
+    ClusterFabricConfig, Node, NodePlacement, NodeState, NodeStatus, SshAuth, SshTarget,
 };
-use bamboo_config::{BrokerClientConfig, Config};
+use bamboo_config::{
+    BrokerClientConfig, Config, ConfigFacade, ConfigSectionEvent, ConfigStoreError,
+    CredentialStatus, CredentialStore, CredentialStoreHealth, SectionEnvelope, SectionId,
+    SectionSourceKind, SectionStatus,
+};
 use bamboo_subagent::{AgentRef, AskMode};
 
 use crate::deploy_agent::{Deployed, DeployedRegistry};
@@ -32,6 +36,7 @@ use crate::deploy_agent::{Deployed, DeployedRegistry};
 pub enum FabricError {
     NotFound(String),
     BadRequest(String),
+    Conflict { expected: u64, actual: u64 },
     Internal(String),
 }
 
@@ -41,11 +46,56 @@ impl std::fmt::Display for FabricError {
             FabricError::NotFound(m) | FabricError::BadRequest(m) | FabricError::Internal(m) => {
                 write!(f, "{m}")
             }
+            FabricError::Conflict { expected, actual } => {
+                write!(
+                    f,
+                    "cluster configuration conflict: expected revision {expected}, current revision {actual}"
+                )
+            }
         }
     }
 }
 
 type FabricResult<T> = Result<T, FabricError>;
+
+fn map_config_store_error(error: ConfigStoreError) -> FabricError {
+    match error {
+        ConfigStoreError::Conflict { expected, actual } => {
+            FabricError::Conflict { expected, actual }
+        }
+        ConfigStoreError::Validation(message) => FabricError::BadRequest(message),
+        ConfigStoreError::Io(error) => {
+            FabricError::Internal(format!("cluster configuration storage failed: {error}"))
+        }
+        ConfigStoreError::Json(_) => {
+            FabricError::Internal("cluster configuration document is invalid".to_string())
+        }
+        ConfigStoreError::Watch(error) => {
+            FabricError::Internal(format!("cluster configuration watch failed: {error}"))
+        }
+    }
+}
+
+/// Exact, adopted cluster-fabric snapshot bound to one lifecycle read or
+/// durable mutation. This type deliberately has no `Debug`/`Serialize`
+/// implementation: the runtime `Config` may contain hydrated SSH secrets and
+/// must only be projected through the server's redacted response builder.
+pub struct FabricCommitSnapshot {
+    pub config: Config,
+    pub section: SectionEnvelope<serde_json::Value>,
+    pub credential_statuses: Vec<CredentialStatus>,
+    pub credential_health: CredentialStoreHealth,
+}
+
+/// Lifecycle result paired with the exact cluster snapshot it observed or
+/// committed. HTTP callers use the snapshot for their redacted envelope;
+/// agent-tool callers can consume only `value`.
+pub struct FabricActionResult<T> {
+    pub value: T,
+    pub snapshot: FabricCommitSnapshot,
+}
+
+type FabricEventPublisher = Arc<dyn Fn(&ConfigSectionEvent) + Send + Sync>;
 
 /// The shared fabric deploy engine: turns persisted nodes into running
 /// `broker-agent` workers, holding their handles + persisting `NodeState`.
@@ -55,6 +105,12 @@ pub struct FabricDeployer {
     /// `AppState::update_config`'s io-lock — #126).
     config_io_lock: Arc<Mutex<()>>,
     data_dir: PathBuf,
+    /// Process-owned modular section authority. Production installs this
+    /// together with the credential store and event publisher; legacy unit
+    /// fixtures retain the compatibility fallback.
+    config_facade: Option<Arc<ConfigFacade>>,
+    credential_store: Option<Arc<CredentialStore>>,
+    publish_event: Option<FabricEventPublisher>,
     /// Worker handles, keyed by node id — SHARED with `deploy_agent` so both
     /// surfaces see/manage the same workers.
     registry: DeployedRegistry,
@@ -97,10 +153,28 @@ impl FabricDeployer {
             config,
             config_io_lock,
             data_dir: data_dir.into(),
+            config_facade: None,
+            credential_store: None,
+            publish_event: None,
             registry,
             bamboo_bin: bamboo_bin.into(),
             recovery: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach the process-owned modular authorities used by production. Every
+    /// durable lifecycle write then participates in the cluster-fabric section
+    /// CAS and publishes the same authoritative section event as operator CRUD.
+    pub fn with_modular_persistence(
+        mut self,
+        config_facade: Arc<ConfigFacade>,
+        credential_store: Arc<CredentialStore>,
+        publish_event: FabricEventPublisher,
+    ) -> Self {
+        self.config_facade = Some(config_facade);
+        self.credential_store = Some(credential_store);
+        self.publish_event = Some(publish_event);
+        self
     }
 
     /// The shared worker registry (so `deploy_agent` can reuse it).
@@ -115,15 +189,243 @@ impl FabricDeployer {
             .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))
     }
 
+    fn credential_snapshot(&self) -> (Vec<CredentialStatus>, CredentialStoreHealth) {
+        let store = self
+            .credential_store
+            .clone()
+            .unwrap_or_else(|| Arc::new(CredentialStore::open(&self.data_dir)));
+        match store.statuses_with_health() {
+            Ok(snapshot) => snapshot,
+            Err(_) => (
+                Vec::new(),
+                CredentialStoreHealth {
+                    revision: 0,
+                    status: SectionStatus::Degraded,
+                    source: SectionSourceKind::Default,
+                    last_error: Some("credential status is unavailable".to_string()),
+                },
+            ),
+        }
+    }
+
+    async fn hydrate_cluster_fabric(
+        &self,
+        fabric: ClusterFabricConfig,
+    ) -> FabricResult<ClusterFabricConfig> {
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut config = Config::default();
+            config.cluster_fabric = fabric;
+            config.hydrate_cluster_credentials_from_store(&data_dir)?;
+            Ok::<_, ConfigStoreError>(config.cluster_fabric.clone())
+        })
+        .await
+        .map_err(|error| {
+            FabricError::Internal(format!("credential hydration task failed: {error}"))
+        })?
+        .map_err(map_config_store_error)
+    }
+
+    async fn snapshot_locked(&self, expected_revision: u64) -> FabricResult<FabricCommitSnapshot> {
+        let mut config = self.config.read().await.clone();
+        let section = if let Some(facade) = &self.config_facade {
+            let actual = facade.registry().cluster_fabric.snapshot().revision;
+            if expected_revision != actual {
+                return Err(FabricError::Conflict {
+                    expected: expected_revision,
+                    actual,
+                });
+            }
+            config.cluster_fabric = self
+                .hydrate_cluster_fabric(facade.effective_config().cluster_fabric.clone())
+                .await?;
+            facade
+                .registry()
+                .envelope_value(SectionId::ClusterFabric)
+                .map_err(map_config_store_error)?
+        } else {
+            if expected_revision != 0 {
+                return Err(FabricError::Conflict {
+                    expected: expected_revision,
+                    actual: 0,
+                });
+            }
+            SectionEnvelope {
+                data: serde_json::Value::Null,
+                revision: 0,
+                loaded_at: chrono::Utc::now(),
+                source_path: self.data_dir.join("config.json"),
+                source_kind: SectionSourceKind::Default,
+                status: SectionStatus::Healthy,
+                last_error: None,
+            }
+        };
+        let (credential_statuses, credential_health) = self.credential_snapshot();
+        Ok(FabricCommitSnapshot {
+            config,
+            section,
+            credential_statuses,
+            credential_health,
+        })
+    }
+
+    pub async fn current_cluster_revision(&self) -> FabricResult<u64> {
+        let _io = self.config_io_lock.lock().await;
+        Ok(self
+            .config_facade
+            .as_ref()
+            .map(|facade| facade.registry().cluster_fabric.snapshot().revision)
+            .unwrap_or(0))
+    }
+
+    /// Commit one engine-owned node mutation through the cluster-fabric
+    /// section authority. Runtime publication occurs only after the durable
+    /// CAS succeeds; the matching section event is emitted only after runtime
+    /// adopts the committed snapshot.
+    async fn persist_node_update_at_revision<F>(
+        &self,
+        expected_revision: u64,
+        update: F,
+    ) -> FabricResult<FabricCommitSnapshot>
+    where
+        F: FnOnce(&mut Config) -> FabricResult<()> + Send,
+    {
+        let _io = self.config_io_lock.lock().await;
+        self.persist_node_update_locked(expected_revision, update)
+            .await
+    }
+
+    /// Locked half of [`Self::persist_node_update_at_revision`]. Lifecycle
+    /// operations hold the same guard across their external worker action, so
+    /// a validated revision cannot become stale after a worker is stopped or
+    /// deployed but before its resulting state is committed.
+    async fn persist_node_update_locked<F>(
+        &self,
+        expected_revision: u64,
+        update: F,
+    ) -> FabricResult<FabricCommitSnapshot>
+    where
+        F: FnOnce(&mut Config) -> FabricResult<()> + Send,
+    {
+        if let Some(facade) = &self.config_facade {
+            let actual = facade.registry().cluster_fabric.snapshot().revision;
+            if expected_revision != actual {
+                return Err(FabricError::Conflict {
+                    expected: expected_revision,
+                    actual,
+                });
+            }
+
+            let mut candidate = self.config.read().await.clone();
+            update(&mut candidate)?;
+            let data_dir = self.data_dir.clone();
+            let revision = tokio::task::spawn_blocking(move || {
+                bamboo_config::persist_cluster_fabric_credential_transaction_at_revision(
+                    &data_dir,
+                    &mut candidate,
+                    &BTreeMap::new(),
+                    expected_revision,
+                )
+            })
+            .await
+            .map_err(|error| FabricError::Internal(format!("persist task failed: {error}")))?
+            .map_err(map_config_store_error)?;
+
+            if let Some(event) = facade.registry().reload_if_changed(SectionId::Credentials) {
+                if matches!(event, ConfigSectionEvent::Invalid { .. }) {
+                    return Err(FabricError::Internal(
+                        "committed credential section became invalid before publication"
+                            .to_string(),
+                    ));
+                }
+            }
+            let event = facade
+                .registry()
+                .reload_if_changed(SectionId::ClusterFabric);
+            if let Some(event @ ConfigSectionEvent::Invalid { .. }) = event.as_ref() {
+                if let Some(publish) = &self.publish_event {
+                    publish(event);
+                }
+                return Err(FabricError::Internal(
+                    "committed cluster section became invalid before publication".to_string(),
+                ));
+            }
+
+            let section = facade
+                .registry()
+                .envelope_value(SectionId::ClusterFabric)
+                .map_err(map_config_store_error)?;
+            if section.revision != revision {
+                return Err(FabricError::Internal(
+                    "committed cluster revision did not match the adopted revision".to_string(),
+                ));
+            }
+
+            let mut adopted = self.config.read().await.clone();
+            adopted.cluster_fabric = self
+                .hydrate_cluster_fabric(facade.effective_config().cluster_fabric.clone())
+                .await?;
+            *self.config.write().await = adopted.clone();
+
+            if let (Some(event), Some(publish)) = (event.as_ref(), self.publish_event.as_ref()) {
+                publish(event);
+            }
+            let (credential_statuses, credential_health) = self.credential_snapshot();
+            return Ok(FabricCommitSnapshot {
+                config: adopted,
+                section,
+                credential_statuses,
+                credential_health,
+            });
+        }
+
+        // Compatibility-only test fixtures have no modular facade. Preserve
+        // the same durable-before-runtime ordering without pretending to offer
+        // a revision other than zero.
+        if expected_revision != 0 {
+            return Err(FabricError::Conflict {
+                expected: expected_revision,
+                actual: 0,
+            });
+        }
+        let mut candidate = self.config.read().await.clone();
+        update(&mut candidate)?;
+        let durable_candidate = candidate.clone();
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || durable_candidate.save_to_dir(data_dir))
+            .await
+            .map_err(|error| FabricError::Internal(format!("persist task failed: {error}")))?
+            .map_err(|error| FabricError::Internal(format!("save config failed: {error}")))?;
+        *self.config.write().await = candidate;
+        self.snapshot_locked(0).await
+    }
+
     /// Deploy a worker onto a node and persist its running state.
     ///
     /// `echo=true` runs the dependency-free echo executor (no LLM) — a
     /// connectivity smoke test.
     pub async fn deploy(&self, node_id: &str, echo: bool) -> FabricResult<NodeState> {
+        let expected_revision = self.current_cluster_revision().await?;
+        Ok(self
+            .deploy_at_revision(node_id, echo, expected_revision)
+            .await?
+            .value)
+    }
+
+    /// Deploy against an operator-captured cluster-fabric revision and return
+    /// the exact adopted snapshot from the final state commit.
+    pub async fn deploy_at_revision(
+        &self,
+        node_id: &str,
+        echo: bool,
+        expected_revision: u64,
+    ) -> FabricResult<FabricActionResult<NodeState>> {
+        let _io = self.config_io_lock.lock().await;
+        let action_snapshot = self.snapshot_locked(expected_revision).await?;
         let (mut node, broker) = {
-            let cfg = self.config.read().await;
+            let cfg = &action_snapshot.config;
             (
-                self.node_snapshot(&cfg, node_id)?,
+                self.node_snapshot(cfg, node_id)?,
                 cfg.subagents().broker.clone(),
             )
         };
@@ -178,12 +480,11 @@ impl FabricDeployer {
         // deliver it (local stdin / russh file-upload) ship it; others fall back to
         // the legacy argv+env self-resolve (spec_json is then ignored, harmless).
         let spec_json = {
-            let cfg = self.config.read().await;
             build_resident_spec(
                 &node,
                 &broker.endpoint,
                 &broker.token,
-                &cfg,
+                &action_snapshot.config,
                 echo,
                 &worker_id,
             )
@@ -228,7 +529,15 @@ impl FabricDeployer {
                     last_error: Some(e.to_string()),
                     ..Default::default()
                 };
-                let _ = self.persist_state(node_id, Some(failed)).await;
+                self.persist_node_update_locked(expected_revision, |config| {
+                    let node = config
+                        .cluster_fabric
+                        .node_mut(node_id)
+                        .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
+                    node.state = Some(failed);
+                    Ok(())
+                })
+                .await?;
                 tracing::warn!(
                     audit = "cluster_fabric.deploy",
                     node = node_id,
@@ -260,11 +569,11 @@ impl FabricDeployer {
         );
 
         // TOFU: pin the observed host-key fingerprint if not already set.
-        if let Some(cell) = build.observed_fp {
-            if let Some(fp) = cell.lock().await.clone() {
-                self.pin_fingerprint_if_absent(node_id, &fp).await;
-            }
-        }
+        let observed_fingerprint = if let Some(cell) = build.observed_fp {
+            cell.lock().await.clone()
+        } else {
+            None
+        };
 
         // Verify-on-deploy: exec'ing the worker used to report "running" even when
         // the worker never dialed home (phantom success — e.g. a missing/incompatible
@@ -307,7 +616,15 @@ impl FabricDeployer {
                 last_error: Some(msg.clone()),
                 ..Default::default()
             };
-            let _ = self.persist_state(node_id, Some(failed)).await;
+            self.persist_node_update_locked(expected_revision, |config| {
+                let node = config
+                    .cluster_fabric
+                    .node_mut(node_id)
+                    .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
+                node.state = Some(failed);
+                Ok(())
+            })
+            .await?;
             tracing::warn!(
                 audit = "cluster_fabric.deploy",
                 node = node_id,
@@ -335,18 +652,87 @@ impl FabricDeployer {
             deployed_at: Some(chrono::Utc::now().to_rfc3339()),
             ..Default::default()
         };
-        self.persist_state(node_id, Some(state.clone())).await?;
-        Ok(state)
+        let response_state = state.clone();
+        let placement = node.placement.clone();
+        let snapshot = match self
+            .persist_node_update_locked(expected_revision, move |config| {
+                let target = config
+                    .cluster_fabric
+                    .node_mut(node_id)
+                    .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
+                if target.placement != placement {
+                    return Err(FabricError::Internal(
+                        "runtime cluster placement diverged from the adopted action snapshot"
+                            .to_string(),
+                    ));
+                }
+                if let (Some(fingerprint), NodePlacement::Ssh(ssh)) =
+                    (observed_fingerprint, &mut target.placement)
+                {
+                    if ssh.host_key_fingerprint.is_none() {
+                        ssh.host_key_fingerprint = Some(fingerprint);
+                    }
+                }
+                target.state = Some(state.clone());
+                Ok(())
+            })
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let deployed = self
+                    .registry
+                    .lock()
+                    .await
+                    .remove(&crate::registry_keys::node_key(node_id));
+                if let Some(deployed) = deployed {
+                    deployed.handle.shutdown().await;
+                }
+                return Err(error);
+            }
+        };
+        Ok(FabricActionResult {
+            value: response_state,
+            snapshot,
+        })
     }
 
     /// Stop a node's worker (if running) and persist the stopped state.
     pub async fn stop(&self, node_id: &str) -> FabricResult<NodeState> {
-        {
-            let cfg = self.config.read().await;
-            self.node_snapshot(&cfg, node_id)?;
-        }
-        // Remove under the lock, shut down outside it: shutdown is graceful now
-        // (SIGTERM + drain grace, #49) and must not hold the shared registry.
+        let expected_revision = self.current_cluster_revision().await?;
+        Ok(self
+            .stop_at_revision(node_id, expected_revision)
+            .await?
+            .value)
+    }
+
+    /// Stop against an operator-captured cluster-fabric revision.
+    pub async fn stop_at_revision(
+        &self,
+        node_id: &str,
+        expected_revision: u64,
+    ) -> FabricResult<FabricActionResult<NodeState>> {
+        let _io = self.config_io_lock.lock().await;
+        let snapshot = self.snapshot_locked(expected_revision).await?;
+        self.node_snapshot(&snapshot.config, node_id)?;
+        let state = NodeState {
+            status: NodeStatus::Stopped,
+            ..Default::default()
+        };
+        let persisted = self
+            .persist_node_update_locked(expected_revision, |config| {
+                let node = config
+                    .cluster_fabric
+                    .node_mut(node_id)
+                    .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
+                node.state = Some(state.clone());
+                Ok(())
+            })
+            .await?;
+        // The durable CAS succeeds before the external worker is affected.
+        // Remove under the registry lock and shut down outside that lock; the
+        // configuration guard remains held so no later lifecycle mutation can
+        // overtake the stop before the worker has actually exited.
         let removed = self
             .registry
             .lock()
@@ -360,20 +746,32 @@ impl FabricDeployer {
             node = node_id,
             outcome = "stopped"
         );
-        let state = NodeState {
-            status: NodeStatus::Stopped,
-            ..Default::default()
-        };
-        self.persist_state(node_id, Some(state.clone())).await?;
-        Ok(state)
+        Ok(FabricActionResult {
+            value: state,
+            snapshot: persisted,
+        })
     }
 
     /// Connectivity preflight: connect + auth + `uname`, WITHOUT deploying.
     pub async fn test(&self, node_id: &str) -> FabricResult<String> {
-        let node = {
-            let cfg = self.config.read().await;
-            self.node_snapshot(&cfg, node_id)?
-        };
+        let expected_revision = self.current_cluster_revision().await?;
+        Ok(self
+            .test_at_revision(node_id, expected_revision)
+            .await?
+            .value)
+    }
+
+    /// Preflight against an operator-captured cluster-fabric revision. The
+    /// operation does not mutate config, so the returned snapshot is the exact
+    /// validated base.
+    pub async fn test_at_revision(
+        &self,
+        node_id: &str,
+        expected_revision: u64,
+    ) -> FabricResult<FabricActionResult<String>> {
+        let _io = self.config_io_lock.lock().await;
+        let snapshot = self.snapshot_locked(expected_revision).await?;
+        let node = self.node_snapshot(&snapshot.config, node_id)?;
         let build = build_deployer(&node, &self.bamboo_bin).map_err(FabricError::BadRequest)?;
         let result = build.deployer.preflight().await;
         tracing::info!(
@@ -382,7 +780,8 @@ impl FabricDeployer {
             placement = placement_env(&node),
             outcome = if result.is_ok() { "ok" } else { "failed" },
         );
-        result.map_err(|e| FabricError::Internal(format!("preflight failed: {e}")))
+        let value = result.map_err(|e| FabricError::Internal(format!("preflight failed: {e}")))?;
+        Ok(FabricActionResult { value, snapshot })
     }
 
     /// Tail the last `lines` lines of a node worker's log.
@@ -474,49 +873,80 @@ impl FabricDeployer {
             ))
         };
 
-        // Commit under the io + write lock, RE-CHECKING the live status. The probe
-        // above ran UNLOCKED for up to `probe_timeout`, so a concurrent stop()/
-        // deploy() may have moved this node out of the monitored set meanwhile —
-        // blindly writing back the stale decision would e.g. resurrect a
-        // user-Stopped node as Unreachable and hand it to auto-recover. If the live
-        // status is no longer Running/Unreachable, the concurrent write wins.
-        let _io = self.config_io_lock.lock().await;
-        let (next, from, snapshot) = {
-            let mut cfg = self.config.write().await;
-            let Some(node) = cfg.cluster_fabric.node_mut(node_id) else {
+        // Re-check after the unlocked probe. A status flip is an authoritative
+        // section mutation; a steady heartbeat remains runtime-only to avoid
+        // revision churn.
+        let live = {
+            let cfg = self.config.read().await;
+            let Some(node) = cfg.cluster_fabric.node(node_id) else {
                 return Ok(current);
             };
-            let live = node.state.clone().unwrap_or_default();
-            if !matches!(live.status, NodeStatus::Running | NodeStatus::Unreachable) {
-                return Ok(live); // moved out of the monitored set mid-probe → leave it
-            }
-            let from = live.status;
-            let next = NodeState {
-                status: new_status,
-                last_health: Some(chrono::Utc::now().to_rfc3339()),
-                last_error: new_error,
-                ..live
-            };
-            node.state = Some(next.clone());
-            // A status FLIP is durable + audited; a steady-state heartbeat stays in
-            // memory only (no config.json churn) — so snapshot to disk only on a flip.
-            (next, from, (from != new_status).then(|| cfg.clone()))
+            node.state.clone().unwrap_or_default()
         };
-        if let Some(snapshot) = snapshot {
-            let data_dir = self.data_dir.clone();
-            tokio::task::spawn_blocking(move || snapshot.save_to_dir(data_dir))
-                .await
-                .map_err(|e| FabricError::Internal(format!("persist task: {e}")))?
-                .map_err(|e| FabricError::Internal(format!("save config: {e}")))?;
+        if !matches!(live.status, NodeStatus::Running | NodeStatus::Unreachable) {
+            return Ok(live);
+        }
+        let from = live.status;
+        let next = NodeState {
+            status: new_status,
+            last_health: Some(chrono::Utc::now().to_rfc3339()),
+            last_error: new_error,
+            ..live
+        };
+        if from != new_status {
+            let expected_revision = self.current_cluster_revision().await?;
+            let committed_next = next.clone();
+            let snapshot = self
+                .persist_node_update_at_revision(expected_revision, |config| {
+                    let Some(node) = config.cluster_fabric.node_mut(node_id) else {
+                        return Ok(());
+                    };
+                    let current = node.state.clone().unwrap_or_default();
+                    if !matches!(
+                        current.status,
+                        NodeStatus::Running | NodeStatus::Unreachable
+                    ) {
+                        return Ok(());
+                    }
+                    node.state = Some(NodeState {
+                        status: committed_next.status,
+                        last_health: committed_next.last_health.clone(),
+                        last_error: committed_next.last_error.clone(),
+                        ..current
+                    });
+                    Ok(())
+                })
+                .await?;
+            let adopted = snapshot
+                .config
+                .cluster_fabric
+                .node(node_id)
+                .and_then(|node| node.state.clone())
+                .unwrap_or(current);
             tracing::info!(
                 audit = "cluster_fabric.health",
                 node = node_id,
                 worker_id = %worker_id,
                 from = ?from,
-                to = ?next.status,
+                to = ?adopted.status,
                 "node health changed",
             );
+            return Ok(adopted);
         }
+
+        let _io = self.config_io_lock.lock().await;
+        let mut cfg = self.config.write().await;
+        let Some(node) = cfg.cluster_fabric.node_mut(node_id) else {
+            return Ok(current);
+        };
+        let current = node.state.clone().unwrap_or_default();
+        if !matches!(
+            current.status,
+            NodeStatus::Running | NodeStatus::Unreachable
+        ) {
+            return Ok(current);
+        }
+        node.state = Some(next.clone());
         Ok(next)
     }
 
@@ -692,44 +1122,34 @@ impl FabricDeployer {
         }))
     }
 
-    /// Persist `state` onto a node (engine-owned field): io-lock + atomic save,
-    /// mirroring `AppState::update_config` minus the provider/MCP side effects.
-    async fn persist_state(&self, node_id: &str, state: Option<NodeState>) -> FabricResult<()> {
-        let _io = self.config_io_lock.lock().await;
-        let snapshot = {
-            let mut cfg = self.config.write().await;
-            let node = cfg
+    /// Persist an engine-owned node state against a specific section revision.
+    async fn persist_state_at_revision(
+        &self,
+        node_id: &str,
+        state: Option<NodeState>,
+        expected_revision: u64,
+    ) -> FabricResult<FabricCommitSnapshot> {
+        self.persist_node_update_at_revision(expected_revision, |config| {
+            let node = config
                 .cluster_fabric
                 .node_mut(node_id)
                 .ok_or_else(|| FabricError::NotFound(format!("Node '{node_id}'")))?;
             node.state = state;
-            cfg.clone()
-        };
-        let data_dir = self.data_dir.clone();
-        tokio::task::spawn_blocking(move || snapshot.save_to_dir(data_dir))
-            .await
-            .map_err(|e| FabricError::Internal(format!("persist task: {e}")))?
-            .map_err(|e| FabricError::Internal(format!("save config: {e}")))?;
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
-    /// Pin `fp` onto a node's SSH target if it has no fingerprint yet (TOFU).
-    async fn pin_fingerprint_if_absent(&self, node_id: &str, fp: &str) {
-        let _io = self.config_io_lock.lock().await;
-        let snapshot = {
-            let mut cfg = self.config.write().await;
-            if let Some(node) = cfg.cluster_fabric.node_mut(node_id) {
-                if let NodePlacement::Ssh(target) = &mut node.placement {
-                    if target.host_key_fingerprint.is_some() {
-                        return;
-                    }
-                    target.host_key_fingerprint = Some(fp.to_string());
-                }
-            }
-            cfg.clone()
-        };
-        let data_dir = self.data_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || snapshot.save_to_dir(data_dir)).await;
+    /// Internal monitor/recovery writes adopt the current cluster revision at
+    /// the moment the mutation begins and still use the same durable CAS path.
+    async fn persist_state(
+        &self,
+        node_id: &str,
+        state: Option<NodeState>,
+    ) -> FabricResult<FabricCommitSnapshot> {
+        let expected_revision = self.current_cluster_revision().await?;
+        self.persist_state_at_revision(node_id, state, expected_revision)
+            .await
     }
 }
 
@@ -1118,6 +1538,61 @@ fn build_russh(node: &Node, target: &SshTarget) -> Result<RusshDeployer, String>
     )
     .with_fingerprint(target.host_key_fingerprint.clone())
     .with_upload(upload))
+}
+
+#[cfg(test)]
+mod lifecycle_persistence_tests {
+    use super::*;
+    use bamboo_config::cluster_fabric::{DeployProfile, TrustLevel};
+
+    #[tokio::test]
+    async fn failed_durable_state_write_does_not_advance_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let invalid_data_dir = root.path().join("not-a-directory");
+        std::fs::write(&invalid_data_dir, b"file").unwrap();
+
+        let mut config = Config::default();
+        config.cluster_fabric.nodes.push(Node {
+            id: "n1".to_string(),
+            label: "node".to_string(),
+            placement: NodePlacement::Local,
+            trust_level: TrustLevel::Trusted,
+            deploy: DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let config = Arc::new(RwLock::new(config));
+        let deployer = FabricDeployer::new(
+            config.clone(),
+            Arc::new(Mutex::new(())),
+            invalid_data_dir,
+            Arc::new(Mutex::new(HashMap::new())),
+            "/usr/bin/true",
+        );
+
+        let result = deployer
+            .persist_state_at_revision(
+                "n1",
+                Some(NodeState {
+                    status: NodeStatus::Stopped,
+                    ..Default::default()
+                }),
+                0,
+            )
+            .await;
+        assert!(result.is_err(), "invalid data directory must fail");
+        assert!(
+            config
+                .read()
+                .await
+                .cluster_fabric
+                .node("n1")
+                .unwrap()
+                .state
+                .is_none(),
+            "runtime must retain the pre-commit state when persistence fails"
+        );
+    }
 }
 
 #[cfg(test)]
