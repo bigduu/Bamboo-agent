@@ -184,6 +184,21 @@ async fn reject_managed_credential_ref(
                 .to_string(),
         ));
     }
+    if config
+        .cluster_fabric
+        .credential_refs
+        .values()
+        .any(|metadata| {
+            metadata
+                .references()
+                .any(|reference| reference == credential_ref)
+        })
+    {
+        return Err(AppError::BadRequest(
+            "active cluster credentials must be changed through the dedicated revisioned cluster-fabric API"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -221,7 +236,14 @@ pub(super) fn map_store_read_error(error: ConfigStoreError) -> AppError {
 mod tests {
     use super::*;
     use actix_web::{test, App};
-    use bamboo_config::CredentialStatus;
+    use bamboo_config::{
+        cluster_fabric::{
+            ClusterCredentialAction, ClusterNodeCredentialIntents, DeployProfile, Node,
+            NodePlacement, SshAuth, SshTarget, TrustLevel,
+        },
+        CredentialStatus,
+    };
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     #[::core::prelude::v1::test]
@@ -464,6 +486,201 @@ mod tests {
                 .map(|auth| auth.username.as_str()),
             Some("active")
         );
+    }
+
+    #[actix_web::test]
+    async fn generic_replace_clear_and_reset_preserve_active_cluster_credentials() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let password_ref = bamboo_config::cluster_password_credential_ref("password-node").unwrap();
+        let private_key_ref =
+            bamboo_config::cluster_private_key_credential_ref("key-node").unwrap();
+        let passphrase_ref = bamboo_config::cluster_passphrase_credential_ref("key-node").unwrap();
+        let intents = BTreeMap::from([
+            (
+                "password-node".to_string(),
+                ClusterNodeCredentialIntents {
+                    password: ClusterCredentialAction::Replace("password-secret".to_string()),
+                    private_key: ClusterCredentialAction::Clear,
+                    passphrase: ClusterCredentialAction::Clear,
+                },
+            ),
+            (
+                "key-node".to_string(),
+                ClusterNodeCredentialIntents {
+                    password: ClusterCredentialAction::Clear,
+                    private_key: ClusterCredentialAction::Replace("private-key-secret".to_string()),
+                    passphrase: ClusterCredentialAction::Replace("passphrase-secret".to_string()),
+                },
+            ),
+        ]);
+        state
+            .update_cluster_fabric_credentials(0, intents, |config| {
+                config.cluster_fabric.nodes = vec![
+                    Node {
+                        id: "password-node".to_string(),
+                        label: "password-node".to_string(),
+                        placement: NodePlacement::Ssh(SshTarget {
+                            host: "password.example".to_string(),
+                            port: 22,
+                            username: "deploy".to_string(),
+                            auth: SshAuth::Password {
+                                password: String::new(),
+                                password_encrypted: None,
+                            },
+                            host_key_fingerprint: None,
+                        }),
+                        trust_level: TrustLevel::Trusted,
+                        deploy: DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    },
+                    Node {
+                        id: "key-node".to_string(),
+                        label: "key-node".to_string(),
+                        placement: NodePlacement::Ssh(SshTarget {
+                            host: "key.example".to_string(),
+                            port: 22,
+                            username: "deploy".to_string(),
+                            auth: SshAuth::PrivateKey {
+                                private_key: String::new(),
+                                private_key_encrypted: None,
+                                private_key_path: None,
+                                passphrase: String::new(),
+                                passphrase_encrypted: None,
+                            },
+                            host_key_fingerprint: None,
+                        }),
+                        trust_level: TrustLevel::Trusted,
+                        deploy: DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    },
+                ];
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let orphan = CredentialRef::parse("custom.cluster-reset.orphan").unwrap();
+        let before_orphan_revision = state.credential_store.revision().unwrap();
+        state
+            .credential_store
+            .replace(
+                orphan.clone(),
+                "unrelated-orphan",
+                CredentialSource::User,
+                before_orphan_revision,
+            )
+            .unwrap();
+        let credential_revision = state.credential_store.revision().unwrap();
+        let cluster_revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .revision;
+        let before_store = std::fs::read(state.credential_store.path()).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/credentials/reset", web::post().to(reset_credentials))
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::put().to(replace_credential),
+                )
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::delete().to(clear_credential),
+                ),
+        )
+        .await;
+
+        for reference in [&password_ref, &private_key_ref, &passphrase_ref] {
+            let uri = format!("/credentials/{}", reference.as_str());
+            let replace = test::call_service(
+                &app,
+                test::TestRequest::put()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({
+                        "expected_revision": credential_revision,
+                        "value": "generic-replacement-must-not-win"
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(replace.status(), actix_web::http::StatusCode::BAD_REQUEST);
+            let replace: serde_json::Value = test::read_body_json(replace).await;
+            assert!(replace["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("dedicated revisioned cluster-fabric API"));
+
+            let clear = test::call_service(
+                &app,
+                test::TestRequest::delete()
+                    .uri(&uri)
+                    .set_json(serde_json::json!({
+                        "expected_revision": credential_revision
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(clear.status(), actix_web::http::StatusCode::BAD_REQUEST);
+            let clear: serde_json::Value = test::read_body_json(clear).await;
+            assert!(clear["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("dedicated revisioned cluster-fabric API"));
+        }
+
+        let reset = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/credentials/reset")
+                .set_json(serde_json::json!({
+                    "expected_revision": credential_revision
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(reset.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let reset: serde_json::Value = test::read_body_json(reset).await;
+        assert!(reset["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("credentials still referenced by configuration"));
+
+        assert_eq!(
+            std::fs::read(state.credential_store.path()).unwrap(),
+            before_store
+        );
+        assert_eq!(
+            state.credential_store.revision().unwrap(),
+            credential_revision
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            cluster_revision
+        );
+        for reference in [&password_ref, &private_key_ref, &passphrase_ref] {
+            assert!(
+                state.credential_store.status(reference).unwrap().configured,
+                "{} must remain configured",
+                reference.as_str()
+            );
+        }
+        assert!(state.credential_store.status(&orphan).unwrap().configured);
     }
 
     #[cfg(feature = "test-utils")]

@@ -135,6 +135,39 @@ impl ClusterNodeCredentialRefs {
     }
 }
 
+/// Explicit operator intent for one isolated cluster credential.
+///
+/// Deliberately does not implement `Debug` or serialization: replacement
+/// values are request-only secret material and must never enter ordinary
+/// configuration documents, logs, events, or diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ClusterCredentialAction {
+    Keep,
+    Replace(String),
+    Clear,
+}
+
+/// Explicit password/private-key/passphrase actions for one node mutation.
+///
+/// Every HTTP mutation supplies all three actions, so an omitted field can
+/// never ambiguously mean both "keep" and "clear".
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClusterNodeCredentialIntents {
+    pub password: ClusterCredentialAction,
+    pub private_key: ClusterCredentialAction,
+    pub passphrase: ClusterCredentialAction,
+}
+
+impl ClusterNodeCredentialIntents {
+    pub fn clear_all() -> Self {
+        Self {
+            password: ClusterCredentialAction::Clear,
+            private_key: ClusterCredentialAction::Clear,
+            passphrase: ClusterCredentialAction::Clear,
+        }
+    }
+}
+
 pub fn cluster_password_credential_ref(node_id: &str) -> ConfigStoreResult<CredentialRef> {
     credential_ref("cluster", node_id, "password")
 }
@@ -238,7 +271,7 @@ pub enum SshAuth {
     /// Stored password.
     Password {
         /// Plaintext — hydrated in memory, empty on disk.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         password: String,
         /// Ciphertext on disk.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,7 +281,7 @@ pub enum SshAuth {
     /// (not a secret). An optional passphrase is always a secret.
     PrivateKey {
         /// Inline PEM plaintext — hydrated in memory, empty on disk.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         private_key: String,
         /// Ciphertext of the inline PEM on disk.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,7 +290,7 @@ pub enum SshAuth {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         private_key_path: Option<String>,
         /// Optional key passphrase plaintext — hydrated in memory, empty on disk.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         passphrase: String,
         /// Ciphertext of the passphrase on disk.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,7 +457,7 @@ impl Config {
 
         let mut requested = Vec::<(usize, Field, CredentialRef)>::new();
         let mut seen_refs = BTreeSet::new();
-        let other_counts = crate::credential_store::config_credential_ref_counts(self)?;
+        let consumer_counts = crate::credential_store::config_credential_ref_counts(self)?;
         for (index, node) in self.cluster_fabric.nodes.iter().enumerate() {
             let metadata = self.cluster_fabric.credential_refs.get(&node.id);
             let empty = ClusterNodeCredentialRefs::default();
@@ -447,7 +480,10 @@ impl Config {
                         "cluster credential reference is not canonical".to_string(),
                     ));
                 }
-                if other_counts.get(reference).copied().unwrap_or(0) != 0
+                // The shared inventory includes this cluster metadata slot.
+                // Exactly one consumer is therefore the expected exclusive
+                // state; any additional consumer remains fail-closed.
+                if consumer_counts.get(reference).copied().unwrap_or(0) != 1
                     || !seen_refs.insert(reference.clone())
                 {
                     return Err(crate::ConfigStoreError::Validation(

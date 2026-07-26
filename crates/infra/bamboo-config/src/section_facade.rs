@@ -1868,6 +1868,21 @@ fn validate_cluster_fabric(value: &ClusterFabricSection) -> Result<(), String> {
             }
         }
     }
+    let mut cluster_names = BTreeSet::new();
+    for cluster in &value.0.clusters {
+        if cluster.name.trim().is_empty() || !cluster_names.insert(cluster.name.as_str()) {
+            return Err("cluster names must be non-empty and unique".to_string());
+        }
+        let mut members = BTreeSet::new();
+        for node_id in &cluster.node_ids {
+            if !node_ids.contains(node_id.as_str()) {
+                return Err("cluster membership references an unknown node".to_string());
+            }
+            if !members.insert(node_id.as_str()) {
+                return Err("cluster membership must not contain duplicate nodes".to_string());
+            }
+        }
+    }
     validate_json_serializable(value)
 }
 

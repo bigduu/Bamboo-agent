@@ -514,6 +514,9 @@ pub async fn get_typed_section(
     match id {
         bamboo_config::SectionId::Providers => get_provider_section(app_state).await,
         bamboo_config::SectionId::Mcp => get_mcp_section(app_state).await,
+        bamboo_config::SectionId::ClusterFabric => {
+            super::super::cluster_fabric::get_cluster_section(app_state).await
+        }
         _ => {
             let _io = app_state.config_io_lock.lock().await;
             let facade = app_state.config_facade.as_ref().ok_or_else(|| {
@@ -544,6 +547,7 @@ pub async fn put_typed_section(
         bamboo_config::SectionId::Providers
             | bamboo_config::SectionId::Mcp
             | bamboo_config::SectionId::Credentials
+            | bamboo_config::SectionId::ClusterFabric
     ) {
         return Err(AppError::BadRequest(
             "this section requires its dedicated endpoint".to_string(),
@@ -3643,6 +3647,50 @@ mod tests {
             .await
             .proxy_auth_credential_ref
             .is_none());
+    }
+
+    #[actix_web::test]
+    async fn generic_cluster_section_put_cannot_bypass_dedicated_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let before = std::fs::read(&cluster_path).unwrap();
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/sections/{section}")
+                    .route(web::get().to(get_typed_section))
+                    .route(web::put().to(put_typed_section)),
+            ),
+        )
+        .await;
+
+        let initial: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/sections/cluster-fabric")
+                .to_request(),
+        )
+        .await;
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/cluster-fabric")
+                .set_json(json!({
+                    "expected_revision": initial["revision"],
+                    "data": {
+                        "nodes": [{
+                            "id": "bypass",
+                            "label": "bypass",
+                            "placement": {"type": "local"}
+                        }]
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(cluster_path).unwrap(), before);
+        assert!(state.config.read().await.cluster_fabric.nodes.is_empty());
     }
 
     #[actix_web::test]

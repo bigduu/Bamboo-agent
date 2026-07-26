@@ -5,15 +5,6 @@ mod constants;
 mod mcp;
 mod provider;
 
-/// Return the public marker used in place of secrets in API responses.
-///
-/// Build the marker as a display value instead of letting a string literal
-/// flow into credential-shaped fields. The marker is not authentication
-/// material, and this keeps credential scanners focused on actual secrets.
-pub(super) fn masked_secret_marker() -> String {
-    "****".to_owned() + "..." + "****"
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -248,7 +239,9 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
         }
     }
 
-    // Redact cluster-fabric SSH secrets on each node's placement.auth.
+    // Cluster-fabric credentials are represented by status metadata on the
+    // section endpoint. Never expose plaintext, ciphertext, or mask markers
+    // through the legacy root configuration response.
     if let Some(nodes) = root
         .get_mut("cluster_fabric")
         .and_then(|f| f.get_mut("nodes"))
@@ -260,11 +253,15 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
                 .and_then(|p| p.get_mut("auth"))
                 .and_then(|a| a.as_object_mut())
             {
-                for field in ["password", "private_key", "passphrase"] {
-                    if auth.get(field).and_then(|v| v.as_str()).is_some() {
-                        auth.insert(field.to_string(), Value::String("****...****".to_string()));
-                    }
-                    auth.remove(&format!("{field}_encrypted"));
+                for field in [
+                    "password",
+                    "password_encrypted",
+                    "private_key",
+                    "private_key_encrypted",
+                    "passphrase",
+                    "passphrase_encrypted",
+                ] {
+                    auth.remove(field);
                 }
             }
         }

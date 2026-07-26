@@ -51,6 +51,12 @@ pub async fn set_bamboo_config(
             "expected_revision is only valid for a dedicated revisioned config domain".to_string(),
         ));
     }
+    if patch_obj.contains_key("cluster_fabric") {
+        return Err(AppError::BadRequest(
+            "cluster_fabric must be changed through the dedicated revisioned cluster API"
+                .to_string(),
+        ));
+    }
     let mut model_limits_patch = take_model_limits_patch(&mut patch_obj);
     config_manager::sanitize_root_patch(&mut patch_obj);
     if model_limits_patch.is_some() && !patch_obj.is_empty() {
@@ -72,14 +78,6 @@ pub async fn set_bamboo_config(
     let new_config = app_state
         .update_config_with_provider_credentials(
             move |config| {
-                if patch_obj.contains_key("cluster_fabric")
-                    && !config.cluster_fabric.credential_refs.is_empty()
-                {
-                    return Err(AppError::BadRequest(
-                        "cluster_fabric with isolated credentials must be changed through the dedicated node API"
-                            .to_string(),
-                    ));
-                }
                 let current = config.clone();
                 let mut patch_obj = patch_obj;
                 remove_unchanged_access_control_echo(&current, &mut patch_obj)?;
@@ -527,6 +525,47 @@ mod tests {
             let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
             assert!(body.contains("revisioned env-vars API"));
         }
+    }
+
+    #[actix_web::test]
+    async fn root_patch_and_validation_reject_cluster_fabric_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let before = std::fs::read(&cluster_path).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/config", web::post().to(set_bamboo_config))
+                .route(
+                    "/config/validate",
+                    web::post().to(crate::handlers::settings::validate_bamboo_config_patch),
+                ),
+        )
+        .await;
+        for uri in ["/config", "/config/validate"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(uri)
+                    .set_json(serde_json::json!({
+                        "cluster_fabric": {
+                            "nodes": [{
+                                "id": "bypass",
+                                "label": "bypass",
+                                "placement": {"type": "local"}
+                            }]
+                        }
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(body.contains("revisioned cluster API"));
+        }
+        assert_eq!(std::fs::read(cluster_path).unwrap(), before);
+        assert!(state.config.read().await.cluster_fabric.nodes.is_empty());
     }
 
     #[actix_web::test]

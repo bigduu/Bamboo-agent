@@ -678,6 +678,39 @@ fn publish_exact_facade_commit(
     Ok(())
 }
 
+/// Refresh both durable members of a cluster exact transaction while exposing
+/// only the authoritative cluster-fabric event. The credential document is an
+/// internal implementation detail; clients use the cluster section revision.
+fn publish_cluster_facade_commit(
+    facade: Option<&std::sync::Arc<bamboo_config::ConfigFacade>>,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+) -> Result<u64, AppError> {
+    let facade = facade.ok_or_else(|| {
+        AppError::BadRequest(
+            "cluster mutations require the modular configuration facade".to_string(),
+        )
+    })?;
+    if let Some(event) = facade.registry().reload_if_changed(SectionId::Credentials) {
+        if matches!(event, ConfigSectionEvent::Invalid { .. }) {
+            return Err(AppError::InternalError(anyhow::anyhow!(
+                "committed credential section became invalid before publication"
+            )));
+        }
+    }
+    if let Some(event) = facade
+        .registry()
+        .reload_if_changed(SectionId::ClusterFabric)
+    {
+        if matches!(event, ConfigSectionEvent::Invalid { .. }) {
+            return Err(AppError::InternalError(anyhow::anyhow!(
+                "committed cluster section became invalid before publication"
+            )));
+        }
+        publish_registry_event(account_sink, &event);
+    }
+    Ok(facade.registry().cluster_fabric.snapshot().revision)
+}
+
 fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
     match id {
         SectionId::Core => {
@@ -1336,7 +1369,10 @@ impl AppState {
     ) -> Result<u64, ConfigSectionMutationError> {
         if matches!(
             id,
-            SectionId::Providers | SectionId::Mcp | SectionId::Credentials
+            SectionId::Providers
+                | SectionId::Mcp
+                | SectionId::Credentials
+                | SectionId::ClusterFabric
         ) {
             return Err(ConfigSectionMutationError::Invalid(
                 "this section requires its dedicated endpoint".to_string(),
@@ -2051,8 +2087,17 @@ impl AppState {
                 candidate.publish_env_vars();
             }
             *config.write().await = candidate.clone();
-            publish_exact_facade_commit(Some(facade), &account_sink, &[SectionId::Credentials, id])
+            if id == SectionId::ClusterFabric {
+                publish_cluster_facade_commit(Some(facade), &account_sink)
+                    .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            } else {
+                publish_exact_facade_commit(
+                    Some(facade),
+                    &account_sink,
+                    &[SectionId::Credentials, id],
+                )
                 .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
+            }
 
             if id == SectionId::Core {
                 match bamboo_llm::ProviderRegistry::from_config(&candidate, app_data_dir.clone())
@@ -3102,7 +3147,10 @@ impl AppState {
     pub async fn update_cluster_fabric_credentials<F>(
         &self,
         expected_revision: u64,
-        node_intents: std::collections::BTreeSet<String>,
+        node_intents: std::collections::BTreeMap<
+            String,
+            bamboo_config::ClusterNodeCredentialIntents,
+        >,
         update: F,
     ) -> Result<(Config, u64), AppError>
     where
@@ -3153,13 +3201,15 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            publish_exact_facade_commit(
-                config_facade.as_ref(),
-                &account_sink,
-                &[SectionId::Credentials, SectionId::ClusterFabric],
-            )?;
             *config.write().await = candidate.clone();
-            Ok::<_, AppError>((candidate, revision))
+            let published_revision =
+                publish_cluster_facade_commit(config_facade.as_ref(), &account_sink)?;
+            if published_revision != revision {
+                return Err(AppError::InternalError(anyhow::anyhow!(
+                    "committed cluster revision did not match the published revision"
+                )));
+            }
+            Ok::<_, AppError>((candidate, published_revision))
         });
         transaction.await.map_err(|error| {
             AppError::InternalError(anyhow::anyhow!(
@@ -3770,6 +3820,107 @@ mod live_reload_tests {
         feed: &mut tokio::sync::broadcast::Receiver<Arc<bamboo_engine::events::ChangeEvent>>,
     ) -> AgentEvent {
         next_config_event(feed, "mcp").await
+    }
+
+    #[tokio::test]
+    async fn cluster_commit_installs_runtime_before_one_authoritative_event() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .revision;
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut feed = state.account_sink.subscribe();
+        let runtime = state.config.clone();
+        let observer = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(3), async move {
+                loop {
+                    let event = feed.recv().await.unwrap();
+                    match &event.event {
+                        AgentEvent::ConfigChanged { section, .. } if section == "credentials" => {
+                            panic!("cluster mutation published an internal credential event")
+                        }
+                        AgentEvent::ConfigChanged { section, revision }
+                            if section == "cluster-fabric" =>
+                        {
+                            assert!(
+                                runtime
+                                    .read()
+                                    .await
+                                    .cluster_fabric
+                                    .node("event-node")
+                                    .is_some(),
+                                "event observer saw the old runtime snapshot"
+                            );
+                            return *revision;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("cluster event timed out")
+        });
+
+        let node = bamboo_config::Node {
+            id: "event-node".to_string(),
+            label: "event-node".to_string(),
+            placement: bamboo_config::NodePlacement::Local,
+            trust_level: bamboo_config::TrustLevel::Trusted,
+            deploy: bamboo_config::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        };
+        let (_, committed) = state
+            .update_cluster_fabric_credentials(
+                revision,
+                BTreeMap::from([(
+                    "event-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                move |config| {
+                    config.cluster_fabric.nodes.push(node);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed, revision + 1);
+        assert_eq!(observer.await.unwrap(), committed);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        let cluster_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, revision: event_revision }
+                        if section == "cluster-fabric" && *event_revision == committed
+                )
+            })
+            .count();
+        let credential_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, .. } if section == "credentials"
+                )
+            })
+            .count();
+        assert_eq!(cluster_events, 1);
+        assert_eq!(credential_events, 0);
     }
 
     async fn wait_for_facade_health(

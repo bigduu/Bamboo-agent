@@ -814,6 +814,8 @@ enum MigrationFault {
     AfterRebaseStageWrite,
     AfterRebaseManifest,
     BeforeExactCommitCredentialRace,
+    BeforeExactStagingUnrelatedCredentialRace,
+    BeforeExactCommitUnrelatedCredentialRace,
     AfterExactCommitCredentialRace,
     AfterExactCommitUnrelatedCredentialRace,
     AfterExactCommitCredentialClearRace,
@@ -1746,11 +1748,32 @@ pub fn persist_access_control_credential_transaction_at_revision(
 pub fn persist_cluster_fabric_credential_transaction_at_revision(
     data_dir: impl AsRef<Path>,
     config: &mut crate::Config,
-    node_intents: &BTreeSet<String>,
+    node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
     expected_revision: u64,
 ) -> ConfigStoreResult<u64> {
-    persist_exact_credential_transaction_inner(
+    persist_cluster_fabric_credential_transaction_inner(
         data_dir.as_ref(),
+        config,
+        node_intents,
+        expected_revision,
+        None,
+    )
+}
+
+fn persist_cluster_fabric_credential_transaction_inner(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
+    expected_revision: u64,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<u64> {
+    if !crate::section_layout_is_active(data_dir)? {
+        return Err(ConfigStoreError::Validation(
+            "cluster credential updates require the modular configuration layout".to_string(),
+        ));
+    }
+    persist_exact_credential_transaction_inner(
+        data_dir,
         config,
         &BTreeSet::new(),
         &BTreeSet::new(),
@@ -1768,7 +1791,7 @@ pub fn persist_cluster_fabric_credential_transaction_at_revision(
         None,
         None,
         #[cfg(test)]
-        None,
+        fault,
     )
 }
 
@@ -2119,7 +2142,7 @@ fn persist_exact_credential_transaction_inner(
     notification_intents: &BTreeSet<String>,
     notification_reset: bool,
     notification_expected_revision: Option<u64>,
-    cluster_transaction: Option<(&BTreeSet<String>, u64)>,
+    cluster_transaction: Option<(&BTreeMap<String, crate::ClusterNodeCredentialIntents>, u64)>,
     connect_transaction: Option<(&crate::patch::ConnectSecretIntents, u64)>,
     access_transaction: Option<(bool, &BTreeSet<String>, u64)>,
     provider_expected_revision: Option<u64>,
@@ -2261,6 +2284,16 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
+    if let (Some((_, expected)), Some(section), Some(ExactTransactionScope::ClusterFabric)) =
+        (cluster_transaction, active_section.as_ref(), exact_scope)
+    {
+        if section.expected_revision != expected {
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: section.expected_revision,
+            });
+        }
+    }
     if let (Some((_, expected)), Some(section)) = (reset_scope, active_section.as_ref()) {
         if section.expected_revision != expected {
             return Err(ConfigStoreError::Conflict {
@@ -2391,7 +2424,7 @@ fn persist_exact_credential_transaction_inner(
     }
     if let Some((node_intents, _)) = cluster_transaction {
         let mut refs = BTreeSet::new();
-        for node_id in node_intents {
+        for node_id in node_intents.keys() {
             refs.insert(crate::cluster_password_credential_ref(node_id)?);
             refs.insert(crate::cluster_private_key_credential_ref(node_id)?);
             refs.insert(crate::cluster_passphrase_credential_ref(node_id)?);
@@ -2468,7 +2501,9 @@ fn persist_exact_credential_transaction_inner(
     };
     let mut prepared = match prepared {
         Some(prepared) => prepared,
-        None if provider_expected_revision.is_some() => store.prepare_provider_metadata_update()?,
+        None if provider_expected_revision.is_some() || cluster_transaction.is_some() => {
+            store.prepare_provider_metadata_update()?
+        }
         None => return store.revision_unchecked(),
     };
     if proxy_only && reset_scope.is_none() {
@@ -2503,14 +2538,6 @@ fn persist_exact_credential_transaction_inner(
                 "notification credential revision precondition is required".to_string(),
             )
         })?;
-        if prepared.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: prepared.expected_revision,
-            });
-        }
-    }
-    if let Some((_, expected)) = cluster_transaction {
         if prepared.expected_revision != expected {
             return Err(ConfigStoreError::Conflict {
                 expected,
@@ -2615,7 +2642,8 @@ fn persist_exact_credential_transaction_inner(
             original_data != candidate_data,
         )
     } else if let (Some(section), Some(scope)) = (active_section.as_ref(), exact_scope) {
-        let credential_changed = mcp_only && prepared.revision != prepared.expected_revision;
+        let credential_changed =
+            (mcp_only || cluster_only) && prepared.revision != prepared.expected_revision;
         let (bytes, changed) = prepare_active_exact_section_document(
             section,
             scope,
@@ -2653,15 +2681,34 @@ fn persist_exact_credential_transaction_inner(
         || cluster_domain_changed
         || connect_domain_changed
         || access_domain_changed;
-    if exact_domain_changed {
+    if exact_domain_changed && !cluster_only {
         prepared.advance_revision_for_domain_change()?;
     }
-    if store.revision_unchecked()? != prepared.expected_revision {
+    let committed_authority_revision = if cluster_only && active_section.is_some() {
+        crate::section_facade::validate_section_envelope(authority_name, &authority_bytes, 0)?
+    } else {
+        prepared.revision
+    };
+    #[cfg(test)]
+    if fault == Some(MigrationFault::BeforeExactStagingUnrelatedCredentialRace) {
+        store.replace_unchecked(
+            credential_ref("provider", "anthropic", "api_key")?,
+            "concurrent-pre-staging-winner",
+            crate::CredentialSource::User,
+            prepared.expected_revision,
+        )?;
+    }
+    let current_credential_revision = store.revision_unchecked()?;
+    if current_credential_revision != prepared.expected_revision && !cluster_only {
         return Err(ConfigStoreError::Conflict {
             expected: prepared.expected_revision,
-            actual: store.revision_unchecked()?,
+            actual: current_credential_revision,
         });
     }
+    // Cluster-fabric's section revision is the public CAS authority. If an
+    // unrelated credential writer advances this internal member after
+    // preparation, stage the immutable base/candidate pair and let the exact
+    // installer perform its touched-ref three-way merge.
     // A true env-domain no-op keeps the CAS revision and avoids publishing an
     // event or rewriting either durable member. Any credential or config
     // semantic change advances the one shared revision exactly once.
@@ -2674,7 +2721,7 @@ fn persist_exact_credential_transaction_inner(
         && !exact_domain_changed
         && prepared.revision == prepared.expected_revision
     {
-        return Ok(prepared.revision);
+        return Ok(committed_authority_revision);
     }
 
     let transaction_id = Uuid::new_v4().to_string();
@@ -2765,10 +2812,20 @@ fn persist_exact_credential_transaction_inner(
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
 
     #[cfg(test)]
-    if fault == Some(MigrationFault::BeforeExactCommitCredentialRace) {
-        let reference = prepared.touched_refs.first().cloned().ok_or_else(|| {
-            ConfigStoreError::Validation("credential intent is empty".to_string())
-        })?;
+    if matches!(
+        fault,
+        Some(
+            MigrationFault::BeforeExactCommitCredentialRace
+                | MigrationFault::BeforeExactCommitUnrelatedCredentialRace
+        )
+    ) {
+        let reference = if fault == Some(MigrationFault::BeforeExactCommitCredentialRace) {
+            prepared.touched_refs.first().cloned().ok_or_else(|| {
+                ConfigStoreError::Validation("credential intent is empty".to_string())
+            })?
+        } else {
+            credential_ref("provider", "anthropic", "api_key")?
+        };
         store.replace_unchecked(
             reference,
             "concurrent-winner",
@@ -2784,6 +2841,13 @@ fn persist_exact_credential_transaction_inner(
         let current_sha256 = sha256(&current);
         if file.original_sha256.as_deref() != Some(current_sha256.as_str()) {
             if file.name == CREDENTIALS_FILE {
+                if exact_scope == Some(ExactTransactionScope::ClusterFabric) {
+                    // The cluster section is the external CAS authority. Commit
+                    // the manifest against its still-current revision and let
+                    // `install_exact_credential_member` three-way rebase this
+                    // internal member over unrelated credential winners.
+                    continue;
+                }
                 return Err(ConfigStoreError::Conflict {
                     expected: file.expected_revision.unwrap_or(0),
                     actual: store.revision_unchecked()?,
@@ -2865,7 +2929,14 @@ fn persist_exact_credential_transaction_inner(
         fault,
     )?;
     finish_transaction(data_dir, manifest)?;
-    store.revision_unchecked()
+    if cluster_only && active_section.is_some() {
+        Ok(committed_authority_revision)
+    } else {
+        // Credential-member rebases can advance beyond the initially staged
+        // revision. Preserve the existing exact-transaction return contract
+        // for every non-cluster domain.
+        store.revision_unchecked()
+    }
 }
 
 #[cfg(test)]
@@ -13864,6 +13935,40 @@ mod tests {
         (facade.effective_config(), revision)
     }
 
+    fn active_facade_config_and_cluster_revision(data_dir: &Path) -> (crate::Config, u64) {
+        let facade = crate::ConfigFacade::open(data_dir).unwrap();
+        let revision = facade.registry().cluster_fabric.snapshot().revision;
+        (facade.effective_config(), revision)
+    }
+
+    fn cluster_test_node(id: &str, auth: crate::SshAuth) -> crate::Node {
+        crate::Node {
+            id: id.to_string(),
+            label: id.to_string(),
+            placement: crate::NodePlacement::Ssh(crate::SshTarget {
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                auth,
+                host_key_fingerprint: None,
+            }),
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        }
+    }
+
+    fn password_intents(
+        action: crate::ClusterCredentialAction,
+    ) -> crate::ClusterNodeCredentialIntents {
+        crate::ClusterNodeCredentialIntents {
+            password: action,
+            private_key: crate::ClusterCredentialAction::Clear,
+            passphrase: crate::ClusterCredentialAction::Clear,
+        }
+    }
+
     fn assert_active_exact_manifest(data_dir: &Path, expected: ExactTransactionScope) {
         let manifest: MigrationManifest =
             serde_json::from_slice(&std::fs::read(data_dir.join(MANIFEST_FILE)).unwrap()).unwrap();
@@ -14267,9 +14372,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::migrate_config_facade_layout(dir.path()).unwrap();
         let root_before = read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap();
-        let intents = BTreeSet::from(["active-node".to_string()]);
 
-        let (mut set, revision) = active_facade_config_and_credential_revision(dir.path());
+        let (mut set, revision) = active_facade_config_and_cluster_revision(dir.path());
         set.cluster_fabric = serde_json::from_value(serde_json::json!({
             "nodes": [{
                 "id": "active-node",
@@ -14278,11 +14382,19 @@ mod tests {
                     "type": "ssh",
                     "host": "127.0.0.1",
                     "username": "deploy",
-                    "auth": {"method": "password", "password": "active-ssh-secret"}
+                    "auth": {"method": "password"}
                 }
             }]
         }))
         .unwrap();
+        let intents = BTreeMap::from([(
+            "active-node".to_string(),
+            crate::ClusterNodeCredentialIntents {
+                password: crate::ClusterCredentialAction::Replace("active-ssh-secret".to_string()),
+                private_key: crate::ClusterCredentialAction::Clear,
+                passphrase: crate::ClusterCredentialAction::Clear,
+            },
+        )]);
         persist_cluster_fabric_credential_transaction_at_revision(
             dir.path(),
             &mut set,
@@ -14292,9 +14404,13 @@ mod tests {
         .unwrap();
         assert_active_exact_manifest(dir.path(), ExactTransactionScope::ClusterFabric);
         let reference = crate::cluster_password_credential_ref("active-node").unwrap();
-        let (mut clear, revision) = active_facade_config_and_credential_revision(dir.path());
+        let (mut clear, revision) = active_facade_config_and_cluster_revision(dir.path());
         assert!(clear.cluster_fabric.credential_refs["active-node"].password_configured);
         clear.cluster_fabric.nodes.clear();
+        let intents = BTreeMap::from([(
+            "active-node".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
         persist_cluster_fabric_credential_transaction_at_revision(
             dir.path(),
             &mut clear,
@@ -14302,7 +14418,7 @@ mod tests {
             revision,
         )
         .unwrap();
-        let (fresh, _) = active_facade_config_and_credential_revision(dir.path());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
         assert!(fresh.cluster_fabric.nodes.is_empty());
         assert!(!fresh
             .cluster_fabric
@@ -14316,6 +14432,690 @@ mod tests {
             read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap(),
             root_before
         );
+    }
+
+    #[test]
+    fn cluster_section_revision_is_authoritative_and_rebases_unrelated_credentials() {
+        let _key = crate::encryption::set_test_encryption_key([0xb1; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                unrelated.clone(),
+                "unrelated-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+
+        let (mut candidate, section_revision) =
+            active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(section_revision, 0);
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "local-1".to_string(),
+            label: "local-1".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "local-1".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        let committed = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            section_revision,
+        )
+        .unwrap();
+        assert_eq!(committed, 1, "the returned revision is the cluster section");
+        assert_eq!(
+            store.revision().unwrap(),
+            1,
+            "metadata-only cluster edits do not manufacture credential revisions"
+        );
+        assert_eq!(
+            store.resolve(&unrelated).unwrap().unwrap().expose(),
+            "unrelated-secret"
+        );
+
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        candidate.cluster_fabric.nodes[0].label = "stale-loser".to_string();
+        let error = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            section_revision,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+    }
+
+    #[test]
+    fn cluster_transaction_merges_unrelated_post_commit_credential_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0xb2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "race-local".to_string(),
+            label: "race-local".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "race-local".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+
+        let committed = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(MigrationFault::AfterExactCommitUnrelatedCredentialRace),
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&unrelated)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-unrelated-winner"
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("race-local").is_some());
+    }
+
+    #[test]
+    fn cluster_transaction_rebases_unrelated_pre_manifest_credential_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0xb6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "pre-manifest-local".to_string(),
+            label: "pre-manifest-local".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "pre-manifest-local".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+
+        let committed = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(MigrationFault::BeforeExactCommitUnrelatedCredentialRace),
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&unrelated)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-winner"
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("pre-manifest-local").is_some());
+    }
+
+    #[test]
+    fn cluster_transaction_rebases_unrelated_pre_staging_credential_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0xb7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "pre-staging-local".to_string(),
+            label: "pre-staging-local".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "pre-staging-local".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+
+        let committed = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(MigrationFault::BeforeExactStagingUnrelatedCredentialRace),
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&unrelated)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-pre-staging-winner"
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("pre-staging-local").is_some());
+    }
+
+    #[test]
+    fn cluster_password_key_and_passphrase_actions_are_explicit_and_secret_free() {
+        let _key = crate::encryption::set_test_encryption_key([0xb3; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut create, revision) = active_facade_config_and_cluster_revision(dir.path());
+        create.cluster_fabric.nodes.push(cluster_test_node(
+            "ssh-1",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let mut intents = BTreeMap::from([(
+            "ssh-1".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "password-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut create,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+        let store = CredentialStore::open(dir.path());
+        let password_ref = crate::cluster_password_credential_ref("ssh-1").unwrap();
+        let key_ref = crate::cluster_private_key_credential_ref("ssh-1").unwrap();
+        let passphrase_ref = crate::cluster_passphrase_credential_ref("ssh-1").unwrap();
+        assert_eq!(
+            store.resolve(&password_ref).unwrap().unwrap().expose(),
+            "password-secret"
+        );
+
+        let (mut keep, revision) = active_facade_config_and_cluster_revision(dir.path());
+        keep.cluster_fabric.node_mut("ssh-1").unwrap().label = "kept".to_string();
+        intents.insert(
+            "ssh-1".to_string(),
+            password_intents(crate::ClusterCredentialAction::Keep),
+        );
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut keep,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            store.resolve(&password_ref).unwrap().unwrap().expose(),
+            "password-secret"
+        );
+
+        let (mut switch, revision) = active_facade_config_and_cluster_revision(dir.path());
+        switch.cluster_fabric.node_mut("ssh-1").unwrap().placement =
+            crate::NodePlacement::Ssh(crate::SshTarget {
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                auth: crate::SshAuth::PrivateKey {
+                    private_key: String::new(),
+                    private_key_encrypted: None,
+                    private_key_path: None,
+                    passphrase: String::new(),
+                    passphrase_encrypted: None,
+                },
+                host_key_fingerprint: None,
+            });
+        intents.insert(
+            "ssh-1".to_string(),
+            crate::ClusterNodeCredentialIntents {
+                password: crate::ClusterCredentialAction::Clear,
+                private_key: crate::ClusterCredentialAction::Replace(
+                    "private-key-secret".to_string(),
+                ),
+                passphrase: crate::ClusterCredentialAction::Replace(
+                    "passphrase-secret".to_string(),
+                ),
+            },
+        );
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut switch,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            3
+        );
+        assert!(store.resolve(&password_ref).unwrap().is_none());
+        assert_eq!(
+            store.resolve(&key_ref).unwrap().unwrap().expose(),
+            "private-key-secret"
+        );
+        assert_eq!(
+            store.resolve(&passphrase_ref).unwrap().unwrap().expose(),
+            "passphrase-secret"
+        );
+
+        let (mut clear_passphrase, revision) =
+            active_facade_config_and_cluster_revision(dir.path());
+        clear_passphrase
+            .cluster_fabric
+            .node_mut("ssh-1")
+            .unwrap()
+            .label = "clear-passphrase".to_string();
+        intents.insert(
+            "ssh-1".to_string(),
+            crate::ClusterNodeCredentialIntents {
+                password: crate::ClusterCredentialAction::Clear,
+                private_key: crate::ClusterCredentialAction::Keep,
+                passphrase: crate::ClusterCredentialAction::Clear,
+            },
+        );
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut clear_passphrase,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            store.resolve(&key_ref).unwrap().unwrap().expose(),
+            "private-key-secret"
+        );
+        assert!(store.resolve(&passphrase_ref).unwrap().is_none());
+
+        let ordinary = std::fs::read_to_string(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        for forbidden in [
+            "password-secret",
+            "private-key-secret",
+            "passphrase-secret",
+            "****",
+            "password_encrypted",
+            "private_key_encrypted",
+            "passphrase_encrypted",
+        ] {
+            assert!(
+                !ordinary.contains(forbidden),
+                "ordinary cluster section leaked {forbidden}"
+            );
+        }
+        let section: Value = serde_json::from_str(&ordinary).unwrap();
+        let auth = &section["data"]["nodes"][0]["placement"]["auth"];
+        assert!(auth.get("password").is_none());
+        assert!(auth.get("private_key").is_none());
+        assert!(auth.get("passphrase").is_none());
+    }
+
+    #[test]
+    fn secret_only_cluster_replace_advances_section_revision_and_rejects_stale_writer() {
+        let _key = crate::encryption::set_test_encryption_key([0xb8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+
+        let (mut create, revision) = active_facade_config_and_cluster_revision(dir.path());
+        create.cluster_fabric.nodes.push(cluster_test_node(
+            "secret-cas",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let initial_intents = BTreeMap::from([(
+            "secret-cas".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "initial-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut create,
+                &initial_intents,
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+
+        let (first_base, shared_revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(shared_revision, 1);
+        let mut first = first_base.clone();
+        let mut stale = first_base;
+        let winner_intents = BTreeMap::from([(
+            "secret-cas".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "winner-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut first,
+                &winner_intents,
+                shared_revision,
+            )
+            .unwrap(),
+            2,
+            "a secret-only write must advance the public cluster revision"
+        );
+
+        let stale_intents = BTreeMap::from([(
+            "secret-cas".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "stale-loser-secret".to_string(),
+            )),
+        )]);
+        let error = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut stale,
+            &stale_intents,
+            shared_revision,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict {
+                expected: 1,
+                actual: 2
+            }
+        ));
+        let reference = crate::cluster_password_credential_ref("secret-cas").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "winner-secret"
+        );
+    }
+
+    #[test]
+    fn node_and_new_cluster_membership_commit_together_or_not_at_all() {
+        let _key = crate::encryption::set_test_encryption_key([0xb4; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "atomic-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        candidate.cluster_fabric.clusters.push(crate::Cluster {
+            name: "new-cluster".to_string(),
+            description: None,
+            node_ids: vec!["atomic-node".to_string()],
+        });
+        let intents = BTreeMap::from([(
+            "atomic-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "atomic-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("atomic-node").is_some());
+        assert_eq!(
+            fresh
+                .cluster_fabric
+                .cluster("new-cluster")
+                .unwrap()
+                .node_ids,
+            ["atomic-node"]
+        );
+
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let (mut failed, revision) = active_facade_config_and_cluster_revision(dir.path());
+        failed.cluster_fabric.nodes.push(cluster_test_node(
+            "failed-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        failed.cluster_fabric.clusters.push(crate::Cluster {
+            name: "failed-cluster".to_string(),
+            description: None,
+            node_ids: vec!["failed-node".to_string()],
+        });
+        let failed_intents = BTreeMap::from([(
+            "failed-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "failed-secret".to_string(),
+            )),
+        )]);
+        assert!(persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut failed,
+            &failed_intents,
+            revision,
+            Some(MigrationFault::AfterStaging),
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        let (fresh, fresh_revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(fresh_revision, revision);
+        assert!(fresh.cluster_fabric.node("failed-node").is_none());
+        assert!(fresh.cluster_fabric.cluster("failed-cluster").is_none());
+    }
+
+    #[test]
+    fn stale_node_delete_cannot_overwrite_concurrent_membership_edit() {
+        let _key = crate::encryption::set_test_encryption_key([0xb5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut initial, revision) = active_facade_config_and_cluster_revision(dir.path());
+        initial.cluster_fabric.nodes.push(crate::Node {
+            id: "member".to_string(),
+            label: "member".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        initial.cluster_fabric.clusters.push(crate::Cluster {
+            name: "first".to_string(),
+            description: None,
+            node_ids: vec!["member".to_string()],
+        });
+        let node_intents = BTreeMap::from([(
+            "member".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut initial,
+            &node_intents,
+            revision,
+        )
+        .unwrap();
+
+        let (base, revision) = active_facade_config_and_cluster_revision(dir.path());
+        let mut membership_winner = base.clone();
+        membership_winner
+            .cluster_fabric
+            .clusters
+            .push(crate::Cluster {
+                name: "second".to_string(),
+                description: None,
+                node_ids: vec!["member".to_string()],
+            });
+        persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut membership_winner,
+            &BTreeMap::new(),
+            revision,
+        )
+        .unwrap();
+
+        let mut stale_delete = base;
+        stale_delete.cluster_fabric.nodes.clear();
+        stale_delete.cluster_fabric.clusters.clear();
+        let error = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut stale_delete,
+            &node_intents,
+            revision,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict { actual: 2, .. }
+        ));
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh.cluster_fabric.node("member").is_some());
+        assert_eq!(
+            fresh.cluster_fabric.cluster("second").unwrap().node_ids,
+            ["member"]
+        );
+    }
+
+    #[test]
+    fn active_cluster_exact_transaction_recovers_every_durable_boundary_atomically() {
+        for (index, fault) in [
+            MigrationFault::AfterManifest,
+            MigrationFault::AfterCredentials,
+            MigrationFault::AfterAuthoritativeSection,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xb7 + index as u8; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+            let node_id = format!("recover-node-{index}");
+            let cluster_name = format!("recover-cluster-{index}");
+            let secret = format!("recover-cluster-secret-{index}");
+            candidate.cluster_fabric.nodes.push(cluster_test_node(
+                &node_id,
+                crate::SshAuth::Password {
+                    password: String::new(),
+                    password_encrypted: None,
+                },
+            ));
+            candidate.cluster_fabric.clusters.push(crate::Cluster {
+                name: cluster_name.clone(),
+                description: None,
+                node_ids: vec![node_id.clone()],
+            });
+            let intents = BTreeMap::from([(
+                node_id.clone(),
+                password_intents(crate::ClusterCredentialAction::Replace(secret.clone())),
+            )]);
+
+            let error = persist_cluster_fabric_credential_transaction_inner(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                revision,
+                Some(fault),
+            )
+            .unwrap_err();
+            assert!(matches!(error, ConfigStoreError::Io(_)));
+            assert!(
+                crate::ConfigFacade::open(dir.path()).is_err(),
+                "a partial durable boundary must not open as a fresh facade"
+            );
+            assert!(recover_pending_config_transaction(dir.path()).unwrap());
+            let (fresh, committed_revision) = active_facade_config_and_cluster_revision(dir.path());
+            assert_eq!(committed_revision, revision + 1);
+            assert!(fresh.cluster_fabric.node(&node_id).is_some());
+            assert_eq!(
+                fresh
+                    .cluster_fabric
+                    .cluster(&cluster_name)
+                    .unwrap()
+                    .node_ids
+                    .as_slice(),
+                std::slice::from_ref(&node_id)
+            );
+            let reference = crate::cluster_password_credential_ref(&node_id).unwrap();
+            assert_eq!(
+                CredentialStore::open(dir.path())
+                    .resolve(&reference)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                secret
+            );
+            assert_active_exact_manifest(dir.path(), ExactTransactionScope::ClusterFabric);
+        }
     }
 
     #[test]

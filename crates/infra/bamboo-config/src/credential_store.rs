@@ -1910,13 +1910,13 @@ impl CredentialStore {
 
     /// Prepare one or more node credential mutations without publishing them.
     /// The caller commits the returned credential envelope together with the
-    /// narrowed `cluster_fabric` root domain through the exact transaction
-    /// manifest. Empty/masked required secrets keep an existing value;
-    /// an empty private-key passphrase is an explicit clear.
+    /// narrowed `cluster_fabric` section through the exact transaction
+    /// manifest. Secret values arrive only through explicit request-only
+    /// actions; ordinary node placement metadata must remain secret-free.
     pub(crate) fn prepare_cluster_node_intents(
         &self,
         config: &mut crate::Config,
-        node_intents: &BTreeSet<String>,
+        node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
         persisted_refs: &BTreeMap<String, crate::ClusterNodeCredentialRefs>,
     ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
         if node_intents.is_empty() {
@@ -1943,7 +1943,7 @@ impl CredentialStore {
         let mut required_refs = BTreeSet::new();
         let mut changed = false;
 
-        for node_id in node_intents {
+        for (node_id, intents) in node_intents {
             let password_ref = crate::cluster_password_credential_ref(node_id)?;
             let private_key_ref = crate::cluster_private_key_credential_ref(node_id)?;
             let passphrase_ref = crate::cluster_passphrase_credential_ref(node_id)?;
@@ -1973,87 +1973,140 @@ impl CredentialStore {
                 }
             }
 
-            enum Action {
-                Keep,
-                Replace(String),
-                Clear,
-            }
             let (password, private_key, passphrase) = match config
                 .cluster_fabric
                 .node(node_id)
                 .map(|node| &node.placement)
             {
                 Some(crate::NodePlacement::Ssh(target)) => match &target.auth {
-                    crate::SshAuth::SystemSshConfig => {
-                        (Action::Clear, Action::Clear, Action::Clear)
-                    }
-                    crate::SshAuth::Password { password, .. } => {
-                        let password =
-                            if password.is_empty() || crate::patch::is_masked_api_key(password) {
-                                if persisted.password_configured {
-                                    Action::Keep
-                                } else {
-                                    return Err(ConfigStoreError::Validation(
-                                        "SSH password is required".to_string(),
-                                    ));
-                                }
-                            } else {
-                                Action::Replace(password.clone())
-                            };
-                        (password, Action::Clear, Action::Clear)
+                    crate::SshAuth::SystemSshConfig => (
+                        intents.password.clone(),
+                        intents.private_key.clone(),
+                        intents.passphrase.clone(),
+                    ),
+                    crate::SshAuth::Password {
+                        password,
+                        password_encrypted,
+                    } => {
+                        if !password.is_empty() || password_encrypted.is_some() {
+                            return Err(ConfigStoreError::Validation(
+                                "SSH placement metadata must not contain credentials".to_string(),
+                            ));
+                        }
+                        if matches!(intents.password, crate::ClusterCredentialAction::Clear) {
+                            return Err(ConfigStoreError::Validation(
+                                "password authentication requires keep or replace".to_string(),
+                            ));
+                        }
+                        (
+                            intents.password.clone(),
+                            intents.private_key.clone(),
+                            intents.passphrase.clone(),
+                        )
                     }
                     crate::SshAuth::PrivateKey {
                         private_key,
+                        private_key_encrypted,
                         private_key_path,
                         passphrase,
+                        passphrase_encrypted,
                         ..
                     } => {
-                        let private_key = if private_key.is_empty()
-                            || crate::patch::is_masked_api_key(private_key)
+                        if !private_key.is_empty()
+                            || private_key_encrypted.is_some()
+                            || !passphrase.is_empty()
+                            || passphrase_encrypted.is_some()
                         {
-                            if persisted.private_key_configured {
-                                Action::Keep
-                            } else if private_key_path
-                                .as_deref()
-                                .is_some_and(|path| !path.trim().is_empty())
-                            {
-                                Action::Clear
-                            } else {
-                                return Err(ConfigStoreError::Validation(
-                                    "an inline private key or private key path is required"
-                                        .to_string(),
-                                ));
-                            }
-                        } else {
-                            Action::Replace(private_key.clone())
-                        };
-                        let passphrase = if crate::patch::is_masked_api_key(passphrase) {
-                            if persisted.passphrase_configured {
-                                Action::Keep
-                            } else {
-                                return Err(ConfigStoreError::Validation(
-                                    "SSH passphrase mask has no stored value".to_string(),
-                                ));
-                            }
-                        } else if passphrase.is_empty() {
-                            Action::Clear
-                        } else {
-                            Action::Replace(passphrase.clone())
-                        };
-                        (Action::Clear, private_key, passphrase)
+                            return Err(ConfigStoreError::Validation(
+                                "SSH placement metadata must not contain credentials".to_string(),
+                            ));
+                        }
+                        let uses_key_path = private_key_path
+                            .as_deref()
+                            .is_some_and(|path| !path.trim().is_empty());
+                        if uses_key_path
+                            && !matches!(intents.private_key, crate::ClusterCredentialAction::Clear)
+                        {
+                            return Err(ConfigStoreError::Validation(
+                                "private-key-path authentication requires clearing the inline private key"
+                                    .to_string(),
+                            ));
+                        }
+                        if !uses_key_path
+                            && matches!(intents.private_key, crate::ClusterCredentialAction::Clear)
+                        {
+                            return Err(ConfigStoreError::Validation(
+                                "private-key authentication requires an inline key or key path"
+                                    .to_string(),
+                            ));
+                        }
+                        (
+                            intents.password.clone(),
+                            intents.private_key.clone(),
+                            intents.passphrase.clone(),
+                        )
                     }
                 },
-                Some(crate::NodePlacement::Local) | None => {
-                    (Action::Clear, Action::Clear, Action::Clear)
-                }
+                Some(crate::NodePlacement::Local) | None => (
+                    intents.password.clone(),
+                    intents.private_key.clone(),
+                    intents.passphrase.clone(),
+                ),
             };
 
+            let no_password = !matches!(
+                config
+                    .cluster_fabric
+                    .node(node_id)
+                    .map(|node| &node.placement),
+                Some(crate::NodePlacement::Ssh(crate::SshTarget {
+                    auth: crate::SshAuth::Password { .. },
+                    ..
+                }))
+            );
+            let no_private_key = !matches!(
+                config
+                    .cluster_fabric
+                    .node(node_id)
+                    .map(|node| &node.placement),
+                Some(crate::NodePlacement::Ssh(crate::SshTarget {
+                    auth: crate::SshAuth::PrivateKey { .. },
+                    ..
+                }))
+            );
+            if no_password && !matches!(password, crate::ClusterCredentialAction::Clear) {
+                return Err(ConfigStoreError::Validation(
+                    "password credential must be cleared for this authentication method"
+                        .to_string(),
+                ));
+            }
+            if no_private_key
+                && (!matches!(private_key, crate::ClusterCredentialAction::Clear)
+                    || !matches!(passphrase, crate::ClusterCredentialAction::Clear))
+            {
+                return Err(ConfigStoreError::Validation(
+                    "private-key credentials must be cleared for this authentication method"
+                        .to_string(),
+                ));
+            }
+            for action in [&password, &private_key, &passphrase] {
+                if let crate::ClusterCredentialAction::Replace(value) = action {
+                    if value.is_empty() || crate::patch::is_masked_api_key(value) {
+                        return Err(ConfigStoreError::Validation(
+                            "credential replacement must be nonempty and must not use a mask sentinel"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
             let mut metadata = crate::ClusterNodeCredentialRefs::default();
-            for (action, canonical, existing, reference_slot, configured_slot) in [
+            for (action, canonical, existing, was_configured, reference_slot, configured_slot) in [
                 (
                     password,
                     password_ref,
                     persisted.password_credential_ref,
+                    persisted.password_configured,
                     &mut metadata.password_credential_ref,
                     &mut metadata.password_configured,
                 ),
@@ -2061,6 +2114,7 @@ impl CredentialStore {
                     private_key,
                     private_key_ref,
                     persisted.private_key_credential_ref,
+                    persisted.private_key_configured,
                     &mut metadata.private_key_credential_ref,
                     &mut metadata.private_key_configured,
                 ),
@@ -2068,14 +2122,15 @@ impl CredentialStore {
                     passphrase,
                     passphrase_ref,
                     persisted.passphrase_credential_ref,
+                    persisted.passphrase_configured,
                     &mut metadata.passphrase_credential_ref,
                     &mut metadata.passphrase_configured,
                 ),
             ] {
                 let reference = existing.clone().unwrap_or(canonical);
                 match action {
-                    Action::Keep => {
-                        if !document.entries.contains_key(&reference) {
+                    crate::ClusterCredentialAction::Keep => {
+                        if !was_configured || !document.entries.contains_key(&reference) {
                             return Err(ConfigStoreError::Validation(
                                 "configured cluster credential is unavailable".to_string(),
                             ));
@@ -2085,7 +2140,7 @@ impl CredentialStore {
                         *reference_slot = Some(reference);
                         *configured_slot = true;
                     }
-                    Action::Replace(value) => {
+                    crate::ClusterCredentialAction::Replace(value) => {
                         if existing.is_none() && document.entries.contains_key(&reference) {
                             return Err(ConfigStoreError::Validation(
                                 "canonical cluster credential reference is already in use"
@@ -2119,7 +2174,7 @@ impl CredentialStore {
                         *reference_slot = Some(reference);
                         *configured_slot = true;
                     }
-                    Action::Clear => {
+                    crate::ClusterCredentialAction::Clear => {
                         if let Some(reference) = existing {
                             touched_refs.insert(reference.clone());
                             changed |= document.entries.remove(&reference).is_some();
@@ -2778,6 +2833,11 @@ pub(crate) fn config_credential_ref_counts(
             if let Some(reference) = device.token_credential_ref.as_ref() {
                 add(reference);
             }
+        }
+    }
+    for metadata in config.cluster_fabric.credential_refs.values() {
+        for reference in metadata.references() {
+            add(reference);
         }
     }
     for server in &config.mcp.servers {
