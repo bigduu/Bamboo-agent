@@ -150,6 +150,7 @@ pub trait ProjectContextSource: Send + Sync {
 #[derive(Clone)]
 pub struct ProjectContextResolver {
     source: Arc<dyn ProjectContextSource>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +193,26 @@ impl ProjectMemoryScope {
 
 impl ProjectContextResolver {
     pub fn new(source: Arc<dyn ProjectContextSource>) -> Self {
-        Self { source }
+        Self {
+            source,
+            workspace_resolver:
+                bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
+        }
+    }
+
+    /// Build a Project resolver against one coherent workspace-provider pair.
+    ///
+    /// The server uses this form so preview/ownership validation cannot observe
+    /// a different `AppState`'s process-global first-wins provider. Other
+    /// embeddings retain [`Self::new`]'s dynamic global behavior.
+    pub fn new_with_workspace_resolver(
+        source: Arc<dyn ProjectContextSource>,
+        workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    ) -> Self {
+        Self {
+            source,
+            workspace_resolver,
+        }
     }
 
     /// Return the stable, opaque Project id persisted on the session.
@@ -317,7 +337,7 @@ impl ProjectContextResolver {
         session: &Session,
         workspace: Option<&Path>,
     ) -> Result<Option<ResolvedProjectContext>, ProjectContextError> {
-        let workspace = Self::resolve_workspace_candidate(session, workspace)?;
+        let workspace = self.resolve_workspace_candidate_for_instance(session, workspace)?;
         self.resolve_with_final_workspace(session, workspace).await
     }
 
@@ -330,15 +350,33 @@ impl ProjectContextResolver {
         session: &Session,
         workspace: Option<&Path>,
     ) -> Result<Option<PathBuf>, ProjectContextError> {
+        Self::resolve_workspace_candidate_with(
+            &bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
+            session,
+            workspace,
+        )
+    }
+
+    fn resolve_workspace_candidate_for_instance(
+        &self,
+        session: &Session,
+        workspace: Option<&Path>,
+    ) -> Result<Option<PathBuf>, ProjectContextError> {
+        Self::resolve_workspace_candidate_with(&self.workspace_resolver, session, workspace)
+    }
+
+    fn resolve_workspace_candidate_with(
+        workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+        session: &Session,
+        workspace: Option<&Path>,
+    ) -> Result<Option<PathBuf>, ProjectContextError> {
         let preferred = workspace
             .map(Path::to_path_buf)
             .or_else(|| session.workspace_path_meta().map(PathBuf::from));
-        bamboo_agent_core::workspace_state::resolve_session_workspace_candidate(
-            &session.id,
-            preferred,
-        )
-        .map(|candidate| resolve_final_workspace(&candidate))
-        .transpose()
+        workspace_resolver
+            .resolve_session_workspace_candidate(&session.id, preferred)
+            .map(|candidate| resolve_final_workspace_with(&candidate, workspace_resolver))
+            .transpose()
     }
 
     async fn resolve_with_final_workspace(
@@ -448,15 +486,16 @@ impl ProjectContextResolver {
         session: &mut Session,
         sync_runtime_workspace: bool,
     ) -> Result<Option<ResolvedProjectContext>, ProjectContextError> {
-        let workspace = Self::resolve_workspace_candidate(session, None)?;
+        let workspace = self.resolve_workspace_candidate_for_instance(session, None)?;
         let resolved = self
             .resolve_with_final_workspace(session, workspace.clone())
             .await?;
         if let Some(workspace) = workspace.as_deref() {
             let final_workspace = if sync_runtime_workspace {
-                bamboo_tools::tools::workspace_state::publish_resolved_workspace(
+                self.workspace_resolver.publish_resolved_workspace(
                     &session.id,
                     workspace.into(),
+                    "project_context_refresh",
                 )
             } else {
                 workspace.to_path_buf()
@@ -512,7 +551,10 @@ impl ProjectContextResolver {
     }
 }
 
-fn resolve_final_workspace(workspace: &Path) -> Result<PathBuf, ProjectContextError> {
+fn resolve_final_workspace_with(
+    workspace: &Path,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<PathBuf, ProjectContextError> {
     if workspace.exists() && !workspace.is_dir() {
         return Err(ProjectContextError::WorkspaceInvalid {
             workspace: workspace.to_string_lossy().into_owned(),
@@ -520,7 +562,7 @@ fn resolve_final_workspace(workspace: &Path) -> Result<PathBuf, ProjectContextEr
         });
     }
     let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let final_workspace = bamboo_agent_core::workspace_state::preview_workspace_path(canonical);
+    let final_workspace = workspace_resolver.preview_workspace_path(canonical);
     if final_workspace.exists() && !final_workspace.is_dir() {
         return Err(ProjectContextError::WorkspaceInvalid {
             workspace: final_workspace.to_string_lossy().into_owned(),

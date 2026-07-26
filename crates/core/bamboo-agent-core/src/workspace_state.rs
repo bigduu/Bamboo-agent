@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 const MAX_TRACKED_WORKSPACES: usize = 2_000;
@@ -35,19 +35,48 @@ pub fn set_workspace(session_id: &str, workspace: PathBuf) -> PathBuf {
 /// validation. The exact supplied path is stored; confinement is not evaluated
 /// a second time, closing the preview/check/publish TOCTOU.
 pub fn publish_resolved_workspace(session_id: &str, workspace: PathBuf) -> PathBuf {
+    publish_resolved_workspace_with_root(
+        session_id,
+        workspace,
+        || WORKSPACE_ROOT_PROVIDER.get().map(|provider| provider()),
+        "process_global",
+    )
+}
+
+fn publish_resolved_workspace_with_root<R>(
+    session_id: &str,
+    workspace: PathBuf,
+    root_config: R,
+    source: &str,
+) -> PathBuf
+where
+    R: FnOnce() -> Option<WorkspaceRootConfig>,
+{
     if !workspace.exists() {
-        if let Some(provider) = WORKSPACE_ROOT_PROVIDER.get() {
-            let cfg = provider();
-            let root = canonicalize_best_effort(&cfg.root);
+        if let Some(config) = root_config() {
+            let root = canonicalize_best_effort(&config.root);
             let candidate = canonicalize_best_effort(&workspace);
             if candidate.starts_with(&root) {
                 if let Err(error) = std::fs::create_dir_all(&candidate) {
                     tracing::warn!(
                         path = %candidate.display(),
+                        workspace_root = %root.display(),
+                        workspace_source = source,
                         %error,
                         "failed to materialize validated workspace"
                     );
                 }
+            } else {
+                // A configured default may disappear after preview. Never
+                // recreate a missing arbitrary path outside the authoritative
+                // root; emit enough non-secret context to diagnose the race.
+                tracing::warn!(
+                    path = %candidate.display(),
+                    workspace_root = %root.display(),
+                    workspace_source = source,
+                    "validated workspace is missing outside the workspace root; \
+                     refusing to recreate it"
+                );
             }
         }
     }
@@ -241,6 +270,112 @@ pub fn set_workspace_root_provider(provider: WorkspaceRootProvider) {
 /// Whether a workspace-root provider has been registered.
 pub fn has_workspace_root_provider() -> bool {
     WORKSPACE_ROOT_PROVIDER.get().is_some()
+}
+
+type SharedDefaultWorkspaceProvider = Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+type SharedWorkspaceRootProvider = Arc<dyn Fn() -> Option<WorkspaceRootConfig> + Send + Sync>;
+
+/// One coherent default/root provider pair.
+///
+/// The process-wide registration APIs remain first-wins for production and
+/// embedding compatibility. A server `AppState` also retains an instance of
+/// this resolver so multiple states in one test process cannot mix the first
+/// state's live config with another state's session persistence.
+#[derive(Clone)]
+pub struct WorkspaceResolver {
+    default_provider: SharedDefaultWorkspaceProvider,
+    root_provider: SharedWorkspaceRootProvider,
+}
+
+impl WorkspaceResolver {
+    /// Build an instance-scoped resolver from live providers.
+    pub fn new<D, R>(default_provider: D, root_provider: R) -> Self
+    where
+        D: Fn() -> Option<PathBuf> + Send + Sync + 'static,
+        R: Fn() -> WorkspaceRootConfig + Send + Sync + 'static,
+    {
+        Self {
+            default_provider: Arc::new(default_provider),
+            root_provider: Arc::new(move || Some(root_provider())),
+        }
+    }
+
+    /// Dynamically delegate to the process-global first-wins providers.
+    ///
+    /// Registration state is intentionally read on every call, not captured
+    /// here, so a resolver constructed before server bootstrap retains the
+    /// historical no-provider/provider transition semantics.
+    pub fn from_process_globals() -> Self {
+        Self {
+            default_provider: Arc::new(get_configured_default_workspace),
+            root_provider: Arc::new(|| WORKSPACE_ROOT_PROVIDER.get().map(|provider| provider())),
+        }
+    }
+
+    /// Return the current instance root and confinement policy.
+    pub fn workspace_root_config(&self) -> Option<WorkspaceRootConfig> {
+        (self.root_provider)()
+    }
+
+    /// Resolve a session workspace through this provider pair without
+    /// publishing state or creating directories.
+    pub fn resolve_session_workspace_candidate(
+        &self,
+        session_id: &str,
+        preferred: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        preferred
+            .or_else(|| peek_workspace(session_id))
+            .or_else(|| (self.default_provider)())
+            .or_else(|| {
+                self.workspace_root_config()
+                    .map(|config| preview_default_session_workspace_dir(&config.root, session_id))
+            })
+            .map(|path| self.preview_workspace_path(path))
+    }
+
+    /// Apply this instance's confinement policy without filesystem mutation.
+    pub fn preview_workspace_path(&self, workspace: PathBuf) -> PathBuf {
+        match self.workspace_root_config() {
+            Some(config) => preview_pin_workspace_path(&workspace, &config.root, config.confine),
+            None => workspace,
+        }
+    }
+
+    /// Preview this resolver's session-scoped root fallback only.
+    ///
+    /// Unlike [`Self::resolve_session_workspace_candidate`], this deliberately
+    /// does not consult the process-global runtime registry or a configured
+    /// default. Server transaction paths use it when their own live config
+    /// snapshot has authoritatively resolved no default workspace.
+    pub fn preview_session_fallback(&self, session_id: &str) -> Option<PathBuf> {
+        let config = self.workspace_root_config()?;
+        let fallback = preview_default_session_workspace_dir(&config.root, session_id);
+        Some(preview_pin_workspace_path(
+            &fallback,
+            &config.root,
+            config.confine,
+        ))
+    }
+
+    /// Publish a previously validated candidate through this instance's root.
+    ///
+    /// Missing paths are materialized only when they are contained by this
+    /// resolver's root. `source` is a non-secret diagnostic label supplied by
+    /// the caller (for example `session_fallback`).
+    pub fn publish_resolved_workspace(
+        &self,
+        session_id: &str,
+        workspace: PathBuf,
+        source: &str,
+    ) -> PathBuf {
+        publish_resolved_workspace_with_root(
+            session_id,
+            workspace,
+            || self.workspace_root_config(),
+            source,
+        )
+    }
 }
 
 fn pin_via_provider(path: PathBuf) -> PathBuf {
@@ -613,6 +748,133 @@ mod tests {
         assert!(relocated.starts_with(canonicalize_best_effort(&root)));
         assert!(!root.exists());
         assert!(!relocated.exists());
+    }
+
+    #[test]
+    fn existing_workspace_publication_does_not_resolve_root_provider() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root_provider_calls = std::cell::Cell::new(0);
+
+        let published = publish_resolved_workspace_with_root(
+            "existing-workspace-lazy-root",
+            workspace.path().to_path_buf(),
+            || {
+                root_provider_calls.set(root_provider_calls.get() + 1);
+                None
+            },
+            "test",
+        );
+
+        assert_eq!(published, workspace.path());
+        assert_eq!(
+            root_provider_calls.get(),
+            0,
+            "publishing an existing directory must not evaluate the root provider"
+        );
+    }
+
+    #[test]
+    fn instance_session_fallback_ignores_same_id_runtime_registry_state() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let root = state_dir.path().join("workspaces");
+        let foreign_workspace = tempfile::tempdir().unwrap();
+        let session_id = "instance-fallback-ignores-runtime";
+        publish_resolved_workspace(session_id, foreign_workspace.path().to_path_buf());
+        let resolver = WorkspaceResolver::new(|| None, {
+            let root = root.clone();
+            move || WorkspaceRootConfig {
+                root: root.clone(),
+                confine: false,
+            }
+        });
+
+        let fallback = resolver
+            .preview_session_fallback(session_id)
+            .expect("instance session fallback");
+
+        assert_eq!(fallback, root.join(session_id));
+        assert_ne!(fallback, foreign_workspace.path());
+    }
+
+    #[test]
+    fn instance_resolver_materializes_its_own_fallback_and_confines_preferred_paths() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let root = state_dir.path().join("workspaces");
+        let resolver = WorkspaceResolver::new(|| None, {
+            let root = root.clone();
+            move || WorkspaceRootConfig {
+                root: root.clone(),
+                confine: true,
+            }
+        });
+
+        let fallback = resolver
+            .resolve_session_workspace_candidate("instance-fallback", None)
+            .expect("instance fallback");
+        assert_eq!(
+            fallback,
+            canonicalize_best_effort(&root).join("instance-fallback")
+        );
+        assert!(!fallback.exists(), "preview must remain side-effect free");
+        let published = resolver.publish_resolved_workspace(
+            "instance-fallback",
+            fallback.clone(),
+            "session_fallback",
+        );
+        assert_eq!(published, fallback);
+        assert!(published.is_dir());
+
+        let outside = state_dir.path().join("outside/project");
+        std::fs::create_dir_all(&outside).unwrap();
+        let confined = resolver
+            .resolve_session_workspace_candidate("instance-confined", Some(outside.clone()))
+            .expect("confined candidate");
+        assert_ne!(confined, outside);
+        assert!(confined.starts_with(canonicalize_best_effort(&root)));
+        assert!(!confined.exists(), "confinement preview must not create");
+        resolver.publish_resolved_workspace("instance-confined", confined.clone(), "request");
+        assert!(confined.is_dir());
+    }
+
+    #[test]
+    fn instance_resolver_does_not_recreate_vanished_default_outside_its_root() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let root = state_dir.path().join("workspaces");
+        let vanished_default = state_dir.path().join("foreign/vanished-default");
+        let resolver = WorkspaceResolver::new(
+            {
+                let vanished_default = vanished_default.clone();
+                move || Some(vanished_default.clone())
+            },
+            {
+                let root = root.clone();
+                move || WorkspaceRootConfig {
+                    root: root.clone(),
+                    confine: false,
+                }
+            },
+        );
+
+        let candidate = resolver
+            .resolve_session_workspace_candidate("vanished-default", None)
+            .expect("configured default candidate");
+        assert_eq!(candidate, vanished_default);
+        assert!(!candidate.exists());
+        let published = resolver.publish_resolved_workspace(
+            "vanished-default",
+            candidate.clone(),
+            "configured_default",
+        );
+
+        assert_eq!(published, candidate);
+        assert!(
+            !candidate.exists(),
+            "a missing configured default outside the instance root must not be recreated"
+        );
+        assert_eq!(
+            get_workspace("vanished-default").as_deref(),
+            Some(candidate.as_path())
+        );
     }
 
     #[test]

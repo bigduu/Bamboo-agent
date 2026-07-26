@@ -329,9 +329,10 @@ pub async fn patch_session(
                 .map(std::path::PathBuf::from)
                 .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
             {
-                bamboo_tools::tools::workspace_state::publish_resolved_workspace(
+                state.workspace_resolver.publish_resolved_workspace(
                     &session_id,
                     workspace,
+                    "project_reassignment",
                 );
             }
             state.account_sink.record(

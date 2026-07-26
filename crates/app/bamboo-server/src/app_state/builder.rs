@@ -204,47 +204,66 @@ impl AppState {
 
         let config = Arc::new(RwLock::new(config));
 
-        // Wire the configured-default-workspace resolver into agent-core. This keeps
-        // the dependency arrow pointing down (agent-core owns only the slot; the
-        // server fills it). The closure reads the server's LIVE in-memory config —
-        // not a fresh disk-reading Config::new(), which would diverge from the live
-        // config and clobber the global env-var cache (#38). `try_read` never blocks
-        // (the resolver is called from sync code, so a blocking read could deadlock);
-        // on the rare write-lock contention it returns the last successfully-resolved
-        // path so a session never transiently falls back to the process cwd.
-        {
+        // Build one coherent configured-default/root provider pair. The process
+        // globals below intentionally remain first-registration-wins, while
+        // this AppState retains the same pair for instance-scoped Project
+        // preview and post-persistence publication (#717).
+        //
+        // The default closure reads the LIVE in-memory config, not a fresh
+        // disk-reading Config::new() (#38). `try_read` never blocks (the
+        // resolver is called from sync code); on write-lock contention it
+        // returns the last successful value rather than transiently falling
+        // back to another source.
+        let live_default_workspace: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync> = {
             let config_for_workspace = config.clone();
             let last_known: Arc<std::sync::Mutex<Option<PathBuf>>> =
                 Arc::new(std::sync::Mutex::new(None));
-            bamboo_agent_core::workspace_state::set_default_workspace_provider(Box::new(
-                move || match config_for_workspace.try_read() {
-                    Ok(cfg) => {
-                        let path = cfg.get_default_work_area_path();
-                        if let Ok(mut cache) = last_known.lock() {
-                            *cache = path.clone();
-                        }
-                        path
+            Arc::new(move || match config_for_workspace.try_read() {
+                Ok(cfg) => {
+                    let path = cfg.get_default_work_area_path();
+                    if let Ok(mut cache) = last_known.lock() {
+                        *cache = path.clone();
                     }
-                    Err(_) => last_known.lock().ok().and_then(|c| c.clone()),
-                },
-            ));
-        }
+                    path
+                }
+                Err(_) => last_known.lock().ok().and_then(|cache| cache.clone()),
+            })
+        };
 
-        // Issue #217: wire the workspace-root + confinement policy into
-        // agent-core, mirroring the default-workspace provider just above.
-        // This is what lets `workspace_or_process_cwd` default a session with
-        // NO configured/explicit workspace to `data_dir/workspaces/{session}`
-        // instead of falling through to the server process's cwd, and lets
-        // `set_workspace` pin/relocate an explicit path when confinement is
-        // enabled (`BAMBOO_WORKSPACE_CONFINE` / `BAMBOO_WORKSPACE_ROOT`).
-        // Read fresh from the environment on every call (not captured here)
-        // so an operator-set env var is honored the same way `bamboo_dir()`
-        // itself is — no config-file knob needed.
-        bamboo_agent_core::workspace_state::set_workspace_root_provider(Box::new(|| {
-            bamboo_agent_core::workspace_state::WorkspaceRootConfig {
-                root: bamboo_config::paths::resolve_workspace_root(),
-                confine: bamboo_config::paths::workspace_confinement_enforced(),
-            }
+        // Issue #217: the root provider re-reads operator env policy on every
+        // call. Its no-override fallback is this AppState's own data directory,
+        // not the unrelated process-global bamboo_dir that another test state
+        // may have registered first.
+        let live_workspace_root: Arc<
+            dyn Fn() -> bamboo_agent_core::workspace_state::WorkspaceRootConfig + Send + Sync,
+        > = {
+            let app_data_dir = data_dir.clone();
+            Arc::new(
+                move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                    root: bamboo_config::paths::resolve_workspace_root_in(&app_data_dir),
+                    confine: bamboo_config::paths::workspace_confinement_enforced(),
+                },
+            )
+        };
+
+        let workspace_resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(
+            {
+                let provider = live_default_workspace.clone();
+                move || provider()
+            },
+            {
+                let provider = live_workspace_root.clone();
+                move || provider()
+            },
+        );
+
+        bamboo_agent_core::workspace_state::set_default_workspace_provider(Box::new({
+            let provider = live_default_workspace;
+            move || provider()
+        }));
+        bamboo_agent_core::workspace_state::set_workspace_root_provider(Box::new({
+            let provider = live_workspace_root;
+            move || provider()
         }));
 
         let (permission_checker, permission_section) =
@@ -470,9 +489,12 @@ impl AppState {
         // Interactive execution paths pass an explicit tool surface override:
         // root sessions use ToolSurface::Root; child sessions use ToolSurface::Child.
         let project_context_resolver = Arc::new(
-            bamboo_engine::project_context::ProjectContextResolver::new(Arc::new(
-                crate::project_context::ProjectStoreContextSource::new(project_store.clone()),
-            )),
+            bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(
+                Arc::new(crate::project_context::ProjectStoreContextSource::new(
+                    project_store.clone(),
+                )),
+                workspace_resolver.clone(),
+            ),
         );
         let agent = Arc::new(
             bamboo_engine::Agent::builder()
@@ -951,6 +973,7 @@ impl AppState {
             session_store,
             project_store,
             project_context_resolver,
+            workspace_resolver,
             session_repo,
             persistence,
             session_inbox,
