@@ -1587,6 +1587,108 @@ async fn same_project_resident_reuse_persists_and_publishes_changed_workspace() 
 }
 
 #[tokio::test]
+async fn resident_reuse_publication_uses_the_validating_instance_workspace_root() {
+    let instance_root = tempfile::tempdir().expect("instance workspace root");
+    let canonical_instance_root = instance_root
+        .path()
+        .canonicalize()
+        .expect("canonical instance workspace root");
+    let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+        let root = canonical_instance_root.clone();
+        move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+            root: root.clone(),
+            confine: true,
+        }
+    });
+    let harness = build_test_harness_with_options(None, Some(resolver.clone())).await;
+    let workspace_a = canonical_instance_root.join("workspace-a");
+    std::fs::create_dir_all(&workspace_a).expect("workspace A");
+    let workspace_b = tempfile::tempdir().expect("foreign workspace B");
+    let context = |tool_call_id: &'static str| {
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx()
+    };
+    let args = |workspace: &std::path::Path, title: &str| {
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "instance-confined-resident",
+            "title": title,
+            "responsibility": "Inspect a confined workspace",
+            "prompt": "Inspect the requested workspace.",
+            "workspace": workspace,
+            "auto_run": false
+        })
+    };
+
+    let created = invoke_completed(
+        &harness.tool,
+        args(&workspace_a, "Workspace A"),
+        context("instance-resident-create"),
+    )
+    .await
+    .expect("create instance-confined resident");
+    let created: serde_json::Value = serde_json::from_str(&created.result).unwrap();
+    let resident_id = created["child_session_id"].as_str().unwrap().to_string();
+    let initial = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .session_store
+        .save_session(&initial)
+        .await
+        .expect("index resident");
+
+    let reused = invoke_completed(
+        &harness.tool,
+        args(workspace_b.path(), "Workspace B"),
+        context("instance-resident-reuse"),
+    )
+    .await
+    .expect("reuse instance-confined resident");
+    let reused: serde_json::Value = serde_json::from_str(&reused.result).unwrap();
+    assert_eq!(reused["child_session_id"], resident_id);
+    assert_eq!(reused["reused"], true);
+
+    let canonical_workspace_b = workspace_b.path().canonicalize().unwrap();
+    let expected = resolver.preview_workspace_path(canonical_workspace_b);
+    let expected_display = bamboo_config::paths::path_to_display_string(&expected);
+    let child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(expected.starts_with(&canonical_instance_root));
+    assert!(
+        expected.is_dir(),
+        "resident reuse must materialize the instance resolver's relocated target"
+    );
+    assert_eq!(child.workspace.as_deref(), Some(expected_display.as_str()));
+    assert_eq!(
+        child.workspace_path_meta().as_deref(),
+        Some(expected_display.as_str())
+    );
+    assert_eq!(
+        bamboo_agent_core::workspace_state::peek_workspace(&resident_id).as_deref(),
+        Some(expected.as_path())
+    );
+}
+
+#[tokio::test]
 async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create() {
     let harness = build_test_harness().await;
 
