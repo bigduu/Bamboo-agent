@@ -59,14 +59,14 @@ fn provider_validation_issue_returns_provider_path_when_openai_key_present() {
 }
 
 #[test]
-fn proxy_auth_payload_without_username_disables_proxy_auth() {
+fn proxy_auth_payload_without_username_rejects_ambiguous_password() {
     let payload: ProxyAuthPayload = serde_json::from_value(serde_json::json!({
         "expected_revision": 0,
         "password": "secret"
     }))
     .unwrap();
 
-    assert!(payload.into_proxy_auth().is_none());
+    assert!(payload.into_proxy_auth().is_err());
 }
 
 #[test]
@@ -78,7 +78,10 @@ fn proxy_auth_payload_with_username_creates_proxy_auth() {
     }))
     .unwrap();
 
-    let auth = payload.into_proxy_auth().expect("proxy auth should exist");
+    let auth = payload
+        .into_proxy_auth()
+        .expect("proxy auth payload should be valid")
+        .expect("proxy auth should exist");
     assert_eq!(auth.username, "alice");
     assert_eq!(auth.password, "secret");
 }

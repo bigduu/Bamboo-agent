@@ -19,12 +19,24 @@ pub(super) struct ValidateConfigResponse {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyAuthPayload {
-    /// Credential-store revision required for replace or clear.
+    /// Core section revision required for replace or clear.
     expected_revision: u64,
+    /// Explicit mutation intent. Omission retains the legacy behavior where a
+    /// nonempty username replaces and an empty username clears.
+    #[serde(default)]
+    action: Option<ProxyCredentialAction>,
     /// Proxy username.
     username: Option<String>,
     /// Proxy password.
     password: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProxyCredentialAction {
+    Keep,
+    Replace,
+    Clear,
 }
 
 impl std::fmt::Debug for ProxyAuthPayload {
@@ -32,6 +44,14 @@ impl std::fmt::Debug for ProxyAuthPayload {
         formatter
             .debug_struct("ProxyAuthPayload")
             .field("expected_revision", &self.expected_revision)
+            .field(
+                "action",
+                &self.action.map(|action| match action {
+                    ProxyCredentialAction::Keep => "keep",
+                    ProxyCredentialAction::Replace => "replace",
+                    ProxyCredentialAction::Clear => "clear",
+                }),
+            )
             .field("username", &self.username.as_ref().map(|_| "[REDACTED]"))
             .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .finish()
@@ -43,16 +63,41 @@ impl ProxyAuthPayload {
         self.expected_revision
     }
 
-    pub(super) fn into_proxy_auth(self) -> Option<ProxyAuth> {
+    pub(super) fn into_proxy_auth(self) -> Result<Option<ProxyAuth>, String> {
         let username = self.username.unwrap_or_default();
-        if username.trim().is_empty() {
-            return None;
+        let password = self.password.unwrap_or_default();
+        let action = self.action.unwrap_or_else(|| {
+            if username.trim().is_empty() {
+                ProxyCredentialAction::Clear
+            } else {
+                ProxyCredentialAction::Replace
+            }
+        });
+        match action {
+            ProxyCredentialAction::Keep => {
+                if !username.is_empty() || !password.is_empty() {
+                    return Err("proxy keep must not include credential values".to_string());
+                }
+                Err("proxy keep is not a mutation; omit the request".to_string())
+            }
+            ProxyCredentialAction::Clear => {
+                if !username.is_empty() || !password.is_empty() {
+                    return Err("proxy clear must not include credential values".to_string());
+                }
+                Ok(None)
+            }
+            ProxyCredentialAction::Replace => {
+                if username.trim().is_empty() {
+                    return Err("proxy replace requires a username".to_string());
+                }
+                if bamboo_config::patch::is_masked_api_key(&username)
+                    || bamboo_config::patch::is_masked_api_key(&password)
+                {
+                    return Err("proxy credential value must not be a mask".to_string());
+                }
+                Ok(Some(ProxyAuth { username, password }))
+            }
         }
-
-        Some(ProxyAuth {
-            username,
-            password: self.password.unwrap_or_default(),
-        })
     }
 }
 
@@ -144,14 +189,12 @@ mod tests {
     fn test_proxy_auth_payload_into_proxy_auth_valid() {
         let payload = ProxyAuthPayload {
             expected_revision: 0,
+            action: None,
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
         };
 
-        let auth = payload.into_proxy_auth();
-        assert!(auth.is_some());
-
-        let auth = auth.unwrap();
+        let auth = payload.into_proxy_auth().unwrap().unwrap();
         assert_eq!(auth.username, "user");
         assert_eq!(auth.password, "pass");
     }
@@ -160,47 +203,48 @@ mod tests {
     fn test_proxy_auth_payload_into_proxy_auth_empty_username() {
         let payload = ProxyAuthPayload {
             expected_revision: 0,
+            action: None,
             username: Some("".to_string()),
             password: Some("pass".to_string()),
         };
 
-        let auth = payload.into_proxy_auth();
-        assert!(auth.is_none());
+        assert!(payload.into_proxy_auth().is_err());
     }
 
     #[test]
     fn test_proxy_auth_payload_into_proxy_auth_whitespace_username() {
         let payload = ProxyAuthPayload {
             expected_revision: 0,
+            action: None,
             username: Some("   ".to_string()),
             password: Some("pass".to_string()),
         };
 
-        let auth = payload.into_proxy_auth();
-        assert!(auth.is_none());
+        assert!(payload.into_proxy_auth().is_err());
     }
 
     #[test]
     fn test_proxy_auth_payload_into_proxy_auth_none_username() {
         let payload = ProxyAuthPayload {
             expected_revision: 0,
+            action: None,
             username: None,
             password: Some("pass".to_string()),
         };
 
-        let auth = payload.into_proxy_auth();
-        assert!(auth.is_none());
+        assert!(payload.into_proxy_auth().is_err());
     }
 
     #[test]
     fn test_proxy_auth_payload_into_proxy_auth_no_password() {
         let payload = ProxyAuthPayload {
             expected_revision: 0,
+            action: None,
             username: Some("user".to_string()),
             password: None,
         };
 
-        let auth = payload.into_proxy_auth().unwrap();
+        let auth = payload.into_proxy_auth().unwrap().unwrap();
         assert_eq!(auth.username, "user");
         assert_eq!(auth.password, "");
     }
@@ -209,6 +253,7 @@ mod tests {
     fn test_proxy_auth_payload_debug() {
         let payload = ProxyAuthPayload {
             expected_revision: 0,
+            action: None,
             username: Some("user".to_string()),
             password: Some("pass".to_string()),
         };

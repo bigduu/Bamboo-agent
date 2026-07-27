@@ -161,6 +161,41 @@ impl PreparedProviderCredentialUpdate {
         self.bytes = serde_json::to_vec_pretty(&envelope)?;
         Ok(())
     }
+
+    /// Validate the active owned references against the exact credential
+    /// candidate that would be staged. This keeps metadata/keep mutations
+    /// from retaining a decryptable-but-semantic mask or empty value, while
+    /// still allowing an explicit replace or clear to repair that record.
+    pub(crate) fn validate_active_values(
+        &self,
+        active_refs: &BTreeSet<CredentialRef>,
+        validate: impl Fn(&CredentialRef, &str) -> bool,
+    ) -> ConfigStoreResult<()> {
+        let envelope: PreparedCredentialEnvelope = serde_json::from_slice(&self.bytes)?;
+        if envelope.schema_version != CREDENTIAL_SCHEMA_VERSION
+            || envelope.revision != self.revision
+        {
+            return Err(ConfigStoreError::Validation(
+                "prepared credential envelope metadata is invalid".to_string(),
+            ));
+        }
+        let lkg = CredentialDocumentLkg {
+            revision: envelope.revision,
+            document: envelope.data,
+        };
+        let statuses = lkg.statuses_with_validation(active_refs, validate);
+        if let Some(reference) = active_refs.iter().find(|reference| {
+            !statuses
+                .iter()
+                .any(|status| &status.credential_ref == *reference && status.configured)
+        }) {
+            return Err(ConfigStoreError::Validation(format!(
+                "active credential '{}' is invalid; explicitly replace or clear it",
+                reference.as_str()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,15 +243,25 @@ impl CredentialDocumentLkg {
     }
 
     /// Project secret-free status metadata while cryptographically validating
-    /// only the references owned by the active cluster generation.
+    /// only the references owned by the requested active section generation.
     ///
     /// Decrypted values are dropped inside this authority and never returned
     /// to GET/status callers. A present but undecryptable entry is represented
     /// as `configured = false`, which the cluster projection renders as
     /// `error` when durable metadata still says the field is configured.
-    pub(crate) fn statuses_with_cluster_crypto_validation(
+    pub(crate) fn statuses_with_crypto_validation(
         &self,
         active_refs: &BTreeSet<CredentialRef>,
+    ) -> Vec<CredentialStatus> {
+        self.statuses_with_validation(active_refs, |_, _| true)
+    }
+
+    /// Project statuses while decrypting and semantically validating only the
+    /// references owned by one active section generation.
+    pub(crate) fn statuses_with_validation(
+        &self,
+        active_refs: &BTreeSet<CredentialRef>,
+        validate: impl Fn(&CredentialRef, &str) -> bool,
     ) -> Vec<CredentialStatus> {
         self.document
             .entries
@@ -224,8 +269,8 @@ impl CredentialDocumentLkg {
             .map(|(credential_ref, entry)| {
                 let configured = if active_refs.contains(credential_ref) {
                     crate::encryption::decrypt(&entry.ciphertext)
-                        .map(drop)
-                        .is_ok()
+                        .map(|value| validate(credential_ref, &value))
+                        .unwrap_or(false)
                 } else {
                     true
                 };
@@ -431,6 +476,25 @@ impl CredentialStore {
         })
     }
 
+    /// Replace an orphan credential through the standalone credential API.
+    ///
+    /// The durable config ownership check and credential CAS execute under the
+    /// same cross-process migration lock. A stale process-local config snapshot
+    /// can therefore never mutate a reference that a newer owned section has
+    /// already claimed.
+    pub fn replace_unreferenced(
+        &self,
+        credential_ref: CredentialRef,
+        secret: &str,
+        source: CredentialSource,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.with_transaction_lock(|| {
+            self.ensure_unreferenced_under_lock(&credential_ref)?;
+            self.replace_unchecked(credential_ref, secret, source, expected_revision)
+        })
+    }
+
     /// Replace an internally managed rotating credential at the latest durable
     /// revision. This is not an HTTP/client mutation primitive: external
     /// callers must continue to use [`Self::replace`] with explicit CAS. The
@@ -570,6 +634,38 @@ impl CredentialStore {
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, CredentialStatus)> {
         self.with_transaction_lock(|| self.clear_unchecked(credential_ref, expected_revision))
+    }
+
+    /// Clear an orphan credential through the standalone credential API.
+    ///
+    /// See [`Self::replace_unreferenced`]: durable ownership and the credential
+    /// CAS share one cross-process critical section.
+    pub fn clear_unreferenced(
+        &self,
+        credential_ref: &CredentialRef,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.with_transaction_lock(|| {
+            self.ensure_unreferenced_under_lock(credential_ref)?;
+            self.clear_unchecked(credential_ref, expected_revision)
+        })
+    }
+
+    fn ensure_unreferenced_under_lock(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<()> {
+        let durable = crate::section_facade::load_durable_effective_config_under_migration_lock(
+            self.data_dir(),
+        )?;
+        if config_credential_ref_counts(&durable)?.contains_key(credential_ref) {
+            return Err(ConfigStoreError::Validation(
+                "credential reference is managed by configuration and must be changed through its \
+                 owning section"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Clear the standalone credential document in one CAS commit, but only
@@ -3172,6 +3268,90 @@ mod tests {
         assert_eq!(
             store.resolve(&password_ref).unwrap().unwrap().expose(),
             durable_secret.as_str()
+        );
+    }
+
+    #[test]
+    fn standalone_mutations_use_durable_owner_not_stale_facade() {
+        let _key = crate::encryption::set_test_encryption_key([0x35; 32]);
+        let dir = TempDir::new().unwrap();
+        let stale_facade = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        let reference = CredentialRef::parse("custom.managed.token").unwrap();
+        let original_secret = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            store
+                .replace(
+                    reference.clone(),
+                    &original_secret,
+                    CredentialSource::User,
+                    0,
+                )
+                .unwrap()
+                .0,
+            1
+        );
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        external_facade
+            .registry()
+            .env
+            .commit(
+                0,
+                crate::EnvSection(vec![crate::EnvVarEntry {
+                    name: "CUSTOM_TOKEN".to_string(),
+                    value: String::new(),
+                    secret: true,
+                    value_encrypted: None,
+                    credential_ref: Some(reference.clone()),
+                    configured: true,
+                    description: Some("claimed by a newer process".to_string()),
+                }]),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_facade.registry().env.snapshot().revision,
+            0,
+            "the first process must remain stale for this regression"
+        );
+        assert_eq!(
+            crate::ConfigFacade::open(dir.path())
+                .unwrap()
+                .registry()
+                .env
+                .snapshot()
+                .revision,
+            1
+        );
+        let before = std::fs::read(store.path()).unwrap();
+
+        for error in [
+            store
+                .replace_unreferenced(
+                    reference.clone(),
+                    "stale-process-replacement",
+                    CredentialSource::User,
+                    1,
+                )
+                .unwrap_err(),
+            store.clear_unreferenced(&reference, 1).unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    error,
+                    ConfigStoreError::Validation(ref message)
+                        if message.starts_with(
+                            "credential reference is managed by configuration"
+                        )
+                ),
+                "{error}"
+            );
+        }
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.resolve(&reference).unwrap().unwrap().expose(),
+            original_secret
         );
     }
 

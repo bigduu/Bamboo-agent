@@ -38,6 +38,8 @@ pub async fn validate_bamboo_config_patch(
                 .to_string(),
         ));
     }
+    let current = app_state.config.read().await.clone();
+    config_manager::remove_unchanged_core_proxy_echo(&current, &mut patch_obj)?;
     config_manager::sanitize_root_patch(&mut patch_obj);
 
     let lifecycle_schema_issues = patch_obj
@@ -66,7 +68,6 @@ pub async fn validate_bamboo_config_patch(
         }));
     }
 
-    let current = app_state.config.read().await.clone();
     let merged = config_manager::build_merged_config(&current, patch_obj.clone())?;
     let domains = config_manager::domains_for_root_patch(&patch_obj);
 

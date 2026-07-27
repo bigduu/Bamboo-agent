@@ -52,6 +52,8 @@ pub async fn set_bamboo_config(
             "expected_revision is only valid for a dedicated revisioned config domain".to_string(),
         ));
     }
+    let current = app_state.config.read().await.clone();
+    config_manager::remove_unchanged_core_proxy_echo(&current, &mut patch_obj)?;
     let mut model_limits_patch = take_model_limits_patch(&mut patch_obj);
     config_manager::sanitize_root_patch(&mut patch_obj);
     if model_limits_patch.is_some() && !patch_obj.is_empty() {
@@ -234,6 +236,22 @@ async fn notification_payload_is_unchanged(
     if patch_obj.get("notifications").is_some_and(Value::is_null) {
         return Ok(false);
     }
+    for (channel, field) in [("ntfy", "token"), ("bark", "device_key")] {
+        if patch_obj
+            .get("notifications")
+            .and_then(Value::as_object)
+            .and_then(|notifications| notifications.get(channel))
+            .and_then(Value::as_object)
+            .and_then(|channel| channel.get(field))
+            .and_then(Value::as_str)
+            .is_some_and(bamboo_config::patch::is_masked_api_key)
+        {
+            return Err(AppError::BadRequest(
+                "notification credential value must not be a mask; omit it to keep the existing value"
+                    .to_string(),
+            ));
+        }
+    }
     let current = app_state.config.read().await.clone();
     let mut notification_patch = serde_json::Map::new();
     notification_patch.insert(
@@ -252,17 +270,17 @@ async fn set_notification_config(
     app_state: web::Data<AppState>,
     mut patch_obj: serde_json::Map<String, Value>,
 ) -> Result<HttpResponse, AppError> {
-    let explicit_revision = patch_obj.contains_key("expected_revision");
     let expected_revision = match patch_obj.remove("expected_revision") {
         Some(value) => value.as_u64().ok_or_else(|| {
             AppError::BadRequest(
                 "notification expected_revision must be an unsigned integer".to_string(),
             )
         })?,
-        None => app_state
-            .credential_store
-            .revision()
-            .map_err(super::super::credentials::map_store_read_error)?,
+        None => {
+            return Err(AppError::BadRequest(
+                "notification expected_revision is required".to_string(),
+            ))
+        }
     };
     if patch_obj.len() != 1 {
         return Err(AppError::BadRequest(
@@ -303,13 +321,10 @@ async fn set_notification_config(
                     Value::Null => {}
                     Value::String(value) => {
                         if bamboo_config::patch::is_masked_api_key(value) {
-                            if explicit_revision {
-                                return Err(AppError::BadRequest(
-                                    "notification credential value must not be a mask; omit it to keep the existing value"
-                                        .to_string(),
-                                ));
-                            }
-                            secret_intents.remove(channel);
+                            return Err(AppError::BadRequest(
+                                "notification credential value must not be a mask; omit it to keep the existing value"
+                                    .to_string(),
+                            ));
                         }
                     }
                     _ => {
@@ -323,7 +338,7 @@ async fn set_notification_config(
     }
     let patch_for_update = patch_obj;
     let intents_for_update = secret_intents.clone();
-    let (new_config, _) = app_state
+    let (new_config, _, _, _) = app_state
         .update_notification_credentials(
             expected_revision,
             secret_intents,
@@ -381,6 +396,28 @@ async fn connect_payload_is_unchanged(
     if patch_obj.get("connect").is_some_and(Value::is_null) {
         return Ok(false);
     }
+    if patch_obj
+        .get("connect")
+        .and_then(|connect| connect.get("platforms"))
+        .and_then(Value::as_array)
+        .is_some_and(|platforms| {
+            platforms.iter().any(|platform| {
+                platform.as_object().is_some_and(|platform| {
+                    ["token", "app_secret"].iter().any(|field| {
+                        platform
+                            .get(*field)
+                            .and_then(Value::as_str)
+                            .is_some_and(bamboo_config::patch::is_masked_api_key)
+                    })
+                })
+            })
+        })
+    {
+        return Err(AppError::BadRequest(
+            "connect credential value must not be a mask; omit it to keep the existing value"
+                .to_string(),
+        ));
+    }
     let current = app_state.config.read().await.clone();
     let mut connect_patch = serde_json::Map::new();
     connect_patch.insert(
@@ -399,17 +436,17 @@ async fn set_connect_config(
     app_state: web::Data<AppState>,
     mut patch_obj: serde_json::Map<String, Value>,
 ) -> Result<HttpResponse, AppError> {
-    let explicit_revision = patch_obj.contains_key("expected_revision");
     let expected_revision = match patch_obj.remove("expected_revision") {
         Some(value) => value.as_u64().ok_or_else(|| {
             AppError::BadRequest(
                 "connect expected_revision must be an unsigned integer".to_string(),
             )
         })?,
-        None => app_state
-            .credential_store
-            .revision()
-            .map_err(super::super::credentials::map_store_read_error)?,
+        None => {
+            return Err(AppError::BadRequest(
+                "connect expected_revision is required".to_string(),
+            ))
+        }
     };
     if patch_obj.len() != 1 {
         return Err(AppError::BadRequest(
@@ -461,15 +498,12 @@ async fn set_connect_config(
                     }
                     Value::String(value) => {
                         if bamboo_config::patch::is_masked_api_key(value) {
-                            if explicit_revision {
-                                return Err(AppError::BadRequest(
-                                    "connect credential value must not be a mask; omit it to keep the existing value"
-                                        .to_string(),
-                                ));
-                            }
-                        } else {
-                            intents.insert(index);
+                            return Err(AppError::BadRequest(
+                                "connect credential value must not be a mask; omit it to keep the existing value"
+                                    .to_string(),
+                            ));
                         }
+                        intents.insert(index);
                     }
                     _ => {
                         return Err(AppError::BadRequest(
@@ -484,7 +518,7 @@ async fn set_connect_config(
     config_manager::sanitize_root_patch(&mut patch_obj);
     let patch_for_update = patch_obj;
     let intents_for_update = secret_intents.clone();
-    let (new_config, _) = app_state
+    let (new_config, _, _, _) = app_state
         .update_connect_credentials(expected_revision, secret_intents, move |config| {
             let current = config.clone();
             let mut patch = patch_for_update;
@@ -586,6 +620,122 @@ mod tests {
             let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
             assert!(body.contains("revisioned env-vars API"));
         }
+    }
+
+    #[actix_web::test]
+    async fn root_patch_and_validation_reject_core_proxy_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let core_before = std::fs::read(dir.path().join("core.json")).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/config", web::post().to(set_bamboo_config))
+                .route(
+                    "/config/validate",
+                    web::post().to(crate::handlers::settings::validate_bamboo_config_patch),
+                ),
+        )
+        .await;
+        for uri in ["/config", "/config/validate"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(uri)
+                    .set_json(serde_json::json!({
+                        "http_proxy": "http://unrevisioned-proxy.test:8080"
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(body.contains("revisioned Core"), "{body}");
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("core.json")).unwrap(),
+            core_before
+        );
+    }
+
+    #[actix_web::test]
+    async fn stale_root_proxy_echo_cannot_rebase_an_unrelated_core_edit_over_exact_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state.stop_config_watcher_for_test();
+        let state = web::Data::new(state);
+
+        let external_facade = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_core = external_facade
+            .registry()
+            .envelope_value(bamboo_config::SectionId::Core)
+            .unwrap()
+            .data;
+        external_core["http_proxy"] = serde_json::json!("http://external-winner.test:8080");
+        external_facade
+            .registry()
+            .commit_value(bamboo_config::SectionId::Core, 0, external_core)
+            .unwrap();
+        let mut external = bamboo_config::ConfigFacade::open(dir.path())
+            .unwrap()
+            .effective_config();
+        external.proxy_auth = Some(bamboo_config::ProxyAuth {
+            username: "external-user".to_string(),
+            password: "external-password".to_string(),
+        });
+        assert_eq!(
+            bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        let core_before = std::fs::read(dir.path().join("core.json")).unwrap();
+        let credentials_before = std::fs::read(dir.path().join("credentials.json")).unwrap();
+        assert_eq!(state.config.read().await.http_proxy, "");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/config", web::post().to(set_bamboo_config)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config")
+                .set_json(serde_json::json!({
+                    "http_proxy": "",
+                    "server": {"port": 22_226}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(dir.path().join("core.json")).unwrap(),
+            core_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.json")).unwrap(),
+            credentials_before
+        );
+        let exact = bamboo_config::read_exact_credential_section_snapshot(
+            dir.path(),
+            bamboo_config::SectionId::Core,
+            Some(2),
+        )
+        .unwrap();
+        let mut committed = bamboo_llm::Config::default();
+        exact.install_into(&mut committed);
+        assert_eq!(committed.http_proxy, "http://external-winner.test:8080");
+        assert_eq!(
+            committed.proxy_auth.as_ref().unwrap().username,
+            "external-user"
+        );
+        assert_ne!(committed.server.port, 22_226);
     }
 
     #[actix_web::test]

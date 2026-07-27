@@ -1,5 +1,6 @@
 mod codex;
 mod config_endpoints;
+mod connect;
 mod credentials;
 mod notifications;
 mod proxy_auth;
@@ -16,11 +17,12 @@ pub use config_endpoints::{
     confirm_config_recovery, get_bamboo_config, get_config_recovery_status,
     get_model_limit_defaults, reset_bamboo_config, set_bamboo_config,
 };
+pub use connect::{get_connect_config, put_connect_config};
 pub use credentials::{
     clear_credential, get_credential_status, get_live_config_health, list_credentials,
     replace_credential, reset_credentials,
 };
-pub use notifications::get_notification_config;
+pub use notifications::{get_notification_config, put_notification_config};
 pub use proxy_auth::{get_proxy_auth_status, set_proxy_auth};
 pub use sections::{
     get_mcp_section, get_provider_section, get_provider_settings_section, get_typed_section,

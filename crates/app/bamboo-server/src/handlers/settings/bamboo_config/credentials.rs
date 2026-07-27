@@ -67,7 +67,7 @@ pub async fn replace_credential(
     reject_managed_credential_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
-        .replace(
+        .replace_unreferenced(
             credential_ref,
             &payload.value,
             CredentialSource::User,
@@ -88,7 +88,7 @@ pub async fn clear_credential(
     reject_managed_credential_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
-        .clear(&credential_ref, payload.expected_revision)
+        .clear_unreferenced(&credential_ref, payload.expected_revision)
         .map_err(map_store_mutation_error)?;
     publish_credential_event(&app_state, revision);
     Ok(HttpResponse::Ok().json(envelope(status, CredentialStoreHealth::committed(revision))))
@@ -184,6 +184,27 @@ async fn reject_managed_credential_ref(
     {
         return Err(AppError::BadRequest(
             "notification credentials must be changed through the revisioned notification config API"
+            .to_string(),
+        ));
+    }
+    if config.connect.platforms.iter().any(|platform| {
+        platform.token_credential_ref.as_ref() == Some(credential_ref)
+            || platform.app_secret_credential_ref.as_ref() == Some(credential_ref)
+    }) {
+        return Err(AppError::BadRequest(
+            "connect credentials must be changed through the revisioned connect config API"
+                .to_string(),
+        ));
+    }
+    if config.access_control.as_ref().is_some_and(|access| {
+        access.password_credential_ref.as_ref() == Some(credential_ref)
+            || access
+                .devices
+                .iter()
+                .any(|device| device.token_credential_ref.as_ref() == Some(credential_ref))
+    }) {
+        return Err(AppError::BadRequest(
+            "access-control credentials must be changed through the revisioned access APIs"
                 .to_string(),
         ));
     }
@@ -224,7 +245,10 @@ fn map_store_mutation_error(error: ConfigStoreError) -> AppError {
         ConfigStoreError::Conflict { expected, actual } => {
             AppError::ConfigConflict { expected, actual }
         }
-        ConfigStoreError::Validation(message) if message.starts_with("credential value ") => {
+        ConfigStoreError::Validation(message)
+            if message.starts_with("credential value ")
+                || message.starts_with("credential reference is managed by configuration") =>
+        {
             AppError::BadRequest(message)
         }
         other => map_store_read_error(other),
@@ -280,6 +304,18 @@ mod tests {
         assert_eq!(value["status"], "healthy");
         assert!(value["data"].get("value").is_none());
         assert!(value["data"].get("secret").is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn durable_managed_reference_rejection_is_a_client_error() {
+        assert!(matches!(
+            map_store_mutation_error(ConfigStoreError::Validation(
+                "credential reference is managed by configuration and must be changed through its \
+                 owning section"
+                    .to_string()
+            )),
+            AppError::BadRequest(_)
+        ));
     }
 
     #[actix_web::test]
@@ -506,6 +542,55 @@ mod tests {
                 .map(|auth| auth.username.as_str()),
             Some("active")
         );
+    }
+
+    #[actix_web::test]
+    async fn generic_mutations_reject_active_connect_and_access_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let connect = CredentialRef::parse("connect.platform-one.token").unwrap();
+        let access_password =
+            bamboo_config::config_crypto::access_password_credential_ref().unwrap();
+        let access_device =
+            bamboo_config::config_crypto::access_device_credential_ref("device-one").unwrap();
+        {
+            let mut config = state.config.write().await;
+            config.connect.platforms.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "platform-one",
+                    "type": "telegram",
+                    "token_credential_ref": connect.clone(),
+                    "token_configured": true
+                }))
+                .unwrap(),
+            );
+            config.access_control = Some(bamboo_config::AccessControlConfig {
+                password_enabled: true,
+                password_credential_ref: Some(access_password.clone()),
+                password_configured: true,
+                devices: vec![bamboo_config::DeviceCredential {
+                    device_id: "device-one".to_string(),
+                    label: "Device".to_string(),
+                    token_hash: String::new(),
+                    token_salt: String::new(),
+                    token_credential_ref: Some(access_device.clone()),
+                    token_configured: true,
+                    created_at: "2026-07-27T00:00:00Z".to_string(),
+                    last_used_at: None,
+                    revoked: false,
+                }],
+                ..Default::default()
+            });
+        }
+
+        for reference in [&connect, &access_password, &access_device] {
+            assert!(
+                reject_managed_credential_ref(&state, reference)
+                    .await
+                    .is_err(),
+                "{reference:?}"
+            );
+        }
     }
 
     #[actix_web::test]
