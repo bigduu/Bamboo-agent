@@ -24,6 +24,7 @@ pub struct ScheduleTasksTool {
     storage: Arc<dyn Storage>,
     config: Arc<RwLock<Config>>,
     project_store: Arc<bamboo_projects::ProjectStore>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 }
 
 impl ScheduleTasksTool {
@@ -34,6 +35,7 @@ impl ScheduleTasksTool {
         storage: Arc<dyn Storage>,
         config: Arc<RwLock<Config>>,
         project_store: Arc<bamboo_projects::ProjectStore>,
+        workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     ) -> Self {
         Self {
             schedule_store,
@@ -42,6 +44,7 @@ impl ScheduleTasksTool {
             storage,
             config,
             project_store,
+            workspace_resolver,
         }
     }
 
@@ -77,14 +80,28 @@ impl ScheduleTasksTool {
                 }
             }
         }
-        normalized.workspace_path = crate::project_context::validate_workspace_assignment(
-            &self.project_store,
-            run_config.project_id.as_ref(),
-            run_config.workspace_path.as_deref(),
-        )
-        .map_err(|error| ToolError::InvalidArguments(error.to_string()))?
-        .as_deref()
-        .map(bamboo_config::paths::path_to_display_string);
+        let validated_workspace =
+            crate::project_context::validate_workspace_assignment_with_resolver(
+                &self.project_store,
+                run_config.project_id.as_ref(),
+                run_config.workspace_path.as_deref(),
+                &self.workspace_resolver,
+            )
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        // Validate the Project default now, but preserve omission in the
+        // durable schedule. A missing explicit workspace means "resolve the
+        // current Project path when this job fires", not "pin today's path
+        // as an explicit override".
+        normalized.workspace_path = run_config
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .and(
+                validated_workspace
+                    .as_deref()
+                    .map(bamboo_config::paths::path_to_display_string),
+            );
         if !run_config.auto_execute {
             return Ok(normalized);
         }
@@ -640,6 +657,7 @@ mod tests {
             state.storage.clone(),
             state.config.clone(),
             state.project_store.clone(),
+            state.workspace_resolver.clone(),
         );
 
         let project = state.project_store.create("Scheduled", None).unwrap();
@@ -713,7 +731,16 @@ mod tests {
         let state = crate::AppState::new(dir.path().to_path_buf())
             .await
             .expect("AppState");
-        let project = state.project_store.create("Scheduled", None).unwrap();
+        let project_path = tempfile::tempdir().expect("Project path");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Scheduled",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
         let mut caller = Session::new("project-scheduler-caller", "model");
         caller.kind = SessionKind::Root;
         caller.set_project_id_meta(project.id.to_string());
@@ -725,6 +752,7 @@ mod tests {
             state.storage.clone(),
             state.config.clone(),
             state.project_store.clone(),
+            state.workspace_resolver.clone(),
         );
         assert_eq!(
             tool.parameters_schema()["properties"]["run_config"]["properties"]["project_id"]
@@ -748,6 +776,20 @@ mod tests {
         assert_eq!(schedules.len(), 1);
         let schedule = &schedules[0];
         assert_eq!(schedule.run_config.project_id.as_ref(), Some(&project.id));
+        assert!(
+            schedule.run_config.workspace_path.is_none(),
+            "Project fallback must stay symbolic in durable schedule config"
+        );
+        let moved_project_path = tempfile::tempdir().expect("Moved Project path");
+        let updated_project = state
+            .project_store
+            .update_with_project_path(
+                &project.id,
+                project.revision,
+                moved_project_path.path().to_string_lossy().as_ref(),
+                |_| Ok(()),
+            )
+            .expect("move Project path before schedule fires");
 
         tool.invoke(
             json!({"action": "run_now", "schedule_id": schedule.id}),
@@ -775,6 +817,10 @@ mod tests {
         .await
         .expect("scheduled session should be persisted");
         assert_eq!(fired.project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(
+            fired.workspace_path.as_deref(),
+            updated_project.project_path.as_deref()
+        );
         let fired_session = state
             .storage
             .load_session(&fired.id)
@@ -787,6 +833,17 @@ mod tests {
             )
             .as_ref(),
             Some(&project.id)
+        );
+        assert_eq!(
+            fired_session.workspace_path_meta().as_deref(),
+            updated_project.project_path.as_deref()
+        );
+        assert_eq!(
+            fired_session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str())
         );
     }
 
@@ -814,6 +871,7 @@ mod tests {
             state.storage.clone(),
             state.config.clone(),
             state.project_store.clone(),
+            state.workspace_resolver.clone(),
         );
 
         let base_args = |project_id: Option<&bamboo_domain::ProjectId>| {
@@ -858,7 +916,16 @@ mod tests {
         let state = crate::AppState::new(dir.path().to_path_buf())
             .await
             .expect("AppState");
-        let project = state.project_store.create("Scheduled", None).unwrap();
+        let project_path = tempfile::tempdir().expect("Project path");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Scheduled",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
         let mut caller = Session::new("assigned-scheduler-caller", "model");
         caller.set_project_id_meta(project.id.to_string());
         state.storage.save_session(&caller).await.unwrap();
@@ -885,6 +952,7 @@ mod tests {
             state.storage.clone(),
             state.config.clone(),
             state.project_store.clone(),
+            state.workspace_resolver.clone(),
         );
 
         tool.invoke(
@@ -945,6 +1013,7 @@ mod tests {
             state.storage.clone(),
             state.config.clone(),
             state.project_store.clone(),
+            state.workspace_resolver.clone(),
         );
 
         let listed = tool

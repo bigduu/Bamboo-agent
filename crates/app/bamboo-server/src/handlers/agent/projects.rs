@@ -20,6 +20,9 @@ pub struct CreateProjectRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Existing user source/work folder. New active Projects cannot be
+    /// created without an authoritative default execution directory.
+    pub project_path: String,
     #[serde(default)]
     pub workspace_bindings: Vec<WorkspaceBinding>,
 }
@@ -40,6 +43,10 @@ pub struct PatchProjectRequest {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_nullable_description")]
     pub description: Option<Option<String>>,
+    /// Select a new authoritative Project folder using the same Project CAS
+    /// revision as name/description updates.
+    #[serde(default)]
+    pub project_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,12 +102,30 @@ fn parse_id(raw: &str) -> std::result::Result<ProjectId, HttpResponse> {
 }
 
 fn project_error(error: ProjectStoreError) -> HttpResponse {
+    if let ProjectStoreError::ProjectPathUnbindConflict {
+        project_id,
+        project_path,
+    } = &error
+    {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_path_unbind_conflict",
+                "message": "Select another Project path before unbinding the current primary folder"
+            },
+            "project_id": project_id,
+            "project_path": project_path,
+        }));
+    }
     let (status, message) = match error {
         ProjectStoreError::NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
         ProjectStoreError::Conflict { .. } => (StatusCode::PRECONDITION_FAILED, error.to_string()),
         ProjectStoreError::AlreadyExists(_)
         | ProjectStoreError::Validation(_)
-        | ProjectStoreError::InvalidPathComponent(_) => (StatusCode::CONFLICT, error.to_string()),
+        | ProjectStoreError::InvalidPathComponent(_)
+        | ProjectStoreError::ProjectPathUnbindConflict { .. } => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
         ProjectStoreError::Io(_) | ProjectStoreError::Json(_) => {
             tracing::error!(%error, "Project registry operation failed");
             (
@@ -110,6 +135,42 @@ fn project_error(error: ProjectStoreError) -> HttpResponse {
         }
     };
     crate::error::json_error(status, message)
+}
+
+fn project_path_validation_error(
+    error: crate::project_context::ProjectWorkspaceValidationError,
+) -> HttpResponse {
+    match error {
+        crate::project_context::ProjectWorkspaceValidationError::Invalid {
+            code,
+            workspace,
+            message,
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": code,
+                "message": message
+            },
+            "project_path": workspace,
+        })),
+        crate::project_context::ProjectWorkspaceValidationError::Conflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_path_conflict",
+                "message": "Project path belongs to another Project"
+            },
+            "project_path": workspace,
+            "owner_project_id": owner_project_id,
+            "project_id": session_project_id,
+        })),
+        crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+            project_error(error)
+        }
+    }
 }
 
 fn with_etag(project: &ProjectManifest, status: StatusCode) -> HttpResponse {
@@ -132,9 +193,19 @@ pub async fn create_project(
     state: web::Data<AppState>,
     request: web::Json<CreateProjectRequest>,
 ) -> Result<HttpResponse> {
-    let project = match state.project_store.create_with_bindings(
+    let project_path = match crate::project_context::validate_project_path_candidate_with_resolver(
+        &state.project_store,
+        None,
+        &request.project_path,
+        &state.workspace_resolver,
+    ) {
+        Ok(project_path) => bamboo_config::paths::path_to_display_string(&project_path),
+        Err(error) => return Ok(project_path_validation_error(error)),
+    };
+    let project = match state.project_store.create_with_project_path(
         request.name.clone(),
         request.description.clone(),
+        project_path,
         request.workspace_bindings.clone(),
     ) {
         Ok(project) => project,
@@ -178,7 +249,7 @@ pub async fn patch_project(
         Ok(revision) => revision,
         Err(response) => return Ok(response),
     };
-    let project = match state.project_store.update(&id, expected, |project| {
+    let mutate = |project: &mut ProjectManifest| {
         if let Some(name) = request.name.as_ref() {
             project.name = name.clone();
         }
@@ -186,7 +257,25 @@ pub async fn patch_project(
             project.description = description.clone();
         }
         Ok(())
-    }) {
+    };
+    let result = if let Some(project_path) = request.project_path.as_deref() {
+        let project_path =
+            match crate::project_context::validate_project_path_candidate_with_resolver(
+                &state.project_store,
+                Some(&id),
+                project_path,
+                &state.workspace_resolver,
+            ) {
+                Ok(project_path) => bamboo_config::paths::path_to_display_string(&project_path),
+                Err(error) => return Ok(project_path_validation_error(error)),
+            };
+        state
+            .project_store
+            .update_with_project_path(&id, expected, &project_path, mutate)
+    } else {
+        state.project_store.update(&id, expected, mutate)
+    };
+    let project = match result {
         Ok(project) => project,
         Err(error) => return Ok(project_error(error)),
     };
@@ -473,10 +562,38 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn create_project_rejects_unavailable_path_without_registry_side_effects() {
+        let (dir, state) = app_state().await;
+        let app = test::init_service(project_app!(state.clone())).await;
+        let missing = dir.path().join("missing-project");
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects")
+                .set_json(serde_json::json!({
+                    "name": "Must not persist",
+                    "project_path": missing
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["error"]["code"], "project_path_unavailable",
+            "unexpected response: {body}"
+        );
+        assert!(state.project_store.list().unwrap().is_empty());
+    }
+
+    #[actix_web::test]
     async fn project_routes_enforce_etag_cas_and_keep_identity_stable() {
         let (dir, state) = app_state().await;
         let mut feed = state.account_sink.subscribe();
         let app = test::init_service(project_app!(state.clone())).await;
+        let project_path = dir.path().join("zenith");
+        std::fs::create_dir_all(&project_path).unwrap();
 
         let create = test::call_service(
             &app,
@@ -484,7 +601,8 @@ mod tests {
                 .uri("/projects")
                 .set_json(serde_json::json!({
                     "name": "Zenith",
-                    "description": "first"
+                    "description": "first",
+                    "project_path": project_path
                 }))
                 .to_request(),
         )
@@ -492,6 +610,20 @@ mod tests {
         assert_eq!(create.status(), StatusCode::CREATED);
         assert_eq!(create.headers().get(header::ETAG).unwrap(), "\"1\"");
         let created: ProjectManifest = test::read_body_json(create).await;
+        assert_eq!(
+            created.project_path.as_deref(),
+            Some(
+                project_path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            created.project_path_status,
+            bamboo_domain::ProjectPathStatus::Configured
+        );
         let home = state.project_store.paths().project_home(&created.id);
         assert!(home.ends_with(created.id.as_str()));
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
@@ -551,11 +683,70 @@ mod tests {
             AgentEvent::ProjectUpdated { project_id, .. } if project_id == renamed.id.as_str()
         ));
 
+        let moved_project_path = dir.path().join("zenith-moved");
+        std::fs::create_dir_all(&moved_project_path).unwrap();
+        let moved = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/projects/{}", renamed.id))
+                .insert_header((header::IF_MATCH, "\"2\""))
+                .set_json(serde_json::json!({"project_path": moved_project_path}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(moved.status(), StatusCode::OK);
+        assert_eq!(moved.headers().get(header::ETAG).unwrap(), "\"3\"");
+        let moved: ProjectManifest = test::read_body_json(moved).await;
+        assert_eq!(moved.id, created.id);
+        assert_eq!(
+            moved.project_path.as_deref(),
+            Some(
+                moved_project_path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        let path_updated_event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            &path_updated_event.event,
+            AgentEvent::ProjectUpdated {
+                project_id,
+                revision: 3,
+            } if project_id == renamed.id.as_str()
+        ));
+
+        let primary_unbind = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri(&format!("/projects/{}/workspaces", renamed.id))
+                .insert_header((header::IF_MATCH, "\"3\""))
+                .set_json(serde_json::json!({"path": moved_project_path}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(primary_unbind.status(), StatusCode::CONFLICT);
+        let primary_unbind: Value = test::read_body_json(primary_unbind).await;
+        assert_eq!(
+            primary_unbind["error"]["code"],
+            "project_path_unbind_conflict"
+        );
+        assert_eq!(
+            state.project_store.get(&renamed.id).unwrap().project_path,
+            moved.project_path
+        );
+
         let listed =
             test::call_service(&app, test::TestRequest::get().uri("/projects").to_request()).await;
         assert_eq!(listed.status(), StatusCode::OK);
         let listed: Value = test::read_body_json(listed).await;
         assert_eq!(listed["projects"][0]["id"], renamed.id.to_string());
+        assert_eq!(listed["projects"][0]["project_path_status"], "configured");
 
         // Resource API returns only counts/revisions; file contents and secret
         // values never cross the contract.

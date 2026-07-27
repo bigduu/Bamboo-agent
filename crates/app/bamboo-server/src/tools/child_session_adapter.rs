@@ -47,6 +47,7 @@ pub struct ChildSessionAdapter {
     /// Out-of-process worker embeddings may omit it and retain confinement-only
     /// validation; the server always supplies it.
     pub(crate) project_store: Option<Arc<bamboo_projects::ProjectStore>>,
+    pub(crate) workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     /// Coalesces concurrent parent-wait registrations for the same parent that
     /// arrive in one spawn round (the LLM emitting several `SubAgent.create`
     /// calls at once → `join_all`) into a single parent persist. See
@@ -150,6 +151,8 @@ impl ChildSessionAdapter {
             subagent_model_resolver,
             config,
             project_store: None,
+            workspace_resolver:
+                bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
             // Fresh per-adapter wait-coalescing map (the type is private to this
             // crate, so out-of-crate callers can't supply it).
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
@@ -433,6 +436,34 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
         model: String,
         disabled_tools: Option<std::collections::BTreeSet<String>>,
     ) -> Result<String, String> {
+        let persisted_parent_workspace = parent_session.workspace_path_meta();
+        let parent_workspace_is_project_default = parent_session
+            .metadata
+            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str)
+            == Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str());
+        let workspace_source = if parent_workspace_is_project_default
+            || (persisted_parent_workspace.is_none()
+                && matches!(
+                    bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                        parent_session
+                    ),
+                    bamboo_engine::project_context::SessionProjectIdentity::Assigned(_)
+                ))
+        {
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+        } else {
+            match parent_session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str)
+            {
+                Some("project_default") => {
+                    bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                }
+                _ => bamboo_engine::project_context::WorkspaceSource::Session,
+            }
+        };
         let input = bamboo_engine::session_app::child_session::CreateChildInput {
             parent_session: parent_session.clone(),
             child_id: format!("guardian-{}", uuid::Uuid::new_v4()),
@@ -442,7 +473,12 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
             // The coordinator branches on this subagent_type to recognize a
             // guardian completion and parse its verdict.
             subagent_type: "guardian".to_string(),
-            workspace: parent_session.workspace_path_meta().unwrap_or_default(),
+            workspace: if parent_workspace_is_project_default {
+                String::new()
+            } else {
+                persisted_parent_workspace.unwrap_or_default()
+            },
+            workspace_source,
             model_override: Some(model),
             model_ref_override: None,
             runtime_metadata: HashMap::new(),
@@ -463,12 +499,27 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    fn publish_child_workspace(
+        &self,
+        session_id: &str,
+        workspace: std::path::PathBuf,
+        source: &str,
+    ) -> std::path::PathBuf {
+        self.workspace_resolver
+            .publish_resolved_workspace(session_id, workspace, source)
+    }
+
     async fn validate_child_workspace(
         &self,
         project_id: Option<&bamboo_domain::ProjectId>,
         requested_workspace: &str,
     ) -> Result<String, ChildSessionError> {
         let Some(store) = self.project_store.as_deref() else {
+            if requested_workspace.trim().is_empty() {
+                return Err(ChildSessionError::InvalidArguments(
+                    "child workspace must be a non-empty path".to_string(),
+                ));
+            }
             let requested = std::path::PathBuf::from(requested_workspace);
             if requested.exists() && !requested.is_dir() {
                 return Err(ChildSessionError::InvalidArguments(format!(
@@ -482,10 +533,11 @@ impl ChildSessionPort for ChildSessionAdapter {
                 &final_workspace,
             ));
         };
-        let final_workspace = crate::project_context::validate_workspace_assignment(
+        let final_workspace = crate::project_context::validate_workspace_assignment_with_resolver(
             store,
             project_id,
             Some(requested_workspace),
+            &self.workspace_resolver,
         )
         .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?
         .ok_or_else(|| {

@@ -604,16 +604,24 @@ impl Tool for SubAgentTool {
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "worker".to_string());
                 // workspace is optional: default to the parent's workspace.
-                let requested_workspace = workspace
+                let explicit_workspace = workspace
                     .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| parent.workspace.clone())
-                    .ok_or_else(|| {
-                        ToolError::InvalidArguments(
-                            "workspace must be non-empty (parent has no workspace to inherit)"
-                                .to_string(),
-                        )
-                    })?;
+                    .filter(|value| !value.is_empty());
+                let workspace_was_explicit = explicit_workspace.is_some();
+                let parent_workspace_is_project_default = parent
+                    .metadata
+                    .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                    .map(String::as_str)
+                    == Some(
+                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
+                    );
+                let requested_workspace = explicit_workspace
+                    .or_else(|| {
+                        (!parent_workspace_is_project_default)
+                            .then(|| parent.workspace.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
                 let parent_project_id =
                     match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
                         bamboo_engine::project_context::SessionProjectIdentity::Assigned(
@@ -629,6 +637,24 @@ impl Tool for SubAgentTool {
                             )));
                         }
                     };
+                let workspace_source = if workspace_was_explicit {
+                    bamboo_engine::project_context::WorkspaceSource::Explicit
+                } else if parent_workspace_is_project_default
+                    || (requested_workspace.is_empty() && parent_project_id.is_some())
+                {
+                    bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                } else {
+                    match parent
+                        .metadata
+                        .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                        .map(String::as_str)
+                    {
+                        Some("project_default") => {
+                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                        }
+                        _ => bamboo_engine::project_context::WorkspaceSource::Session,
+                    }
+                };
                 // This must precede resident lookup/cancellation and every
                 // child/session mutation. Reused residents bypass
                 // `create_child_action`, while new children and guardians use
@@ -738,7 +764,11 @@ impl Tool for SubAgentTool {
                         // authorized workspace before publishing runtime state
                         // or enqueueing the next resident task.
                         self.sessions
-                            .save_resident_reuse_state(&mut child, &workspace)
+                            .save_resident_reuse_state(
+                                &mut child,
+                                &workspace,
+                                workspace_source,
+                            )
                             .await
                             .map_err(tool_error_from_child_session)?;
                         // Reuse: reset => update (truncate + new task) then rerun;
@@ -816,6 +846,7 @@ impl Tool for SubAgentTool {
                                 assignment_prompt: prompt.clone(),
                                 subagent_type: subagent_type.clone(),
                                 workspace: workspace.clone(),
+                                workspace_source,
                                 model_override,
                                 model_ref_override,
                                 runtime_metadata,

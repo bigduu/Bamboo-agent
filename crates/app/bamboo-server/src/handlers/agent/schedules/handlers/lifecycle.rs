@@ -208,6 +208,65 @@ mod tests {
         }
 
         #[actix_web::test]
+        async fn create_schedule_validates_but_does_not_pin_project_default_workspace() {
+            let temp_dir = tempdir().expect("tempdir");
+            bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let project_path = tempdir().expect("Project path");
+            let foreign_default = tempdir().expect("foreign global default");
+            let state = web::Data::new(
+                AppState::new(temp_dir.path().to_path_buf())
+                    .await
+                    .expect("app state"),
+            );
+            let project = state
+                .project_store
+                .create_with_project_path(
+                    "Scheduled",
+                    None,
+                    project_path.path().to_string_lossy(),
+                    Vec::new(),
+                )
+                .expect("configured Project");
+            state.config.write().await.default_work_area =
+                Some(bamboo_config::DefaultWorkAreaConfig {
+                    path: Some(foreign_default.path().to_string_lossy().into_owned()),
+                });
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(configure_routes),
+            )
+            .await;
+
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/schedules")
+                    .set_json(serde_json::json!({
+                        "name": "Project default",
+                        "trigger": {"type": "interval", "every_seconds": 3600},
+                        "run_config": {
+                            "project_id": project.id,
+                            "auto_execute": false
+                        }
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let schedules = state.schedule_store.list_schedules().await;
+            assert_eq!(schedules.len(), 1);
+            assert_eq!(
+                schedules[0].run_config.project_id.as_ref(),
+                Some(&project.id)
+            );
+            assert!(
+                schedules[0].run_config.workspace_path.is_none(),
+                "omission must remain a live Project-default selection"
+            );
+        }
+
+        #[actix_web::test]
         async fn run_now_rejects_archived_or_missing_project_before_run_creation() {
             let temp_dir = tempdir().expect("tempdir");
             bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
@@ -216,7 +275,16 @@ mod tests {
                     .await
                     .expect("app state"),
             );
-            let project = state.project_store.create("Scheduled", None).unwrap();
+            let project_path = tempdir().expect("Project path");
+            let project = state
+                .project_store
+                .create_with_project_path(
+                    "Scheduled",
+                    None,
+                    project_path.path().to_string_lossy(),
+                    Vec::new(),
+                )
+                .unwrap();
             let archived_schedule = state
                 .schedule_store
                 .create_schedule(
@@ -287,12 +355,21 @@ mod tests {
         async fn legacy_run_config_patch_preserves_existing_project_membership() {
             let temp_dir = tempdir().expect("tempdir");
             bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+            let project_path = tempdir().expect("Project path");
             let state = web::Data::new(
                 AppState::new(temp_dir.path().to_path_buf())
                     .await
                     .expect("app state"),
             );
-            let project = state.project_store.create("Scheduled", None).unwrap();
+            let project = state
+                .project_store
+                .create_with_project_path(
+                    "Scheduled",
+                    None,
+                    project_path.path().to_string_lossy(),
+                    Vec::new(),
+                )
+                .unwrap();
             let schedule = state
                 .schedule_store
                 .create_schedule(
@@ -341,6 +418,7 @@ mod tests {
                 persisted.run_config.task_message.as_deref(),
                 Some("updated by an old client")
             );
+            assert!(persisted.run_config.workspace_path.is_none());
         }
 
         #[actix_web::test]

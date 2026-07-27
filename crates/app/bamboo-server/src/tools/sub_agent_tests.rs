@@ -172,6 +172,13 @@ async fn build_test_harness() -> TestHarness {
 async fn build_test_harness_with_resolver(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
 ) -> TestHarness {
+    build_test_harness_with_options(subagent_model_resolver, None).await
+}
+
+async fn build_test_harness_with_options(
+    subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
+) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
     let workspace_path = bamboo_home.join("workspace");
@@ -328,6 +335,9 @@ async fn build_test_harness_with_resolver(
         subagent_model_resolver,
         config,
         project_store: Some(project_store.clone()),
+        workspace_resolver: workspace_resolver.unwrap_or_else(
+            bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals,
+        ),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
     });
     let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
@@ -352,6 +362,65 @@ async fn build_test_harness_with_resolver(
 // -----------------------------------------------------------------------
 // ④ Batched parent-wait registration
 // -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn child_publication_uses_the_validating_instance_workspace_root() {
+    let instance_root = tempfile::tempdir().expect("instance workspace root");
+    let canonical_instance_root = instance_root
+        .path()
+        .canonicalize()
+        .expect("canonical instance workspace root");
+    let foreign_workspace = tempfile::tempdir().expect("foreign workspace");
+    let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+        let root = instance_root.path().to_path_buf();
+        move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+            root: root.clone(),
+            confine: true,
+        }
+    });
+    let harness = build_test_harness_with_options(None, Some(resolver)).await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("load parent")
+        .expect("parent");
+    let child_id = "instance-confined-child".to_string();
+
+    child_session::create_child_action(
+        harness.adapter.as_ref(),
+        child_session::CreateChildInput {
+            parent_session: parent,
+            child_id: child_id.clone(),
+            title: "Confined child".to_string(),
+            responsibility: "Inspect".to_string(),
+            assignment_prompt: "Inspect".to_string(),
+            subagent_type: "explorer".to_string(),
+            workspace: foreign_workspace.path().to_string_lossy().into_owned(),
+            workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
+            model_override: None,
+            model_ref_override: None,
+            runtime_metadata: HashMap::new(),
+            auto_run: false,
+            reasoning_effort: None,
+            lifecycle: None,
+            resident_name: None,
+            resident_context: None,
+            disabled_tools: None,
+            context_fork: None,
+        },
+    )
+    .await
+    .expect("instance-confined child");
+
+    let published =
+        bamboo_agent_core::workspace_state::get_workspace(&child_id).expect("published workspace");
+    assert!(published.starts_with(&canonical_instance_root));
+    assert!(
+        published.is_dir(),
+        "the same instance resolver that validated the relocated target must materialize it"
+    );
+}
 
 #[tokio::test]
 async fn child_resident_and_guardian_reject_cross_project_workspace_without_side_effects() {
@@ -402,6 +471,7 @@ async fn child_resident_and_guardian_reject_cross_project_workspace_without_side
                 assignment_prompt: "Inspect".to_string(),
                 subagent_type: role.to_string(),
                 workspace: workspace.path().to_string_lossy().into_owned(),
+                workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
                 model_override: None,
                 model_ref_override: None,
                 runtime_metadata: HashMap::new(),
@@ -1517,6 +1587,108 @@ async fn same_project_resident_reuse_persists_and_publishes_changed_workspace() 
 }
 
 #[tokio::test]
+async fn resident_reuse_publication_uses_the_validating_instance_workspace_root() {
+    let instance_root = tempfile::tempdir().expect("instance workspace root");
+    let canonical_instance_root = instance_root
+        .path()
+        .canonicalize()
+        .expect("canonical instance workspace root");
+    let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+        let root = canonical_instance_root.clone();
+        move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+            root: root.clone(),
+            confine: true,
+        }
+    });
+    let harness = build_test_harness_with_options(None, Some(resolver.clone())).await;
+    let workspace_a = canonical_instance_root.join("workspace-a");
+    std::fs::create_dir_all(&workspace_a).expect("workspace A");
+    let workspace_b = tempfile::tempdir().expect("foreign workspace B");
+    let context = |tool_call_id: &'static str| {
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx()
+    };
+    let args = |workspace: &std::path::Path, title: &str| {
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "instance-confined-resident",
+            "title": title,
+            "responsibility": "Inspect a confined workspace",
+            "prompt": "Inspect the requested workspace.",
+            "workspace": workspace,
+            "auto_run": false
+        })
+    };
+
+    let created = invoke_completed(
+        &harness.tool,
+        args(&workspace_a, "Workspace A"),
+        context("instance-resident-create"),
+    )
+    .await
+    .expect("create instance-confined resident");
+    let created: serde_json::Value = serde_json::from_str(&created.result).unwrap();
+    let resident_id = created["child_session_id"].as_str().unwrap().to_string();
+    let initial = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .adapter
+        .session_store
+        .save_session(&initial)
+        .await
+        .expect("index resident");
+
+    let reused = invoke_completed(
+        &harness.tool,
+        args(workspace_b.path(), "Workspace B"),
+        context("instance-resident-reuse"),
+    )
+    .await
+    .expect("reuse instance-confined resident");
+    let reused: serde_json::Value = serde_json::from_str(&reused.result).unwrap();
+    assert_eq!(reused["child_session_id"], resident_id);
+    assert_eq!(reused["reused"], true);
+
+    let canonical_workspace_b = workspace_b.path().canonicalize().unwrap();
+    let expected = resolver.preview_workspace_path(canonical_workspace_b);
+    let expected_display = bamboo_config::paths::path_to_display_string(&expected);
+    let child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(expected.starts_with(&canonical_instance_root));
+    assert!(
+        expected.is_dir(),
+        "resident reuse must materialize the instance resolver's relocated target"
+    );
+    assert_eq!(child.workspace.as_deref(), Some(expected_display.as_str()));
+    assert_eq!(
+        child.workspace_path_meta().as_deref(),
+        Some(expected_display.as_str())
+    );
+    assert_eq!(
+        bamboo_agent_core::workspace_state::peek_workspace(&resident_id).as_deref(),
+        Some(expected.as_path())
+    );
+}
+
+#[tokio::test]
 async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create() {
     let harness = build_test_harness().await;
 
@@ -2444,6 +2616,141 @@ async fn create_requires_workspace() {
         }
         other => panic!("expected InvalidArguments error, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn assigned_child_without_parent_workspace_uses_project_path() {
+    let harness = build_test_harness().await;
+    let project_path = tempfile::tempdir().expect("Project path");
+    let project = harness
+        .project_store
+        .create_with_project_path(
+            "Child Project",
+            None,
+            project_path.path().to_string_lossy(),
+            Vec::new(),
+        )
+        .expect("Project");
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("load parent")
+        .expect("parent");
+    parent.set_project_id_meta(project.id.to_string());
+    parent.workspace = None;
+    harness
+        .storage
+        .save_session(&parent)
+        .await
+        .expect("save parent");
+
+    let result = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "title": "Project Default Child",
+            "responsibility": "Verify Project fallback",
+            "prompt": "Inspect the Project.",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_project_default_workspace",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("assigned child should use Project path");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child_id = payload["child_session_id"].as_str().unwrap();
+    let child = harness
+        .storage
+        .load_session(child_id)
+        .await
+        .expect("load child")
+        .expect("child");
+    let expected =
+        bamboo_config::paths::path_to_display_string(&project_path.path().canonicalize().unwrap());
+    assert_eq!(
+        child.workspace_path_meta().as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        child.project_id_meta().as_deref(),
+        Some(project.id.as_str())
+    );
+    assert_eq!(
+        child
+            .metadata
+            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str),
+        Some("project_default")
+    );
+
+    let moved_project_path = tempfile::tempdir().expect("Moved Project path");
+    let updated = harness
+        .project_store
+        .update_with_project_path(
+            &project.id,
+            project.revision,
+            moved_project_path.path().to_string_lossy().as_ref(),
+            |_| Ok(()),
+        )
+        .expect("move Project path");
+    parent.workspace = Some(expected.clone());
+    parent.set_workspace_path_meta(expected);
+    parent.metadata.insert(
+        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+            .as_str()
+            .to_string(),
+    );
+    harness
+        .storage
+        .save_session(&parent)
+        .await
+        .expect("save stale default-derived parent");
+    let result = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "title": "Moved Project Default Child",
+            "responsibility": "Verify current Project fallback",
+            "prompt": "Inspect the moved Project.",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_moved_project_default_workspace",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("child should follow Project path CAS");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let moved_child = harness
+        .storage
+        .load_session(payload["child_session_id"].as_str().unwrap())
+        .await
+        .expect("load moved child")
+        .expect("moved child");
+    assert_eq!(
+        moved_child.workspace_path_meta().as_deref(),
+        updated.project_path.as_deref()
+    );
 }
 
 #[tokio::test]

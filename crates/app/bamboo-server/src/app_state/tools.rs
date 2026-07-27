@@ -39,6 +39,7 @@ pub(super) fn build_base_tools(
     ledger_schedule_bridge: Arc<crate::schedule_app::LateBoundLedgerBridge>,
     project_store: Arc<bamboo_projects::ProjectStore>,
     account_sink: Arc<bamboo_engine::events::AccountEventSink>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -65,15 +66,22 @@ pub(super) fn build_base_tools(
     // Replace the framework Workspace tool with the Project-aware server
     // overlay and expose the explicit Project registry tool. Overlay dispatch
     // still delegates permission decisions to the built-in executor.
-    let workspace_tool = Arc::new(crate::tools::ProjectWorkspaceTool::new(
-        session_repo.clone(),
-        project_store.clone(),
-    ));
+    let workspace_tool = Arc::new(
+        crate::tools::ProjectWorkspaceTool::new_with_workspace_resolver(
+            session_repo.clone(),
+            project_store.clone(),
+            workspace_resolver.clone(),
+        ),
+    );
     let with_workspace: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(base, workspace_tool));
     let project_tool = Arc::new(
-        crate::tools::ProjectTool::new(session_repo.clone(), project_store.clone())
-            .with_account_sink(account_sink),
+        crate::tools::ProjectTool::new_with_workspace_resolver(
+            session_repo.clone(),
+            project_store.clone(),
+            workspace_resolver,
+        )
+        .with_account_sink(account_sink),
     );
     let with_project: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_workspace,
@@ -174,6 +182,7 @@ pub(super) fn build_root_tools(
     broker: Option<bamboo_config::BrokerClientConfig>,
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
     project_store: Arc<bamboo_projects::ProjectStore>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Arc<dyn ToolExecutor> {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
@@ -188,6 +197,7 @@ pub(super) fn build_root_tools(
         subagent_model_resolver,
         config: config.clone(),
         project_store: Some(project_store.clone()),
+        workspace_resolver: workspace_resolver.clone(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
     });
 
@@ -214,6 +224,7 @@ pub(super) fn build_root_tools(
         storage.clone(),
         config.clone(),
         project_store,
+        workspace_resolver,
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),

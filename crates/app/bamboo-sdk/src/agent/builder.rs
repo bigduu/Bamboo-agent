@@ -85,6 +85,7 @@ impl bamboo_engine::project_context::ProjectContextSource for SdkProjectContextS
         Ok(Some(bamboo_engine::project_context::ProjectDescriptor {
             id: manifest.id.clone(),
             name: manifest.name,
+            project_path: manifest.project_path.map(std::path::PathBuf::from),
             home: self.store.paths().project_home(project_id),
             workspace_bindings: manifest.workspace_bindings,
             resources,
@@ -1761,8 +1762,16 @@ mod tests {
     #[tokio::test]
     async fn defaults_backed_sdk_validates_and_propagates_project_identity() {
         let dir = tempfile::tempdir().unwrap();
+        let project_path = tempfile::tempdir().unwrap();
         let store = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
-        let project = store.create("SDK Project", None).unwrap();
+        let project = store
+            .create_with_project_path(
+                "SDK Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
         let empty_executor: Arc<dyn ToolExecutor> = Arc::new(
             bamboo_tools::BuiltinToolExecutor::with_registry(ToolRegistry::new()),
         );
@@ -1777,8 +1786,41 @@ mod tests {
             .build()
             .unwrap();
 
-        let session = agent.new_session("sdk-project-session").unwrap();
+        let mut session = agent.new_session("sdk-project-session").unwrap();
         assert_eq!(session.project_id_meta(), Some(project.id.to_string()));
+        let error = agent
+            .run(&mut session, "verify SDK Project fallback")
+            .await
+            .expect_err("test provider terminates after runtime setup");
+        assert!(error
+            .to_string()
+            .contains("test provider must not be called"));
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(
+                bamboo_config::paths::path_to_display_string(
+                    &project_path.path().canonicalize().unwrap()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("project_default")
+        );
+        let prompt = session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("runtime system prompt")
+            .content
+            .as_str();
+        assert!(prompt.contains("Project path:"));
+        assert!(prompt.contains("Project home (Bamboo data):"));
+        assert!(prompt.contains("Workspace source: project_default"));
     }
 
     #[test]

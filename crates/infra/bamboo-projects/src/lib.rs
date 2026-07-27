@@ -12,9 +12,9 @@ use std::process::Command;
 use bamboo_domain::{
     LegacyProjectAssignment, LegacyProjectDryRunReport, LegacyProjectMatchBasis,
     LegacyProjectSuggestion, LegacyProjectUnassigned, LegacySessionProjectInput, ProjectId,
-    ProjectIndex, ProjectIndexEntry, ProjectManifest, ProjectResourceEntry, ProjectResourceKind,
-    ProjectResourceSummary, ProjectStatus, WorkspaceBinding, PROJECT_INDEX_SCHEMA_VERSION,
-    PROJECT_MANIFEST_SCHEMA_VERSION,
+    ProjectIndex, ProjectIndexEntry, ProjectManifest, ProjectPathStatus, ProjectResourceEntry,
+    ProjectResourceKind, ProjectResourceSummary, ProjectStatus, WorkspaceBinding,
+    PROJECT_INDEX_SCHEMA_VERSION, PROJECT_MANIFEST_SCHEMA_VERSION,
 };
 use chrono::Utc;
 use fs2::FileExt;
@@ -42,6 +42,13 @@ pub enum ProjectStoreError {
     AlreadyExists(ProjectId),
     #[error("project revision conflict: expected {expected}, actual {actual}")]
     Conflict { expected: u64, actual: u64 },
+    #[error(
+        "project_path '{project_path}' cannot be unbound from Project '{project_id}'; select another Project path first"
+    )]
+    ProjectPathUnbindConflict {
+        project_id: ProjectId,
+        project_path: String,
+    },
     #[error("project validation failed: {0}")]
     Validation(String),
     #[error("invalid project path component: {0}")]
@@ -375,6 +382,22 @@ impl ProjectStore {
         self.create_manifest(manifest)
     }
 
+    /// Create a configured active Project with one authoritative user source
+    /// folder plus zero or more additional workspaces/worktrees.
+    pub fn create_with_project_path(
+        &self,
+        name: impl Into<String>,
+        description: Option<String>,
+        project_path: impl Into<String>,
+        workspace_bindings: Vec<WorkspaceBinding>,
+    ) -> ProjectStoreResult<ProjectManifest> {
+        let mut manifest = ProjectManifest::new(ProjectId::new(), name, description, Utc::now());
+        manifest.project_path = Some(project_path.into());
+        manifest.project_path_status = ProjectPathStatus::Configured;
+        manifest.workspace_bindings = workspace_bindings;
+        self.create_manifest(manifest)
+    }
+
     pub fn create_with_id(
         &self,
         project_id: ProjectId,
@@ -389,7 +412,7 @@ impl ProjectStore {
         &self,
         mut manifest: ProjectManifest,
     ) -> ProjectStoreResult<ProjectManifest> {
-        canonicalize_manifest_bindings(&mut manifest)?;
+        canonicalize_manifest_paths(&mut manifest)?;
         validate_manifest(&manifest)?;
         if manifest.revision != 1 {
             return Err(ProjectStoreError::Validation(
@@ -403,8 +426,9 @@ impl ProjectStore {
         let _registry_lock = lock_exclusive(projects_dir.join(".registry.lock"))?;
         validate_existing_confined_directory(self.paths.data_dir(), &projects_dir)?;
         let existing_projects = self.load_registry_manifests()?;
-        validate_new_workspace_bindings(
+        validate_new_workspace_roots(
             &manifest.id,
+            manifest.project_path.as_deref(),
             &manifest.workspace_bindings,
             &existing_projects,
         )?;
@@ -465,13 +489,63 @@ impl ProjectStore {
     where
         F: FnOnce(&mut ProjectManifest) -> ProjectStoreResult<()>,
     {
-        self.update_inner(project_id, expected_revision, false, mutate)
+        self.update_inner(project_id, expected_revision, false, false, mutate)
+    }
+
+    /// Atomically update the authoritative Project path and other metadata
+    /// under the registry lock. The new path is canonicalized and checked
+    /// against every Project root before the CAS write becomes visible.
+    pub fn update_with_project_path<F>(
+        &self,
+        project_id: &ProjectId,
+        expected_revision: u64,
+        project_path: &str,
+        mutate: F,
+    ) -> ProjectStoreResult<ProjectManifest>
+    where
+        F: FnOnce(&mut ProjectManifest) -> ProjectStoreResult<()>,
+    {
+        let project_path = canonicalize_project_path(project_path)?;
+        let projects_dir = validate_existing_confined_directory(
+            self.paths.data_dir(),
+            &self.paths.projects_dir(),
+        )?;
+        let _registry_lock = lock_exclusive(projects_dir.join(".registry.lock"))?;
+        validate_existing_confined_directory(self.paths.data_dir(), &projects_dir)?;
+
+        let current = self.get(project_id)?;
+        let remaining_bindings = current
+            .workspace_bindings
+            .iter()
+            .filter(|binding| binding.path != project_path)
+            .cloned()
+            .collect::<Vec<_>>();
+        let existing_projects = self
+            .load_registry_manifests()?
+            .into_iter()
+            .filter(|project| project.id != *project_id)
+            .collect::<Vec<_>>();
+        validate_new_workspace_roots(
+            project_id,
+            Some(&project_path),
+            &remaining_bindings,
+            &existing_projects,
+        )?;
+
+        self.update_inner(project_id, expected_revision, true, true, move |manifest| {
+            mutate(manifest)?;
+            manifest.project_path = Some(project_path);
+            manifest.project_path_status = ProjectPathStatus::Configured;
+            manifest.workspace_bindings = remaining_bindings;
+            Ok(())
+        })
     }
 
     fn update_inner<F>(
         &self,
         project_id: &ProjectId,
         expected_revision: u64,
+        allow_project_path_change: bool,
         allow_workspace_binding_change: bool,
         mutate: F,
     ) -> ProjectStoreResult<ProjectManifest>
@@ -505,6 +579,14 @@ impl ProjectStore {
             {
                 return Err(ProjectStoreError::Validation(
                     "workspace bindings must be changed through bind/unbind APIs".to_string(),
+                ));
+            }
+            if !allow_project_path_change
+                && (candidate.project_path != current.project_path
+                    || candidate.project_path_status != current.project_path_status)
+            {
+                return Err(ProjectStoreError::Validation(
+                    "project_path must be changed through the Project path CAS API".to_string(),
                 ));
             }
             candidate.revision = current
@@ -547,20 +629,27 @@ impl ProjectStore {
         let _registry_lock = lock_exclusive(projects_dir.join(".registry.lock"))?;
         validate_existing_confined_directory(self.paths.data_dir(), &projects_dir)?;
         let existing_projects = self.load_registry_manifests()?;
-        validate_new_workspace_bindings(
+        validate_new_workspace_roots(
             project_id,
+            None,
             std::slice::from_ref(&binding),
             &existing_projects,
         )?;
-        self.update_inner(project_id, expected_revision, true, move |manifest| {
-            if manifest.status != ProjectStatus::Active {
-                return Err(ProjectStoreError::Validation(
-                    "cannot bind a workspace to an archived project".to_string(),
-                ));
-            }
-            manifest.workspace_bindings.push(binding);
-            Ok(())
-        })
+        self.update_inner(
+            project_id,
+            expected_revision,
+            false,
+            true,
+            move |manifest| {
+                if manifest.status != ProjectStatus::Active {
+                    return Err(ProjectStoreError::Validation(
+                        "cannot bind a workspace to an archived project".to_string(),
+                    ));
+                }
+                manifest.workspace_bindings.push(binding);
+                Ok(())
+            },
+        )
     }
 
     /// Remove only the exact binding; no session or Project resource is
@@ -579,46 +668,64 @@ impl ProjectStore {
         )?;
         let _registry_lock = lock_exclusive(projects_dir.join(".registry.lock"))?;
         validate_existing_confined_directory(self.paths.data_dir(), &projects_dir)?;
-        self.update_inner(project_id, expected_revision, true, move |manifest| {
-            // The exact manifest string is authoritative for DELETE. In
-            // particular, do not canonicalize it first: the workspace may be
-            // stale, missing, or replaced by a symlink after it was bound.
-            let matched_path = if manifest
-                .workspace_bindings
-                .iter()
-                .any(|binding| binding.path == requested_path)
-            {
-                requested_path.clone()
-            } else {
-                // Compatibility for callers that send an existing path alias
-                // (`nested/..`, platform spelling, and similar). This fallback
-                // is reached only when the raw stored identity did not match.
-                let canonical_path =
-                    canonicalize_utf8(Path::new(&requested_path), "workspace binding")
-                        .unwrap_or_else(|_| requested_path.clone());
-                if manifest
+        self.update_inner(
+            project_id,
+            expected_revision,
+            false,
+            true,
+            move |manifest| {
+                if manifest.project_path.as_deref() == Some(requested_path.as_str()) {
+                    return Err(ProjectStoreError::ProjectPathUnbindConflict {
+                        project_id: manifest.id.clone(),
+                        project_path: requested_path.clone(),
+                    });
+                }
+                // The exact manifest string is authoritative for DELETE. In
+                // particular, do not canonicalize it first: the workspace may be
+                // stale, missing, or replaced by a symlink after it was bound.
+                let matched_path = if manifest
                     .workspace_bindings
                     .iter()
-                    .any(|binding| binding.path == canonical_path)
+                    .any(|binding| binding.path == requested_path)
                 {
-                    canonical_path
+                    requested_path.clone()
                 } else {
+                    // Compatibility for callers that send an existing path alias
+                    // (`nested/..`, platform spelling, and similar). This fallback
+                    // is reached only when the raw stored identity did not match.
+                    let canonical_path =
+                        canonicalize_utf8(Path::new(&requested_path), "workspace binding")
+                            .unwrap_or_else(|_| requested_path.clone());
+                    if manifest.project_path.as_deref() == Some(canonical_path.as_str()) {
+                        return Err(ProjectStoreError::ProjectPathUnbindConflict {
+                            project_id: manifest.id.clone(),
+                            project_path: canonical_path,
+                        });
+                    }
+                    if manifest
+                        .workspace_bindings
+                        .iter()
+                        .any(|binding| binding.path == canonical_path)
+                    {
+                        canonical_path
+                    } else {
+                        return Err(ProjectStoreError::Validation(format!(
+                            "workspace binding was not found: {requested_path}"
+                        )));
+                    }
+                };
+                let before = manifest.workspace_bindings.len();
+                manifest
+                    .workspace_bindings
+                    .retain(|binding| binding.path != matched_path);
+                if manifest.workspace_bindings.len() == before {
                     return Err(ProjectStoreError::Validation(format!(
                         "workspace binding was not found: {requested_path}"
                     )));
                 }
-            };
-            let before = manifest.workspace_bindings.len();
-            manifest
-                .workspace_bindings
-                .retain(|binding| binding.path != matched_path);
-            if manifest.workspace_bindings.len() == before {
-                return Err(ProjectStoreError::Validation(format!(
-                    "workspace binding was not found: {requested_path}"
-                )));
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 
     pub fn bump_resource_revision(
@@ -645,12 +752,7 @@ impl ProjectStore {
         let matches = self
             .list()?
             .into_iter()
-            .filter(|project| {
-                project
-                    .workspace_bindings
-                    .iter()
-                    .any(|binding| binding.path == canonical_path)
-            })
+            .filter(|project| project.workspace_roots().any(|root| root == canonical_path))
             .collect::<Vec<_>>();
         match matches.len() {
             0 => Ok(None),
@@ -678,9 +780,9 @@ impl ProjectStore {
             .list()?
             .into_iter()
             .filter(|project| {
-                project.workspace_bindings.iter().any(|binding| {
-                    let binding = Path::new(&binding.path);
-                    candidate == binding || candidate.starts_with(binding)
+                project.workspace_roots().any(|root| {
+                    let root = Path::new(root);
+                    candidate == root || candidate.starts_with(root)
                 })
             })
             .collect::<Vec<_>>();
@@ -701,6 +803,16 @@ impl ProjectStore {
         let Some(project) = self.find_workspace_owner(&canonical_path)? else {
             return Ok(None);
         };
+        if project.project_path.as_deref() == Some(canonical_path.as_str()) {
+            return Ok(Some((
+                project,
+                WorkspaceBinding {
+                    path: canonical_path,
+                    label: Some("Project path".to_string()),
+                    git_common_dir: None,
+                },
+            )));
+        }
         let binding = project
             .workspace_bindings
             .iter()
@@ -892,7 +1004,10 @@ impl ProjectStore {
             Err(error) => return Err(error),
         };
         match decode_manifest(&primary, project_id) {
-            Ok(manifest) => self.normalize_manifest_revision_locked(manifest),
+            Ok(decoded) if decoded.migrated_from_v1 => {
+                self.persist_migrated_manifest_locked(project_id, &primary, decoded.manifest)
+            }
+            Ok(decoded) => self.normalize_manifest_revision_locked(decoded.manifest),
             Err(primary_error) => {
                 let quarantine =
                     path.with_file_name(format!("project.json.corrupt.{}", Uuid::new_v4()));
@@ -909,7 +1024,8 @@ impl ProjectStore {
                     } else {
                         None
                     };
-                if let Some(manifest) = recovered {
+                if let Some(decoded) = recovered {
+                    let manifest = decoded.manifest;
                     let revision_floor = self.read_manifest_revision_floor(project_id)?;
                     let mut candidate = manifest.clone();
                     candidate.revision = candidate
@@ -932,6 +1048,28 @@ impl ProjectStore {
                 }
             }
         }
+    }
+
+    fn persist_migrated_manifest_locked(
+        &self,
+        project_id: &ProjectId,
+        v1_bytes: &[u8],
+        manifest: ProjectManifest,
+    ) -> ProjectStoreResult<ProjectManifest> {
+        let revision_floor = self.read_manifest_revision_floor(project_id)?;
+        let mut candidate = manifest;
+        candidate.revision = candidate
+            .revision
+            .max(revision_floor)
+            .checked_add(1)
+            .ok_or_else(|| ProjectStoreError::Validation("revision exhausted".to_string()))?;
+        candidate.updated_at = Utc::now();
+
+        let home = self.validate_project_home(project_id)?;
+        write_bytes_atomic(&home.join(PROJECT_MANIFEST_BACKUP_FILE), v1_bytes)?;
+        self.write_manifest_revision_floor(project_id, candidate.revision)?;
+        write_json_atomic(&self.paths.manifest_path(project_id), &candidate)?;
+        Ok(candidate)
     }
 
     fn write_manifest_locked(
@@ -1031,9 +1169,15 @@ impl ProjectStore {
         };
         match serde_json::from_slice::<ProjectIndex>(&bytes)
             .map_err(ProjectStoreError::from)
-            .and_then(|index| {
-                validate_index(&index)?;
-                Ok(index)
+            .and_then(|index| match index.schema_version {
+                1 => Ok(index),
+                PROJECT_INDEX_SCHEMA_VERSION => {
+                    validate_index(&index)?;
+                    Ok(index)
+                }
+                schema_version => Err(ProjectStoreError::Validation(format!(
+                    "unsupported project index schema {schema_version}"
+                ))),
             }) {
             Ok(index) => Ok(index.revision),
             Err(error) => {
@@ -1069,8 +1213,37 @@ impl ProjectStore {
     }
 }
 
-fn decode_manifest(bytes: &[u8], expected_id: &ProjectId) -> ProjectStoreResult<ProjectManifest> {
-    let manifest: ProjectManifest = serde_json::from_slice(bytes)?;
+struct DecodedManifest {
+    manifest: ProjectManifest,
+    migrated_from_v1: bool,
+}
+
+fn decode_manifest(bytes: &[u8], expected_id: &ProjectId) -> ProjectStoreResult<DecodedManifest> {
+    let mut manifest: ProjectManifest = serde_json::from_slice(bytes)?;
+    let migrated_from_v1 = match manifest.schema_version {
+        1 => {
+            // A sole v1 binding is the only deterministic primary-folder
+            // signal. Zero or multiple bindings deliberately remain
+            // unconfigured instead of choosing by ordering.
+            if manifest.workspace_bindings.len() == 1 {
+                let binding = manifest.workspace_bindings.remove(0);
+                manifest.project_path = Some(binding.path);
+                manifest.project_path_status = ProjectPathStatus::Configured;
+            } else if manifest.workspace_bindings.is_empty() {
+                manifest.project_path_status = ProjectPathStatus::NeedsConfiguration;
+            } else {
+                manifest.project_path_status = ProjectPathStatus::NeedsSelection;
+            }
+            manifest.schema_version = PROJECT_MANIFEST_SCHEMA_VERSION;
+            true
+        }
+        PROJECT_MANIFEST_SCHEMA_VERSION => false,
+        schema_version => {
+            return Err(ProjectStoreError::Validation(format!(
+                "unsupported project manifest schema {schema_version}"
+            )));
+        }
+    };
     validate_manifest(&manifest)?;
     if &manifest.id != expected_id {
         return Err(ProjectStoreError::Validation(format!(
@@ -1078,38 +1251,61 @@ fn decode_manifest(bytes: &[u8], expected_id: &ProjectId) -> ProjectStoreResult<
             manifest.id, expected_id
         )));
     }
-    Ok(manifest)
+    Ok(DecodedManifest {
+        manifest,
+        migrated_from_v1,
+    })
 }
 
-fn canonicalize_manifest_bindings(manifest: &mut ProjectManifest) -> ProjectStoreResult<()> {
+fn canonicalize_manifest_paths(manifest: &mut ProjectManifest) -> ProjectStoreResult<()> {
+    if let Some(project_path) = manifest.project_path.as_deref() {
+        manifest.project_path = Some(canonicalize_project_path(project_path)?);
+        manifest.project_path_status = ProjectPathStatus::Configured;
+    }
     for binding in &mut manifest.workspace_bindings {
         *binding = canonicalize_binding(binding.clone())?;
     }
     Ok(())
 }
 
-fn validate_new_workspace_bindings(
+fn canonicalize_project_path(project_path: &str) -> ProjectStoreResult<String> {
+    validate_absolute_path(project_path, "project_path")?;
+    let canonical = canonicalize_utf8(Path::new(project_path), "project_path")?;
+    let metadata = std::fs::symlink_metadata(&canonical)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProjectStoreError::Validation(format!(
+            "project_path must be a plain directory: {canonical}"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn validate_new_workspace_roots(
     project_id: &ProjectId,
+    project_path: Option<&str>,
     incoming: &[WorkspaceBinding],
     existing_projects: &[ProjectManifest],
 ) -> ProjectStoreResult<()> {
-    for (index, binding) in incoming.iter().enumerate() {
-        for other in incoming.iter().skip(index + 1) {
-            if workspace_paths_overlap(&binding.path, &other.path) {
+    let incoming_roots = project_path
+        .into_iter()
+        .chain(incoming.iter().map(|binding| binding.path.as_str()))
+        .collect::<Vec<_>>();
+    for (index, root) in incoming_roots.iter().enumerate() {
+        for other in incoming_roots.iter().skip(index + 1) {
+            if workspace_paths_overlap(root, other) {
                 return Err(ProjectStoreError::Validation(format!(
-                    "project {project_id} contains overlapping workspace bindings: {} and {}",
-                    binding.path, other.path
+                    "project {project_id} contains overlapping workspace roots: {root} and {other}"
                 )));
             }
         }
     }
-    for binding in incoming {
+    for root in incoming_roots {
         for project in existing_projects {
-            for existing in &project.workspace_bindings {
-                if workspace_paths_overlap(&binding.path, &existing.path) {
+            for existing in project.workspace_roots() {
+                if workspace_paths_overlap(root, existing) {
                     return Err(ProjectStoreError::Validation(format!(
-                        "workspace binding {} overlaps project {} binding {}",
-                        binding.path, project.id, existing.path
+                        "workspace root {root} overlaps project {} root {existing}",
+                        project.id
                     )));
                 }
             }
@@ -1293,11 +1489,38 @@ fn validate_manifest(manifest: &ProjectManifest) -> ProjectStoreResult<()> {
         ));
     }
     let mut paths = HashSet::new();
+    if let Some(project_path) = manifest.project_path.as_deref() {
+        validate_absolute_path(project_path, "project_path")?;
+        paths.insert(project_path);
+    }
+    match (manifest.project_path.as_ref(), manifest.project_path_status) {
+        (Some(_), ProjectPathStatus::Configured)
+        | (None, ProjectPathStatus::NeedsConfiguration | ProjectPathStatus::NeedsSelection) => {}
+        (Some(_), status) => {
+            return Err(ProjectStoreError::Validation(format!(
+                "configured project_path has incompatible status {status:?}"
+            )));
+        }
+        (None, ProjectPathStatus::Configured) => {
+            return Err(ProjectStoreError::Validation(
+                "project_path status is configured but no path is present".to_string(),
+            ));
+        }
+    }
     for binding in &manifest.workspace_bindings {
         validate_absolute_path(&binding.path, "workspace binding")?;
         if !paths.insert(binding.path.as_str()) {
             return Err(ProjectStoreError::Validation(format!(
-                "duplicate workspace binding: {}",
+                "duplicate workspace root: {}",
+                binding.path
+            )));
+        }
+        if manifest
+            .workspace_roots()
+            .any(|other| other != binding.path && workspace_paths_overlap(&binding.path, other))
+        {
+            return Err(ProjectStoreError::Validation(format!(
+                "overlapping workspace root: {}",
                 binding.path
             )));
         }
@@ -1603,12 +1826,31 @@ pub fn plan_legacy_migration(
 ) -> LegacyProjectDryRunReport {
     let mut report = LegacyProjectDryRunReport::default();
     let mut by_path: HashMap<&str, Vec<&ProjectManifest>> = HashMap::new();
-    let mut by_git: HashMap<&str, Vec<&ProjectManifest>> = HashMap::new();
+    let mut by_git: HashMap<String, Vec<&ProjectManifest>> = HashMap::new();
     for project in projects {
+        if let Some(project_path) = project.project_path.as_deref() {
+            by_path.entry(project_path).or_default().push(project);
+            let project_path = Path::new(project_path);
+            let is_stable_plain_directory = std::fs::symlink_metadata(project_path)
+                .ok()
+                .is_some_and(|metadata| {
+                    !metadata.file_type().is_symlink()
+                        && metadata.is_dir()
+                        && std::fs::canonicalize(project_path).ok().as_deref() == Some(project_path)
+                });
+            if is_stable_plain_directory {
+                if let Ok(Some(git_common_dir)) = resolve_git_common_dir(project_path) {
+                    by_git.entry(git_common_dir).or_default().push(project);
+                }
+            }
+        }
         for binding in &project.workspace_bindings {
             by_path.entry(&binding.path).or_default().push(project);
             if let Some(git_common_dir) = binding.git_common_dir.as_deref() {
-                by_git.entry(git_common_dir).or_default().push(project);
+                by_git
+                    .entry(git_common_dir.to_string())
+                    .or_default()
+                    .push(project);
             }
         }
     }
@@ -1793,6 +2035,195 @@ mod tests {
                 actual: 2
             })
         ));
+    }
+
+    #[test]
+    fn project_path_is_canonical_owned_and_cas_update_keeps_identity() {
+        let (temp, store) = store();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(first.join("nested")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let project = store
+            .create_with_project_path(
+                "Zenith",
+                None,
+                first.join("nested").join("..").to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let first = first.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(project.project_path.as_deref(), Some(first.as_str()));
+        assert_eq!(
+            store
+                .find_workspace_owner(&first)
+                .unwrap()
+                .map(|owner| owner.id),
+            Some(project.id.clone())
+        );
+
+        let attempted_override = first.clone();
+        let updated = store
+            .update_with_project_path(
+                &project.id,
+                project.revision,
+                second.to_string_lossy().as_ref(),
+                move |manifest| {
+                    manifest.project_path = Some(attempted_override);
+                    manifest.project_path_status = ProjectPathStatus::NeedsSelection;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let second = second
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(updated.id, project.id);
+        assert_eq!(updated.project_path.as_deref(), Some(second.as_str()));
+        assert!(store.find_workspace_owner(&first).unwrap().is_none());
+        assert_eq!(
+            store
+                .find_workspace_owner(&second)
+                .unwrap()
+                .map(|owner| owner.id),
+            Some(project.id.clone())
+        );
+        assert!(matches!(
+            store.unbind_workspace(&project.id, updated.revision, &second),
+            Err(ProjectStoreError::ProjectPathUnbindConflict {
+                project_id,
+                project_path,
+            }) if project_id == project.id && project_path == second
+        ));
+
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        let indexed = reopened.index().unwrap();
+        assert_eq!(
+            indexed.projects[&project.id].project_path.as_deref(),
+            Some(second.as_str())
+        );
+        assert_eq!(
+            indexed.projects[&project.id].project_path_status,
+            ProjectPathStatus::Configured
+        );
+    }
+
+    #[test]
+    fn project_path_create_and_cas_update_reject_cross_project_overlap() {
+        let (temp, store) = store();
+        let owner_root = temp.path().join("owner");
+        let nested = owner_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let owner = store
+            .create_with_project_path("Owner", None, owner_root.to_string_lossy(), Vec::new())
+            .unwrap();
+        let project_count = store.list().unwrap().len();
+
+        assert!(matches!(
+            store.create_with_project_path(
+                "Overlapping create",
+                None,
+                nested.to_string_lossy(),
+                Vec::new(),
+            ),
+            Err(ProjectStoreError::Validation(message)) if message.contains("overlaps")
+        ));
+        assert_eq!(store.list().unwrap().len(), project_count);
+
+        let target = store.create("Target", None).unwrap();
+        assert!(matches!(
+            store.update_with_project_path(
+                &target.id,
+                target.revision,
+                nested.to_string_lossy().as_ref(),
+                |_| Ok(()),
+            ),
+            Err(ProjectStoreError::Validation(message)) if message.contains("overlaps")
+        ));
+        let unchanged = store.get(&target.id).unwrap();
+        assert_eq!(unchanged.revision, target.revision);
+        assert!(unchanged.project_path.is_none());
+        assert_eq!(
+            store
+                .find_workspace_owner_for_path(nested.to_string_lossy().as_ref())
+                .unwrap()
+                .map(|project| project.id),
+            Some(owner.id)
+        );
+    }
+
+    #[test]
+    fn v1_manifest_migration_promotes_only_one_binding() {
+        fn rewrite_as_v1(store: &ProjectStore, project: &ProjectManifest) {
+            let path = store.paths().manifest_path(&project.id);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            value["schema_version"] = serde_json::json!(1);
+            value.as_object_mut().unwrap().remove("project_path");
+            std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        }
+
+        let (temp, store) = store();
+        let single = temp.path().join("single");
+        let multiple_a = temp.path().join("multiple-a");
+        let multiple_b = temp.path().join("multiple-b");
+        std::fs::create_dir_all(&single).unwrap();
+        std::fs::create_dir_all(&multiple_a).unwrap();
+        std::fs::create_dir_all(&multiple_b).unwrap();
+
+        let one = store
+            .create_with_bindings("one", None, vec![binding(&single)])
+            .unwrap();
+        rewrite_as_v1(&store, &one);
+        let migrated = store.get(&one.id).unwrap();
+        assert_eq!(migrated.schema_version, PROJECT_MANIFEST_SCHEMA_VERSION);
+        assert_eq!(migrated.revision, one.revision + 1);
+        assert_eq!(
+            migrated.project_path.as_deref(),
+            Some(single.canonicalize().unwrap().to_string_lossy().as_ref())
+        );
+        assert_eq!(migrated.project_path_status, ProjectPathStatus::Configured);
+        assert!(migrated.workspace_bindings.is_empty());
+        let backup: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                store
+                    .paths()
+                    .project_home(&one.id)
+                    .join(PROJECT_MANIFEST_BACKUP_FILE),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backup["schema_version"], 1);
+
+        let zero = store.create("zero", None).unwrap();
+        rewrite_as_v1(&store, &zero);
+        let migrated = store.get(&zero.id).unwrap();
+        assert!(migrated.project_path.is_none());
+        assert_eq!(
+            migrated.project_path_status,
+            ProjectPathStatus::NeedsConfiguration
+        );
+        assert!(migrated.workspace_bindings.is_empty());
+
+        let many = store
+            .create_with_bindings(
+                "many",
+                None,
+                vec![binding(&multiple_a), binding(&multiple_b)],
+            )
+            .unwrap();
+        rewrite_as_v1(&store, &many);
+        let migrated = store.get(&many.id).unwrap();
+        assert!(migrated.project_path.is_none());
+        assert_eq!(
+            migrated.project_path_status,
+            ProjectPathStatus::NeedsSelection
+        );
+        assert_eq!(migrated.workspace_bindings.len(), 2);
     }
 
     #[test]
@@ -2336,6 +2767,127 @@ mod tests {
             .all(|binding| {
                 binding.git_common_dir.as_deref() == Some(expected_common_dir.as_str())
             }));
+    }
+
+    #[test]
+    fn migrated_primary_project_path_retains_git_evidence_for_linked_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let linked_worktree = temp.path().join("linked-worktree");
+        initialize_git_repository(&repository);
+        let linked_worktree_arg = linked_worktree.to_string_lossy().into_owned();
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-migration",
+                &linked_worktree_arg,
+            ],
+        );
+
+        let store = ProjectStore::open(temp.path().join("data")).unwrap();
+        let legacy = store
+            .create_with_bindings(
+                "Legacy Git Project",
+                None,
+                vec![WorkspaceBinding {
+                    path: repository.to_string_lossy().into_owned(),
+                    label: Some("main".to_string()),
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        let manifest_path = store.paths().manifest_path(&legacy.id);
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        raw["schema_version"] = serde_json::json!(1);
+        raw.as_object_mut().unwrap().remove("project_path");
+        raw.as_object_mut().unwrap().remove("project_path_status");
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let migrated = store.get(&legacy.id).unwrap();
+        assert_eq!(
+            migrated.project_path.as_deref(),
+            Some(
+                repository
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(migrated.workspace_bindings.is_empty());
+        let linked_canonical = linked_worktree.canonicalize().unwrap();
+        let linked_git_common_dir = resolve_git_common_dir(&linked_canonical)
+            .unwrap()
+            .expect("linked worktree common dir");
+        let report = plan_legacy_migration(
+            &[LegacySessionProjectInput {
+                session_id: "linked-legacy-session".to_string(),
+                workspace_path: Some(linked_canonical.to_string_lossy().into_owned()),
+                canonical_path: Some(linked_canonical.to_string_lossy().into_owned()),
+                git_common_dir: Some(linked_git_common_dir),
+                legacy_project_keys: Vec::new(),
+            }],
+            &[migrated],
+        );
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].project_id, legacy.id);
+        assert_eq!(
+            report.assignments[0].basis,
+            LegacyProjectMatchBasis::GitCommonDir
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_dry_run_rejects_git_evidence_from_replaced_project_path_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let configured_path = temp.path().join("configured-project");
+        let replacement_repository = temp.path().join("replacement-repository");
+        std::fs::create_dir_all(&configured_path).unwrap();
+        let configured_path = configured_path.canonicalize().unwrap();
+        initialize_git_repository(&replacement_repository);
+        let replacement_common_dir = resolve_git_common_dir(&replacement_repository)
+            .unwrap()
+            .expect("replacement common dir");
+        let mut project = ProjectManifest::new(
+            "01JREPLACED000000000000000".parse().unwrap(),
+            "Replaced Project path",
+            None,
+            Utc::now(),
+        );
+        project.project_path = Some(configured_path.to_string_lossy().into_owned());
+        project.project_path_status = ProjectPathStatus::Configured;
+
+        std::fs::remove_dir(&configured_path).unwrap();
+        symlink(&replacement_repository, &configured_path).unwrap();
+
+        let report = plan_legacy_migration(
+            &[LegacySessionProjectInput {
+                session_id: "replacement-session".to_string(),
+                workspace_path: Some(replacement_repository.to_string_lossy().into_owned()),
+                canonical_path: Some(
+                    replacement_repository
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                git_common_dir: Some(replacement_common_dir),
+                legacy_project_keys: Vec::new(),
+            }],
+            &[project],
+        );
+        assert!(report.assignments.is_empty());
+        assert!(report
+            .unassigned
+            .iter()
+            .any(|entry| entry.session_id == "replacement-session"));
     }
 
     #[test]
