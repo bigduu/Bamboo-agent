@@ -1915,7 +1915,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
 
-        let old_password = format!("old-root-secret-{}", uuid::Uuid::new_v4());
+        let old_password = uuid::Uuid::new_v4().to_string();
         let old_salt = "11".repeat(16);
         let old_hash = compute_password_hash(&old_password, &old_salt).unwrap();
         writer
@@ -1950,7 +1950,7 @@ mod tests {
             assert!(verify_password(&stale_config, &old_password));
         }
 
-        let new_password = format!("new-root-secret-{}", uuid::Uuid::new_v4());
+        let new_password = uuid::Uuid::new_v4().to_string();
         let new_salt = "22".repeat(16);
         let new_hash = compute_password_hash(&new_password, &new_salt).unwrap();
         writer
