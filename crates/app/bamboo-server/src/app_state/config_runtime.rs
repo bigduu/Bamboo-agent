@@ -137,6 +137,41 @@ fn run_generic_before_event_test_hook(data_dir: &Path) {
     }
 }
 
+#[cfg(test)]
+type GenericBeforeProviderPublishTestHook = Box<dyn FnOnce() + Send + 'static>;
+#[cfg(test)]
+type GenericBeforeProviderPublishTestHooks =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, GenericBeforeProviderPublishTestHook>>;
+
+#[cfg(test)]
+fn generic_before_provider_publish_test_hooks() -> &'static GenericBeforeProviderPublishTestHooks {
+    static HOOKS: std::sync::OnceLock<GenericBeforeProviderPublishTestHooks> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_generic_before_provider_publish_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    generic_before_provider_publish_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_generic_before_provider_publish_test_hook(data_dir: &Path) {
+    let hook = generic_before_provider_publish_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(data_dir);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct FacadeRuntimeMaterialization {
     config: Config,
     failures: BTreeSet<SectionId>,
@@ -3018,7 +3053,9 @@ impl AppState {
             // Hold the config-IO lock across BOTH the in-memory mutation AND the
             // disk persist, so a concurrent reload_config can't read the disk in
             // the gap before we persist and then clobber this mutation with the
-            // stale copy (#126). Slow side effects run after this block unlocks.
+            // stale copy (#126). Effects stay inside the same owned lifetime:
+            // otherwise a later writer can publish its runtime and then be
+            // overwritten by this task's older async provider/MCP effects.
             let snapshot = {
                 let _io = io;
                 let commit = Self::persist_config_snapshot(
@@ -3053,19 +3090,18 @@ impl AppState {
                 // boundary as durable commit and live installation. Otherwise a
                 // later local writer can enqueue r2 before this task enqueues r1.
                 publish_exact_facade_events(&account_sink, &events)?;
+                Self::apply_config_effects_owned(
+                    snapshot.clone(),
+                    effects,
+                    app_data_dir,
+                    config,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                )
+                .await?;
                 snapshot
             };
-
-            Self::apply_config_effects_owned(
-                snapshot.clone(),
-                effects,
-                app_data_dir,
-                config,
-                provider_registry,
-                provider,
-                mcp_manager,
-            )
-            .await?;
             Ok::<_, AppError>(snapshot)
         });
         transaction.await.map_err(|error| {
@@ -3147,7 +3183,7 @@ impl AppState {
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
         let transaction = tokio::spawn(async move {
-            let (snapshot, enforcement_newly_off) = {
+            let snapshot = {
                 let _io = io;
                 let data_dir = app_data_dir.clone();
                 let commit_facade = config_facade.clone();
@@ -3216,21 +3252,21 @@ impl AppState {
                     *cfg = snapshot.clone();
                 }
                 publish_exact_facade_events(&account_sink, &events)?;
-                (snapshot, enforcement_newly_off)
+                if enforcement_newly_off {
+                    warn_plugin_trust_enforcement_off();
+                }
+                Self::apply_config_effects_owned(
+                    snapshot.clone(),
+                    effects,
+                    app_data_dir,
+                    config,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                )
+                .await?;
+                snapshot
             };
-            if enforcement_newly_off {
-                warn_plugin_trust_enforcement_off();
-            }
-            Self::apply_config_effects_owned(
-                snapshot.clone(),
-                effects,
-                app_data_dir,
-                config,
-                provider_registry,
-                provider,
-                mcp_manager,
-            )
-            .await?;
             Ok::<_, AppError>(snapshot)
         });
         transaction.await.map_err(|error| {
@@ -4171,8 +4207,9 @@ impl AppState {
         let mcp_manager = self.mcp_manager.clone();
         let transaction = tokio::spawn(async move {
             // Same #126 serialization as update_config: mutate + persist under
-            // the config-IO lock so a reload can't interleave; effects run
-            // unlocked but remain owned by this cancellation-independent task.
+            // the config-IO lock so a reload can't interleave. Provider/MCP
+            // effects also remain serialized so an older replacement cannot
+            // overwrite a later writer's runtime after an async suspension.
             let new_config = {
                 let _io = io;
                 let commit = Self::persist_config_snapshot(
@@ -4208,19 +4245,18 @@ impl AppState {
                     warn_plugin_trust_enforcement_off();
                 }
                 publish_exact_facade_events(&account_sink, &events)?;
+                Self::apply_config_effects_owned(
+                    published.clone(),
+                    effects,
+                    app_data_dir,
+                    config,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                )
+                .await?;
                 published
             };
-
-            Self::apply_config_effects_owned(
-                new_config.clone(),
-                effects,
-                app_data_dir,
-                config,
-                provider_registry,
-                provider,
-                mcp_manager,
-            )
-            .await?;
             Ok::<_, AppError>(new_config)
         });
         transaction.await.map_err(|error| {
@@ -4240,13 +4276,12 @@ impl AppState {
         mcp_manager: Arc<McpServerManager>,
     ) -> Result<(), AppError> {
         if effects.reload_provider {
-            // Match `reload_provider`: if a later writer won after the
-            // serialization lock was released, initialize from that current
-            // live snapshot rather than regressing runtime to this task's
-            // older committed candidate.
+            // The caller retains config_io_lock through provider construction
+            // and publication, so this current live snapshot cannot be
+            // superseded while an awaited runtime build is in flight.
             let live_config = config.read().await.clone();
             let candidate_registry =
-                bamboo_llm::ProviderRegistry::from_config(&live_config, app_data_dir)
+                bamboo_llm::ProviderRegistry::from_config(&live_config, app_data_dir.clone())
                     .await
                     .map_err(|e| {
                         AppError::InternalError(anyhow::anyhow!(
@@ -4271,6 +4306,8 @@ impl AppState {
                     bamboo_llm::LLMError::Auth(message)
                 ))
             })?;
+            #[cfg(test)]
+            run_generic_before_provider_publish_test_hook(&app_data_dir);
             let mut live_provider = provider.write().await;
             provider_registry.replace_with(candidate_registry);
             *live_provider = candidate_provider;
@@ -5726,6 +5763,138 @@ mod live_reload_tests {
         .await
         .map(|revisions| assert_eq!(revisions, vec![1, 2]))
         .expect("both serialized core events must reach the journal");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generic_runtime_effects_finish_before_later_config_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mcp-fixture.py");
+        std::fs::write(
+            &script,
+            r#"import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "config-order-fixture", "version": "1.0.0"},
+        }
+    elif request.get("method") == "tools/list":
+        result = {"tools": []}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|command| {
+                std::process::Command::new(command)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            })
+            .expect("a Python interpreter is required for the MCP ordering fixture");
+
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let held_provider = state.provider.write().await;
+        let (provider_ready_tx, provider_ready_rx) = std::sync::mpsc::channel();
+        set_generic_before_provider_publish_test_hook(dir.path(), move || {
+            provider_ready_tx.send(()).unwrap();
+        });
+
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_config(
+                        |config| {
+                            config.provider = "copilot".to_string();
+                            Ok(())
+                        },
+                        ConfigUpdateEffects {
+                            reload_provider: true,
+                            reconcile_mcp: true,
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || provider_ready_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            state.config_io_lock.try_lock().is_err(),
+            "the first writer must retain config_io_lock until its runtime effects finish"
+        );
+        assert!(
+            !first.is_finished(),
+            "the first writer must still be waiting to publish its provider"
+        );
+
+        let later_mcp = McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: "later-winner".to_string(),
+                name: None,
+                enabled: true,
+                transport: TransportConfig::Stdio(StdioConfig {
+                    command: python.to_string(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    cwd: None,
+                    env: std::collections::HashMap::new(),
+                    env_encrypted: std::collections::HashMap::new(),
+                    env_credential_refs: std::collections::HashMap::new(),
+                    startup_timeout_ms: 2_000,
+                }),
+                request_timeout_ms: 2_000,
+                healthcheck_interval_ms: 10_000,
+                reconnect: ReconnectConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        };
+        let second = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_config(
+                        move |config| {
+                            config.mcp = later_mcp;
+                            Ok(())
+                        },
+                        ConfigUpdateEffects {
+                            reload_provider: false,
+                            reconcile_mcp: true,
+                        },
+                    )
+                    .await
+            })
+        };
+
+        drop(held_provider);
+        first.await.unwrap().unwrap();
+        let published = second.await.unwrap().unwrap();
+        assert_eq!(published.mcp.servers[0].id, "later-winner");
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "later-winner");
+        assert_eq!(
+            state.mcp_manager.list_servers(),
+            vec!["later-winner".to_string()],
+            "the later durable config generation must remain the final runtime generation"
+        );
+        state.mcp_manager.shutdown_all().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
