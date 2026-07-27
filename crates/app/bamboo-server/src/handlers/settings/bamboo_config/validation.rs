@@ -32,6 +32,12 @@ pub async fn validate_bamboo_config_patch(
             "env_vars must be changed through the dedicated revisioned env-vars API".to_string(),
         ));
     }
+    if patch_obj.contains_key("cluster_fabric") {
+        return Err(AppError::BadRequest(
+            "cluster_fabric must be changed through the dedicated revisioned cluster API"
+                .to_string(),
+        ));
+    }
     config_manager::sanitize_root_patch(&mut patch_obj);
 
     let lifecycle_schema_issues = patch_obj

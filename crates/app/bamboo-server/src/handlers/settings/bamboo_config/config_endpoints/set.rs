@@ -24,6 +24,7 @@ pub async fn set_bamboo_config(
             "env_vars must be changed through the dedicated revisioned env-vars API".to_string(),
         ));
     }
+    remove_unchanged_cluster_fabric_echo(&app_state, &mut patch_obj).await?;
     if patch_obj.contains_key("notifications") {
         let has_other_domain = patch_obj
             .keys()
@@ -72,14 +73,6 @@ pub async fn set_bamboo_config(
     let new_config = app_state
         .update_config_with_provider_credentials(
             move |config| {
-                if patch_obj.contains_key("cluster_fabric")
-                    && !config.cluster_fabric.credential_refs.is_empty()
-                {
-                    return Err(AppError::BadRequest(
-                        "cluster_fabric with isolated credentials must be changed through the dedicated node API"
-                            .to_string(),
-                    ));
-                }
                 let current = config.clone();
                 let mut patch_obj = patch_obj;
                 remove_unchanged_access_control_echo(&current, &mut patch_obj)?;
@@ -131,7 +124,18 @@ pub async fn set_bamboo_config(
         }
     }
 
-    Ok(HttpResponse::Ok().json(redacted_config_json(&new_config, &app_state.app_data_dir).await?))
+    // The live config deliberately retains the current node heartbeat/runtime
+    // state while this unrelated compatibility write installs only its owned
+    // section. Preserve the established POST contract by returning the
+    // operator-owned cluster projection, not a transient runtime heartbeat
+    // that was ignored rather than committed by this request.
+    let mut response_config = new_config;
+    for node in &mut response_config.cluster_fabric.nodes {
+        node.state = None;
+    }
+    response_config.sanitize_cluster_fabric_for_disk();
+    Ok(HttpResponse::Ok()
+        .json(redacted_config_json(&response_config, &app_state.app_data_dir).await?))
 }
 
 pub(super) fn remove_unchanged_access_control_echo(
@@ -165,6 +169,61 @@ fn access_control_patch_error() -> AppError {
     AppError::BadRequest(
         "access_control must be changed through the dedicated password, pairing, and device APIs"
             .to_string(),
+    )
+}
+
+async fn remove_unchanged_cluster_fabric_echo(
+    app_state: &AppState,
+    patch_obj: &mut Map<String, Value>,
+) -> Result<(), AppError> {
+    let Some(incoming) = patch_obj.get("cluster_fabric") else {
+        return Ok(());
+    };
+    if incoming.is_null() {
+        return Err(cluster_fabric_patch_error());
+    }
+
+    let current = app_state.config.read().await.clone();
+    let current_value = current.to_compatibility_value()?;
+    let redacted_current = redact_config_for_api(current_value, &current);
+    let Some(current_cluster) = redacted_current.get("cluster_fabric") else {
+        return Err(cluster_fabric_patch_error());
+    };
+    if cluster_fabric_without_runtime_state(current_cluster)
+        != cluster_fabric_without_runtime_state(incoming)
+    {
+        return Err(cluster_fabric_patch_error());
+    }
+
+    // Compatibility clients POST the complete redacted GET payload. Ignore a
+    // semantically unchanged operator-owned cluster echo before routing any
+    // other domain. Runtime node state may advance between GET and POST, and is
+    // ignored here as well as on persistence; all other cluster fields must
+    // still match exactly.
+    patch_obj.remove("cluster_fabric");
+    Ok(())
+}
+
+fn cluster_fabric_without_runtime_state(cluster: &Value) -> Value {
+    let mut cluster = cluster.clone();
+    let Some(nodes) = cluster
+        .as_object_mut()
+        .and_then(|object| object.get_mut("nodes"))
+        .and_then(Value::as_array_mut)
+    else {
+        return cluster;
+    };
+    for node in nodes {
+        if let Some(node) = node.as_object_mut() {
+            node.remove("state");
+        }
+    }
+    cluster
+}
+
+fn cluster_fabric_patch_error() -> AppError {
+    AppError::BadRequest(
+        "cluster_fabric must be changed through the dedicated revisioned cluster API".to_string(),
     )
 }
 
@@ -527,6 +586,218 @@ mod tests {
             let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
             assert!(body.contains("revisioned env-vars API"));
         }
+    }
+
+    #[actix_web::test]
+    async fn root_patch_and_validation_reject_cluster_fabric_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let before = std::fs::read(&cluster_path).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/config", web::post().to(set_bamboo_config))
+                .route(
+                    "/config/validate",
+                    web::post().to(crate::handlers::settings::validate_bamboo_config_patch),
+                ),
+        )
+        .await;
+        for uri in ["/config", "/config/validate"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(uri)
+                    .set_json(serde_json::json!({
+                        "cluster_fabric": {
+                            "nodes": [{
+                                "id": "bypass",
+                                "label": "bypass",
+                                "placement": {"type": "local"}
+                            }]
+                        }
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(body.contains("revisioned cluster API"));
+        }
+        assert_eq!(std::fs::read(cluster_path).unwrap(), before);
+        assert!(state.config.read().await.cluster_fabric.nodes.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_root_get_post_accepts_only_an_unchanged_redacted_cluster_echo() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let reference = bamboo_config::cluster_password_credential_ref("echo-node").unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                std::collections::BTreeMap::from([(
+                    "echo-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents {
+                        password: bamboo_config::ClusterCredentialAction::Replace(
+                            "echo-secret".to_string(),
+                        ),
+                        private_key: bamboo_config::ClusterCredentialAction::Clear,
+                        passphrase: bamboo_config::ClusterCredentialAction::Clear,
+                    },
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "echo-node".to_string(),
+                        label: "echo-node".to_string(),
+                        placement: bamboo_config::NodePlacement::Ssh(bamboo_config::SshTarget {
+                            host: "echo.example".to_string(),
+                            port: 22,
+                            username: "deploy".to_string(),
+                            auth: bamboo_config::SshAuth::Password {
+                                password: String::new(),
+                                password_encrypted: None,
+                            },
+                            host_key_fingerprint: None,
+                        }),
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let cluster_revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .revision;
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let cluster_before = std::fs::read(&cluster_path).unwrap();
+        let credentials_before = std::fs::read(state.credential_store.path()).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route(
+                    "/config",
+                    web::get().to(crate::handlers::settings::get_bamboo_config),
+                )
+                .route("/config", web::post().to(set_bamboo_config)),
+        )
+        .await;
+
+        let mut full_config: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/config").to_request(),
+        )
+        .await;
+        let cluster_echo = full_config["cluster_fabric"].clone();
+        assert!(cluster_echo.get("credential_refs").is_none());
+        assert!(!cluster_echo.to_string().contains(reference.as_str()));
+        assert!(!cluster_echo.to_string().contains("echo-secret"));
+
+        full_config["server"]["port"] = serde_json::json!(19_999);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config")
+                .set_json(&full_config)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["cluster_fabric"], cluster_echo);
+        assert_eq!(response["server"]["port"], 19_999);
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_before);
+        assert_eq!(
+            std::fs::read(state.credential_store.path()).unwrap(),
+            credentials_before
+        );
+
+        {
+            let mut config = state.config.write().await;
+            config.cluster_fabric.node_mut("echo-node").unwrap().state =
+                Some(bamboo_config::NodeState {
+                    status: bamboo_config::NodeStatus::Running,
+                    worker_id: Some("heartbeat-worker".to_string()),
+                    last_health: Some("runtime-only-heartbeat".to_string()),
+                    ..Default::default()
+                });
+        }
+        let mut heartbeat_echo: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/config").to_request(),
+        )
+        .await;
+        assert_eq!(
+            heartbeat_echo["cluster_fabric"]["nodes"][0]["state"]["last_health"],
+            "runtime-only-heartbeat"
+        );
+        state
+            .config
+            .write()
+            .await
+            .cluster_fabric
+            .node_mut("echo-node")
+            .unwrap()
+            .state
+            .as_mut()
+            .unwrap()
+            .last_health = Some("newer-runtime-only-heartbeat".to_string());
+        heartbeat_echo["server"]["port"] = serde_json::json!(20_000);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config")
+                .set_json(&heartbeat_echo)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["server"]["port"], 20_000);
+        assert!(!response.to_string().contains("runtime-only-heartbeat"));
+        assert!(!response
+            .to_string()
+            .contains("newer-runtime-only-heartbeat"));
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            cluster_revision
+        );
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_before);
+        assert_eq!(
+            std::fs::read(state.credential_store.path()).unwrap(),
+            credentials_before
+        );
+        assert!(state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .data
+            .0
+            .node("echo-node")
+            .unwrap()
+            .state
+            .is_none());
     }
 
     #[actix_web::test]

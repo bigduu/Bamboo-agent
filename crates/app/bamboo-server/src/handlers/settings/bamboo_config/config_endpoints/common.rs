@@ -126,6 +126,9 @@ fn map_config_store_error(error: bamboo_config::ConfigStoreError) -> AppError {
             AppError::ConfigConflict { expected, actual }
         }
         bamboo_config::ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+        bamboo_config::ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+            anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+        ),
         bamboo_config::ConfigStoreError::Io(error) => AppError::StorageError(error),
         bamboo_config::ConfigStoreError::Json(_) => {
             AppError::BadRequest("configuration document is invalid".to_string())

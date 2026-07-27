@@ -41,6 +41,11 @@ pub enum ConfigStoreError {
     Conflict { expected: u64, actual: u64 },
     #[error("configuration validation failed: {0}")]
     Validation(String),
+    /// The caller cannot prove whether the durable commit point won. Callers
+    /// that own an external side effect must retain it until recovery resolves
+    /// the transaction instead of compensating as if commit definitely failed.
+    #[error("configuration commit outcome is indeterminate: {0}")]
+    CommitIndeterminate(String),
     #[error("configuration watch failed")]
     Watch(#[from] notify::Error),
 }
@@ -55,6 +60,7 @@ pub(crate) fn repairable_live_lkg_error(error: &ConfigStoreError) -> bool {
         }
         ConfigStoreError::Io(_)
         | ConfigStoreError::Conflict { .. }
+        | ConfigStoreError::CommitIndeterminate(_)
         | ConfigStoreError::Watch(_) => false,
     }
 }
@@ -1398,6 +1404,112 @@ where
         candidate: T,
     ) -> ConfigStoreResult<ConfigSectionEvent> {
         self.commit_inner(expected_revision, candidate, || {})
+    }
+
+    /// Adopt a snapshot that was durably installed by a compound transaction
+    /// while that transaction still owns its cross-process commit lock.
+    ///
+    /// This deliberately performs no filesystem write. The caller must supply
+    /// the exact immutable candidate installed by the transaction and invoke
+    /// this method before releasing the transaction's external serialization
+    /// lock. Keeping the ordinary live-section operation lock around the
+    /// validation and publication prevents a watcher reload from interleaving
+    /// with the known commit.
+    #[allow(dead_code)]
+    pub(crate) fn adopt_committed(
+        &self,
+        expected_revision: u64,
+        committed_revision: u64,
+        candidate: T,
+    ) -> ConfigStoreResult<ConfigSectionEvent> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.snapshot();
+        if current.revision != expected_revision {
+            return Err(ConfigStoreError::Conflict {
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("section revision counter exhausted".to_string())
+        })?;
+        if committed_revision != next_revision {
+            return Err(ConfigStoreError::Validation(format!(
+                "committed section revision {committed_revision} does not follow expected revision {expected_revision}"
+            )));
+        }
+        (self.validate)(&candidate).map_err(ConfigStoreError::Validation)?;
+        self.publish(
+            SectionSnapshot {
+                data: Arc::new(candidate),
+                revision: committed_revision,
+                loaded_at: Utc::now(),
+                source_path: self.store.path().to_path_buf(),
+                source_kind: SectionSourceKind::File,
+                status: SectionStatus::Healthy,
+                last_error: None,
+            },
+            LiveRepairAuthority::None,
+        );
+        Ok(ConfigSectionEvent::Changed {
+            section: self.name.clone(),
+            revision: committed_revision,
+        })
+    }
+
+    /// Adopt a compound commit whose durable base revision was validated by
+    /// the caller while it still owns the cross-process transaction lock.
+    ///
+    /// Unlike [`Self::adopt_committed`], this permits a process-local snapshot
+    /// to lag behind `expected_revision`. The caller's durable CAS is the
+    /// authority for the skipped local generations; a local snapshot ahead of
+    /// that validated base is still rejected and is never republished at an
+    /// already-observed revision.
+    pub(crate) fn adopt_committed_from_durable_base(
+        &self,
+        expected_revision: u64,
+        committed_revision: u64,
+        candidate: T,
+    ) -> ConfigStoreResult<ConfigSectionEvent> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.snapshot();
+        let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("section revision counter exhausted".to_string())
+        })?;
+        if committed_revision != next_revision {
+            return Err(ConfigStoreError::Validation(format!(
+                "committed section revision {committed_revision} does not follow expected revision {expected_revision}"
+            )));
+        }
+        if current.revision > expected_revision {
+            return Err(ConfigStoreError::Conflict {
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        (self.validate)(&candidate).map_err(ConfigStoreError::Validation)?;
+        self.publish(
+            SectionSnapshot {
+                data: Arc::new(candidate),
+                revision: committed_revision,
+                loaded_at: Utc::now(),
+                source_path: self.store.path().to_path_buf(),
+                source_kind: SectionSourceKind::File,
+                status: SectionStatus::Healthy,
+                last_error: None,
+            },
+            LiveRepairAuthority::None,
+        );
+        Ok(ConfigSectionEvent::Changed {
+            section: self.name.clone(),
+            revision: committed_revision,
+        })
     }
 
     fn commit_inner<F>(
@@ -3277,6 +3389,153 @@ mod tests {
         let durable = section.store.load().unwrap().unwrap();
         assert_eq!(durable.revision, 1);
         assert_eq!(durable.data.value, "external");
+    }
+
+    #[test]
+    fn adopt_committed_validates_and_never_writes_the_durable_document() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = LiveSection::open(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "default".into(),
+            },
+            |candidate: &Example| {
+                (candidate.value != "invalid")
+                    .then_some(())
+                    .ok_or_else(|| "invalid candidate".to_string())
+            },
+        )
+        .unwrap();
+        let durable = serde_json::to_vec_pretty(&RevisionedDocument {
+            schema_version: 1,
+            revision: 1,
+            data: Example {
+                value: "committed".into(),
+            },
+        })
+        .unwrap();
+        std::fs::write(&path, &durable).unwrap();
+
+        assert!(matches!(
+            section.adopt_committed(
+                1,
+                2,
+                Example {
+                    value: "wrong-base".into(),
+                },
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert!(matches!(
+            section.adopt_committed(
+                0,
+                2,
+                Example {
+                    value: "skipped-revision".into(),
+                },
+            ),
+            Err(ConfigStoreError::Validation(_))
+        ));
+        assert!(matches!(
+            section.adopt_committed(
+                0,
+                1,
+                Example {
+                    value: "invalid".into(),
+                },
+            ),
+            Err(ConfigStoreError::Validation(_))
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            durable,
+            "rejected adoptions must never rewrite the compound transaction"
+        );
+
+        assert_eq!(
+            section
+                .adopt_committed(
+                    0,
+                    1,
+                    Example {
+                        value: "committed".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed {
+                section: "example".to_string(),
+                revision: 1,
+            }
+        );
+        assert_eq!(section.snapshot().revision, 1);
+        assert_eq!(section.snapshot().data.value, "committed");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            durable,
+            "successful adoption is process-local and must not touch disk"
+        );
+    }
+
+    #[test]
+    fn durable_base_adoption_catches_up_only_a_snapshot_not_ahead_of_expected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        let section = LiveSection::open(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "local-r0".into(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let durable = serde_json::to_vec_pretty(&RevisionedDocument {
+            schema_version: 1,
+            revision: 2,
+            data: Example {
+                value: "durable-r2".into(),
+            },
+        })
+        .unwrap();
+        std::fs::write(&path, &durable).unwrap();
+
+        assert_eq!(
+            section
+                .adopt_committed_from_durable_base(
+                    1,
+                    2,
+                    Example {
+                        value: "durable-r2".into(),
+                    },
+                )
+                .unwrap(),
+            ConfigSectionEvent::Changed {
+                section: "example".to_string(),
+                revision: 2,
+            }
+        );
+        assert_eq!(section.snapshot().revision, 2);
+        assert_eq!(section.snapshot().data.value, "durable-r2");
+        assert!(matches!(
+            section.adopt_committed_from_durable_base(
+                1,
+                2,
+                Example {
+                    value: "same-revision-divergence".into(),
+                },
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(section.snapshot().data.value, "durable-r2");
+        assert_eq!(std::fs::read(path).unwrap(), durable);
     }
 
     #[test]

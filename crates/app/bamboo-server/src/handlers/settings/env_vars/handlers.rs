@@ -587,10 +587,11 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn committed_reload_preserves_external_root_rebase_in_live_snapshot() {
+    async fn committed_env_write_preserves_external_root_bytes_without_cross_section_adoption() {
         let _serial = encryption_test_lock().lock().await;
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let baseline_seq = state.account_sink.latest_seq();
         bamboo_config::set_env_transaction_test_hook(|data_dir| {
             let path = data_dir.join("config.json");
             let mut root: serde_json::Value = std::fs::read(&path)
@@ -623,14 +624,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revision, 1);
-        assert_eq!(committed.extra["external_root_marker"], "preserved");
-        assert_eq!(
-            state.config.read().await.extra["external_root_marker"],
-            "preserved"
+        assert!(
+            !committed.extra.contains_key("external_root_marker"),
+            "an unrevisioned external root field must not be installed with the env commit"
+        );
+        assert!(
+            !state
+                .config
+                .read()
+                .await
+                .extra
+                .contains_key("external_root_marker"),
+            "the live process must advance only the owned env section"
         );
         let root: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
                 .unwrap();
         assert_eq!(root["external_root_marker"], "preserved");
+        let facade = state.config_facade.as_ref().unwrap();
+        assert_eq!(facade.registry().core.snapshot().revision, 0);
+        assert_eq!(facade.registry().env.snapshot().revision, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            &event.event,
+            bamboo_agent_core::AgentEvent::ConfigChanged { section, .. } if section == "core"
+        )));
     }
 }

@@ -247,12 +247,17 @@ pub fn run_config_set(
     dry_run: bool,
 ) -> Result<()> {
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
+    let parts: Vec<&str> = key.split('.').collect();
+    if matches!(parts.as_slice(), ["cluster_fabric", ..]) {
+        bail!(
+            "cluster_fabric is managed by the dedicated revisioned cluster API and cannot be changed with `bamboo config set`"
+        );
+    }
     let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
     let mut provider_credential_intents = BTreeSet::new();
     let mut provider_instance_credential_intents = BTreeSet::new();
     let mut notification_credential_intents = BTreeSet::new();
 
-    let parts: Vec<&str> = key.split('.').collect();
     // `Some(outcome)` = generic dot-path set (validated new config inside);
     // `None` = a dedicated arm mutated `config` in place.
     let outcome = match parts.as_slice() {
@@ -892,6 +897,10 @@ mod tests {
             ("proxy_auth.username", "alice"),
             ("providers.anthropic.api_key_encrypted", "cipher"),
             ("provider_instances.nope.api_key", "sk-x"),
+            (
+                "cluster_fabric.nodes",
+                r#"[{"id":"cli-bypass","label":"cli-bypass","placement":{"type":"local"}}]"#,
+            ),
         ] {
             assert!(
                 run_config_set(key, value, Some(data_dir.clone()), false).is_err(),

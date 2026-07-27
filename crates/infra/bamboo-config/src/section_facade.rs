@@ -22,14 +22,14 @@ use crate::{
     AccessControlConfig, AnthropicModelMapping, AtomicJsonStore, BrokerClientConfig,
     ClusterFabricConfig, Config, ConfigSectionEvent, ConfigStoreResult, ConfigValues,
     ConnectConfig, CredentialRef, CredentialSource, CredentialStatus, CredentialStore,
-    DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry, FeatureFlags, GeminiModelMapping,
-    HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, MemoryConfig,
-    NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
+    CredentialStoreHealth, DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry, FeatureFlags,
+    GeminiModelMapping, HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig, LiveSection,
+    MemoryConfig, NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
     RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig,
     StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
 };
 
-const SECTION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_VERSION: u32 = 1;
 pub const SECTION_LAYOUT_FILE: &str = "config-sections.json";
 const SECTION_LAYOUT_COMPLETION_VERSION: u32 = 1;
@@ -715,6 +715,52 @@ impl SectionProjection {
     }
 }
 
+pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
+    match id {
+        SectionId::Core => {
+            target.http_proxy = source.http_proxy.clone();
+            target.https_proxy = source.https_proxy.clone();
+            target.proxy_auth = source.proxy_auth.clone();
+            target.proxy_auth_encrypted = None;
+            target.proxy_auth_credential_ref = source.proxy_auth_credential_ref.clone();
+            target.headless_auth = source.headless_auth;
+            target.server = source.server.clone();
+            target.default_work_area = source.default_work_area.clone();
+            target.run_budget = source.run_budget;
+            target.stream_timeout = source.stream_timeout;
+            target.extra = source.extra.clone();
+        }
+        SectionId::Providers => {
+            target.provider = source.provider.clone();
+            target.defaults = source.defaults.clone();
+            target.provider_instances = source.provider_instances.clone();
+            target.default_provider_instance = source.default_provider_instance.clone();
+            target.features = source.features.clone();
+            *target.providers_mut() = source.providers().clone();
+        }
+        SectionId::Mcp => target.mcp = source.mcp.clone(),
+        SectionId::ToolsSkills => {
+            target.tools = source.tools.clone();
+            target.skills = source.skills.clone();
+            target.plugin_trust = source.plugin_trust.clone();
+        }
+        SectionId::Memory => *target.memory_mut() = source.memory().clone(),
+        SectionId::Subagents => *target.subagents_mut() = source.subagents().clone(),
+        SectionId::Notifications => target.notifications = source.notifications.clone(),
+        SectionId::Connect => target.connect = source.connect.clone(),
+        SectionId::ClusterFabric => target.cluster_fabric = source.cluster_fabric.clone(),
+        SectionId::Env => target.env_vars = source.env_vars.clone(),
+        SectionId::AccessControl => target.access_control = source.access_control.clone(),
+        SectionId::Hooks => target.hooks = source.hooks.clone(),
+        SectionId::ModelPolicy => {
+            target.keyword_masking = source.keyword_masking.clone();
+            target.anthropic_model_mapping = source.anthropic_model_mapping.clone();
+            target.gemini_model_mapping = source.gemini_model_mapping.clone();
+        }
+        SectionId::ModelLimits | SectionId::Credentials => {}
+    }
+}
+
 fn plan_section_file<T>(
     data_dir: &Path,
     name: &'static str,
@@ -992,7 +1038,7 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
     validate_provider_override_credentials(value).map_err(crate::ConfigStoreError::Validation)
 }
 
-fn validate_ordinary_section_raw(value: &Value) -> Result<(), String> {
+pub(crate) fn validate_ordinary_section_raw(value: &Value) -> Result<(), String> {
     validate_ordinary_section_json(value).map_err(|error| error.to_string())
 }
 
@@ -1814,7 +1860,7 @@ pub(crate) fn validate_connect_isolated(value: &ConnectConfig) -> Result<(), Str
     Ok(())
 }
 
-fn validate_cluster_fabric(value: &ClusterFabricSection) -> Result<(), String> {
+pub(crate) fn validate_cluster_fabric(value: &ClusterFabricSection) -> Result<(), String> {
     use crate::cluster_fabric::{NodePlacement, SshAuth};
 
     let mut node_ids = BTreeSet::new();
@@ -1865,6 +1911,21 @@ fn validate_cluster_fabric(value: &ClusterFabricSection) -> Result<(), String> {
         ] {
             if configured != reference.is_some() {
                 return Err("cluster credential metadata is inconsistent".to_string());
+            }
+        }
+    }
+    let mut cluster_names = BTreeSet::new();
+    for cluster in &value.0.clusters {
+        if cluster.name.trim().is_empty() || !cluster_names.insert(cluster.name.as_str()) {
+            return Err("cluster names must be non-empty and unique".to_string());
+        }
+        let mut members = BTreeSet::new();
+        for node_id in &cluster.node_ids {
+            if !node_ids.contains(node_id.as_str()) {
+                return Err("cluster membership references an unknown node".to_string());
+            }
+            if !members.insert(node_id.as_str()) {
+                return Err("cluster membership must not contain duplicate nodes".to_string());
             }
         }
     }
@@ -3448,6 +3509,114 @@ impl CredentialSection {
         }
     }
 
+    /// Silently adopt a credential snapshot captured by a compound
+    /// transaction while it held the migration lock. This method is called
+    /// only after that outer lock has been released, preserving the ordinary
+    /// credential mutation lock order (`operation_lock` then migration lock).
+    ///
+    /// A newer process-local snapshot always wins. Equal revisions must carry
+    /// identical public status data; otherwise the durable source reused a
+    /// revision and adoption fails closed.
+    fn adopt_captured(
+        &self,
+        document_lkg: CredentialDocumentLkg,
+        statuses: Vec<CredentialStatus>,
+        health: CredentialStoreHealth,
+    ) -> ConfigStoreResult<()> {
+        self.adopt_captured_with_event(document_lkg, statuses, health)
+            .map(|_| ())
+    }
+
+    fn adopt_captured_with_event(
+        &self,
+        document_lkg: CredentialDocumentLkg,
+        statuses: Vec<CredentialStatus>,
+        health: CredentialStoreHealth,
+    ) -> ConfigStoreResult<Option<ConfigSectionEvent>> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.snapshot();
+        if current.revision > health.revision {
+            return Ok(None);
+        }
+        if current.revision == health.revision && current.data.as_ref() != &statuses {
+            return Err(crate::ConfigStoreError::Validation(
+                "credential document reused the live revision with different data".to_string(),
+            ));
+        }
+        if current.revision == health.revision
+            && current.status == health.status
+            && current.source_kind == health.source
+            && current.last_error == health.last_error
+            && (health.status != SectionStatus::Healthy || health.source != SectionSourceKind::File)
+        {
+            // A cluster-only metadata commit still captures credential health
+            // under the transaction lock. Missing/default or degraded/backup
+            // snapshots need no adoption when the facade already owns that
+            // exact state.
+            return Ok(None);
+        }
+        // Healthy/file snapshots continue through publication even when their
+        // public status projection is unchanged, so the facade's opaque LKG is
+        // the exact credential document captured by this compound commit.
+        if health.status != SectionStatus::Healthy
+            || health.source != SectionSourceKind::File
+            || document_lkg.revision() != health.revision
+        {
+            return Err(crate::ConfigStoreError::Validation(
+                "captured credential transaction snapshot is not healthy".to_string(),
+            ));
+        }
+
+        let observable_change = current.revision != health.revision
+            || current.status != health.status
+            || current.source_kind != health.source
+            || current.last_error != health.last_error
+            || current.data.as_ref() != &statuses;
+        let recovered =
+            current.status != SectionStatus::Healthy && health.status == SectionStatus::Healthy;
+        *self
+            .document_lkg
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(document_lkg));
+        *self
+            .repair_authority
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = CredentialRepairAuthority::None;
+        *self
+            .trusted_lkg
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(CredentialSectionSnapshot {
+                data: Arc::new(statuses),
+                revision: health.revision,
+                loaded_at: Utc::now(),
+                source_path: self.store.path().to_path_buf(),
+                source_kind: health.source,
+                status: health.status,
+                last_error: health.last_error,
+            });
+        Ok(observable_change.then(|| {
+            if recovered {
+                ConfigSectionEvent::Recovered {
+                    section: SectionId::Credentials.descriptor().name.to_string(),
+                    revision: health.revision,
+                }
+            } else {
+                ConfigSectionEvent::Changed {
+                    section: SectionId::Credentials.descriptor().name.to_string(),
+                    revision: health.revision,
+                }
+            }
+        }))
+    }
+
     pub fn reload(&self) -> ConfigStoreResult<Arc<CredentialSectionSnapshot>> {
         let _operation = self
             .operation_lock
@@ -3827,6 +3996,9 @@ fn error_category(error: &crate::ConfigStoreError) -> String {
         crate::ConfigStoreError::Json(_) => "credential document is invalid",
         crate::ConfigStoreError::Conflict { .. } => "credential revision conflict",
         crate::ConfigStoreError::Validation(_) => "credential document failed validation",
+        crate::ConfigStoreError::CommitIndeterminate(_) => {
+            "credential transaction outcome is indeterminate"
+        }
         crate::ConfigStoreError::Watch(_) => "credential store watch failed",
     }
     .to_string()
@@ -4161,6 +4333,71 @@ impl SectionRegistry {
     }
 }
 
+/// Reconstruct the effective configuration from the coherent modular
+/// authorities while the caller owns the shared migration lock.
+///
+/// Credential ownership checks must use these durable snapshots rather than a
+/// process-local runtime that may lag a commit made by another process.
+pub(crate) fn load_durable_effective_config_under_migration_lock(
+    data_dir: &Path,
+) -> ConfigStoreResult<Config> {
+    if !section_layout_is_active(data_dir)? {
+        return Err(crate::ConfigStoreError::Validation(
+            "durable credential ownership requires the modular configuration layout".to_string(),
+        ));
+    }
+    let registry = SectionRegistry::open_configured(data_dir, true)?;
+    let health = registry.health()?;
+    for id in [
+        SectionId::Core,
+        SectionId::Providers,
+        SectionId::Mcp,
+        SectionId::Notifications,
+        SectionId::Connect,
+        SectionId::ClusterFabric,
+        SectionId::Env,
+        SectionId::AccessControl,
+        SectionId::Subagents,
+    ] {
+        let health = health
+            .iter()
+            .find(|health| health.section == id)
+            .expect("every durable credential owner has section health");
+        if health.status != SectionStatus::Healthy || health.source_kind != SectionSourceKind::File
+        {
+            return Err(crate::ConfigStoreError::Validation(format!(
+                "durable {} credential ownership is unavailable",
+                id.descriptor().name
+            )));
+        }
+    }
+    Ok(registry.projection().into_config())
+}
+
+/// Reconstruct a runtime source for one exact owned section while the caller
+/// owns the shared migration lock.
+///
+/// Unlike the full ownership preflight above, this intentionally does not
+/// require the legacy-root completion attestation to remain active after the
+/// exact section commit. A compatibility process may recreate `config.json`
+/// after the commit point; that must not prevent adopting the still-healthy
+/// typed authority, nor authorize installing the recreated root wholesale.
+pub(crate) fn load_durable_effective_section_under_migration_lock(
+    data_dir: &Path,
+    id: SectionId,
+) -> ConfigStoreResult<Config> {
+    let registry = SectionRegistry::open_configured(data_dir, true)?;
+    let envelope = registry.envelope_value(id)?;
+    if envelope.status != SectionStatus::Healthy || envelope.source_kind != SectionSourceKind::File
+    {
+        return Err(crate::ConfigStoreError::Validation(format!(
+            "durable {} credential ownership is unavailable",
+            id.descriptor().name
+        )));
+    }
+    Ok(registry.projection().into_config())
+}
+
 /// Effective compatibility facade assembled from immutable section snapshots.
 pub struct ConfigFacade {
     registry: Arc<SectionRegistry>,
@@ -4213,6 +4450,99 @@ impl ConfigFacade {
 
     pub fn effective_config(&self) -> Config {
         self.registry.projection().into_config()
+    }
+
+    /// Publish the exact cluster-fabric snapshot installed by the credential
+    /// compound transaction. This is a process-local adoption only: the
+    /// transaction has already made both durable members authoritative and
+    /// must still hold its cross-process migration lock while calling here.
+    pub(crate) fn adopt_committed_cluster_fabric(
+        &self,
+        expected_revision: u64,
+        committed_revision: u64,
+        candidate: ClusterFabricConfig,
+    ) -> ConfigStoreResult<ConfigSectionEvent> {
+        let mut sanitized = Config::default();
+        sanitized.cluster_fabric = candidate;
+        sanitized.sanitize_cluster_fabric_for_disk();
+        self.registry
+            .cluster_fabric
+            .adopt_committed_from_durable_base(
+                expected_revision,
+                committed_revision,
+                ClusterFabricSection(sanitized.cluster_fabric.clone()),
+            )
+    }
+
+    /// Adopt one exact compound-transaction section while the shared
+    /// migration lock still excludes a later cross-process writer.
+    pub(crate) fn adopt_committed_section(
+        &self,
+        id: SectionId,
+        expected_revision: u64,
+        committed_revision: u64,
+        candidate: &Config,
+    ) -> ConfigStoreResult<ConfigSectionEvent> {
+        let projection =
+            SectionProjection::from_config(candidate, self.registry.projection().model_limits)?;
+        macro_rules! adopt {
+            ($field:ident, $candidate:expr) => {
+                self.registry.$field.adopt_committed_from_durable_base(
+                    expected_revision,
+                    committed_revision,
+                    $candidate,
+                )
+            };
+        }
+        match id {
+            SectionId::Core => adopt!(core, projection.core),
+            SectionId::Providers => adopt!(providers, projection.providers),
+            SectionId::Mcp => adopt!(mcp, projection.mcp),
+            SectionId::ToolsSkills => adopt!(tools_skills, projection.tools_skills),
+            SectionId::Memory => adopt!(memory, projection.memory),
+            SectionId::Subagents => adopt!(subagents, projection.subagents),
+            SectionId::Notifications => adopt!(notifications, projection.notifications),
+            SectionId::Connect => adopt!(connect, projection.connect),
+            SectionId::ClusterFabric => adopt!(cluster_fabric, projection.cluster_fabric),
+            SectionId::Env => adopt!(env, projection.env),
+            SectionId::AccessControl => adopt!(access_control, projection.access_control),
+            SectionId::Hooks => adopt!(hooks, projection.hooks),
+            SectionId::ModelPolicy => adopt!(model_policy, projection.model_policy),
+            SectionId::ModelLimits => adopt!(model_limits, projection.model_limits),
+            SectionId::Credentials => Err(crate::ConfigStoreError::Validation(
+                "credential snapshots require opaque credential adoption".to_string(),
+            )),
+        }
+    }
+
+    /// A semantic no-op can still name a durable owned generation newer than
+    /// this process. Reload it while the caller holds the migration lock so
+    /// the returned event and snapshot cannot be assembled from different
+    /// cross-process generations.
+    pub(crate) fn catch_up_committed_section(&self, id: SectionId) -> Option<ConfigSectionEvent> {
+        self.registry.reload_if_changed(id)
+    }
+
+    pub(crate) fn adopt_captured_cluster_credentials(
+        &self,
+        document_lkg: CredentialDocumentLkg,
+        statuses: Vec<CredentialStatus>,
+        health: CredentialStoreHealth,
+    ) -> ConfigStoreResult<()> {
+        self.registry
+            .credentials
+            .adopt_captured(document_lkg, statuses, health)
+    }
+
+    pub(crate) fn adopt_captured_credentials_with_event(
+        &self,
+        document_lkg: CredentialDocumentLkg,
+        statuses: Vec<CredentialStatus>,
+        health: CredentialStoreHealth,
+    ) -> ConfigStoreResult<Option<ConfigSectionEvent>> {
+        self.registry
+            .credentials
+            .adopt_captured_with_event(document_lkg, statuses, health)
     }
 }
 
@@ -4339,18 +4669,92 @@ fn migrate_one_copilot_cache(
     Ok(())
 }
 
-/// Persist a compatibility [`Config`] through the active modular authorities.
-///
-/// This is the bridge used by legacy root PATCH/CLI callers during the
-/// compatibility window: `config.json` is never recreated after activation,
-/// and unchanged sections retain their own revisions. All candidates are
-/// validated before the first durable write; each changed member then uses the
-/// section's snapshot-bound CAS so a concurrent process/editor winner is never
-/// silently overwritten.
-pub fn persist_facade_effective_config(
+/// Opaque runtime projection for the one section changed by a compatibility
+/// write. It can install that owned section into an existing process config but
+/// cannot expose or replace unrelated sections.
+pub struct FacadeSectionRuntimeSnapshot {
+    section: SectionId,
+    runtime: Config,
+}
+
+impl FacadeSectionRuntimeSnapshot {
+    pub fn install_into(self, target: &mut Config) {
+        apply_runtime_section(self.section, &self.runtime, target);
+    }
+}
+
+/// Exact process-adoption result captured for a compatibility write while the
+/// shared migration lock still excluded a later writer.
+pub struct FacadeConfigCommit {
+    pub section_adoption: Option<ConfigStoreResult<ConfigSectionEvent>>,
+    pub runtime: ConfigStoreResult<Option<FacadeSectionRuntimeSnapshot>>,
+}
+
+fn materialize_facade_commit_runtime_under_lock(
+    data_dir: &Path,
+    section: SectionId,
+    mut runtime: Config,
+) -> ConfigStoreResult<FacadeSectionRuntimeSnapshot> {
+    let credentials = matches!(
+        section,
+        SectionId::Core
+            | SectionId::Providers
+            | SectionId::Mcp
+            | SectionId::Notifications
+            | SectionId::Connect
+            | SectionId::ClusterFabric
+            | SectionId::Env
+            | SectionId::AccessControl
+    )
+    .then(|| CredentialStore::open(data_dir).snapshot_with_health_unchecked())
+    .transpose()?
+    .map(|(snapshot, _, _)| snapshot);
+    match section {
+        SectionId::Core => runtime.hydrate_proxy_auth_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::Providers => runtime.hydrate_provider_credentials_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::Mcp => runtime.hydrate_mcp_credentials_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::Notifications => runtime.hydrate_notification_credentials_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::Connect => runtime.hydrate_connect_credentials_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::ClusterFabric => runtime.hydrate_cluster_credentials_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::Env => runtime.hydrate_env_var_credentials_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::AccessControl => runtime.hydrate_access_control_credentials_from_snapshot(
+            credentials.as_ref().expect("credential-backed section"),
+        )?,
+        SectionId::ToolsSkills
+        | SectionId::Memory
+        | SectionId::Subagents
+        | SectionId::Hooks
+        | SectionId::ModelPolicy
+        | SectionId::ModelLimits => {}
+        SectionId::Credentials => {
+            return Err(crate::ConfigStoreError::Validation(
+                "compatibility config cannot own the credential section".to_string(),
+            ))
+        }
+    }
+    runtime.apply_runtime_env_overrides();
+    Ok(FacadeSectionRuntimeSnapshot { section, runtime })
+}
+
+fn persist_facade_effective_config_inner(
     data_dir: impl AsRef<Path>,
     config: &Config,
-) -> ConfigStoreResult<Vec<ConfigSectionEvent>> {
+    process_facade: Option<&ConfigFacade>,
+) -> ConfigStoreResult<(Vec<ConfigSectionEvent>, Option<FacadeConfigCommit>)> {
     let data_dir = data_dir.as_ref();
     let facade = ConfigFacade::open(data_dir)?;
     let current = facade.registry.projection();
@@ -4359,6 +4763,10 @@ pub fn persist_facade_effective_config(
     // is not part of the compatibility Config wire shape. Preserve its current
     // durable projection across unrelated root writes.
     candidate.subagents.external_broker = current.subagents.external_broker.clone();
+    // Compatibility/root writers never own cluster CAS. Rebase this field on
+    // the freshly opened durable facade, not the caller's possibly stale
+    // process projection, before validation and change detection.
+    candidate.cluster_fabric = current.cluster_fabric.clone();
     validate_projection(&candidate)?;
 
     crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
@@ -4395,37 +4803,101 @@ pub fn persist_facade_effective_config(
             )));
         }
         let mut events = Vec::new();
+        let mut committed = None;
         macro_rules! commit_if_changed {
-            ($field:ident, $candidate:expr) => {{
+            ($id:ident, $field:ident, $candidate:expr) => {{
                 let candidate = $candidate;
                 let snapshot = facade.registry.$field.snapshot();
                 if serde_json::to_value(snapshot.data.as_ref())?
                     != serde_json::to_value(&candidate)?
                 {
-                    events.push(
-                        facade
-                            .registry
-                            .$field
-                            .commit(snapshot.revision, candidate)?,
-                    );
+                    let expected_revision = snapshot.revision;
+                    let event = facade
+                        .registry
+                        .$field
+                        .commit(expected_revision, candidate)?;
+                    let committed_revision = match &event {
+                        ConfigSectionEvent::Changed { revision, .. }
+                        | ConfigSectionEvent::Recovered { revision, .. }
+                        | ConfigSectionEvent::Invalid { revision, .. } => *revision,
+                    };
+                    events.push(event);
+                    committed = Some((SectionId::$id, expected_revision, committed_revision));
                 }
             }};
         }
 
-        commit_if_changed!(core, candidate.core);
-        commit_if_changed!(providers, candidate.providers);
-        commit_if_changed!(mcp, candidate.mcp);
-        commit_if_changed!(tools_skills, candidate.tools_skills);
-        commit_if_changed!(memory, candidate.memory);
-        commit_if_changed!(subagents, candidate.subagents);
-        commit_if_changed!(notifications, candidate.notifications);
-        commit_if_changed!(connect, candidate.connect);
-        commit_if_changed!(cluster_fabric, candidate.cluster_fabric);
-        commit_if_changed!(env, candidate.env);
-        commit_if_changed!(access_control, candidate.access_control);
-        commit_if_changed!(hooks, candidate.hooks);
-        commit_if_changed!(model_policy, candidate.model_policy);
-        Ok(events)
+        commit_if_changed!(Core, core, candidate.core);
+        commit_if_changed!(Providers, providers, candidate.providers);
+        commit_if_changed!(Mcp, mcp, candidate.mcp);
+        commit_if_changed!(ToolsSkills, tools_skills, candidate.tools_skills);
+        commit_if_changed!(Memory, memory, candidate.memory);
+        commit_if_changed!(Subagents, subagents, candidate.subagents);
+        commit_if_changed!(Notifications, notifications, candidate.notifications);
+        commit_if_changed!(Connect, connect, candidate.connect);
+        commit_if_changed!(ClusterFabric, cluster_fabric, candidate.cluster_fabric);
+        commit_if_changed!(Env, env, candidate.env);
+        commit_if_changed!(AccessControl, access_control, candidate.access_control);
+        commit_if_changed!(Hooks, hooks, candidate.hooks);
+        commit_if_changed!(ModelPolicy, model_policy, candidate.model_policy);
+
+        let process_commit = process_facade.map(|process_facade| {
+            let Some((section, expected_revision, committed_revision)) = committed else {
+                return FacadeConfigCommit {
+                    section_adoption: None,
+                    runtime: Ok(None),
+                };
+            };
+            let exact = facade.effective_config();
+            let runtime =
+                materialize_facade_commit_runtime_under_lock(data_dir, section, exact).map(Some);
+            // A failed exact runtime must leave the process facade behind the
+            // durable revision. Its watcher can then observe and retry that
+            // generation instead of treating an uninstalled commit as current.
+            let section_adoption = runtime.as_ref().ok().map(|_| {
+                process_facade.adopt_committed_section(
+                    section,
+                    expected_revision,
+                    committed_revision,
+                    &facade.effective_config(),
+                )
+            });
+            FacadeConfigCommit {
+                section_adoption,
+                runtime,
+            }
+        });
+        Ok((events, process_commit))
+    })
+}
+
+/// Persist a compatibility [`Config`] through the active modular authorities
+/// and return the durable section events without adopting a process facade.
+pub fn persist_facade_effective_config(
+    data_dir: impl AsRef<Path>,
+    config: &Config,
+) -> ConfigStoreResult<Vec<ConfigSectionEvent>> {
+    persist_facade_effective_config_inner(data_dir, config, None).map(|(events, _)| events)
+}
+
+/// Persist a compatibility [`Config`] through the active modular authorities
+/// and capture the exact changed-section runtime for `process_facade`.
+///
+/// This is the bridge used by legacy root PATCH/CLI callers during the
+/// compatibility window: `config.json` is never recreated after activation,
+/// unchanged sections retain their own revisions, and the caller can install
+/// only the section it actually committed.
+pub fn persist_facade_effective_config_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &Config,
+    process_facade: &ConfigFacade,
+) -> ConfigStoreResult<FacadeConfigCommit> {
+    let (_, commit) =
+        persist_facade_effective_config_inner(data_dir, config, Some(process_facade))?;
+    commit.ok_or_else(|| {
+        crate::ConfigStoreError::Validation(
+            "compatibility commit omitted process adoption result".to_string(),
+        )
     })
 }
 
@@ -8263,5 +8735,120 @@ mod tests {
             reopened.registry().tools_skills.snapshot().revision,
             tools_revision
         );
+    }
+
+    #[test]
+    fn stale_compatibility_config_never_overwrites_newer_exact_cluster_authority() {
+        let _key = crate::encryption::set_test_encryption_key([90; 32]);
+        let dir = TempDir::new().unwrap();
+        let initial_facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut initial = initial_facade.effective_config();
+        initial.cluster_fabric.nodes.push(crate::Node {
+            id: "owned-node".to_string(),
+            label: "generation-one".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = std::collections::BTreeMap::from([(
+            "owned-node".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        assert_eq!(
+            crate::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut initial,
+                &intents,
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let stale_caller = ConfigFacade::open(dir.path()).unwrap().effective_config();
+        let mut external = stale_caller.clone();
+        external
+            .cluster_fabric
+            .node_mut("owned-node")
+            .unwrap()
+            .label = "external-generation-two".to_string();
+        assert_eq!(
+            crate::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                &std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let cluster_r2 = std::fs::read(&cluster_path).unwrap();
+
+        assert!(
+            persist_facade_effective_config(dir.path(), &stale_caller)
+                .unwrap()
+                .is_empty(),
+            "a stale no-op must not manufacture a cluster revision"
+        );
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r2);
+
+        let mut unrelated = stale_caller;
+        unrelated.server.port = 22_222;
+        let events = persist_facade_effective_config(dir.path(), &unrelated).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConfigSectionEvent::Changed { section, .. } if section == "core"
+        ));
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_r2);
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("owned-node")
+                .unwrap()
+                .label,
+            "external-generation-two"
+        );
+        assert_eq!(reopened.effective_config().server.port, 22_222);
+    }
+
+    #[test]
+    fn failed_compatibility_runtime_materialization_leaves_process_facade_reloadable() {
+        let _key = crate::encryption::set_test_encryption_key([91; 32]);
+        let dir = TempDir::new().unwrap();
+        let process_facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let reference = CredentialRef::parse("proxy.default.auth").unwrap();
+        CredentialStore::open(dir.path())
+            .replace(reference.clone(), "not-json", CredentialSource::User, 0)
+            .unwrap();
+
+        let mut candidate = process_facade.effective_config();
+        candidate.server.port = 22_223;
+        candidate.proxy_auth_credential_ref = Some(reference);
+        let core_before = process_facade.registry().core.snapshot().revision;
+
+        let commit =
+            persist_facade_effective_config_with_adoption(dir.path(), &candidate, &process_facade)
+                .unwrap();
+        assert!(commit.runtime.is_err());
+        assert!(
+            commit.section_adoption.is_none(),
+            "an unmaterialized runtime must not advance the process facade"
+        );
+        assert_eq!(
+            process_facade.registry().core.snapshot().revision,
+            core_before
+        );
+
+        let durable = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(durable.registry().core.snapshot().revision, core_before + 1);
+        assert_eq!(durable.effective_config().server.port, 22_223);
     }
 }

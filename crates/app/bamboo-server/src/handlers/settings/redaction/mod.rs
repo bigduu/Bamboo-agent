@@ -5,15 +5,6 @@ mod constants;
 mod mcp;
 mod provider;
 
-/// Return the public marker used in place of secrets in API responses.
-///
-/// Build the marker as a display value instead of letting a string literal
-/// flow into credential-shaped fields. The marker is not authentication
-/// material, and this keeps credential scanners focused on actual secrets.
-pub(super) fn masked_secret_marker() -> String {
-    "****".to_owned() + "..." + "****"
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -248,23 +239,33 @@ pub fn redact_config_for_api(mut value: Value, config: &Config) -> Value {
         }
     }
 
-    // Redact cluster-fabric SSH secrets on each node's placement.auth.
-    if let Some(nodes) = root
+    // Cluster-fabric credentials are represented by status metadata on the
+    // section endpoint. Never expose plaintext, ciphertext, or mask markers
+    // through the legacy root configuration response.
+    if let Some(fabric) = root
         .get_mut("cluster_fabric")
-        .and_then(|f| f.get_mut("nodes"))
-        .and_then(|v| v.as_array_mut())
+        .and_then(Value::as_object_mut)
     {
-        for node in nodes.iter_mut() {
-            if let Some(auth) = node
-                .get_mut("placement")
-                .and_then(|p| p.get_mut("auth"))
-                .and_then(|a| a.as_object_mut())
-            {
-                for field in ["password", "private_key", "passphrase"] {
-                    if auth.get(field).and_then(|v| v.as_str()).is_some() {
-                        auth.insert(field.to_string(), Value::String("****...****".to_string()));
+        // Stable references reveal the existence and storage layout of
+        // credentials. The dedicated cluster section exposes only status.
+        fabric.remove("credential_refs");
+        if let Some(nodes) = fabric.get_mut("nodes").and_then(Value::as_array_mut) {
+            for node in nodes.iter_mut() {
+                if let Some(auth) = node
+                    .get_mut("placement")
+                    .and_then(|p| p.get_mut("auth"))
+                    .and_then(|a| a.as_object_mut())
+                {
+                    for field in [
+                        "password",
+                        "password_encrypted",
+                        "private_key",
+                        "private_key_encrypted",
+                        "passphrase",
+                        "passphrase_encrypted",
+                    ] {
+                        auth.remove(field);
                     }
-                    auth.remove(&format!("{field}_encrypted"));
                 }
             }
         }

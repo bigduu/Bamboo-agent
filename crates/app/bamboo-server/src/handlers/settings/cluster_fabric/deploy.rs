@@ -6,7 +6,7 @@
 //! [`FabricError`] to the HTTP [`AppError`].
 
 use bamboo_config::cluster_fabric::NodeState;
-use bamboo_server_tools::FabricError;
+use bamboo_server_tools::{FabricActionResult, FabricError};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
@@ -15,6 +15,8 @@ fn map_err(e: FabricError) -> AppError {
     match e {
         FabricError::NotFound(m) => AppError::NotFound(m),
         FabricError::BadRequest(m) => AppError::BadRequest(m),
+        FabricError::Conflict { expected, actual } => AppError::ConfigConflict { expected, actual },
+        FabricError::Committed(m) => AppError::InternalError(anyhow::anyhow!(m)),
         FabricError::Internal(m) => AppError::InternalError(anyhow::anyhow!(m)),
     }
 }
@@ -23,26 +25,35 @@ pub async fn deploy_node(
     app_state: &AppState,
     node_id: &str,
     echo: bool,
-) -> Result<NodeState, AppError> {
+    expected_revision: u64,
+) -> Result<FabricActionResult<NodeState>, AppError> {
     app_state
         .fabric_deployer
-        .deploy(node_id, echo)
+        .deploy_at_revision(node_id, echo, expected_revision)
         .await
         .map_err(map_err)
 }
 
-pub async fn stop_node(app_state: &AppState, node_id: &str) -> Result<NodeState, AppError> {
+pub async fn stop_node(
+    app_state: &AppState,
+    node_id: &str,
+    expected_revision: u64,
+) -> Result<FabricActionResult<NodeState>, AppError> {
     app_state
         .fabric_deployer
-        .stop(node_id)
+        .stop_at_revision(node_id, expected_revision)
         .await
         .map_err(map_err)
 }
 
-pub async fn test_node(app_state: &AppState, node_id: &str) -> Result<String, AppError> {
+pub async fn test_node(
+    app_state: &AppState,
+    node_id: &str,
+    expected_revision: u64,
+) -> Result<FabricActionResult<String>, AppError> {
     app_state
         .fabric_deployer
-        .test(node_id)
+        .test_at_revision(node_id, expected_revision)
         .await
         .map_err(map_err)
 }
