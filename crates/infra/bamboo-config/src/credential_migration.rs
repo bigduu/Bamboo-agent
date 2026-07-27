@@ -2587,7 +2587,6 @@ where
     let mut adoption = None;
     let mut exact_runtime = None;
     let mut committed_recovery = None;
-    let mut transaction_changed = false;
     let mut callback = |revision: u64,
                         changed: bool,
                         candidate: &crate::ClusterFabricConfig,
@@ -2596,7 +2595,6 @@ where
         let runtime_ready = runtime.is_ok();
         exact_runtime = Some(runtime);
         committed_recovery = Some(recovery);
-        transaction_changed = changed;
         if revision == expected_revision {
             if runtime_ready {
                 adoption = facade
@@ -2627,13 +2625,11 @@ where
     }) {
         Ok(exact) => {
             let runtime = exact.runtime;
-            let credential_adoption = transaction_changed.then(|| {
-                facade.adopt_captured_cluster_credentials(
-                    exact.credential_lkg,
-                    runtime.credential_statuses.clone(),
-                    runtime.credential_health.clone(),
-                )
-            });
+            let credential_adoption = Some(facade.adopt_captured_cluster_credentials(
+                exact.credential_lkg,
+                runtime.credential_statuses.clone(),
+                runtime.credential_health.clone(),
+            ));
             (Ok(runtime), credential_adoption)
         }
         Err(error) => (Err(error), None),
@@ -3305,7 +3301,6 @@ where
     let mut adoption = None;
     let mut exact_runtime = None;
     let mut committed_recovery = None;
-    let mut transaction_changed = false;
     let mut callback = |revision: u64,
                         changed: bool,
                         candidate: &crate::ClusterFabricConfig,
@@ -3314,7 +3309,6 @@ where
         let runtime_ready = runtime.is_ok();
         exact_runtime = Some(runtime);
         committed_recovery = Some(recovery);
-        transaction_changed = changed;
         if revision == expected_revision {
             if runtime_ready {
                 adoption = facade
@@ -3360,13 +3354,11 @@ where
     }) {
         Ok(exact) => {
             let runtime = exact.runtime;
-            let credential_adoption = transaction_changed.then(|| {
-                facade.adopt_captured_cluster_credentials(
-                    exact.credential_lkg,
-                    runtime.credential_statuses.clone(),
-                    runtime.credential_health.clone(),
-                )
-            });
+            let credential_adoption = Some(facade.adopt_captured_cluster_credentials(
+                exact.credential_lkg,
+                runtime.credential_statuses.clone(),
+                runtime.credential_health.clone(),
+            ));
             (Ok(runtime), credential_adoption)
         }
         Err(error) => (Err(error), None),
@@ -17772,6 +17764,160 @@ mod tests {
         let (fresh, fresh_revision) = active_facade_config_and_cluster_revision(dir.path());
         assert_eq!(fresh_revision, committed);
         assert_eq!(fresh.cluster_fabric, callback_candidate);
+    }
+
+    #[test]
+    fn adopted_cluster_semantic_noop_catches_up_exact_credential_generation() {
+        let _key = crate::encryption::set_test_encryption_key([0x7e; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            0
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 0);
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut external = external_facade.effective_config();
+        external.cluster_fabric.nodes.push(cluster_test_node(
+            "credential-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                &BTreeMap::from([(
+                    "credential-node".to_string(),
+                    password_intents(crate::ClusterCredentialAction::Replace(
+                        "captured-password".to_string(),
+                    )),
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut retry = fresh.effective_config();
+        let commit = persist_cluster_fabric_credential_transaction_with_adoption(
+            dir.path(),
+            &mut retry,
+            &BTreeMap::from([(
+                "credential-node".to_string(),
+                password_intents(crate::ClusterCredentialAction::Keep),
+            )]),
+            1,
+            &process_facade,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(commit.revision, 1);
+        assert!(matches!(
+            commit.adoption.unwrap().unwrap(),
+            crate::ConfigSectionEvent::Changed {
+                ref section,
+                revision: 1
+            } if section == "cluster-fabric"
+        ));
+        commit.credential_adoption.unwrap().unwrap();
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            1
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 1);
+        let runtime = commit.runtime.unwrap();
+        let crate::NodePlacement::Ssh(target) = &runtime
+            .cluster_fabric
+            .node("credential-node")
+            .unwrap()
+            .placement
+        else {
+            panic!("credential node must remain SSH-placed")
+        };
+        let crate::SshAuth::Password { password, .. } = &target.auth else {
+            panic!("credential node must remain password-authenticated")
+        };
+        assert_eq!(password, "captured-password");
+    }
+
+    #[test]
+    fn adopted_cluster_reset_noop_catches_up_exact_credential_generation() {
+        let _key = crate::encryption::set_test_encryption_key([0x7f; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut external = external_facade.effective_config();
+        external.cluster_fabric.nodes.push(cluster_test_node(
+            "reset-credential-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                &BTreeMap::from([(
+                    "reset-credential-node".to_string(),
+                    password_intents(crate::ClusterCredentialAction::Replace(
+                        "reset-password".to_string(),
+                    )),
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let reset_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut reset = reset_facade.effective_config();
+        reset.cluster_fabric = crate::ClusterFabricConfig::default();
+        assert_eq!(
+            persist_cluster_fabric_reset_at_revision_with_adoption(
+                dir.path(),
+                &mut reset,
+                1,
+                &reset_facade,
+                |_, _| {},
+            )
+            .unwrap()
+            .revision,
+            2
+        );
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            0
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 0);
+
+        let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut retry = fresh.effective_config();
+        let commit = persist_cluster_fabric_reset_at_revision_with_adoption(
+            dir.path(),
+            &mut retry,
+            2,
+            &process_facade,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(commit.revision, 2);
+        commit.adoption.unwrap().unwrap();
+        commit.credential_adoption.unwrap().unwrap();
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            2
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 2);
+        assert!(commit.runtime.unwrap().cluster_fabric.nodes.is_empty());
     }
 
     #[test]

@@ -1,9 +1,7 @@
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -2927,26 +2925,38 @@ impl AppState {
     }
 
     async fn persist_config_snapshot(
-        &self,
+        data_dir: PathBuf,
+        config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
         config: Config,
     ) -> anyhow::Result<Option<bamboo_config::FacadeConfigCommit>> {
-        let data_dir = self.app_data_dir.clone();
-        if let Some(facade) = self.config_facade.clone() {
+        if let Some(facade) = config_facade {
             tokio::task::spawn_blocking(move || {
-                bamboo_config::persist_facade_effective_config_with_adoption(
-                    data_dir,
+                let result = bamboo_config::persist_facade_effective_config_with_adoption(
+                    &data_dir,
                     &config,
                     facade.as_ref(),
-                )
+                );
+                #[cfg(test)]
+                if result.is_ok() {
+                    run_generic_before_event_test_hook(&data_dir);
+                }
+                result
             })
             .await
             .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))?
             .map(Some)
             .map_err(Into::into)
         } else {
-            tokio::task::spawn_blocking(move || config.save_to_dir(data_dir))
-                .await
-                .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
+            tokio::task::spawn_blocking(move || {
+                let result = config.save_to_dir(data_dir.clone());
+                #[cfg(test)]
+                if result.is_ok() {
+                    run_generic_before_event_test_hook(&data_dir);
+                }
+                result
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Config save task failed: {e}"))??;
             Ok(None)
         }
     }
@@ -2965,96 +2975,104 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
-        // Hold the config-IO lock across BOTH the in-memory mutation AND the disk
-        // persist, so a concurrent reload_config can't read the disk in the gap
-        // before we persist and then clobber this mutation with the stale copy
-        // (#126). The lock is dropped before apply_config_effects — slow side
-        // effects (provider reload) don't need to block reloads/other updates.
-        let snapshot = {
-            let _io = self.config_io_lock.lock().await;
-            let (mut snapshot, live_base, enforcement_newly_off) = {
-                let cfg = self.config.read().await;
-                // Refuse the whole operation (no in-memory mutation, no disk
-                // write) while a config-corruption recovery is pending
-                // confirmation (#153) — `save_to_dir` would reject the persist
-                // anyway, but checking here BEFORE `update()` runs keeps the
-                // in-memory config frozen exactly at the recovered state
-                // instead of silently drifting further from what's on disk.
-                reject_if_recovery_pending(&cfg)?;
-                let was_off = cfg.plugin_trust.enforcement_is_off();
-                let live_base = cfg.clone();
-                let mut candidate = cfg.clone();
-                restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut candidate);
-                update(&mut candidate)?;
-                // No caller of this compatibility entrypoint owns cluster CAS.
-                restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut candidate);
-                // Backfill any missing connect.platforms id (#496) on the live
-                // in-memory config itself — not just inside `save_to_dir`'s
-                // internal save-copy — so the response this update returns
-                // (and any GET immediately after) already reflects the id a
-                // client can round-trip on its next PATCH.
-                candidate.assign_connect_platform_ids();
-                // Same live-vs-save-copy treatment for ciphertext (#516):
-                // `save_to_dir` refreshes `*_encrypted` only on its save-time
-                // clone, so a secret set through this entrypoint (e.g. a
-                // provider instance created over HTTP) would otherwise stay
-                // plaintext-only in memory — and the next settings-PATCH merge
-                // (`build_merged_config`'s serde round-trip drops plaintext)
-                // would lose the key entirely.
-                candidate.refresh_encrypted_secrets().map_err(|e| {
-                    AppError::InternalError(anyhow::anyhow!(
-                        "Failed to refresh encrypted secrets: {e}"
-                    ))
-                })?;
-                let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
-                (candidate, live_base, newly_off)
-            };
-            // Loud signal at the MOMENT plugin_trust.enforcement is flipped off
-            // live (e.g. via `bamboo config set plugin_trust.enforcement off`
-            // over HTTP), mirroring the boot-time warn in `AppState::new` — so
-            // this security-relevant relaxation is never applied silently. Only
-            // on the transition into `Off` (not every unrelated config write
-            // while already off).
-            if enforcement_newly_off {
-                warn_plugin_trust_enforcement_off();
-            }
-            let commit = self
-                .persist_config_snapshot(snapshot.clone())
+        // Cancellation while waiting for either guard is pre-commit and leaves
+        // every authority untouched. After candidate construction there is no
+        // await before the owned guard and candidate enter the detached task.
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let (mut snapshot, live_base, enforcement_newly_off) = {
+            let cfg = self.config.read().await;
+            // Refuse the whole operation (no in-memory mutation, no disk
+            // write) while a config-corruption recovery is pending
+            // confirmation (#153) — `save_to_dir` would reject the persist
+            // anyway, but checking here BEFORE `update()` runs keeps the
+            // in-memory config frozen exactly at the recovered state.
+            reject_if_recovery_pending(&cfg)?;
+            let was_off = cfg.plugin_trust.enforcement_is_off();
+            let live_base = cfg.clone();
+            let mut candidate = cfg.clone();
+            restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut candidate);
+            update(&mut candidate)?;
+            // No caller of this compatibility entrypoint owns cluster CAS.
+            restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut candidate);
+            candidate.assign_connect_platform_ids();
+            candidate.refresh_encrypted_secrets().map_err(|e| {
+                AppError::InternalError(anyhow::anyhow!("Failed to refresh encrypted secrets: {e}"))
+            })?;
+            let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
+            (candidate, live_base, newly_off)
+        };
+        if enforcement_newly_off {
+            warn_plugin_trust_enforcement_off();
+        }
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        // The detached task owns every step after dispatch. Dropping the
+        // request's JoinHandle cannot strand a completed durable/facade commit
+        // ahead of live publication, its exact events, or requested effects.
+        let transaction = tokio::spawn(async move {
+            // Hold the config-IO lock across BOTH the in-memory mutation AND the
+            // disk persist, so a concurrent reload_config can't read the disk in
+            // the gap before we persist and then clobber this mutation with the
+            // stale copy (#126). Slow side effects run after this block unlocks.
+            let snapshot = {
+                let _io = io;
+                let commit = Self::persist_config_snapshot(
+                    app_data_dir.clone(),
+                    config_facade.clone(),
+                    snapshot.clone(),
+                )
                 .await
                 .map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
                 })?;
-            let events = match commit {
-                Some(commit) => {
-                    let mut published = live_base;
-                    let events =
-                        install_facade_config_commit(commit, &mut published).map_err(|e| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "failed to install committed configuration section: {e}"
-                            ))
-                        })?;
-                    snapshot = published;
-                    events
+                let events = match commit {
+                    Some(commit) => {
+                        let mut published = live_base;
+                        let events =
+                            install_facade_config_commit(commit, &mut published).map_err(|e| {
+                                AppError::InternalError(anyhow::anyhow!(
+                                    "failed to install committed configuration section: {e}"
+                                ))
+                            })?;
+                        snapshot = published;
+                        events
+                    }
+                    None => Vec::new(),
+                };
+                {
+                    let mut cfg = config.write().await;
+                    snapshot.publish_env_vars();
+                    *cfg = snapshot.clone();
                 }
-                None => Vec::new(),
+                // Keep synchronous event enqueue inside the same serialization
+                // boundary as durable commit and live installation. Otherwise a
+                // later local writer can enqueue r2 before this task enqueues r1.
+                publish_exact_facade_events(&account_sink, &events)?;
+                snapshot
             };
-            {
-                let mut cfg = self.config.write().await;
-                snapshot.publish_env_vars();
-                *cfg = snapshot.clone();
-            }
-            // Keep synchronous event enqueue inside the same serialization
-            // boundary as durable commit and live installation. Otherwise a
-            // later local writer can enqueue r2 while this task is preempted
-            // after unlocking, then this task can enqueue stale r1.
-            #[cfg(test)]
-            run_generic_before_event_test_hook(&self.app_data_dir);
-            publish_exact_facade_events(&self.account_sink, &events)?;
-            snapshot
-        };
 
-        self.apply_config_effects(snapshot.clone(), effects).await?;
-        Ok(snapshot)
+            Self::apply_config_effects_owned(
+                snapshot.clone(),
+                effects,
+                app_data_dir,
+                config,
+                provider_registry,
+                provider,
+                mcp_manager,
+            )
+            .await?;
+            Ok::<_, AppError>(snapshot)
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "config update transaction task failed: {error}"
+            ))
+        })?
     }
 
     /// Compatibility provider update whose credential and metadata documents
@@ -3072,136 +3090,154 @@ impl AppState {
         if provider_intents.is_empty() && provider_instance_intents.is_empty() {
             return self.update_config(update, effects).await;
         }
+        let io = self.config_io_lock.clone().lock_owned().await;
         let config_facade = self.config_facade.clone();
-        let account_sink = self.account_sink.clone();
-        let (snapshot, enforcement_newly_off) = {
-            let _io = self.config_io_lock.lock().await;
-            let (mut candidate, live_base, enforcement_newly_off) = {
-                let cfg = self.config.read().await;
-                reject_if_recovery_pending(&cfg)?;
-                let was_off = cfg.plugin_trust.enforcement_is_off();
-                let live_base = cfg.clone();
-                let mut candidate = cfg.clone();
-                restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
-                update(&mut candidate)?;
-                // Provider compatibility updates never own cluster CAS.
-                restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
-                // Provider plaintext may be present until the exact credential
-                // transaction assigns its durable reference. Compare every
-                // other section against a candidate whose provider projection
-                // is replaced with the current durable domain; the exact
-                // transaction below remains the sole provider validator.
-                let mut non_provider_candidate = candidate.clone();
-                apply_runtime_section(SectionId::Providers, &cfg, &mut non_provider_candidate);
-                let mut comparison_base = cfg.clone();
-                restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut comparison_base);
-                let mut changed = bamboo_config::changed_facade_sections(
-                    &comparison_base,
-                    &non_provider_candidate,
-                )
-                .map_err(|_| {
+        let (mut candidate, live_base, enforcement_newly_off) = {
+            let cfg = self.config.read().await;
+            reject_if_recovery_pending(&cfg)?;
+            let was_off = cfg.plugin_trust.enforcement_is_off();
+            let live_base = cfg.clone();
+            let mut candidate = cfg.clone();
+            restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
+            update(&mut candidate)?;
+            // Provider compatibility updates never own cluster CAS.
+            restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
+            // Provider plaintext may be present until the exact credential
+            // transaction assigns its durable reference. Compare every other
+            // section against a candidate whose provider projection is
+            // replaced with the current durable domain.
+            let mut non_provider_candidate = candidate.clone();
+            apply_runtime_section(SectionId::Providers, &cfg, &mut non_provider_candidate);
+            let mut comparison_base = cfg.clone();
+            restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut comparison_base);
+            let mut changed =
+                bamboo_config::changed_facade_sections(&comparison_base, &non_provider_candidate)
+                    .map_err(|_| {
                     AppError::InternalError(anyhow::anyhow!(
                         "failed to compare modular configuration sections"
                     ))
                 })?;
-                // The compatibility wire shape can normalize duplicated
-                // external-broker metadata while leaving the actual subagents
-                // module byte-for-byte equivalent. That is an unchanged echo,
-                // not a second section mutation.
-                if serde_json::to_value(cfg.subagents()).ok()
-                    == serde_json::to_value(candidate.subagents()).ok()
-                {
-                    changed.retain(|section| *section != SectionId::Subagents);
-                }
-                if let Some(other) = changed
-                    .into_iter()
-                    .find(|section| *section != SectionId::Providers)
-                {
-                    return Err(AppError::BadRequest(format!(
-                        "provider credential updates cannot be combined with {} changes; split the request",
-                        other.descriptor().name
-                    )));
-                }
-                candidate.assign_connect_platform_ids();
-                candidate.refresh_encrypted_secrets().map_err(|error| {
-                    AppError::InternalError(anyhow::anyhow!(
-                        "Failed to refresh encrypted secrets: {error}"
-                    ))
-                })?;
-                let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
-                (candidate, live_base, newly_off)
-            };
-            let data_dir = self.app_data_dir.clone();
-            let commit_facade = config_facade.clone();
-            let (candidate, commit) = tokio::task::spawn_blocking(move || {
-                if let Some(facade) = commit_facade {
-                    let commit =
-                        bamboo_config::persist_provider_instance_credential_transaction_with_adoption(
+            if serde_json::to_value(cfg.subagents()).ok()
+                == serde_json::to_value(candidate.subagents()).ok()
+            {
+                changed.retain(|section| *section != SectionId::Subagents);
+            }
+            if let Some(other) = changed
+                .into_iter()
+                .find(|section| *section != SectionId::Providers)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "provider credential updates cannot be combined with {} changes; split the request",
+                    other.descriptor().name
+                )));
+            }
+            candidate.assign_connect_platform_ids();
+            candidate.refresh_encrypted_secrets().map_err(|error| {
+                AppError::InternalError(anyhow::anyhow!(
+                    "Failed to refresh encrypted secrets: {error}"
+                ))
+            })?;
+            let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
+            (candidate, live_base, newly_off)
+        };
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let account_sink = self.account_sink.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let transaction = tokio::spawn(async move {
+            let (snapshot, enforcement_newly_off) = {
+                let _io = io;
+                let data_dir = app_data_dir.clone();
+                let commit_facade = config_facade.clone();
+                let (candidate, commit) = tokio::task::spawn_blocking(move || {
+                    let result = if let Some(facade) = commit_facade {
+                        let commit =
+                            bamboo_config::persist_provider_instance_credential_transaction_with_adoption(
+                                &data_dir,
+                                &mut candidate,
+                                &provider_intents,
+                                &provider_instance_intents,
+                                facade.as_ref(),
+                            )?;
+                        Ok::<_, ConfigStoreError>((candidate, Some(commit)))
+                    } else {
+                        bamboo_config::persist_provider_instance_credential_transaction(
                             &data_dir,
                             &mut candidate,
                             &provider_intents,
                             &provider_instance_intents,
-                            facade.as_ref(),
                         )?;
-                    Ok::<_, ConfigStoreError>((candidate, Some(commit)))
-                } else {
-                    bamboo_config::persist_provider_instance_credential_transaction(
-                        &data_dir,
-                        &mut candidate,
-                        &provider_intents,
-                        &provider_instance_intents,
-                    )?;
-                    Ok((load_committed_effective_config(&data_dir)?, None))
-                }
-            })
-            .await
-            .map_err(|error| {
-                AppError::InternalError(anyhow::anyhow!(
-                    "provider credential transaction task failed: {error}"
-                ))
-            })?
-            .map_err(|error| match error {
-                ConfigStoreError::Conflict { expected, actual } => {
-                    AppError::ConfigConflict { expected, actual }
-                }
-                ConfigStoreError::Validation(message) => AppError::BadRequest(message),
-                ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
-                    anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
-                ),
-                ConfigStoreError::Io(error) => AppError::StorageError(error),
-                ConfigStoreError::Json(_) => {
-                    AppError::BadRequest("configuration document is invalid".to_string())
-                }
-                ConfigStoreError::Watch(error) => {
-                    AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
-                }
-            })?;
-            let (snapshot, events) = match commit {
-                Some(commit) => {
-                    let mut published = live_base;
-                    let installed = install_credential_section_commit(commit, &mut published)
-                        .map_err(|error| {
+                        Ok((load_committed_effective_config(&data_dir)?, None))
+                    };
+                    #[cfg(test)]
+                    run_generic_before_event_test_hook(&data_dir);
+                    result
+                })
+                .await
+                .map_err(|error| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "provider credential transaction task failed: {error}"
+                    ))
+                })?
+                .map_err(|error| match error {
+                    ConfigStoreError::Conflict { expected, actual } => {
+                        AppError::ConfigConflict { expected, actual }
+                    }
+                    ConfigStoreError::Validation(message) => AppError::BadRequest(message),
+                    ConfigStoreError::CommitIndeterminate(message) => AppError::InternalError(
+                        anyhow::anyhow!("configuration commit outcome is indeterminate: {message}"),
+                    ),
+                    ConfigStoreError::Io(error) => AppError::StorageError(error),
+                    ConfigStoreError::Json(_) => {
+                        AppError::BadRequest("configuration document is invalid".to_string())
+                    }
+                    ConfigStoreError::Watch(error) => AppError::InternalError(anyhow::anyhow!(
+                        "configuration watch failed: {error}"
+                    )),
+                })?;
+                let (snapshot, events) = match commit {
+                    Some(commit) => {
+                        let mut published = live_base;
+                        let installed = install_credential_section_commit(commit, &mut published)
+                            .map_err(|error| {
                             AppError::InternalError(anyhow::anyhow!(
                                 "provider process adoption failed: {error}"
                             ))
                         })?;
-                    (published, installed.events)
+                        (published, installed.events)
+                    }
+                    None => (candidate, Vec::new()),
+                };
+                {
+                    let mut cfg = config.write().await;
+                    snapshot.publish_env_vars();
+                    *cfg = snapshot.clone();
                 }
-                None => (candidate, Vec::new()),
+                publish_exact_facade_events(&account_sink, &events)?;
+                (snapshot, enforcement_newly_off)
             };
-            {
-                let mut cfg = self.config.write().await;
-                snapshot.publish_env_vars();
-                *cfg = snapshot.clone();
+            if enforcement_newly_off {
+                warn_plugin_trust_enforcement_off();
             }
-            publish_exact_facade_events(&account_sink, &events)?;
-            (snapshot, enforcement_newly_off)
-        };
-        if enforcement_newly_off {
-            warn_plugin_trust_enforcement_off();
-        }
-        self.apply_config_effects(snapshot.clone(), effects).await?;
-        Ok(snapshot)
+            Self::apply_config_effects_owned(
+                snapshot.clone(),
+                effects,
+                app_data_dir,
+                config,
+                provider_registry,
+                provider,
+                mcp_manager,
+            )
+            .await?;
+            Ok::<_, AppError>(snapshot)
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "provider config transaction task failed: {error}"
+            ))
+        })?
     }
 
     /// Mutate user env vars through the recoverable credentials.json +
@@ -4117,74 +4153,135 @@ impl AppState {
             AppError::InternalError(anyhow::anyhow!("Failed to refresh encrypted secrets: {e}"))
         })?;
 
-        // Same #126 serialization as update_config: mutate + persist under the
-        // config-IO lock so a reload can't interleave; effects run unlocked.
-        let new_config = {
-            let _io = self.config_io_lock.lock().await;
-            restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut new_config);
-            let (was_off, live_base) = {
-                let cfg = self.config.read().await;
-                // Same guard as `update_config` (#153): a full-config replace
-                // must not silently blow away an unconfirmed recovery either.
-                reject_if_recovery_pending(&cfg)?;
-                (cfg.plugin_trust.enforcement_is_off(), cfg.clone())
-            };
-            let commit = self
-                .persist_config_snapshot(new_config.clone())
+        let io = self.config_io_lock.clone().lock_owned().await;
+        restore_authoritative_cluster_fabric(self.config_facade.as_ref(), &mut new_config);
+        let (was_off, live_base) = {
+            let cfg = self.config.read().await;
+            // Same guard as `update_config` (#153): a full-config replace must
+            // not silently blow away an unconfirmed recovery either.
+            reject_if_recovery_pending(&cfg)?;
+            (cfg.plugin_trust.enforcement_is_off(), cfg.clone())
+        };
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let transaction = tokio::spawn(async move {
+            // Same #126 serialization as update_config: mutate + persist under
+            // the config-IO lock so a reload can't interleave; effects run
+            // unlocked but remain owned by this cancellation-independent task.
+            let new_config = {
+                let _io = io;
+                let commit = Self::persist_config_snapshot(
+                    app_data_dir.clone(),
+                    config_facade.clone(),
+                    new_config.clone(),
+                )
                 .await
                 .map_err(|e| {
                     AppError::InternalError(anyhow::anyhow!("Failed to save config: {e}"))
                 })?;
-            let mut published = if commit.is_some() {
-                live_base
-            } else {
-                new_config
-            };
-            let events = match commit {
-                Some(commit) => {
-                    install_facade_config_commit(commit, &mut published).map_err(|error| {
-                        AppError::InternalError(anyhow::anyhow!(
-                            "failed to install committed configuration section: {error}"
-                        ))
-                    })?
+                let mut published = if commit.is_some() {
+                    live_base
+                } else {
+                    new_config
+                };
+                let events = match commit {
+                    Some(commit) => {
+                        install_facade_config_commit(commit, &mut published).map_err(|error| {
+                            AppError::InternalError(anyhow::anyhow!(
+                                "failed to install committed configuration section: {error}"
+                            ))
+                        })?
+                    }
+                    None => Vec::new(),
+                };
+                let enforcement_newly_off = !was_off && published.plugin_trust.enforcement_is_off();
+                published.publish_env_vars();
+                *config.write().await = published.clone();
+                // Same live signal as `update_config` — a full-config replace
+                // that transitions plugin_trust.enforcement into `Off` warns.
+                if enforcement_newly_off {
+                    warn_plugin_trust_enforcement_off();
                 }
-                None => Vec::new(),
+                publish_exact_facade_events(&account_sink, &events)?;
+                published
             };
-            let enforcement_newly_off = !was_off && published.plugin_trust.enforcement_is_off();
-            published.publish_env_vars();
-            *self.config.write().await = published.clone();
-            // Same live signal as `update_config` — a full-config replace (JSON
-            // merge / PATCH endpoints) that transitions plugin_trust.enforcement
-            // into `Off` must warn just as loudly as a targeted set.
-            if enforcement_newly_off {
-                warn_plugin_trust_enforcement_off();
-            }
-            publish_exact_facade_events(&self.account_sink, &events)?;
-            published
-        };
 
-        self.apply_config_effects(new_config.clone(), effects)
+            Self::apply_config_effects_owned(
+                new_config.clone(),
+                effects,
+                app_data_dir,
+                config,
+                provider_registry,
+                provider,
+                mcp_manager,
+            )
             .await?;
-        Ok(new_config)
+            Ok::<_, AppError>(new_config)
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "config replacement transaction task failed: {error}"
+            ))
+        })?
     }
 
-    async fn apply_config_effects(
-        &self,
+    async fn apply_config_effects_owned(
         new_config: Config,
         effects: ConfigUpdateEffects,
+        app_data_dir: PathBuf,
+        config: Arc<RwLock<Config>>,
+        provider_registry: Arc<bamboo_llm::ProviderRegistry>,
+        provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
+        mcp_manager: Arc<McpServerManager>,
     ) -> Result<(), AppError> {
         if effects.reload_provider {
-            self.reload_provider().await.map_err(|e| {
+            // Match `reload_provider`: if a later writer won after the
+            // serialization lock was released, initialize from that current
+            // live snapshot rather than regressing runtime to this task's
+            // older committed candidate.
+            let live_config = config.read().await.clone();
+            let candidate_registry =
+                bamboo_llm::ProviderRegistry::from_config(&live_config, app_data_dir)
+                    .await
+                    .map_err(|e| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "Failed to reload provider after updating config: {e}"
+                        ))
+                    })?;
+            let default_provider_name = candidate_registry.default_provider_name();
+            let candidate_provider = candidate_registry.get_default().ok_or_else(|| {
+                let message = if live_config.has_provider_instances() {
+                    format!(
+                        "Default provider instance '{}' is not available or failed to initialize",
+                        default_provider_name
+                    )
+                } else {
+                    format!(
+                        "Provider '{}' is not available or failed to initialize",
+                        live_config.provider
+                    )
+                };
                 AppError::InternalError(anyhow::anyhow!(
-                    "Failed to reload provider after updating config: {e}"
+                    "Failed to reload provider after updating config: {}",
+                    bamboo_llm::LLMError::Auth(message)
                 ))
             })?;
+            let mut live_provider = provider.write().await;
+            provider_registry.replace_with(candidate_registry);
+            *live_provider = candidate_provider;
+            tracing::info!(
+                default_provider = %default_provider_name,
+                "Provider reloaded successfully"
+            );
         }
 
         if effects.reconcile_mcp {
-            self.mcp_manager
-                .reconcile_from_config(&new_config.mcp)
-                .await;
+            mcp_manager.reconcile_from_config(&new_config.mcp).await;
         }
 
         Ok(())
@@ -5629,6 +5726,231 @@ mod live_reload_tests {
         .await
         .map(|revisions| assert_eq!(revisions, vec![1, 2]))
         .expect("both serialized core events must reach the journal");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generic_update_cancellation_after_commit_finishes_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let mut feed = state.account_sink.subscribe();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_event_test_hook(dir.path(), move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_config(
+                        |config| {
+                            config.server.port = 22_240;
+                            Ok(())
+                        },
+                        ConfigUpdateEffects::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .core
+                .snapshot()
+                .revision,
+            1,
+            "the abort boundary must follow durable commit and facade adoption"
+        );
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        let converged = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("detached generic update must finish live publication");
+        drop(converged);
+
+        assert_eq!(state.config.read().await.server.port, 22_240);
+        assert_eq!(
+            bamboo_config::ConfigFacade::open(dir.path())
+                .unwrap()
+                .effective_config()
+                .server
+                .port,
+            22_240
+        );
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigChanged {
+                section,
+                revision: 1
+            } if section == "core"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provider_update_cancellation_after_commit_finishes_publication() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x7d; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let mut feed = state.account_sink.subscribe();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_event_test_hook(dir.path(), move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_config_with_provider_credentials(
+                        |config| {
+                            config.provider = "openai".to_string();
+                            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+                                api_key: "cancellation-secret".to_string(),
+                                model: Some("cancellation-model".to_string()),
+                                ..Default::default()
+                            });
+                            Ok(())
+                        },
+                        BTreeSet::from(["openai".to_string()]),
+                        BTreeSet::new(),
+                        ConfigUpdateEffects::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .providers
+                .snapshot()
+                .revision,
+            1,
+            "the abort boundary must follow provider durable/facade adoption"
+        );
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        let converged = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("detached provider update must finish live publication");
+        drop(converged);
+
+        assert_eq!(state.config.read().await.provider, "openai");
+        let durable = bamboo_config::ConfigFacade::open(dir.path())
+            .unwrap()
+            .effective_config();
+        assert_eq!(durable.provider, "openai");
+        assert_eq!(
+            durable
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("cancellation-model")
+        );
+        assert!(matches!(
+            next_config_event(&mut feed, "providers").await,
+            AgentEvent::ConfigChanged {
+                section,
+                revision: 1
+            } if section == "providers"
+        ));
+        for file in ["providers.json", "credentials.json"] {
+            assert!(
+                !std::fs::read_to_string(dir.path().join(file))
+                    .unwrap()
+                    .contains("cancellation-secret"),
+                "{file} must remain secret-free"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replace_config_cancellation_after_commit_finishes_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let mut replacement = state.config.read().await.clone();
+        replacement.server.port = 22_241;
+        let mut feed = state.account_sink.subscribe();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_event_test_hook(dir.path(), move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .replace_config(replacement, ConfigUpdateEffects::default())
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .core
+                .snapshot()
+                .revision,
+            1,
+            "the abort boundary must follow replacement durable/facade adoption"
+        );
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        let converged = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("detached replacement must finish live publication");
+        drop(converged);
+
+        assert_eq!(state.config.read().await.server.port, 22_241);
+        assert_eq!(
+            bamboo_config::ConfigFacade::open(dir.path())
+                .unwrap()
+                .effective_config()
+                .server
+                .port,
+            22_241
+        );
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigChanged {
+                section,
+                revision: 1
+            } if section == "core"
+        ));
     }
 
     #[tokio::test]
