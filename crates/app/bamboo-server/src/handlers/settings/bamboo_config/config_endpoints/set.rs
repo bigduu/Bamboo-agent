@@ -234,6 +234,22 @@ async fn notification_payload_is_unchanged(
     if patch_obj.get("notifications").is_some_and(Value::is_null) {
         return Ok(false);
     }
+    for (channel, field) in [("ntfy", "token"), ("bark", "device_key")] {
+        if patch_obj
+            .get("notifications")
+            .and_then(Value::as_object)
+            .and_then(|notifications| notifications.get(channel))
+            .and_then(Value::as_object)
+            .and_then(|channel| channel.get(field))
+            .and_then(Value::as_str)
+            .is_some_and(bamboo_config::patch::is_masked_api_key)
+        {
+            return Err(AppError::BadRequest(
+                "notification credential value must not be a mask; omit it to keep the existing value"
+                    .to_string(),
+            ));
+        }
+    }
     let current = app_state.config.read().await.clone();
     let mut notification_patch = serde_json::Map::new();
     notification_patch.insert(
@@ -252,17 +268,17 @@ async fn set_notification_config(
     app_state: web::Data<AppState>,
     mut patch_obj: serde_json::Map<String, Value>,
 ) -> Result<HttpResponse, AppError> {
-    let explicit_revision = patch_obj.contains_key("expected_revision");
     let expected_revision = match patch_obj.remove("expected_revision") {
         Some(value) => value.as_u64().ok_or_else(|| {
             AppError::BadRequest(
                 "notification expected_revision must be an unsigned integer".to_string(),
             )
         })?,
-        None => app_state
-            .credential_store
-            .revision()
-            .map_err(super::super::credentials::map_store_read_error)?,
+        None => {
+            return Err(AppError::BadRequest(
+                "notification expected_revision is required".to_string(),
+            ))
+        }
     };
     if patch_obj.len() != 1 {
         return Err(AppError::BadRequest(
@@ -303,13 +319,10 @@ async fn set_notification_config(
                     Value::Null => {}
                     Value::String(value) => {
                         if bamboo_config::patch::is_masked_api_key(value) {
-                            if explicit_revision {
-                                return Err(AppError::BadRequest(
-                                    "notification credential value must not be a mask; omit it to keep the existing value"
-                                        .to_string(),
-                                ));
-                            }
-                            secret_intents.remove(channel);
+                            return Err(AppError::BadRequest(
+                                "notification credential value must not be a mask; omit it to keep the existing value"
+                                    .to_string(),
+                            ));
                         }
                     }
                     _ => {
@@ -323,7 +336,7 @@ async fn set_notification_config(
     }
     let patch_for_update = patch_obj;
     let intents_for_update = secret_intents.clone();
-    let (new_config, _) = app_state
+    let (new_config, _, _, _) = app_state
         .update_notification_credentials(
             expected_revision,
             secret_intents,
@@ -381,6 +394,28 @@ async fn connect_payload_is_unchanged(
     if patch_obj.get("connect").is_some_and(Value::is_null) {
         return Ok(false);
     }
+    if patch_obj
+        .get("connect")
+        .and_then(|connect| connect.get("platforms"))
+        .and_then(Value::as_array)
+        .is_some_and(|platforms| {
+            platforms.iter().any(|platform| {
+                platform.as_object().is_some_and(|platform| {
+                    ["token", "app_secret"].iter().any(|field| {
+                        platform
+                            .get(*field)
+                            .and_then(Value::as_str)
+                            .is_some_and(bamboo_config::patch::is_masked_api_key)
+                    })
+                })
+            })
+        })
+    {
+        return Err(AppError::BadRequest(
+            "connect credential value must not be a mask; omit it to keep the existing value"
+                .to_string(),
+        ));
+    }
     let current = app_state.config.read().await.clone();
     let mut connect_patch = serde_json::Map::new();
     connect_patch.insert(
@@ -399,17 +434,17 @@ async fn set_connect_config(
     app_state: web::Data<AppState>,
     mut patch_obj: serde_json::Map<String, Value>,
 ) -> Result<HttpResponse, AppError> {
-    let explicit_revision = patch_obj.contains_key("expected_revision");
     let expected_revision = match patch_obj.remove("expected_revision") {
         Some(value) => value.as_u64().ok_or_else(|| {
             AppError::BadRequest(
                 "connect expected_revision must be an unsigned integer".to_string(),
             )
         })?,
-        None => app_state
-            .credential_store
-            .revision()
-            .map_err(super::super::credentials::map_store_read_error)?,
+        None => {
+            return Err(AppError::BadRequest(
+                "connect expected_revision is required".to_string(),
+            ))
+        }
     };
     if patch_obj.len() != 1 {
         return Err(AppError::BadRequest(
@@ -461,15 +496,12 @@ async fn set_connect_config(
                     }
                     Value::String(value) => {
                         if bamboo_config::patch::is_masked_api_key(value) {
-                            if explicit_revision {
-                                return Err(AppError::BadRequest(
-                                    "connect credential value must not be a mask; omit it to keep the existing value"
-                                        .to_string(),
-                                ));
-                            }
-                        } else {
-                            intents.insert(index);
+                            return Err(AppError::BadRequest(
+                                "connect credential value must not be a mask; omit it to keep the existing value"
+                                    .to_string(),
+                            ));
                         }
+                        intents.insert(index);
                     }
                     _ => {
                         return Err(AppError::BadRequest(
@@ -484,7 +516,7 @@ async fn set_connect_config(
     config_manager::sanitize_root_patch(&mut patch_obj);
     let patch_for_update = patch_obj;
     let intents_for_update = secret_intents.clone();
-    let (new_config, _) = app_state
+    let (new_config, _, _, _) = app_state
         .update_connect_credentials(expected_revision, secret_intents, move |config| {
             let current = config.clone();
             let mut patch = patch_for_update;

@@ -831,6 +831,18 @@ fn publish_exact_facade_events(
 struct InstalledCredentialSectionCommit {
     events: Vec<ConfigSectionEvent>,
     metadata: bamboo_config::CredentialSectionRuntimeMetadata,
+    section: Option<bamboo_config::SectionEnvelope<Value>>,
+}
+
+fn read_credential_runtime_metadata(
+    data_dir: &std::path::Path,
+) -> Result<bamboo_config::CredentialSectionRuntimeMetadata, ConfigStoreError> {
+    let (credential_statuses, credential_health) =
+        bamboo_config::CredentialStore::open(data_dir).statuses_with_health()?;
+    Ok(bamboo_config::CredentialSectionRuntimeMetadata {
+        credential_statuses,
+        credential_health,
+    })
 }
 
 fn install_credential_section_commit(
@@ -841,8 +853,10 @@ fn install_credential_section_commit(
         revision: _,
         section_adoption,
         credential_adoption,
+        section,
         runtime,
     } = commit;
+    let section = section?;
     let metadata = runtime?.install_into(target);
     let mut events = Vec::new();
     if let Some(adoption) = credential_adoption {
@@ -853,7 +867,11 @@ fn install_credential_section_commit(
     if let Some(adoption) = section_adoption {
         events.push(adoption?);
     }
-    Ok(InstalledCredentialSectionCommit { events, metadata })
+    Ok(InstalledCredentialSectionCommit {
+        events,
+        metadata,
+        section: Some(section),
+    })
 }
 
 fn install_facade_config_commit(
@@ -3276,15 +3294,23 @@ impl AppState {
         })?
     }
 
-    /// Mutate user env vars through the recoverable credentials.json +
-    /// config.json exact transaction. The detached task owns the mutation so
-    /// request cancellation cannot strand durable metadata ahead of runtime.
+    /// Mutate user env vars through the recoverable Env-section + credential
+    /// exact transaction. The detached task owns the mutation so request
+    /// cancellation cannot strand durable metadata ahead of runtime.
     pub async fn update_env_var_credentials<F>(
         &self,
         expected_revision: u64,
         env_intents: std::collections::BTreeSet<String>,
         update: F,
-    ) -> Result<(Config, u64), AppError>
+    ) -> Result<
+        (
+            Config,
+            u64,
+            bamboo_config::CredentialSectionRuntimeMetadata,
+            Option<bamboo_config::SectionEnvelope<Value>>,
+        ),
+        AppError,
+    >
     where
         F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
     {
@@ -3359,22 +3385,29 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            let events = match commit {
+            let installed = match commit {
                 Some(commit) => {
-                    install_credential_section_commit(commit, &mut candidate)
-                        .map_err(|error| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "env process adoption failed: {error}"
-                            ))
-                        })?
-                        .events
+                    install_credential_section_commit(commit, &mut candidate).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "env process adoption failed: {error}"
+                        ))
+                    })?
                 }
-                None => Vec::new(),
+                None => InstalledCredentialSectionCommit {
+                    events: Vec::new(),
+                    metadata: read_credential_runtime_metadata(&app_data_dir).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "env credential status unavailable after commit: {error}"
+                        ))
+                    })?,
+                    section: None,
+                },
             };
             candidate.publish_env_vars();
             *config.write().await = candidate.clone();
-            publish_exact_facade_events(&account_sink, &events)?;
-            Ok::<_, AppError>((candidate, revision))
+            publish_exact_facade_events(&account_sink, &installed.events)?;
+            let section = installed.section;
+            Ok::<_, AppError>((candidate, revision, installed.metadata, section))
         });
         transaction.await.map_err(|error| {
             AppError::InternalError(anyhow::anyhow!(
@@ -3384,7 +3417,7 @@ impl AppState {
     }
 
     /// Mutate notification metadata and ntfy/Bark credentials through the
-    /// recoverable credentials.json + config.json exact transaction. The
+    /// recoverable Notifications-section + credential exact transaction. The
     /// detached task completes durable commit and live publication even if the
     /// initiating HTTP request is cancelled.
     pub async fn update_notification_credentials<F>(
@@ -3393,7 +3426,15 @@ impl AppState {
         secret_intents: std::collections::BTreeSet<String>,
         reset_domain: bool,
         update: F,
-    ) -> Result<(Config, u64), AppError>
+    ) -> Result<
+        (
+            Config,
+            u64,
+            bamboo_config::CredentialSectionRuntimeMetadata,
+            Option<bamboo_config::SectionEnvelope<Value>>,
+        ),
+        AppError,
+    >
     where
         F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
     {
@@ -3466,21 +3507,28 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            let events = match commit {
+            let installed = match commit {
                 Some(commit) => {
-                    install_credential_section_commit(commit, &mut candidate)
-                        .map_err(|error| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "notification process adoption failed: {error}"
-                            ))
-                        })?
-                        .events
+                    install_credential_section_commit(commit, &mut candidate).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "notification process adoption failed: {error}"
+                        ))
+                    })?
                 }
-                None => Vec::new(),
+                None => InstalledCredentialSectionCommit {
+                    events: Vec::new(),
+                    metadata: read_credential_runtime_metadata(&app_data_dir).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "notification credential status unavailable after commit: {error}"
+                        ))
+                    })?,
+                    section: None,
+                },
             };
             *config.write().await = candidate.clone();
-            publish_exact_facade_events(&account_sink, &events)?;
-            Ok::<_, AppError>((candidate, revision))
+            publish_exact_facade_events(&account_sink, &installed.events)?;
+            let section = installed.section;
+            Ok::<_, AppError>((candidate, revision, installed.metadata, section))
         });
         transaction.await.map_err(|error| {
             AppError::InternalError(anyhow::anyhow!(
@@ -3498,7 +3546,15 @@ impl AppState {
         expected_revision: u64,
         secret_intents: bamboo_config::patch::ConnectSecretIntents,
         update: F,
-    ) -> Result<(Config, u64), AppError>
+    ) -> Result<
+        (
+            Config,
+            u64,
+            bamboo_config::CredentialSectionRuntimeMetadata,
+            Option<bamboo_config::SectionEnvelope<Value>>,
+        ),
+        AppError,
+    >
     where
         F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
     {
@@ -3568,21 +3624,28 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            let events = match commit {
+            let installed = match commit {
                 Some(commit) => {
-                    install_credential_section_commit(commit, &mut candidate)
-                        .map_err(|error| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "connect process adoption failed: {error}"
-                            ))
-                        })?
-                        .events
+                    install_credential_section_commit(commit, &mut candidate).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "connect process adoption failed: {error}"
+                        ))
+                    })?
                 }
-                None => Vec::new(),
+                None => InstalledCredentialSectionCommit {
+                    events: Vec::new(),
+                    metadata: read_credential_runtime_metadata(&app_data_dir).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "connect credential status unavailable after commit: {error}"
+                        ))
+                    })?,
+                    section: None,
+                },
             };
             *config.write().await = candidate.clone();
-            publish_exact_facade_events(&account_sink, &events)?;
-            Ok::<_, AppError>((candidate, revision))
+            publish_exact_facade_events(&account_sink, &installed.events)?;
+            let section = installed.section;
+            Ok::<_, AppError>((candidate, revision, installed.metadata, section))
         });
         transaction.await.map_err(|error| {
             AppError::InternalError(anyhow::anyhow!(
@@ -3599,7 +3662,15 @@ impl AppState {
         password_intent: bool,
         device_intents: std::collections::BTreeSet<String>,
         update: F,
-    ) -> Result<(Config, u64), AppError>
+    ) -> Result<
+        (
+            Config,
+            u64,
+            bamboo_config::CredentialSectionRuntimeMetadata,
+            Option<bamboo_config::SectionEnvelope<Value>>,
+        ),
+        AppError,
+    >
     where
         F: FnOnce(&mut Config) -> Result<(), AppError> + Send + 'static,
     {
@@ -3670,21 +3741,28 @@ impl AppState {
                     AppError::InternalError(anyhow::anyhow!("configuration watch failed: {error}"))
                 }
             })?;
-            let events = match commit {
+            let installed = match commit {
                 Some(commit) => {
-                    install_credential_section_commit(commit, &mut candidate)
-                        .map_err(|error| {
-                            AppError::InternalError(anyhow::anyhow!(
-                                "access-control process adoption failed: {error}"
-                            ))
-                        })?
-                        .events
+                    install_credential_section_commit(commit, &mut candidate).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "access-control process adoption failed: {error}"
+                        ))
+                    })?
                 }
-                None => Vec::new(),
+                None => InstalledCredentialSectionCommit {
+                    events: Vec::new(),
+                    metadata: read_credential_runtime_metadata(&app_data_dir).map_err(|error| {
+                        AppError::InternalError(anyhow::anyhow!(
+                            "access-control credential status unavailable after commit: {error}"
+                        ))
+                    })?,
+                    section: None,
+                },
             };
             *config.write().await = candidate.clone();
-            publish_exact_facade_events(&account_sink, &events)?;
-            Ok::<_, AppError>((candidate, revision))
+            publish_exact_facade_events(&account_sink, &installed.events)?;
+            let section = installed.section;
+            Ok::<_, AppError>((candidate, revision, installed.metadata, section))
         });
         transaction.await.map_err(|error| {
             AppError::InternalError(anyhow::anyhow!(
@@ -3694,7 +3772,7 @@ impl AppState {
     }
 
     /// Mutate cluster-fabric node metadata and SSH credentials through the
-    /// recoverable credentials.json + config.json exact transaction. The
+    /// recoverable Cluster-section + credential exact transaction. The
     /// detached task owns durable commit, committed-root reload, and live
     /// publication so request cancellation cannot leave runtime behind disk.
     pub async fn update_cluster_fabric_credentials<F>(
@@ -3979,8 +4057,10 @@ impl AppState {
     ) -> Result<
         (
             Config,
+            u64,
             bamboo_config::CredentialStatus,
             bamboo_config::CredentialStoreHealth,
+            Option<bamboo_config::SectionEnvelope<Value>>,
         ),
         AppError,
     > {
@@ -3998,8 +4078,10 @@ impl AppState {
     ) -> Result<
         (
             Config,
+            u64,
             bamboo_config::CredentialStatus,
             bamboo_config::CredentialStoreHealth,
+            Option<bamboo_config::SectionEnvelope<Value>>,
         ),
         AppError,
     >
@@ -4045,7 +4127,8 @@ impl AppState {
                             .expect("canonical proxy credential reference is valid")
                     });
             let commit_facade = config_facade.clone();
-            let (mut candidate, reference, commit) = tokio::task::spawn_blocking(move || {
+            let (mut candidate, revision, reference, commit) =
+                tokio::task::spawn_blocking(move || {
                 if let Some(facade) = commit_facade {
                     let commit =
                         bamboo_config::persist_proxy_auth_credential_transaction_at_revision_with_adoption(
@@ -4054,15 +4137,23 @@ impl AppState {
                             expected_revision,
                             facade.as_ref(),
                         )?;
-                    Ok::<_, ConfigStoreError>((candidate, status_reference, Some(commit)))
+                    let revision = commit.revision;
+                    Ok::<_, ConfigStoreError>((
+                        candidate,
+                        revision,
+                        status_reference,
+                        Some(commit),
+                    ))
                 } else {
-                    bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
+                    let revision =
+                        bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
                         &transaction_dir,
                         &mut candidate,
                         expected_revision,
                     )?;
                     Ok((
                         load_committed_effective_config(&transaction_dir)?,
+                        revision,
                         status_reference,
                         None,
                     ))
@@ -4100,6 +4191,9 @@ impl AppState {
                 ),
                 None => None,
             };
+            let section = installed
+                .as_ref()
+                .and_then(|installed| installed.section.clone());
 
             // No fallible metadata read occurs before publication. Once the
             // transaction commits, a response error can no longer leave live
@@ -4162,7 +4256,7 @@ impl AppState {
                         )),
                     })?
             };
-            Ok::<_, AppError>((candidate, status, health))
+            Ok::<_, AppError>((candidate, revision, status, health, section))
         });
         transaction.await.map_err(|error| {
             AppError::InternalError(anyhow::anyhow!(
@@ -5101,7 +5195,14 @@ mod live_reload_tests {
         .unwrap();
         let cluster_path = dir.path().join("cluster-fabric.json");
         let cluster_r2 = std::fs::read(&cluster_path).unwrap();
-        let expected_revision = state.credential_store.revision().unwrap();
+        let expected_revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .env
+            .snapshot()
+            .revision;
 
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -5170,7 +5271,7 @@ mod live_reload_tests {
         );
         drop(stale_runtime);
 
-        let (published, revision) = updating.await.unwrap().unwrap();
+        let (published, revision, _, _) = updating.await.unwrap().unwrap();
         assert!(revision > expected_revision);
         assert!(published
             .env_vars
@@ -5236,6 +5337,87 @@ mod live_reload_tests {
             &event.event,
             AgentEvent::ConfigChanged { section, .. } if section == "cluster-fabric"
         )));
+    }
+
+    #[tokio::test]
+    async fn env_mutation_returns_its_captured_envelope_after_a_later_section_commit() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x74; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        set_credential_after_commit_before_live_test_hook(dir.path(), SectionId::Env, move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let updating = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_env_var_credentials(
+                        0,
+                        BTreeSet::from(["TOKEN".to_string()]),
+                        |config| {
+                            config.env_vars.push(bamboo_config::EnvVarEntry {
+                                name: "TOKEN".to_string(),
+                                value: "first-secret".to_string(),
+                                secret: true,
+                                value_encrypted: None,
+                                credential_ref: None,
+                                configured: true,
+                                description: Some("first generation".to_string()),
+                            });
+                            Ok(())
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let external_dir = dir.path().to_path_buf();
+        let process_facade = state.config_facade.clone().unwrap();
+        let later = tokio::task::spawn_blocking(move || {
+            let external = bamboo_config::ConfigFacade::open(&external_dir).unwrap();
+            let mut candidate = external.effective_config();
+            candidate.env_vars[0].description = Some("later generation".to_string());
+            bamboo_config::persist_env_var_credential_transaction_at_revision_with_adoption(
+                &external_dir,
+                &mut candidate,
+                &BTreeSet::from(["TOKEN".to_string()]),
+                1,
+                process_facade.as_ref(),
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(later.revision, 2);
+        assert_eq!(later.section.unwrap().revision, 2);
+        release_tx.send(()).unwrap();
+
+        let (_, revision, _, section) = updating.await.unwrap().unwrap();
+        let section = section.expect("modular mutation returns its exact section");
+        assert_eq!(revision, 1);
+        assert_eq!(section.revision, 1);
+        assert_eq!(section.data[0]["description"], "first generation");
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .env
+                .snapshot()
+                .revision,
+            2,
+            "the process facade advanced, but the response retained its own commit"
+        );
     }
 
     #[tokio::test]

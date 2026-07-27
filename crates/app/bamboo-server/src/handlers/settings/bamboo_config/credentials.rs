@@ -184,6 +184,27 @@ async fn reject_managed_credential_ref(
     {
         return Err(AppError::BadRequest(
             "notification credentials must be changed through the revisioned notification config API"
+            .to_string(),
+        ));
+    }
+    if config.connect.platforms.iter().any(|platform| {
+        platform.token_credential_ref.as_ref() == Some(credential_ref)
+            || platform.app_secret_credential_ref.as_ref() == Some(credential_ref)
+    }) {
+        return Err(AppError::BadRequest(
+            "connect credentials must be changed through the revisioned connect config API"
+                .to_string(),
+        ));
+    }
+    if config.access_control.as_ref().is_some_and(|access| {
+        access.password_credential_ref.as_ref() == Some(credential_ref)
+            || access
+                .devices
+                .iter()
+                .any(|device| device.token_credential_ref.as_ref() == Some(credential_ref))
+    }) {
+        return Err(AppError::BadRequest(
+            "access-control credentials must be changed through the revisioned access APIs"
                 .to_string(),
         ));
     }
@@ -506,6 +527,55 @@ mod tests {
                 .map(|auth| auth.username.as_str()),
             Some("active")
         );
+    }
+
+    #[actix_web::test]
+    async fn generic_mutations_reject_active_connect_and_access_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let connect = CredentialRef::parse("connect.platform-one.token").unwrap();
+        let access_password =
+            bamboo_config::config_crypto::access_password_credential_ref().unwrap();
+        let access_device =
+            bamboo_config::config_crypto::access_device_credential_ref("device-one").unwrap();
+        {
+            let mut config = state.config.write().await;
+            config.connect.platforms.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "platform-one",
+                    "type": "telegram",
+                    "token_credential_ref": connect.clone(),
+                    "token_configured": true
+                }))
+                .unwrap(),
+            );
+            config.access_control = Some(bamboo_config::AccessControlConfig {
+                password_enabled: true,
+                password_credential_ref: Some(access_password.clone()),
+                password_configured: true,
+                devices: vec![bamboo_config::DeviceCredential {
+                    device_id: "device-one".to_string(),
+                    label: "Device".to_string(),
+                    token_hash: String::new(),
+                    token_salt: String::new(),
+                    token_credential_ref: Some(access_device.clone()),
+                    token_configured: true,
+                    created_at: "2026-07-27T00:00:00Z".to_string(),
+                    last_used_at: None,
+                    revoked: false,
+                }],
+                ..Default::default()
+            });
+        }
+
+        for reference in [&connect, &access_password, &access_device] {
+            assert!(
+                reject_managed_credential_ref(&state, reference)
+                    .await
+                    .is_err(),
+                "{reference:?}"
+            );
+        }
     }
 
     #[actix_web::test]

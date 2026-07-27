@@ -548,6 +548,10 @@ pub async fn put_typed_section(
             | bamboo_config::SectionId::Mcp
             | bamboo_config::SectionId::Credentials
             | bamboo_config::SectionId::ClusterFabric
+            | bamboo_config::SectionId::Env
+            | bamboo_config::SectionId::Notifications
+            | bamboo_config::SectionId::Connect
+            | bamboo_config::SectionId::AccessControl
     ) {
         return Err(AppError::BadRequest(
             "this section requires its dedicated endpoint".to_string(),
@@ -3830,6 +3834,36 @@ mod tests {
                 .label,
             "queued-second-commit"
         );
+    }
+
+    #[actix_web::test]
+    async fn generic_typed_put_rejects_credential_backed_domain_bypasses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/sections/{section}", web::put().to(put_typed_section)),
+        )
+        .await;
+
+        for section in ["env", "notifications", "connect", "access-control"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::put()
+                    .uri(&format!("/sections/{section}"))
+                    .set_json(json!({"expected_revision": 0, "data": {}}))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "{section}"
+            );
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(body.contains("dedicated endpoint"), "{section}: {body}");
+        }
     }
 
     #[actix_web::test]

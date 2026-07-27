@@ -1745,9 +1745,10 @@ fn persist_proxy_auth_credential_transaction(
     persist_proxy_auth_credential_transaction_at_revision(data_dir, config, expected_revision)
 }
 
-/// Persist proxy authentication with an explicit credential-store revision
-/// precondition. The returned revision is the durable credential revision
-/// committed by the exact transaction.
+/// Persist proxy authentication with an explicit revision precondition. In the
+/// modular layout the core section is the public CAS authority and the returned
+/// revision is its exact committed revision. The legacy layout retains the
+/// credential-document revision contract for bounded compatibility.
 pub fn persist_proxy_auth_credential_transaction_at_revision(
     data_dir: impl AsRef<Path>,
     config: &mut crate::Config,
@@ -1784,8 +1785,9 @@ pub fn persist_proxy_auth_credential_transaction_at_revision(
     )
 }
 
-/// Persist secret env values and their root metadata as one recoverable exact
-/// transaction guarded by the credential document revision.
+/// Persist secret env values and their metadata as one recoverable exact
+/// transaction. In the modular layout the env section is the sole public CAS
+/// authority; the credential revision remains an internal transaction member.
 pub fn persist_env_var_credential_transaction_at_revision(
     data_dir: impl AsRef<Path>,
     config: &mut crate::Config,
@@ -2035,6 +2037,7 @@ pub struct CredentialSectionTransactionCommit {
     pub revision: u64,
     pub section_adoption: Option<ConfigStoreResult<crate::ConfigSectionEvent>>,
     pub credential_adoption: Option<ConfigStoreResult<Option<crate::ConfigSectionEvent>>>,
+    pub section: ConfigStoreResult<crate::SectionEnvelope<Value>>,
     pub runtime: ConfigStoreResult<CredentialSectionRuntimeSnapshot>,
 }
 
@@ -2143,6 +2146,7 @@ where
     F: FnOnce(SectionPostCommit<'_>) -> ConfigStoreResult<u64>,
 {
     let mut section_adoption = None;
+    let mut exact_section = None;
     let mut exact_runtime = None;
     let mut callback =
         |scope: ExactTransactionScope,
@@ -2174,6 +2178,19 @@ where
                         .catch_up_committed_section(scope.section_id())
                         .map(Ok)
                 };
+                exact_section = Some(
+                    if section_adoption
+                        .as_ref()
+                        .is_none_or(|adoption| adoption.is_ok())
+                    {
+                        facade.registry().envelope_value(scope.section_id())
+                    } else {
+                        Err(ConfigStoreError::Validation(
+                            "committed section could not be adopted for exact response capture"
+                                .to_string(),
+                        ))
+                    },
+                );
             }
             exact_runtime = Some(runtime);
         };
@@ -2181,6 +2198,11 @@ where
     let exact_runtime = exact_runtime.unwrap_or_else(|| {
         Err(ConfigStoreError::Validation(
             "exact section transaction omitted runtime materialization".to_string(),
+        ))
+    });
+    let section = exact_section.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "exact section transaction omitted its committed envelope".to_string(),
         ))
     });
     let (runtime, credential_adoption) = match exact_runtime {
@@ -2200,6 +2222,7 @@ where
         revision,
         section_adoption,
         credential_adoption,
+        section,
         runtime,
     })
 }
@@ -3610,46 +3633,38 @@ fn persist_exact_credential_transaction_inner(
     } else {
         None
     };
-    if let (Some(expected), Some(section), Some(ExactTransactionScope::Providers)) = (
-        provider_expected_revision,
-        active_section.as_ref(),
-        exact_scope,
-    ) {
-        if section.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: section.expected_revision,
-            });
+    let client_section_revision = match exact_scope {
+        Some(ExactTransactionScope::Providers) => provider_expected_revision,
+        Some(ExactTransactionScope::Mcp) => {
+            mcp_transaction.map(|(_, expected_revision)| expected_revision)
         }
-    }
-    if let (Some(expected), Some(section), Some(ExactTransactionScope::Mcp)) = (
-        mcp_transaction.map(|(_, revision)| revision),
-        active_section.as_ref(),
-        exact_scope,
-    ) {
-        if section.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: section.expected_revision,
-            });
+        Some(ExactTransactionScope::ProxyAuth) => proxy_expected_revision,
+        Some(ExactTransactionScope::EnvVars) => env_expected_revision,
+        Some(ExactTransactionScope::Notifications) => notification_expected_revision,
+        Some(ExactTransactionScope::Connect) => {
+            connect_transaction.map(|(_, expected_revision)| expected_revision)
         }
-    }
-    if let (Some((_, expected)), Some(section), Some(ExactTransactionScope::ClusterFabric)) =
-        (cluster_transaction, active_section.as_ref(), exact_scope)
-    {
-        if section.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: section.expected_revision,
-            });
+        Some(ExactTransactionScope::AccessControl) => {
+            access_transaction.map(|(_, _, expected_revision)| expected_revision)
         }
+        Some(ExactTransactionScope::ClusterFabric) => {
+            cluster_transaction.map(|(_, expected_revision)| expected_revision)
+        }
+        None => None,
     }
-    if let (Some((_, expected)), Some(section)) = (reset_scope, active_section.as_ref()) {
-        if section.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: section.expected_revision,
-            });
+    .or_else(|| reset_scope.map(|(_, expected_revision)| expected_revision));
+    if let Some(section) = active_section.as_ref() {
+        if let Some(expected) = client_section_revision {
+            if section.expected_revision != expected {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: section.expected_revision,
+                });
+            }
+        } else if !matches!(exact_scope, Some(ExactTransactionScope::Providers)) {
+            return Err(ConfigStoreError::Validation(
+                "owned section revision precondition is required".to_string(),
+            ));
         }
     }
 
@@ -3855,17 +3870,6 @@ fn persist_exact_credential_transaction_inner(
             store.prepare_provider_metadata_update()?
         }
         None if section_post_commit.is_some() && active_section.is_some() => {
-            let expected_credential_revision = proxy_expected_revision
-                .or(env_expected_revision)
-                .or(notification_expected_revision)
-                .or_else(|| connect_transaction.map(|(_, revision)| revision))
-                .or_else(|| access_transaction.map(|(_, _, revision)| revision));
-            if let Some(expected) = expected_credential_revision {
-                let actual = store.revision_unchecked()?;
-                if actual != expected {
-                    return Err(ConfigStoreError::Conflict { expected, actual });
-                }
-            }
             let scope = exact_scope.expect("active exact section has a scope");
             let section = active_section
                 .as_ref()
@@ -3881,11 +3885,11 @@ fn persist_exact_credential_transaction_inner(
                     .as_mut()
                     .expect("guarded by post-commit callback presence"),
             );
-            return store.revision_unchecked();
+            return Ok(section.expected_revision);
         }
         None => return store.revision_unchecked(),
     };
-    if proxy_only && reset_scope.is_none() {
+    if active_section.is_none() && proxy_only && reset_scope.is_none() {
         let expected = proxy_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "proxy auth credential revision precondition is required".to_string(),
@@ -3898,7 +3902,7 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if env_only && reset_scope.is_none() {
+    if active_section.is_none() && env_only && reset_scope.is_none() {
         let expected = env_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "env credential revision precondition is required".to_string(),
@@ -3911,7 +3915,7 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if notification_only && reset_scope.is_none() {
+    if active_section.is_none() && notification_only && reset_scope.is_none() {
         let expected = notification_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "notification credential revision precondition is required".to_string(),
@@ -3924,20 +3928,22 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if let Some((_, expected)) = connect_transaction {
-        if prepared.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: prepared.expected_revision,
-            });
+    if active_section.is_none() {
+        if let Some((_, expected)) = connect_transaction {
+            if prepared.expected_revision != expected {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: prepared.expected_revision,
+                });
+            }
         }
-    }
-    if let Some((_, _, expected)) = access_transaction {
-        if prepared.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: prepared.expected_revision,
-            });
+        if let Some((_, _, expected)) = access_transaction {
+            if prepared.expected_revision != expected {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: prepared.expected_revision,
+                });
+            }
         }
     }
     if proxy_only && active_section.is_some() && prepared.required_refs.is_empty() {
@@ -4021,8 +4027,10 @@ fn persist_exact_credential_transaction_inner(
             original_data != candidate_data,
         )
     } else if let (Some(section), Some(scope)) = (active_section.as_ref(), exact_scope) {
-        let credential_changed =
-            (mcp_only || cluster_only) && prepared.revision != prepared.expected_revision;
+        // A secret-only replacement/clear is still an owned-section mutation:
+        // clients observing only the typed section revision must be able to
+        // detect it even when the persisted metadata is otherwise unchanged.
+        let credential_changed = prepared.revision != prepared.expected_revision;
         let (bytes, changed) = prepare_active_exact_section_document(
             section,
             scope,
@@ -4078,7 +4086,21 @@ fn persist_exact_credential_transaction_inner(
         )?;
     }
     let current_credential_revision = store.revision_unchecked()?;
-    if current_credential_revision != prepared.expected_revision && !cluster_only {
+    let owned_section_is_public_authority = active_section.is_some()
+        && matches!(
+            exact_scope,
+            Some(
+                ExactTransactionScope::ProxyAuth
+                    | ExactTransactionScope::EnvVars
+                    | ExactTransactionScope::Notifications
+                    | ExactTransactionScope::Connect
+                    | ExactTransactionScope::AccessControl
+                    | ExactTransactionScope::ClusterFabric
+            )
+        );
+    if current_credential_revision != prepared.expected_revision
+        && !owned_section_is_public_authority
+    {
         return Err(ConfigStoreError::Conflict {
             expected: prepared.expected_revision,
             actual: current_credential_revision,
@@ -4126,7 +4148,7 @@ fn persist_exact_credential_transaction_inner(
                 callback,
             );
         }
-        return if cluster_only && active_section.is_some() {
+        return if active_section.is_some() {
             Ok(committed_authority_revision)
         } else {
             store.revision_unchecked()
@@ -4250,8 +4272,8 @@ fn persist_exact_credential_transaction_inner(
         let current_sha256 = sha256(&current);
         if file.original_sha256.as_deref() != Some(current_sha256.as_str()) {
             if file.name == CREDENTIALS_FILE {
-                if exact_scope == Some(ExactTransactionScope::ClusterFabric) {
-                    // The cluster section is the external CAS authority. Commit
+                if owned_section_is_public_authority {
+                    // The owned section is the external CAS authority. Commit
                     // the manifest against its still-current revision and let
                     // `install_exact_credential_member` three-way rebase this
                     // internal member over unrelated credential winners.
@@ -4627,9 +4649,13 @@ fn persist_exact_credential_transaction_inner(
             callback,
         );
         // Credential-member rebases can advance beyond the initially staged
-        // revision. Keep the public credential revision distinct from the
-        // exact owned-section envelope revision passed to adoption above.
-        store.revision_unchecked()
+        // revision. The owned section remains the sole public CAS authority.
+        Ok(committed_authority_revision)
+    } else if active_section.is_some() {
+        // Non-adopting callers use the same public contract: the returned
+        // revision is the owned section generation, never the internal
+        // credential-document generation.
+        Ok(committed_authority_revision)
     } else {
         // Credential-member rebases can advance beyond the initially staged
         // revision. Preserve the existing exact-transaction return contract
@@ -11720,9 +11746,17 @@ fn install_exact_credential_member(
             continue;
         }
         if file.touched_credential_refs.is_empty()
-            && manifest.exact_scope != Some(ExactTransactionScope::Notifications)
-            && manifest.exact_scope != Some(ExactTransactionScope::Connect)
-            && manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+            && !matches!(
+                manifest.exact_scope,
+                Some(
+                    ExactTransactionScope::ProxyAuth
+                        | ExactTransactionScope::EnvVars
+                        | ExactTransactionScope::Notifications
+                        | ExactTransactionScope::Connect
+                        | ExactTransactionScope::AccessControl
+                        | ExactTransactionScope::ClusterFabric
+                )
+            )
         {
             return Err(ConfigStoreError::Validation(
                 "committed credential transaction cannot be safely rebased".to_string(),
@@ -16020,6 +16054,251 @@ mod tests {
         (facade.effective_config(), revision)
     }
 
+    fn active_facade_config_and_section_revision(
+        data_dir: &Path,
+        section: crate::SectionId,
+    ) -> (crate::Config, u64) {
+        let facade = crate::ConfigFacade::open(data_dir).unwrap();
+        let revision = facade.registry().envelope_value(section).unwrap().revision;
+        (facade.effective_config(), revision)
+    }
+
+    fn install_unrelated_credential(data_dir: &Path, value: &str) -> CredentialRef {
+        let reference = credential_ref("provider", "unrelated", "api_key").unwrap();
+        CredentialStore::open(data_dir)
+            .replace(reference.clone(), value, crate::CredentialSource::User, 0)
+            .unwrap();
+        reference
+    }
+
+    fn assert_unrelated_credential(data_dir: &Path, reference: &CredentialRef, value: &str) {
+        assert_eq!(
+            CredentialStore::open(data_dir)
+                .resolve(reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            value
+        );
+    }
+
+    fn persist_owned_domain_with_fault(
+        data_dir: &Path,
+        config: &mut crate::Config,
+        scope: ExactTransactionScope,
+        expected_revision: u64,
+        fault: MigrationFault,
+    ) -> ConfigStoreResult<u64> {
+        let empty = BTreeSet::new();
+        match scope {
+            ExactTransactionScope::ProxyAuth => {
+                let providers = BTreeSet::from(["__proxy_auth".to_string()]);
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &providers,
+                    &empty,
+                    Some(expected_revision),
+                    &empty,
+                    None,
+                    false,
+                    &empty,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::EnvVars => {
+                let intents = config
+                    .env_vars
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect::<BTreeSet<_>>();
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &empty,
+                    &empty,
+                    None,
+                    &intents,
+                    Some(expected_revision),
+                    false,
+                    &empty,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::Notifications => {
+                let intents = BTreeSet::from(["ntfy".to_string()]);
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &empty,
+                    &empty,
+                    None,
+                    &empty,
+                    None,
+                    true,
+                    &intents,
+                    false,
+                    Some(expected_revision),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::Connect => {
+                let mut intents = crate::patch::ConnectSecretIntents::default();
+                intents.token.insert(0);
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &empty,
+                    &empty,
+                    None,
+                    &empty,
+                    None,
+                    false,
+                    &empty,
+                    false,
+                    None,
+                    None,
+                    Some((&intents, expected_revision)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::AccessControl => persist_exact_credential_transaction_inner(
+                data_dir,
+                config,
+                &empty,
+                &empty,
+                None,
+                &empty,
+                None,
+                false,
+                &empty,
+                false,
+                None,
+                None,
+                None,
+                Some((true, &empty, expected_revision)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(fault),
+            ),
+            ExactTransactionScope::Providers
+            | ExactTransactionScope::Mcp
+            | ExactTransactionScope::ClusterFabric => unreachable!("test helper scope"),
+        }
+    }
+
+    fn populate_owned_domain_candidate(
+        config: &mut crate::Config,
+        scope: ExactTransactionScope,
+        suffix: usize,
+    ) -> (CredentialRef, String) {
+        match scope {
+            ExactTransactionScope::ProxyAuth => {
+                let secret = format!("fault-proxy-secret-{suffix}");
+                config.proxy_auth = Some(crate::ProxyAuth {
+                    username: "fault-user".to_string(),
+                    password: secret.clone(),
+                });
+                (credential_ref("proxy", "default", "auth").unwrap(), secret)
+            }
+            ExactTransactionScope::EnvVars => {
+                let name = format!("FAULT_TOKEN_{suffix}");
+                let secret = format!("fault-env-secret-{suffix}");
+                config.env_vars.push(crate::EnvVarEntry {
+                    name: name.clone(),
+                    value: secret.clone(),
+                    secret: true,
+                    value_encrypted: None,
+                    credential_ref: None,
+                    configured: true,
+                    description: None,
+                });
+                (credential_ref("env", &name, "value").unwrap(), secret)
+            }
+            ExactTransactionScope::Notifications => {
+                let secret = format!("fault-notification-secret-{suffix}");
+                config.notifications.ntfy.enabled = true;
+                config.notifications.ntfy.topic = format!("fault-topic-{suffix}");
+                config.notifications.ntfy.token = Some(secret.clone());
+                config.notifications.ntfy.configured = true;
+                (
+                    credential_ref("notification", "ntfy", "token").unwrap(),
+                    secret,
+                )
+            }
+            ExactTransactionScope::Connect => {
+                let id = format!("fault-connect-{suffix}");
+                let secret = format!("fault-connect-secret-{suffix}");
+                config.connect.platforms.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": id.clone(),
+                        "type": "telegram",
+                        "token": secret.clone(),
+                        "allow_from": ["owner"]
+                    }))
+                    .unwrap(),
+                );
+                (credential_ref("connect", &id, "token").unwrap(), secret)
+            }
+            ExactTransactionScope::AccessControl => {
+                let marker = format!("{:064x}", suffix + 1);
+                config.access_control = Some(crate::AccessControlConfig {
+                    password_enabled: true,
+                    password_hash: Some(marker.clone()),
+                    password_salt: Some("03".repeat(16)),
+                    password_credential_ref: None,
+                    password_configured: false,
+                    updated_at: None,
+                    devices: Vec::new(),
+                });
+                (
+                    crate::config_crypto::access_password_credential_ref().unwrap(),
+                    marker,
+                )
+            }
+            ExactTransactionScope::Providers
+            | ExactTransactionScope::Mcp
+            | ExactTransactionScope::ClusterFabric => unreachable!("test helper scope"),
+        }
+    }
+
     fn active_facade_config_and_cluster_revision(data_dir: &Path) -> (crate::Config, u64) {
         let facade = crate::ConfigFacade::open(data_dir).unwrap();
         let revision = facade.registry().cluster_fabric.snapshot().revision;
@@ -16261,6 +16540,415 @@ mod tests {
     }
 
     #[test]
+    fn active_credential_domains_use_owned_section_cas_and_rebase_unrelated_credentials() {
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc1; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), crate::SectionId::Core);
+            let unrelated = install_unrelated_credential(dir.path(), "proxy-unrelated-winner");
+            candidate.proxy_auth = Some(crate::ProxyAuth {
+                username: "proxy-user".to_string(),
+                password: "proxy-secret".to_string(),
+            });
+
+            let committed = persist_proxy_auth_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .core
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "proxy-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc2; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), crate::SectionId::Env);
+            let unrelated = install_unrelated_credential(dir.path(), "env-unrelated-winner");
+            candidate.env_vars.push(crate::EnvVarEntry {
+                name: "OWNED_TOKEN".to_string(),
+                value: "owned-env-secret".to_string(),
+                secret: true,
+                value_encrypted: None,
+                credential_ref: None,
+                configured: true,
+                description: Some("owned metadata".to_string()),
+            });
+
+            let committed = persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeSet::from(["OWNED_TOKEN".to_string()]),
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .env
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "env-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc3; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) = active_facade_config_and_section_revision(
+                dir.path(),
+                crate::SectionId::Notifications,
+            );
+            let unrelated =
+                install_unrelated_credential(dir.path(), "notification-unrelated-winner");
+            candidate.notifications.ntfy.enabled = true;
+            candidate.notifications.ntfy.topic = "owned-topic".to_string();
+            candidate.notifications.ntfy.token = Some("owned-notification-secret".to_string());
+            candidate.notifications.ntfy.configured = true;
+
+            let committed = persist_notification_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeSet::from(["ntfy".to_string()]),
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .notifications
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "notification-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc4; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), crate::SectionId::Connect);
+            let unrelated = install_unrelated_credential(dir.path(), "connect-unrelated-winner");
+            candidate.connect.platforms.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "telegram-owned",
+                    "type": "telegram",
+                    "token": "owned-connect-secret",
+                    "allow_from": ["owner"]
+                }))
+                .unwrap(),
+            );
+            let mut intents = crate::patch::ConnectSecretIntents::default();
+            intents.token.insert(0);
+
+            let committed = persist_connect_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .connect
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "connect-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc5; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) = active_facade_config_and_section_revision(
+                dir.path(),
+                crate::SectionId::AccessControl,
+            );
+            let unrelated = install_unrelated_credential(dir.path(), "access-unrelated-winner");
+            candidate.access_control = Some(crate::AccessControlConfig {
+                password_enabled: true,
+                password_hash: Some("a".repeat(64)),
+                password_salt: Some("01".repeat(16)),
+                password_credential_ref: None,
+                password_configured: false,
+                updated_at: None,
+                devices: Vec::new(),
+            });
+
+            let committed = persist_access_control_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                true,
+                &BTreeSet::new(),
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .access_control
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "access-unrelated-winner");
+        }
+    }
+
+    #[test]
+    fn owned_section_transactions_rebase_unrelated_credentials_changed_after_preparation() {
+        for (scope, key) in [
+            (ExactTransactionScope::ProxyAuth, 0xd0),
+            (ExactTransactionScope::EnvVars, 0xd1),
+            (ExactTransactionScope::Notifications, 0xd2),
+            (ExactTransactionScope::Connect, 0xd3),
+            (ExactTransactionScope::AccessControl, 0xd4),
+        ] {
+            let _key = crate::encryption::set_test_encryption_key([key; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), scope.section_id());
+            match scope {
+                ExactTransactionScope::ProxyAuth => {
+                    candidate.proxy_auth = Some(crate::ProxyAuth {
+                        username: "race-proxy-user".to_string(),
+                        password: "race-proxy-secret".to_string(),
+                    });
+                }
+                ExactTransactionScope::EnvVars => {
+                    candidate.env_vars.push(crate::EnvVarEntry {
+                        name: "RACE_TOKEN".to_string(),
+                        value: "race-env-secret".to_string(),
+                        secret: true,
+                        value_encrypted: None,
+                        credential_ref: None,
+                        configured: true,
+                        description: None,
+                    });
+                }
+                ExactTransactionScope::Notifications => {
+                    candidate.notifications.ntfy.enabled = true;
+                    candidate.notifications.ntfy.topic = "race-topic".to_string();
+                    candidate.notifications.ntfy.token =
+                        Some("race-notification-secret".to_string());
+                    candidate.notifications.ntfy.configured = true;
+                }
+                ExactTransactionScope::Connect => {
+                    candidate.connect.platforms.push(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "race-telegram",
+                            "type": "telegram",
+                            "token": "race-connect-secret",
+                            "allow_from": ["owner"]
+                        }))
+                        .unwrap(),
+                    );
+                }
+                ExactTransactionScope::AccessControl => {
+                    candidate.access_control = Some(crate::AccessControlConfig {
+                        password_enabled: true,
+                        password_hash: Some("b".repeat(64)),
+                        password_salt: Some("02".repeat(16)),
+                        password_credential_ref: None,
+                        password_configured: false,
+                        updated_at: None,
+                        devices: Vec::new(),
+                    });
+                }
+                ExactTransactionScope::Providers
+                | ExactTransactionScope::Mcp
+                | ExactTransactionScope::ClusterFabric => unreachable!(),
+            }
+
+            let committed = persist_owned_domain_with_fault(
+                dir.path(),
+                &mut candidate,
+                scope,
+                revision,
+                MigrationFault::BeforeExactStagingUnrelatedCredentialRace,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1, "{scope:?}");
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .envelope_value(scope.section_id())
+                    .unwrap()
+                    .revision,
+                committed,
+                "{scope:?}"
+            );
+            let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+            assert_eq!(
+                CredentialStore::open(dir.path())
+                    .resolve(&unrelated)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                "concurrent-pre-staging-winner",
+                "{scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_credential_sections_recover_every_durable_boundary_atomically() {
+        let scopes = [
+            ExactTransactionScope::ProxyAuth,
+            ExactTransactionScope::EnvVars,
+            ExactTransactionScope::Notifications,
+            ExactTransactionScope::Connect,
+            ExactTransactionScope::AccessControl,
+        ];
+        let faults = [
+            MigrationFault::AfterManifest,
+            MigrationFault::AfterCredentials,
+            MigrationFault::AfterAuthoritativeSection,
+        ];
+        for (scope_index, scope) in scopes.into_iter().enumerate() {
+            for (fault_index, fault) in faults.into_iter().enumerate() {
+                let case = scope_index * faults.len() + fault_index;
+                let _key = crate::encryption::set_test_encryption_key([0xe0 + case as u8; 32]);
+                let dir = tempfile::tempdir().unwrap();
+                crate::migrate_config_facade_layout(dir.path()).unwrap();
+                let (mut candidate, revision) =
+                    active_facade_config_and_section_revision(dir.path(), scope.section_id());
+                let (reference, secret_marker) =
+                    populate_owned_domain_candidate(&mut candidate, scope, case);
+
+                let error = persist_owned_domain_with_fault(
+                    dir.path(),
+                    &mut candidate,
+                    scope,
+                    revision,
+                    fault,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(error, ConfigStoreError::Io(_)),
+                    "{scope:?} {fault:?}"
+                );
+                assert!(
+                    crate::ConfigFacade::open(dir.path()).is_err(),
+                    "{scope:?} {fault:?} must not expose a partial generation"
+                );
+                assert!(
+                    recover_pending_config_transaction(dir.path()).unwrap(),
+                    "{scope:?} {fault:?}"
+                );
+                let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+                assert_eq!(
+                    fresh
+                        .registry()
+                        .envelope_value(scope.section_id())
+                        .unwrap()
+                        .revision,
+                    revision + 1,
+                    "{scope:?} {fault:?}"
+                );
+                assert!(
+                    CredentialStore::open(dir.path())
+                        .status(&reference)
+                        .unwrap()
+                        .configured,
+                    "{scope:?} {fault:?}"
+                );
+                for file in [scope.section_id().descriptor().file_name, CREDENTIALS_FILE] {
+                    let bytes = std::fs::read_to_string(dir.path().join(file)).unwrap();
+                    assert!(
+                        !bytes.contains(&secret_marker),
+                        "{scope:?} {fault:?} leaked into {file}"
+                    );
+                }
+                assert_active_exact_manifest(dir.path(), scope);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_env_section_revision_conflicts_without_touching_credentials() {
+        let _key = crate::encryption::set_test_encryption_key([0xc6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, stale_revision) =
+            active_facade_config_and_section_revision(dir.path(), crate::SectionId::Env);
+        candidate.env_vars.push(crate::EnvVarEntry {
+            name: "STALE_TOKEN".to_string(),
+            value: "must-not-commit".to_string(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let path = dir.path().join(ENV_FILE);
+        let mut envelope: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["revision"] = Value::from(stale_revision + 1);
+        let bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+        crate::section_facade::validate_section_envelope(ENV_FILE, &bytes, stale_revision + 1)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+
+        let error = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::from(["STALE_TOKEN".to_string()]),
+            stale_revision,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict {
+                expected,
+                actual
+            } if expected == stale_revision && actual == stale_revision + 1
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+    }
+
+    #[test]
     fn adopted_env_semantic_noop_catches_up_only_the_stale_owned_generation() {
         let _key = crate::encryption::set_test_encryption_key([0x5a; 32]);
         let dir = tempfile::tempdir().unwrap();
@@ -16311,9 +16999,11 @@ mod tests {
             revision: committed_revision,
             section_adoption,
             credential_adoption,
+            section,
             runtime,
         } = commit;
         assert_eq!(committed_revision, revision);
+        assert_eq!(section.unwrap().revision, committed_revision);
         assert!(matches!(
             section_adoption.unwrap().unwrap(),
             crate::ConfigSectionEvent::Changed {

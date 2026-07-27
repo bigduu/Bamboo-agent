@@ -21,6 +21,8 @@ async fn configure_routes_registers_expected_api_prefixes() {
         ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
         ("GET", "/v1/bamboo/workflows"),
         ("GET", "/v1/bamboo/access/status"),
+        ("PUT", "/v1/bamboo/config/notifications"),
+        ("PUT", "/v1/bamboo/config/connect"),
         ("GET", "/api/v1/plugins"),
         ("GET", "/openai/v1/models"),
         ("GET", "/anthropic/v1/models"),
@@ -30,6 +32,7 @@ async fn configure_routes_registers_expected_api_prefixes() {
     for (method, uri) in requests {
         let req = match method {
             "POST" => test::TestRequest::post().uri(uri).to_request(),
+            "PUT" => test::TestRequest::put().uri(uri).to_request(),
             "DELETE" => test::TestRequest::delete().uri(uri).to_request(),
             _ => test::TestRequest::get().uri(uri).to_request(),
         };
@@ -57,6 +60,8 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
         ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
         ("GET", "/v1/bamboo/workflows"),
         ("GET", "/v1/bamboo/access/status"),
+        ("PUT", "/v1/bamboo/config/notifications"),
+        ("PUT", "/v1/bamboo/config/connect"),
         ("GET", "/api/v1/plugins"),
         ("GET", "/openai/v1/models"),
         ("GET", "/anthropic/v1/models"),
@@ -66,6 +71,7 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
     for (method, uri) in requests {
         let req = match method {
             "POST" => test::TestRequest::post().uri(uri).to_request(),
+            "PUT" => test::TestRequest::put().uri(uri).to_request(),
             "DELETE" => test::TestRequest::delete().uri(uri).to_request(),
             _ => test::TestRequest::get().uri(uri).to_request(),
         };
@@ -97,6 +103,8 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
         "/sessions/session/workflow-runs/example",
         "/bamboo/setup/status",
         "/bamboo/config",
+        "/bamboo/config/notifications",
+        "/bamboo/config/connect",
         "/bamboo/access/status",
         "/bamboo/model-limits/defaults",
         "/bamboo/tools",
@@ -757,10 +765,22 @@ async fn password_change_preserves_paired_devices() {
     assert_eq!(device_count_before, 1);
 
     // Change the root password (local bypass → current_password not required).
+    let expected_revision = app_state
+        .config_facade
+        .as_ref()
+        .expect("modular config facade")
+        .registry()
+        .access_control
+        .snapshot()
+        .revision;
     let change_req = test::TestRequest::post()
         .uri("/v1/bamboo/access/password")
         .insert_header((header::HOST, "localhost:9562"))
-        .set_json(serde_json::json!({ "new_password": "newsecret" }))
+        .set_json(serde_json::json!({
+            "expected_revision": expected_revision,
+            "action": "replace",
+            "value": "newsecret"
+        }))
         .to_request();
     let change_resp = test::call_service(&app, change_req).await;
     assert_eq!(change_resp.status(), StatusCode::OK);

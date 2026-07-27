@@ -1780,20 +1780,16 @@ fn validate_external_broker_endpoint(raw: &str) -> Result<(), String> {
 
 fn validate_notifications(value: &NotificationsSection) -> Result<(), String> {
     let ntfy = &value.notifications.ntfy;
-    if ntfy
-        .token
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
+    validate_secret_free_http_url("ntfy base", &ntfy.base_url, false)?;
+    if ntfy.token.is_some()
         || ntfy.token_encrypted.is_some()
         || ntfy.configured != ntfy.credential_ref.is_some()
     {
         return Err("ntfy credential metadata is not isolated".to_string());
     }
     let bark = &value.notifications.bark;
-    if bark
-        .device_key
-        .as_ref()
-        .is_some_and(|value| !value.trim().is_empty())
+    validate_secret_free_http_url("Bark base", &bark.base_url, false)?;
+    if bark.device_key.is_some()
         || bark.device_key_encrypted.is_some()
         || bark.configured != bark.credential_ref.is_some()
     {
@@ -1809,27 +1805,22 @@ fn validate_connect(value: &ConnectSection) -> Result<(), String> {
 
 pub(crate) fn validate_connect_isolated(value: &ConnectConfig) -> Result<(), String> {
     for platform in &value.platforms {
-        let has_secret = platform
-            .token
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
-            || platform
-                .token_encrypted
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || platform
-                .app_secret
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || platform
-                .app_secret_encrypted
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty());
+        let has_secret = platform.token.is_some()
+            || platform.token_encrypted.is_some()
+            || platform.app_secret.is_some()
+            || platform.app_secret_encrypted.is_some();
         if has_secret {
             return Err("connect credentials must use credential references".to_string());
         }
         if platform.platform_type.trim().is_empty() {
             return Err("connect platform type must not be empty".to_string());
+        }
+        if let Some(domain) = platform
+            .domain
+            .as_deref()
+            .filter(|domain| domain.contains("://"))
+        {
+            validate_secret_free_http_url("connect platform domain", domain, false)?;
         }
         if platform.token_configured != platform.token_credential_ref.is_some()
             || platform.app_secret_configured != platform.app_secret_credential_ref.is_some()
@@ -7555,7 +7546,7 @@ mod tests {
     }
 
     #[test]
-    fn core_provider_and_mcp_validators_reject_noncanonical_secret_channels() {
+    fn section_validators_reject_noncanonical_secret_channels() {
         for url in [
             "http://user:password@example.test/path",
             "https://example.test/path?token=secret",
@@ -7822,6 +7813,58 @@ mod tests {
                     "servers": [{
                         "id": "zero-connect",
                         "transport": {"type": "sse", "url": "https://mcp.test/sse", "connect_timeout_ms": 0}
+                    }]
+                }),
+            ),
+            (
+                "notifications.json",
+                json!({
+                    "notifications": {
+                        "ntfy": {
+                            "base_url": "https://user:literal-secret@ntfy.test",
+                            "topic": "alerts"
+                        }
+                    }
+                }),
+            ),
+            (
+                "notifications.json",
+                json!({
+                    "notifications": {
+                        "bark": {
+                            "base_url": "https://bark.test?device_key=literal-secret"
+                        }
+                    }
+                }),
+            ),
+            (
+                "notifications.json",
+                json!({
+                    "notifications": {
+                        "ntfy": {
+                            "base_url": "https://ntfy.test",
+                            "token": ""
+                        }
+                    }
+                }),
+            ),
+            (
+                "connect.json",
+                json!({
+                    "platforms": [{
+                        "type": "feishu",
+                        "domain": "https://user:literal-secret@feishu.test",
+                        "allow_from": ["owner"]
+                    }]
+                }),
+            ),
+            (
+                "connect.json",
+                json!({
+                    "platforms": [{
+                        "type": "telegram",
+                        "token_encrypted": "",
+                        "allow_from": ["owner"]
                     }]
                 }),
             ),

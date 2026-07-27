@@ -100,6 +100,18 @@ into independent user-visible commits; any future operation requiring all-or-non
 semantics must use a staged manifest/journal transaction rather than sequential
 file rewrites.
 
+For a credential-backed modular section, the owned section envelope is the sole
+public CAS authority. This applies to `core` proxy authentication, `env`,
+`notifications`, `connect`, `access-control`, and `cluster-fabric`. The
+`credentials.json` revision is an internal transaction member and diagnostic
+health value, never the precondition for one of those domain forms. An exact
+transaction compares the client section revision, stages metadata and explicit
+credential actions together, and three-way-merges an unrelated credential-store
+winner under the migration lock. A competing edit to the owned section returns
+`409`; an unrelated credential edit does not create a false domain conflict.
+The committed section envelope and matching `config.changed` event use the same
+revision, even for a secret-only replace or clear.
+
 On a corrupt primary, the bytes are copied to a uniquely named quarantine and the
 newest valid backup is loaded as degraded last-known-good. No default is written
 over the corrupt file. Repairing the primary transitions to healthy. Errors exposed
@@ -123,7 +135,7 @@ content-derived value in the quarantine filename.
 | cluster password/private key/passphrase | `cluster.<node-id>.<field>`; ordinary config stores these refs and configured metadata in `cluster_fabric.credential_refs` |
 | connect platform token/app secret | `connect.<stable-platform-id>.<field>` |
 | external broker bearer token | `broker.external.bearer_token` |
-| access password/device token | `access_control.<stable-rule-id>.<field>`; ordinary config stores refs/configured metadata only |
+| access password/device token | `access.root.password_verifier` / `access.<device-id>.device_token_verifier`; ordinary config stores refs/configured metadata only |
 | Copilot GitHub OAuth access token | `copilot.oauth.github_access_token` |
 | Copilot chat token cache | `copilot.oauth.chat_config` |
 
@@ -191,16 +203,19 @@ writes share the same exact credentials/providers/root transaction. Client-owned
 precedes live publication, and generic saves fail closed if an unreferenced
 instance secret would re-enter `config.json`.
 
-Notification ntfy/Bark updates use their own exact credentials/root transaction
-scope. The complete notification subtree is hash-CAS/revision protected; a
-committed transaction rebases unrelated root edits, rejects a competing
-notification-domain edit, and rolls back both members on an unsafe consumer
-conflict. Parseable root backup generations are scrubbed only after their secret
-is durably represented in the credential store. Runtime hydration fails closed
-when configured refs are missing or corrupt. Root PATCH requires an expected
-credential revision, uses omission/clear/replace semantics, and rejects masks or
-client-owned ref/configured metadata; the metadata GET never exposes secret
-material.
+Notification ntfy/Bark updates use their own exact Notifications-section and
+credentials transaction scope. The complete notification subtree is
+revision-protected; a committed transaction rebases unrelated credential-store
+edits, rejects a competing Notifications-section edit, and rolls back both
+members on an unsafe consumer conflict. Parseable root backup generations are
+scrubbed only after their secret is durably represented in the credential store.
+Runtime hydration fails closed when configured refs are missing or corrupt.
+`PUT /bamboo/config/notifications`
+requires the Notifications section revision and accepts explicit
+`keep | replace | clear` actions. The bounded root-PATCH compatibility path also
+requires that section revision. Both reject masks and client-owned
+ref/configured metadata; GET and mutation responses pair the exact typed section
+envelope with secret-free credential status.
 
 The external broker loader completes/rechecks migration before reading
 `broker.json`, then resolves `broker.external.bearer_token` through the credential
@@ -228,10 +243,13 @@ intact, keeps the last-known-good revision, marks health degraded and publishes
 `config.invalid`; repair publishes `config.recovered`. Directory debouncing and
 missing-file retries cover editor temp-write/rename bursts.
 
-Credential metadata/status/replace/clear HTTP adapters now use the encrypted store
-with expected-revision CAS. Responses contain only status metadata and health;
-conflicts return HTTP 409. Successful mutations publish `config.changed` through
-the durable account feed, which also supplies the v2 WebSocket `feed` channel.
+Generic credential metadata/status/replace/clear HTTP adapters use the encrypted
+store with credential-document CAS only for unowned references. Active proxy,
+Env, Notifications, Connect, Access Control, and Cluster references reject that
+generic mutation path and point to their domain transaction. Responses contain
+only status metadata and health; conflicts return HTTP 409. Successful mutations
+publish `config.changed` through the durable account feed, which also supplies
+the v2 WebSocket `feed` channel.
 
 Read-only typed provider and MCP section endpoints expose the same independent
 revision/health/source envelopes used by the watcher. Their DTOs are intentionally
@@ -245,14 +263,42 @@ metadata-only sidecars. Runtime construction hydrates references from
 candidate with a redacted degraded/invalid transition and retains the
 last-known-good runtime.
 
-The typed section API exposes GET envelopes and revisioned PUT mutations for all
-ordinary sections; provider, MCP and credentials retain their dedicated validated
-transactions. Server-owned credential-reference fields are preserved and cannot
-be replaced through an ordinary DTO. Compatibility writes are preflighted against
-the facade projection and rejected before the first durable write if they change
-more than one section. `model_limits` cannot be combined with another section.
-The legacy full-reset endpoint is likewise rejected for an active modular layout
-until it has a recoverable multi-file manifest; callers reset sections separately.
+The typed section API exposes GET envelopes and revisioned PUT mutations for
+ordinary non-credential sections. Provider, MCP, Env, Notifications, Connect,
+Access Control, Cluster Fabric, and credentials use dedicated validated
+transactions; generic `PUT /config/sections/{id}` rejects those domains so it
+cannot become a second write authority. Server-owned credential-reference fields
+are preserved and cannot be replaced through an ordinary DTO. Compatibility
+writes are preflighted against the facade projection and rejected before the
+first durable write if they change more than one section. `model_limits` cannot
+be combined with another section. The legacy full-reset endpoint is likewise
+rejected for an active modular layout until it has a recoverable multi-file
+manifest; callers reset sections separately.
+
+The domain mutation adapters use explicit secret intent without masks:
+
+- Env accepts `credential_change: {action: keep|replace|clear}` per secret
+  entry; omission retains the documented missing/nonempty/empty compatibility
+  form. A secret-to-plain conversion requires an explicit new plain value.
+- Notifications and Connect expose dedicated PUT/GET adapters whose mutation
+  payloads separate metadata from `credential_change`, `token_change`, and
+  `app_secret_change`.
+- `POST /bamboo/access/password` requires the Access Control section revision
+  and supports revisioned password `replace` and `clear`, preserving paired
+  devices. The public pre-auth Access status exposes the authoritative
+  revision, health and source projection but omits section data and local
+  source paths; the gated password mutation returns its exact committed
+  envelope.
+- `POST /bamboo/proxy-auth` requires the Core section revision and returns the
+  exact committed Core envelope.
+
+Every mutation response is built from the runtime/credential snapshot captured
+under the exact transaction and contains no plaintext, ciphertext, or UI mask.
+Each credential field reports one explicit state: `configured` when the owned
+record is usable, `from_env` when an environment source is active, `missing`
+when no usable value is bound, or `error` when configured metadata cannot be
+resolved safely. Credential-store revision and health remain nested diagnostics
+and never become the domain mutation precondition.
 
 Omitted or empty reference metadata preserves an existing binding (clearing is a
 separate credential operation); an explicit replacement reference must parse and
@@ -267,6 +313,7 @@ Proxy authentication now follows the same isolated-store boundary. Legacy
 credential/config manifest. Ordinary root config and rotated backups retain
 only `proxy_auth_credential_ref`; runtime construction resolves and parses the
 credential after migration readiness. The dedicated set/clear endpoint uses an
-exact transaction, and its status endpoint returns credential/section metadata
-without username, password, ciphertext, or mask values. Generic root saves
-refuse an unisolated proxy secret rather than recreating legacy ciphertext.
+exact Core-section transaction, and its status and mutation responses return the
+typed Core envelope plus credential status without username, password,
+ciphertext, or mask values. Generic root saves refuse an unisolated proxy secret
+rather than recreating legacy ciphertext.
