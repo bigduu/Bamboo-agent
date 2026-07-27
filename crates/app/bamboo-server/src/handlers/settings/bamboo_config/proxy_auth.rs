@@ -123,29 +123,13 @@ pub async fn set_proxy_auth(
 pub async fn get_proxy_auth_status(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let _io = app_state.config_io_lock.lock().await;
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
-        AppError::BadRequest("proxy settings require the modular configuration facade".to_string())
-    })?;
-    let section = facade
-        .registry()
-        .envelope_value(bamboo_config::SectionId::Core)
-        .map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!(
-                "Core section envelope unavailable: {error}"
-            ))
-        })?;
-    let reference = app_state
-        .config
-        .read()
-        .await
-        .proxy_auth_credential_ref
-        .clone();
+    let exact = app_state
+        .read_exact_credential_section(bamboo_config::SectionId::Core)
+        .await?;
+    let section = exact.section;
+    let reference = exact.config.proxy_auth_credential_ref.clone();
     let Some(reference) = reference else {
-        let (_, health) = app_state
-            .credential_store
-            .statuses_with_health()
-            .map_err(super::credentials::map_store_read_error)?;
+        let health = exact.metadata.credential_health;
         let credential = credential_status_view(None, false, None, &health);
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "section": section.clone(),
@@ -167,11 +151,13 @@ pub async fn get_proxy_auth_status(
             "credential_last_error": health.last_error,
         })));
     };
-    let (status, health) = app_state
-        .credential_store
-        .status_with_health(&reference)
-        .map_err(super::credentials::map_store_read_error)?;
-    let credential = credential_status_view(Some(&reference), true, Some(&status), &health);
+    let health = exact.metadata.credential_health;
+    let status = exact
+        .metadata
+        .credential_statuses
+        .iter()
+        .find(|status| status.credential_ref == reference);
+    let credential = credential_status_view(Some(&reference), true, status, &health);
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "section": section.clone(),
         "credential_ref": credential.credential_ref,
@@ -229,6 +215,107 @@ mod tests {
         assert_eq!(response["state"], "missing");
         assert_eq!(response["revision"], 0);
         assert_eq!(response["credential_revision"], 1);
+    }
+
+    #[actix_web::test]
+    async fn status_reports_valid_ciphertext_with_invalid_proxy_payload_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "proxy-user".to_string(),
+                    password: "proxy-secret".to_string(),
+                }),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let reference = credential_ref("proxy", "default", "auth").unwrap();
+        state
+            .credential_store
+            .replace(
+                reference.clone(),
+                r#"{"username":"","password":"still-encrypted"}"#,
+                CredentialSource::User,
+                1,
+            )
+            .unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/proxy-auth/status", web::get().to(get_proxy_auth_status)),
+        )
+        .await;
+        let response: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/proxy-auth/status")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response["revision"], 1);
+        assert_eq!(response["credential_revision"], 2);
+        assert_eq!(response["configured"], false);
+        assert_eq!(response["state"], "error");
+
+        state
+            .credential_store
+            .replace(
+                reference,
+                r#"{"username":"****...****","password":"still-encrypted"}"#,
+                CredentialSource::User,
+                2,
+            )
+            .unwrap();
+        let masked: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/proxy-auth/status")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(masked["credential_revision"], 3);
+        assert_eq!(masked["configured"], false);
+        assert_eq!(masked["state"], "error");
+    }
+
+    #[actix_web::test]
+    async fn exact_status_reports_wrong_encryption_key_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "proxy-user".to_string(),
+                    password: "proxy-secret".to_string(),
+                }),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let exact = tokio::task::spawn_blocking(move || {
+            let _wrong_key = bamboo_config::encryption::set_test_encryption_key([0xa7; 32]);
+            bamboo_config::read_exact_credential_section_snapshot(
+                data_dir,
+                bamboo_config::SectionId::Core,
+                None,
+            )
+        })
+        .await;
+        let exact = exact.unwrap().unwrap();
+        assert_eq!(exact.section.revision, 1);
+        let reference = credential_ref("proxy", "default", "auth").unwrap();
+        let status = exact
+            .credential_statuses
+            .iter()
+            .find(|status| status.credential_ref == reference)
+            .unwrap();
+        assert!(!status.configured);
     }
 
     #[actix_web::test]

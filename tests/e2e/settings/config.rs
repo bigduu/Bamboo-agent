@@ -62,6 +62,14 @@ async fn test_set_bamboo_config() {
             .route(
                 "/v1/bamboo/config",
                 web::get().to(settings::get_bamboo_config),
+            )
+            .route(
+                "/v1/bamboo/config/sections/{section}",
+                web::get().to(settings::get_typed_section),
+            )
+            .route(
+                "/v1/bamboo/config/sections/{section}",
+                web::put().to(settings::put_typed_section),
             ),
     )
     .await;
@@ -80,10 +88,16 @@ async fn test_set_bamboo_config() {
 
     let set_resp = test::call_service(&app, set_req).await;
     assert!(set_resp.status().is_success());
-    let proxy_req = test::TestRequest::post()
-        .uri("/v1/bamboo/config")
+    let core_req = test::TestRequest::get()
+        .uri("/v1/bamboo/config/sections/core")
+        .to_request();
+    let mut core: serde_json::Value = test::call_and_read_body_json(&app, core_req).await;
+    core["data"]["http_proxy"] = json!("http://proxy:8080");
+    let proxy_req = test::TestRequest::put()
+        .uri("/v1/bamboo/config/sections/core")
         .set_json(json!({
-            "http_proxy": "http://proxy:8080"
+            "expected_revision": core["revision"],
+            "data": core["data"]
         }))
         .to_request();
     let proxy_resp = test::call_service(&app, proxy_req).await;
@@ -195,6 +209,14 @@ async fn test_set_bamboo_config_allows_incomplete_provider_config() {
             .route(
                 "/v1/bamboo/config",
                 web::get().to(settings::get_bamboo_config),
+            )
+            .route(
+                "/v1/bamboo/config/sections/{section}",
+                web::get().to(settings::get_typed_section),
+            )
+            .route(
+                "/v1/bamboo/config/sections/{section}",
+                web::put().to(settings::put_typed_section),
             ),
     )
     .await;
@@ -202,13 +224,26 @@ async fn test_set_bamboo_config_allows_incomplete_provider_config() {
     let set_req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
         .set_json(json!({
-            "provider": "anthropic",
-            "http_proxy": "http://proxy:8080"
+            "provider": "anthropic"
         }))
         .to_request();
 
     let set_resp = test::call_service(&app, set_req).await;
     assert!(set_resp.status().is_success());
+    let core_req = test::TestRequest::get()
+        .uri("/v1/bamboo/config/sections/core")
+        .to_request();
+    let mut core: serde_json::Value = test::call_and_read_body_json(&app, core_req).await;
+    core["data"]["http_proxy"] = json!("http://proxy:8080");
+    let proxy_req = test::TestRequest::put()
+        .uri("/v1/bamboo/config/sections/core")
+        .set_json(json!({
+            "expected_revision": core["revision"],
+            "data": core["data"]
+        }))
+        .to_request();
+    let proxy_resp = test::call_service(&app, proxy_req).await;
+    assert!(proxy_resp.status().is_success());
 
     let get_req = test::TestRequest::get()
         .uri("/v1/bamboo/config")

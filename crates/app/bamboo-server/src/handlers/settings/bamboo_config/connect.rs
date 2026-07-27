@@ -168,26 +168,15 @@ fn connect_response(
 
 /// Return the Connect section and one secret-free credential status snapshot.
 pub async fn get_connect_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let _io = app_state.config_io_lock.lock().await;
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
-        AppError::BadRequest(
-            "connect settings require the modular configuration facade".to_string(),
-        )
-    })?;
-    let section = facade
-        .registry()
-        .envelope_value(bamboo_config::SectionId::Connect)
-        .map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!(
-                "connect section envelope unavailable: {error}"
-            ))
-        })?;
-    let config = app_state.config.read().await.clone();
-    let (statuses, health) = app_state
-        .credential_store
-        .statuses_with_health()
-        .map_err(super::credentials::map_store_read_error)?;
-    Ok(HttpResponse::Ok().json(connect_response(section, &config, statuses, health)))
+    let exact = app_state
+        .read_exact_credential_section(bamboo_config::SectionId::Connect)
+        .await?;
+    Ok(HttpResponse::Ok().json(connect_response(
+        exact.section,
+        &exact.config,
+        exact.metadata.credential_statuses,
+        exact.metadata.credential_health,
+    )))
 }
 
 /// Replace Connect metadata and explicitly keep, replace, or clear platform

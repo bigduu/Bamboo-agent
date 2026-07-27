@@ -90,33 +90,17 @@ fn env_response(
 
 /// `GET /bamboo/env-vars` – list all env vars without secret values or masks.
 pub async fn list_env_vars(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
-    let _io = app_state.config_io_lock.lock().await;
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
-        AppError::BadRequest("env settings require the modular configuration facade".to_string())
-    })?;
-    let section = facade
-        .registry()
-        .envelope_value(bamboo_config::SectionId::Env)
-        .map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!("env section envelope unavailable: {error}"))
-        })?;
+    let exact = app_state
+        .read_exact_credential_section(bamboo_config::SectionId::Env)
+        .await?;
+    let section = exact.section;
     let revision = section.revision;
-    let (statuses, credential_health) =
-        app_state
-            .credential_store
-            .statuses_with_health()
-            .map_err(|error| {
-                AppError::InternalError(anyhow::anyhow!(
-                    "env credential status unavailable: {error}"
-                ))
-            })?;
-    let config = app_state.config.read().await;
     Ok(HttpResponse::Ok().json(env_response(
-        &config,
+        &exact.config,
         revision,
-        &statuses,
+        &exact.metadata.credential_statuses,
         section,
-        credential_health,
+        exact.metadata.credential_health,
     )))
 }
 
@@ -144,6 +128,7 @@ pub async fn upsert_env_var(
         .update_env_var_credentials(
             expected_revision,
             std::collections::BTreeSet::from([name]),
+            false,
             move |cfg| {
                 // Replace existing or push new.
                 if let Some(existing) = cfg.env_vars.iter_mut().find(|e| e.name == req.name) {
@@ -265,20 +250,12 @@ pub async fn replace_env_vars(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut intents = {
-        let cfg = app_state.config.read().await;
-        cfg.env_vars
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    intents.extend(
-        requested_entries
-            .iter()
-            .map(|(entry, _)| entry.name.clone()),
-    );
+    let intents = requested_entries
+        .iter()
+        .map(|(entry, _)| entry.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let (updated, revision, metadata, section) = app_state
-        .update_env_var_credentials(expected_revision, intents, move |cfg| {
+        .update_env_var_credentials(expected_revision, intents, true, move |cfg| {
             let mut new_entries = Vec::with_capacity(requested_entries.len());
             for (entry, secret_change) in &requested_entries {
                 let existing = cfg
@@ -380,6 +357,7 @@ pub async fn delete_env_var(
         .update_env_var_credentials(
             expected_revision,
             std::collections::BTreeSet::from([intent]),
+            false,
             move |cfg| {
                 let before = cfg.env_vars.len();
                 cfg.env_vars.retain(|e| e.name != name);
@@ -775,6 +753,138 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn stale_full_replace_clears_omitted_durable_secret_and_credential_record() {
+        let _serial = encryption_test_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut stale = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stale.stop_config_watcher_for_test();
+        let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        writer
+            .update_env_var_credentials(
+                0,
+                std::collections::BTreeSet::from(["EXTERNAL_SECRET".to_string()]),
+                false,
+                |config| {
+                    config.env_vars.push(EnvVarEntry {
+                        name: "EXTERNAL_SECRET".to_string(),
+                        value: "external-secret-value".to_string(),
+                        secret: true,
+                        value_encrypted: None,
+                        credential_ref: None,
+                        configured: true,
+                        description: None,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(stale.config.read().await.env_vars.is_empty());
+
+        let stale_store = stale.credential_store.clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(stale))
+                .route("/env-vars/replace", web::post().to(replace_env_vars)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/env-vars/replace")
+                .set_json(serde_json::json!({
+                    "expected_revision": 1,
+                    "entries": [{
+                        "name": "PUBLIC_VALUE",
+                        "value": "public",
+                        "secret": false
+                    }]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["revision"], 2);
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["name"], "PUBLIC_VALUE");
+
+        let reference = bamboo_config::credential_ref("env", "EXTERNAL_SECRET", "value").unwrap();
+        assert!(!stale_store.status(&reference).unwrap().configured);
+        assert!(stale_store.resolve(&reference).unwrap().is_none());
+        let durable: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("env.json")).unwrap()).unwrap();
+        assert_eq!(durable["revision"], 2);
+        assert_eq!(durable["data"].as_array().unwrap().len(), 1);
+        assert!(
+            !std::fs::read_to_string(dir.path().join("credentials.json"))
+                .unwrap()
+                .contains("EXTERNAL_SECRET")
+        );
+    }
+
+    #[actix_web::test]
+    async fn stale_process_get_pairs_latest_env_section_with_same_credential_generation() {
+        let _serial = encryption_test_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        writer
+            .update_env_var_credentials(
+                0,
+                std::collections::BTreeSet::from(["TOKEN".to_string()]),
+                false,
+                |config| {
+                    config.env_vars.push(EnvVarEntry {
+                        name: "TOKEN".to_string(),
+                        value: "first-generation-secret".to_string(),
+                        secret: true,
+                        value_encrypted: None,
+                        credential_ref: None,
+                        configured: true,
+                        description: None,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let mut stale = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stale.stop_config_watcher_for_test();
+        assert_eq!(stale.config.read().await.env_vars.len(), 1);
+
+        writer
+            .update_env_var_credentials(
+                1,
+                std::collections::BTreeSet::from(["TOKEN".to_string()]),
+                false,
+                |config| {
+                    config.env_vars.clear();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.config.read().await.env_vars.len(), 1);
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(stale))
+                .route("/env-vars", web::get().to(list_env_vars)),
+        )
+        .await;
+        let body: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/env-vars").to_request(),
+        )
+        .await;
+        assert_eq!(body["revision"], 2);
+        assert_eq!(body["section"]["revision"], 2);
+        assert_eq!(body["credential_health"]["revision"], 2);
+        assert!(body["entries"].as_array().unwrap().is_empty());
+        assert!(!body.to_string().contains("env.TOKEN.value"));
+    }
+
+    #[actix_web::test]
     async fn cancelled_caller_finishes_once_and_old_revision_retry_cannot_replay() {
         let _serial = encryption_test_lock().lock().await;
         let dir = tempfile::tempdir().unwrap();
@@ -786,6 +896,7 @@ mod tests {
                 .update_env_var_credentials(
                     0,
                     std::collections::BTreeSet::from(["TOKEN".to_string()]),
+                    false,
                     |config| {
                         config.env_vars.push(EnvVarEntry {
                             name: "TOKEN".to_string(),
@@ -844,6 +955,7 @@ mod tests {
             .update_env_var_credentials(
                 0,
                 std::collections::BTreeSet::from(["TOKEN".to_string()]),
+                false,
                 |_| Ok(()),
             )
             .await;
@@ -881,6 +993,7 @@ mod tests {
             .update_env_var_credentials(
                 0,
                 std::collections::BTreeSet::from(["TOKEN".to_string()]),
+                false,
                 |config| {
                     config.env_vars.push(EnvVarEntry {
                         name: "TOKEN".to_string(),
@@ -927,5 +1040,113 @@ mod tests {
             &event.event,
             bamboo_agent_core::AgentEvent::ConfigChanged { section, .. } if section == "core"
         )));
+    }
+
+    #[actix_web::test]
+    async fn post_manifest_section_rebase_returns_and_publishes_actual_revision() {
+        let _serial = encryption_test_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let baseline_seq = state.account_sink.latest_seq();
+        bamboo_config::set_env_transaction_test_hook(|data_dir| {
+            let path = data_dir.join("env.json");
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(envelope["revision"], 0);
+            envelope["revision"] = serde_json::Value::from(1);
+            envelope["data"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": "EXTERNAL",
+                    "value": "external-winner",
+                    "secret": false,
+                    "configured": true,
+                    "description": "post-manifest generation"
+                }));
+            std::fs::write(path, serde_json::to_vec_pretty(&envelope).unwrap()).unwrap();
+        });
+
+        let (committed, revision, _, section) = state
+            .update_env_var_credentials(
+                0,
+                std::collections::BTreeSet::from(["TOKEN".to_string()]),
+                false,
+                |config| {
+                    config.env_vars.push(EnvVarEntry {
+                        name: "TOKEN".to_string(),
+                        value: "transaction-secret".to_string(),
+                        secret: true,
+                        value_encrypted: None,
+                        credential_ref: None,
+                        configured: true,
+                        description: Some("transaction generation".to_string()),
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(revision, 2);
+        let section = section.expect("exact committed envelope");
+        assert_eq!(section.revision, revision);
+        let returned_names = section
+            .data
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            returned_names,
+            std::collections::BTreeSet::from(["EXTERNAL", "TOKEN"])
+        );
+        let live = state.config.read().await.clone();
+        for config in [&committed, &live] {
+            assert!(config.env_vars.iter().any(|entry| {
+                entry.name == "EXTERNAL" && entry.value == "external-winner" && !entry.secret
+            }));
+            assert!(config
+                .env_vars
+                .iter()
+                .any(|entry| entry.name == "TOKEN" && entry.value == "transaction-secret"));
+        }
+
+        let facade = state.config_facade.as_ref().unwrap();
+        assert_eq!(facade.registry().env.snapshot().revision, revision);
+        let durable: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("env.json")).unwrap()).unwrap();
+        assert_eq!(durable["revision"], revision);
+        assert_eq!(
+            durable["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry["name"].as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["EXTERNAL", "TOKEN"])
+        );
+        let credentials = std::fs::read_to_string(dir.path().join("credentials.json")).unwrap();
+        assert!(!credentials.contains("transaction-secret"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        let env_revisions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                    if section == "env" =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(env_revisions, vec![revision]);
     }
 }

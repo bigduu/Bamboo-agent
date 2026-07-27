@@ -67,7 +67,7 @@ pub async fn replace_credential(
     reject_managed_credential_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
-        .replace(
+        .replace_unreferenced(
             credential_ref,
             &payload.value,
             CredentialSource::User,
@@ -88,7 +88,7 @@ pub async fn clear_credential(
     reject_managed_credential_ref(&app_state, &credential_ref).await?;
     let (revision, status) = app_state
         .credential_store
-        .clear(&credential_ref, payload.expected_revision)
+        .clear_unreferenced(&credential_ref, payload.expected_revision)
         .map_err(map_store_mutation_error)?;
     publish_credential_event(&app_state, revision);
     Ok(HttpResponse::Ok().json(envelope(status, CredentialStoreHealth::committed(revision))))
@@ -245,7 +245,10 @@ fn map_store_mutation_error(error: ConfigStoreError) -> AppError {
         ConfigStoreError::Conflict { expected, actual } => {
             AppError::ConfigConflict { expected, actual }
         }
-        ConfigStoreError::Validation(message) if message.starts_with("credential value ") => {
+        ConfigStoreError::Validation(message)
+            if message.starts_with("credential value ")
+                || message.starts_with("credential reference is managed by configuration") =>
+        {
             AppError::BadRequest(message)
         }
         other => map_store_read_error(other),
@@ -301,6 +304,18 @@ mod tests {
         assert_eq!(value["status"], "healthy");
         assert!(value["data"].get("value").is_none());
         assert!(value["data"].get("secret").is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn durable_managed_reference_rejection_is_a_client_error() {
+        assert!(matches!(
+            map_store_mutation_error(ConfigStoreError::Validation(
+                "credential reference is managed by configuration and must be changed through its \
+                 owning section"
+                    .to_string()
+            )),
+            AppError::BadRequest(_)
+        ));
     }
 
     #[actix_web::test]

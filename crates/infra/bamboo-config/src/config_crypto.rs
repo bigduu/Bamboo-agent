@@ -74,7 +74,9 @@ fn validate_access_verifier(hash: &str, salt: &str) -> crate::ConfigStoreResult<
     Ok(())
 }
 
-fn decode_access_verifier(secret: &str) -> crate::ConfigStoreResult<AccessVerifierRecord> {
+pub(crate) fn decode_access_verifier(
+    secret: &str,
+) -> crate::ConfigStoreResult<AccessVerifierRecord> {
     let record: AccessVerifierRecord = serde_json::from_str(secret).map_err(|_| {
         crate::ConfigStoreError::Validation(
             "access-control verifier credential is invalid".to_string(),

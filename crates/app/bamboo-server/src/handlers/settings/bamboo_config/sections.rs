@@ -517,6 +517,14 @@ pub async fn get_typed_section(
         bamboo_config::SectionId::ClusterFabric => {
             super::super::cluster_fabric::get_cluster_section(app_state).await
         }
+        bamboo_config::SectionId::Core
+        | bamboo_config::SectionId::Env
+        | bamboo_config::SectionId::Notifications
+        | bamboo_config::SectionId::Connect
+        | bamboo_config::SectionId::AccessControl => {
+            let exact = app_state.read_exact_credential_section(id).await?;
+            Ok(HttpResponse::Ok().json(exact.section))
+        }
         _ => {
             let _io = app_state.config_io_lock.lock().await;
             let facade = app_state.config_facade.as_ref().ok_or_else(|| {
@@ -558,20 +566,11 @@ pub async fn put_typed_section(
         ));
     }
     let payload = payload.into_inner();
-    app_state
+    let committed = app_state
         .put_ordinary_section(id, payload.expected_revision, payload.data)
         .await
         .map_err(map_mutation_error)?;
-
-    let _io = app_state.config_io_lock.lock().await;
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
-        AppError::BadRequest("typed sections require the modular configuration facade".to_string())
-    })?;
-    let envelope = facade
-        .registry()
-        .envelope_value(id)
-        .map_err(|error| map_mutation_error(ConfigSectionMutationError::Store(error)))?;
-    Ok(HttpResponse::Ok().json(envelope))
+    Ok(HttpResponse::Ok().json(committed))
 }
 
 /// Reset exactly one section to its backend-owned default using the typed
@@ -597,8 +596,13 @@ pub async fn reset_typed_section(
                 .reset_credential_backed_section(id, expected_revision)
                 .await
                 .map_err(map_mutation_error)?;
-            if let CredentialBackedResetCommit::Cluster(snapshot) = commit {
-                return cluster_reset_response(*snapshot);
+            match commit {
+                CredentialBackedResetCommit::Cluster(snapshot) => {
+                    return cluster_reset_response(*snapshot);
+                }
+                CredentialBackedResetCommit::Section(section) => {
+                    return Ok(HttpResponse::Ok().json(section));
+                }
             }
         }
         SectionId::Providers => {
@@ -622,10 +626,11 @@ pub async fn reset_typed_section(
         }
         ordinary => {
             let candidate = default_section_value(ordinary)?;
-            app_state
+            let committed = app_state
                 .put_ordinary_section(ordinary, expected_revision, candidate)
                 .await
                 .map_err(map_mutation_error)?;
+            return Ok(HttpResponse::Ok().json(committed));
         }
     }
 
@@ -3669,6 +3674,415 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn exact_core_get_can_commit_over_a_stopped_watchers_durable_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stale = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stale.stop_config_watcher_for_test();
+        assert_eq!(
+            stale
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .envelope_value(SectionId::Core)
+                .unwrap()
+                .revision,
+            0
+        );
+
+        let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        writer
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "external-user".to_string(),
+                    password: "external-secret".to_string(),
+                }),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let reference = bamboo_config::credential_ref("proxy", "default", "auth").unwrap();
+        let stale = web::Data::new(stale);
+        let app = test::init_service(
+            App::new().app_data(stale.clone()).service(
+                web::resource("/sections/{section}")
+                    .route(web::get().to(get_typed_section))
+                    .route(web::put().to(put_typed_section)),
+            ),
+        )
+        .await;
+        let exact: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/sections/core").to_request(),
+        )
+        .await;
+        assert_eq!(exact["revision"], 1);
+        assert_eq!(
+            exact["data"]["proxy_auth_credential_ref"],
+            reference.as_str()
+        );
+        let mut feed = stale.account_sink.subscribe();
+
+        let mut candidate = exact["data"].clone();
+        candidate["headless_auth"] = json!(true);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/core")
+                .set_json(json!({"expected_revision": 1, "data": candidate}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let committed: Value = test::read_body_json(response).await;
+        assert_eq!(committed["revision"], 2);
+        assert_eq!(committed["data"]["headless_auth"], true);
+        assert_eq!(
+            committed["data"]["proxy_auth_credential_ref"],
+            reference.as_str()
+        );
+        assert!(
+            writer
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+        let live = stale.config.read().await;
+        assert!(live.headless_auth);
+        assert_eq!(
+            live.proxy_auth.as_ref().map(|auth| auth.username.as_str()),
+            Some("external-user")
+        );
+        drop(live);
+        let committed_event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "core"
+                ) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("committed Core event");
+        assert!(matches!(
+            committed_event.event,
+            bamboo_agent_core::AgentEvent::ConfigChanged {
+                ref section,
+                revision: 2
+            } if section == "core"
+        ));
+        let duplicate = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "core"
+                ) {
+                    return event;
+                }
+            }
+        })
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "stale-local success must publish only committed r2"
+        );
+    }
+
+    #[actix_web::test]
+    async fn failed_stale_core_put_emits_nothing_until_normal_reload_installs_r1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stale = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stale.stop_config_watcher_for_test();
+
+        let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        writer
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "external-user".to_string(),
+                    password: "external-secret".to_string(),
+                }),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let stale = web::Data::new(stale);
+        let mut feed = stale.account_sink.subscribe();
+        let app = test::init_service(
+            App::new().app_data(stale.clone()).service(
+                web::resource("/sections/{section}")
+                    .route(web::get().to(get_typed_section))
+                    .route(web::put().to(put_typed_section)),
+            ),
+        )
+        .await;
+        let exact: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/sections/core").to_request(),
+        )
+        .await;
+        assert_eq!(exact["revision"], 1);
+        let mut invalid = exact["data"].clone();
+        invalid["http_proxy"] = json!("http://user:secret@proxy.example");
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/core")
+                .set_json(json!({"expected_revision": 1, "data": invalid}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            stale
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .envelope_value(SectionId::Core)
+                .unwrap()
+                .revision,
+            0
+        );
+        {
+            let live = stale.config.read().await;
+            assert!(live.proxy_auth.is_none());
+            assert!(live.proxy_auth_credential_ref.is_none());
+        }
+        let premature = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "core"
+                ) {
+                    return event;
+                }
+            }
+        })
+        .await;
+        assert!(
+            premature.is_err(),
+            "failed stale-local PUT must not publish durable r1"
+        );
+
+        stale
+            .reload_ordinary_section_for_test(SectionId::Core)
+            .await;
+        assert_eq!(
+            stale
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .envelope_value(SectionId::Core)
+                .unwrap()
+                .revision,
+            1
+        );
+        {
+            let live = stale.config.read().await;
+            assert_eq!(
+                live.proxy_auth.as_ref().map(|auth| auth.username.as_str()),
+                Some("external-user")
+            );
+            assert!(live.proxy_auth_credential_ref.is_some());
+        }
+        let reloaded = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
+                        if section == "core" && *revision == 1
+                ) {
+                    return event;
+                }
+            }
+        })
+        .await;
+        assert!(
+            reloaded.is_ok(),
+            "normal reload publishes r1 only after runtime adoption"
+        );
+    }
+
+    #[actix_web::test]
+    async fn core_metadata_rejects_invalid_proxy_keep_while_replace_repairs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "initial-user".to_string(),
+                    password: "initial-secret".to_string(),
+                }),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let reference = bamboo_config::credential_ref("proxy", "default", "auth").unwrap();
+        state
+            .credential_store
+            .replace(
+                reference.clone(),
+                "not-json",
+                bamboo_config::CredentialSource::User,
+                1,
+            )
+            .unwrap();
+
+        let exact = state
+            .read_exact_credential_section(SectionId::Core)
+            .await
+            .unwrap();
+        assert_eq!(exact.section.revision, 1);
+        assert!(!exact.metadata.status(&reference).configured);
+        let mut candidate = exact.section.data;
+        candidate["headless_auth"] = json!(true);
+        let core_path = dir.path().join("core.json");
+        let credential_path = dir.path().join("credentials.json");
+        let core_before = std::fs::read(&core_path).unwrap();
+        let credentials_before = std::fs::read(&credential_path).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/sections/{section}", web::put().to(put_typed_section)),
+        )
+        .await;
+        let keep = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/core")
+                .set_json(json!({"expected_revision": 1, "data": candidate}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(keep.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(&core_path).unwrap(), core_before);
+        assert_eq!(std::fs::read(&credential_path).unwrap(), credentials_before);
+
+        let (_, revision, status, _, section) = state
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "replacement-user".to_string(),
+                    password: "replacement-secret".to_string(),
+                }),
+                1,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision, 2);
+        assert!(status.configured);
+        assert_eq!(section.unwrap().revision, 2);
+        let repaired = state.credential_store.resolve(&reference).unwrap().unwrap();
+        let repaired: bamboo_config::ProxyAuth = serde_json::from_str(repaired.expose()).unwrap();
+        assert_eq!(repaired.username, "replacement-user");
+        assert_eq!(repaired.password, "replacement-secret");
+    }
+
+    #[actix_web::test]
+    async fn stale_generic_core_put_cannot_rebind_proxy_ref_cleared_by_exact_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        writer
+            .update_proxy_auth_credential(
+                Some(bamboo_config::ProxyAuth {
+                    username: "proxy-user".to_string(),
+                    password: "proxy-secret".to_string(),
+                }),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut stale = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stale.stop_config_watcher_for_test();
+        let mut stale_core = stale
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .envelope_value(bamboo_config::SectionId::Core)
+            .unwrap()
+            .data;
+        assert_eq!(
+            stale_core["proxy_auth_credential_ref"],
+            "proxy.default.auth"
+        );
+        stale_core["headless_auth"] = json!(true);
+
+        writer
+            .update_proxy_auth_credential(None, 1, Default::default())
+            .await
+            .unwrap();
+        let reference = bamboo_config::credential_ref("proxy", "default", "auth").unwrap();
+        assert!(
+            !writer
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(stale))
+                .route("/sections/{section}", web::put().to(put_typed_section)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/sections/core")
+                .set_json(json!({
+                    "expected_revision": 2,
+                    "data": stale_core
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+
+        let exact = bamboo_config::read_exact_credential_section_snapshot(
+            dir.path(),
+            bamboo_config::SectionId::Core,
+            Some(2),
+        )
+        .unwrap();
+        assert!(exact.section.data["proxy_auth_credential_ref"].is_null());
+        assert_eq!(exact.section.data["headless_auth"], false);
+        assert!(
+            !writer
+                .credential_store
+                .status(&reference)
+                .unwrap()
+                .configured
+        );
+    }
+
+    #[actix_web::test]
     async fn generic_cluster_section_put_cannot_bypass_dedicated_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
@@ -3834,6 +4248,60 @@ mod tests {
                 .label,
             "queued-second-commit"
         );
+    }
+
+    #[actix_web::test]
+    async fn delayed_non_cluster_reset_response_stays_bound_to_its_exact_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state
+            .update_notification_credentials(
+                0,
+                BTreeSet::from(["ntfy".to_string()]),
+                false,
+                |config| {
+                    config.notifications.ntfy.enabled = true;
+                    config.notifications.ntfy.topic = "before-reset".to_string();
+                    config.notifications.ntfy.token = Some("reset-secret".to_string());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        let reset = state
+            .reset_credential_backed_section(SectionId::Notifications, 1)
+            .await
+            .unwrap();
+        let CredentialBackedResetCommit::Section(reset_section) = reset else {
+            panic!("non-cluster reset must return its exact committed envelope");
+        };
+        let (_, _, _, later_section) = state
+            .update_notification_credentials(2, BTreeSet::new(), false, |config| {
+                config.notifications.desktop.enabled = Some(true);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let later_section = later_section.unwrap();
+
+        assert_eq!(reset_section.revision, 2);
+        assert_eq!(
+            reset_section.data,
+            json!({
+                "notifications":
+                    serde_json::to_value(bamboo_config::NotificationsConfig::default()).unwrap()
+            })
+        );
+        assert_eq!(later_section.revision, 3);
+        assert_eq!(
+            later_section.data["notifications"]["desktop"]["enabled"],
+            true
+        );
+        assert!(reset_section.data["notifications"]["desktop"]["enabled"].is_null());
+        assert!(!serde_json::to_string(&reset_section)
+            .unwrap()
+            .contains("reset-secret"));
     }
 
     #[actix_web::test]

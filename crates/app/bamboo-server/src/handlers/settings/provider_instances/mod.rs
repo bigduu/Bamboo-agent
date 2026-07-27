@@ -623,8 +623,7 @@ mod tests {
         assert_eq!(create_resp.status(), actix_web::http::StatusCode::CREATED);
 
         // A settings save that does not mention `provider_instances` at all.
-        let save_payload: Value =
-            serde_json::json!({ "http_proxy": "http://example.invalid:8080" });
+        let save_payload: Value = serde_json::json!({ "headless_auth": true });
         crate::handlers::settings::set_bamboo_config(app_state.clone(), web::Json(save_payload))
             .await
             .expect("unrelated settings save should succeed");
@@ -697,8 +696,7 @@ mod tests {
         .await
         .expect("update should succeed");
 
-        let save_payload: Value =
-            serde_json::json!({ "http_proxy": "http://example.invalid:9090" });
+        let save_payload: Value = serde_json::json!({ "headless_auth": true });
         crate::handlers::settings::set_bamboo_config(app_state.clone(), web::Json(save_payload))
             .await
             .expect("unrelated settings save should succeed");

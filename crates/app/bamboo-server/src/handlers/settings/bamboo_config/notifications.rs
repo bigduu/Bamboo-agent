@@ -116,30 +116,14 @@ fn notification_response(
 pub async fn get_notification_config(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let _io = app_state.config_io_lock.lock().await;
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
-        AppError::BadRequest(
-            "notification settings require the modular configuration facade".to_string(),
-        )
-    })?;
-    let section = facade
-        .registry()
-        .envelope_value(bamboo_config::SectionId::Notifications)
-        .map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!(
-                "notification section envelope unavailable: {error}"
-            ))
-        })?;
-    let config = app_state.config.read().await.clone();
-    let (statuses, credential_health) = app_state
-        .credential_store
-        .statuses_with_health()
-        .map_err(super::credentials::map_store_read_error)?;
+    let exact = app_state
+        .read_exact_credential_section(bamboo_config::SectionId::Notifications)
+        .await?;
     Ok(HttpResponse::Ok().json(notification_response(
-        section,
-        &config,
-        statuses,
-        credential_health,
+        exact.section,
+        &exact.config,
+        exact.metadata.credential_statuses,
+        exact.metadata.credential_health,
     )))
 }
 

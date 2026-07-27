@@ -25,20 +25,38 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
-    let req = test::TestRequest::post()
-        .uri("/v1/bamboo/config")
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/config/sections/core")
+        .to_request();
+    let mut core: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    core["data"]["http_proxy"] = json!("http://proxy:8080");
+    let req = test::TestRequest::put()
+        .uri("/v1/bamboo/config/sections/core")
         .set_json(json!({
-            "http_proxy": "http://proxy:8080"
+            "expected_revision": core["revision"],
+            "data": core["data"]
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    // 2) Persist proxy auth (optional) and mark setup complete.
+    // 2) Persist proxy auth against the Core section revision exposed by the
+    // secret-free status endpoint, then mark setup complete.
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/proxy-auth/status")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert!(resp.status().is_success());
+    let body = test::read_body(resp).await;
+    let proxy_status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(proxy_status["configured"], false);
+    let core_revision = proxy_status["revision"].as_u64().unwrap();
+
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/proxy-auth")
         .set_json(json!({
-            "expected_revision": 0,
+            "expected_revision": core_revision,
+            "action": "replace",
             "username": "proxy-user-name",
             "password": "proxy-pass-value"
         }))
@@ -67,7 +85,8 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     assert!(!credentials.contains("proxy-user-name"));
     assert!(!credentials.contains("proxy-pass-value"));
 
-    // Attempt to inject proxy_auth_encrypted via permissive endpoint - must be ignored.
+    // Attempt to inject proxy_auth_encrypted via permissive endpoint - it must
+    // fail closed in favor of the revisioned Core/proxy-auth APIs.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
         .set_json(json!({
@@ -75,7 +94,7 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
-    assert!(resp.status().is_success());
+    assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
 
     // Proxy auth should remain configured (sanitize must prevent overwriting credentials).
     let req = test::TestRequest::get()
@@ -190,10 +209,16 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     assert!(providers["openai"].get("api_key_encrypted").is_none());
 
     // Ensure the permissive endpoint merges without clobbering prior provider/setup state.
-    let req = test::TestRequest::post()
-        .uri("/v1/bamboo/config")
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/config/sections/core")
+        .to_request();
+    let mut core: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    core["data"]["https_proxy"] = json!("http://proxy:8080");
+    let req = test::TestRequest::put()
+        .uri("/v1/bamboo/config/sections/core")
         .set_json(json!({
-            "https_proxy": "http://proxy:8080"
+            "expected_revision": core["revision"],
+            "data": core["data"]
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;

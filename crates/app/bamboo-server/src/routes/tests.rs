@@ -1035,10 +1035,13 @@ async fn v2_devices_list_excludes_secret_material() {
 async fn v2_devices_delete_revokes_and_404s_unknown() {
     let data_dir = tempdir().unwrap();
     let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
-    {
-        let mut config = app_state.config.write().await;
-        config.access_control = Some(password_access_control());
-    }
+    app_state
+        .update_access_control_credentials(0, true, Default::default(), |config| {
+            config.access_control = Some(password_access_control());
+            Ok(())
+        })
+        .await
+        .unwrap();
     inject_code(&app_state, "333333", Duration::from_secs(120));
     let app = test::init_service(
         App::new()

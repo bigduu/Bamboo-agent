@@ -678,36 +678,62 @@ fn build_access_status(config: &Config, req: &HttpRequest) -> AccessStatusRespon
     }
 }
 
+fn build_exact_access_status(
+    config: &Config,
+    statuses: &[bamboo_config::CredentialStatus],
+    health: &bamboo_config::CredentialStoreHealth,
+    req: &HttpRequest,
+) -> AccessStatusResponse {
+    let status_for = |reference: &bamboo_config::CredentialRef| {
+        statuses
+            .iter()
+            .find(|status| &status.credential_ref == reference)
+    };
+    let password_enabled = config.access_control.as_ref().is_some_and(|access| {
+        access.password_enabled
+            && credential_status_view(
+                access.password_credential_ref.as_ref(),
+                access.password_configured,
+                access.password_credential_ref.as_ref().and_then(status_for),
+                health,
+            )
+            .configured
+    });
+    let has_device = config.access_control.as_ref().is_some_and(|access| {
+        access.devices.iter().any(|device| {
+            !device.revoked
+                && credential_status_view(
+                    device.token_credential_ref.as_ref(),
+                    device.token_configured,
+                    device.token_credential_ref.as_ref().and_then(status_for),
+                    health,
+                )
+                .configured
+        })
+    });
+    let local_bypass = is_local_request(req);
+    AccessStatusResponse {
+        password_enabled,
+        local_bypass,
+        requires_password: (password_enabled || has_device) && !local_bypass,
+    }
+}
+
 pub async fn get_access_status(
     req: HttpRequest,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
-    let _io = app_state.config_io_lock.lock().await;
-    let facade = app_state.config_facade.as_ref().ok_or_else(|| {
-        AppError::BadRequest("access settings require the modular configuration facade".to_string())
-    })?;
-    let section = facade
-        .registry()
-        .envelope_value(bamboo_config::SectionId::AccessControl)
-        .map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!(
-                "access-control section envelope unavailable: {error}"
-            ))
-        })?;
-    let config = app_state.config.read().await.clone();
+    let exact = app_state
+        .read_exact_credential_section(bamboo_config::SectionId::AccessControl)
+        .await?;
+    let section = exact.section;
+    let config = exact.config;
     let reference = config
         .access_control
         .as_ref()
         .and_then(|access| access.password_credential_ref.clone());
-    let (statuses, credential_health) =
-        app_state
-            .credential_store
-            .statuses_with_health()
-            .map_err(|error| {
-                AppError::InternalError(anyhow::anyhow!(
-                    "access-control credential status unavailable: {error}"
-                ))
-            })?;
+    let statuses = exact.metadata.credential_statuses;
+    let credential_health = exact.metadata.credential_health;
     let credential = reference.as_ref().and_then(|reference| {
         statuses
             .iter()
@@ -724,7 +750,7 @@ pub async fn get_access_status(
         &credential_health,
     );
     Ok(HttpResponse::Ok().json(AccessStatusEnvelope {
-        runtime: build_access_status(&config, &req),
+        runtime: build_exact_access_status(&config, &statuses, &credential_health, &req),
         revision: section.revision,
         status: section.status,
         source_kind: section.source_kind,
@@ -823,28 +849,8 @@ pub async fn update_access_password(
         ));
     }
 
-    let current_config = app_state.config.read().await.clone();
-    let password_already_enabled = current_config
-        .access_control
-        .as_ref()
-        .map(|access| access.password_enabled)
-        .unwrap_or(false);
-
-    if password_already_enabled && !local_bypass {
-        let current_password = payload.current_password.trim();
-        if current_password.is_empty() {
-            return Err(AppError::Unauthorized(
-                "current_password is required".to_string(),
-            ));
-        }
-        if !verify_password(&current_config, current_password) {
-            return Err(AppError::Unauthorized(
-                "invalid current password".to_string(),
-            ));
-        }
-    }
-
     let expected_revision = payload.expected_revision;
+    let current_password = payload.current_password.trim().to_string();
     let (password_hash, salt_hex) = if matches!(action, AccessPasswordAction::Replace) {
         let mut salt_bytes = [0_u8; 16];
         rand::rng().fill(&mut salt_bytes);
@@ -864,6 +870,25 @@ pub async fn update_access_password(
             true,
             BTreeSet::new(),
             move |config| {
+                // Authorize against the exact durable AccessControl generation
+                // installed by the AppState updater. A stale process-local
+                // verifier must never authorize replacing a newer password.
+                let password_already_enabled = config
+                    .access_control
+                    .as_ref()
+                    .is_some_and(|access| access.password_enabled);
+                if password_already_enabled && !local_bypass {
+                    if current_password.is_empty() {
+                        return Err(AppError::Unauthorized(
+                            "current_password is required".to_string(),
+                        ));
+                    }
+                    if !verify_password(config, &current_password) {
+                        return Err(AppError::Unauthorized(
+                            "invalid current password".to_string(),
+                        ));
+                    }
+                }
                 // Mutate in place so an existing `access_control` keeps its paired
                 // `devices` across a root-password change. Replacing the whole
                 // struct with `devices: vec![]` would silently wipe every device
@@ -1618,17 +1643,111 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn access_status_reports_valid_ciphertext_with_invalid_verifier_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        state
+            .update_access_control_credentials(0, true, BTreeSet::new(), |config| {
+                config.access_control = Some(AccessControlConfig {
+                    password_enabled: true,
+                    password_hash: Some("a".repeat(64)),
+                    password_salt: Some("11".repeat(16)),
+                    password_configured: true,
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let reference = bamboo_config::config_crypto::access_password_credential_ref().unwrap();
+        state
+            .credential_store
+            .replace(
+                reference.clone(),
+                r#"{"hash":"not-a-valid-hash","salt":"11"}"#,
+                bamboo_config::CredentialSource::User,
+                1,
+            )
+            .unwrap();
+        let access_path = dir.path().join("access-control.json");
+        let credential_path = dir.path().join("credentials.json");
+        let access_before = std::fs::read(&access_path).unwrap();
+        let credentials_before = std::fs::read(&credential_path).unwrap();
+        let keep = state
+            .update_access_control_credentials(1, false, BTreeSet::new(), |config| {
+                config.access_control.as_mut().unwrap().updated_at =
+                    Some("metadata-keep-must-fail".to_string());
+                Ok(())
+            })
+            .await;
+        assert!(keep.is_err());
+        assert_eq!(std::fs::read(&access_path).unwrap(), access_before);
+        assert_eq!(std::fs::read(&credential_path).unwrap(), credentials_before);
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/access/status", web::get().to(get_access_status)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            TestRequest::get()
+                .uri("/access/status")
+                .peer_addr("203.0.113.8:5700".parse().unwrap())
+                .insert_header((header::HOST, "bamboo.example.com"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["revision"], 1);
+        assert_eq!(body["password_enabled"], false);
+        assert_eq!(body["password_configured"], false);
+        assert_eq!(body["credential_state"], "error");
+
+        let (_, revision, metadata, section) = state
+            .update_access_control_credentials(1, true, BTreeSet::new(), |config| {
+                let access = config.access_control.as_mut().unwrap();
+                access.password_enabled = false;
+                access.password_hash = None;
+                access.password_salt = None;
+                access.password_configured = false;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(revision, 2);
+        assert!(!metadata.status(&reference).configured);
+        let section = section.unwrap();
+        assert_eq!(section.revision, 2);
+        assert!(section.data["password_credential_ref"].is_null());
+    }
+
+    #[actix_web::test]
     async fn password_replace_and_clear_use_access_revision_and_preserve_devices() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0xd3; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
-        let mut events = state.account_sink.subscribe();
         let (device, _token) = issue_device_token("paired-device");
         let device_id = device.device_id.clone();
-        state.config.write().await.access_control = Some(AccessControlConfig {
-            devices: vec![device],
-            ..Default::default()
-        });
+        let device_intent = device_id.clone();
+        state
+            .update_access_control_credentials(
+                0,
+                false,
+                BTreeSet::from([device_intent]),
+                move |config| {
+                    config.access_control = Some(AccessControlConfig {
+                        devices: vec![device],
+                        ..Default::default()
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let mut events = state.account_sink.subscribe();
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
@@ -1641,7 +1760,7 @@ mod tests {
             TestRequest::post()
                 .uri("/access/password")
                 .set_json(serde_json::json!({
-                    "expected_revision": 0,
+                    "expected_revision": 1,
                     "action": "replace",
                     "value": "root-replacement-secret"
                 }))
@@ -1650,8 +1769,8 @@ mod tests {
         .await;
         assert_eq!(replace.status(), StatusCode::OK);
         let replace: serde_json::Value = test::read_body_json(replace).await;
-        assert_eq!(replace["revision"], 1);
-        assert_eq!(replace["section"]["revision"], 1);
+        assert_eq!(replace["revision"], 2);
+        assert_eq!(replace["section"]["revision"], 2);
         assert_eq!(replace["credential"]["configured"], true);
         assert_eq!(replace["credential"]["state"], "configured");
         assert!(!replace.to_string().contains("root-replacement-secret"));
@@ -1661,7 +1780,7 @@ mod tests {
                 let event = events.recv().await.unwrap();
                 if matches!(
                     &event.event,
-                    bamboo_agent_core::AgentEvent::ConfigChanged { section, revision: 1 }
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, revision: 2 }
                         if section == "access-control"
                 ) {
                     break event;
@@ -1672,7 +1791,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             event.event,
-            bamboo_agent_core::AgentEvent::ConfigChanged { ref section, revision: 1 }
+            bamboo_agent_core::AgentEvent::ConfigChanged { ref section, revision: 2 }
                 if section == "access-control"
         ));
 
@@ -1681,7 +1800,7 @@ mod tests {
             TestRequest::post()
                 .uri("/access/password")
                 .set_json(serde_json::json!({
-                    "expected_revision": 1,
+                    "expected_revision": 2,
                     "action": "clear",
                     "current_password": "root-replacement-secret"
                 }))
@@ -1690,8 +1809,8 @@ mod tests {
         .await;
         assert_eq!(clear.status(), StatusCode::OK);
         let clear: serde_json::Value = test::read_body_json(clear).await;
-        assert_eq!(clear["revision"], 2);
-        assert_eq!(clear["section"]["revision"], 2);
+        assert_eq!(clear["revision"], 3);
+        assert_eq!(clear["section"]["revision"], 3);
         assert_eq!(clear["password_enabled"], false);
         assert_eq!(clear["credential"]["configured"], false);
         assert_eq!(clear["credential"]["state"], "missing");
@@ -1705,7 +1824,7 @@ mod tests {
             TestRequest::post()
                 .uri("/access/password")
                 .set_json(serde_json::json!({
-                    "expected_revision": 1,
+                    "expected_revision": 2,
                     "action": "replace",
                     "value": "stale-root-secret"
                 }))
@@ -1737,7 +1856,7 @@ mod tests {
             TestRequest::post()
                 .uri("/access/password")
                 .set_json(serde_json::json!({
-                    "expected_revision": 2,
+                    "expected_revision": 3,
                     "action": "replace",
                     "value": "****...****"
                 }))
@@ -1751,7 +1870,7 @@ mod tests {
             TestRequest::post()
                 .uri("/access/password")
                 .set_json(serde_json::json!({
-                    "expected_revision": 2,
+                    "expected_revision": 3,
                     "action": "replace",
                     "value": "ambiguous-value-secret",
                     "new_password": "ambiguous-legacy-secret"
@@ -1766,7 +1885,7 @@ mod tests {
             TestRequest::post()
                 .uri("/access/password")
                 .set_json(serde_json::json!({
-                    "expected_revision": 2,
+                    "expected_revision": 3,
                     "action": "clear",
                     "value": "unexpected-clear-secret"
                 }))
@@ -1789,6 +1908,105 @@ mod tests {
             assert!(!access_file.contains(secret));
             assert!(!credentials.contains(secret));
         }
+    }
+
+    #[actix_web::test]
+    async fn stale_process_old_password_cannot_authorize_newer_access_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
+
+        let old_salt = "11".repeat(16);
+        let old_hash = compute_password_hash("old-root-secret", &old_salt).unwrap();
+        writer
+            .update_access_control_credentials(0, true, BTreeSet::new(), move |config| {
+                config.access_control = Some(AccessControlConfig {
+                    password_enabled: true,
+                    password_hash: Some(old_hash),
+                    password_salt: Some(old_salt),
+                    password_configured: true,
+                    ..Default::default()
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let mut stale = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stale.stop_config_watcher_for_test();
+        assert_eq!(
+            stale
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .access_control
+                .snapshot()
+                .revision,
+            1
+        );
+        {
+            let stale_config = stale.config.read().await;
+            assert!(verify_password(&stale_config, "old-root-secret"));
+        }
+
+        let new_salt = "22".repeat(16);
+        let new_hash = compute_password_hash("new-root-secret", &new_salt).unwrap();
+        writer
+            .update_access_control_credentials(1, true, BTreeSet::new(), move |config| {
+                let access = config.access_control.get_or_insert_with(Default::default);
+                access.password_enabled = true;
+                access.password_hash = Some(new_hash);
+                access.password_salt = Some(new_salt);
+                access.password_configured = true;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        {
+            let stale_config = stale.config.read().await;
+            assert!(verify_password(&stale_config, "old-root-secret"));
+            assert!(!verify_password(&stale_config, "new-root-secret"));
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(stale))
+                .route("/access/password", web::post().to(update_access_password)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            TestRequest::post()
+                .uri("/access/password")
+                .peer_addr("203.0.113.7:5700".parse().unwrap())
+                .insert_header((header::HOST, "bamboo.example.com"))
+                .set_json(serde_json::json!({
+                    "expected_revision": 2,
+                    "action": "replace",
+                    "current_password": "old-root-secret",
+                    "value": "unauthorized-third-secret"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let exact = bamboo_config::read_exact_credential_section_snapshot(
+            dir.path(),
+            bamboo_config::SectionId::AccessControl,
+            Some(2),
+        )
+        .unwrap();
+        let mut durable = Config::default();
+        exact.install_into(&mut durable);
+        assert!(verify_password(&durable, "new-root-secret"));
+        assert!(!verify_password(&durable, "old-root-secret"));
+        assert!(!verify_password(&durable, "unauthorized-third-secret"));
+        assert!(
+            !std::fs::read_to_string(dir.path().join("credentials.json"))
+                .unwrap()
+                .contains("unauthorized-third-secret")
+        );
     }
 
     #[actix_web::test]

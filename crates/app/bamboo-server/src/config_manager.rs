@@ -144,6 +144,42 @@ pub fn assert_json_object(value: Value) -> Result<Map<String, Value>, AppError> 
     }
 }
 
+/// Legacy full-config clients may echo the secret-free Core proxy projection,
+/// but they may not mutate it without the owned Core section revision.
+///
+/// Dropping only an exact lock-time echo preserves bounded compatibility while
+/// ensuring proxy URLs and the server-managed credential reference cannot
+/// bypass the typed Core/proxy-auth APIs.
+pub fn remove_unchanged_core_proxy_echo(
+    current: &Config,
+    patch_obj: &mut Map<String, Value>,
+) -> Result<(), AppError> {
+    if ["proxy_auth", "proxy_auth_encrypted"]
+        .iter()
+        .any(|field| patch_obj.contains_key(*field))
+    {
+        return Err(core_proxy_patch_error());
+    }
+    let current_value = current.to_compatibility_value()?;
+    for field in ["http_proxy", "https_proxy", "proxy_auth_credential_ref"] {
+        let Some(incoming) = patch_obj.get(field) else {
+            continue;
+        };
+        if current_value.get(field) != Some(incoming) {
+            return Err(core_proxy_patch_error());
+        }
+        patch_obj.remove(field);
+    }
+    Ok(())
+}
+
+fn core_proxy_patch_error() -> AppError {
+    AppError::BadRequest(
+        "proxy configuration must be changed through the dedicated revisioned Core and proxy-auth APIs"
+            .to_string(),
+    )
+}
+
 pub fn build_merged_config(
     current: &Config,
     patch_obj: Map<String, Value>,

@@ -1406,6 +1406,68 @@ where
         self.commit_inner(expected_revision, candidate, || {})
     }
 
+    /// Commit and return the immutable envelope published by this exact
+    /// operation while the section operation lock still excludes reloads.
+    pub fn commit_with_envelope(
+        &self,
+        expected_revision: u64,
+        candidate: T,
+    ) -> ConfigStoreResult<(ConfigSectionEvent, SectionEnvelope<T>)> {
+        self.commit_inner_with_envelope(expected_revision, candidate, || {})
+    }
+
+    /// Commit against an exact healthy durable base while permitting this
+    /// process's immutable snapshot to lag behind that base.
+    ///
+    /// The caller must hold any wider transaction lock needed by the section
+    /// and supply the exact durable value loaded for `expected_revision`.
+    /// Keeping the section operation lock across the content-aware file CAS
+    /// and publication means a successful stale-local write can jump directly
+    /// from rN to rN+K, while a failed write neither consumes nor publishes an
+    /// intermediate durable generation.
+    pub(crate) fn commit_from_durable_base_with_envelope(
+        &self,
+        expected_revision: u64,
+        expected_data: &T,
+        candidate: T,
+    ) -> ConfigStoreResult<(ConfigSectionEvent, SectionEnvelope<T>)> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.snapshot();
+        if current.revision > expected_revision {
+            return Err(ConfigStoreError::Validation(format!(
+                "process-local {} revision {} is ahead of durable mutation base {expected_revision}",
+                self.name, current.revision
+            )));
+        }
+        let revision = self.store.commit_from_live_snapshot(
+            expected_revision,
+            expected_data,
+            candidate.clone(),
+            |value| (self.validate)(value),
+        )?;
+        let committed = SectionSnapshot {
+            data: Arc::new(candidate),
+            revision,
+            loaded_at: Utc::now(),
+            source_path: self.store.path().to_path_buf(),
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Healthy,
+            last_error: None,
+        };
+        let envelope = committed.envelope();
+        self.publish(committed, LiveRepairAuthority::None);
+        Ok((
+            ConfigSectionEvent::Changed {
+                section: self.name.clone(),
+                revision,
+            },
+            envelope,
+        ))
+    }
+
     /// Adopt a snapshot that was durably installed by a compound transaction
     /// while that transaction still owns its cross-process commit lock.
     ///
@@ -1521,6 +1583,19 @@ where
     where
         F: FnOnce(),
     {
+        self.commit_inner_with_envelope(expected_revision, candidate, before_publish)
+            .map(|(event, _)| event)
+    }
+
+    fn commit_inner_with_envelope<F>(
+        &self,
+        expected_revision: u64,
+        candidate: T,
+        before_publish: F,
+    ) -> ConfigStoreResult<(ConfigSectionEvent, SectionEnvelope<T>)>
+    where
+        F: FnOnce(),
+    {
         let _operation = self
             .operation_lock
             .lock()
@@ -1558,22 +1633,24 @@ where
             }
         };
         before_publish();
-        self.publish(
-            SectionSnapshot {
-                data: Arc::new(candidate),
-                revision,
-                loaded_at: Utc::now(),
-                source_path: self.store.path().to_path_buf(),
-                source_kind: SectionSourceKind::File,
-                status: SectionStatus::Healthy,
-                last_error: None,
-            },
-            LiveRepairAuthority::None,
-        );
-        Ok(ConfigSectionEvent::Changed {
-            section: self.name.clone(),
+        let committed = SectionSnapshot {
+            data: Arc::new(candidate),
             revision,
-        })
+            loaded_at: Utc::now(),
+            source_path: self.store.path().to_path_buf(),
+            source_kind: SectionSourceKind::File,
+            status: SectionStatus::Healthy,
+            last_error: None,
+        };
+        let envelope = committed.envelope();
+        self.publish(committed, LiveRepairAuthority::None);
+        Ok((
+            ConfigSectionEvent::Changed {
+                section: self.name.clone(),
+                revision,
+            },
+            envelope,
+        ))
     }
 
     pub fn reload(&self) -> ConfigSectionEvent {
@@ -3536,6 +3613,87 @@ mod tests {
         ));
         assert_eq!(section.snapshot().data.value, "durable-r2");
         assert_eq!(std::fs::read(path).unwrap(), durable);
+    }
+
+    #[test]
+    fn failed_durable_base_commit_leaves_intermediate_revision_for_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("example.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&RevisionedDocument {
+                schema_version: 1,
+                revision: 0,
+                data: Example {
+                    value: "local-r0".into(),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let section = LiveSection::open(
+            "example",
+            AtomicJsonStore::new(&path, 1),
+            Example {
+                value: "local-r0".into(),
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let external = AtomicJsonStore::new(&path, 1);
+        external
+            .commit(
+                0,
+                Example {
+                    value: "durable-r1".into(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let captured_base = Example {
+            value: "durable-r1".into(),
+        };
+
+        // An out-of-contract editor reuses r1 with different content after
+        // the exact base was captured. The content-aware durable CAS must
+        // reject it without advancing or publishing the stale local snapshot.
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&RevisionedDocument {
+                schema_version: 1,
+                revision: 1,
+                data: Example {
+                    value: "rewritten-r1".into(),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            section.commit_from_durable_base_with_envelope(
+                1,
+                &captured_base,
+                Example {
+                    value: "candidate-r2".into(),
+                },
+            ),
+            Err(ConfigStoreError::Conflict {
+                expected: 1,
+                actual: 1
+            })
+        ));
+        assert_eq!(section.snapshot().revision, 0);
+        assert_eq!(section.snapshot().data.value, "local-r0");
+
+        assert_eq!(
+            section.reload(),
+            ConfigSectionEvent::Changed {
+                section: "example".to_string(),
+                revision: 1,
+            }
+        );
+        assert_eq!(section.snapshot().revision, 1);
+        assert_eq!(section.snapshot().data.value, "rewritten-r1");
     }
 
     #[test]

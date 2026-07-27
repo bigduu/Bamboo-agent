@@ -162,6 +162,156 @@ impl ExactTransactionScope {
     }
 }
 
+fn non_cluster_credential_scope(
+    section: crate::SectionId,
+) -> ConfigStoreResult<ExactTransactionScope> {
+    match section {
+        crate::SectionId::Core => Ok(ExactTransactionScope::ProxyAuth),
+        crate::SectionId::Env => Ok(ExactTransactionScope::EnvVars),
+        crate::SectionId::Notifications => Ok(ExactTransactionScope::Notifications),
+        crate::SectionId::Connect => Ok(ExactTransactionScope::Connect),
+        crate::SectionId::AccessControl => Ok(ExactTransactionScope::AccessControl),
+        _ => Err(ConfigStoreError::Validation(
+            "section is not a non-cluster credential-backed domain".to_string(),
+        )),
+    }
+}
+
+fn credential_refs_for_scope(
+    config: &crate::Config,
+    scope: ExactTransactionScope,
+) -> BTreeSet<crate::CredentialRef> {
+    match scope {
+        ExactTransactionScope::ProxyAuth => {
+            config.proxy_auth_credential_ref.iter().cloned().collect()
+        }
+        ExactTransactionScope::EnvVars => config
+            .env_vars
+            .iter()
+            .filter(|entry| entry.secret && entry.configured)
+            .filter_map(|entry| entry.credential_ref.clone())
+            .collect(),
+        ExactTransactionScope::Notifications => [
+            config
+                .notifications
+                .ntfy
+                .configured
+                .then(|| config.notifications.ntfy.credential_ref.clone())
+                .flatten(),
+            config
+                .notifications
+                .bark
+                .configured
+                .then(|| config.notifications.bark.credential_ref.clone())
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        ExactTransactionScope::Connect => config
+            .connect
+            .platforms
+            .iter()
+            .flat_map(|platform| {
+                [
+                    platform
+                        .token_configured
+                        .then(|| platform.token_credential_ref.clone())
+                        .flatten(),
+                    platform
+                        .app_secret_configured
+                        .then(|| platform.app_secret_credential_ref.clone())
+                        .flatten(),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect(),
+        ExactTransactionScope::AccessControl => config
+            .access_control
+            .iter()
+            .flat_map(|access| {
+                access
+                    .password_configured
+                    .then(|| access.password_credential_ref.clone())
+                    .flatten()
+                    .into_iter()
+                    .chain(access.devices.iter().filter_map(|device| {
+                        device
+                            .token_configured
+                            .then(|| device.token_credential_ref.clone())
+                            .flatten()
+                    }))
+            })
+            .collect(),
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
+        | ExactTransactionScope::ClusterFabric => BTreeSet::new(),
+    }
+}
+
+fn credential_value_is_valid_for_scope(scope: ExactTransactionScope, value: &str) -> bool {
+    match scope {
+        ExactTransactionScope::ProxyAuth => serde_json::from_str::<crate::ProxyAuth>(value)
+            .is_ok_and(|auth| {
+                !auth.username.trim().is_empty()
+                    && !crate::patch::is_masked_api_key(&auth.username)
+                    && !crate::patch::is_masked_api_key(&auth.password)
+            }),
+        ExactTransactionScope::AccessControl => {
+            crate::config_crypto::decode_access_verifier(value).is_ok()
+        }
+        ExactTransactionScope::EnvVars
+        | ExactTransactionScope::Notifications
+        | ExactTransactionScope::Connect => {
+            !value.trim().is_empty() && !crate::patch::is_masked_api_key(value)
+        }
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
+        | ExactTransactionScope::ClusterFabric => true,
+    }
+}
+
+fn semantic_credential_statuses_for_scope(
+    config: &crate::Config,
+    scope: ExactTransactionScope,
+    credential_lkg: &crate::credential_store::CredentialDocumentLkg,
+) -> (BTreeSet<crate::CredentialRef>, Vec<crate::CredentialStatus>) {
+    let active_refs = credential_refs_for_scope(config, scope);
+    let statuses = credential_lkg.statuses_with_validation(&active_refs, |_, value| {
+        credential_value_is_valid_for_scope(scope, value)
+    });
+    (active_refs, statuses)
+}
+
+fn ensure_active_credential_statuses(
+    active_refs: &BTreeSet<crate::CredentialRef>,
+    statuses: &[crate::CredentialStatus],
+) -> ConfigStoreResult<()> {
+    if let Some(reference) = active_refs.iter().find(|reference| {
+        !statuses
+            .iter()
+            .any(|status| &status.credential_ref == *reference && status.configured)
+    }) {
+        return Err(ConfigStoreError::Validation(format!(
+            "active credential '{}' is invalid; explicitly replace or clear it",
+            reference.as_str()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_active_section_credential_values(
+    config: &crate::Config,
+    section: crate::SectionId,
+    credential_lkg: &crate::credential_store::CredentialDocumentLkg,
+) -> ConfigStoreResult<()> {
+    let scope = non_cluster_credential_scope(section)?;
+    let (active_refs, statuses) =
+        semantic_credential_statuses_for_scope(config, scope, credential_lkg);
+    ensure_active_credential_statuses(&active_refs, &statuses)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum MigrationScope {
@@ -2009,6 +2159,34 @@ impl CredentialSectionRuntimeMetadata {
     }
 }
 
+/// One coherent durable generation of a non-cluster credential-backed
+/// section and the credential document observed under the same migration
+/// lock.
+///
+/// With an expected revision this contains a hydrated, mutation-safe runtime
+/// section and requires healthy primary authorities. Without one it contains
+/// the secret-free durable projection, including degraded last-known-good
+/// metadata suitable for GET/status responses.
+pub struct ExactCredentialSectionReadSnapshot {
+    pub section: crate::SectionEnvelope<Value>,
+    pub credential_statuses: Vec<crate::CredentialStatus>,
+    pub credential_health: crate::CredentialStoreHealth,
+    section_id: crate::SectionId,
+    runtime: crate::Config,
+}
+
+impl ExactCredentialSectionReadSnapshot {
+    /// Install only this snapshot's owned section into an existing runtime.
+    /// Unrelated process-local sections are preserved.
+    pub fn install_into(self, target: &mut crate::Config) -> CredentialSectionRuntimeMetadata {
+        crate::section_facade::apply_runtime_section(self.section_id, &self.runtime, target);
+        CredentialSectionRuntimeMetadata {
+            credential_statuses: self.credential_statuses,
+            credential_health: self.credential_health,
+        }
+    }
+}
+
 /// Exact runtime projection for one non-cluster credential-backed section.
 ///
 /// Callers can install only the owned section into an existing process
@@ -2046,6 +2224,83 @@ struct ExactSectionRuntimeSnapshot {
     credential_lkg: crate::credential_store::CredentialDocumentLkg,
 }
 
+/// Recover readiness and read one durable credential-backed section together
+/// with one immutable credential generation while the shared migration lock
+/// excludes compound writers.
+///
+/// Revision-bound reads are mutation preflights: the section itself is the
+/// CAS authority and both primary documents must be healthy. Unbound reads
+/// are secret-free response snapshots and may report degraded LKG health.
+pub fn read_exact_credential_section_snapshot(
+    data_dir: impl AsRef<Path>,
+    section: crate::SectionId,
+    expected_revision: Option<u64>,
+) -> ConfigStoreResult<ExactCredentialSectionReadSnapshot> {
+    let data_dir = data_dir.as_ref();
+    let scope = non_cluster_credential_scope(section)?;
+    with_migration_lock(data_dir, || {
+        recover_committed(
+            data_dir,
+            #[cfg(test)]
+            None,
+        )?;
+        ensure_provider_mcp_migration_ready(data_dir)?;
+
+        let (config, envelope) = if expected_revision.is_some() {
+            crate::section_facade::load_durable_effective_section_under_migration_lock(
+                data_dir, section,
+            )?
+        } else {
+            crate::section_facade::load_durable_effective_section_snapshot_under_migration_lock(
+                data_dir, section,
+            )?
+        };
+        if let Some(expected) = expected_revision {
+            if expected != envelope.revision {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: envelope.revision,
+                });
+            }
+        }
+
+        let store = CredentialStore::open(data_dir);
+        let (runtime, credential_statuses, credential_health) = if expected_revision.is_some() {
+            let exact =
+                materialize_section_runtime_under_migration_lock(config, scope, &store, false)?;
+            if exact.runtime.credential_health.status == crate::SectionStatus::Degraded {
+                return Err(ConfigStoreError::Validation(format!(
+                    "revision-bound {} mutations require a healthy primary credential section",
+                    section.descriptor().name
+                )));
+            }
+            let credential_statuses = exact.runtime.credential_statuses.clone();
+            let credential_health = exact.runtime.credential_health.clone();
+            (
+                exact.runtime.runtime,
+                credential_statuses,
+                credential_health,
+            )
+        } else {
+            let (credential_lkg, _, credential_health) = store.snapshot_with_health_unchecked()?;
+            let active_refs = credential_refs_for_scope(&config, scope);
+            let credential_statuses = credential_lkg
+                .statuses_with_validation(&active_refs, |_, value| {
+                    credential_value_is_valid_for_scope(scope, value)
+                });
+            (config, credential_statuses, credential_health)
+        };
+
+        Ok(ExactCredentialSectionReadSnapshot {
+            section: envelope,
+            credential_statuses,
+            credential_health,
+            section_id: section,
+            runtime,
+        })
+    })
+}
+
 type SectionPostCommit<'a> = &'a mut dyn FnMut(
     ExactTransactionScope,
     u64,
@@ -2059,35 +2314,48 @@ fn materialize_section_runtime_under_migration_lock(
     mut runtime: crate::Config,
     scope: ExactTransactionScope,
     store: &CredentialStore,
+    reject_invalid_active: bool,
 ) -> ConfigStoreResult<ExactSectionRuntimeSnapshot> {
-    let (credential_lkg, credential_statuses, credential_health) =
-        store.snapshot_with_health_unchecked()?;
-    match scope {
-        ExactTransactionScope::Providers => {
-            runtime.hydrate_provider_credentials_from_snapshot(&credential_lkg)?;
-        }
-        ExactTransactionScope::Mcp => {
-            runtime.hydrate_mcp_credentials_from_snapshot(&credential_lkg)?;
-        }
-        ExactTransactionScope::ProxyAuth => {
-            runtime.hydrate_proxy_auth_from_snapshot(&credential_lkg)?;
-        }
-        ExactTransactionScope::EnvVars => {
-            runtime.hydrate_env_var_credentials_from_snapshot(&credential_lkg)?;
-        }
-        ExactTransactionScope::Notifications => {
-            runtime.hydrate_notification_credentials_from_snapshot(&credential_lkg)?;
-        }
-        ExactTransactionScope::Connect => {
-            runtime.hydrate_connect_credentials_from_snapshot(&credential_lkg)?;
-        }
-        ExactTransactionScope::AccessControl => {
-            runtime.hydrate_access_control_credentials_from_snapshot(&credential_lkg)?;
-        }
-        ExactTransactionScope::ClusterFabric => {
-            return Err(ConfigStoreError::Validation(
-                "cluster runtime uses its dedicated transaction snapshot".to_string(),
-            ));
+    let (credential_lkg, _, credential_health) = store.snapshot_with_health_unchecked()?;
+    let (active_refs, credential_statuses) =
+        semantic_credential_statuses_for_scope(&runtime, scope, &credential_lkg);
+    let active_values_valid =
+        ensure_active_credential_statuses(&active_refs, &credential_statuses).is_ok();
+    if reject_invalid_active {
+        ensure_active_credential_statuses(&active_refs, &credential_statuses)?;
+    }
+    // A mutation base must remain repairable. If an active value decrypts but
+    // fails its domain semantics, retain only the secret-free durable
+    // metadata. Explicit replace/clear can repair it; keep/metadata is rejected
+    // against the prepared credential candidate before staging.
+    if active_values_valid {
+        match scope {
+            ExactTransactionScope::Providers => {
+                runtime.hydrate_provider_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::Mcp => {
+                runtime.hydrate_mcp_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::ProxyAuth => {
+                runtime.hydrate_proxy_auth_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::EnvVars => {
+                runtime.hydrate_env_var_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::Notifications => {
+                runtime.hydrate_notification_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::Connect => {
+                runtime.hydrate_connect_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::AccessControl => {
+                runtime.hydrate_access_control_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::ClusterFabric => {
+                return Err(ConfigStoreError::Validation(
+                    "cluster runtime uses its dedicated transaction snapshot".to_string(),
+                ));
+            }
         }
     }
     runtime.apply_runtime_env_overrides();
@@ -2105,36 +2373,58 @@ fn materialize_section_runtime_under_migration_lock(
 fn capture_section_post_commit(
     data_dir: &Path,
     scope: ExactTransactionScope,
-    expected_revision: u64,
-    committed_revision: u64,
+    request_expected_revision: u64,
+    staged_committed_revision: u64,
     changed: bool,
     store: &CredentialStore,
     callback: &mut SectionPostCommit<'_>,
-) {
+) -> u64 {
     match crate::section_facade::load_durable_effective_section_under_migration_lock(
         data_dir,
         scope.section_id(),
     ) {
-        Ok(candidate) => {
-            let runtime =
-                materialize_section_runtime_under_migration_lock(candidate.clone(), scope, store);
+        Ok((candidate, envelope)) => {
+            let actual_revision = envelope.revision;
+            let adoption_expected_revision = if changed {
+                actual_revision.saturating_sub(1)
+            } else {
+                request_expected_revision
+            };
+            let runtime = if changed && actual_revision < staged_committed_revision {
+                Err(ConfigStoreError::Validation(format!(
+                    "committed {} section revision {actual_revision} precedes staged revision \
+                     {staged_committed_revision}",
+                    scope.section_id().descriptor().name
+                )))
+            } else {
+                materialize_section_runtime_under_migration_lock(
+                    candidate.clone(),
+                    scope,
+                    store,
+                    true,
+                )
+            };
             callback(
                 scope,
-                expected_revision,
-                committed_revision,
+                adoption_expected_revision,
+                actual_revision,
                 changed,
                 Some(&candidate),
                 runtime,
             );
+            actual_revision
         }
-        Err(error) => callback(
-            scope,
-            expected_revision,
-            committed_revision,
-            changed,
-            None,
-            Err(error),
-        ),
+        Err(error) => {
+            callback(
+                scope,
+                request_expected_revision,
+                staged_committed_revision,
+                changed,
+                None,
+                Err(error),
+            );
+            staged_committed_revision
+        }
     }
 }
 
@@ -2532,8 +2822,7 @@ pub fn read_exact_cluster_fabric_snapshot(
                     .values()
                     .flat_map(|metadata| metadata.references().cloned())
                     .collect::<BTreeSet<_>>();
-                credential_statuses =
-                    credential_lkg.statuses_with_cluster_crypto_validation(&active_refs);
+                credential_statuses = credential_lkg.statuses_with_crypto_validation(&active_refs);
             }
         }
         let credential_degraded = credential_health.status == crate::SectionStatus::Degraded;
@@ -3874,7 +4163,7 @@ fn persist_exact_credential_transaction_inner(
             let section = active_section
                 .as_ref()
                 .expect("guarded by active-section presence");
-            capture_section_post_commit(
+            let actual_revision = capture_section_post_commit(
                 data_dir,
                 scope,
                 section.expected_revision,
@@ -3885,7 +4174,7 @@ fn persist_exact_credential_transaction_inner(
                     .as_mut()
                     .expect("guarded by post-commit callback presence"),
             );
-            return Ok(section.expected_revision);
+            return Ok(actual_revision);
         }
         None => return store.revision_unchecked(),
     };
@@ -3948,6 +4237,24 @@ fn persist_exact_credential_transaction_inner(
     }
     if proxy_only && active_section.is_some() && prepared.required_refs.is_empty() {
         config.proxy_auth_credential_ref = None;
+    }
+    if active_section.is_some()
+        && matches!(
+            exact_scope,
+            Some(
+                ExactTransactionScope::ProxyAuth
+                    | ExactTransactionScope::EnvVars
+                    | ExactTransactionScope::Notifications
+                    | ExactTransactionScope::Connect
+                    | ExactTransactionScope::AccessControl
+            )
+        )
+    {
+        let scope = exact_scope.expect("matched an active non-cluster credential scope");
+        let active_refs = credential_refs_for_scope(config, scope);
+        prepared.validate_active_values(&active_refs, |_, value| {
+            credential_value_is_valid_for_scope(scope, value)
+        })?;
     }
     let (config_bytes, provider_bytes) = if proxy_only {
         (
@@ -4138,7 +4445,7 @@ fn persist_exact_credential_transaction_inner(
             active_section.as_ref(),
             section_post_commit.as_mut(),
         ) {
-            capture_section_post_commit(
+            let actual_revision = capture_section_post_commit(
                 data_dir,
                 scope,
                 section.expected_revision,
@@ -4147,6 +4454,7 @@ fn persist_exact_credential_transaction_inner(
                 &store,
                 callback,
             );
+            return Ok(actual_revision);
         }
         return if active_section.is_some() {
             Ok(committed_authority_revision)
@@ -4639,7 +4947,7 @@ fn persist_exact_credential_transaction_inner(
         active_section.as_ref(),
         section_post_commit.as_mut(),
     ) {
-        capture_section_post_commit(
+        let actual_revision = capture_section_post_commit(
             data_dir,
             scope,
             section.expected_revision,
@@ -4650,12 +4958,16 @@ fn persist_exact_credential_transaction_inner(
         );
         // Credential-member rebases can advance beyond the initially staged
         // revision. The owned section remains the sole public CAS authority.
-        Ok(committed_authority_revision)
-    } else if active_section.is_some() {
+        Ok(actual_revision)
+    } else if let (Some(scope), Some(_)) = (exact_scope, active_section.as_ref()) {
         // Non-adopting callers use the same public contract: the returned
         // revision is the owned section generation, never the internal
         // credential-document generation.
-        Ok(committed_authority_revision)
+        crate::section_facade::load_durable_effective_section_under_migration_lock(
+            data_dir,
+            scope.section_id(),
+        )
+        .map(|(_, envelope)| envelope.revision)
     } else {
         // Credential-member rebases can advance beyond the initially staged
         // revision. Preserve the existing exact-transaction return contract
@@ -16945,6 +17257,137 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
             credentials_before
+        );
+    }
+
+    #[test]
+    fn env_keep_rejects_a_semantically_invalid_active_credential_without_writes() {
+        let _key = crate::encryption::set_test_encryption_key([0x4d; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut seed, initial_revision) =
+            active_facade_config_and_section_revision(dir.path(), crate::SectionId::Env);
+        seed.env_vars.push(crate::EnvVarEntry {
+            name: "MASKED_TOKEN".to_string(),
+            value: "initial-secret".to_string(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let intents = BTreeSet::from(["MASKED_TOKEN".to_string()]);
+        let section_revision = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut seed,
+            &intents,
+            initial_revision,
+        )
+        .unwrap();
+        let reference = seed.env_vars[0].credential_ref.clone().unwrap();
+        let credential_path = dir.path().join(CREDENTIALS_FILE);
+        let mut credential_document: Value =
+            serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
+        credential_document["data"]["entries"][reference.as_str()]["ciphertext"] =
+            Value::String(crate::encryption::encrypt("********").unwrap());
+        std::fs::write(
+            &credential_path,
+            serde_json::to_vec_pretty(&credential_document).unwrap(),
+        )
+        .unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+
+        let exact = read_exact_credential_section_snapshot(
+            dir.path(),
+            crate::SectionId::Env,
+            Some(section_revision),
+        )
+        .unwrap();
+        let mut keep = crate::Config::default();
+        let metadata = exact.install_into(&mut keep);
+        assert!(!metadata.status(&reference).configured);
+        let entry = keep
+            .env_vars
+            .iter_mut()
+            .find(|entry| entry.name == "MASKED_TOKEN")
+            .unwrap();
+        entry.value.clear();
+        entry.description = Some("metadata-only edit".to_string());
+
+        let env_before = std::fs::read(dir.path().join(ENV_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let directory_before = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        let error = persist_env_var_credential_transaction_at_revision_with_adoption(
+            dir.path(),
+            &mut keep,
+            &intents,
+            section_revision,
+            &process_facade,
+        )
+        .err()
+        .expect("retaining a semantic mask must fail");
+        assert!(matches!(
+            error,
+            ConfigStoreError::Validation(message)
+                if message.contains("explicitly replace or clear")
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(ENV_FILE)).unwrap(),
+            env_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>(),
+            directory_before
+        );
+        assert!(!dir.path().join(JOURNAL_FILE).exists());
+        assert_active_exact_manifest(dir.path(), ExactTransactionScope::EnvVars);
+
+        let get = read_exact_credential_section_snapshot(dir.path(), crate::SectionId::Env, None)
+            .unwrap();
+        assert!(
+            !get.credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == reference)
+                .unwrap()
+                .configured,
+            "GET/status must report the invalid active record truthfully"
+        );
+
+        let entry = keep
+            .env_vars
+            .iter_mut()
+            .find(|entry| entry.name == "MASKED_TOKEN")
+            .unwrap();
+        entry.value = "replacement-secret".to_string();
+        entry.configured = true;
+        let repaired = persist_env_var_credential_transaction_at_revision_with_adoption(
+            dir.path(),
+            &mut keep,
+            &intents,
+            section_revision,
+            &process_facade,
+        )
+        .unwrap();
+        assert_eq!(repaired.revision, section_revision + 1);
+        assert!(
+            repaired
+                .runtime
+                .unwrap()
+                .credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == reference)
+                .unwrap()
+                .configured
         );
     }
 
