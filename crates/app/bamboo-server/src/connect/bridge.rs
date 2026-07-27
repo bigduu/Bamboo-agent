@@ -198,6 +198,7 @@ fn create_connect_session(
     workspace_path: Option<&str>,
     project_id: Option<&bamboo_domain::ProjectId>,
     reasoning_effort: Option<ReasoningEffort>,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Session {
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut session = Session::new(session_id.clone(), model.to_string());
@@ -213,9 +214,10 @@ fn create_connect_session(
         session.set_project_id_meta(project_id.to_string());
     }
     if let Some(path) = workspace_path {
-        let final_workspace = bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        let final_workspace = workspace_resolver.publish_resolved_workspace(
             &session_id,
             PathBuf::from(path),
+            "connect",
         );
         session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
             &final_workspace,
@@ -780,6 +782,7 @@ impl ConnectBridge {
             final_workspace_display.as_deref(),
             project_id,
             resolved.reasoning_effort,
+            &self.ctx.workspace_resolver,
         );
         if project_id.is_some() {
             session.metadata.insert(
@@ -1407,6 +1410,39 @@ mod tests {
         assert!(
             bridge.session_id_for_key("fake:chat:user").await.is_none(),
             "failed validation must not publish a chat-to-session mapping"
+        );
+    }
+
+    #[test]
+    fn connect_publication_uses_the_validating_instance_workspace_root() {
+        let instance_root = tempfile::tempdir().expect("instance workspace root");
+        let relocated = instance_root.path().join("connect-workspace");
+        let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+            let root = instance_root.path().to_path_buf();
+            move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                root: root.clone(),
+                confine: true,
+            }
+        });
+
+        let session = create_connect_session(
+            "fake:chat:user",
+            "model",
+            "system",
+            "base",
+            Some(relocated.to_string_lossy().as_ref()),
+            None,
+            None,
+            &resolver,
+        );
+
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(relocated.to_string_lossy().as_ref())
+        );
+        assert!(
+            relocated.is_dir(),
+            "the AppState resolver must materialize its own validated target"
         );
     }
 

@@ -400,6 +400,7 @@ async fn run_schedule_job(
         &resolved.base_system_prompt,
         resolved.workspace_path.as_deref(),
         resolved.reasoning_effort,
+        &ctx.workspace_resolver,
     );
     let session_id = session.id.clone();
     if let Some(config) = ctx.permission_config.as_ref() {

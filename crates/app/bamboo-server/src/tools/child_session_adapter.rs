@@ -499,6 +499,16 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
 
 #[async_trait]
 impl ChildSessionPort for ChildSessionAdapter {
+    fn publish_child_workspace(
+        &self,
+        session_id: &str,
+        workspace: std::path::PathBuf,
+        source: &str,
+    ) -> std::path::PathBuf {
+        self.workspace_resolver
+            .publish_resolved_workspace(session_id, workspace, source)
+    }
+
     async fn validate_child_workspace(
         &self,
         project_id: Option<&bamboo_domain::ProjectId>,

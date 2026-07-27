@@ -116,9 +116,10 @@ pub async fn create_child_action(
     // process-global confinement policy a second time: server embeddings may
     // use an instance-scoped resolver whose policy differs from the first
     // AppState registered in this process.
-    let stored_workspace = bamboo_agent_core::workspace_state::publish_resolved_workspace(
+    let stored_workspace = port.publish_child_workspace(
         &child.id,
         std::path::PathBuf::from(final_workspace),
+        input.workspace_source.as_str(),
     );
     child.workspace = Some(stored_workspace.to_string_lossy().to_string());
     child.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(

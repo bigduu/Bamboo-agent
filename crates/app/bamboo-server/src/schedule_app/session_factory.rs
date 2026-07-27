@@ -16,6 +16,7 @@ pub fn create_schedule_session(
     base_system_prompt: &str,
     workspace_path: Option<&str>,
     reasoning_effort: Option<ReasoningEffort>,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Session {
     let session_id = uuid::Uuid::new_v4().to_string();
     let title = format!(
@@ -45,9 +46,10 @@ pub fn create_schedule_session(
         session.set_project_id_meta(project_id.to_string());
     }
     if let Some(path) = workspace_path {
-        let final_workspace = bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        let final_workspace = workspace_resolver.publish_resolved_workspace(
             &session_id,
             std::path::PathBuf::from(path),
+            "schedule",
         );
         let final_workspace = bamboo_config::paths::path_to_display_string(&final_workspace);
         session.set_workspace_path_meta(final_workspace);
@@ -85,4 +87,52 @@ pub fn create_schedule_session(
     }
 
     session
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::workspace_state::{WorkspaceResolver, WorkspaceRootConfig};
+    use bamboo_domain::ScheduleRunConfig;
+
+    #[test]
+    fn schedule_publication_uses_the_validating_instance_workspace_root() {
+        let instance_root = tempfile::tempdir().expect("instance workspace root");
+        let relocated = instance_root.path().join("scheduled-workspace");
+        let resolver = WorkspaceResolver::new(|| None, {
+            let root = instance_root.path().to_path_buf();
+            move || WorkspaceRootConfig {
+                root: root.clone(),
+                confine: true,
+            }
+        });
+        let job = ScheduleRunJob {
+            run_id: "run-instance-root".to_string(),
+            schedule_id: "schedule-instance-root".to_string(),
+            schedule_name: "instance root".to_string(),
+            run_config: ScheduleRunConfig::default(),
+            scheduled_for: chrono::Utc::now(),
+            claimed_at: chrono::Utc::now(),
+            was_catch_up: false,
+        };
+
+        let session = create_schedule_session(
+            &job,
+            "model",
+            "system",
+            "base",
+            Some(relocated.to_string_lossy().as_ref()),
+            None,
+            &resolver,
+        );
+
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(relocated.to_string_lossy().as_ref())
+        );
+        assert!(
+            relocated.is_dir(),
+            "the AppState resolver must materialize its own validated target"
+        );
+    }
 }

@@ -172,6 +172,13 @@ async fn build_test_harness() -> TestHarness {
 async fn build_test_harness_with_resolver(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
 ) -> TestHarness {
+    build_test_harness_with_options(subagent_model_resolver, None).await
+}
+
+async fn build_test_harness_with_options(
+    subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
+) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
     let workspace_path = bamboo_home.join("workspace");
@@ -328,8 +335,9 @@ async fn build_test_harness_with_resolver(
         subagent_model_resolver,
         config,
         project_store: Some(project_store.clone()),
-        workspace_resolver:
-            bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
+        workspace_resolver: workspace_resolver.unwrap_or_else(
+            bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals,
+        ),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
     });
     let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
@@ -354,6 +362,65 @@ async fn build_test_harness_with_resolver(
 // -----------------------------------------------------------------------
 // ④ Batched parent-wait registration
 // -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn child_publication_uses_the_validating_instance_workspace_root() {
+    let instance_root = tempfile::tempdir().expect("instance workspace root");
+    let canonical_instance_root = instance_root
+        .path()
+        .canonicalize()
+        .expect("canonical instance workspace root");
+    let foreign_workspace = tempfile::tempdir().expect("foreign workspace");
+    let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+        let root = instance_root.path().to_path_buf();
+        move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+            root: root.clone(),
+            confine: true,
+        }
+    });
+    let harness = build_test_harness_with_options(None, Some(resolver)).await;
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("load parent")
+        .expect("parent");
+    let child_id = "instance-confined-child".to_string();
+
+    child_session::create_child_action(
+        harness.adapter.as_ref(),
+        child_session::CreateChildInput {
+            parent_session: parent,
+            child_id: child_id.clone(),
+            title: "Confined child".to_string(),
+            responsibility: "Inspect".to_string(),
+            assignment_prompt: "Inspect".to_string(),
+            subagent_type: "explorer".to_string(),
+            workspace: foreign_workspace.path().to_string_lossy().into_owned(),
+            workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
+            model_override: None,
+            model_ref_override: None,
+            runtime_metadata: HashMap::new(),
+            auto_run: false,
+            reasoning_effort: None,
+            lifecycle: None,
+            resident_name: None,
+            resident_context: None,
+            disabled_tools: None,
+            context_fork: None,
+        },
+    )
+    .await
+    .expect("instance-confined child");
+
+    let published =
+        bamboo_agent_core::workspace_state::get_workspace(&child_id).expect("published workspace");
+    assert!(published.starts_with(&canonical_instance_root));
+    assert!(
+        published.is_dir(),
+        "the same instance resolver that validated the relocated target must materialize it"
+    );
+}
 
 #[tokio::test]
 async fn child_resident_and_guardian_reject_cross_project_workspace_without_side_effects() {

@@ -189,6 +189,21 @@ pub trait ChildSessionPort: Send + Sync {
         normalize_child_workspace(requested_workspace)
     }
 
+    /// Publish a child workspace that already passed this port's validation.
+    ///
+    /// Server adapters override this so validation and publication use the
+    /// same AppState-scoped confinement resolver. The default preserves the
+    /// process-global behavior for non-server embeddings.
+    fn publish_child_workspace(
+        &self,
+        session_id: &str,
+        workspace: std::path::PathBuf,
+        source: &str,
+    ) -> std::path::PathBuf {
+        let _ = source;
+        bamboo_agent_core::workspace_state::publish_resolved_workspace(session_id, workspace)
+    }
+
     async fn load_root_session(&self, root_id: &str) -> Result<Session, ChildSessionError>;
     async fn load_child_for_parent(
         &self,
@@ -242,9 +257,10 @@ pub trait ChildSessionPort: Send + Sync {
             workspace_source.as_str().to_string(),
         );
         self.save_child_session_authoritative_flags(child).await?;
-        bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        self.publish_child_workspace(
             &child.id,
             std::path::PathBuf::from(workspace),
+            workspace_source.as_str(),
         );
         Ok(())
     }
