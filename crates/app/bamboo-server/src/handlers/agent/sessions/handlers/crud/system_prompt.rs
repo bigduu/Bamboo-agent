@@ -1,4 +1,4 @@
-use actix_web::{http::StatusCode, web, HttpResponse, Result};
+use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 
@@ -7,19 +7,7 @@ use super::super::super::types::SessionSystemPromptResponse;
 fn project_snapshot_error(
     error: bamboo_engine::project_context::ProjectContextError,
 ) -> HttpResponse {
-    use bamboo_engine::project_context::ProjectContextError;
-
-    let status = match error {
-        ProjectContextError::InvalidProjectIdentity { .. }
-        | ProjectContextError::WorkspaceInvalid { .. } => StatusCode::BAD_REQUEST,
-        ProjectContextError::WorkspaceConflict { .. }
-        | ProjectContextError::UnassignedWorkspaceConflict { .. }
-        | ProjectContextError::ProjectUnavailable { .. } => StatusCode::CONFLICT,
-        ProjectContextError::Source(_) | ProjectContextError::IdentityMismatch { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    };
-    crate::error::json_error(status, error.to_string())
+    crate::project_context::project_context_error_response(error)
 }
 
 /// `GET /api/v1/sessions/{session_id}/system-prompt`
@@ -332,6 +320,9 @@ mod tests {
                 .await
                 .expect("invalid snapshot response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body()).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_project_identity");
 
         let mut conflict = Session::new("conflicting-project-snapshot", "gpt-5");
         conflict.set_project_id_meta(assigned_project.id.to_string());
@@ -341,10 +332,30 @@ mod tests {
             .save_session(&conflict)
             .await
             .expect("save conflicting session");
-        let response = get_system_prompt_snapshot(state, web::Path::from(conflict.id.clone()))
-            .await
-            .expect("conflict snapshot response");
+        let response =
+            get_system_prompt_snapshot(state.clone(), web::Path::from(conflict.id.clone()))
+                .await
+                .expect("conflict snapshot response");
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body()).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "project_workspace_conflict");
+
+        let mut missing = Session::new("missing-project-path-snapshot", "gpt-5");
+        missing.set_project_id_meta(assigned_project.id.to_string());
+        state
+            .storage
+            .save_session(&missing)
+            .await
+            .expect("save missing-path session");
+        let response = get_system_prompt_snapshot(state, web::Path::from(missing.id.clone()))
+            .await
+            .expect("missing-path snapshot response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body()).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "project_path_missing");
+        assert_eq!(body["project_id"], assigned_project.id.to_string());
     }
 
     #[test]

@@ -189,12 +189,17 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
     );
 
     // ---- Resolve workspace path (metadata only, no filesystem) ----
+    let allow_legacy_workspace_fallback = matches!(
+        crate::project_context::ProjectContextResolver::session_project_identity(&session),
+        crate::project_context::SessionProjectIdentity::Unassigned
+    );
     let workspace_path = resolve_workspace_path_with_default(
         &mut session,
         input.workspace_path.as_deref(),
         input.default_workspace_path.as_deref(),
         &workspace_fallback_policy,
         input.data_dir.as_deref(),
+        allow_legacy_workspace_fallback,
     );
 
     // ---- Resolve typed workflow selection / legacy skill IDs ----
@@ -335,6 +340,7 @@ pub fn resolve_workspace_path(
         None,
         &ChatWorkspaceFallbackPolicy::Legacy,
         data_dir,
+        true,
     )
 }
 
@@ -344,17 +350,34 @@ fn resolve_workspace_path_with_default(
     default_workspace_path: Option<&str>,
     fallback_policy: &ChatWorkspaceFallbackPolicy,
     data_dir: Option<&Path>,
+    allow_legacy_fallback: bool,
 ) -> Option<String> {
     if let Some(path) = workspace_path_from_request {
         session.set_workspace_path_meta(path);
+        session.metadata.insert(
+            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            crate::project_context::WorkspaceSource::Explicit
+                .as_str()
+                .to_string(),
+        );
     }
 
     let resolved = workspace_path_from_request
         .map(ToString::to_string)
         .or_else(|| session.workspace_path_meta())
-        .or_else(|| default_workspace_path.map(ToString::to_string))
         .or_else(|| {
-            resolve_workspace_fallback_with(fallback_policy, || resolve_default_workspace(data_dir))
+            allow_legacy_fallback
+                .then(|| default_workspace_path.map(ToString::to_string))
+                .flatten()
+        })
+        .or_else(|| {
+            allow_legacy_fallback
+                .then(|| {
+                    resolve_workspace_fallback_with(fallback_policy, || {
+                        resolve_default_workspace(data_dir)
+                    })
+                })
+                .flatten()
         });
     if let Some(workspace) = resolved.as_ref() {
         // Persist the effective post-lock choice, including a live-config or

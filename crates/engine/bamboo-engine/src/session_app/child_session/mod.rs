@@ -114,6 +114,8 @@ pub struct CreateChildInput {
     pub subagent_type: String,
     /// Absolute path to the working directory for the child session.
     pub workspace: String,
+    /// How the child workspace was selected before validation.
+    pub workspace_source: crate::project_context::WorkspaceSource,
     /// Optional model override resolved from subagent_type routing.
     /// When `None`, the child inherits the parent session's model.
     pub model_override: Option<String>,
@@ -231,9 +233,14 @@ pub trait ChildSessionPort: Send + Sync {
         &self,
         child: &mut Session,
         workspace: &str,
+        workspace_source: crate::project_context::WorkspaceSource,
     ) -> Result<(), ChildSessionError> {
         child.workspace = Some(workspace.to_string());
         child.set_workspace_path_meta(workspace);
+        child.metadata.insert(
+            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            workspace_source.as_str().to_string(),
+        );
         self.save_child_session_authoritative_flags(child).await?;
         bamboo_agent_core::workspace_state::publish_resolved_workspace(
             &child.id,

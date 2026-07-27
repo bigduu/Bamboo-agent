@@ -97,6 +97,29 @@ fn project_context_error_response(
                 "project_id": project_id,
             }))
         }
+        ProjectContextError::ProjectPathMissing { project_id } => {
+            HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_path_missing",
+                    "message": "Assigned Project has no configured project_path"
+                },
+                "project_id": project_id,
+            }))
+        }
+        ProjectContextError::ProjectPathUnavailable {
+            project_id,
+            project_path,
+            message,
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_path_unavailable",
+                "message": message
+            },
+            "project_id": project_id,
+            "project_path": project_path,
+        })),
         error @ (ProjectContextError::Source(_) | ProjectContextError::IdentityMismatch { .. }) => {
             tracing::error!(%error, "failed to resolve Project context for reassignment");
             crate::error::json_error(
@@ -184,20 +207,6 @@ pub async fn patch_session(
             return Ok(precondition_failed(&session_id, session.metadata_version));
         }
 
-        // Materialize the effective configured fallback into this still-local
-        // snapshot only when neither persisted nor runtime workspace exists.
-        // The resolver then validates the same final candidate create/chat
-        // would use; a rejected reassignment publishes nothing.
-        if session.workspace_path_meta().is_none()
-            && bamboo_agent_core::workspace_state::peek_workspace(&session_id).is_none()
-        {
-            if let Some(workspace) = state.config.read().await.get_default_work_area_path() {
-                session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
-                    &workspace,
-                ));
-            }
-        }
-
         let target = match requested_project {
             Some(raw) => {
                 let trimmed = raw.trim();
@@ -244,45 +253,64 @@ pub async fn patch_session(
             }
             None => None,
         };
-        if let Err(error) = crate::project_context::validate_workspace_assignment(
-            &state.project_store,
-            target.as_ref(),
-            session.workspace_path_meta().as_deref(),
-        ) {
-            return Ok(match error {
-                crate::project_context::ProjectWorkspaceValidationError::Invalid {
-                    code,
-                    workspace,
-                    message,
-                } => HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": code,
-                        "message": message
-                    },
-                    "workspace": workspace,
-                })),
-                crate::project_context::ProjectWorkspaceValidationError::Conflict {
-                    workspace,
-                    owner_project_id,
-                    session_project_id,
-                } => HttpResponse::Conflict().json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": "project_workspace_conflict",
-                        "message": "Workspace belongs to another Project"
-                    },
-                    "workspace": workspace,
-                    "owner_project_id": owner_project_id,
-                    "session_project_id": session_project_id,
-                })),
-                crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
-                    return Err(crate::error::json_internal_server_error(format!(
-                        "Failed to validate workspace Project ownership: {error}"
-                    )));
+        let workspace_for_validation = (session
+            .metadata
+            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str)
+            != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str()))
+        .then(|| session.workspace_path_meta())
+        .flatten();
+        let final_workspace =
+            match crate::project_context::validate_workspace_assignment_with_resolver(
+                &state.project_store,
+                target.as_ref(),
+                workspace_for_validation.as_deref(),
+                &state.workspace_resolver,
+            ) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    return Ok(match error {
+                        crate::project_context::ProjectWorkspaceValidationError::Invalid {
+                            code,
+                            workspace,
+                            message,
+                        } => {
+                            let mut response = if code.starts_with("project_path_") {
+                                HttpResponse::Conflict()
+                            } else {
+                                HttpResponse::BadRequest()
+                            };
+                            response.json(serde_json::json!({
+                                "error": {
+                                    "type": "api_error",
+                                    "code": code,
+                                    "message": message
+                                },
+                                "workspace": workspace,
+                            }))
+                        }
+                        crate::project_context::ProjectWorkspaceValidationError::Conflict {
+                            workspace,
+                            owner_project_id,
+                            session_project_id,
+                        } => HttpResponse::Conflict().json(serde_json::json!({
+                            "error": {
+                                "type": "api_error",
+                                "code": "project_workspace_conflict",
+                                "message": "Workspace belongs to another Project"
+                            },
+                            "workspace": workspace,
+                            "owner_project_id": owner_project_id,
+                            "session_project_id": session_project_id,
+                        })),
+                        crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+                            return Err(crate::error::json_internal_server_error(format!(
+                                "Failed to validate workspace Project ownership: {error}"
+                            )));
+                        }
+                    });
                 }
-            });
-        }
+            };
 
         let current_raw = session.project_id_meta();
         let current = current_raw
@@ -296,6 +324,19 @@ pub async fn patch_session(
             match target.as_ref() {
                 Some(project_id) => session.set_project_id_meta(project_id.to_string()),
                 None => session.clear_project_id_meta(),
+            }
+            if let Some(workspace) = final_workspace.as_deref() {
+                session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+                    workspace,
+                ));
+                if target.is_some() && workspace_for_validation.is_none() {
+                    session.metadata.insert(
+                        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                            .as_str()
+                            .to_string(),
+                    );
+                }
             }
             session.metadata_version = session.metadata_version.saturating_add(1);
             session.updated_at = chrono::Utc::now();
@@ -798,9 +839,10 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn project_reassignment_validates_assigned_and_unassigned_default_workspace_candidates() {
+    async fn project_reassignment_uses_target_path_but_unassignment_still_checks_global_default() {
         let state = new_state().await;
         let workspace = tempdir().expect("default workspace");
+        let target_path = tempdir().expect("target Project path");
         let owner = state
             .project_store
             .create_with_bindings(
@@ -815,7 +857,12 @@ mod tests {
             .expect("owner Project");
         let target = state
             .project_store
-            .create("Other Project", None)
+            .create_with_project_path(
+                "Other Project",
+                None,
+                target_path.path().to_string_lossy(),
+                Vec::new(),
+            )
             .expect("target Project");
         state.config.write().await.default_work_area = Some(bamboo_config::DefaultWorkAreaConfig {
             path: Some(workspace.path().to_string_lossy().into_owned()),
@@ -835,43 +882,63 @@ mod tests {
         )
         .await;
 
-        for (session_id, requested_project, expected_project) in [
-            (
-                unassigned.id.as_str(),
-                serde_json::Value::String(target.id.to_string()),
-                None,
-            ),
-            (
-                assigned.id.as_str(),
-                serde_json::Value::Null,
-                Some(owner.id.as_str()),
-            ),
-        ] {
-            let response = test::call_service(
-                &app,
-                test::TestRequest::patch()
-                    .uri(&format!("/api/v1/sessions/{session_id}"))
-                    .insert_header((header::IF_MATCH, "\"0\""))
-                    .set_json(serde_json::json!({"project_id": requested_project}))
-                    .to_request(),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::CONFLICT);
-            let body: Value = test::read_body_json(response).await;
-            assert_eq!(body["error"]["code"], "project_workspace_conflict");
-            assert_eq!(body["owner_project_id"], owner.id.as_str());
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", unassigned.id))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({"project_id": target.id}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let persisted = state
+            .storage
+            .load_session(&unassigned.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            Some(target.id.as_str())
+        );
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            target.project_path.as_deref()
+        );
+        assert_eq!(
+            persisted
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("project_default")
+        );
 
-            let persisted = state
-                .storage
-                .load_session(session_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(persisted.project_id_meta().as_deref(), expected_project);
-            assert_eq!(persisted.metadata_version, 0);
-            assert!(persisted.workspace_path_meta().is_none());
-            assert!(bamboo_agent_core::workspace_state::peek_workspace(session_id).is_none());
-        }
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", assigned.id))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({"project_id": null}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "project_workspace_conflict");
+        assert_eq!(body["owner_project_id"], owner.id.as_str());
+        let persisted = state
+            .storage
+            .load_session(&assigned.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            Some(owner.id.as_str())
+        );
+        assert_eq!(persisted.metadata_version, 0);
+        assert!(persisted.workspace_path_meta().is_none());
     }
 
     #[actix_web::test]

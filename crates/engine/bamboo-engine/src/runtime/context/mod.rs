@@ -8,7 +8,7 @@ pub mod instruction;
 use bamboo_config::paths;
 use bamboo_llm::Config;
 
-use crate::project_context::{ResolvedProjectContext, WorkspaceBindingStatus};
+use crate::project_context::{ResolvedProjectContext, WorkspaceBindingStatus, WorkspaceSource};
 
 pub const DEFAULT_BASE_PROMPT: &str =
     "You are Bodhi, a highly capable AI assistant. You run on the Bamboo agent runtime (you may see it referenced as \"Bamboo\" in injected context and tool names).\n\nYou help users solve problems quickly and correctly. Be concise, practical, and proactive.\nDelegate to sub-agents sparingly, and only when parallelism or isolation earns its cost — the task-execution ladder in the operating directives below says when. When you do delegate:\n- Give each child ONE narrow responsibility plus a detailed, self-contained prompt (it cannot see this conversation), and the workspace/files it needs — set `workspace` explicitly when the task lives in a different repo or directory than yours.\n- Use a one-shot child for independent throwaway work; use a resident agent (`lifecycle=resident` with a stable `name`) for a recurring task family, so successive tasks reuse one agent instead of spawning a new one each time.\n- To run several in parallel: create them (they run in the background), then call SubAgent.wait once.\n- A child that returns is not automatically correct: before trusting its result, verify it actually accessed the files and resources it needed (not guesses), and re-dispatch (run/send_message) any child that reported missing context or did degraded work.\n\nIf Bamboo has already injected relevant workspace or environment context, treat it as available working context instead of re-asking the user for the same information. Prefer a minimal verifiable attempt first, then diagnose failures and only ask follow-up questions for information that is still genuinely missing.\n\nYou have a persistent cross-session memory via the `memory` tool. When you learn a durable, non-derivable fact (a user preference, a confirmed decision, a stable reference), save it as one atomic memory with a specific, descriptive title. Treat injected memory as context to verify against current files, not as authoritative truth. Conversely, when the user refers to their own preferences, past decisions, or personal context you don't already know — including first-person questions about themselves (\"what do I...\", \"did I...\", \"我...?\") — query memory before answering instead of saying you don't know.\n\nWhen making function calls using tools, always include a brief text explanation before or alongside the tool calls describing what you are about to do and why. Never silently call tools without any visible narration to the user.";
@@ -105,14 +105,23 @@ pub fn build_workspace_prompt_context_with_binding(
     workspace_path: &str,
     binding_status: WorkspaceBindingStatus,
 ) -> Option<String> {
+    build_workspace_prompt_context_with_binding_and_source(workspace_path, binding_status, None)
+}
+
+pub fn build_workspace_prompt_context_with_binding_and_source(
+    workspace_path: &str,
+    binding_status: WorkspaceBindingStatus,
+    source: Option<WorkspaceSource>,
+) -> Option<String> {
     let workspace_path = workspace_path.trim();
     if workspace_path.is_empty() {
         return None;
     }
 
     let body = format!(
-        "{WORKSPACE_CONTEXT_PREFIX}{}\nBinding status: {}\nWorkspace-local resources may override Project-shared resources.\nChanging the workspace changes only the filesystem execution context; it does not change Project membership or Project memory.\n{}",
+        "{WORKSPACE_CONTEXT_PREFIX}{}\nWorkspace source: {}\nBinding status: {}\nWorkspace-local resources may override Project-shared resources.\nChanging the workspace changes only the filesystem execution context; it does not change Project membership or Project memory.\n{}",
         prompt_safe_scalar(workspace_path),
+        source.unwrap_or(WorkspaceSource::Session).as_str(),
         binding_status.as_str(),
         workspace_prompt_guidance()
     );
@@ -130,10 +139,16 @@ pub fn build_workspace_prompt_context_with_binding(
 /// [`ResolvedProjectContext`] and therefore cannot leak through this builder.
 pub fn build_project_prompt_context(context: &ResolvedProjectContext) -> String {
     let project = &context.project;
+    let project_path = project
+        .project_path
+        .as_deref()
+        .map(paths::path_to_display_string)
+        .unwrap_or_else(|| "not configured".to_string());
     let body = format!(
-        "{PROJECT_CONTEXT_PREFIX}{}\nProject name: {}\nProject home: {}\nThis session belongs to this Project.\nWorkspace is mutable execution context; changing it does not change Project membership, sidebar grouping, Project memory, or Project-shared resources.\nProject-shared resource inventory is supplied separately as per-round dynamic context.\nUse Workspace to inspect/change only the current directory.\nUse Project to inspect Project identity, bindings, and shared resources.",
+        "{PROJECT_CONTEXT_PREFIX}{}\nProject name: {}\nProject path: {}\nProject home (Bamboo data): {}\nThis session belongs to this Project.\nWorkspace is mutable execution context; changing it does not change Project membership, sidebar grouping, Project memory, or Project-shared resources.\nProject-shared resource inventory is supplied separately as per-round dynamic context.\nUse Workspace to inspect/change only the current directory.\nUse Project to inspect Project identity, bindings, and shared resources.",
         prompt_safe_scalar(project.id.as_str()),
         prompt_safe_scalar(&project.name),
+        prompt_safe_scalar(&project_path),
         prompt_safe_scalar(&paths::path_to_display_string(&project.home)),
     );
     format!("{PROJECT_CONTEXT_START_MARKER}\n{body}\n{PROJECT_CONTEXT_END_MARKER}")
@@ -162,8 +177,17 @@ pub fn upsert_workspace_prompt_context(
     workspace_path: Option<&str>,
     binding_status: WorkspaceBindingStatus,
 ) -> String {
+    upsert_workspace_prompt_context_with_source(prompt, workspace_path, binding_status, None)
+}
+
+pub fn upsert_workspace_prompt_context_with_source(
+    prompt: &str,
+    workspace_path: Option<&str>,
+    binding_status: WorkspaceBindingStatus,
+    source: Option<WorkspaceSource>,
+) -> String {
     let block = workspace_path.and_then(|workspace| {
-        build_workspace_prompt_context_with_binding(workspace, binding_status)
+        build_workspace_prompt_context_with_binding_and_source(workspace, binding_status, source)
     });
     replace_prompt_block(
         prompt,
@@ -264,7 +288,11 @@ pub fn assemble_system_prompt_with_project(
         let binding_status = project_context
             .map(|context| context.binding_status)
             .unwrap_or(WorkspaceBindingStatus::Unregistered);
-        if let Some(segment) = build_workspace_prompt_context_with_binding(path, binding_status) {
+        if let Some(segment) = build_workspace_prompt_context_with_binding_and_source(
+            path,
+            binding_status,
+            project_context.map(|context| context.workspace_source),
+        ) {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");
             }
@@ -306,6 +334,7 @@ mod project_context_tests {
             project: ProjectDescriptor {
                 id: project_id.clone(),
                 name: "Zenith".to_string(),
+                project_path: Some(PathBuf::from(workspace)),
                 home: PathBuf::from("/data/projects/01JPROJECT00000000000000000"),
                 workspace_bindings: vec![WorkspaceBinding {
                     path: workspace.to_string(),
@@ -339,6 +368,7 @@ mod project_context_tests {
                 },
             },
             workspace: Some(PathBuf::from(workspace)),
+            workspace_source: WorkspaceSource::Session,
             binding_status: WorkspaceBindingStatus::Registered,
         }
     }

@@ -29,6 +29,12 @@ pub(super) fn apply_workspace_path_to_session(
     }
 
     session.set_workspace_path_meta(workspace_path);
+    session.metadata.insert(
+        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        crate::project_context::WorkspaceSource::Explicit
+            .as_str()
+            .to_string(),
+    );
 
     if let Some(system_message) = session
         .messages
@@ -60,10 +66,13 @@ pub(super) fn upsert_workspace_context(
         return strip_existing_workspace_context(prompt);
     }
 
-    let Some(segment) = crate::runtime::context::build_workspace_prompt_context_with_binding(
-        workspace_path,
-        binding_status,
-    ) else {
+    let Some(segment) =
+        crate::runtime::context::build_workspace_prompt_context_with_binding_and_source(
+            workspace_path,
+            binding_status,
+            Some(crate::project_context::WorkspaceSource::Explicit),
+        )
+    else {
         return strip_existing_workspace_context(prompt);
     };
     let stripped = strip_existing_workspace_context(prompt);

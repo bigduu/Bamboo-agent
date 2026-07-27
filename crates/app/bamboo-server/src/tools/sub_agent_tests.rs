@@ -328,6 +328,8 @@ async fn build_test_harness_with_resolver(
         subagent_model_resolver,
         config,
         project_store: Some(project_store.clone()),
+        workspace_resolver:
+            bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
         parent_wait_slots: Arc::new(dashmap::DashMap::new()),
     });
     let tool = SubAgentTool::new(adapter.clone(), adapter.clone());
@@ -402,6 +404,7 @@ async fn child_resident_and_guardian_reject_cross_project_workspace_without_side
                 assignment_prompt: "Inspect".to_string(),
                 subagent_type: role.to_string(),
                 workspace: workspace.path().to_string_lossy().into_owned(),
+                workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
                 model_override: None,
                 model_ref_override: None,
                 runtime_metadata: HashMap::new(),
@@ -2444,6 +2447,141 @@ async fn create_requires_workspace() {
         }
         other => panic!("expected InvalidArguments error, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn assigned_child_without_parent_workspace_uses_project_path() {
+    let harness = build_test_harness().await;
+    let project_path = tempfile::tempdir().expect("Project path");
+    let project = harness
+        .project_store
+        .create_with_project_path(
+            "Child Project",
+            None,
+            project_path.path().to_string_lossy(),
+            Vec::new(),
+        )
+        .expect("Project");
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .expect("load parent")
+        .expect("parent");
+    parent.set_project_id_meta(project.id.to_string());
+    parent.workspace = None;
+    harness
+        .storage
+        .save_session(&parent)
+        .await
+        .expect("save parent");
+
+    let result = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "title": "Project Default Child",
+            "responsibility": "Verify Project fallback",
+            "prompt": "Inspect the Project.",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_project_default_workspace",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("assigned child should use Project path");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child_id = payload["child_session_id"].as_str().unwrap();
+    let child = harness
+        .storage
+        .load_session(child_id)
+        .await
+        .expect("load child")
+        .expect("child");
+    let expected =
+        bamboo_config::paths::path_to_display_string(&project_path.path().canonicalize().unwrap());
+    assert_eq!(
+        child.workspace_path_meta().as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        child.project_id_meta().as_deref(),
+        Some(project.id.as_str())
+    );
+    assert_eq!(
+        child
+            .metadata
+            .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str),
+        Some("project_default")
+    );
+
+    let moved_project_path = tempfile::tempdir().expect("Moved Project path");
+    let updated = harness
+        .project_store
+        .update_with_project_path(
+            &project.id,
+            project.revision,
+            moved_project_path.path().to_string_lossy().as_ref(),
+            |_| Ok(()),
+        )
+        .expect("move Project path");
+    parent.workspace = Some(expected.clone());
+    parent.set_workspace_path_meta(expected);
+    parent.metadata.insert(
+        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+            .as_str()
+            .to_string(),
+    );
+    harness
+        .storage
+        .save_session(&parent)
+        .await
+        .expect("save stale default-derived parent");
+    let result = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "title": "Moved Project Default Child",
+            "responsibility": "Verify current Project fallback",
+            "prompt": "Inspect the moved Project.",
+            "auto_run": false
+        }),
+        ToolExecutionContext {
+            session_id: Some(harness.parent_session_id.as_str()),
+            tool_call_id: "tool_call_moved_project_default_workspace",
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+        .to_tool_ctx(),
+    )
+    .await
+    .expect("child should follow Project path CAS");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let moved_child = harness
+        .storage
+        .load_session(payload["child_session_id"].as_str().unwrap())
+        .await
+        .expect("load moved child")
+        .expect("moved child");
+    assert_eq!(
+        moved_child.workspace_path_meta().as_deref(),
+        updated.project_path.as_deref()
+    );
 }
 
 #[tokio::test]

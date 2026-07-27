@@ -45,12 +45,28 @@ pub fn create_schedule_session(
         session.set_project_id_meta(project_id.to_string());
     }
     if let Some(path) = workspace_path {
-        let final_workspace = bamboo_tools::tools::workspace_state::set_workspace(
+        let final_workspace = bamboo_agent_core::workspace_state::publish_resolved_workspace(
             &session_id,
             std::path::PathBuf::from(path),
         );
         let final_workspace = bamboo_config::paths::path_to_display_string(&final_workspace);
         session.set_workspace_path_meta(final_workspace);
+        if job.run_config.project_id.is_some() {
+            let source = if job
+                .run_config
+                .workspace_path
+                .as_deref()
+                .is_some_and(|workspace| !workspace.trim().is_empty())
+            {
+                bamboo_engine::project_context::WorkspaceSource::Explicit
+            } else {
+                bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+            };
+            session.metadata.insert(
+                bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+                source.as_str().to_string(),
+            );
+        }
     }
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());

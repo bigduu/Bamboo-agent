@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub const PROJECT_ID_METADATA_KEY: &str = "project_id";
 pub const PROJECT_RESOURCES_RENDERED_KEY: &str = "project_resources_rendered";
+pub const WORKSPACE_SOURCE_METADATA_KEY: &str = "workspace_source";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +37,9 @@ impl WorkspaceBindingStatus {
 pub struct ProjectDescriptor {
     pub id: ProjectId,
     pub name: String,
+    /// Canonical user source folder and default execution workspace.
+    pub project_path: Option<PathBuf>,
+    /// Bamboo-owned Project data/resources directory.
     pub home: PathBuf,
     pub workspace_bindings: Vec<WorkspaceBinding>,
     pub resources: ProjectResourceSummary,
@@ -52,7 +56,26 @@ pub struct ProjectMemoryReadRoots {
 pub struct ResolvedProjectContext {
     pub project: ProjectDescriptor,
     pub workspace: Option<PathBuf>,
+    pub workspace_source: WorkspaceSource,
     pub binding_status: WorkspaceBindingStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSource {
+    Explicit,
+    Session,
+    ProjectDefault,
+}
+
+impl WorkspaceSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Session => "session",
+            Self::ProjectDefault => "project_default",
+        }
+    }
 }
 
 impl ResolvedProjectContext {
@@ -117,6 +140,14 @@ pub enum ProjectContextError {
     InvalidProjectIdentity { raw: String, message: String },
     #[error("assigned Project '{project_id}' is unavailable")]
     ProjectUnavailable { project_id: ProjectId },
+    #[error("assigned Project '{project_id}' has no configured project_path")]
+    ProjectPathMissing { project_id: ProjectId },
+    #[error("assigned Project '{project_id}' path '{project_path}' is unavailable: {message}")]
+    ProjectPathUnavailable {
+        project_id: ProjectId,
+        project_path: String,
+        message: String,
+    },
     #[error("workspace '{workspace}' is invalid: {message}")]
     WorkspaceInvalid { workspace: String, message: String },
 }
@@ -337,8 +368,81 @@ impl ProjectContextResolver {
         session: &Session,
         workspace: Option<&Path>,
     ) -> Result<Option<ResolvedProjectContext>, ProjectContextError> {
-        let workspace = self.resolve_workspace_candidate_for_instance(session, workspace)?;
-        self.resolve_with_final_workspace(session, workspace).await
+        let project_id = match Self::session_project_identity(session) {
+            SessionProjectIdentity::Assigned(project_id) => project_id,
+            SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(ProjectContextError::InvalidProjectIdentity { raw, message });
+            }
+            SessionProjectIdentity::Unassigned => {
+                let workspace =
+                    self.resolve_workspace_candidate_for_instance(session, workspace)?;
+                if let Some(candidate) = workspace.as_deref() {
+                    if let Some(owner_project_id) =
+                        self.source.find_workspace_owner(candidate).await?
+                    {
+                        return Err(ProjectContextError::UnassignedWorkspaceConflict {
+                            workspace: candidate.to_string_lossy().into_owned(),
+                            owner_project_id,
+                        });
+                    }
+                }
+                return Ok(None);
+            }
+        };
+        let project = self
+            .source
+            .find_project(&project_id)
+            .await?
+            .ok_or_else(|| ProjectContextError::ProjectUnavailable {
+                project_id: project_id.clone(),
+            })?;
+        if project.id != project_id {
+            return Err(ProjectContextError::IdentityMismatch {
+                requested: project_id.to_string(),
+                actual: project.id.to_string(),
+            });
+        }
+
+        let (workspace, workspace_source) = if let Some(workspace) = workspace {
+            (
+                resolve_existing_workspace_with_resolver(workspace, &self.workspace_resolver)?,
+                WorkspaceSource::Explicit,
+            )
+        } else if session
+            .metadata
+            .get(WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str)
+            == Some(WorkspaceSource::ProjectDefault.as_str())
+        {
+            (
+                resolve_project_default_workspace(&project, &self.workspace_resolver)?,
+                WorkspaceSource::ProjectDefault,
+            )
+        } else if let Some(workspace) = session.workspace_path_meta() {
+            let persisted_source = session
+                .metadata
+                .get(WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str);
+            let workspace = resolve_existing_workspace_with_resolver(
+                Path::new(&workspace),
+                &self.workspace_resolver,
+            )?;
+            let source = match persisted_source {
+                Some("explicit") => WorkspaceSource::Explicit,
+                Some("session") => WorkspaceSource::Session,
+                _ => WorkspaceSource::Session,
+            };
+            (workspace, source)
+        } else {
+            (
+                resolve_project_default_workspace(&project, &self.workspace_resolver)?,
+                WorkspaceSource::ProjectDefault,
+            )
+        };
+
+        self.resolve_assigned_project(project, workspace, workspace_source)
+            .await
+            .map(Some)
     }
 
     /// Resolve the exact workspace the runtime will use without publishing it.
@@ -373,77 +477,62 @@ impl ProjectContextResolver {
         let preferred = workspace
             .map(Path::to_path_buf)
             .or_else(|| session.workspace_path_meta().map(PathBuf::from));
+        if preferred.is_none()
+            && matches!(
+                Self::session_project_identity(session),
+                SessionProjectIdentity::Assigned(_)
+            )
+        {
+            // This synchronous helper cannot consult the Project source.
+            // Assigned callers must use `resolve`, which selects project_path;
+            // they must never fall through to process-global/session-temp
+            // compatibility defaults here.
+            return Ok(None);
+        }
         workspace_resolver
             .resolve_session_workspace_candidate(&session.id, preferred)
             .map(|candidate| resolve_final_workspace_with(&candidate, workspace_resolver))
             .transpose()
     }
 
-    async fn resolve_with_final_workspace(
+    async fn resolve_assigned_project(
         &self,
-        session: &Session,
-        workspace: Option<PathBuf>,
-    ) -> Result<Option<ResolvedProjectContext>, ProjectContextError> {
-        let project_id = match Self::session_project_identity(session) {
-            SessionProjectIdentity::Assigned(project_id) => project_id,
-            SessionProjectIdentity::Invalid { raw, message } => {
-                return Err(ProjectContextError::InvalidProjectIdentity { raw, message });
+        project: ProjectDescriptor,
+        workspace: PathBuf,
+        workspace_source: WorkspaceSource,
+    ) -> Result<ResolvedProjectContext, ProjectContextError> {
+        let binding_status = match self.source.find_workspace_owner(&workspace).await? {
+            Some(owner) if owner == project.id => WorkspaceBindingStatus::Registered,
+            Some(owner) => {
+                return Err(ProjectContextError::WorkspaceConflict {
+                    workspace: workspace.to_string_lossy().into_owned(),
+                    owner_project_id: owner,
+                    session_project_id: project.id.clone(),
+                });
             }
-            SessionProjectIdentity::Unassigned => {
-                if let Some(candidate) = workspace.as_deref() {
-                    if let Some(owner_project_id) =
-                        self.source.find_workspace_owner(candidate).await?
-                    {
-                        return Err(ProjectContextError::UnassignedWorkspaceConflict {
-                            workspace: candidate.to_string_lossy().into_owned(),
-                            owner_project_id,
-                        });
-                    }
-                }
-                return Ok(None);
+            None if project
+                .project_path
+                .iter()
+                .map(PathBuf::as_path)
+                .chain(
+                    project
+                        .workspace_bindings
+                        .iter()
+                        .map(|binding| Path::new(&binding.path)),
+                )
+                .any(|root| path_is_within_binding(root, &workspace)) =>
+            {
+                WorkspaceBindingStatus::Registered
             }
-        };
-        let project = self
-            .source
-            .find_project(&project_id)
-            .await?
-            .ok_or_else(|| ProjectContextError::ProjectUnavailable {
-                project_id: project_id.clone(),
-            })?;
-        if project.id != project_id {
-            return Err(ProjectContextError::IdentityMismatch {
-                requested: project_id.to_string(),
-                actual: project.id.to_string(),
-            });
-        }
-
-        let binding_status = match workspace.as_deref() {
-            Some(candidate) => match self.source.find_workspace_owner(candidate).await? {
-                Some(owner) if owner == project.id => WorkspaceBindingStatus::Registered,
-                Some(owner) => {
-                    return Err(ProjectContextError::WorkspaceConflict {
-                        workspace: candidate.to_string_lossy().into_owned(),
-                        owner_project_id: owner,
-                        session_project_id: project.id.clone(),
-                    });
-                }
-                None if project
-                    .workspace_bindings
-                    .iter()
-                    .any(|binding| path_is_within_binding(Path::new(&binding.path), candidate)) =>
-                {
-                    WorkspaceBindingStatus::Registered
-                }
-                None => WorkspaceBindingStatus::Unregistered,
-            },
             None => WorkspaceBindingStatus::Unregistered,
         };
 
-        Ok(Some(ResolvedProjectContext {
+        Ok(ResolvedProjectContext {
             project,
-            workspace,
+            workspace: Some(workspace),
+            workspace_source,
             binding_status,
-        }))
+        })
     }
 
     pub async fn workspace_owner(
@@ -486,10 +575,12 @@ impl ProjectContextResolver {
         session: &mut Session,
         sync_runtime_workspace: bool,
     ) -> Result<Option<ResolvedProjectContext>, ProjectContextError> {
-        let workspace = self.resolve_workspace_candidate_for_instance(session, None)?;
-        let resolved = self
-            .resolve_with_final_workspace(session, workspace.clone())
-            .await?;
+        let resolved = self.resolve(session, None).await?;
+        let workspace = if let Some(context) = resolved.as_ref() {
+            context.workspace.clone()
+        } else {
+            self.resolve_workspace_candidate_for_instance(session, None)?
+        };
         if let Some(workspace) = workspace.as_deref() {
             let final_workspace = if sync_runtime_workspace {
                 self.workspace_resolver.publish_resolved_workspace(
@@ -503,6 +594,14 @@ impl ProjectContextResolver {
             session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
                 &final_workspace,
             ));
+        }
+        if let Some(context) = resolved.as_ref() {
+            session.metadata.insert(
+                WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+                context.workspace_source.as_str().to_string(),
+            );
+        } else {
+            session.metadata.remove(WORKSPACE_SOURCE_METADATA_KEY);
         }
         let current = session
             .messages
@@ -525,13 +624,14 @@ impl ProjectContextResolver {
         let workspace_display = workspace
             .as_deref()
             .map(bamboo_config::paths::path_to_display_string);
-        updated = crate::runtime::context::upsert_workspace_prompt_context(
+        updated = crate::runtime::context::upsert_workspace_prompt_context_with_source(
             &updated,
             workspace_display.as_deref(),
             resolved
                 .as_ref()
                 .map(|context| context.binding_status)
                 .unwrap_or(WorkspaceBindingStatus::Unregistered),
+            resolved.as_ref().map(|context| context.workspace_source),
         );
 
         if let Some(system_message) = session
@@ -572,14 +672,107 @@ fn resolve_final_workspace_with(
     Ok(std::fs::canonicalize(&final_workspace).unwrap_or(final_workspace))
 }
 
-fn path_is_within_binding(binding: &Path, candidate: &Path) -> bool {
-    match (
-        std::fs::canonicalize(binding),
-        std::fs::canonicalize(candidate),
-    ) {
-        (Ok(binding), Ok(candidate)) => candidate == binding || candidate.starts_with(binding),
-        _ => candidate == binding || candidate.starts_with(binding),
+/// Resolve an already-selected workspace with the same existence, directory,
+/// and instance-confinement checks used by assigned runtime resolution.
+///
+/// Server-side Project/Workspace tools use this seam so read diagnostics
+/// cannot report a stale or differently confined workspace as runnable.
+pub fn resolve_existing_workspace_with_resolver(
+    workspace: &Path,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<PathBuf, ProjectContextError> {
+    if !workspace.exists() {
+        return Err(ProjectContextError::WorkspaceInvalid {
+            workspace: workspace.to_string_lossy().into_owned(),
+            message: "path does not exist".to_string(),
+        });
     }
+    resolve_final_workspace_with(workspace, workspace_resolver)
+}
+
+fn resolve_project_default_workspace(
+    project: &ProjectDescriptor,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<PathBuf, ProjectContextError> {
+    let project_path =
+        project
+            .project_path
+            .as_deref()
+            .ok_or_else(|| ProjectContextError::ProjectPathMissing {
+                project_id: project.id.clone(),
+            })?;
+    let display = project_path.to_string_lossy().into_owned();
+    if !project_path.exists() {
+        return Err(ProjectContextError::ProjectPathUnavailable {
+            project_id: project.id.clone(),
+            project_path: display,
+            message: "path does not exist".to_string(),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(project_path).map_err(|error| {
+        ProjectContextError::ProjectPathUnavailable {
+            project_id: project.id.clone(),
+            project_path: display.clone(),
+            message: format!("path metadata is unavailable: {error}"),
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProjectContextError::ProjectPathUnavailable {
+            project_id: project.id.clone(),
+            project_path: display,
+            message: "configured path is no longer a plain directory".to_string(),
+        });
+    }
+    let canonical = std::fs::canonicalize(project_path).map_err(|error| {
+        ProjectContextError::ProjectPathUnavailable {
+            project_id: project.id.clone(),
+            project_path: display.clone(),
+            message: format!("path could not be canonicalized: {error}"),
+        }
+    })?;
+    if canonical != project_path {
+        return Err(ProjectContextError::ProjectPathUnavailable {
+            project_id: project.id.clone(),
+            project_path: display,
+            message: "configured path no longer resolves to its registered canonical directory"
+                .to_string(),
+        });
+    }
+    let final_workspace = workspace_resolver.preview_workspace_path(canonical.clone());
+    let final_workspace = std::fs::canonicalize(&final_workspace).map_err(|error| {
+        ProjectContextError::ProjectPathUnavailable {
+            project_id: project.id.clone(),
+            project_path: display.clone(),
+            message: format!("confinement target is unavailable: {error}"),
+        }
+    })?;
+    if final_workspace != canonical {
+        return Err(ProjectContextError::ProjectPathUnavailable {
+            project_id: project.id.clone(),
+            project_path: display,
+            message: format!(
+                "workspace confinement redirected the Project path to '{}'",
+                final_workspace.display()
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
+fn path_is_within_binding(binding: &Path, candidate: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(binding) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let Ok(canonical_binding) = std::fs::canonicalize(binding) else {
+        return false;
+    };
+    if canonical_binding != binding {
+        return false;
+    }
+    candidate == binding || candidate.starts_with(binding)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -773,10 +966,13 @@ mod tests {
         let worktree = directory.path().join("worktree");
         std::fs::create_dir_all(&main).expect("main");
         std::fs::create_dir_all(&worktree).expect("worktree");
+        let main = main.canonicalize().expect("canonical main");
+        let worktree = worktree.canonicalize().expect("canonical worktree");
         let project_id = ProjectId::parse("01JPROJECT00000000000000000").expect("project id");
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
             name: "Zenith".to_string(),
+            project_path: Some(main.clone()),
             home: directory
                 .path()
                 .join("projects/01JPROJECT00000000000000000"),
@@ -824,14 +1020,361 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assigned_session_uses_project_path_before_global_or_temp_fallback() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let project_path = directory.path().join("project");
+        let foreign_default = directory.path().join("foreign-default");
+        let workspace_root = directory.path().join("session-workspaces");
+        std::fs::create_dir_all(&project_path).expect("project path");
+        std::fs::create_dir_all(&foreign_default).expect("foreign default");
+        std::fs::create_dir_all(&workspace_root).expect("workspace root");
+        let project_id = ProjectId::parse("project-default").expect("Project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Project Default".to_string(),
+            project_path: Some(project_path.canonicalize().unwrap()),
+            home: directory.path().join("projects/project-default"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory.path().join("projects/project-default/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new_with_workspace_resolver(
+            Arc::new(StaticSource(descriptor)),
+            bamboo_agent_core::workspace_state::WorkspaceResolver::new(
+                {
+                    let foreign_default = foreign_default.clone();
+                    move || Some(foreign_default.clone())
+                },
+                {
+                    let workspace_root = workspace_root.clone();
+                    move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                        root: workspace_root.clone(),
+                        confine: false,
+                    }
+                },
+            ),
+        );
+        let mut session = Session::new("project-default-session", "test");
+        session.set_project_id_meta(project_id.to_string());
+        session
+            .messages
+            .insert(0, bamboo_agent_core::Message::system("base"));
+
+        let resolved = resolver
+            .refresh_session_prompt_read_only(&mut session)
+            .await
+            .expect("Project default must resolve")
+            .expect("assigned Project");
+        assert_eq!(
+            resolved.workspace.as_deref(),
+            Some(project_path.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(resolved.workspace_source, WorkspaceSource::ProjectDefault);
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(
+                bamboo_config::paths::path_to_display_string(&project_path.canonicalize().unwrap())
+                    .as_str()
+            )
+        );
+        let prompt = &session.messages[0].content;
+        assert_eq!(prompt.matches("Project path:").count(), 1);
+        assert_eq!(prompt.matches("Project home (Bamboo data):").count(), 1);
+        assert_eq!(prompt.matches("Workspace path:").count(), 1);
+        assert_eq!(
+            prompt.matches("Workspace source: project_default").count(),
+            1
+        );
+        assert!(!prompt.contains(foreign_default.to_string_lossy().as_ref()));
+        assert!(!workspace_root.join(&session.id).exists());
+
+        let moved_project_path = directory.path().join("project-moved");
+        std::fs::create_dir_all(&moved_project_path).expect("moved Project path");
+        let moved_descriptor = ProjectDescriptor {
+            id: project_id,
+            name: "Project Default".to_string(),
+            project_path: Some(moved_project_path.canonicalize().unwrap()),
+            home: directory.path().join("projects/project-default"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id: ProjectId::parse("project-default").unwrap(),
+                resource_revision: 2,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory.path().join("projects/project-default/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let moved_resolver = ProjectContextResolver::new(Arc::new(StaticSource(moved_descriptor)));
+        let moved = moved_resolver
+            .resolve(&session, None)
+            .await
+            .expect("moved Project path")
+            .expect("assigned Project");
+        assert_eq!(
+            moved.workspace.as_deref(),
+            Some(moved_project_path.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(moved.workspace_source, WorkspaceSource::ProjectDefault);
+    }
+
+    #[tokio::test]
+    async fn legacy_persisted_workspace_equal_to_project_path_remains_session_owned_after_path_cas()
+    {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let project_path = directory.path().join("project");
+        let moved_project_path = directory.path().join("project-moved");
+        std::fs::create_dir_all(&project_path).expect("Project path");
+        std::fs::create_dir_all(&moved_project_path).expect("moved Project path");
+        let project_path = project_path.canonicalize().expect("canonical Project path");
+        let moved_project_path = moved_project_path
+            .canonicalize()
+            .expect("canonical moved Project path");
+        let project_id = ProjectId::parse("legacy-persisted-workspace").expect("Project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Legacy persisted workspace".to_string(),
+            project_path: Some(project_path.clone()),
+            home: directory.path().join("projects/legacy-persisted-workspace"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory
+                    .path()
+                    .join("projects/legacy-persisted-workspace/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
+        let mut session = Session::new("legacy-persisted-workspace", "test");
+        session.set_project_id_meta(project_id.to_string());
+        session
+            .set_workspace_path_meta(bamboo_config::paths::path_to_display_string(&project_path));
+
+        let initial = resolver
+            .refresh_session_prompt_read_only(&mut session)
+            .await
+            .expect("legacy persisted workspace must resolve")
+            .expect("assigned Project");
+        assert_eq!(initial.workspace.as_deref(), Some(project_path.as_path()));
+        assert_eq!(initial.workspace_source, WorkspaceSource::Session);
+        assert_eq!(
+            session
+                .metadata
+                .get(WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("session")
+        );
+
+        let moved_descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Legacy persisted workspace".to_string(),
+            project_path: Some(moved_project_path),
+            home: directory.path().join("projects/legacy-persisted-workspace"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id,
+                resource_revision: 2,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory
+                    .path()
+                    .join("projects/legacy-persisted-workspace/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let moved_resolver = ProjectContextResolver::new(Arc::new(StaticSource(moved_descriptor)));
+        let after_cas = moved_resolver
+            .resolve(&session, None)
+            .await
+            .expect("persisted workspace must remain authoritative")
+            .expect("assigned Project");
+        assert_eq!(after_cas.workspace.as_deref(), Some(project_path.as_path()));
+        assert_eq!(after_cas.workspace_source, WorkspaceSource::Session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_default_rejects_configured_path_replaced_by_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let project_path = directory.path().join("project");
+        let replacement = directory.path().join("replacement");
+        std::fs::create_dir_all(&project_path).expect("Project path");
+        std::fs::create_dir_all(&replacement).expect("replacement");
+        let configured_path = project_path.canonicalize().expect("canonical Project path");
+        let project_id = ProjectId::parse("symlink-replaced-project").expect("Project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Symlink replacement".to_string(),
+            project_path: Some(configured_path),
+            home: directory.path().join("projects/symlink-replaced-project"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory
+                    .path()
+                    .join("projects/symlink-replaced-project/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
+        let mut session = Session::new("symlink-replaced-project", "test");
+        session.set_project_id_meta(project_id.to_string());
+
+        std::fs::remove_dir(&project_path).expect("remove configured Project path");
+        symlink(&replacement, &project_path).expect("replace Project path with symlink");
+
+        assert!(matches!(
+            resolver.resolve(&session, None).await,
+            Err(ProjectContextError::ProjectPathUnavailable { .. })
+        ));
+        assert!(session.workspace_path_meta().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_workspace_is_not_registered_through_a_replaced_project_path_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let project_path = directory.path().join("project");
+        let replacement = directory.path().join("replacement");
+        let explicit_workspace = replacement.join("explicit");
+        std::fs::create_dir_all(&project_path).expect("Project path");
+        std::fs::create_dir_all(&explicit_workspace).expect("explicit workspace");
+        let configured_path = project_path.canonicalize().expect("canonical Project path");
+        let project_id = ProjectId::parse("symlink-explicit-project").expect("Project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Symlink explicit workspace".to_string(),
+            project_path: Some(configured_path),
+            home: directory.path().join("projects/symlink-explicit-project"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory
+                    .path()
+                    .join("projects/symlink-explicit-project/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
+        let mut session = Session::new("symlink-explicit-project", "test");
+        session.set_project_id_meta(project_id.to_string());
+
+        std::fs::remove_dir(&project_path).expect("remove configured Project path");
+        symlink(&replacement, &project_path).expect("replace Project path with symlink");
+
+        let resolved = resolver
+            .resolve(&session, Some(&explicit_workspace))
+            .await
+            .expect("explicit workspace remains independently resolvable")
+            .expect("assigned Project");
+        assert_eq!(
+            resolved.workspace.as_deref(),
+            Some(explicit_workspace.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            resolved.binding_status,
+            WorkspaceBindingStatus::Unregistered
+        );
+        assert_eq!(resolved.workspace_source, WorkspaceSource::Explicit);
+    }
+
+    #[tokio::test]
+    async fn missing_or_unavailable_project_path_fails_closed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let project_id = ProjectId::parse("unconfigured-project").expect("Project id");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Unconfigured".to_string(),
+            project_path: None,
+            home: directory.path().join("projects/unconfigured-project"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory
+                    .path()
+                    .join("projects/unconfigured-project/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
+        let mut session = Session::new("unconfigured", "test");
+        session.set_project_id_meta(project_id.to_string());
+        assert!(matches!(
+            resolver.resolve(&session, None).await,
+            Err(ProjectContextError::ProjectPathMissing { .. })
+        ));
+
+        let missing = directory.path().join("moved-away");
+        let descriptor = ProjectDescriptor {
+            id: project_id.clone(),
+            name: "Unavailable".to_string(),
+            project_path: Some(missing.clone()),
+            home: directory.path().join("projects/unconfigured-project"),
+            workspace_bindings: Vec::new(),
+            resources: bamboo_domain::ProjectResourceSummary {
+                project_id: project_id.clone(),
+                resource_revision: 1,
+                resources: Vec::new(),
+            },
+            memory_read_roots: ProjectMemoryReadRoots {
+                primary: directory
+                    .path()
+                    .join("projects/unconfigured-project/memory/v1"),
+                legacy_aliases: Vec::new(),
+            },
+        };
+        let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
+        assert!(matches!(
+            resolver.resolve(&session, None).await,
+            Err(ProjectContextError::ProjectPathUnavailable {
+                project_path,
+                ..
+            }) if project_path == missing.to_string_lossy()
+        ));
+        assert!(session.workspace_path_meta().is_none());
+    }
+
+    #[tokio::test]
     async fn prompt_refresh_removes_stale_project_and_updates_unassigned_workspace() {
         let directory = tempfile::tempdir().expect("tempdir");
         let workspace = directory.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
         let project_id = ProjectId::parse("project-prompt-refresh").expect("Project id");
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
             name: "Prompt Project".to_string(),
+            project_path: Some(workspace.clone()),
             home: directory.path().join("projects/project-prompt-refresh"),
             workspace_bindings: vec![WorkspaceBinding {
                 path: workspace.to_string_lossy().into_owned(),
@@ -896,6 +1439,7 @@ mod tests {
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
             name: "Project A".to_string(),
+            project_path: Some(workspace.clone()),
             home: directory.path().join("projects/project-a"),
             workspace_bindings: vec![WorkspaceBinding {
                 path: workspace.to_string_lossy().into_owned(),
@@ -961,6 +1505,7 @@ mod tests {
         let descriptor = ProjectDescriptor {
             id: descriptor_id.clone(),
             name: "Descriptor".to_string(),
+            project_path: Some(workspace.clone()),
             home: directory.path().join("projects/descriptor"),
             workspace_bindings: Vec::new(),
             resources: bamboo_domain::ProjectResourceSummary {
@@ -1001,6 +1546,7 @@ mod tests {
         let descriptor = ProjectDescriptor {
             id: descriptor_id.clone(),
             name: "Descriptor".to_string(),
+            project_path: None,
             home: directory.path().join("projects/descriptor"),
             workspace_bindings: Vec::new(),
             resources: bamboo_domain::ProjectResourceSummary {

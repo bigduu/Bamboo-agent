@@ -406,6 +406,7 @@ impl AppState {
             ledger_schedule_bridge.clone(),
             project_store.clone(),
             account_sink.clone(),
+            workspace_resolver.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -687,6 +688,7 @@ impl AppState {
             Some(account_sink.inbox()),
             notification_relay_deps.clone(),
             project_store.clone(),
+            workspace_resolver.clone(),
         );
 
         bamboo_engine::auto_dream::spawn_auto_dream_task_with_project_resolver(
@@ -814,6 +816,7 @@ impl AppState {
             config_snapshot.subagents().broker.clone(),
             fabric_deployer.clone(),
             project_store.clone(),
+            workspace_resolver.clone(),
         );
         let workflow_run_tool =
             Arc::new(crate::workflow::WorkflowRunTool::new(workflow_runs.clone()));
@@ -881,6 +884,7 @@ impl AppState {
                 provider_registry.clone(),
                 permission_checker.clone(),
                 project_store.clone(),
+                workspace_resolver.clone(),
             )
             .await
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
@@ -904,6 +908,7 @@ impl AppState {
             subagent_model_resolver: None,
             config: config.clone(),
             project_store: Some(project_store.clone()),
+            workspace_resolver: workspace_resolver.clone(),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();

@@ -180,6 +180,13 @@ fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
         session.metadata.get("workspace_path"),
         Some(&"/tmp/workspace".to_string())
     );
+    assert_eq!(
+        session
+            .metadata
+            .get(crate::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str),
+        Some("explicit")
+    );
     let system_content = session
         .messages
         .iter()
@@ -187,6 +194,7 @@ fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
         .map(|message| message.content.clone())
         .unwrap_or_default();
     assert!(system_content.contains("Workspace path: /tmp/workspace"));
+    assert!(system_content.contains("Workspace source: explicit"));
     assert!(system_content.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
     assert!(system_content.contains(crate::runtime::context::WORKSPACE_CONTEXT_END_MARKER));
     let snapshot = crate::runtime::runner::read_prompt_snapshot(&session)

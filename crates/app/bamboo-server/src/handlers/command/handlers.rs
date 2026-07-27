@@ -70,10 +70,18 @@ async fn session_resource_context(
                 )));
             }
         };
-    let workspace = crate::project_context::validate_workspace_assignment(
+    let persisted_workspace = (session
+        .metadata
+        .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+        .map(String::as_str)
+        != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str()))
+    .then(|| session.workspace_path_meta())
+    .flatten();
+    let workspace = crate::project_context::validate_workspace_assignment_with_resolver(
         &app_state.project_store,
         project_id.as_ref(),
-        session.workspace_path_meta().as_deref(),
+        persisted_workspace.as_deref(),
+        &app_state.workspace_resolver,
     )
     .map_err(|error| match error {
         crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }

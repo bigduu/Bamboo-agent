@@ -79,10 +79,11 @@ pub async fn create_session(
             }
         }
     }
-    let final_workspace = match crate::project_context::validate_workspace_assignment(
+    let final_workspace = match crate::project_context::validate_workspace_assignment_with_resolver(
         &state.project_store,
         req.project_id.as_ref(),
         req.workspace_path.as_deref(),
+        &state.workspace_resolver,
     ) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -91,14 +92,27 @@ pub async fn create_session(
                     code,
                     workspace,
                     message,
-                } => Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": code,
-                        "message": message
-                    },
-                    "workspace": workspace,
-                }))),
+                } => {
+                    let project_path_error = code.starts_with("project_path_");
+                    let mut response = if project_path_error {
+                        HttpResponse::Conflict()
+                    } else {
+                        HttpResponse::BadRequest()
+                    };
+                    let mut body = serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": code,
+                            "message": message
+                        },
+                        "workspace": workspace,
+                    });
+                    if project_path_error {
+                        body["project_id"] = serde_json::json!(req.project_id);
+                        body["project_path"] = body["workspace"].clone();
+                    }
+                    Ok(response.json(body))
+                }
                 crate::project_context::ProjectWorkspaceValidationError::Conflict {
                     workspace,
                     owner_project_id,
@@ -156,7 +170,22 @@ pub async fn create_session(
     let configured_default_workspace = config_snapshot.get_default_work_area_path();
     let workspace_source = if let Some(workspace) = final_workspace_display.as_deref() {
         session.set_workspace_path_meta(workspace);
-        "request"
+        let source = if req
+            .workspace_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+        {
+            bamboo_engine::project_context::WorkspaceSource::Explicit
+        } else if req.project_id.is_some() {
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+        } else {
+            bamboo_engine::project_context::WorkspaceSource::Session
+        };
+        session.metadata.insert(
+            bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            source.as_str().to_string(),
+        );
+        source.as_str()
     } else if let Some(workspace) = configured_default_workspace {
         session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(&workspace));
         "configured_default"
@@ -206,6 +235,29 @@ pub async fn create_session(
                     "message": message
                 },
                 "workspace": workspace,
+            })),
+            bamboo_engine::project_context::ProjectContextError::ProjectPathMissing {
+                project_id,
+            } => HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_path_missing",
+                    "message": "Assigned Project has no configured project_path"
+                },
+                "project_id": project_id,
+            })),
+            bamboo_engine::project_context::ProjectContextError::ProjectPathUnavailable {
+                project_id,
+                project_path,
+                message,
+            } => HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_path_unavailable",
+                    "message": message
+                },
+                "project_id": project_id,
+                "project_path": project_path,
             })),
             error => {
                 return Err(crate::error::json_internal_server_error(format!(
@@ -631,9 +683,15 @@ mod tests {
     #[actix_web::test]
     async fn assigned_session_created_event_replays_project_identity_from_journal() {
         let state = new_state().await;
+        let project_path = tempdir().expect("Project path");
         let project = state
             .project_store
-            .create("Journal Project", None)
+            .create_with_project_path(
+                "Journal Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
             .expect("Project");
         let mut live = state.account_sink.subscribe();
         let app = test::init_service(
@@ -686,24 +744,27 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn configured_default_workspace_is_validated_before_session_creation() {
+    async fn assigned_project_path_wins_over_foreign_configured_default() {
         let state = new_state().await;
-        let workspace = tempdir().expect("default workspace");
+        let workspace = tempdir().expect("foreign default workspace");
+        let other_workspace = tempdir().expect("assigned Project path");
         let owner = state
             .project_store
-            .create_with_bindings(
+            .create_with_project_path(
                 "Default Owner",
                 None,
-                vec![bamboo_domain::WorkspaceBinding {
-                    path: workspace.path().to_string_lossy().into_owned(),
-                    label: None,
-                    git_common_dir: None,
-                }],
+                workspace.path().to_string_lossy(),
+                Vec::new(),
             )
             .expect("owner Project");
         let other = state
             .project_store
-            .create("Other Project", None)
+            .create_with_project_path(
+                "Other Project",
+                None,
+                other_workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
             .expect("other Project");
         state.config.write().await.default_work_area = Some(bamboo_config::DefaultWorkAreaConfig {
             path: Some(workspace.path().to_string_lossy().into_owned()),
@@ -715,42 +776,44 @@ mod tests {
         )
         .await;
 
-        let conflict = test::call_service(
+        let response = test::call_service(
             &app,
             test::TestRequest::post()
                 .uri("/api/v1/sessions")
                 .set_json(serde_json::json!({
-                    "title": "Must not persist",
+                    "title": "Uses Project path",
                     "project_id": other.id.to_string()
                 }))
                 .to_request(),
         )
         .await;
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-        let body: Value = test::read_body_json(conflict).await;
-        assert_eq!(body["error"]["code"], "project_workspace_conflict");
-        assert_eq!(body["owner_project_id"], owner.id.as_str());
-        assert!(state.session_store.list_index_entries().await.is_empty());
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["session"]["workspace_path"],
+            bamboo_config::paths::path_to_display_string(
+                &other_workspace.path().canonicalize().unwrap()
+            )
+        );
+        assert_ne!(body["session"]["project_id"], owner.id.as_str());
     }
 
     #[actix_web::test]
     async fn same_project_default_workspace_is_persisted_with_prompt_marker() {
         let state = new_state().await;
         let workspace = tempdir().expect("default workspace");
+        let foreign_default = tempdir().expect("foreign global default");
         let project = state
             .project_store
-            .create_with_bindings(
+            .create_with_project_path(
                 "Default Owner",
                 None,
-                vec![bamboo_domain::WorkspaceBinding {
-                    path: workspace.path().to_string_lossy().into_owned(),
-                    label: None,
-                    git_common_dir: None,
-                }],
+                workspace.path().to_string_lossy(),
+                Vec::new(),
             )
             .expect("Project");
         state.config.write().await.default_work_area = Some(bamboo_config::DefaultWorkAreaConfig {
-            path: Some(workspace.path().to_string_lossy().into_owned()),
+            path: Some(foreign_default.path().to_string_lossy().into_owned()),
         });
         let app = test::init_service(
             App::new()
@@ -792,15 +855,40 @@ mod tests {
             session.workspace_path_meta().as_deref(),
             Some(canonical_display.as_str())
         );
+        let index_entry = state
+            .session_store
+            .list_index_entries()
+            .await
+            .into_iter()
+            .find(|entry| entry.id == session_id)
+            .expect("session index entry");
+        assert_eq!(
+            index_entry.workspace_path.as_deref(),
+            Some(canonical_display.as_str())
+        );
+        assert_eq!(index_entry.project_id.as_deref(), Some(project.id.as_str()));
         assert_eq!(
             bamboo_agent_core::workspace_state::get_workspace(session_id).as_deref(),
             Some(canonical.as_path())
         );
         let snapshot = session.prompt_snapshot.expect("prompt snapshot");
-        assert!(snapshot
-            .workspace_context
+        assert!(snapshot.workspace_context.as_deref().is_some_and(|value| {
+            value.contains("Binding status: registered")
+                && value.contains("Workspace source: project_default")
+        }));
+        let project_context = snapshot
+            .project_context
             .as_deref()
-            .is_some_and(|value| value.contains("Binding status: registered")));
+            .expect("Project context");
+        assert!(project_context.contains(&format!("Project path: {canonical_display}")));
+        assert!(project_context.contains("Project home (Bamboo data):"));
+        assert_eq!(
+            snapshot
+                .effective_system_prompt
+                .matches("BAMBOO_PROJECT_CONTEXT_START")
+                .count(),
+            1
+        );
         assert_eq!(
             snapshot
                 .effective_system_prompt
@@ -811,27 +899,91 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn assigned_project_without_path_fails_before_session_side_effects() {
+        let state = new_state().await;
+        let project = state
+            .project_store
+            .create("Legacy unconfigured", None)
+            .expect("legacy Project");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({
+                    "title": "Must not persist",
+                    "project_id": project.id.to_string()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "project_path_missing");
+        assert!(state.session_store.list_index_entries().await.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn unavailable_project_path_fails_before_session_side_effects() {
+        let state = new_state().await;
+        let project_path = tempdir().expect("Project path");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Moved Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Project");
+        project_path.close().expect("remove Project path");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({
+                    "title": "Must not persist",
+                    "project_id": project.id.to_string()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "project_path_unavailable");
+        assert_eq!(body["project_id"], project.id.as_str());
+        assert!(state.session_store.list_index_entries().await.is_empty());
+    }
+
+    #[actix_web::test]
     async fn same_project_identity_is_stable_across_root_session_workspaces_and_apis() {
         let state = new_state().await;
         let first_workspace = tempdir().expect("first workspace");
         let second_workspace = tempdir().expect("second workspace");
         let project = state
             .project_store
-            .create_with_bindings(
+            .create_with_project_path(
                 "Multi-workspace Project",
                 None,
-                vec![
-                    bamboo_domain::WorkspaceBinding {
-                        path: first_workspace.path().to_string_lossy().into_owned(),
-                        label: Some("first".to_string()),
-                        git_common_dir: None,
-                    },
-                    bamboo_domain::WorkspaceBinding {
-                        path: second_workspace.path().to_string_lossy().into_owned(),
-                        label: Some("second".to_string()),
-                        git_common_dir: None,
-                    },
-                ],
+                first_workspace.path().to_string_lossy(),
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: second_workspace.path().to_string_lossy().into_owned(),
+                    label: Some("second".to_string()),
+                    git_common_dir: None,
+                }],
             )
             .expect("Project");
         let app = test::init_service(

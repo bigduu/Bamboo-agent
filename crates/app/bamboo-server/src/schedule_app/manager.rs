@@ -66,6 +66,8 @@ pub struct ScheduleContext {
     pub trigger_engine: DynTriggerEngine,
     /// Authoritative Project registry, rechecked when each persisted job fires.
     pub project_store: Arc<bamboo_projects::ProjectStore>,
+    /// AppState-owned workspace policy used by every schedule preflight/fire.
+    pub workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     /// Dependencies to start the always-on notification relay (see
     /// `crate::app_state::session_events::ensure_notification_relay`).
     /// Scheduled runs previously never classified events into notifications
@@ -310,10 +312,24 @@ async fn run_schedule_job(
 ) -> Result<ScheduleRunLifecycleResult, String> {
     validate_schedule_project_at_fire(&ctx.project_store, &job.run_config)?;
     let mut resolved = (ctx.resolve_run_config)(&job);
-    let final_workspace = crate::project_context::validate_workspace_assignment(
+    let explicit_workspace = job
+        .run_config
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty());
+    let requested_workspace = explicit_workspace.or_else(|| {
+        job.run_config
+            .project_id
+            .is_none()
+            .then_some(resolved.workspace_path.as_deref())
+            .flatten()
+    });
+    let final_workspace = crate::project_context::validate_workspace_assignment_with_resolver(
         &ctx.project_store,
         job.run_config.project_id.as_ref(),
-        resolved.workspace_path.as_deref(),
+        requested_workspace,
+        &ctx.workspace_resolver,
     )
     .map_err(|error| format!("validate schedule workspace at execution time: {error}"))?;
     resolved.workspace_path = final_workspace
@@ -338,11 +354,20 @@ async fn run_schedule_job(
         }
         _ => bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered,
     };
-    resolved.system_prompt = bamboo_engine::runtime::context::upsert_workspace_prompt_context(
-        &resolved.system_prompt,
-        resolved.workspace_path.as_deref(),
-        binding_status,
-    );
+    let workspace_source = job.run_config.project_id.as_ref().map(|_| {
+        if explicit_workspace.is_some() {
+            bamboo_engine::project_context::WorkspaceSource::Explicit
+        } else {
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+        }
+    });
+    resolved.system_prompt =
+        bamboo_engine::runtime::context::upsert_workspace_prompt_context_with_source(
+            &resolved.system_prompt,
+            resolved.workspace_path.as_deref(),
+            binding_status,
+            workspace_source,
+        );
     // Primary model is required for a schedule run; the roster stores it as
     // `Option<String>`, so recover the owned String once for the checks/logging
     // below (an absent primary is treated as the old empty-string skip).
@@ -735,6 +760,7 @@ pub fn build_schedule_context(
         app_data_dir: base.app_data_dir,
         trigger_engine: base.trigger_engine,
         project_store: base.project_store,
+        workspace_resolver: base.workspace_resolver,
         persistence: base.persistence,
         notification_relay: base.notification_relay,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {

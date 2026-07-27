@@ -31,6 +31,101 @@ pub enum ProjectWorkspaceValidationError {
     Store(#[from] ProjectStoreError),
 }
 
+pub(crate) fn project_context_error_response(
+    error: ProjectContextError,
+) -> actix_web::HttpResponse {
+    match error {
+        ProjectContextError::WorkspaceConflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        } => actix_web::HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_workspace_conflict",
+                "message": "Workspace belongs to another Project"
+            },
+            "workspace": workspace,
+            "owner_project_id": owner_project_id,
+            "session_project_id": session_project_id,
+        })),
+        ProjectContextError::UnassignedWorkspaceConflict {
+            workspace,
+            owner_project_id,
+        } => actix_web::HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_workspace_conflict",
+                "message": "Workspace belongs to another Project"
+            },
+            "workspace": workspace,
+            "owner_project_id": owner_project_id,
+            "session_project_id": "unassigned",
+        })),
+        ProjectContextError::WorkspaceInvalid { workspace, message } => {
+            actix_web::HttpResponse::BadRequest().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "workspace_invalid",
+                    "message": message
+                },
+                "workspace": workspace,
+            }))
+        }
+        ProjectContextError::InvalidProjectIdentity { raw, message } => {
+            actix_web::HttpResponse::BadRequest().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "invalid_project_identity",
+                    "message": format!(
+                        "Session carries an invalid Project identity '{raw}': {message}"
+                    )
+                }
+            }))
+        }
+        ProjectContextError::ProjectUnavailable { project_id } => {
+            actix_web::HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_unavailable",
+                    "message": "Assigned Project is unavailable"
+                },
+                "project_id": project_id,
+            }))
+        }
+        ProjectContextError::ProjectPathMissing { project_id } => {
+            actix_web::HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_path_missing",
+                    "message": "Assigned Project has no configured project_path"
+                },
+                "project_id": project_id,
+            }))
+        }
+        ProjectContextError::ProjectPathUnavailable {
+            project_id,
+            project_path,
+            message,
+        } => actix_web::HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_path_unavailable",
+                "message": message
+            },
+            "project_id": project_id,
+            "project_path": project_path,
+        })),
+        error @ (ProjectContextError::Source(_) | ProjectContextError::IdentityMismatch { .. }) => {
+            tracing::error!(%error, "failed to resolve Project context");
+            crate::error::json_error(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve Project context",
+            )
+        }
+    }
+}
+
 /// Resolve confinement before checking ownership, without mutating the global
 /// workspace registry or session metadata. HTTP creation paths must call this
 /// before any workspace/session side effect.
@@ -44,7 +139,47 @@ pub fn validate_workspace_assignment(
         session_project_id,
         requested_workspace,
         bamboo_agent_core::workspace_state::preview_workspace_path,
+        false,
     )
+}
+
+pub fn validate_workspace_assignment_with_resolver(
+    store: &ProjectStore,
+    session_project_id: Option<&ProjectId>,
+    requested_workspace: Option<&str>,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<Option<std::path::PathBuf>, ProjectWorkspaceValidationError> {
+    validate_workspace_assignment_with(
+        store,
+        session_project_id,
+        requested_workspace,
+        |workspace| workspace_resolver.preview_workspace_path(workspace),
+        false,
+    )
+}
+
+/// Validate a proposed authoritative Project path with the same
+/// canonicalization, confinement, and ownership rules used at session
+/// resolution time. `project_id` is `None` during create and the existing
+/// stable ID during a CAS update.
+pub fn validate_project_path_candidate_with_resolver(
+    store: &ProjectStore,
+    project_id: Option<&ProjectId>,
+    project_path: &str,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<std::path::PathBuf, ProjectWorkspaceValidationError> {
+    validate_workspace_assignment_with(
+        store,
+        project_id,
+        Some(project_path),
+        |workspace| workspace_resolver.preview_workspace_path(workspace),
+        true,
+    )?
+    .ok_or_else(|| ProjectWorkspaceValidationError::Invalid {
+        code: "project_path_missing",
+        workspace: project_path.to_string(),
+        message: "Project path must be a non-empty existing directory".to_string(),
+    })
 }
 
 fn validate_workspace_assignment_with(
@@ -52,45 +187,129 @@ fn validate_workspace_assignment_with(
     session_project_id: Option<&ProjectId>,
     requested_workspace: Option<&str>,
     resolve_workspace: impl FnOnce(std::path::PathBuf) -> std::path::PathBuf,
+    explicit_is_project_path: bool,
 ) -> Result<Option<std::path::PathBuf>, ProjectWorkspaceValidationError> {
-    let Some(requested_workspace) = requested_workspace
+    let explicit_workspace = requested_workspace
         .map(str::trim)
-        .filter(|workspace| !workspace.is_empty())
-    else {
-        return Ok(None);
-    };
-    let requested_path = std::path::Path::new(requested_workspace);
+        .filter(|workspace| !workspace.is_empty());
+    if explicit_is_project_path && explicit_workspace.is_none() {
+        return Err(ProjectWorkspaceValidationError::Invalid {
+            code: "project_path_missing",
+            workspace: requested_workspace.unwrap_or_default().to_string(),
+            message: "Project path must be a non-empty existing directory".to_string(),
+        });
+    }
+    let (requested_workspace, is_project_default, is_persisted_project_default) =
+        if let Some(workspace) = explicit_workspace {
+            (workspace.to_string(), explicit_is_project_path, false)
+        } else if let Some(project_id) = session_project_id {
+            let project = store.get(project_id)?;
+            let Some(project_path) = project.project_path else {
+                return Err(ProjectWorkspaceValidationError::Invalid {
+                    code: "project_path_missing",
+                    workspace: String::new(),
+                    message: format!("Project '{project_id}' has no configured project_path"),
+                });
+            };
+            (project_path, true, true)
+        } else {
+            return Ok(None);
+        };
+    let requested_path = std::path::Path::new(&requested_workspace);
     if !requested_path.exists() {
         return Err(ProjectWorkspaceValidationError::Invalid {
-            code: "workspace_not_found",
-            workspace: requested_workspace.to_string(),
-            message: "Workspace path does not exist".to_string(),
+            code: if is_project_default {
+                "project_path_unavailable"
+            } else {
+                "workspace_not_found"
+            },
+            workspace: requested_workspace,
+            message: if is_project_default {
+                "Project path does not exist".to_string()
+            } else {
+                "Workspace path does not exist".to_string()
+            },
         });
     }
     if !requested_path.is_dir() {
         return Err(ProjectWorkspaceValidationError::Invalid {
-            code: "workspace_not_directory",
-            workspace: requested_workspace.to_string(),
-            message: "Workspace path is not a directory".to_string(),
+            code: if is_project_default {
+                "project_path_unavailable"
+            } else {
+                "workspace_not_directory"
+            },
+            workspace: requested_workspace,
+            message: if is_project_default {
+                "Project path is not a directory".to_string()
+            } else {
+                "Workspace path is not a directory".to_string()
+            },
         });
+    }
+    if is_persisted_project_default {
+        let metadata = std::fs::symlink_metadata(requested_path).map_err(|error| {
+            ProjectWorkspaceValidationError::Invalid {
+                code: "project_path_unavailable",
+                workspace: requested_workspace.clone(),
+                message: format!("Project path metadata is unavailable: {error}"),
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ProjectWorkspaceValidationError::Invalid {
+                code: "project_path_unavailable",
+                workspace: requested_workspace,
+                message: "Configured Project path is no longer a plain directory".to_string(),
+            });
+        }
     }
     let canonical =
         requested_path
             .canonicalize()
             .map_err(|_| ProjectWorkspaceValidationError::Invalid {
-                code: "workspace_invalid",
-                workspace: requested_workspace.to_string(),
-                message: "Workspace path could not be canonicalized".to_string(),
+                code: if is_project_default {
+                    "project_path_unavailable"
+                } else {
+                    "workspace_invalid"
+                },
+                workspace: requested_workspace.clone(),
+                message: if is_project_default {
+                    "Project path could not be canonicalized".to_string()
+                } else {
+                    "Workspace path could not be canonicalized".to_string()
+                },
             })?;
-    let final_workspace = resolve_workspace(canonical);
+    if is_persisted_project_default && canonical != requested_path {
+        return Err(ProjectWorkspaceValidationError::Invalid {
+            code: "project_path_unavailable",
+            workspace: requested_workspace,
+            message:
+                "Configured Project path no longer resolves to its registered canonical directory"
+                    .to_string(),
+        });
+    }
+    let final_workspace = resolve_workspace(canonical.clone());
     let final_workspace = final_workspace.canonicalize().unwrap_or(final_workspace);
     let display = bamboo_config::paths::path_to_display_string(&final_workspace);
+    if is_project_default && final_workspace != canonical {
+        return Err(ProjectWorkspaceValidationError::Invalid {
+            code: "project_path_unavailable",
+            workspace: requested_workspace,
+            message: format!(
+                "Workspace confinement redirected the Project path to '{}'",
+                final_workspace.display()
+            ),
+        });
+    }
     let owner = match store.find_workspace_owner_for_path(&display) {
         Ok(owner) => owner,
         Err(ProjectStoreError::Validation(message))
         | Err(ProjectStoreError::InvalidPathComponent(message)) => {
             return Err(ProjectWorkspaceValidationError::Invalid {
-                code: "workspace_invalid",
+                code: if is_project_default {
+                    "project_path_unavailable"
+                } else {
+                    "workspace_invalid"
+                },
                 workspace: display,
                 message,
             });
@@ -144,6 +363,7 @@ impl ProjectContextSource for ProjectStoreContextSource {
         Ok(Some(ProjectDescriptor {
             id: manifest.id.clone(),
             name: manifest.name,
+            project_path: manifest.project_path.map(std::path::PathBuf::from),
             home: self.store.paths().project_home(project_id),
             workspace_bindings: manifest.workspace_bindings,
             resources,
@@ -221,6 +441,7 @@ mod tests {
             Some(&owner.id),
             Some(raw.path().to_string_lossy().as_ref()),
             |_| confined.path().to_path_buf(),
+            false,
         )
         .expect("same owner");
         assert_eq!(
@@ -239,6 +460,7 @@ mod tests {
             Some(&other.id),
             Some(raw.path().to_string_lossy().as_ref()),
             |_| confined.path().to_path_buf(),
+            false,
         )
         .expect_err("final workspace owner must win over the raw request");
         assert!(matches!(
@@ -247,6 +469,109 @@ mod tests {
                 owner_project_id,
                 ..
             } if owner_project_id == owner.id
+        ));
+    }
+
+    #[test]
+    fn assigned_omission_uses_project_path_and_reports_unconfigured_legacy_project() {
+        let data = tempfile::tempdir().expect("data");
+        let project_path = tempfile::tempdir().expect("Project path");
+        let foreign_default = tempfile::tempdir().expect("foreign default");
+        let store = ProjectStore::open(data.path()).expect("Project store");
+        let project = store
+            .create_with_project_path(
+                "Configured",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("configured Project");
+
+        let resolved = validate_workspace_assignment_with(
+            &store,
+            Some(&project.id),
+            None,
+            |_| foreign_default.path().to_path_buf(),
+            false,
+        )
+        .expect_err("confinement must not silently relocate project_path");
+        assert!(matches!(
+            resolved,
+            ProjectWorkspaceValidationError::Invalid {
+                code: "project_path_unavailable",
+                ..
+            }
+        ));
+
+        let resolved = validate_workspace_assignment_with(
+            &store,
+            Some(&project.id),
+            None,
+            |workspace| workspace,
+            false,
+        )
+        .expect("Project path fallback");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(project_path.path().canonicalize().unwrap().as_path())
+        );
+
+        let legacy = store.create("Legacy", None).expect("legacy Project");
+        let error = validate_workspace_assignment_with(
+            &store,
+            Some(&legacy.id),
+            None,
+            |workspace| workspace,
+            false,
+        )
+        .expect_err("unconfigured Project must fail closed");
+        assert!(matches!(
+            error,
+            ProjectWorkspaceValidationError::Invalid {
+                code: "project_path_missing",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn assigned_omission_rejects_project_path_replaced_by_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let data = root.path().join("data");
+        let project_path = root.path().join("project");
+        let replacement = root.path().join("replacement");
+        std::fs::create_dir_all(&project_path).expect("Project path");
+        std::fs::create_dir_all(&replacement).expect("replacement");
+        let store = ProjectStore::open(&data).expect("Project store");
+        let project = store
+            .create_with_project_path(
+                "Configured",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("configured Project");
+
+        std::fs::remove_dir(&project_path).expect("remove original Project path");
+        symlink(&replacement, &project_path).expect("replace Project path with symlink");
+
+        let error = validate_workspace_assignment_with(
+            &store,
+            Some(&project.id),
+            None,
+            |workspace| workspace,
+            false,
+        )
+        .expect_err("persisted Project path must not follow a replacement symlink");
+        assert!(matches!(
+            error,
+            ProjectWorkspaceValidationError::Invalid {
+                code: "project_path_unavailable",
+                ..
+            }
         ));
     }
 }
