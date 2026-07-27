@@ -1915,8 +1915,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = AppState::new(dir.path().to_path_buf()).await.unwrap();
 
+        let old_password = format!("old-root-secret-{}", uuid::Uuid::new_v4());
         let old_salt = "11".repeat(16);
-        let old_hash = compute_password_hash("old-root-secret", &old_salt).unwrap();
+        let old_hash = compute_password_hash(&old_password, &old_salt).unwrap();
         writer
             .update_access_control_credentials(0, true, BTreeSet::new(), move |config| {
                 config.access_control = Some(AccessControlConfig {
@@ -1946,11 +1947,12 @@ mod tests {
         );
         {
             let stale_config = stale.config.read().await;
-            assert!(verify_password(&stale_config, "old-root-secret"));
+            assert!(verify_password(&stale_config, &old_password));
         }
 
+        let new_password = format!("new-root-secret-{}", uuid::Uuid::new_v4());
         let new_salt = "22".repeat(16);
-        let new_hash = compute_password_hash("new-root-secret", &new_salt).unwrap();
+        let new_hash = compute_password_hash(&new_password, &new_salt).unwrap();
         writer
             .update_access_control_credentials(1, true, BTreeSet::new(), move |config| {
                 let access = config.access_control.get_or_insert_with(Default::default);
@@ -1964,8 +1966,8 @@ mod tests {
             .unwrap();
         {
             let stale_config = stale.config.read().await;
-            assert!(verify_password(&stale_config, "old-root-secret"));
-            assert!(!verify_password(&stale_config, "new-root-secret"));
+            assert!(verify_password(&stale_config, &old_password));
+            assert!(!verify_password(&stale_config, &new_password));
         }
 
         let app = test::init_service(
@@ -1983,7 +1985,7 @@ mod tests {
                 .set_json(serde_json::json!({
                     "expected_revision": 2,
                     "action": "replace",
-                    "current_password": "old-root-secret",
+                    "current_password": old_password,
                     "value": "unauthorized-third-secret"
                 }))
                 .to_request(),
@@ -1999,8 +2001,8 @@ mod tests {
         .unwrap();
         let mut durable = Config::default();
         exact.install_into(&mut durable);
-        assert!(verify_password(&durable, "new-root-secret"));
-        assert!(!verify_password(&durable, "old-root-secret"));
+        assert!(verify_password(&durable, &new_password));
+        assert!(!verify_password(&durable, &old_password));
         assert!(!verify_password(&durable, "unauthorized-third-secret"));
         assert!(
             !std::fs::read_to_string(dir.path().join("credentials.json"))
