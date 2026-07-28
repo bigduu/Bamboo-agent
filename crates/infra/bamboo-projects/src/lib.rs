@@ -1341,7 +1341,7 @@ fn workspace_paths_overlap(left: &str, right: &str) -> bool {
 }
 
 fn canonicalize_binding(mut binding: WorkspaceBinding) -> ProjectStoreResult<WorkspaceBinding> {
-    binding.path = canonicalize_utf8(Path::new(&binding.path), "workspace binding")?;
+    binding.path = canonicalize_workspace_path(Path::new(&binding.path))?;
     let actual_git_common_dir = resolve_git_common_dir(Path::new(&binding.path))?;
     if let Some(supplied) = binding.git_common_dir.as_deref() {
         let supplied = canonicalize_utf8(Path::new(supplied), "git common dir")?;
@@ -1356,7 +1356,17 @@ fn canonicalize_binding(mut binding: WorkspaceBinding) -> ProjectStoreResult<Wor
     Ok(binding)
 }
 
-fn resolve_git_common_dir(workspace: &Path) -> ProjectStoreResult<Option<String>> {
+/// Canonicalize a Workspace path with the exact filesystem semantics used
+/// when persisting Workspace bindings.
+pub fn canonicalize_workspace_path(workspace: &Path) -> ProjectStoreResult<String> {
+    canonicalize_utf8(workspace, "workspace binding")
+}
+
+/// Discover the canonical Git common directory for a Workspace without
+/// mutating the repository. Linked worktrees and their main checkout resolve
+/// to the same directory. A missing Git executable or non-repository
+/// Workspace yields `None`.
+pub fn resolve_git_common_dir(workspace: &Path) -> ProjectStoreResult<Option<String>> {
     let absolute = run_git_common_dir(
         workspace,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],

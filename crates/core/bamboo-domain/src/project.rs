@@ -302,7 +302,9 @@ pub struct ProjectResourceSummary {
     pub resources: Vec<ProjectResourceEntry>,
 }
 
-/// Pre-resolved legacy session input for the migration dry-run seam.
+/// Legacy session input for the migration dry-run seam. Callers may provide
+/// canonical/Git/key evidence explicitly; the server can enrich only omitted
+/// evidence from a readable `workspace_path`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacySessionProjectInput {
     pub session_id: String,
