@@ -760,7 +760,9 @@ pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
             .max_age(3600)
     };
 
-    cors
+    // Session metadata mutations use the response ETag as their If-Match CAS
+    // token, so cross-origin browser/Tauri clients must be able to read it.
+    cors.expose_headers([header::ETAG])
 }
 
 /// Apply the Governor (rate limiter) + CORS middleware pair to `app`, IN THE
@@ -1135,6 +1137,117 @@ mod tests {
 
             (status, has_acao, pre.status())
         }};
+    }
+
+    /// A browser can only read the session CAS token when CORS explicitly
+    /// exposes `ETag`. Exercise the real session route behind the production
+    /// CORS middleware for every bind-mode branch, while keeping the existing
+    /// permissive request-header policy available to `If-Match` preflights.
+    #[actix_web::test]
+    async fn cors_exposes_session_etag_for_every_bind_mode() {
+        use crate::routes::configure_routes;
+        use crate::AppState;
+        use actix_web::http::{header, Method, StatusCode};
+        use actix_web::{test, web, App};
+        use bamboo_agent_core::Session;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "cors-etag-session";
+        let mut session = Session::new(session_id, "model");
+        state.save_and_cache_session(&mut session).await;
+
+        for (bind_addr, origin) in [
+            ("127.0.0.1", "http://127.0.0.1:1420"),
+            ("0.0.0.0", "http://127.0.0.1:1420"),
+            ("192.0.2.10", "http://192.0.2.10:1420"),
+        ] {
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .wrap(build_cors(bind_addr, 9562))
+                    .configure(configure_routes),
+            )
+            .await;
+
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/api/v1/sessions/{session_id}"))
+                    .insert_header((header::ORIGIN, origin))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "bind {bind_addr}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok()),
+                Some("\"0\""),
+                "the real session response must still carry its CAS token for bind {bind_addr}"
+            );
+
+            let exposed = response
+                .headers()
+                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            assert!(
+                exposed
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case("etag")),
+                "ETag must be browser-readable for bind {bind_addr}; exposed={exposed:?}"
+            );
+            assert_eq!(
+                exposed.len(),
+                1,
+                "do not broadly expose unrelated response headers for bind {bind_addr}"
+            );
+
+            let preflight = test::call_service(
+                &app,
+                test::TestRequest::default()
+                    .method(Method::OPTIONS)
+                    .uri(&format!("/api/v1/sessions/{session_id}"))
+                    .insert_header((header::ORIGIN, origin))
+                    .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "PATCH"))
+                    .insert_header((
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "content-type, if-match",
+                    ))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                preflight.status(),
+                StatusCode::OK,
+                "existing PATCH preflight behavior must remain intact for bind {bind_addr}"
+            );
+            let allowed_headers = preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert!(
+                allowed_headers
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case("if-match")),
+                "If-Match must remain allowed for bind {bind_addr}; allowed={allowed_headers}"
+            );
+        }
+
+        state.shutdown().await;
     }
 
     /// The production order — enforced by the shared [`wrap_governor_and_cors`]
