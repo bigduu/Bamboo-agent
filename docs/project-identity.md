@@ -76,13 +76,18 @@ during migration, but cannot create new Project-scoped writes.
 ## API and propagation
 
 The `/api/v1/projects` API creates, lists, updates, binds, unbinds, inspects,
-and archives Projects. Create requires `project_path`; list/detail return it;
-PATCH can change it without changing `project_id`. Mutations require the
-current revision through `If-Match`. The current primary path cannot be
-unbound—select a replacement with Project CAS first. Session
-create/list/detail and chat contracts expose `project_id`; explicit session
-reassignment also requires `If-Match` and is rejected while the session is
-running.
+archives, and unarchives Projects. Create requires `project_path`; list/detail
+return it; PATCH can change it without changing `project_id`. Mutations require
+the current revision through `If-Match`. `POST /api/v1/projects/{id}/unarchive`
+restores only an archived Project, returns its canonical manifest and new ETag,
+and publishes `ProjectUpdated`. Missing or stale `If-Match` values return `428`
+or `412`; restoring an already-active Project returns structured
+`project_not_archived` (`409`). Restore preserves Project identity, paths,
+bindings, legacy aliases, shared resources, and session ownership. The current
+primary path cannot be unbound—select a replacement with Project CAS first.
+Session create/list/detail and chat contracts expose `project_id`; explicit
+session reassignment also requires `If-Match` and is rejected while the session
+is running.
 
 `PATCH /api/v1/sessions/{id}` accepts `workspace_path` as an immediate durable
 Workspace switch. It requires `If-Match` (`428` when absent, `412` when stale),

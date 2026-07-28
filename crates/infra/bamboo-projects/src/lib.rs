@@ -42,6 +42,8 @@ pub enum ProjectStoreError {
     AlreadyExists(ProjectId),
     #[error("project revision conflict: expected {expected}, actual {actual}")]
     Conflict { expected: u64, actual: u64 },
+    #[error("project {0} is not archived")]
+    NotArchived(ProjectId),
     #[error(
         "project_path '{project_path}' cannot be unbound from Project '{project_id}'; select another Project path first"
     )]
@@ -609,6 +611,24 @@ impl ProjectStore {
     ) -> ProjectStoreResult<ProjectManifest> {
         self.update(project_id, expected_revision, |manifest| {
             manifest.status = ProjectStatus::Archived;
+            Ok(())
+        })
+    }
+
+    /// Restore an archived Project under the same per-Project CAS lock used by
+    /// every manifest mutation. The status check is intentionally performed
+    /// inside the update closure so two concurrent restores cannot both
+    /// succeed.
+    pub fn unarchive(
+        &self,
+        project_id: &ProjectId,
+        expected_revision: u64,
+    ) -> ProjectStoreResult<ProjectManifest> {
+        self.update(project_id, expected_revision, |manifest| {
+            if manifest.status != ProjectStatus::Archived {
+                return Err(ProjectStoreError::NotArchived(manifest.id.clone()));
+            }
+            manifest.status = ProjectStatus::Active;
             Ok(())
         })
     }
@@ -2035,6 +2055,82 @@ mod tests {
                 actual: 2
             })
         ));
+    }
+
+    #[test]
+    fn unarchive_is_atomic_and_preserves_project_identity_and_resources() {
+        let (temp, store) = store();
+        let project_path = temp.path().join("project");
+        let workspace_path = temp.path().join("workspace");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let project = store
+            .create_with_project_path(
+                "Zenith",
+                Some("Project restore contract".to_string()),
+                project_path.to_string_lossy(),
+                vec![WorkspaceBinding {
+                    path: workspace_path.to_string_lossy().into_owned(),
+                    label: Some("Issue worktree".to_string()),
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.unarchive(&project.id, project.revision),
+            Err(ProjectStoreError::NotArchived(project_id)) if project_id == project.id
+        ));
+        assert_eq!(
+            store.get(&project.id).unwrap().revision,
+            project.revision,
+            "rejected restore must not bump the manifest"
+        );
+
+        let project = store
+            .update(&project.id, project.revision, |manifest| {
+                manifest
+                    .legacy_project_keys
+                    .push("legacy-zenith".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let project = store
+            .bump_resource_revision(&project.id, project.revision)
+            .unwrap();
+        let settings_path = store.paths().settings_path(&project.id);
+        let memory_path = store.paths().memory_v1_dir(&project.id).join("index.json");
+        std::fs::create_dir_all(memory_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, br#"{"theme":"dark"}"#).unwrap();
+        std::fs::write(&memory_path, br#"{"entries":["stable"]}"#).unwrap();
+
+        let archived = store.archive(&project.id, project.revision).unwrap();
+        let settings_before = std::fs::read(&settings_path).unwrap();
+        let memory_before = std::fs::read(&memory_path).unwrap();
+        let restored = store.unarchive(&archived.id, archived.revision).unwrap();
+
+        assert_eq!(restored.status, ProjectStatus::Active);
+        assert_eq!(restored.revision, archived.revision + 1);
+        assert!(restored.updated_at >= archived.updated_at);
+        assert_eq!(restored.id, archived.id);
+        assert_eq!(restored.project_path, archived.project_path);
+        assert_eq!(restored.project_path_status, archived.project_path_status);
+        assert_eq!(restored.workspace_bindings, archived.workspace_bindings);
+        assert_eq!(restored.legacy_project_keys, archived.legacy_project_keys);
+        assert_eq!(restored.resource_revision, archived.resource_revision);
+        assert_eq!(restored.created_at, archived.created_at);
+        assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
+        assert_eq!(std::fs::read(&memory_path).unwrap(), memory_before);
+
+        assert!(matches!(
+            store.unarchive(&restored.id, restored.revision),
+            Err(ProjectStoreError::NotArchived(project_id)) if project_id == restored.id
+        ));
+        assert_eq!(
+            store.get(&restored.id).unwrap(),
+            restored,
+            "repeated restore must leave the canonical manifest unchanged"
+        );
     }
 
     #[test]

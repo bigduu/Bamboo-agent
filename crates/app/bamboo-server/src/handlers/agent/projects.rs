@@ -102,6 +102,16 @@ fn parse_id(raw: &str) -> std::result::Result<ProjectId, HttpResponse> {
 }
 
 fn project_error(error: ProjectStoreError) -> HttpResponse {
+    if let ProjectStoreError::NotArchived(project_id) = &error {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_not_archived",
+                "message": "Project is not archived"
+            },
+            "project_id": project_id,
+        }));
+    }
     if let ProjectStoreError::ProjectPathUnbindConflict {
         project_id,
         project_path,
@@ -121,6 +131,7 @@ fn project_error(error: ProjectStoreError) -> HttpResponse {
         ProjectStoreError::NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
         ProjectStoreError::Conflict { .. } => (StatusCode::PRECONDITION_FAILED, error.to_string()),
         ProjectStoreError::AlreadyExists(_)
+        | ProjectStoreError::NotArchived(_)
         | ProjectStoreError::Validation(_)
         | ProjectStoreError::InvalidPathComponent(_)
         | ProjectStoreError::ProjectPathUnbindConflict { .. } => {
@@ -397,6 +408,33 @@ pub async fn archive_project(
     Ok(with_etag(&project, StatusCode::OK))
 }
 
+pub async fn unarchive_project(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    http_request: HttpRequest,
+) -> Result<HttpResponse> {
+    let id = match parse_id(&path) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let expected = match parse_if_match(&http_request) {
+        Ok(revision) => revision,
+        Err(response) => return Ok(response),
+    };
+    let project = match state.project_store.unarchive(&id, expected) {
+        Ok(project) => project,
+        Err(error) => return Ok(project_error(error)),
+    };
+    state.account_sink.record(
+        None,
+        &AgentEvent::ProjectUpdated {
+            project_id: project.id.to_string(),
+            revision: project.revision,
+        },
+    );
+    Ok(with_etag(&project, StatusCode::OK))
+}
+
 pub async fn legacy_dry_run(
     state: web::Data<AppState>,
     request: web::Json<LegacyDryRunRequest>,
@@ -546,6 +584,10 @@ mod tests {
                 )
                 .route("/projects/{id}/resources", web::get().to(project_resources))
                 .route("/projects/{id}/archive", web::post().to(archive_project))
+                .route(
+                    "/projects/{id}/unarchive",
+                    web::post().to(unarchive_project),
+                )
                 .route(
                     "/projects/migrations/legacy/dry-run",
                     web::post().to(legacy_dry_run),
@@ -897,6 +939,162 @@ mod tests {
         .await;
         assert_eq!(dry_run.status(), StatusCode::OK);
         drop(dir);
+    }
+
+    #[actix_web::test]
+    async fn unarchive_route_is_cas_guarded_replayable_and_preserves_ownership() {
+        let (dir, state) = app_state().await;
+        let app = test::init_service(project_app!(state.clone())).await;
+        let project_path = dir.path().join("zenith");
+        let workspace_path = dir.path().join("worktree");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Zenith",
+                Some("Restore me".to_string()),
+                project_path.to_string_lossy(),
+                vec![WorkspaceBinding {
+                    path: workspace_path.to_string_lossy().into_owned(),
+                    label: Some("Issue worktree".to_string()),
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        let project = state
+            .project_store
+            .update(&project.id, project.revision, |manifest| {
+                manifest
+                    .legacy_project_keys
+                    .push("legacy-zenith".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let archived = state
+            .project_store
+            .archive(&project.id, project.revision)
+            .unwrap();
+
+        let session_id = "project-unarchive-session";
+        let mut session = bamboo_agent_core::Session::new(session_id, "test-model");
+        session.set_project_id_meta(archived.id.to_string());
+        session.set_workspace_path_meta(archived.workspace_bindings[0].path.clone());
+        state.storage.save_session(&session).await.unwrap();
+
+        let missing = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", archived.id))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", archived.id))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", archived.revision + 1)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            state.project_store.get(&archived.id).unwrap(),
+            archived,
+            "stale restore must not mutate the Project"
+        );
+
+        let journal_cursor = state.account_sink.latest_seq();
+        let mut feed = state.account_sink.subscribe();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", archived.id))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", archived.revision)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            format!("\"{}\"", archived.revision + 1).as_str()
+        );
+        let restored: ProjectManifest = test::read_body_json(response).await;
+        assert_eq!(restored.status, ProjectStatus::Active);
+        assert_eq!(restored.revision, archived.revision + 1);
+        assert_eq!(restored.id, archived.id);
+        assert_eq!(restored.project_path, archived.project_path);
+        assert_eq!(restored.project_path_status, archived.project_path_status);
+        assert_eq!(restored.workspace_bindings, archived.workspace_bindings);
+        assert_eq!(restored.legacy_project_keys, archived.legacy_project_keys);
+        assert_eq!(restored.resource_revision, archived.resource_revision);
+        assert_eq!(restored.created_at, archived.created_at);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+            .await
+            .expect("ProjectUpdated delivery")
+            .expect("account feed event");
+        assert!(matches!(
+            &event.event,
+            AgentEvent::ProjectUpdated {
+                project_id,
+                revision,
+            } if project_id == restored.id.as_str() && *revision == restored.revision
+        ));
+        let replay = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            journal_cursor,
+        )
+        .expect("journal replay");
+        assert!(replay.iter().any(|change| matches!(
+            &change.event,
+            AgentEvent::ProjectUpdated {
+                project_id,
+                revision,
+            } if project_id == restored.id.as_str() && *revision == restored.revision
+        )));
+
+        let persisted_session = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .expect("persisted session");
+        assert_eq!(
+            persisted_session.project_id_meta().as_deref(),
+            Some(restored.id.as_str())
+        );
+        assert_eq!(
+            persisted_session.workspace_path_meta(),
+            Some(restored.workspace_bindings[0].path.clone())
+        );
+
+        let repeated = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", restored.id))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", restored.revision)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(repeated.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(repeated).await;
+        assert_eq!(body["error"]["code"], "project_not_archived");
+        assert_eq!(body["project_id"], restored.id.to_string());
+        assert_eq!(
+            state.project_store.get(&restored.id).unwrap(),
+            restored,
+            "repeated restore must not create stale optimistic state"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), feed.recv())
+                .await
+                .is_err(),
+            "rejected restore must not publish ProjectUpdated"
+        );
     }
 
     #[actix_web::test]
