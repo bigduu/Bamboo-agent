@@ -153,6 +153,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::projects::archive_project),
         )
         .route(
+            "/projects/{project_id}/unarchive",
+            web::post().to(agent::projects::unarchive_project),
+        )
+        .route(
             "/sessions/cleanup",
             web::post().to(agent::sessions::cleanup_sessions),
         )
