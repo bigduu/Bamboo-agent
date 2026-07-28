@@ -626,13 +626,63 @@ mod optional_model_e2e {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(response).await;
-        assert_eq!(body["error"]["code"], "workspace_not_found");
+        assert_eq!(body["error"]["code"], "workspace_invalid");
         assert!(state
             .storage
             .load_session("chat-invalid-workspace")
             .await
             .expect("load")
             .is_none());
+    }
+
+    #[actix_web::test]
+    async fn chat_explicit_workspace_switch_requires_existing_project_binding() {
+        let state = new_state().await;
+        let project_path = tempdir().expect("Project path");
+        let unbound = tempdir().expect("unbound workspace");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Assigned Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Project");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": "chat-unbound-workspace",
+                    "project_id": project.id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "workspace_path": unbound.path(),
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "project_workspace_unbound");
+        assert_eq!(body["session_project_id"], project.id.as_str());
+        assert!(
+            state
+                .storage
+                .load_session("chat-unbound-workspace")
+                .await
+                .expect("load")
+                .is_none(),
+            "binding validation must happen before chat creates the session"
+        );
     }
 
     #[actix_web::test]

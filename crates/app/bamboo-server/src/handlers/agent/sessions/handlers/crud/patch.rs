@@ -142,9 +142,10 @@ fn project_context_error_response(
 /// concurrency: the precondition is checked inside the per-session lock (so it
 /// is race-free) and a mismatch returns `412`. The precondition is applied to
 /// the first authoritative write in the patch (each write bumps the version).
-/// Project reassignment is deliberately performed first and requires an
-/// explicit precondition so a mixed-field request cannot consume the caller's
-/// CAS token on a lower-risk title/pin update.
+/// Project reassignment and Workspace switching are deliberately performed
+/// first as one atomic metadata transaction and require an explicit
+/// precondition, so a mixed-field request cannot consume the caller's CAS
+/// token on a lower-risk title/pin update.
 pub async fn patch_session(
     state: web::Data<AppState>,
     path: web::Path<String>,
@@ -155,17 +156,18 @@ pub async fn patch_session(
     // Consumed by the first authoritative setter invoked (see `.take()` below).
     let mut precondition = parse_if_match(&http_req);
 
-    // Project reassignment is an explicit authoritative operation, distinct
-    // from workspace changes. The entire validate -> mutate -> persist ->
-    // cache/index/prompt/event sequence is serialized by the session lock.
-    if let Some(requested_project) = req.project_id.as_ref() {
+    // Project reassignment and explicit Workspace switching are one
+    // authoritative transaction. The entire validate -> mutate -> persist ->
+    // cache/index/prompt/event sequence is serialized by the session lock, so
+    // a combined request cannot persist either half before both validate.
+    if req.project_id.is_some() || req.workspace_path.is_some() {
         let Some(expected_version) = precondition.take() else {
             return Ok(HttpResponse::build(
                 actix_web::http::StatusCode::PRECONDITION_REQUIRED,
             )
             .json(serde_json::json!({
                 "error": crate::error::error_value(
-                    "If-Match with the current session metadata_version is required for Project reassignment"
+                    "If-Match with the current session metadata_version is required for Project or Workspace changes"
                 ),
                 "session_id": session_id,
             })));
@@ -181,7 +183,7 @@ pub async fn patch_session(
                 "error": {
                     "type": "api_error",
                     "code": "session_project_running_conflict",
-                    "message": "A running or starting session cannot be reassigned to another Project"
+                    "message": "A running or starting session cannot change Project or Workspace"
                 },
                 "session_id": session_id,
             })));
@@ -193,7 +195,7 @@ pub async fn patch_session(
             .await
             .map_err(|error| {
                 crate::error::json_internal_server_error(format!(
-                    "Failed to load session for Project reassignment: {error}"
+                    "Failed to load session for Project/Workspace update: {error}"
                 ))
             })?
         else {
@@ -207,8 +209,32 @@ pub async fn patch_session(
             return Ok(precondition_failed(&session_id, session.metadata_version));
         }
 
-        let target = match requested_project {
-            Some(raw) => {
+        let current_raw = session.project_id_meta();
+        let current_project =
+            match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                &session,
+            ) {
+                bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                    Some(project_id)
+                }
+                bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
+                bamboo_engine::project_context::SessionProjectIdentity::Invalid {
+                    raw,
+                    message,
+                } if req.project_id.is_none() => {
+                    let error =
+                        bamboo_engine::project_context::ProjectContextError::InvalidProjectIdentity {
+                        raw,
+                        message,
+                    };
+                    return Ok(project_context_error_response(error));
+                }
+                // An explicit reassignment (including `null`) is the recovery path
+                // for malformed legacy membership.
+                bamboo_engine::project_context::SessionProjectIdentity::Invalid { .. } => None,
+            };
+        let target = match req.project_id.as_ref() {
+            Some(Some(raw)) => {
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
                     return Ok(crate::error::json_error(
@@ -251,20 +277,40 @@ pub async fn patch_session(
                 }
                 Some(project_id)
             }
-            None => None,
+            Some(None) => None,
+            None => current_project.clone(),
         };
-        let workspace_for_validation = (session
+
+        let current_workspace = session.workspace_path_meta();
+        let current_workspace_source = session
             .metadata
             .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
-            .map(String::as_str)
-            != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str()))
-        .then(|| session.workspace_path_meta())
-        .flatten();
-        let final_workspace =
+            .cloned();
+        let mut selected_project_default = false;
+        let final_workspace = if let Some(requested_workspace) = req.workspace_path.as_deref() {
+            match crate::project_context::validate_explicit_session_workspace_with_resolver(
+                &state.project_store,
+                target.as_ref(),
+                requested_workspace,
+                &state.workspace_resolver,
+            ) {
+                Ok(workspace) => Some(workspace),
+                Err(error) => {
+                    return Ok(crate::project_context::session_workspace_error_response(
+                        error,
+                    ));
+                }
+            }
+        } else {
+            let workspace_for_validation = (current_workspace_source.as_deref()
+                != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str()))
+            .then_some(current_workspace.as_deref())
+            .flatten();
+            selected_project_default = target.is_some() && workspace_for_validation.is_none();
             match crate::project_context::validate_workspace_assignment_with_resolver(
                 &state.project_store,
                 target.as_ref(),
-                workspace_for_validation.as_deref(),
+                workspace_for_validation,
                 &state.workspace_resolver,
             ) {
                 Ok(workspace) => workspace,
@@ -310,26 +356,40 @@ pub async fn patch_session(
                         }
                     });
                 }
-            };
-
-        let current_raw = session.project_id_meta();
-        let current = current_raw
+            }
+        };
+        let final_workspace_display = final_workspace
             .as_deref()
-            .and_then(|value| value.trim().parse::<bamboo_domain::ProjectId>().ok());
+            .map(bamboo_config::paths::path_to_display_string);
         let membership_changed = match target.as_ref() {
-            Some(target) => current.as_ref() != Some(target),
+            Some(target) => current_project.as_ref() != Some(target),
             None => current_raw.is_some(),
         };
-        if membership_changed {
+        let workspace_changed = req.workspace_path.is_some()
+            && (current_workspace.as_deref() != final_workspace_display.as_deref()
+                || (target.is_some()
+                    && current_workspace_source.as_deref()
+                        != Some(
+                            bamboo_engine::project_context::WorkspaceSource::Explicit.as_str(),
+                        )));
+        if membership_changed || workspace_changed {
             match target.as_ref() {
-                Some(project_id) => session.set_project_id_meta(project_id.to_string()),
-                None => session.clear_project_id_meta(),
+                Some(project_id) if membership_changed => {
+                    session.set_project_id_meta(project_id.to_string())
+                }
+                None if membership_changed => session.clear_project_id_meta(),
+                _ => {}
             }
-            if let Some(workspace) = final_workspace.as_deref() {
-                session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
-                    workspace,
-                ));
-                if target.is_some() && workspace_for_validation.is_none() {
+            if let Some(workspace) = final_workspace_display.as_deref() {
+                session.set_workspace_path_meta(workspace);
+                if req.workspace_path.is_some() {
+                    session.metadata.insert(
+                        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+                        bamboo_engine::project_context::WorkspaceSource::Explicit
+                            .as_str()
+                            .to_string(),
+                    );
+                } else if target.is_some() && selected_project_default {
                     session.metadata.insert(
                         bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
                         bamboo_engine::project_context::WorkspaceSource::ProjectDefault
@@ -341,8 +401,9 @@ pub async fn patch_session(
             session.metadata_version = session.metadata_version.saturating_add(1);
             session.updated_at = chrono::Utc::now();
 
-            // Resolve and replace the stable Project marker through the single
-            // engine resolver seam. Workspace membership is not changed.
+            // Resolve and replace the stable Project/Workspace markers through
+            // the single engine resolver seam. Validation never mutates Project
+            // workspace bindings.
             if let Err(error) = state
                 .project_context_resolver
                 .refresh_session_prompt_read_only(&mut session)
@@ -358,7 +419,7 @@ pub async fn patch_session(
                 .await
                 .map_err(|error| {
                     crate::error::json_internal_server_error(format!(
-                        "Failed to save Project reassignment: {error}"
+                        "Failed to save Project/Workspace update: {error}"
                     ))
                 })?;
             state.sessions.insert(
@@ -373,7 +434,7 @@ pub async fn patch_session(
                 state.workspace_resolver.publish_resolved_workspace(
                     &session_id,
                     workspace,
-                    "project_reassignment",
+                    "session_metadata_patch",
                 );
             }
             state.account_sink.record(
@@ -381,12 +442,13 @@ pub async fn patch_session(
                 &bamboo_agent_core::AgentEvent::SessionProjectUpdated {
                     session_id: session_id.clone(),
                     project_id: target.as_ref().map(ToString::to_string),
+                    workspace_path: session.workspace_path_meta(),
                     metadata_version: session.metadata_version,
                 },
             );
         }
         // Preserve a valid CAS token for any lower-risk fields included in the
-        // same PATCH. A real reassignment bumped it; an idempotent reassignment
+        // same PATCH. A real metadata change bumped it; an idempotent request
         // leaves it unchanged.
         precondition = Some(session.metadata_version);
     }
@@ -597,7 +659,11 @@ pub async fn patch_session(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use actix_web::{http::header, http::StatusCode, test, web, App};
+    use bamboo_domain::Storage as _;
+    use bamboo_engine::runtime::execution::runner_state::{AgentRunner, AgentStatus};
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -623,6 +689,51 @@ mod tests {
             let body: Value = test::read_body_json(resp).await;
             body["session"]["id"].as_str().unwrap().to_string()
         }};
+    }
+
+    fn display(path: &Path) -> String {
+        bamboo_config::paths::path_to_display_string(
+            &path.canonicalize().expect("canonical workspace"),
+        )
+    }
+
+    fn binding(path: &Path) -> bamboo_domain::WorkspaceBinding {
+        bamboo_domain::WorkspaceBinding {
+            path: path.to_string_lossy().into_owned(),
+            label: None,
+            git_common_dir: None,
+        }
+    }
+
+    async fn seed_session(
+        state: &web::Data<AppState>,
+        session_id: &str,
+        project_id: Option<&bamboo_domain::ProjectId>,
+        workspace: Option<&Path>,
+    ) {
+        let mut session = bamboo_agent_core::Session::new(session_id, "model");
+        session.title = "Original title".to_string();
+        if let Some(project_id) = project_id {
+            session.set_project_id_meta(project_id.to_string());
+        }
+        if let Some(workspace) = workspace {
+            session.set_workspace_path_meta(display(workspace));
+            session.metadata.insert(
+                bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+                bamboo_engine::project_context::WorkspaceSource::Explicit
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        state
+            .storage
+            .save_session(&session)
+            .await
+            .expect("seed session");
+        state.sessions.insert(
+            session_id.to_string(),
+            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        );
     }
 
     #[actix_web::test]
@@ -1069,6 +1180,7 @@ mod tests {
                         session_id: event_session_id,
                         project_id: Some(event_project_id),
                         metadata_version,
+                        ..
                     } if event_session_id == session_id.as_str()
                         && event_project_id == project.id.as_str()
                         && *metadata_version == persisted.metadata_version
@@ -1154,5 +1266,642 @@ mod tests {
         );
         assert_eq!(persisted.metadata_version, 0);
         drop(startup_guard);
+    }
+
+    #[actix_web::test]
+    async fn workspace_patch_persists_assigned_bound_switch_across_get_list_restart_and_event() {
+        let state = new_state().await;
+        let first = tempdir().expect("first workspace");
+        let second = tempdir().expect("second workspace");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Multi-workspace Project",
+                None,
+                first.path().to_string_lossy(),
+                vec![binding(second.path())],
+            )
+            .expect("Project");
+        let session_id = "workspace-patch-assigned";
+        seed_session(&state, session_id, Some(&project.id), Some(first.path())).await;
+        let mut feed = state.account_sink.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "workspace_path": second.path()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), "\"1\"");
+        let response_body: Value = test::read_body_json(response).await;
+        let expected_workspace = display(second.path());
+        assert_eq!(response_body["session"]["project_id"], project.id.as_str());
+        assert_eq!(
+            response_body["session"]["workspace_path"],
+            expected_workspace.as_str()
+        );
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            Some(project.id.as_str()),
+            "ordinary Workspace switching must not change Project membership"
+        );
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(expected_workspace.as_str())
+        );
+        assert_eq!(persisted.metadata_version, 1);
+        assert_eq!(
+            persisted
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("explicit")
+        );
+
+        let index_entry = state
+            .session_store
+            .get_index_entry(session_id)
+            .await
+            .expect("index entry");
+        assert_eq!(
+            index_entry.workspace_path.as_deref(),
+            Some(expected_workspace.as_str())
+        );
+        assert_eq!(index_entry.project_id.as_deref(), Some(project.id.as_str()));
+
+        let get = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .to_request(),
+        )
+        .await;
+        let get_body: Value = test::read_body_json(get).await;
+        assert_eq!(
+            get_body["session"]["workspace_path"],
+            expected_workspace.as_str()
+        );
+        assert_eq!(get_body["session"]["project_id"], project.id.as_str());
+
+        let list = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        let list_body: Value = test::read_body_json(list).await;
+        let listed = list_body["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .find(|entry| entry["id"] == session_id)
+            .expect("listed session");
+        assert_eq!(listed["workspace_path"], expected_workspace.as_str());
+        assert_eq!(listed["project_id"], project.id.as_str());
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+            .await
+            .expect("workspace event timeout")
+            .expect("workspace event");
+        assert!(matches!(
+            &event.event,
+            bamboo_agent_core::AgentEvent::SessionProjectUpdated {
+                session_id: event_session_id,
+                project_id: Some(event_project_id),
+                workspace_path: Some(event_workspace),
+                metadata_version: 1,
+            } if event_session_id == session_id
+                && event_project_id == project.id.as_str()
+                && event_workspace == &expected_workspace
+        ));
+
+        let restarted = bamboo_storage::SessionStoreV2::new(state.app_data_dir.clone())
+            .await
+            .expect("restart session store");
+        let restarted_session = restarted
+            .load_session(session_id)
+            .await
+            .expect("restart load")
+            .expect("restart session");
+        assert_eq!(
+            restarted_session.workspace_path_meta().as_deref(),
+            Some(expected_workspace.as_str())
+        );
+        assert_eq!(
+            restarted
+                .get_index_entry(session_id)
+                .await
+                .expect("restart index")
+                .workspace_path
+                .as_deref(),
+            Some(expected_workspace.as_str())
+        );
+    }
+
+    #[actix_web::test]
+    async fn workspace_patch_allows_unassigned_unbound_path_without_assigning_project() {
+        let state = new_state().await;
+        let first = tempdir().expect("first workspace");
+        let second = tempdir().expect("second workspace");
+        let session_id = "workspace-patch-unassigned";
+        seed_session(&state, session_id, None, Some(first.path())).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({ "workspace_path": second.path() }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(response).await;
+        assert!(body["session"]["project_id"].is_null());
+        assert_eq!(body["session"]["workspace_path"], display(second.path()));
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(persisted.project_id_meta().is_none());
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(display(second.path()).as_str())
+        );
+        assert_eq!(persisted.metadata_version, 1);
+    }
+
+    #[actix_web::test]
+    async fn workspace_patch_rejects_cross_project_path_without_partial_update() {
+        let state = new_state().await;
+        let own_workspace = tempdir().expect("own workspace");
+        let foreign_workspace = tempdir().expect("foreign workspace");
+        let own = state
+            .project_store
+            .create_with_project_path(
+                "Own Project",
+                None,
+                own_workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("own Project");
+        let foreign = state
+            .project_store
+            .create_with_project_path(
+                "Foreign Project",
+                None,
+                foreign_workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("foreign Project");
+        let session_id = "workspace-patch-foreign";
+        seed_session(
+            &state,
+            session_id,
+            Some(&own.id),
+            Some(own_workspace.path()),
+        )
+        .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "workspace_path": foreign_workspace.path(),
+                    "title": "Must not persist"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "project_workspace_conflict");
+        assert_eq!(body["owner_project_id"], foreign.id.as_str());
+        assert_eq!(body["session_project_id"], own.id.as_str());
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            Some(own.id.as_str())
+        );
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(display(own_workspace.path()).as_str())
+        );
+        assert_eq!(persisted.title, "Original title");
+        assert_eq!(persisted.metadata_version, 0);
+    }
+
+    #[actix_web::test]
+    async fn workspace_patch_rejects_archived_running_invalid_and_unbound_targets() {
+        // Archived Project.
+        let archived_state = new_state().await;
+        let archived_workspace = tempdir().expect("archived workspace");
+        let archived_switch = tempdir().expect("archived switch");
+        let archived = archived_state
+            .project_store
+            .create_with_project_path(
+                "Archived Project",
+                None,
+                archived_workspace.path().to_string_lossy(),
+                vec![binding(archived_switch.path())],
+            )
+            .expect("archived Project");
+        archived_state
+            .project_store
+            .archive(&archived.id, archived.revision)
+            .expect("archive Project");
+        seed_session(
+            &archived_state,
+            "workspace-patch-archived",
+            Some(&archived.id),
+            Some(archived_workspace.path()),
+        )
+        .await;
+        let archived_app = test::init_service(
+            App::new()
+                .app_data(archived_state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let archived_response = test::call_service(
+            &archived_app,
+            test::TestRequest::patch()
+                .uri("/api/v1/sessions/workspace-patch-archived")
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "workspace_path": archived_switch.path()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(archived_response.status(), StatusCode::CONFLICT);
+        let archived_body: Value = test::read_body_json(archived_response).await;
+        assert_eq!(archived_body["error"]["code"], "project_archived");
+
+        // Running session.
+        let running_state = new_state().await;
+        let running_workspace = tempdir().expect("running workspace");
+        let running_switch = tempdir().expect("running switch");
+        let running_project = running_state
+            .project_store
+            .create_with_project_path(
+                "Running Project",
+                None,
+                running_workspace.path().to_string_lossy(),
+                vec![binding(running_switch.path())],
+            )
+            .expect("running Project");
+        let running_id = "workspace-patch-running";
+        seed_session(
+            &running_state,
+            running_id,
+            Some(&running_project.id),
+            Some(running_workspace.path()),
+        )
+        .await;
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        running_state
+            .agent_runners
+            .write()
+            .await
+            .insert(running_id.to_string(), runner);
+        let running_app = test::init_service(
+            App::new()
+                .app_data(running_state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let running_response = test::call_service(
+            &running_app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{running_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({ "workspace_path": running_switch.path() }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(running_response.status(), StatusCode::CONFLICT);
+        let running_body: Value = test::read_body_json(running_response).await;
+        assert_eq!(
+            running_body["error"]["code"],
+            "session_project_running_conflict"
+        );
+
+        // Invalid and unbound paths.
+        let validation_state = new_state().await;
+        let bound_workspace = tempdir().expect("bound workspace");
+        let unbound_workspace = tempdir().expect("unbound workspace");
+        let validation_project = validation_state
+            .project_store
+            .create_with_project_path(
+                "Validation Project",
+                None,
+                bound_workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("validation Project");
+        let validation_id = "workspace-patch-validation";
+        seed_session(
+            &validation_state,
+            validation_id,
+            Some(&validation_project.id),
+            Some(bound_workspace.path()),
+        )
+        .await;
+        let validation_app = test::init_service(
+            App::new()
+                .app_data(validation_state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let missing = bound_workspace.path().join("missing");
+        let invalid_response = test::call_service(
+            &validation_app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{validation_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({ "workspace_path": missing }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+        let invalid_body: Value = test::read_body_json(invalid_response).await;
+        assert_eq!(invalid_body["error"]["code"], "workspace_invalid");
+
+        let unbound_response = test::call_service(
+            &validation_app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{validation_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "workspace_path": unbound_workspace.path()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(unbound_response.status(), StatusCode::CONFLICT);
+        let unbound_body: Value = test::read_body_json(unbound_response).await;
+        assert_eq!(unbound_body["error"]["code"], "project_workspace_unbound");
+        assert_eq!(
+            unbound_body["session_project_id"],
+            validation_project.id.as_str()
+        );
+
+        for (state, session_id, expected_workspace) in [
+            (
+                &archived_state,
+                "workspace-patch-archived",
+                archived_workspace.path(),
+            ),
+            (&running_state, running_id, running_workspace.path()),
+            (&validation_state, validation_id, bound_workspace.path()),
+        ] {
+            let persisted = state
+                .storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                persisted.workspace_path_meta().as_deref(),
+                Some(display(expected_workspace).as_str())
+            );
+            assert_eq!(persisted.metadata_version, 0);
+        }
+    }
+
+    #[actix_web::test]
+    async fn combined_project_workspace_patch_validates_atomically_against_target_project() {
+        let state = new_state().await;
+        let original_workspace = tempdir().expect("original workspace");
+        let target_workspace = tempdir().expect("target workspace");
+        let unbound_workspace = tempdir().expect("unbound workspace");
+        let original = state
+            .project_store
+            .create_with_project_path(
+                "Original Project",
+                None,
+                original_workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("original Project");
+        let target = state
+            .project_store
+            .create_with_project_path(
+                "Target Project",
+                None,
+                target_workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("target Project");
+        let session_id = "workspace-patch-combined";
+        seed_session(
+            &state,
+            session_id,
+            Some(&original.id),
+            Some(original_workspace.path()),
+        )
+        .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "project_id": target.id,
+                    "workspace_path": unbound_workspace.path(),
+                    "title": "Must not persist"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected_body: Value = test::read_body_json(rejected).await;
+        assert_eq!(rejected_body["error"]["code"], "project_workspace_unbound");
+        assert_eq!(
+            rejected_body["session_project_id"],
+            target.id.as_str(),
+            "combined validation must use the target Project"
+        );
+        let unchanged = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.project_id_meta().as_deref(),
+            Some(original.id.as_str())
+        );
+        assert_eq!(
+            unchanged.workspace_path_meta().as_deref(),
+            Some(display(original_workspace.path()).as_str())
+        );
+        assert_eq!(unchanged.title, "Original title");
+        assert_eq!(unchanged.metadata_version, 0);
+
+        let accepted = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "project_id": target.id,
+                    "workspace_path": target_workspace.path()
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let changed = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            changed.project_id_meta().as_deref(),
+            Some(target.id.as_str())
+        );
+        assert_eq!(
+            changed.workspace_path_meta().as_deref(),
+            Some(display(target_workspace.path()).as_str())
+        );
+        assert_eq!(changed.metadata_version, 1);
+    }
+
+    #[actix_web::test]
+    async fn workspace_patch_requires_if_match_and_rejects_stale_version() {
+        let state = new_state().await;
+        let first = tempdir().expect("first workspace");
+        let second = tempdir().expect("second workspace");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "CAS Project",
+                None,
+                first.path().to_string_lossy(),
+                vec![binding(second.path())],
+            )
+            .expect("Project");
+        let session_id = "workspace-patch-cas";
+        seed_session(&state, session_id, Some(&project.id), Some(first.path())).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let missing = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .set_json(serde_json::json!({ "workspace_path": second.path() }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            missing.status(),
+            actix_web::http::StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(
+            state
+                .storage
+                .load_session(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workspace_path_meta()
+                .as_deref(),
+            Some(display(first.path()).as_str())
+        );
+
+        let accepted = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({ "workspace_path": second.path() }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({ "workspace_path": first.path() }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale.headers().get(header::ETAG).unwrap(), "\"1\"");
+        let stale_body: Value = test::read_body_json(stale).await;
+        assert_eq!(stale_body["current_version"], 1);
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(display(second.path()).as_str())
+        );
+        assert_eq!(persisted.metadata_version, 1);
     }
 }

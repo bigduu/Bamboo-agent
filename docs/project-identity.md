@@ -33,7 +33,10 @@ also register additional workspace/worktree roots. All roots own their
 descendant paths. Bamboo rejects a Project path CAS update, session assignment,
 or Workspace tool change when the confinement-resolved destination belongs to
 another Project. An unregistered directory remains an ephemeral workspace and
-is not added to the registry.
+is not added to the registry. For an assigned session, user-facing explicit
+switches through session PATCH or chat reject an unregistered directory with
+`project_workspace_unbound`; bind it through the Project workspace API first.
+Unassigned sessions may continue to select unregistered directories.
 
 Assigned sessions resolve their effective workspace with one precedence:
 
@@ -80,6 +83,24 @@ unbound—select a replacement with Project CAS first. Session
 create/list/detail and chat contracts expose `project_id`; explicit session
 reassignment also requires `If-Match` and is rejected while the session is
 running.
+
+`PATCH /api/v1/sessions/{id}` accepts `workspace_path` as an immediate durable
+Workspace switch. It requires `If-Match` (`428` when absent, `412` when stale),
+never changes `project_id`, updates the session metadata/index before returning,
+and publishes `session_project_updated` with `project_id`, `workspace_path`, and
+`metadata_version` on the account feed. Assigned sessions may select only an
+existing path already bound to their active Project; the endpoint never binds
+paths as a side effect. Errors are structured as `workspace_invalid` (`400`),
+`project_workspace_conflict`, `project_workspace_unbound`, `project_archived`,
+or `session_project_running_conflict` (`409`). Sending `project_id` and
+`workspace_path` together validates and commits both as one explicit
+reassignment transaction.
+
+`POST /chat` retains its compatibility behavior where an explicitly supplied
+`workspace_path` becomes the persisted Workspace for that chat turn. It uses
+the same active-Project, path, ownership, and pre-existing-binding validation
+as the PATCH switch, while chat requests that omit the field keep the current
+durable Workspace/fallback behavior.
 
 Child, resident, guardian, remote actor, schedule, connect, headless, TUI, and
 SDK creation paths propagate the typed Project ID. Normal chat and Workspace
