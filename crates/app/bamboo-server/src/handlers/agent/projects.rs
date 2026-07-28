@@ -5,12 +5,17 @@
 //! responses are counts/revisions only and never include file contents,
 //! environment values, headers, or credentials.
 
+use std::path::Path;
+
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
     LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectStatus, WorkspaceBinding,
 };
-use bamboo_projects::{plan_legacy_migration, ProjectStoreError};
+use bamboo_memory::memory_store::project_key_from_path;
+use bamboo_projects::{
+    canonicalize_workspace_path, plan_legacy_migration, resolve_git_common_dir, ProjectStoreError,
+};
 use serde::Deserialize;
 
 use crate::app_state::AppState;
@@ -72,6 +77,106 @@ pub struct LegacyMemoryMigrationRequest {
 #[derive(Debug, Deserialize)]
 pub struct LegacyMemoryMigrationStatusQuery {
     pub legacy_project_key: String,
+}
+
+fn missing_legacy_evidence(input: &LegacySessionProjectInput) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if input.canonical_path.is_none() {
+        fields.push("canonical_path");
+    }
+    if input.git_common_dir.is_none() {
+        fields.push("git_common_dir");
+    }
+    if input.legacy_project_keys.is_empty() {
+        fields.push("legacy_project_keys");
+    }
+    fields
+}
+
+fn readable_canonical_workspace(workspace_path: &str) -> std::result::Result<String, String> {
+    let canonical = canonicalize_workspace_path(Path::new(workspace_path))
+        .map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        format!(
+            "canonical Workspace metadata is unavailable ({}): {error}",
+            canonical
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "canonical Workspace is not a plain directory ({canonical})"
+        ));
+    }
+    let mut entries = std::fs::read_dir(&canonical).map_err(|error| {
+        format!(
+            "canonical Workspace is not readable ({}): {error}",
+            canonical
+        )
+    })?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(|error| {
+            format!(
+                "canonical Workspace is not readable ({}): {error}",
+                canonical
+            )
+        })?;
+    }
+    Ok(canonical)
+}
+
+fn enrich_legacy_dry_run_sessions(
+    inputs: &[LegacySessionProjectInput],
+) -> (Vec<LegacySessionProjectInput>, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let sessions = inputs
+        .iter()
+        .cloned()
+        .map(|mut input| {
+            let missing = missing_legacy_evidence(&input);
+            if missing.is_empty() {
+                return input;
+            }
+            let Some(workspace_path) = input.workspace_path.as_deref() else {
+                diagnostics.push(format!(
+                    "session {} could not enrich {} because workspace_path is absent",
+                    input.session_id,
+                    missing.join(", ")
+                ));
+                return input;
+            };
+            let canonical_workspace = match readable_canonical_workspace(workspace_path) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "session {} could not enrich {} from workspace_path: {error}",
+                        input.session_id,
+                        missing.join(", ")
+                    ));
+                    return input;
+                }
+            };
+
+            if input.canonical_path.is_none() {
+                input.canonical_path = Some(canonical_workspace.clone());
+            }
+            if input.git_common_dir.is_none() {
+                match resolve_git_common_dir(Path::new(&canonical_workspace)) {
+                    Ok(git_common_dir) => input.git_common_dir = git_common_dir,
+                    Err(error) => diagnostics.push(format!(
+                        "session {} could not enrich git_common_dir from workspace_path: {error}",
+                        input.session_id
+                    )),
+                }
+            }
+            if input.legacy_project_keys.is_empty() {
+                input
+                    .legacy_project_keys
+                    .push(project_key_from_path(Path::new(&canonical_workspace)));
+            }
+            input
+        })
+        .collect();
+    (sessions, diagnostics)
 }
 
 fn parse_if_match(req: &HttpRequest) -> std::result::Result<u64, HttpResponse> {
@@ -443,7 +548,10 @@ pub async fn legacy_dry_run(
         Ok(projects) => projects,
         Err(error) => return Ok(project_error(error)),
     };
-    Ok(HttpResponse::Ok().json(plan_legacy_migration(&request.sessions, &projects)))
+    let (sessions, diagnostics) = enrich_legacy_dry_run_sessions(&request.sessions);
+    let mut report = plan_legacy_migration(&sessions, &projects);
+    report.diagnostics.extend(diagnostics);
+    Ok(HttpResponse::Ok().json(report))
 }
 
 pub async fn migrate_legacy_memory(
@@ -558,7 +666,11 @@ pub fn is_active(project: &ProjectManifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
     use actix_web::{http::header, test, App};
+    use bamboo_domain::{LegacyProjectDryRunReport, LegacyProjectMatchBasis};
     use serde_json::Value;
 
     async fn app_state() -> (tempfile::TempDir, web::Data<AppState>) {
@@ -567,6 +679,36 @@ mod tests {
             .await
             .expect("test AppState");
         (dir, web::Data::new(state))
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .expect("git must be installed for migration dry-run tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialize_git_repository(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        run_git(root, &["init", "-q"]);
+        run_git(
+            root,
+            &["config", "user.email", "legacy-dry-run@example.test"],
+        );
+        run_git(root, &["config", "user.name", "Legacy Dry Run Test"]);
+        run_git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("README.md"), "legacy dry-run\n").unwrap();
+        run_git(root, &["add", "README.md"]);
+        run_git(root, &["commit", "-q", "-m", "initial"]);
     }
 
     macro_rules! project_app {
@@ -939,6 +1081,303 @@ mod tests {
         .await;
         assert_eq!(dry_run.status(), StatusCode::OK);
         drop(dir);
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_enriches_exact_match_without_persisting() {
+        let (dir, state) = app_state().await;
+        let workspace = dir.path().join("exact-workspace");
+        let alias_child = workspace.join("alias");
+        std::fs::create_dir_all(&alias_child).unwrap();
+        let project = state
+            .project_store
+            .create_with_project_path("Exact match", None, workspace.to_string_lossy(), Vec::new())
+            .unwrap();
+        let before = state.project_store.get(&project.id).unwrap();
+        let manifest_path = state.project_store.paths().manifest_path(&project.id);
+        let index_path = state.project_store.paths().index_path();
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+        let index_bytes = std::fs::read(&index_path).unwrap();
+        let app = test::init_service(project_app!(state.clone())).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [{
+                        "session_id": "canonical-exact",
+                        "workspace_path": alias_child.join("..")
+                    }]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].session_id, "canonical-exact");
+        assert_eq!(report.assignments[0].project_id, project.id);
+        assert_eq!(
+            report.assignments[0].basis,
+            LegacyProjectMatchBasis::ExactCanonicalBinding
+        );
+        assert!(report.suggestions.is_empty());
+        assert!(report.unassigned.is_empty());
+
+        assert_eq!(state.project_store.get(&project.id).unwrap(), before);
+        assert_eq!(std::fs::read(manifest_path).unwrap(), manifest_bytes);
+        assert_eq!(std::fs::read(index_path).unwrap(), index_bytes);
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_matches_linked_worktree_by_derived_git_common_dir() {
+        let (dir, state) = app_state().await;
+        let repository = dir.path().join("main-repository");
+        let linked_worktree = dir.path().join("linked-worktree");
+        initialize_git_repository(&repository);
+        let linked_arg = linked_worktree.to_string_lossy().into_owned();
+        run_git(
+            &repository,
+            &["worktree", "add", "-q", "-b", "linked-match", &linked_arg],
+        );
+        let project = state
+            .project_store
+            .create_with_project_path("Git match", None, repository.to_string_lossy(), Vec::new())
+            .unwrap();
+        let app = test::init_service(project_app!(state.clone())).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [{
+                        "session_id": "linked-session",
+                        "workspace_path": linked_worktree
+                    }]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].session_id, "linked-session");
+        assert_eq!(report.assignments[0].project_id, project.id);
+        assert_eq!(
+            report.assignments[0].basis,
+            LegacyProjectMatchBasis::GitCommonDir
+        );
+        assert!(report.suggestions.is_empty());
+        assert!(report.unassigned.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_groups_git_worktrees_with_derived_memory_keys() {
+        let (dir, state) = app_state().await;
+        let repository = dir.path().join("group-repository");
+        let linked_worktree = dir.path().join("group-worktree");
+        initialize_git_repository(&repository);
+        let linked_arg = linked_worktree.to_string_lossy().into_owned();
+        run_git(
+            &repository,
+            &["worktree", "add", "-q", "-b", "linked-group", &linked_arg],
+        );
+        let expected_keys = [
+            project_key_from_path(&repository),
+            project_key_from_path(&linked_worktree),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let app = test::init_service(project_app!(state)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": "main-session",
+                            "workspace_path": repository
+                        },
+                        {
+                            "session_id": "worktree-session",
+                            "workspace_path": linked_worktree
+                        }
+                    ]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert!(report.assignments.is_empty());
+        assert_eq!(report.suggestions.len(), 1);
+        assert_eq!(
+            report.suggestions[0].basis,
+            LegacyProjectMatchBasis::GitCommonDir
+        );
+        assert_eq!(
+            report.suggestions[0]
+                .session_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            ["main-session".to_string(), "worktree-session".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            report.suggestions[0]
+                .legacy_project_keys
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_keys
+        );
+        assert!(report.unassigned.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_keeps_all_explicit_evidence_authoritative() {
+        let (dir, state) = app_state().await;
+        let workspace = dir.path().join("explicit-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let app = test::init_service(project_app!(state)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": "explicit-a",
+                            "workspace_path": &workspace,
+                            "canonical_path": "/caller/canonical-a",
+                            "git_common_dir": "/caller/shared/.git",
+                            "legacy_project_keys": ["caller-key-a"]
+                        },
+                        {
+                            "session_id": "explicit-b",
+                            "workspace_path": &workspace,
+                            "canonical_path": "/caller/canonical-b",
+                            "git_common_dir": "/caller/shared/.git",
+                            "legacy_project_keys": ["caller-key-b"]
+                        }
+                    ]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert!(report.assignments.is_empty());
+        assert_eq!(report.suggestions.len(), 1);
+        assert_eq!(
+            report.suggestions[0].basis,
+            LegacyProjectMatchBasis::GitCommonDir
+        );
+        assert_eq!(
+            report.suggestions[0].legacy_project_keys,
+            vec!["caller-key-a".to_string(), "caller-key-b".to_string()]
+        );
+        assert!(report.unassigned.is_empty());
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_skips_missing_workspace_enrichment_with_diagnostics() {
+        let (dir, state) = app_state().await;
+        let missing = dir.path().join("missing-workspace");
+        let inputs = vec![LegacySessionProjectInput {
+            session_id: "missing-session".to_string(),
+            workspace_path: Some(missing.to_string_lossy().into_owned()),
+            canonical_path: None,
+            git_common_dir: None,
+            legacy_project_keys: Vec::new(),
+        }];
+        let (enriched, diagnostics) = enrich_legacy_dry_run_sessions(&inputs);
+        assert!(enriched[0].canonical_path.is_none());
+        assert!(enriched[0].git_common_dir.is_none());
+        assert!(enriched[0].legacy_project_keys.is_empty());
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("missing-session")
+                && diagnostic.contains("legacy_project_keys")
+                && diagnostic.contains("could not be canonicalized")
+        }));
+        let app = test::init_service(project_app!(state)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": "missing-session",
+                            "workspace_path": missing
+                        },
+                        {
+                            "session_id": "absent-session"
+                        }
+                    ]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert!(report.assignments.is_empty());
+        assert!(report.suggestions.is_empty());
+        assert_eq!(report.unassigned.len(), 2);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("missing-session")));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("absent-session")));
+    }
+
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn legacy_dry_run_skips_unreadable_workspace_enrichment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = dir.path().join("guarded");
+        let workspace = guarded.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let original_permissions = std::fs::metadata(&guarded).unwrap().permissions();
+        let mut blocked_permissions = original_permissions.clone();
+        blocked_permissions.set_mode(0o000);
+        std::fs::set_permissions(&guarded, blocked_permissions).unwrap();
+
+        if std::fs::read_dir(&workspace).is_ok() {
+            std::fs::set_permissions(&guarded, original_permissions).unwrap();
+            return;
+        }
+        let inputs = vec![LegacySessionProjectInput {
+            session_id: "unreadable-session".to_string(),
+            workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            canonical_path: None,
+            git_common_dir: None,
+            legacy_project_keys: Vec::new(),
+        }];
+        let (enriched, diagnostics) = enrich_legacy_dry_run_sessions(&inputs);
+        std::fs::set_permissions(&guarded, original_permissions).unwrap();
+
+        assert!(enriched[0].canonical_path.is_none());
+        assert!(enriched[0].git_common_dir.is_none());
+        assert!(enriched[0].legacy_project_keys.is_empty());
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("unreadable-session") && diagnostic.contains("could not enrich")
+        }));
     }
 
     #[actix_web::test]

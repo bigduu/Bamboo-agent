@@ -124,10 +124,17 @@ and revisions—never MCP headers, environment values, or credential secrets.
 
 Migration dry-runs match only exact canonical bindings or a safely resolved
 common Git directory. Ambiguous names, missing paths, remote URLs, and path
-hashes remain Unassigned. Memory migration is copy/verify/commit, resumable and
-idempotent; it does not overwrite Project-home documents or delete the legacy
-source. A Project can retain read-only `legacy_project_keys` aliases during the
-migration window. Manifest v1 migration promotes an old binding only when
-exactly one exists. Zero bindings remain `needs_configuration`; multiple
-bindings remain `needs_selection` and are never resolved by vector order or a
-`main` label.
+hashes remain Unassigned. When a dry-run session supplies only `workspace_path`,
+the server reads that existing Workspace to derive its canonical path, Git
+common directory, and the exact legacy memory key used by Bamboo Memory.
+Caller-supplied evidence remains authoritative and is never rewritten. Missing,
+unreadable, or nonexistent Workspaces produce diagnostics and no derived
+evidence instead of failing the request. This enrichment is read-only and never
+updates a session, Project manifest, index, or memory record.
+
+Memory migration is copy/verify/commit, resumable and idempotent; it does not
+overwrite Project-home documents or delete the legacy source. A Project can
+retain read-only `legacy_project_keys` aliases during the migration window.
+Manifest v1 migration promotes an old binding only when exactly one exists.
+Zero bindings remain `needs_configuration`; multiple bindings remain
+`needs_selection` and are never resolved by vector order or a `main` label.
