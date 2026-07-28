@@ -31,6 +31,101 @@ pub enum ProjectWorkspaceValidationError {
     Store(#[from] ProjectStoreError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SessionWorkspaceValidationError {
+    #[error("{message}")]
+    Invalid { workspace: String, message: String },
+    #[error(
+        "workspace '{workspace}' belongs to Project '{owner_project_id}', not session Project '{session_project_id}'"
+    )]
+    Conflict {
+        workspace: String,
+        owner_project_id: ProjectId,
+        session_project_id: String,
+    },
+    #[error("workspace '{workspace}' is not bound to assigned Project '{session_project_id}'")]
+    Unbound {
+        workspace: String,
+        session_project_id: ProjectId,
+    },
+    #[error("assigned Project '{project_id}' is archived")]
+    ProjectArchived { project_id: ProjectId },
+    #[error("assigned Project '{project_id}' is unavailable")]
+    ProjectUnavailable { project_id: ProjectId },
+    #[error("failed to resolve workspace Project ownership: {0}")]
+    Store(#[from] ProjectStoreError),
+}
+
+pub(crate) fn session_workspace_error_response(
+    error: SessionWorkspaceValidationError,
+) -> actix_web::HttpResponse {
+    match error {
+        SessionWorkspaceValidationError::Invalid { workspace, message } => {
+            actix_web::HttpResponse::BadRequest().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "workspace_invalid",
+                    "message": message
+                },
+                "workspace": workspace,
+            }))
+        }
+        SessionWorkspaceValidationError::Conflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        } => actix_web::HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_workspace_conflict",
+                "message": "Workspace belongs to another Project"
+            },
+            "workspace": workspace,
+            "owner_project_id": owner_project_id,
+            "session_project_id": session_project_id,
+        })),
+        SessionWorkspaceValidationError::Unbound {
+            workspace,
+            session_project_id,
+        } => actix_web::HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_workspace_unbound",
+                "message": "Workspace must be bound to the session Project before switching"
+            },
+            "workspace": workspace,
+            "session_project_id": session_project_id,
+        })),
+        SessionWorkspaceValidationError::ProjectArchived { project_id } => {
+            actix_web::HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_archived",
+                    "message": "Archived Projects cannot switch session workspaces"
+                },
+                "project_id": project_id,
+            }))
+        }
+        SessionWorkspaceValidationError::ProjectUnavailable { project_id } => {
+            actix_web::HttpResponse::Conflict().json(serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "project_unavailable",
+                    "message": "Assigned Project is unavailable"
+                },
+                "project_id": project_id,
+            }))
+        }
+        SessionWorkspaceValidationError::Store(error) => {
+            tracing::error!(%error, "failed to validate session workspace Project ownership");
+            crate::error::json_error(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to validate workspace Project ownership",
+            )
+        }
+    }
+}
+
 pub(crate) fn project_context_error_response(
     error: ProjectContextError,
 ) -> actix_web::HttpResponse {
@@ -156,6 +251,105 @@ pub fn validate_workspace_assignment_with_resolver(
         |workspace| workspace_resolver.preview_workspace_path(workspace),
         false,
     )
+}
+
+/// Validate an explicit session Workspace switch.
+///
+/// This is stricter than the generic creation/runtime resolver: an assigned
+/// session may switch only to a path already registered to its active Project.
+/// The API never binds a path as a side effect. Unassigned sessions may switch
+/// to an unregistered path, but still cannot borrow another Project's binding.
+pub(crate) fn validate_explicit_session_workspace_with_resolver(
+    store: &ProjectStore,
+    session_project_id: Option<&ProjectId>,
+    requested_workspace: &str,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<std::path::PathBuf, SessionWorkspaceValidationError> {
+    let requested_workspace = requested_workspace.trim();
+    if requested_workspace.is_empty() {
+        return Err(SessionWorkspaceValidationError::Invalid {
+            workspace: String::new(),
+            message: "Workspace path must be a non-empty existing directory".to_string(),
+        });
+    }
+
+    if let Some(project_id) = session_project_id {
+        match store.get(project_id) {
+            Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => {}
+            Ok(_) => {
+                return Err(SessionWorkspaceValidationError::ProjectArchived {
+                    project_id: project_id.clone(),
+                });
+            }
+            Err(ProjectStoreError::NotFound(_)) => {
+                return Err(SessionWorkspaceValidationError::ProjectUnavailable {
+                    project_id: project_id.clone(),
+                });
+            }
+            Err(error) => return Err(SessionWorkspaceValidationError::Store(error)),
+        }
+    }
+
+    let final_workspace = validate_workspace_assignment_with_resolver(
+        store,
+        session_project_id,
+        Some(requested_workspace),
+        workspace_resolver,
+    )
+    .map_err(|error| match error {
+        ProjectWorkspaceValidationError::Invalid {
+            workspace, message, ..
+        } => SessionWorkspaceValidationError::Invalid { workspace, message },
+        ProjectWorkspaceValidationError::Conflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        } => SessionWorkspaceValidationError::Conflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        },
+        ProjectWorkspaceValidationError::Store(error) => {
+            SessionWorkspaceValidationError::Store(error)
+        }
+    })?
+    .ok_or_else(|| SessionWorkspaceValidationError::Invalid {
+        workspace: requested_workspace.to_string(),
+        message: "Workspace path must be a non-empty existing directory".to_string(),
+    })?;
+
+    let display = bamboo_config::paths::path_to_display_string(&final_workspace);
+    let owner = match store.find_workspace_owner_for_path(&display) {
+        Ok(owner) => owner,
+        Err(ProjectStoreError::Validation(message))
+        | Err(ProjectStoreError::InvalidPathComponent(message)) => {
+            return Err(SessionWorkspaceValidationError::Invalid {
+                workspace: display,
+                message,
+            });
+        }
+        Err(error) => return Err(SessionWorkspaceValidationError::Store(error)),
+    };
+    match (session_project_id, owner) {
+        (Some(session_project_id), Some(owner)) if owner.id == *session_project_id => {
+            Ok(final_workspace)
+        }
+        (Some(session_project_id), Some(owner)) => Err(SessionWorkspaceValidationError::Conflict {
+            workspace: display,
+            owner_project_id: owner.id,
+            session_project_id: session_project_id.to_string(),
+        }),
+        (Some(session_project_id), None) => Err(SessionWorkspaceValidationError::Unbound {
+            workspace: display,
+            session_project_id: session_project_id.clone(),
+        }),
+        (None, Some(owner)) => Err(SessionWorkspaceValidationError::Conflict {
+            workspace: display,
+            owner_project_id: owner.id,
+            session_project_id: "unassigned".to_string(),
+        }),
+        (None, None) => Ok(final_workspace),
+    }
 }
 
 /// Validate a proposed authoritative Project path with the same

@@ -677,13 +677,20 @@ pub enum AgentEvent {
     /// A Project was archived. Sessions and resources are deliberately retained.
     ProjectArchived { project_id: String, revision: u64 },
 
-    /// A session was explicitly reassigned to another Project (or unassigned).
+    /// A session's stable Project membership and/or mutable Workspace changed.
+    ///
+    /// The historical variant name is retained for wire compatibility. Clients
+    /// should use `metadata_version` to order refreshes and consume both fields.
     SessionProjectUpdated {
         session_id: String,
         /// Explicit `null` means Unassigned. Keep the field present so account
         /// feed replay consumers can recover session grouping without a fetch.
         #[serde(default)]
         project_id: Option<String>,
+        /// Explicit `null` means the session has no persisted Workspace.
+        /// `default` keeps older journal entries deserializable.
+        #[serde(default)]
+        workspace_path: Option<String>,
         metadata_version: u64,
     },
 
@@ -985,6 +992,7 @@ mod tests {
         let event = AgentEvent::SessionProjectUpdated {
             session_id: "session-1".to_string(),
             project_id: None,
+            workspace_path: Some("/workspaces/current".to_string()),
             metadata_version: 4,
         };
 
@@ -996,6 +1004,7 @@ mod tests {
                 .is_some_and(serde_json::Value::is_null),
             "unassignment must carry an explicit project_id: null"
         );
+        assert_eq!(value["workspace_path"], "/workspaces/current");
 
         let restored: AgentEvent = serde_json::from_value(value).expect("event should deserialize");
         assert!(matches!(
@@ -1003,8 +1012,29 @@ mod tests {
             AgentEvent::SessionProjectUpdated {
                 session_id,
                 project_id: None,
+                workspace_path: Some(workspace_path),
                 metadata_version: 4,
-            } if session_id == "session-1"
+            } if session_id == "session-1" && workspace_path == "/workspaces/current"
+        ));
+    }
+
+    #[test]
+    fn session_project_updated_deserializes_legacy_event_without_workspace() {
+        let restored: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "session_project_updated",
+            "session_id": "session-1",
+            "project_id": "project-1",
+            "metadata_version": 2
+        }))
+        .expect("legacy event should deserialize");
+
+        assert!(matches!(
+            restored,
+            AgentEvent::SessionProjectUpdated {
+                workspace_path: None,
+                metadata_version: 2,
+                ..
+            }
         ));
     }
 

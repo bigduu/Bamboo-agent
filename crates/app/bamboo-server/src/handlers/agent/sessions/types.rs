@@ -303,6 +303,12 @@ pub struct PatchSessionRequest {
     /// JSON null = unassign. Empty strings are rejected.
     #[serde(default, deserialize_with = "deserialize_project_reassignment")]
     pub project_id: Option<Option<String>>,
+    /// Immediately switch the session's persisted execution workspace.
+    ///
+    /// Assigned sessions may select only an existing path already bound to
+    /// their Project. This never changes `project_id` and requires `If-Match`.
+    #[serde(default)]
+    pub workspace_path: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -393,6 +399,7 @@ mod tests {
 
         assert_eq!(req.title, Some("New Title".to_string()));
         assert!(req.pinned.is_none());
+        assert!(req.workspace_path.is_none());
         assert!(req.model.is_none());
         assert!(req.reasoning_effort.is_none());
         assert!(req.clear_reasoning_effort.is_none());
@@ -406,8 +413,18 @@ mod tests {
 
         assert_eq!(req.title, Some("New Title".to_string()));
         assert_eq!(req.pinned, Some(true));
+        assert!(req.workspace_path.is_none());
         assert_eq!(req.model, Some("gpt-5".to_string()));
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn test_patch_session_request_workspace_path() {
+        let req: PatchSessionRequest =
+            serde_json::from_str(r#"{"workspace_path":"/workspaces/zenith"}"#).unwrap();
+
+        assert_eq!(req.workspace_path.as_deref(), Some("/workspaces/zenith"));
+        assert!(req.project_id.is_none());
     }
 
     #[test]
@@ -417,6 +434,7 @@ mod tests {
 
         assert!(req.title.is_none());
         assert!(req.pinned.is_none());
+        assert!(req.workspace_path.is_none());
         assert!(req.model.is_none());
         assert!(req.reasoning_effort.is_none());
         assert!(req.clear_reasoning_effort.is_none());
