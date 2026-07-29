@@ -409,6 +409,22 @@ pub fn openai_compat_chat_stream_from_sse<H>(response: Response, mut handler: H)
 where
     H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
 {
+    let sentinel_seen = Arc::new(AtomicBool::new(false));
+    let sentinel_seen_by_handler = Arc::clone(&sentinel_seen);
+    let upstream = llm_stream_from_sse_multi(response, move |event, data| {
+        if data.trim() == "[DONE]" {
+            sentinel_seen_by_handler.store(true, Ordering::Release);
+        }
+        handler(event, data)
+    });
+
+    coordinate_openai_compat_chat_terminal(upstream, sentinel_seen)
+}
+
+fn coordinate_openai_compat_chat_terminal(
+    upstream: LLMStream,
+    sentinel_seen: Arc<AtomicBool>,
+) -> LLMStream {
     struct TerminalState {
         upstream: LLMStream,
         sentinel_seen: Arc<AtomicBool>,
@@ -416,15 +432,8 @@ where
         finished: bool,
     }
 
-    let sentinel_seen = Arc::new(AtomicBool::new(false));
-    let sentinel_seen_by_handler = Arc::clone(&sentinel_seen);
     let state = TerminalState {
-        upstream: llm_stream_from_sse_multi(response, move |event, data| {
-            if data.trim() == "[DONE]" {
-                sentinel_seen_by_handler.store(true, Ordering::Release);
-            }
-            handler(event, data)
-        }),
+        upstream,
         sentinel_seen,
         pending_finish: false,
         finished: false,
@@ -443,6 +452,7 @@ where
                         return Some((Ok(LLMChunk::Done), state));
                     }
                     state.pending_finish = true;
+                    cooperative_yield_once().await;
                 }
                 Some(Ok(chunk)) => return Some((Ok(chunk), state)),
                 Some(Err(error)) => {
@@ -459,6 +469,24 @@ where
     }))
 }
 
+async fn cooperative_yield_once() {
+    // Suppressed finish markers are intentionally invisible to consumers, but
+    // an always-ready upstream can otherwise keep this `unfold` future inside
+    // one poll forever. Force exactly one self-waking Pending boundary so
+    // cancellation, timeouts, and sibling tasks remain observable.
+    let mut yielded = false;
+    futures::future::poll_fn(move |context| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::provider::Result;
@@ -466,7 +494,7 @@ mod tests {
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
-    use futures::StreamExt;
+    use futures::{Future, StreamExt};
 
     type MultiParser = fn(&str) -> Result<Vec<LLMChunk>>;
 
@@ -1419,6 +1447,73 @@ mod tests {
             assert_eq!(chunks.len(), 1);
             assert!(matches!(chunks[0], LLMChunk::Done));
         }
+    }
+
+    #[test]
+    fn always_ready_duplicate_finish_source_has_bounded_poll_work() {
+        let upstream_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_in_stream = std::sync::Arc::clone(&upstream_polls);
+        let upstream: crate::provider::LLMStream =
+            Box::pin(futures::stream::poll_fn(move |_context| {
+                polls_in_stream.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::task::Poll::Ready(Some(Ok(LLMChunk::Done)))
+            }));
+        let sentinel_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut stream = super::coordinate_openai_compat_chat_terminal(upstream, sentinel_seen);
+        let mut next = Box::pin(stream.next());
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+
+        assert!(matches!(
+            next.as_mut().poll(&mut context),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            upstream_polls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one downstream poll must not spin through duplicate finish markers"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn infinite_duplicate_finish_source_is_cooperative_and_cancellable() {
+        let upstream_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_in_stream = std::sync::Arc::clone(&upstream_polls);
+        let upstream: crate::provider::LLMStream =
+            Box::pin(futures::stream::poll_fn(move |_context| {
+                polls_in_stream.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::task::Poll::Ready(Some(Ok(LLMChunk::Done)))
+            }));
+        let sentinel_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut stream = super::coordinate_openai_compat_chat_terminal(upstream, sentinel_seen);
+
+        let reader = tokio::spawn(async move { stream.next().await });
+        let sibling_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling_flag = std::sync::Arc::clone(&sibling_ran);
+        let sibling = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            sibling_flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        sibling.await.expect("sibling task");
+        assert!(sibling_ran.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            upstream_polls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the infinite reader must have started before cancellation"
+        );
+        assert!(
+            !reader.is_finished(),
+            "duplicate finish markers must stay deferred"
+        );
+
+        reader.abort();
+        assert!(
+            reader
+                .await
+                .expect_err("reader must be aborted")
+                .is_cancelled(),
+            "a cooperative read must remain cancellable"
+        );
     }
 
     #[tokio::test]
