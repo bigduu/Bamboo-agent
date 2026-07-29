@@ -43,6 +43,24 @@ pub enum LLMChunk {
         /// does not report it on this event.
         input_tokens: u64,
     },
+    /// Authoritative token-usage snapshot reported by one provider event.
+    ///
+    /// Every field is optional so parsers preserve the distinction between a
+    /// provider reporting `0` and omitting a field entirely. Cache counts are
+    /// carried alongside the input/output totals because OpenAI-compatible
+    /// terminal events report all of them in one object and the single-chunk
+    /// Chat Completions parser must not discard either half.
+    ///
+    /// `reasoning_tokens` is a subset of `output_tokens` for OpenAI Responses
+    /// and reasoning Chat Completions. Consumers must not add it to the output
+    /// total.
+    ProviderUsage {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        cache_creation_input_tokens: Option<u64>,
+        cache_read_input_tokens: Option<u64>,
+    },
     /// Token usage summary at the end of an Anthropic response.
     UsageSummary {
         output_tokens: u64,
@@ -64,6 +82,7 @@ impl LLMChunk {
             | Self::ResponseId(_)
             | Self::ReasoningSignature(_)
             | Self::CacheUsage { .. }
+            | Self::ProviderUsage { .. }
             | Self::UsageSummary { .. }
             | Self::Done => false,
         }

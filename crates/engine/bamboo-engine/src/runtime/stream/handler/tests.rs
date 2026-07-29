@@ -145,6 +145,42 @@ async fn consume_llm_stream_silent_does_not_emit_events() {
 }
 
 #[tokio::test]
+async fn consume_llm_stream_records_provider_usage_snapshots_without_double_counting() {
+    let usage = LLMChunk::ProviderUsage {
+        input_tokens: Some(101),
+        output_tokens: Some(37),
+        reasoning_tokens: Some(11),
+        cache_creation_input_tokens: Some(0),
+        cache_read_input_tokens: Some(29),
+    };
+    let stream = build_stream(vec![
+        Ok(usage.clone()),
+        // Repeated cumulative snapshots are idempotent, not additive.
+        Ok(usage),
+        // Omitted fields must not invent or erase authoritative totals.
+        Ok(LLMChunk::ProviderUsage {
+            input_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        }),
+        Ok(LLMChunk::Done),
+    ]);
+
+    let output =
+        consume_llm_stream_silent(stream, &CancellationToken::new(), "session-provider-usage")
+            .await
+            .expect("stream should succeed");
+
+    assert_eq!(output.input_tokens, 101);
+    assert_eq!(output.output_tokens, 37);
+    assert_eq!(output.thinking_tokens, 11);
+    assert_eq!(output.cache_creation_input_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 29);
+}
+
+#[tokio::test]
 async fn consume_llm_stream_returns_single_prefix_stream_error_message() {
     let stream = build_stream(vec![Err(LLMError::Stream(
         "Transport error: error decoding response body".to_string(),

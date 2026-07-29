@@ -116,6 +116,32 @@ pub(super) async fn handle_chunk_result(
             );
             Ok(())
         }
+        Ok(LLMChunk::ProviderUsage {
+            input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        }) => {
+            tracing::debug!(
+                "[{}] Provider usage: input={:?}, output={:?}, reasoning={:?}, \
+                 cache_creation={:?}, cache_read={:?}",
+                session_id,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens
+            );
+            state.record_provider_usage(
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            );
+            Ok(())
+        }
         Ok(LLMChunk::UsageSummary {
             output_tokens,
             thinking_tokens,

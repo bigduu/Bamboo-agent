@@ -95,6 +95,38 @@ impl StreamAccumulationState {
         self.input_tokens = self.input_tokens.max(input);
     }
 
+    /// Record an authoritative provider usage snapshot.
+    ///
+    /// Snapshot values replace previously observed values rather than being
+    /// summed. OpenAI-compatible terminal usage objects are cumulative for the
+    /// request, so addition would double-count if an upstream repeats a final
+    /// frame. Omitted fields leave existing state untouched; an explicit zero
+    /// remains authoritative.
+    pub(super) fn record_provider_usage(
+        &mut self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        cache_creation_input_tokens: Option<u64>,
+        cache_read_input_tokens: Option<u64>,
+    ) {
+        if let Some(input_tokens) = input_tokens {
+            self.input_tokens = input_tokens;
+        }
+        if let Some(output_tokens) = output_tokens {
+            self.output_tokens = output_tokens;
+        }
+        if let Some(reasoning_tokens) = reasoning_tokens {
+            self.thinking_tokens = reasoning_tokens;
+        }
+        if let Some(cache_creation_input_tokens) = cache_creation_input_tokens {
+            self.cache_creation_input_tokens = cache_creation_input_tokens;
+        }
+        if let Some(cache_read_input_tokens) = cache_read_input_tokens {
+            self.cache_read_input_tokens = cache_read_input_tokens;
+        }
+    }
+
     pub(super) fn into_output(self) -> StreamHandlingOutput {
         StreamHandlingOutput {
             response_id: self.response_id,
