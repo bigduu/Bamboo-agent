@@ -76,6 +76,10 @@ pub struct StreamHandlingOutput {
     pub thinking_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Provider-reported total input when a [`bamboo_llm::LLMChunk::ProviderUsage`]
+    /// snapshot is available. Legacy cache-only chunks retain their historical
+    /// fresh-input semantics; callers can distinguish cached input through the
+    /// adjacent cache counters.
     pub input_tokens: u64,
 }
 

@@ -9,6 +9,8 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::{AgentError, AgentEvent};
 use bamboo_config::StreamTimeoutConfig;
 use bamboo_llm::provider::LLMError;
+use bamboo_llm::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
+use bamboo_llm::providers::common::openai_responses::ResponsesSseParser;
 use bamboo_llm::{LLMChunk, LLMStream};
 
 use super::consume::consume_llm_stream_internal;
@@ -178,6 +180,79 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
     assert_eq!(output.thinking_tokens, 11);
     assert_eq!(output.cache_creation_input_tokens, 0);
     assert_eq!(output.cache_read_input_tokens, 29);
+}
+
+#[tokio::test]
+async fn openai_chat_usage_parser_reaches_stream_output_once() {
+    let usage = parse_openai_compat_sse_data_strict(
+        r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":120,"prompt_tokens_details":{"cached_tokens":768},"completion_tokens_details":{"reasoning_tokens":20}}}"#,
+    )
+    .expect("chat usage chunk");
+    assert!(matches!(usage, LLMChunk::ProviderUsage { .. }));
+
+    let stream = build_stream(vec![Ok(usage), Ok(LLMChunk::Done)]);
+    let output = consume_llm_stream_silent(
+        stream,
+        &CancellationToken::new(),
+        "session-openai-chat-usage",
+    )
+    .await
+    .expect("stream should succeed");
+
+    assert_eq!(output.input_tokens, 1000);
+    assert_eq!(output.output_tokens, 120);
+    assert_eq!(output.thinking_tokens, 20);
+    assert_eq!(output.cache_creation_input_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 768);
+    assert_eq!(
+        output.input_tokens - output.cache_read_input_tokens,
+        232,
+        "fresh input remains derivable from the authoritative total"
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_completed_usage_reaches_stream_output_once() {
+    let mut parser = ResponsesSseParser::new();
+    let chunks = parser
+        .handle_event_multi(
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_usage","output":[{"id":"msg_usage","type":"message","content":[{"type":"output_text","text":"answer"}]}],"usage":{"input_tokens":55,"output_tokens":21,"input_tokens_details":{"cached_tokens":13},"output_tokens_details":{"reasoning_tokens":8}}}}"#,
+        )
+        .expect("responses completed event");
+
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. }))
+            .count(),
+        1
+    );
+    assert!(chunks
+        .iter()
+        .all(|chunk| !matches!(chunk, LLMChunk::CacheUsage { .. })));
+
+    let stream = build_stream(chunks.into_iter().map(Ok).collect());
+    let output = consume_llm_stream_silent(
+        stream,
+        &CancellationToken::new(),
+        "session-openai-responses-usage",
+    )
+    .await
+    .expect("stream should succeed");
+
+    assert_eq!(output.response_id.as_deref(), Some("resp_usage"));
+    assert_eq!(output.content, "answer");
+    assert_eq!(output.input_tokens, 55);
+    assert_eq!(output.output_tokens, 21);
+    assert_eq!(output.thinking_tokens, 8);
+    assert_eq!(output.cache_creation_input_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 13);
+    assert_eq!(
+        output.input_tokens - output.cache_read_input_tokens,
+        42,
+        "fresh input remains derivable without emitting a second cache chunk"
+    );
 }
 
 #[tokio::test]

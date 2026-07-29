@@ -16,9 +16,10 @@
 //!    `cache_read_input_tokens`; OpenAI-compatible APIs report
 //!    `prompt_tokens_details.cached_tokens` (or `input_tokens_details.cached_tokens`
 //!    on the Responses API); Gemini reports `cachedContentTokenCount`. The
-//!    `cache_usage_from_*` helpers normalize these into [`LLMChunk::CacheUsage`]
-//!    so the same downstream accounting (and the frontend cache badge) works for
-//!    every provider.
+//!    OpenAI terminal usage is normalized into a combined
+//!    [`LLMChunk::ProviderUsage`] snapshot, while the remaining
+//!    `cache_usage_from_*` helpers use [`LLMChunk::CacheUsage`]. Both feed the
+//!    same downstream cache fields (and frontend cache badge).
 //!
 //! [`PromptCachePlan`] is the provider-agnostic description of (1): the engine
 //! builds it once from the prompt envelope and each provider renders it in its
@@ -93,12 +94,15 @@ impl PromptCachePlan {
     }
 }
 
-/// Normalize an OpenAI-style `usage` object into a [`LLMChunk::CacheUsage`], if
-/// it reports cached prompt tokens.
+/// Normalize an OpenAI-style `usage` object into a cache-only chunk, if it
+/// reports cached prompt tokens.
 ///
 /// OpenAI exposes cached input tokens under `prompt_tokens_details.cached_tokens`
 /// (Chat Completions) or `input_tokens_details.cached_tokens` (Responses API).
 /// Returns `None` when no cache hit is reported, so callers can skip emitting.
+///
+/// Streaming parsers use [`provider_usage_from_openai_usage`] instead so input,
+/// output, reasoning, and cache fields from one terminal event remain atomic.
 pub fn cache_usage_from_openai_usage(usage: &Value) -> Option<LLMChunk> {
     let cached = usage
         .get("prompt_tokens_details")

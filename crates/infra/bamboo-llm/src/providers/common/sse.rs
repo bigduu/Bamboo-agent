@@ -212,7 +212,7 @@ mod tests {
                 .body(
                     concat!(
                         "event: response.completed\n",
-                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"output\":[{\"id\":\"msg_terminal\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal answer\"}]}],\"usage\":{\"input_tokens\":21,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"output\":[{\"id\":\"msg_terminal\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal answer\"}]}],\"usage\":{\"input_tokens\":21,\"output_tokens\":13,\"input_tokens_details\":{\"cached_tokens\":8},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n",
                         "\n",
                     )
                     .to_string(),
@@ -234,10 +234,12 @@ mod tests {
         assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
         assert!(matches!(
             chunks[2],
-            LLMChunk::CacheUsage {
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 8,
-                input_tokens: 13,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(21),
+                output_tokens: Some(13),
+                reasoning_tokens: Some(5),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(8),
             }
         ));
         assert!(matches!(chunks[3], LLMChunk::Done));
