@@ -612,16 +612,35 @@ impl ResponsesSseParser {
     }
 
     fn function_call_item_key(
+        &self,
         item: &Value,
         item_key_hint: Option<&str>,
         output_index: Option<i64>,
     ) -> Option<String> {
-        item.get("id")
+        let inner_id = item
+            .get("id")
             .and_then(Value::as_str)
-            .or_else(|| item.get("call_id").and_then(Value::as_str))
+            .filter(|id| !id.is_empty());
+        let item_key_hint = item_key_hint.filter(|id| !id.is_empty());
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+
+        // Incremental output_item.done snapshots can be sparse. Prefer whichever
+        // identity already owns the added/delta accumulator before choosing a new
+        // key; otherwise a nested call_id can steal precedence from the outer
+        // item_id that holds the accumulated name and arguments.
+        for candidate in [inner_id, item_key_hint, call_id].into_iter().flatten() {
+            if self.fn_calls.contains_key(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+
+        inner_id
             .or(item_key_hint)
+            .or(call_id)
             .map(str::to_string)
-            .filter(|id| !id.is_empty())
             .or_else(|| output_index.map(|index| format!("output:{index}")))
     }
 
@@ -652,7 +671,7 @@ impl ResponsesSseParser {
         item_key_hint: Option<&str>,
         output_index: Option<i64>,
     ) -> Option<LLMChunk> {
-        let item_key = Self::function_call_item_key(item, item_key_hint, output_index)?;
+        let item_key = self.function_call_item_key(item, item_key_hint, output_index)?;
         let call_id = item
             .get("call_id")
             .or_else(|| item.get("id"))
@@ -1327,14 +1346,17 @@ impl ResponsesSseParser {
                     .and_then(|value| value.as_str())
                     .or_else(|| v.get("delta").and_then(|value| value.as_str()))
                     .unwrap_or("");
-                if let Some(output_index) = Self::text_output_index(&v) {
-                    self.streamed_text_output_indexes.insert(output_index);
+                let output_index = Self::text_output_index(&v);
+                let out = if let Some(stream_key) = Self::text_stream_key(&v) {
+                    self.emit_text_done_with_key(stream_key.as_str(), text)
+                } else {
+                    let item_id = Self::text_item_id(&v);
+                    self.emit_done_text(item_id.as_deref(), text)
+                };
+                if out.is_some() {
+                    self.streamed_text_output_indexes.extend(output_index);
                 }
-                if let Some(stream_key) = Self::text_stream_key(&v) {
-                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text));
-                }
-                let item_id = Self::text_item_id(&v);
-                Ok(self.emit_done_text(item_id.as_deref(), text))
+                Ok(out)
             }
 
             "response.content_part.added" => {
@@ -1360,14 +1382,17 @@ impl ResponsesSseParser {
 
             "response.content_part.done" => {
                 let text = Self::content_part_output_text(&v, false);
-                if let Some(output_index) = Self::text_output_index(&v) {
-                    self.streamed_text_output_indexes.insert(output_index);
+                let output_index = Self::text_output_index(&v);
+                let out = if let Some(stream_key) = Self::text_stream_key(&v) {
+                    self.emit_text_done_with_key(stream_key.as_str(), text.as_str())
+                } else {
+                    let item_id = Self::text_item_id(&v);
+                    self.emit_done_text(item_id.as_deref(), text.as_str())
+                };
+                if out.is_some() {
+                    self.streamed_text_output_indexes.extend(output_index);
                 }
-                if let Some(stream_key) = Self::text_stream_key(&v) {
-                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text.as_str()));
-                }
-                let item_id = Self::text_item_id(&v);
-                Ok(self.emit_done_text(item_id.as_deref(), text.as_str()))
+                Ok(out)
             }
 
             "response.output_item.added" => {
