@@ -436,7 +436,7 @@ struct AccFnCall {
 /// - `response.content_part.added/done` (output_text parts) -> `LLMChunk::Token(...)`
 /// - `response.output_item.added/done` message output_text -> `LLMChunk::Token(...)`
 /// - `response.output_item.*` + `response.function_call_arguments.delta` -> `LLMChunk::ToolCalls`
-/// - `response.completed` -> `LLMChunk::Done`
+/// - `response.completed` -> terminal output fallbacks, cache usage, then `LLMChunk::Done`
 pub struct ResponsesSseParser {
     // item_id -> accumulated function call
     fn_calls: HashMap<String, AccFnCall>,
@@ -611,10 +611,15 @@ impl ResponsesSseParser {
         })
     }
 
-    fn function_call_item_key(item: &Value, output_index: Option<i64>) -> Option<String> {
+    fn function_call_item_key(
+        item: &Value,
+        item_key_hint: Option<&str>,
+        output_index: Option<i64>,
+    ) -> Option<String> {
         item.get("id")
             .and_then(Value::as_str)
             .or_else(|| item.get("call_id").and_then(Value::as_str))
+            .or(item_key_hint)
             .map(str::to_string)
             .filter(|id| !id.is_empty())
             .or_else(|| output_index.map(|index| format!("output:{index}")))
@@ -644,9 +649,10 @@ impl ResponsesSseParser {
     fn emit_function_call_item(
         &mut self,
         item: &Value,
+        item_key_hint: Option<&str>,
         output_index: Option<i64>,
     ) -> Option<LLMChunk> {
-        let item_key = Self::function_call_item_key(item, output_index)?;
+        let item_key = Self::function_call_item_key(item, item_key_hint, output_index)?;
         let call_id = item
             .get("call_id")
             .or_else(|| item.get("id"))
@@ -691,7 +697,9 @@ impl ResponsesSseParser {
 
         let mut chunks = Vec::new();
         for (output_index, item) in output.iter().enumerate() {
-            let output_index = output_index as i64;
+            let Ok(output_index) = i64::try_from(output_index) else {
+                continue;
+            };
             match item.get("type").and_then(Value::as_str).unwrap_or("") {
                 "message" => {
                     if let Some(chunk) = self.emit_completed_message_item(item, output_index) {
@@ -699,7 +707,9 @@ impl ResponsesSseParser {
                     }
                 }
                 "function_call" => {
-                    if let Some(chunk) = self.emit_function_call_item(item, Some(output_index)) {
+                    if let Some(chunk) =
+                        self.emit_function_call_item(item, None, Some(output_index))
+                    {
                         chunks.push(chunk);
                     }
                 }
@@ -1453,7 +1463,11 @@ impl ResponsesSseParser {
                         return Ok(out);
                     }
                     if item_type == "function_call" {
-                        return Ok(self.emit_function_call_item(item, output_index));
+                        return Ok(self.emit_function_call_item(
+                            item,
+                            (!item_id.is_empty()).then_some(item_id.as_str()),
+                            output_index,
+                        ));
                     }
                 }
 
