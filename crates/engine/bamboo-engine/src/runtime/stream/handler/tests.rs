@@ -9,10 +9,14 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::{AgentError, AgentEvent};
 use bamboo_config::StreamTimeoutConfig;
 use bamboo_llm::provider::LLMError;
+use bamboo_llm::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
+use bamboo_llm::providers::common::openai_responses::ResponsesSseParser;
 use bamboo_llm::{LLMChunk, LLMStream};
 
 use super::consume::consume_llm_stream_internal;
-use super::{consume_llm_stream, consume_llm_stream_silent, StreamTimeoutContext};
+use super::{
+    consume_llm_stream, consume_llm_stream_silent, ProviderUsageSnapshot, StreamTimeoutContext,
+};
 
 fn build_stream(items: Vec<bamboo_llm::provider::Result<LLMChunk>>) -> LLMStream {
     Box::pin(stream::iter(items))
@@ -142,6 +146,395 @@ async fn consume_llm_stream_silent_does_not_emit_events() {
     assert!(output.reasoning_content.is_empty());
     assert_eq!(output.token_count, 5);
     assert!(output.tool_calls.is_empty());
+}
+
+#[tokio::test]
+async fn consume_llm_stream_records_provider_usage_snapshots_without_double_counting() {
+    let usage = LLMChunk::ProviderUsage {
+        input_tokens: Some(101),
+        output_tokens: Some(37),
+        reasoning_tokens: Some(11),
+        cache_creation_input_tokens: Some(0),
+        cache_read_input_tokens: Some(29),
+    };
+    let stream = build_stream(vec![
+        Ok(usage.clone()),
+        // Repeated cumulative snapshots are idempotent, not additive.
+        Ok(usage),
+        // Omitted fields must not invent or erase authoritative totals.
+        Ok(LLMChunk::ProviderUsage {
+            input_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        }),
+        Ok(LLMChunk::Done),
+    ]);
+
+    let output =
+        consume_llm_stream_silent(stream, &CancellationToken::new(), "session-provider-usage")
+            .await
+            .expect("stream should succeed");
+
+    assert_eq!(output.input_tokens, 72);
+    assert_eq!(output.output_tokens, 37);
+    assert_eq!(output.thinking_tokens, 11);
+    assert_eq!(output.cache_creation_input_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 29);
+    assert_eq!(
+        output.provider_usage,
+        Some(ProviderUsageSnapshot {
+            input_tokens: Some(101),
+            output_tokens: Some(37),
+            reasoning_tokens: Some(11),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(29),
+        })
+    );
+}
+
+#[tokio::test]
+async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field() {
+    let omitted = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: None,
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-usage-omitted",
+    )
+    .await
+    .expect("omitted snapshot");
+    assert_eq!(
+        omitted.provider_usage,
+        Some(ProviderUsageSnapshot::default())
+    );
+
+    let explicit_zero = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(9),
+                output_tokens: Some(9),
+                reasoning_tokens: Some(9),
+                cache_creation_input_tokens: Some(9),
+                cache_read_input_tokens: Some(9),
+            }),
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                reasoning_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                cache_read_input_tokens: Some(0),
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-usage-zero",
+    )
+    .await
+    .expect("zero snapshot");
+    assert_eq!(
+        explicit_zero.provider_usage,
+        Some(ProviderUsageSnapshot {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            reasoning_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+        })
+    );
+}
+
+#[tokio::test]
+async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() {
+    let cases = [
+        (Some(120), Some(20), 120, 20),
+        (Some(0), Some(0), 0, 0),
+        (None, Some(20), 56, 20),
+        (Some(120), None, 120, 78),
+    ];
+
+    for (case_index, (provider_output, provider_reasoning, expected_output, expected_reasoning)) in
+        cases.into_iter().enumerate()
+    {
+        for provider_first in [true, false] {
+            let provider = LLMChunk::ProviderUsage {
+                input_tokens: None,
+                output_tokens: provider_output,
+                reasoning_tokens: provider_reasoning,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            };
+            let legacy = LLMChunk::UsageSummary {
+                output_tokens: 56,
+                thinking_tokens: 78,
+            };
+            let chunks = if provider_first {
+                vec![provider, legacy, LLMChunk::Done]
+            } else {
+                vec![legacy, provider, LLMChunk::Done]
+            };
+            let output = consume_llm_stream_silent(
+                build_stream(chunks.into_iter().map(Ok).collect()),
+                &CancellationToken::new(),
+                &format!("session-provider-output-{case_index}-{provider_first}"),
+            )
+            .await
+            .expect("mixed provider and legacy usage");
+
+            assert_eq!(output.output_tokens, expected_output);
+            assert_eq!(output.thinking_tokens, expected_reasoning);
+            assert_eq!(
+                output.provider_usage,
+                Some(ProviderUsageSnapshot {
+                    input_tokens: None,
+                    output_tokens: provider_output,
+                    reasoning_tokens: provider_reasoning,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                })
+            );
+
+            let log_record = crate::token_usage_log::TokenUsageRecord::new(
+                "2026-07-29T00:00:00Z".to_string(),
+                "session-provider-output",
+                "test-model",
+                "openai",
+                1,
+                None,
+                output.cache_creation_input_tokens,
+                output.cache_read_input_tokens,
+                output.input_tokens,
+                output.output_tokens,
+                output.thinking_tokens,
+            );
+            assert_eq!(log_record.output_tokens, expected_output);
+            assert_eq!(log_record.thinking_tokens, expected_reasoning);
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_cache_reconciles_without_input_total_in_both_orders() {
+    let cases = [
+        (None, Some(50), 11, 50),
+        (Some(0), Some(0), 0, 0),
+        (Some(7), None, 7, 50),
+    ];
+
+    for (case_index, (provider_creation, provider_read, expected_creation, expected_read)) in
+        cases.into_iter().enumerate()
+    {
+        for provider_first in [true, false] {
+            let provider = LLMChunk::ProviderUsage {
+                input_tokens: None,
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: provider_creation,
+                cache_read_input_tokens: provider_read,
+            };
+            let legacy = LLMChunk::CacheUsage {
+                cache_creation_input_tokens: 11,
+                cache_read_input_tokens: 50,
+                input_tokens: 80,
+            };
+            let chunks = if provider_first {
+                vec![provider, legacy, LLMChunk::Done]
+            } else {
+                vec![legacy, provider, LLMChunk::Done]
+            };
+            let output = consume_llm_stream_silent(
+                build_stream(chunks.into_iter().map(Ok).collect()),
+                &CancellationToken::new(),
+                &format!("session-provider-cache-{case_index}-{provider_first}"),
+            )
+            .await
+            .expect("mixed provider and legacy cache usage");
+
+            assert_eq!(output.input_tokens, 80);
+            assert_eq!(
+                output.cache_creation_input_tokens, expected_creation,
+                "provider creation availability must be order-independent"
+            );
+            assert_eq!(
+                output.cache_read_input_tokens, expected_read,
+                "provider read availability must be order-independent"
+            );
+            assert_eq!(
+                output.provider_usage,
+                Some(ProviderUsageSnapshot {
+                    input_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                    cache_creation_input_tokens: provider_creation,
+                    cache_read_input_tokens: provider_read,
+                })
+            );
+
+            let log_record = crate::token_usage_log::TokenUsageRecord::new(
+                "2026-07-29T00:00:00Z".to_string(),
+                "session-provider-cache",
+                "test-model",
+                "openai",
+                1,
+                None,
+                output.cache_creation_input_tokens,
+                output.cache_read_input_tokens,
+                output.input_tokens,
+                output.output_tokens,
+                output.thinking_tokens,
+            );
+            assert_eq!(log_record.cache_creation_input_tokens, expected_creation);
+            assert_eq!(log_record.cache_read_input_tokens, expected_read);
+        }
+    }
+}
+
+#[tokio::test]
+async fn openai_chat_usage_parser_reaches_stream_output_once() {
+    let usage = parse_openai_compat_sse_data_strict(
+        r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":120,"prompt_tokens_details":{"cached_tokens":768},"completion_tokens_details":{"reasoning_tokens":20}}}"#,
+    )
+    .expect("chat usage chunk");
+    assert!(matches!(usage, LLMChunk::ProviderUsage { .. }));
+
+    let stream = build_stream(vec![Ok(usage), Ok(LLMChunk::Done)]);
+    let output = consume_llm_stream_silent(
+        stream,
+        &CancellationToken::new(),
+        "session-openai-chat-usage",
+    )
+    .await
+    .expect("stream should succeed");
+
+    assert_eq!(output.input_tokens, 232);
+    assert_eq!(output.output_tokens, 120);
+    assert_eq!(output.thinking_tokens, 20);
+    assert_eq!(output.cache_creation_input_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 768);
+    assert_eq!(
+        output.provider_usage.and_then(|usage| usage.input_tokens),
+        Some(1000)
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_completed_usage_reaches_stream_output_once() {
+    let mut parser = ResponsesSseParser::new();
+    let chunks = parser
+        .handle_event_multi(
+            "response.completed",
+            r#"{"type":"response.completed","response":{"id":"resp_usage","output":[{"id":"msg_usage","type":"message","content":[{"type":"output_text","text":"answer"}]}],"usage":{"input_tokens":55,"output_tokens":21,"input_tokens_details":{"cached_tokens":13},"output_tokens_details":{"reasoning_tokens":8}}}}"#,
+        )
+        .expect("responses completed event");
+
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. }))
+            .count(),
+        1
+    );
+    assert!(chunks
+        .iter()
+        .all(|chunk| !matches!(chunk, LLMChunk::CacheUsage { .. })));
+
+    let stream = build_stream(chunks.into_iter().map(Ok).collect());
+    let output = consume_llm_stream_silent(
+        stream,
+        &CancellationToken::new(),
+        "session-openai-responses-usage",
+    )
+    .await
+    .expect("stream should succeed");
+
+    assert_eq!(output.response_id.as_deref(), Some("resp_usage"));
+    assert_eq!(output.content, "answer");
+    assert_eq!(output.input_tokens, 42);
+    assert_eq!(output.output_tokens, 21);
+    assert_eq!(output.thinking_tokens, 8);
+    assert_eq!(output.cache_creation_input_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 13);
+    assert_eq!(
+        output.provider_usage.and_then(|usage| usage.input_tokens),
+        Some(55)
+    );
+}
+
+#[tokio::test]
+async fn provider_total_clamps_flat_cache_subset_without_mutating_raw_snapshot() {
+    let aggregate_overflow = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: Some(50),
+                cache_read_input_tokens: Some(80),
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-cache-overflow",
+    )
+    .await
+    .expect("aggregate cache overflow");
+
+    assert_eq!(aggregate_overflow.input_tokens, 0);
+    assert_eq!(aggregate_overflow.cache_read_input_tokens, 80);
+    assert_eq!(aggregate_overflow.cache_creation_input_tokens, 20);
+    assert_eq!(
+        aggregate_overflow.input_tokens
+            + aggregate_overflow.cache_read_input_tokens
+            + aggregate_overflow.cache_creation_input_tokens,
+        100
+    );
+    assert_eq!(
+        aggregate_overflow.provider_usage,
+        Some(ProviderUsageSnapshot {
+            input_tokens: Some(100),
+            output_tokens: None,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: Some(50),
+            cache_read_input_tokens: Some(80),
+        }),
+        "raw anomalous provider values remain available for diagnostics"
+    );
+
+    let cache_exceeds_input = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: Some(30),
+                cache_read_input_tokens: Some(120),
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-cache-exceeds-input",
+    )
+    .await
+    .expect("cache exceeds input");
+
+    assert_eq!(cache_exceeds_input.input_tokens, 0);
+    assert_eq!(cache_exceeds_input.cache_read_input_tokens, 100);
+    assert_eq!(cache_exceeds_input.cache_creation_input_tokens, 0);
+    assert_eq!(
+        cache_exceeds_input.input_tokens
+            + cache_exceeds_input.cache_read_input_tokens
+            + cache_exceeds_input.cache_creation_input_tokens,
+        100,
+        "normalized compatibility fields never exceed authoritative input"
+    );
 }
 
 #[tokio::test]

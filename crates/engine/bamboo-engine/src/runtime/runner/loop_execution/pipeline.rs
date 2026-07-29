@@ -150,10 +150,10 @@ impl RoundActivity {
     fn absorb_attempt(&mut self, stream_output: &StreamHandlingOutput) {
         self.prompt_tokens = self
             .prompt_tokens
-            .saturating_add(stream_output.input_tokens);
+            .saturating_add(stream_output.prompt_tokens_for_runtime_budget());
         self.completion_tokens = self
             .completion_tokens
-            .saturating_add(stream_output.output_tokens);
+            .saturating_add(stream_output.completion_tokens_for_runtime_budget());
         self.tool_call_count = self
             .tool_call_count
             .saturating_add(stream_output.tool_calls.len() as u32);
@@ -4257,6 +4257,7 @@ mod tests {
                 thinking_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                provider_usage: None,
                 input_tokens: input,
             }
         }
@@ -4285,6 +4286,55 @@ mod tests {
         activity.absorb_attempt(&attempt(u64::MAX, u64::MAX, vec![]));
         assert_eq!(activity.prompt_tokens, u64::MAX);
         assert_eq!(activity.completion_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn round_activity_prefers_provider_prompt_total_without_adding_reasoning_twice() {
+        use crate::runtime::stream::handler::{ProviderUsageSnapshot, StreamHandlingOutput};
+
+        let mut output = StreamHandlingOutput {
+            response_id: None,
+            content: "answer".to_string(),
+            reasoning_content: "thought".to_string(),
+            reasoning_signature: None,
+            token_count: 6,
+            tool_calls: Vec::new(),
+            // Deliberately conflicting legacy flat values prove runtime
+            // guardrails consult the authoritative provider snapshot.
+            output_tokens: 56,
+            thinking_tokens: 78,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 768,
+            provider_usage: Some(ProviderUsageSnapshot {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                reasoning_tokens: Some(20),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(768),
+            }),
+            input_tokens: 232,
+        };
+
+        let mut activity = super::RoundActivity::default();
+        activity.absorb_attempt(&output);
+
+        assert_eq!(activity.prompt_tokens, 1000);
+        assert_eq!(
+            activity.completion_tokens, 120,
+            "reasoning is a subset of provider output, not additional output"
+        );
+
+        output
+            .provider_usage
+            .as_mut()
+            .expect("provider usage")
+            .output_tokens = Some(0);
+        let mut zero_activity = super::RoundActivity::default();
+        zero_activity.absorb_attempt(&output);
+        assert_eq!(
+            zero_activity.completion_tokens, 0,
+            "explicit provider zero must beat a nonzero legacy flat value"
+        );
     }
 
     /// PR #539 review #2: `runtime.budget_exceeded_kind` must be cleared at
@@ -5384,6 +5434,7 @@ mod tests {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_usage: None,
             input_tokens: 0,
         }
     }
@@ -5731,6 +5782,7 @@ mod tests {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_usage: None,
             input_tokens: 0,
         };
 

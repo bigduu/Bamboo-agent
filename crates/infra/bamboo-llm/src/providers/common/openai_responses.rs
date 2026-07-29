@@ -436,7 +436,7 @@ struct AccFnCall {
 /// - `response.content_part.added/done` (output_text parts) -> `LLMChunk::Token(...)`
 /// - `response.output_item.added/done` message output_text -> `LLMChunk::Token(...)`
 /// - `response.output_item.*` + `response.function_call_arguments.delta` -> `LLMChunk::ToolCalls`
-/// - `response.completed` -> terminal output fallbacks, cache usage, then `LLMChunk::Done`
+/// - `response.completed` -> terminal output fallbacks, provider usage, then `LLMChunk::Done`
 pub struct ResponsesSseParser {
     // item_id -> accumulated function call
     fn_calls: HashMap<String, AccFnCall>,
@@ -1514,9 +1514,9 @@ impl ResponsesSseParser {
     /// Parse one Responses SSE event into every logical downstream chunk it carries.
     ///
     /// Most events produce zero or one chunk. `response.completed` can carry a
-    /// response ID, several output items, cache usage, and terminal completion in
-    /// the same frame; returning a vector keeps all of them without deferring state
-    /// to a later event that may never arrive.
+    /// response ID, several output items, provider usage, and terminal completion
+    /// in the same frame; returning a vector keeps all of them without deferring
+    /// state to a later event that may never arrive.
     pub fn handle_event_multi(&mut self, event: &str, data: &str) -> Result<Vec<LLMChunk>> {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             // Be lenient: some upstreams occasionally send non-JSON keepalives.
@@ -1536,8 +1536,10 @@ impl ResponsesSseParser {
                 .and_then(|response| response.get("usage"))
                 .or_else(|| v.get("usage"));
             self.log_reasoning_summary_if_needed(usage);
-            if let Some(cache_chunk) = usage.and_then(crate::cache::cache_usage_from_openai_usage) {
-                chunks.push(cache_chunk);
+            if let Some(usage_chunk) =
+                usage.and_then(crate::cache::provider_usage_from_openai_usage)
+            {
+                chunks.push(usage_chunk);
             }
             chunks.push(LLMChunk::Done);
             return Ok(chunks);
@@ -2436,12 +2438,12 @@ mod tests {
     }
 
     #[test]
-    fn parser_completed_only_response_id_coexists_with_output_cache_and_done() {
+    fn parser_completed_only_response_id_coexists_with_output_usage_and_done() {
         let mut parser = ResponsesSseParser::new();
         let chunks = parser
             .handle_event_multi(
                 "response.completed",
-                r#"{"type":"response.completed","response":{"id":"resp_terminal","output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"terminal answer"}]}],"usage":{"input_tokens":21,"input_tokens_details":{"cached_tokens":8}}}}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_terminal","output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"terminal answer"}]}],"usage":{"input_tokens":21,"output_tokens":13,"input_tokens_details":{"cached_tokens":8},"output_tokens_details":{"reasoning_tokens":5}}}}"#,
             )
             .expect("completed event");
 
@@ -2450,13 +2452,67 @@ mod tests {
         assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
         assert!(matches!(
             chunks[2],
-            LLMChunk::CacheUsage {
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 8,
-                input_tokens: 13,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(21),
+                output_tokens: Some(13),
+                reasoning_tokens: Some(5),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(8),
             }
         ));
         assert!(matches!(chunks[3], LLMChunk::Done));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. }))
+                .count(),
+            1,
+            "one terminal provider event must emit usage exactly once"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !matches!(chunk, LLMChunk::CacheUsage { .. })),
+            "combined provider usage must not also emit legacy cache usage"
+        );
+    }
+
+    #[test]
+    fn parser_completed_usage_preserves_totals_with_zero_cache() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":34,"output_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":3}}}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            chunks[0],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(34),
+                output_tokens: Some(12),
+                reasoning_tokens: Some(3),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(0),
+            }
+        ));
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_usage_does_not_invent_missing_totals() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"usage":{"total_tokens":46,"input_tokens":null,"output_tokens_details":{}}}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], LLMChunk::Done));
     }
 
     #[test]

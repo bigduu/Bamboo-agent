@@ -19,7 +19,7 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 
 use super::common::openai_compat::{
-    messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient,
+    messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient_multi,
     tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
@@ -27,7 +27,7 @@ use super::common::openai_responses::{
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::{llm_stream_from_sse, llm_stream_from_sse_multi};
+use super::common::sse::llm_stream_from_sse_multi;
 
 const COPILOT_TRANSPORT_MAX_ATTEMPTS: usize = 2;
 const COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS: u64 = 250;
@@ -1398,12 +1398,8 @@ impl LLMProvider for CopilotProvider {
                     }
 
                     if retry.status().is_success() {
-                        let stream = llm_stream_from_sse(retry, |_event, data| {
-                            let chunk = parse_openai_compat_sse_data_lenient(data)?;
-                            match chunk {
-                                LLMChunk::Done => Ok(Some(LLMChunk::Done)),
-                                other => Ok(Some(other)),
-                            }
+                        let stream = llm_stream_from_sse_multi(retry, |_event, data| {
+                            parse_openai_compat_sse_data_lenient_multi(data)
                         });
                         return Ok(stream);
                     }
@@ -1466,7 +1462,7 @@ impl LLMProvider for CopilotProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = llm_stream_from_sse(response, move |_event, data| {
+        let stream = llm_stream_from_sse_multi(response, move |_event, data| {
             let mut reasoning_chunk_to_emit: Option<String> = None;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 if let Some(delta) = v
@@ -1493,32 +1489,29 @@ impl LLMProvider for CopilotProvider {
                 }
             }
 
+            let mut chunks = parse_openai_compat_sse_data_lenient_multi(data)?;
             if let Some(reasoning_chunk) = reasoning_chunk_to_emit {
-                return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk)));
+                chunks.retain(|chunk| !matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
+                chunks.insert(0, LLMChunk::ReasoningToken(reasoning_chunk));
             }
 
-            let chunk = parse_openai_compat_sse_data_lenient(data)?;
-            match chunk {
-                LLMChunk::Done => {
-                    if !logged_summary
-                        && (requested_reasoning.is_some() || observed_reasoning_signal)
-                    {
-                        tracing::info!(
-                            "[{}] Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
-                            session_for_log,
-                            model_for_log,
-                            requested_reasoning
-                                .map(ReasoningEffort::as_str)
-                                .unwrap_or("none"),
-                            observed_reasoning_signal,
-                            reasoning_chars
-                        );
-                        logged_summary = true;
-                    }
-                    Ok(Some(LLMChunk::Done))
-                }
-                other => Ok(Some(other)),
+            if chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done))
+                && !logged_summary
+                && (requested_reasoning.is_some() || observed_reasoning_signal)
+            {
+                tracing::info!(
+                    "[{}] Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                    session_for_log,
+                    model_for_log,
+                    requested_reasoning
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("none"),
+                    observed_reasoning_signal,
+                    reasoning_chars
+                );
+                logged_summary = true;
             }
+            Ok(chunks)
         });
 
         Ok(stream)

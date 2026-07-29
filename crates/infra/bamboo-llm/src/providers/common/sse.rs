@@ -94,6 +94,7 @@ where
 mod tests {
     use super::*;
     use crate::providers::anthropic::{parse_anthropic_sse_event, AnthropicStreamState};
+    use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict_multi;
     use crate::providers::common::openai_responses::ResponsesSseParser;
     use futures::StreamExt;
     use serde_json::json;
@@ -212,7 +213,7 @@ mod tests {
                 .body(
                     concat!(
                         "event: response.completed\n",
-                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"output\":[{\"id\":\"msg_terminal\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal answer\"}]}],\"usage\":{\"input_tokens\":21,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"output\":[{\"id\":\"msg_terminal\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal answer\"}]}],\"usage\":{\"input_tokens\":21,\"output_tokens\":13,\"input_tokens_details\":{\"cached_tokens\":8},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n",
                         "\n",
                     )
                     .to_string(),
@@ -234,13 +235,55 @@ mod tests {
         assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
         assert!(matches!(
             chunks[2],
-            LLMChunk::CacheUsage {
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 8,
-                input_tokens: 13,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(21),
+                output_tokens: Some(13),
+                reasoning_tokens: Some(5),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(8),
             }
         ));
         assert!(matches!(chunks[3], LLMChunk::Done));
+    }
+
+    #[tokio::test]
+    async fn openai_chat_frame_flattens_business_output_and_usage_before_done() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n",
+                        "\n",
+                        "data: [DONE]\n",
+                        "\n",
+                    )
+                    .to_string(),
+                )
+                .expect("http response"),
+        );
+        let mut stream = llm_stream_from_sse_multi(response, |_event, data| {
+            parse_openai_compat_sse_data_strict_multi(data)
+        });
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "answer"));
+        assert!(matches!(
+            chunks[1],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(4),
+                cache_read_input_tokens: Some(3),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[2], LLMChunk::Done));
     }
 
     #[tokio::test]

@@ -111,6 +111,7 @@ pub(super) fn convert_chunk_to_openai(
         }),
         bamboo_llm::types::LLMChunk::TransportActivity
         | bamboo_llm::types::LLMChunk::CacheUsage { .. }
+        | bamboo_llm::types::LLMChunk::ProviderUsage { .. }
         | bamboo_llm::types::LLMChunk::UsageSummary { .. }
         | bamboo_llm::types::LLMChunk::ReasoningSignature(_) => None,
     }
