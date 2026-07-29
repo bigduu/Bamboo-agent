@@ -17,7 +17,6 @@ use crate::providers::common::openai_compat::{
     build_openai_compat_body, parse_openai_compat_sse_data_strict_multi,
 };
 use crate::providers::common::sse::{llm_stream_from_sse, llm_stream_from_sse_multi};
-use crate::types::LLMChunk;
 use bamboo_config::KeywordMaskingConfig;
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 
@@ -437,6 +436,7 @@ impl BodhiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::LLMChunk;
     use bamboo_domain::FunctionSchema;
     use futures::StreamExt;
     use serde_json::Value;

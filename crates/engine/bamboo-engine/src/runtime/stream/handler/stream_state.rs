@@ -1,6 +1,8 @@
 use bamboo_agent_core::tools::ToolCallAccumulator;
 
-use super::{InterruptedStreamOutput, PartialToolCallSnapshot, StreamHandlingOutput};
+use super::{
+    InterruptedStreamOutput, PartialToolCallSnapshot, ProviderUsageSnapshot, StreamHandlingOutput,
+};
 
 pub(super) struct StreamAccumulationState {
     response_id: Option<String>,
@@ -17,6 +19,7 @@ pub(super) struct StreamAccumulationState {
     thinking_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
+    provider_usage: Option<ProviderUsageSnapshot>,
     input_tokens: u64,
 }
 
@@ -34,6 +37,7 @@ impl StreamAccumulationState {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_usage: None,
             input_tokens: 0,
         }
     }
@@ -110,19 +114,25 @@ impl StreamAccumulationState {
         cache_creation_input_tokens: Option<u64>,
         cache_read_input_tokens: Option<u64>,
     ) {
+        let snapshot = self.provider_usage.get_or_insert_default();
         if let Some(input_tokens) = input_tokens {
+            snapshot.input_tokens = Some(input_tokens);
             self.input_tokens = input_tokens;
         }
         if let Some(output_tokens) = output_tokens {
+            snapshot.output_tokens = Some(output_tokens);
             self.output_tokens = output_tokens;
         }
         if let Some(reasoning_tokens) = reasoning_tokens {
+            snapshot.reasoning_tokens = Some(reasoning_tokens);
             self.thinking_tokens = reasoning_tokens;
         }
         if let Some(cache_creation_input_tokens) = cache_creation_input_tokens {
+            snapshot.cache_creation_input_tokens = Some(cache_creation_input_tokens);
             self.cache_creation_input_tokens = cache_creation_input_tokens;
         }
         if let Some(cache_read_input_tokens) = cache_read_input_tokens {
+            snapshot.cache_read_input_tokens = Some(cache_read_input_tokens);
             self.cache_read_input_tokens = cache_read_input_tokens;
         }
     }
@@ -139,6 +149,7 @@ impl StreamAccumulationState {
             thinking_tokens: self.thinking_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
+            provider_usage: self.provider_usage,
             input_tokens: self.input_tokens,
         }
     }

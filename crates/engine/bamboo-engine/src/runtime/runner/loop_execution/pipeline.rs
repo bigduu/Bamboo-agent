@@ -4257,6 +4257,7 @@ mod tests {
                 thinking_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                provider_usage: None,
                 input_tokens: input,
             }
         }
@@ -5384,6 +5385,7 @@ mod tests {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_usage: None,
             input_tokens: 0,
         }
     }
@@ -5731,6 +5733,7 @@ mod tests {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_usage: None,
             input_tokens: 0,
         };
 

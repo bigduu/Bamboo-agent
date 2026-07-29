@@ -62,6 +62,20 @@ fn sanitize_identifier(value: &str) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
+/// Raw authoritative usage fields preserved from provider terminal events.
+///
+/// Each field remains optional so callers can distinguish an explicit
+/// provider-reported zero from an omitted value. Flat counters on
+/// [`StreamHandlingOutput`] remain the normalized compatibility view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderUsageSnapshot {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
 pub struct StreamHandlingOutput {
     pub response_id: Option<String>,
     pub content: String,
@@ -76,6 +90,10 @@ pub struct StreamHandlingOutput {
     pub thinking_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Merged authoritative provider snapshot, when at least one provider-usage
+    /// chunk was observed. Repeated cumulative snapshots are idempotent, absent
+    /// fields do not erase known values, and explicit zeros remain `Some(0)`.
+    pub provider_usage: Option<ProviderUsageSnapshot>,
     /// Provider-reported total input when a [`bamboo_llm::LLMChunk::ProviderUsage`]
     /// snapshot is available. Legacy cache-only chunks retain their historical
     /// fresh-input semantics; callers can distinguish cached input through the

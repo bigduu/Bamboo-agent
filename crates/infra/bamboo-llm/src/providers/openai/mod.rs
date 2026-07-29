@@ -22,8 +22,7 @@ use bamboo_domain::ToolSchema;
 
 use super::common::model_fetcher;
 use super::common::openai_compat::{
-    build_openai_compat_body, parse_openai_compat_sse_data_strict,
-    parse_openai_compat_sse_data_strict_multi,
+    build_openai_compat_body, parse_openai_compat_sse_data_strict_multi,
 };
 use super::common::openai_responses::{
     build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
@@ -649,6 +648,7 @@ impl LLMProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionSchema, ToolSchema};
 

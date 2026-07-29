@@ -14,7 +14,9 @@ use bamboo_llm::providers::common::openai_responses::ResponsesSseParser;
 use bamboo_llm::{LLMChunk, LLMStream};
 
 use super::consume::consume_llm_stream_internal;
-use super::{consume_llm_stream, consume_llm_stream_silent, StreamTimeoutContext};
+use super::{
+    consume_llm_stream, consume_llm_stream_silent, ProviderUsageSnapshot, StreamTimeoutContext,
+};
 
 fn build_stream(items: Vec<bamboo_llm::provider::Result<LLMChunk>>) -> LLMStream {
     Box::pin(stream::iter(items))
@@ -180,6 +182,74 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
     assert_eq!(output.thinking_tokens, 11);
     assert_eq!(output.cache_creation_input_tokens, 0);
     assert_eq!(output.cache_read_input_tokens, 29);
+    assert_eq!(
+        output.provider_usage,
+        Some(ProviderUsageSnapshot {
+            input_tokens: Some(101),
+            output_tokens: Some(37),
+            reasoning_tokens: Some(11),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(29),
+        })
+    );
+}
+
+#[tokio::test]
+async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field() {
+    let omitted = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: None,
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-usage-omitted",
+    )
+    .await
+    .expect("omitted snapshot");
+    assert_eq!(
+        omitted.provider_usage,
+        Some(ProviderUsageSnapshot::default())
+    );
+
+    let explicit_zero = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(9),
+                output_tokens: Some(9),
+                reasoning_tokens: Some(9),
+                cache_creation_input_tokens: Some(9),
+                cache_read_input_tokens: Some(9),
+            }),
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                reasoning_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                cache_read_input_tokens: Some(0),
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-usage-zero",
+    )
+    .await
+    .expect("zero snapshot");
+    assert_eq!(
+        explicit_zero.provider_usage,
+        Some(ProviderUsageSnapshot {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            reasoning_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+        })
+    );
 }
 
 #[tokio::test]
