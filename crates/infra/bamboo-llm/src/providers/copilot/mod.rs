@@ -27,7 +27,7 @@ use super::common::openai_responses::{
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::llm_stream_from_sse;
+use super::common::sse::{llm_stream_from_sse, llm_stream_from_sse_multi};
 
 const COPILOT_TRANSPORT_MAX_ATTEMPTS: usize = 2;
 const COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS: u64 = 250;
@@ -800,8 +800,8 @@ impl CopilotProvider {
                         let mut parser =
                             ResponsesSseParser::new_with_context("Copilot", model, None);
                         let model_for_debug = model.to_string();
-                        let stream = llm_stream_from_sse(fallback, move |event, data| {
-                            let parsed = parser.handle_event(event, data);
+                        let stream = llm_stream_from_sse_multi(fallback, move |event, data| {
+                            let parsed = parser.handle_event_multi(event, data);
                             append_responses_sse_record(
                                 "Copilot",
                                 &model_for_debug,
@@ -862,8 +862,8 @@ impl CopilotProvider {
 
         let mut parser = ResponsesSseParser::new_with_context("Copilot", model, reasoning_effort);
         let model_for_debug = model.to_string();
-        let stream = llm_stream_from_sse(response, move |event, data| {
-            let parsed = parser.handle_event(event, data);
+        let stream = llm_stream_from_sse_multi(response, move |event, data| {
+            let parsed = parser.handle_event_multi(event, data);
             append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
             parsed
         });

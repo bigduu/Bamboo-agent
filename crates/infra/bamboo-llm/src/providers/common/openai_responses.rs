@@ -5,8 +5,7 @@
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use crate::provider::ResponsesRequestOptions;
-use crate::provider::Result;
+use crate::provider::{LLMError, ResponsesRequestOptions, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::MessagePart;
 use bamboo_domain::ReasoningEffort;
@@ -437,7 +436,7 @@ struct AccFnCall {
 /// - `response.content_part.added/done` (output_text parts) -> `LLMChunk::Token(...)`
 /// - `response.output_item.added/done` message output_text -> `LLMChunk::Token(...)`
 /// - `response.output_item.*` + `response.function_call_arguments.delta` -> `LLMChunk::ToolCalls`
-/// - `response.completed` -> `LLMChunk::Done`
+/// - `response.completed` -> terminal output fallbacks, cache usage, then `LLMChunk::Done`
 pub struct ResponsesSseParser {
     // item_id -> accumulated function call
     fn_calls: HashMap<String, AccFnCall>,
@@ -455,6 +454,13 @@ pub struct ResponsesSseParser {
     // Output indexes that already surfaced any user-visible text stream.
     // Used to suppress redundant message snapshots in `response.output_item.done`.
     streamed_text_output_indexes: HashSet<i64>,
+    // Function-call item IDs, provider call IDs, and output indexes that already
+    // produced a downstream ToolCalls chunk. A completed response can repeat the
+    // authoritative output_item.done snapshot, so all three identities are
+    // retained to suppress the fallback without relying on any one optional key.
+    emitted_tool_item_ids: HashSet<String>,
+    emitted_tool_call_ids: HashSet<String>,
+    emitted_tool_output_indexes: HashSet<i64>,
     // Reasoning output item IDs that have already emitted summary text.
     streamed_reasoning_item_ids: HashSet<String>,
     // Some upstreams omit item_id on reasoning deltas; use the same done-fallback guard
@@ -507,6 +513,9 @@ impl ResponsesSseParser {
             text_delta_stream_keys: HashSet::new(),
             text_done_stream_keys: HashSet::new(),
             streamed_text_output_indexes: HashSet::new(),
+            emitted_tool_item_ids: HashSet::new(),
+            emitted_tool_call_ids: HashSet::new(),
+            emitted_tool_output_indexes: HashSet::new(),
             streamed_reasoning_item_ids: HashSet::new(),
             saw_unkeyed_reasoning_delta: false,
             reasoning_item_content: HashMap::new(),
@@ -600,6 +609,136 @@ impl ResponsesSseParser {
                 arguments: acc.arguments,
             },
         })
+    }
+
+    fn function_call_item_key(
+        &self,
+        item: &Value,
+        item_key_hint: Option<&str>,
+        output_index: Option<i64>,
+    ) -> Option<String> {
+        let inner_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let item_key_hint = item_key_hint.filter(|id| !id.is_empty());
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+
+        // Incremental output_item.done snapshots can be sparse. Prefer whichever
+        // identity already owns the added/delta accumulator before choosing a new
+        // key; otherwise a nested call_id can steal precedence from the outer
+        // item_id that holds the accumulated name and arguments.
+        for candidate in [inner_id, item_key_hint, call_id].into_iter().flatten() {
+            if self.fn_calls.contains_key(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+
+        inner_id
+            .or(item_key_hint)
+            .or(call_id)
+            .map(str::to_string)
+            .or_else(|| output_index.map(|index| format!("output:{index}")))
+    }
+
+    fn tool_call_was_emitted(
+        &self,
+        item_key: &str,
+        call_id: Option<&str>,
+        output_index: Option<i64>,
+    ) -> bool {
+        self.emitted_tool_item_ids.contains(item_key)
+            || call_id.is_some_and(|id| self.emitted_tool_call_ids.contains(id))
+            || output_index.is_some_and(|index| self.emitted_tool_output_indexes.contains(&index))
+    }
+
+    fn mark_tool_call_emitted(&mut self, item_key: &str, call_id: &str, output_index: Option<i64>) {
+        self.emitted_tool_item_ids.insert(item_key.to_string());
+        if !call_id.is_empty() {
+            self.emitted_tool_call_ids.insert(call_id.to_string());
+        }
+        if let Some(output_index) = output_index {
+            self.emitted_tool_output_indexes.insert(output_index);
+        }
+    }
+
+    fn emit_function_call_item(
+        &mut self,
+        item: &Value,
+        item_key_hint: Option<&str>,
+        output_index: Option<i64>,
+    ) -> Option<LLMChunk> {
+        let item_key = self.function_call_item_key(item, item_key_hint, output_index)?;
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if self.tool_call_was_emitted(item_key.as_str(), call_id, output_index) {
+            return None;
+        }
+
+        self.apply_done_fn_call_item(item_key.as_str(), item);
+        let call = self.finalize_tool_call(item_key.as_str())?;
+        self.mark_tool_call_emitted(item_key.as_str(), call.id.as_str(), output_index);
+        Some(LLMChunk::ToolCalls(vec![call]))
+    }
+
+    fn emit_completed_message_item(&mut self, item: &Value, output_index: i64) -> Option<LLMChunk> {
+        if self.streamed_text_output_indexes.contains(&output_index) {
+            return None;
+        }
+
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let text = Self::message_item_output_text(item);
+        let out = self.emit_done_text(item_id, text.as_str());
+        if out.is_some() {
+            self.streamed_text_output_indexes.insert(output_index);
+        }
+        out
+    }
+
+    fn completed_output_chunks(&mut self, value: &Value) -> Vec<LLMChunk> {
+        let Some(output) = value
+            .get("response")
+            .and_then(|response| response.get("output"))
+            .or_else(|| value.get("output"))
+            .and_then(Value::as_array)
+        else {
+            return Vec::new();
+        };
+
+        let mut chunks = Vec::new();
+        for (output_index, item) in output.iter().enumerate() {
+            let Ok(output_index) = i64::try_from(output_index) else {
+                continue;
+            };
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message" => {
+                    if let Some(chunk) = self.emit_completed_message_item(item, output_index) {
+                        chunks.push(chunk);
+                    }
+                }
+                "function_call" => {
+                    if let Some(chunk) =
+                        self.emit_function_call_item(item, None, Some(output_index))
+                    {
+                        chunks.push(chunk);
+                    }
+                }
+                // Unknown and malformed terminal items are intentionally ignored:
+                // gateways vary, and one unsupported output must not discard valid
+                // siblings from the same completed response.
+                _ => {}
+            }
+        }
+        chunks
     }
 
     fn text_item_id(v: &Value) -> Option<String> {
@@ -1039,18 +1178,7 @@ impl ResponsesSseParser {
         Some(LLMChunk::ResponseId(response_id.to_string()))
     }
 
-    pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            // Be lenient: some upstreams occasionally send non-JSON keepalives.
-            return Ok(None);
-        };
-
-        let event_type = self.event_type(event, &v);
-
-        if let Some(chunk) = self.maybe_emit_response_id(event_type, &v) {
-            return Ok(Some(chunk));
-        }
-
+    fn handle_event_value(&mut self, event_type: &str, v: Value) -> Result<Option<LLMChunk>> {
         match event_type {
             // `summary_part.added` is typically a shape/placeholder signal; text is usually empty.
             "response.reasoning_summary_part.added" => {
@@ -1218,14 +1346,17 @@ impl ResponsesSseParser {
                     .and_then(|value| value.as_str())
                     .or_else(|| v.get("delta").and_then(|value| value.as_str()))
                     .unwrap_or("");
-                if let Some(output_index) = Self::text_output_index(&v) {
-                    self.streamed_text_output_indexes.insert(output_index);
+                let output_index = Self::text_output_index(&v);
+                let out = if let Some(stream_key) = Self::text_stream_key(&v) {
+                    self.emit_text_done_with_key(stream_key.as_str(), text)
+                } else {
+                    let item_id = Self::text_item_id(&v);
+                    self.emit_done_text(item_id.as_deref(), text)
+                };
+                if out.is_some() {
+                    self.streamed_text_output_indexes.extend(output_index);
                 }
-                if let Some(stream_key) = Self::text_stream_key(&v) {
-                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text));
-                }
-                let item_id = Self::text_item_id(&v);
-                Ok(self.emit_done_text(item_id.as_deref(), text))
+                Ok(out)
             }
 
             "response.content_part.added" => {
@@ -1251,14 +1382,17 @@ impl ResponsesSseParser {
 
             "response.content_part.done" => {
                 let text = Self::content_part_output_text(&v, false);
-                if let Some(output_index) = Self::text_output_index(&v) {
-                    self.streamed_text_output_indexes.insert(output_index);
+                let output_index = Self::text_output_index(&v);
+                let out = if let Some(stream_key) = Self::text_stream_key(&v) {
+                    self.emit_text_done_with_key(stream_key.as_str(), text.as_str())
+                } else {
+                    let item_id = Self::text_item_id(&v);
+                    self.emit_done_text(item_id.as_deref(), text.as_str())
+                };
+                if out.is_some() {
+                    self.streamed_text_output_indexes.extend(output_index);
                 }
-                if let Some(stream_key) = Self::text_stream_key(&v) {
-                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text.as_str()));
-                }
-                let item_id = Self::text_item_id(&v);
-                Ok(self.emit_done_text(item_id.as_deref(), text.as_str()))
+                Ok(out)
             }
 
             "response.output_item.added" => {
@@ -1313,6 +1447,7 @@ impl ResponsesSseParser {
             "response.output_item.done" => {
                 // Emit tool call when the function_call item is done.
                 let item_id = Self::text_item_id(&v).unwrap_or_default();
+                let output_index = Self::text_output_index(&v);
 
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1331,7 +1466,6 @@ impl ResponsesSseParser {
                         ));
                     }
                     if item_type == "message" {
-                        let output_index = Self::text_output_index(&v);
                         if output_index
                             .is_some_and(|index| self.streamed_text_output_indexes.contains(&index))
                         {
@@ -1353,8 +1487,12 @@ impl ResponsesSseParser {
                         }
                         return Ok(out);
                     }
-                    if item_type == "function_call" && !item_id.is_empty() {
-                        self.apply_done_fn_call_item(&item_id, item);
+                    if item_type == "function_call" {
+                        return Ok(self.emit_function_call_item(
+                            item,
+                            (!item_id.is_empty()).then_some(item_id.as_str()),
+                            output_index,
+                        ));
                     }
                 }
 
@@ -1365,29 +1503,66 @@ impl ResponsesSseParser {
                 let Some(call) = self.finalize_tool_call(&item_id) else {
                     return Ok(None);
                 };
-
+                self.mark_tool_call_emitted(item_id.as_str(), call.id.as_str(), output_index);
                 Ok(Some(LLMChunk::ToolCalls(vec![call])))
             }
 
-            "response.completed" => {
-                let usage = v
-                    .get("response")
-                    .and_then(|response| response.get("usage"))
-                    .or_else(|| v.get("usage"));
-                self.log_reasoning_summary_if_needed(usage);
-                // Surface provider-side prompt cache hits so the same accounting
-                // and frontend badge work for the Responses API. `Done` is only an
-                // informational log downstream (the stream terminates on EOF), so
-                // emitting CacheUsage here in its place is safe.
-                if let Some(cache_chunk) =
-                    usage.and_then(crate::cache::cache_usage_from_openai_usage)
-                {
-                    return Ok(Some(cache_chunk));
-                }
-                Ok(Some(LLMChunk::Done))
-            }
-
             _ => Ok(None),
+        }
+    }
+
+    /// Parse one Responses SSE event into every logical downstream chunk it carries.
+    ///
+    /// Most events produce zero or one chunk. `response.completed` can carry a
+    /// response ID, several output items, cache usage, and terminal completion in
+    /// the same frame; returning a vector keeps all of them without deferring state
+    /// to a later event that may never arrive.
+    pub fn handle_event_multi(&mut self, event: &str, data: &str) -> Result<Vec<LLMChunk>> {
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            // Be lenient: some upstreams occasionally send non-JSON keepalives.
+            return Ok(Vec::new());
+        };
+
+        let event_type = self.event_type(event, &v).to_string();
+        let mut chunks = Vec::new();
+        if let Some(chunk) = self.maybe_emit_response_id(event_type.as_str(), &v) {
+            chunks.push(chunk);
+        }
+
+        if event_type == "response.completed" {
+            chunks.extend(self.completed_output_chunks(&v));
+            let usage = v
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .or_else(|| v.get("usage"));
+            self.log_reasoning_summary_if_needed(usage);
+            if let Some(cache_chunk) = usage.and_then(crate::cache::cache_usage_from_openai_usage) {
+                chunks.push(cache_chunk);
+            }
+            chunks.push(LLMChunk::Done);
+            return Ok(chunks);
+        }
+
+        if let Some(chunk) = self.handle_event_value(event_type.as_str(), v)? {
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+
+    /// Backward-compatible helper for callers that only accept one chunk per event.
+    ///
+    /// Responses provider streams use [`Self::handle_event_multi`]. Returning an
+    /// explicit error here prevents a multi-output terminal frame from being
+    /// silently truncated by legacy callers.
+    #[allow(dead_code)]
+    pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
+        let mut chunks = self.handle_event_multi(event, data)?;
+        match chunks.len() {
+            0 => Ok(None),
+            1 => Ok(chunks.pop()),
+            count => Err(LLMError::Stream(format!(
+                "Responses SSE event produced {count} chunks; use handle_event_multi"
+            ))),
         }
     }
 }
@@ -1993,6 +2168,32 @@ mod tests {
     }
 
     #[test]
+    fn parser_empty_output_text_done_does_not_hide_completed_message() {
+        let mut parser = ResponsesSseParser::new();
+        let done = parser
+            .handle_event(
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_terminal","output_index":0,"content_index":0,"text":""}"#,
+            )
+            .expect("empty text done");
+        assert!(done.is_none());
+
+        let completed = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"real terminal text"}]}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(completed.len(), 2);
+        assert!(matches!(
+            &completed[0],
+            LLMChunk::Token(text) if text == "real terminal text"
+        ));
+        assert!(matches!(completed[1], LLMChunk::Done));
+    }
+
+    #[test]
     fn parser_skips_output_text_done_after_streaming_delta_for_same_item() {
         let mut p = ResponsesSseParser::new();
         let _ = p
@@ -2035,6 +2236,36 @@ mod tests {
         match out {
             Some(LLMChunk::Token(t)) => assert_eq!(t, "hello from part done"),
             other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_empty_or_non_text_content_part_done_does_not_hide_completed_message() {
+        let done_payloads = [
+            r#"{"type":"response.content_part.done","item_id":"msg_terminal","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}"#,
+            r#"{"type":"response.content_part.done","item_id":"msg_terminal","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":"not output text"}}"#,
+        ];
+
+        for done_payload in done_payloads {
+            let mut parser = ResponsesSseParser::new();
+            let done = parser
+                .handle_event("response.content_part.done", done_payload)
+                .expect("content part done");
+            assert!(done.is_none());
+
+            let completed = parser
+                .handle_event_multi(
+                    "response.completed",
+                    r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"real terminal text"}]}]}}"#,
+                )
+                .expect("completed event");
+
+            assert_eq!(completed.len(), 2);
+            assert!(matches!(
+                &completed[0],
+                LLMChunk::Token(text) if text == "real terminal text"
+            ));
+            assert!(matches!(completed[1], LLMChunk::Done));
         }
     }
 
@@ -2082,6 +2313,168 @@ mod tests {
             )
             .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn parser_recovers_terminal_only_message_from_completed_output() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from completion"}]}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        match &chunks[0] {
+            LLMChunk::Token(text) => assert_eq!(text, "Hello from completion"),
+            other => panic!("expected terminal token, got {other:?}"),
+        }
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_recovers_terminal_only_function_call_from_completed_output() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"fc_terminal","type":"function_call","call_id":"call_terminal","name":"search","arguments":"{\"q\":\"bamboo\"}"}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        match &chunks[0] {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_terminal");
+                assert_eq!(calls[0].function.name, "search");
+                assert_eq!(calls[0].function.arguments, r#"{"q":"bamboo"}"#);
+            }
+            other => panic!("expected terminal tool call, got {other:?}"),
+        }
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_fallback_does_not_repeat_normally_streamed_text_or_tool() {
+        let mut parser = ResponsesSseParser::new();
+
+        let created = parser
+            .handle_event(
+                "response.created",
+                r#"{"type":"response.created","response":{"id":"resp_streamed"}}"#,
+            )
+            .expect("created event");
+        assert!(matches!(
+            created,
+            Some(LLMChunk::ResponseId(response_id)) if response_id == "resp_streamed"
+        ));
+
+        let text = parser
+            .handle_event(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_streamed","output_index":0,"content_index":0,"delta":"already streamed"}"#,
+            )
+            .expect("text delta");
+        assert!(matches!(
+            text,
+            Some(LLMChunk::Token(token)) if token == "already streamed"
+        ));
+
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_streamed","output_index":1,"delta":"{\"q\":\"streamed\"}"}"#,
+            )
+            .expect("tool arguments delta");
+        let tool = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":"{\"q\":\"streamed\"}"}}"#,
+            )
+            .expect("tool item done");
+        assert!(matches!(tool, Some(LLMChunk::ToolCalls(calls)) if calls.len() == 1));
+
+        let completed = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_streamed","output":[{"id":"msg_streamed","type":"message","content":[{"type":"output_text","text":"already streamed"}]},{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":"{\"q\":\"streamed\"}"}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(completed.len(), 1);
+        assert!(matches!(completed[0], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_output_preserves_multiple_mixed_items_and_ignores_unknowns() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"first"},{"type":"refusal","refusal":"ignored"},{"type":"output_text","text":" message"}]},{"type":"computer_call","id":"unknown_1"},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a\"}"},{"id":"fc_bad","type":"function_call","call_id":"call_bad","arguments":"{}"},{"id":"msg_2","type":"message","content":[{"type":"output_text","text":"second message"}]},{"id":"fc_2","type":"function_call","call_id":"call_2","name":"read_file","arguments":"{\"path\":\"b\"}"},null]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 5);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "first message"));
+        assert!(
+            matches!(&chunks[1], LLMChunk::ToolCalls(calls) if calls.len() == 1 && calls[0].id == "call_1")
+        );
+        assert!(matches!(&chunks[2], LLMChunk::Token(text) if text == "second message"));
+        assert!(
+            matches!(&chunks[3], LLMChunk::ToolCalls(calls) if calls.len() == 1 && calls[0].id == "call_2")
+        );
+        assert!(matches!(chunks[4], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_only_response_id_coexists_with_output_cache_and_done() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_terminal","output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"terminal answer"}]}],"usage":{"input_tokens":21,"input_tokens_details":{"cached_tokens":8}}}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 4);
+        assert!(matches!(&chunks[0], LLMChunk::ResponseId(id) if id == "resp_terminal"));
+        assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
+        assert!(matches!(
+            chunks[2],
+            LLMChunk::CacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 8,
+                input_tokens: 13,
+            }
+        ));
+        assert!(matches!(chunks[3], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_is_lenient_for_malformed_payloads() {
+        let mut parser = ResponsesSseParser::new();
+        assert!(parser
+            .handle_event_multi("response.completed", "not-json")
+            .expect("malformed keepalive")
+            .is_empty());
+
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":"not-an-array"}}"#,
+            )
+            .expect("malformed output");
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], LLMChunk::Done));
     }
 
     /// #237 finding 4: an aggregator that puts a non-empty `arguments` snapshot
@@ -2313,6 +2706,72 @@ mod tests {
             }
             other => panic!("expected tool_calls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_keeps_outer_item_id_for_sparse_function_call_done_item() {
+        let mut parser = ResponsesSseParser::new();
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"fc_outer","type":"function_call","call_id":"call_outer","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_outer","delta":"{\"q\":\"outer\"}"}"#,
+            )
+            .expect("tool arguments delta");
+
+        let chunk = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item_id":"fc_outer","item":{"type":"function_call"}}"#,
+            )
+            .expect("tool item done");
+
+        assert!(matches!(
+            chunk,
+            Some(LLMChunk::ToolCalls(calls))
+                if calls.len() == 1
+                    && calls[0].id == "call_outer"
+                    && calls[0].function.name == "search"
+                    && calls[0].function.arguments == r#"{"q":"outer"}"#
+        ));
+    }
+
+    #[test]
+    fn parser_sparse_function_done_call_id_reuses_outer_item_accumulator() {
+        let mut parser = ResponsesSseParser::new();
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item_id":"fc_outer","item":{"type":"function_call","call_id":"call_outer","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_outer","delta":"{\"q\":\"outer\"}"}"#,
+            )
+            .expect("tool arguments delta");
+
+        let chunk = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item_id":"fc_outer","item":{"type":"function_call","call_id":"call_outer"}}"#,
+            )
+            .expect("sparse tool item done");
+
+        assert!(matches!(
+            chunk,
+            Some(LLMChunk::ToolCalls(calls))
+                if calls.len() == 1
+                    && calls[0].id == "call_outer"
+                    && calls[0].function.name == "search"
+                    && calls[0].function.arguments == r#"{"q":"outer"}"#
+        ));
     }
 
     #[test]

@@ -204,6 +204,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_responses_completed_frame_flattens_every_parser_chunk() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"output\":[{\"id\":\"msg_terminal\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal answer\"}]}],\"usage\":{\"input_tokens\":21,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n",
+                        "\n",
+                    )
+                    .to_string(),
+                )
+                .expect("http response"),
+        );
+        let mut parser = ResponsesSseParser::new();
+        let mut stream = llm_stream_from_sse_multi(response, move |event, data| {
+            parser.handle_event_multi(event, data)
+        });
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 4);
+        assert!(matches!(&chunks[0], LLMChunk::ResponseId(id) if id == "resp_terminal"));
+        assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
+        assert!(matches!(
+            chunks[2],
+            LLMChunk::CacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 8,
+                input_tokens: 13,
+            }
+        ));
+        assert!(matches!(chunks[3], LLMChunk::Done));
+    }
+
+    #[tokio::test]
     async fn llm_stream_from_sse_maps_handler_errors_to_stream_error() {
         let sse_body = concat!("event: token\n", "data: boom\n", "\n");
 
