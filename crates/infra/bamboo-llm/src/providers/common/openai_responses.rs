@@ -2628,6 +2628,39 @@ mod tests {
     }
 
     #[test]
+    fn parser_keeps_outer_item_id_for_sparse_function_call_done_item() {
+        let mut parser = ResponsesSseParser::new();
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"fc_outer","type":"function_call","call_id":"call_outer","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_outer","delta":"{\"q\":\"outer\"}"}"#,
+            )
+            .expect("tool arguments delta");
+
+        let chunk = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item_id":"fc_outer","item":{"type":"function_call"}}"#,
+            )
+            .expect("tool item done");
+
+        assert!(matches!(
+            chunk,
+            Some(LLMChunk::ToolCalls(calls))
+                if calls.len() == 1
+                    && calls[0].id == "call_outer"
+                    && calls[0].function.name == "search"
+                    && calls[0].function.arguments == r#"{"q":"outer"}"#
+        ));
+    }
+
+    #[test]
     fn parser_prefers_done_arguments_snapshot_over_accumulated_partials() {
         let mut p = ResponsesSseParser::new();
 
