@@ -143,7 +143,7 @@ notify = "8"
 # with `cargo tree -i aws-lc-sys` after any version bump. `connect` pulls in
 # `connect_async` (TCP dialing) — `native-tls` alone only adds the TLS
 # stream wrapper, not dialing.
-prost = "0.13"
+prost = "0.14"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
 
 [features]
