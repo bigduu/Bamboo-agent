@@ -1953,7 +1953,6 @@ fn validate_access_control(value: &AccessControlSection) -> Result<(), String> {
         if access.password_hash.is_some()
             || access.password_salt.is_some()
             || access.password_configured != access.password_credential_ref.is_some()
-            || (access.password_enabled && !access.password_configured)
         {
             return Err("access-control password verifier metadata is not isolated".to_string());
         }
@@ -2238,6 +2237,12 @@ fn load_strict_root(
     }
     if read_planning_source(data_dir, "connect.json", overrides)?.is_some() {
         effective_root.remove("connect");
+    }
+    if let Some(access) = effective_root.get_mut("access_control") {
+        // Strict root decoding must use the same secret-free repair projection
+        // as the later compound planner. Otherwise one malformed verifier
+        // disables every typed section before AccessControl can be isolated.
+        scrub_preflight_access_control_secrets(access)?;
     }
     let config = serde_json::from_value::<Config>(effective).map_err(|error| {
         crate::ConfigStoreError::Validation(format!(
@@ -2527,6 +2532,14 @@ fn scrub_preflight_connect_secrets(raw: &mut Value) {
     }
 }
 
+/// Mirror the credential planner's AccessControl extraction in the zero-write
+/// facade preflight by invoking the same pure sanitizer against a clone. The
+/// returned extraction plan is intentionally discarded: durable writes remain
+/// owned by the migration transaction after every preflight succeeds.
+fn scrub_preflight_access_control_secrets(raw: &mut Value) -> ConfigStoreResult<()> {
+    crate::credential_migration::sanitize_access_control_for_preflight(raw)
+}
+
 fn preflight_legacy_root_sections(
     data_dir: &Path,
     input: &StrictPlanningInput,
@@ -2592,6 +2605,7 @@ fn preflight_legacy_root_sections(
             SectionId::Env => scrub_preflight_env_secrets(&mut data),
             SectionId::ClusterFabric => scrub_preflight_cluster_secrets(&mut data),
             SectionId::Connect => scrub_preflight_connect_secrets(&mut data),
+            SectionId::AccessControl => scrub_preflight_access_control_secrets(&mut data)?,
             SectionId::Credentials => unreachable!("credentials were skipped above"),
             _ => {}
         }
@@ -3008,6 +3022,16 @@ pub fn migrate_config_facade_layout(
     let mut recovered = false;
     for _ in 0..4 {
         recovered |= crate::recover_pending_config_transaction(data_dir)?;
+        if section_layout_is_active(data_dir)?
+            && crate::credential_migration::access_control_requires_opaque_repair(data_dir)?
+        {
+            let access = crate::credential_migration::with_migration_lock(data_dir, || {
+                crate::credential_migration::migrate_access_control_credentials_for_facade_locked(
+                    data_dir,
+                )
+            })?;
+            recovered |= access.resumed;
+        }
         let source_before = preflight_source_hashes(data_dir)?;
         let preflight = (|| {
             let broker_ready = preflight_broker_document(data_dir)?;
@@ -3049,6 +3073,8 @@ pub fn migrate_config_facade_layout(
                     migrate_provider_mcp_credentials_for_facade_locked(data_dir)?;
                 let cluster =
                     crate::credential_migration::migrate_cluster_credentials_locked(data_dir)?;
+                let access = crate::credential_migration::
+                    migrate_access_control_credentials_for_facade_locked(data_dir)?;
                 let mut broker_resumed = false;
                 if broker_ready {
                     match crate::credential_migration::migrate_external_broker_credentials_locked(
@@ -3067,7 +3093,11 @@ pub fn migrate_config_facade_layout(
                 }
                 return Ok(Some(crate::SectionMigrationOutcome {
                     activated: false,
-                    resumed: recovered || provider.resumed || cluster.resumed || broker_resumed,
+                    resumed: recovered
+                        || provider.resumed
+                        || cluster.resumed
+                        || access.resumed
+                        || broker_resumed,
                 }));
             }
 
@@ -3344,6 +3374,37 @@ pub(crate) fn current_members_satisfy_completion(
         } else {
             match validate_section_envelope(descriptor.file_name, &bytes, 0) {
                 Ok(revision) => revision,
+                Err(_) if descriptor.id == SectionId::AccessControl => {
+                    // Access is the sole section whose damaged bytes can be
+                    // projected into an encrypted, fail-closed repair record.
+                    // Keep validating every structurally recoverable revision
+                    // below, but let opaque Access damage through recovery so
+                    // it cannot revoke the already-attested unrelated layout.
+                    let Ok(mut envelope) = serde_json::from_slice::<Value>(&bytes) else {
+                        continue;
+                    };
+                    let Some(object) = envelope.as_object_mut() else {
+                        continue;
+                    };
+                    if object.get("schema_version").and_then(Value::as_u64)
+                        != Some(u64::from(SECTION_SCHEMA_VERSION))
+                    {
+                        continue;
+                    }
+                    let Some(revision) = object.get("revision").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let Some(data) = object.get_mut("data") else {
+                        continue;
+                    };
+                    if crate::credential_migration::sanitize_access_control_for_preflight(data)
+                        .is_err()
+                        || validate_section_data(descriptor.file_name, data).is_err()
+                    {
+                        continue;
+                    }
+                    revision
+                }
                 Err(_) => return Ok(false),
             }
         };
@@ -5290,6 +5351,7 @@ fn layout_not_committed() -> crate::ConfigStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use serde_json::json;
     use std::collections::BTreeSet;
     use tempfile::TempDir;
@@ -5412,6 +5474,33 @@ mod tests {
         let mut snapshot = BTreeMap::new();
         visit(root, root, &mut snapshot);
         snapshot
+    }
+
+    fn assert_no_plaintext_in_persistent_files(root: &Path, forbidden: &[&str]) {
+        fn visit(root: &Path, current: &Path, forbidden: &[&str]) {
+            for entry in std::fs::read_dir(current).unwrap().map(Result::unwrap) {
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    visit(root, &path, forbidden);
+                    continue;
+                }
+                if path.extension().and_then(|extension| extension.to_str()) == Some("lock") {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                for sentinel in forbidden {
+                    assert!(
+                        !bytes
+                            .windows(sentinel.len())
+                            .any(|window| window == sentinel.as_bytes()),
+                        "{} leaked plaintext sentinel {sentinel}",
+                        path.strip_prefix(root).unwrap().display()
+                    );
+                }
+            }
+        }
+
+        visit(root, root, forbidden);
     }
 
     fn section_document(revision: u64, data: Value) -> Value {
@@ -5807,6 +5896,510 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[test]
+    fn incomplete_enabled_access_control_keeps_facade_available_and_reports_repair_state() {
+        let _key = crate::encryption::set_test_encryption_key([0xa1; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "access_control": {
+                    "password_enabled": true
+                },
+                "tools": {"disabled": ["bash"]},
+                "mcp": {}
+            }),
+        );
+
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let access = facade.registry().access_control.snapshot();
+        let access = access.data.0.as_ref().unwrap();
+        assert!(access.password_enabled);
+        assert!(!access.password_configured);
+        assert!(access.password_credential_ref.is_none());
+        assert!(facade.registry().tools_skills.snapshot().status == SectionStatus::Healthy);
+        assert!(facade.registry().mcp.snapshot().status == SectionStatus::Healthy);
+        assert!(facade.registry().credentials.statuses().is_empty());
+
+        let exact = crate::read_exact_credential_section_snapshot(
+            dir.path(),
+            SectionId::AccessControl,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.section.status, SectionStatus::Degraded);
+        assert_eq!(
+            exact.section.last_error.as_deref(),
+            Some("access-control credential repair is required")
+        );
+
+        let before = directory_snapshot(dir.path());
+        let outcome = migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(!outcome.activated);
+        assert_eq!(directory_snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn corrupted_access_password_metadata_isolated_to_degraded_access_section() {
+        let _key = crate::encryption::set_test_encryption_key([0xa4; 32]);
+        for (label, access, forbidden) in [
+            (
+                "hash-only",
+                json!({
+                    "password_enabled": true,
+                    "password_hash": "orphan-hash"
+                }),
+                "orphan-hash",
+            ),
+            (
+                "salt-only",
+                json!({
+                    "password_enabled": true,
+                    "password_salt": "orphan-salt"
+                }),
+                "orphan-salt",
+            ),
+            (
+                "configured-without-ref",
+                json!({
+                    "password_enabled": true,
+                    "password_configured": true
+                }),
+                "configured-without-ref",
+            ),
+            (
+                "noncanonical-ref",
+                json!({
+                    "password_enabled": true,
+                    "password_configured": true,
+                    "password_credential_ref": "access.other.password_verifier"
+                }),
+                "access.other.password_verifier",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            write_json(
+                &dir.path().join("config.json"),
+                &json!({
+                    "access_control": access,
+                    "tools": {"disabled": ["bash"]},
+                    "mcp": {}
+                }),
+            );
+
+            let facade = ConfigFacade::open_or_migrate(dir.path())
+                .unwrap_or_else(|error| panic!("{label} must not disable the facade: {error}"));
+            assert_eq!(
+                facade.registry().tools_skills.snapshot().status,
+                SectionStatus::Healthy,
+                "{label}"
+            );
+            assert_eq!(
+                facade.registry().mcp.snapshot().status,
+                SectionStatus::Healthy,
+                "{label}"
+            );
+            let exact = crate::read_exact_credential_section_snapshot(
+                dir.path(),
+                SectionId::AccessControl,
+                None,
+            )
+            .unwrap();
+            assert_eq!(exact.section.status, SectionStatus::Degraded, "{label}");
+            assert_eq!(
+                exact.section.last_error.as_deref(),
+                Some("access-control credential repair is required"),
+                "{label}"
+            );
+            let access: AccessControlSection = serde_json::from_value(exact.section.data).unwrap();
+            let access = access.0.unwrap();
+            assert!(access.password_enabled, "{label}");
+            assert!(!access.password_configured, "{label}");
+            assert!(access.password_credential_ref.is_none(), "{label}");
+            assert!(access.password_hash.is_none(), "{label}");
+            assert!(access.password_salt.is_none(), "{label}");
+            if label != "configured-without-ref" {
+                for name in ["config.json", "access-control.json", "credentials.json"] {
+                    assert!(
+                        !std::fs::read_to_string(dir.path().join(name))
+                            .unwrap()
+                            .contains(forbidden),
+                        "{label} leaked repair material in {name}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_access_fragments_are_encrypted_in_one_stable_recovery_slot() {
+        let _key = crate::encryption::set_test_encryption_key([0xa5; 32]);
+        let dir = TempDir::new().unwrap();
+        let original_access = json!({
+            "password_enabled": true,
+            "password_hash": "root-hash-fragment",
+            "password_salt": "root-salt-fragment",
+            "devices": [{
+                "device_id": "bamboo_0123456789ab",
+                "label": "Damaged phone",
+                "token_hash": "device-hash-fragment",
+                "token_salt": "device-salt-fragment",
+                "created_at": "2026-07-29T00:00:00Z"
+            }],
+            "future_private_fragment": "payload-private-fragment"
+        });
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "access_control": original_access,
+                "tools": {"disabled": ["bash"]},
+                "mcp": {}
+            }),
+        );
+
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            facade.registry().tools_skills.snapshot().status,
+            SectionStatus::Healthy
+        );
+        assert_eq!(
+            facade.registry().mcp.snapshot().status,
+            SectionStatus::Healthy
+        );
+        let access = facade.registry().access_control.snapshot();
+        let access = access.data.0.as_ref().unwrap();
+        assert!(access.password_enabled);
+        assert!(access.repair_required);
+        assert!(!access.password_configured);
+        assert!(access.devices.is_empty());
+
+        let recovery_ref = CredentialRef::parse("access_repair.root.payload".to_string()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        let recovery = store.resolve(&recovery_ref).unwrap().unwrap();
+        let payload: Value = serde_json::from_str(recovery.expose()).unwrap();
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["source_slot"], "root");
+        assert_eq!(payload["access_control"], original_access);
+        assert!(store.statuses().unwrap().is_empty());
+        assert!(store.status_with_health(&recovery_ref).is_err());
+
+        assert_no_plaintext_in_persistent_files(
+            dir.path(),
+            &[
+                "root-hash-fragment",
+                "root-salt-fragment",
+                "device-hash-fragment",
+                "device-salt-fragment",
+                "payload-private-fragment",
+            ],
+        );
+
+        let before = directory_snapshot(dir.path());
+        let second = migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(!second.activated);
+        assert_eq!(directory_snapshot(dir.path()), before);
+        assert!(ConfigFacade::open(dir.path())
+            .unwrap()
+            .registry()
+            .access_control
+            .snapshot()
+            .data
+            .0
+            .as_ref()
+            .is_some_and(|access| access.repair_required));
+    }
+
+    #[test]
+    fn active_layout_quarantines_access_damage_without_accepting_flag_clear() {
+        let _key = crate::encryption::set_test_encryption_key([0xa6; 32]);
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let revision = facade.registry().access_control.snapshot().revision;
+        let damaged = json!({
+            "schema_version": SECTION_SCHEMA_VERSION,
+            "revision": revision + 1,
+            "data": {
+                "password_enabled": "yes",
+                "password_hash": "active-layout-secret"
+            }
+        });
+        write_json(&dir.path().join("access-control.json"), &damaged);
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+        let exact = crate::read_exact_credential_section_snapshot(
+            dir.path(),
+            SectionId::AccessControl,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.section.status, SectionStatus::Degraded);
+        let exact_revision = exact.section.revision;
+        let mut candidate = Config::default();
+        exact.install_into(&mut candidate);
+        let access = candidate.access_control.as_mut().unwrap();
+        assert!(access.password_enabled);
+        assert!(access.repair_required);
+        access.repair_required = false;
+
+        let before_access = std::fs::read(dir.path().join("access-control.json")).unwrap();
+        let before_credentials = std::fs::read(dir.path().join("credentials.json")).unwrap();
+        let error = crate::persist_access_control_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            false,
+            &BTreeSet::new(),
+            exact_revision,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("server-owned"));
+        assert_eq!(
+            std::fs::read(dir.path().join("access-control.json")).unwrap(),
+            before_access
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.json")).unwrap(),
+            before_credentials
+        );
+
+        let recovery_ref =
+            CredentialRef::parse("access_repair.section.payload".to_string()).unwrap();
+        let recovery = CredentialStore::open(dir.path())
+            .resolve(&recovery_ref)
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(recovery.expose()).unwrap();
+        assert_eq!(payload["access_control"], damaged["data"]);
+        assert_no_plaintext_in_persistent_files(dir.path(), &["active-layout-secret"]);
+    }
+
+    #[test]
+    fn active_layout_repairs_syntax_invalid_access_without_disabling_other_sections() {
+        let _key = crate::encryption::set_test_encryption_key([0xa8; 32]);
+        let dir = TempDir::new().unwrap();
+        let initial = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let initial_access_revision = initial.registry().access_control.snapshot().revision;
+        drop(initial);
+
+        let damaged = br#"{ "password_hash": "opaque-access-secret""#;
+        std::fs::write(dir.path().join("access-control.json"), damaged).unwrap();
+
+        let facade = ConfigFacade::open_or_migrate(dir.path())
+            .expect("AccessControl damage must remain section-local");
+        assert_eq!(
+            facade.registry().tools_skills.snapshot().status,
+            SectionStatus::Healthy
+        );
+        assert_eq!(
+            facade.registry().mcp.snapshot().status,
+            SectionStatus::Healthy
+        );
+        let access = facade.registry().access_control.snapshot();
+        let access = access.data.0.as_ref().unwrap();
+        assert!(access.password_enabled);
+        assert!(access.repair_required);
+        assert!(!access.password_configured);
+
+        let tools = facade.registry().tools_skills.snapshot();
+        let mut tools_candidate = serde_json::to_value(tools.data.as_ref()).unwrap();
+        tools_candidate["tools"]["disabled"] = json!(["bash"]);
+        let event = facade
+            .registry()
+            .commit_value(SectionId::ToolsSkills, tools.revision, tools_candidate)
+            .unwrap();
+        assert_eq!(
+            event,
+            ConfigSectionEvent::Changed {
+                section: "tools-skills".to_string(),
+                revision: tools.revision + 1,
+            }
+        );
+
+        let exact = crate::read_exact_credential_section_snapshot(
+            dir.path(),
+            SectionId::AccessControl,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.section.status, SectionStatus::Degraded);
+        assert_eq!(
+            exact.section.last_error.as_deref(),
+            Some("access-control credential repair is required")
+        );
+        assert!(validate_section_envelope(
+            "access-control.json",
+            &std::fs::read(dir.path().join("access-control.json")).unwrap(),
+            initial_access_revision + 1,
+        )
+        .is_ok());
+
+        let recovery_ref =
+            CredentialRef::parse("access_repair.section.payload".to_string()).unwrap();
+        let recovery = CredentialStore::open(dir.path())
+            .resolve(&recovery_ref)
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(recovery.expose()).unwrap();
+        assert_eq!(payload["encoding"], "base64");
+        let encoded = payload["access_control_bytes"].as_str().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            damaged
+        );
+        assert_no_plaintext_in_persistent_files(dir.path(), &["opaque-access-secret"]);
+    }
+
+    #[test]
+    fn access_recovery_slot_collision_aborts_without_mutating_any_source() {
+        let _key = crate::encryption::set_test_encryption_key([0xa7; 32]);
+        let dir = TempDir::new().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let ordinary = CredentialRef::parse("custom.collision.payload").unwrap();
+        store
+            .replace(
+                ordinary,
+                "preexisting-user-value",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let credentials_path = dir.path().join("credentials.json");
+        let credentials = std::fs::read_to_string(&credentials_path)
+            .unwrap()
+            .replace("custom.collision.payload", "access_repair.root.payload");
+        std::fs::write(&credentials_path, credentials).unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "access_control": {
+                    "password_enabled": "yes",
+                    "password_hash": "collision-private-fragment"
+                },
+                "tools": {"disabled": ["bash"]},
+                "mcp": {}
+            }),
+        );
+        let before = directory_snapshot(dir.path());
+
+        let error = migrate_config_facade_layout(dir.path()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("access recovery target credential is already user-managed"));
+        assert_eq!(directory_snapshot(dir.path()), before);
+        assert!(std::fs::read_to_string(dir.path().join("config.json"))
+            .unwrap()
+            .contains("collision-private-fragment"));
+    }
+
+    #[test]
+    fn complete_legacy_access_verifier_migrates_atomically_and_idempotently() {
+        let _key = crate::encryption::set_test_encryption_key([0xa2; 32]);
+        let dir = TempDir::new().unwrap();
+        let hash = "a".repeat(64);
+        let salt = "01".repeat(16);
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "access_control": {
+                    "password_enabled": true,
+                    "password_hash": hash,
+                    "password_salt": salt
+                }
+            }),
+        );
+
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let access = facade.registry().access_control.snapshot();
+        let access = access.data.0.as_ref().unwrap();
+        assert!(access.password_enabled);
+        assert!(access.password_configured);
+        assert_eq!(
+            access
+                .password_credential_ref
+                .as_ref()
+                .map(CredentialRef::as_str),
+            Some("access.root.password_verifier")
+        );
+        assert!(access.password_hash.is_none());
+        assert!(access.password_salt.is_none());
+
+        let mut runtime = facade.effective_config();
+        runtime
+            .hydrate_access_control_credentials_from_store(dir.path())
+            .unwrap();
+        let hydrated = runtime.access_control.as_ref().unwrap();
+        assert_eq!(hydrated.password_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(hydrated.password_salt.as_deref(), Some(salt.as_str()));
+        for name in ["config.json", "access-control.json", "credentials.json"] {
+            let persisted = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            assert!(!persisted.contains(&hash), "{name} leaked the legacy hash");
+            assert!(!persisted.contains(&salt), "{name} leaked the legacy salt");
+        }
+
+        let before = directory_snapshot(dir.path());
+        let outcome = migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(!outcome.activated);
+        assert_eq!(directory_snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn legacy_access_verifier_recovers_after_compound_manifest_interruption() {
+        use crate::credential_migration::{
+            install_section_split_migration_with_fault, plan_facade_compound_credentials,
+            FacadeSourceSnapshot, SectionSplitTestFault,
+        };
+
+        let _key = crate::encryption::set_test_encryption_key([0xa3; 32]);
+        let dir = TempDir::new().unwrap();
+        let hash = "b".repeat(64);
+        let salt = "02".repeat(16);
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "access_control": {
+                    "password_enabled": true,
+                    "password_hash": hash,
+                    "password_salt": salt
+                }
+            }),
+        );
+
+        let source_snapshot = FacadeSourceSnapshot::capture(dir.path()).unwrap();
+        let credentials =
+            plan_facade_compound_credentials(dir.path(), source_snapshot, false).unwrap();
+        let plan = plan_config_facade_compound_layout(dir.path(), false, credentials).unwrap();
+        assert!(install_section_split_migration_with_fault(
+            dir.path(),
+            plan,
+            SectionSplitTestFault::Manifest,
+        )
+        .is_err());
+        assert!(!section_layout_is_active(dir.path()).unwrap());
+
+        let recovered = migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(recovered.resumed);
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        let mut runtime = facade.effective_config();
+        runtime
+            .hydrate_access_control_credentials_from_store(dir.path())
+            .unwrap();
+        let access = runtime.access_control.as_ref().unwrap();
+        assert_eq!(access.password_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(access.password_salt.as_deref(), Some(salt.as_str()));
+        assert_eq!(
+            facade.registry().credentials.statuses().len(),
+            1,
+            "recovery must not duplicate the migrated verifier"
+        );
+
+        let before = directory_snapshot(dir.path());
+        let second = migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(!second.activated);
+        assert_eq!(directory_snapshot(dir.path()), before);
     }
 
     #[test]

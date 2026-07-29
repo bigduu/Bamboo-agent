@@ -583,7 +583,7 @@ impl SkillManager {
             let original_len = skills.len();
             skills = budget_skills_for_context(
                 skills,
-                &self.store.workflow_catalog_snapshot().await,
+                &self.store.skill_catalog_snapshot().await,
                 request_hint,
                 DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
             )
@@ -668,7 +668,7 @@ impl SkillManager {
         .await;
 
         if selected_skill_ids.is_none() {
-            let catalog = store.workflow_catalog_snapshot().await;
+            let catalog = store.skill_catalog_snapshot().await;
             skills = budget_skills_for_context(
                 skills,
                 &catalog,
@@ -1215,6 +1215,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflows_never_enter_automatic_or_explicit_skill_activation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data = directory.path().join("data");
+        let orchestration = data.join("skills/orchestrate");
+        fs::create_dir_all(&orchestration)
+            .await
+            .expect("orchestration root");
+        fs::write(
+            orchestration.join("SKILL.md"),
+            "---\nname: orchestrate\ndescription: Runs a workflow.\n---\nWorkflow support text.\n",
+        )
+        .await
+        .expect("workflow instructions");
+        fs::write(
+            orchestration.join("workflow.yaml"),
+            "id: orchestrate\nname: Orchestrate\ndescription: Runs tools\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+        )
+        .await
+        .expect("workflow metadata");
+        let workflows = data.join("workflows");
+        fs::create_dir_all(&workflows)
+            .await
+            .expect("legacy workflows");
+        fs::write(
+            workflows.join("legacy-review.md"),
+            "---\ndescription: Reviews a legacy change.\n---\nReview it.\n",
+        )
+        .await
+        .expect("legacy workflow");
+
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir: data.join("skills"),
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize manager");
+
+        let automatic = manager
+            .resolve_skills_for_request_with_mode(
+                &BTreeSet::new(),
+                None,
+                None,
+                Some("orchestrate and review"),
+            )
+            .await;
+        for id in ["orchestrate", "legacy-review"] {
+            assert!(automatic.iter().all(|skill| skill.id != id));
+            let explicit_ids = vec![id.to_string()];
+            let explicit = manager
+                .resolve_skills_for_request_with_mode(
+                    &BTreeSet::new(),
+                    Some(&explicit_ids),
+                    None,
+                    Some("run it"),
+                )
+                .await;
+            assert!(explicit.iter().all(|skill| skill.id != id));
+        }
+        let skill_catalog = manager.store().skill_catalog_snapshot().await;
+        assert!(skill_catalog
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry.id.as_str(), "orchestrate" | "legacy-review")));
+        let workflow_catalog = manager.store().workflow_catalog_snapshot().await;
+        assert!(workflow_catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == "orchestrate"));
+        assert!(workflow_catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == "legacy-review"));
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_migration_is_a_selectable_skill_not_a_workflow_replacement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data = directory.path().join("data");
+        let source = data.join("workflows/migrated-review.md");
+        fs::create_dir_all(source.parent().unwrap())
+            .await
+            .expect("workflow root");
+        fs::write(&source, "Review the migrated change.\n")
+            .await
+            .expect("legacy source");
+        crate::legacy::migrate_legacy_markdown_workflow(
+            &source,
+            "workflows/migrated-review.md",
+            &data.join("skills"),
+            "migrated-review",
+            Some("Use when reviewing a migrated change."),
+        )
+        .await
+        .expect("explicit migration");
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir: data.join("skills"),
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize manager");
+
+        let ids = vec!["migrated-review".to_string()];
+        let explicit = manager
+            .resolve_skills_for_request_with_mode(
+                &BTreeSet::new(),
+                Some(&ids),
+                None,
+                Some("review"),
+            )
+            .await;
+        assert_eq!(
+            explicit
+                .iter()
+                .map(|skill| skill.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["migrated-review"]
+        );
+        assert!(manager
+            .store()
+            .skill_catalog_snapshot()
+            .await
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.id == "migrated-review"
+                    && entry.migration_status
+                        == Some(crate::LegacyWorkflowMigrationStatus::Migrated)
+            }));
+        assert!(manager
+            .store()
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.id == "migrated-review"
+                    && entry.migration_status
+                        == Some(crate::LegacyWorkflowMigrationStatus::Available)
+            }));
+    }
+
+    #[tokio::test]
     async fn automatic_selection_keeps_lkg_policy_until_recovery() {
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("skills");
@@ -1261,7 +1401,7 @@ mod tests {
         assert!(resolve().await.iter().any(|skill| skill.id == "steady"));
         let invalid = manager
             .store()
-            .workflow_catalog_snapshot()
+            .skill_catalog_snapshot()
             .await
             .entries
             .into_iter()
@@ -1278,7 +1418,7 @@ mod tests {
         assert!(!resolve().await.iter().any(|skill| skill.id == "steady"));
         let recovered = manager
             .store()
-            .workflow_catalog_snapshot()
+            .skill_catalog_snapshot()
             .await
             .entries
             .into_iter()
@@ -1408,9 +1548,11 @@ mod tests {
         manager.initialize().await.expect("initialize");
         let project_id = bamboo_domain::ProjectId::parse("project-1").expect("project id");
         let project_only = manager
-            .workflow_catalog_for_project_workspace(&project_id, &project_home, None)
+            .store_for_project_workspace(&project_id, &project_home, None)
             .await
-            .expect("project catalog");
+            .expect("project store")
+            .skill_catalog_snapshot()
+            .await;
         assert_eq!(
             project_only
                 .entries
@@ -1422,9 +1564,11 @@ mod tests {
         );
 
         let overlaid = manager
-            .workflow_catalog_for_project_workspace(&project_id, &project_home, Some(&workspace))
+            .store_for_project_workspace(&project_id, &project_home, Some(&workspace))
             .await
-            .expect("overlay catalog");
+            .expect("overlay store")
+            .skill_catalog_snapshot()
+            .await;
         let winner = overlaid
             .entries
             .iter()

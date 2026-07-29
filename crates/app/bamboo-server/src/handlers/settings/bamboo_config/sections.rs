@@ -1881,6 +1881,77 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn partial_access_control_does_not_disable_other_typed_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec_pretty(&json!({
+                "access_control": {
+                    "password_enabled": true,
+                    "password_hash": "orphaned-legacy-hash"
+                },
+                "tools": {
+                    "disabled": ["bash"]
+                },
+                "mcp": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        assert!(
+            state.config_facade.is_some(),
+            "repairable AccessControl metadata must not disable the modular facade"
+        );
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/sections/{section}", web::get().to(get_typed_section)),
+        )
+        .await;
+
+        for section in ["tools-skills", "mcp"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/sections/{section}"))
+                    .to_request(),
+            )
+            .await;
+            assert!(
+                response.status().is_success(),
+                "{section} must remain independently available"
+            );
+        }
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/sections/access-control")
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(
+            body["last_error"],
+            "access-control credential repair is required"
+        );
+        assert_eq!(body["data"]["password_enabled"], true);
+        assert_eq!(body["data"]["password_configured"], false);
+        assert!(body["data"].get("password_hash").is_none());
+        assert!(body["data"].get("password_salt").is_none());
+        for name in ["config.json", "access-control.json", "credentials.json"] {
+            assert!(
+                !std::fs::read_to_string(dir.path().join(name))
+                    .unwrap()
+                    .contains("orphaned-legacy-hash"),
+                "{name} must not retain unusable verifier material"
+            );
+        }
+    }
+
+    #[actix_web::test]
     async fn typed_sections_expose_health_and_diagnostics_without_secret_material() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x49; 32]);
         let dir = tempfile::tempdir().unwrap();
@@ -4588,6 +4659,55 @@ mod tests {
                 .unwrap()
                 .configured
         );
+    }
+
+    #[actix_web::test]
+    async fn access_control_reset_clears_server_owned_recovery_payload() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x66; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec_pretty(&json!({
+                "access_control": {
+                    "password_enabled": "yes",
+                    "password_hash": "reset-recovery-private-fragment"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let recovery = bamboo_config::CredentialRef::parse("access_repair.root.payload").unwrap();
+        assert!(state.credential_store.resolve(&recovery).unwrap().is_some());
+        let revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .access_control
+            .snapshot()
+            .revision;
+
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/sections/{section}/reset",
+            web::post().to(reset_typed_section),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/sections/access-control/reset")
+                .set_json(json!({"expected_revision": revision}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(status.is_success(), "unexpected response {status}: {body}");
+        assert!(state.config.read().await.access_control.is_none());
+        assert!(state.credential_store.resolve(&recovery).unwrap().is_none());
+        assert!(!body.contains("reset-recovery-private-fragment"));
+        assert!(!body.contains("access_repair."));
     }
 
     #[actix_web::test]

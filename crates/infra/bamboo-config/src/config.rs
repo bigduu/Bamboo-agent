@@ -224,6 +224,12 @@ pub struct AccessControlConfig {
     /// Whether password protection is enabled.
     #[serde(default)]
     pub password_enabled: bool,
+    /// A malformed legacy verifier or device record was isolated into the
+    /// encrypted recovery store and needs an explicit user repair. Runtime
+    /// authorization treats this as fail-closed even when no usable verifier
+    /// can be hydrated.
+    #[serde(default)]
+    pub repair_required: bool,
     /// Runtime-only password verifier hash. Legacy documents may still
     /// deserialize it for migration, but ordinary section serialization never
     /// writes verifier material.
@@ -5402,6 +5408,7 @@ mod tests {
         // identical for instances that never paired a device.
         let access = AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
             password_credential_ref: None,
@@ -5432,6 +5439,7 @@ mod tests {
         };
         let access = AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
             password_credential_ref: None,

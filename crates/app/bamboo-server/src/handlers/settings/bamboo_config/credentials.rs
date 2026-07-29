@@ -49,7 +49,7 @@ pub async fn get_credential_status(
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let credential_ref = parse_credential_ref(path.into_inner())?;
-    reject_cluster_credential_ref(&credential_ref)?;
+    reject_reserved_credential_ref(&credential_ref)?;
     let (status, health) = app_state
         .credential_store
         .status_with_health(&credential_ref)
@@ -162,7 +162,7 @@ async fn reject_managed_credential_ref(
     app_state: &AppState,
     credential_ref: &CredentialRef,
 ) -> Result<(), AppError> {
-    reject_cluster_credential_ref(credential_ref)?;
+    reject_reserved_credential_ref(credential_ref)?;
     let config = app_state.config.read().await;
     if config.proxy_auth_credential_ref.as_ref() == Some(credential_ref) {
         return Err(AppError::BadRequest(
@@ -230,11 +230,20 @@ fn is_cluster_credential_ref(credential_ref: &CredentialRef) -> bool {
     credential_ref.as_str().starts_with("cluster.")
 }
 
-fn reject_cluster_credential_ref(credential_ref: &CredentialRef) -> Result<(), AppError> {
+fn is_access_recovery_credential_ref(credential_ref: &CredentialRef) -> bool {
+    credential_ref.as_str().starts_with("access_repair.")
+}
+
+fn reject_reserved_credential_ref(credential_ref: &CredentialRef) -> Result<(), AppError> {
     if is_cluster_credential_ref(credential_ref) {
         return Err(AppError::BadRequest(
             "cluster credential references are reserved for the dedicated revisioned cluster-fabric API"
                 .to_string(),
+        ));
+    }
+    if is_access_recovery_credential_ref(credential_ref) {
+        return Err(AppError::BadRequest(
+            "credential reference is reserved for server-owned access recovery".to_string(),
         ));
     }
     Ok(())

@@ -2,7 +2,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
-use bamboo_skills::WorkflowCatalogEntry;
+use bamboo_skills::{
+    LegacyWorkflowMigrationStatus, WorkflowCatalogEntry, WorkflowKind, WorkflowStatus,
+};
 use serde::Deserialize;
 
 use super::types::CommandItem;
@@ -217,15 +219,8 @@ pub(super) async fn list_prompt_presets_as_commands(data_dir: &Path) -> Vec<Comm
     }
 }
 
-pub(super) fn catalog_entry_to_command(entry: &WorkflowCatalogEntry) -> CommandItem {
-    // Until the WorkflowRun engine owns orchestration activation (#578), every catalog bundle is
-    // selected through its canonical SKILL.md instruction entrypoint. Advertising an
-    // orchestration bundle as a legacy `workflow` makes Lotus fetch
-    // `/commands/workflow/{id}`, whose compatibility handler only serves
-    // `${BAMBOO_DATA_DIR}/workflows/{id}.md`; a bundle-local workflow.yaml therefore becomes a
-    // visible command that always fails on selection. Keep the future execution semantic in
-    // metadata.kind without pretending the legacy prompt-workflow adapter can execute it.
-    CommandItem {
+pub(super) fn skill_catalog_entry_to_command(entry: &WorkflowCatalogEntry) -> Option<CommandItem> {
+    (entry.winner && entry.status == WorkflowStatus::Valid).then(|| CommandItem {
         id: format!("skill-{}", entry.id),
         name: entry.id.clone(),
         display_name: entry.name.clone(),
@@ -242,7 +237,35 @@ pub(super) fn catalog_entry_to_command(entry: &WorkflowCatalogEntry) -> CommandI
             "argumentSchema": entry.argument_schema,
             "status": entry.status,
         }),
-    }
+    })
+}
+
+pub(super) fn legacy_workflow_catalog_entry_to_command(
+    entry: &WorkflowCatalogEntry,
+) -> Option<CommandItem> {
+    (entry.winner
+        && entry.kind == WorkflowKind::Instruction
+        && entry.status == WorkflowStatus::Valid
+        && entry.migration_status == Some(LegacyWorkflowMigrationStatus::Available))
+    .then(|| CommandItem {
+        id: format!("workflow-{}", entry.id),
+        name: entry.id.clone(),
+        display_name: entry.name.clone(),
+        description: entry.description.clone(),
+        command_type: "workflow".to_string(),
+        category: None,
+        tags: None,
+        metadata: serde_json::json!({
+            "kind": entry.kind,
+            "source": entry.source,
+            "revision": entry.revision,
+            "version": entry.version,
+            "invocationPolicy": entry.invocation_policy,
+            "argumentSchema": entry.argument_schema,
+            "status": entry.status,
+            "migrationStatus": entry.migration_status,
+        }),
+    })
 }
 
 pub(super) async fn list_mcp_tools_as_commands(

@@ -200,6 +200,7 @@ async fn remote_unverified_request_is_blocked_by_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -228,6 +229,7 @@ async fn lifecycle_hook_dry_run_is_blocked_by_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -265,6 +267,7 @@ async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -309,6 +312,7 @@ async fn plugin_routes_are_blocked_by_the_same_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -337,6 +341,7 @@ async fn access_bootstrap_endpoints_remain_public() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -372,6 +377,7 @@ async fn verified_cookie_allows_remote_request_through_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -469,6 +475,7 @@ async fn local_request_bypasses_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -554,6 +561,7 @@ async fn v2_stream_upgrade_is_open_but_siblings_stay_gated() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -619,6 +627,7 @@ const SECRET_SALT: &str = "01010101010101010101010101010101";
 fn password_access_control() -> AccessControlConfig {
     AccessControlConfig {
         password_enabled: true,
+        repair_required: false,
         password_hash: Some(SECRET_HASH.to_string()),
         password_salt: Some(SECRET_SALT.to_string()),
         password_credential_ref: None,
