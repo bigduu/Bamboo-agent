@@ -207,73 +207,95 @@ struct OpenAICompatFunctionDelta {
     arguments: Option<String>,
 }
 
-/// Convert a single OpenAI-compatible stream chunk into an [`LLMChunk`].
-pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> LLMChunk {
-    // Final usage chunk (normally empty choices): preserve provider-reported
-    // input/output/reasoning totals and cache data together. Returning one
-    // combined snapshot is required because this parser emits one chunk per
-    // Chat Completions SSE event.
+/// Convert one OpenAI-compatible stream frame into every logical chunk it
+/// carries.
+///
+/// Some compatible gateways attach `usage` to the same frame as content, tool
+/// deltas, or `finish_reason`. Business output is emitted first, the cumulative
+/// provider snapshot follows it, and [`LLMChunk::Done`] is always last so no
+/// semantic chunk is stranded behind a terminal marker.
+pub fn parse_openai_compat_chunk_multi(chunk: OpenAICompatStreamChunk) -> Vec<LLMChunk> {
+    let mut chunks = Vec::new();
+    let mut is_terminal = false;
+
+    if let Some(choice) = chunk.choices.first() {
+        if let Some(tool_calls) = &choice.delta.tool_calls {
+            // Carry each delta's `index` so the engine accumulator can route
+            // argument-only continuation fragments (which arrive with empty id/name)
+            // to the matching call. A positional heuristic corrupts arguments when an
+            // aggregator interleaves fragments across indices. #236.
+            let calls: Vec<(u32, bamboo_domain::ToolCall)> = tool_calls
+                .iter()
+                .map(|tc| {
+                    (
+                        tc.index,
+                        bamboo_domain::ToolCall {
+                            id: tc.id.clone().unwrap_or_default(),
+                            tool_type: tc
+                                .tool_type
+                                .clone()
+                                .unwrap_or_else(|| "function".to_string()),
+                            function: bamboo_domain::FunctionCall {
+                                name: tc
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.name.clone())
+                                    .unwrap_or_default(),
+                                arguments: tc
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.arguments.clone())
+                                    .unwrap_or_default(),
+                            },
+                        },
+                    )
+                })
+                .collect();
+
+            if !calls.is_empty() {
+                chunks.push(LLMChunk::ToolCallsIndexed(calls));
+            }
+        }
+
+        if let Some(content) = &choice.delta.content {
+            chunks.push(LLMChunk::Token(content.clone()));
+        }
+
+        is_terminal = choice.finish_reason.is_some();
+    }
+
     if let Some(usage) = &chunk.usage {
         if let Some(usage_chunk) = crate::cache::provider_usage_from_openai_usage(usage) {
-            return usage_chunk;
+            chunks.push(usage_chunk);
         }
     }
 
-    let Some(choice) = chunk.choices.first() else {
-        return LLMChunk::Token(String::new());
-    };
-
-    if let Some(tool_calls) = &choice.delta.tool_calls {
-        // Carry each delta's `index` so the engine accumulator can route
-        // argument-only continuation fragments (which arrive with empty id/name)
-        // to the matching call. A positional heuristic corrupts arguments when an
-        // aggregator interleaves fragments across indices. #236.
-        let calls: Vec<(u32, bamboo_domain::ToolCall)> = tool_calls
-            .iter()
-            .map(|tc| {
-                (
-                    tc.index,
-                    bamboo_domain::ToolCall {
-                        id: tc.id.clone().unwrap_or_default(),
-                        tool_type: tc
-                            .tool_type
-                            .clone()
-                            .unwrap_or_else(|| "function".to_string()),
-                        function: bamboo_domain::FunctionCall {
-                            name: tc
-                                .function
-                                .as_ref()
-                                .and_then(|f| f.name.clone())
-                                .unwrap_or_default(),
-                            arguments: tc
-                                .function
-                                .as_ref()
-                                .and_then(|f| f.arguments.clone())
-                                .unwrap_or_default(),
-                        },
-                    },
-                )
-            })
-            .collect();
-
-        if !calls.is_empty() {
-            return LLMChunk::ToolCallsIndexed(calls);
-        }
-
-        return LLMChunk::Token(String::new());
+    if is_terminal {
+        chunks.push(LLMChunk::Done);
+    } else if chunks.is_empty() {
+        chunks.push(LLMChunk::Token(String::new()));
     }
 
-    if let Some(content) = &choice.delta.content {
-        return LLMChunk::Token(content.clone());
-    }
+    chunks
+}
 
-    // Some OpenAI-compatible providers terminate with an empty delta plus
-    // finish_reason (without emitting a separate [DONE] marker).
-    if choice.finish_reason.is_some() {
-        return LLMChunk::Done;
+fn require_single_openai_compat_chunk(mut chunks: Vec<LLMChunk>) -> Result<LLMChunk> {
+    if chunks.len() != 1 {
+        return Err(LLMError::Stream(format!(
+            "OpenAI-compatible SSE frame produced {} logical chunks; use the multi-output parser",
+            chunks.len()
+        )));
     }
+    Ok(chunks.remove(0))
+}
 
-    LLMChunk::Token(String::new())
+/// Legacy single-output conversion.
+///
+/// Valid multi-semantic frames fail explicitly instead of silently discarding
+/// content or usage. Production Chat adapters use
+/// [`parse_openai_compat_chunk_multi`].
+pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> Result<LLMChunk> {
+    require_single_openai_compat_chunk(parse_openai_compat_chunk_multi(chunk))
 }
 
 /// Surface a mid-stream OpenAI-compatible `"error"` event as an [`LLMError::Api`].
@@ -305,8 +327,14 @@ fn openai_compat_error_to_llm_error(error: &Value) -> LLMError {
 ///   token). See issue #26.
 /// - Invalid JSON -> error
 pub fn parse_openai_compat_sse_data_strict(data: &str) -> Result<LLMChunk> {
+    require_single_openai_compat_chunk(parse_openai_compat_sse_data_strict_multi(data)?)
+}
+
+/// Strict OpenAI-compatible SSE parsing that preserves every logical chunk in
+/// one frame.
+pub fn parse_openai_compat_sse_data_strict_multi(data: &str) -> Result<Vec<LLMChunk>> {
     if data.trim() == "[DONE]" {
-        return Ok(LLMChunk::Done);
+        return Ok(vec![LLMChunk::Done]);
     }
 
     // Parse into a generic JSON value first so we can detect mid-stream error
@@ -318,7 +346,7 @@ pub fn parse_openai_compat_sse_data_strict(data: &str) -> Result<LLMChunk> {
         return Err(openai_compat_error_to_llm_error(error));
     }
     let chunk: OpenAICompatStreamChunk = serde_json::from_value(value)?;
-    Ok(parse_openai_compat_chunk(chunk))
+    Ok(parse_openai_compat_chunk_multi(chunk))
 }
 
 /// Parse an SSE `data:` payload in lenient mode (Copilot behavior).
@@ -329,8 +357,15 @@ pub fn parse_openai_compat_sse_data_strict(data: &str) -> Result<LLMChunk> {
 ///   swallowed as empty tokens). See issue #26.
 /// - Invalid JSON -> `LLMChunk::Token("")`
 pub fn parse_openai_compat_sse_data_lenient(data: &str) -> Result<LLMChunk> {
+    require_single_openai_compat_chunk(parse_openai_compat_sse_data_lenient_multi(data)?)
+}
+
+/// Lenient Copilot-compatible SSE parsing that preserves every logical chunk
+/// in one valid frame while retaining the historical empty-token fallback for
+/// malformed payloads.
+pub fn parse_openai_compat_sse_data_lenient_multi(data: &str) -> Result<Vec<LLMChunk>> {
     if data.trim() == "[DONE]" {
-        return Ok(LLMChunk::Done);
+        return Ok(vec![LLMChunk::Done]);
     }
 
     match serde_json::from_str::<Value>(data) {
@@ -342,11 +377,11 @@ pub fn parse_openai_compat_sse_data_lenient(data: &str) -> Result<LLMChunk> {
                 return Err(openai_compat_error_to_llm_error(error));
             }
             match serde_json::from_value::<OpenAICompatStreamChunk>(value) {
-                Ok(chunk) => Ok(parse_openai_compat_chunk(chunk)),
-                Err(_) => Ok(LLMChunk::Token(String::new())),
+                Ok(chunk) => Ok(parse_openai_compat_chunk_multi(chunk)),
+                Err(_) => Ok(vec![LLMChunk::Token(String::new())]),
             }
         }
-        Err(_) => Ok(LLMChunk::Token(String::new())),
+        Err(_) => Ok(vec![LLMChunk::Token(String::new())]),
     }
 }
 
@@ -767,6 +802,79 @@ mod tests {
         let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
 
         assert!(matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
+    }
+
+    #[test]
+    fn multi_parsers_preserve_text_tool_and_finish_frames_with_usage() {
+        type MultiParser = fn(&str) -> crate::provider::Result<Vec<LLMChunk>>;
+        let parsers: [MultiParser; 2] = [
+            super::parse_openai_compat_sse_data_strict_multi,
+            super::parse_openai_compat_sse_data_lenient_multi,
+        ];
+        let usage = r#""usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}"#;
+
+        for parse in parsers {
+            let text = format!(r#"{{"choices":[{{"delta":{{"content":"answer"}}}}],{usage}}}"#);
+            let chunks = parse(&text).expect("text plus usage");
+            assert_eq!(chunks.len(), 2);
+            assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
+            assert!(matches!(chunks[1], LLMChunk::ProviderUsage { .. }));
+
+            let tool = format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"call_1","type":"function","function":{{"name":"search","arguments":"{{}}"}}}}]}}}}],{usage}}}"#
+            );
+            let chunks = parse(&tool).expect("tool plus usage");
+            assert_eq!(chunks.len(), 2);
+            assert!(matches!(
+                &chunks[0],
+                LLMChunk::ToolCallsIndexed(calls)
+                    if calls.len() == 1 && calls[0].1.function.name == "search"
+            ));
+            assert!(matches!(chunks[1], LLMChunk::ProviderUsage { .. }));
+
+            let finish =
+                format!(r#"{{"choices":[{{"delta":{{}},"finish_reason":"stop"}}],{usage}}}"#);
+            let chunks = parse(&finish).expect("finish plus usage");
+            assert_eq!(chunks.len(), 2);
+            assert!(matches!(chunks[0], LLMChunk::ProviderUsage { .. }));
+            assert!(
+                matches!(chunks[1], LLMChunk::Done),
+                "Done must remain the final logical chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_parsers_preserve_independent_empty_choices_usage_frame() {
+        let data = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+
+        for chunks in [
+            super::parse_openai_compat_sse_data_strict_multi(data).unwrap(),
+            super::parse_openai_compat_sse_data_lenient_multi(data).unwrap(),
+        ] {
+            assert_eq!(chunks.len(), 1);
+            assert!(matches!(
+                chunks[0],
+                LLMChunk::ProviderUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(4),
+                    cache_read_input_tokens: Some(0),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_single_parsers_reject_multi_semantic_frames_explicitly() {
+        let data = r#"{"choices":[{"delta":{"content":"answer"}}],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
+
+        for error in [
+            super::parse_openai_compat_sse_data_strict(data).unwrap_err(),
+            super::parse_openai_compat_sse_data_lenient(data).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("use the multi-output parser"));
+        }
     }
 
     #[test]

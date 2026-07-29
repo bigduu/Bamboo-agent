@@ -21,13 +21,16 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 
 use super::common::model_fetcher;
-use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
+use super::common::openai_compat::{
+    build_openai_compat_body, parse_openai_compat_sse_data_strict,
+    parse_openai_compat_sse_data_strict_multi,
+};
 use super::common::openai_responses::{
     build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::{llm_stream_from_sse, llm_stream_from_sse_multi};
+use super::common::sse::llm_stream_from_sse_multi;
 
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
@@ -527,16 +530,12 @@ impl LLMProvider for OpenAIProvider {
                     .await?;
 
                 if fallback.status().is_success() {
-                    let stream = llm_stream_from_sse(fallback, |_event, data| {
+                    let stream = llm_stream_from_sse_multi(fallback, |_event, data| {
                         if data.trim().is_empty() {
-                            return Ok(None);
+                            return Ok(Vec::new());
                         }
 
-                        let chunk = parse_openai_compat_sse_data_strict(data)?;
-                        match chunk {
-                            LLMChunk::Done => Ok(Some(LLMChunk::Done)),
-                            other => Ok(Some(other)),
-                        }
+                        parse_openai_compat_sse_data_strict_multi(data)
                     });
 
                     return Ok(stream);
@@ -582,9 +581,9 @@ impl LLMProvider for OpenAIProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = llm_stream_from_sse(response, move |_event, data| {
+        let stream = llm_stream_from_sse_multi(response, move |_event, data| {
             if data.trim().is_empty() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
 
             let mut reasoning_chunk_to_emit: Option<String> = None;
@@ -613,31 +612,28 @@ impl LLMProvider for OpenAIProvider {
                 }
             }
 
+            let mut chunks = parse_openai_compat_sse_data_strict_multi(data)?;
             if let Some(reasoning_chunk) = reasoning_chunk_to_emit {
-                return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk)));
+                chunks.retain(|chunk| !matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
+                chunks.insert(0, LLMChunk::ReasoningToken(reasoning_chunk));
             }
 
-            let chunk = parse_openai_compat_sse_data_strict(data)?;
-            match chunk {
-                LLMChunk::Done => {
-                    if !logged_summary
-                        && (requested_reasoning.is_some() || observed_reasoning_signal)
-                    {
-                        tracing::info!(
-                            "OpenAI chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
-                            model_for_log,
-                            requested_reasoning
-                                .map(ReasoningEffort::as_str)
-                                .unwrap_or("none"),
-                            observed_reasoning_signal,
-                            reasoning_chars
-                        );
-                        logged_summary = true;
-                    }
-                    Ok(Some(LLMChunk::Done))
-                }
-                other => Ok(Some(other)),
+            if chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done))
+                && !logged_summary
+                && (requested_reasoning.is_some() || observed_reasoning_signal)
+            {
+                tracing::info!(
+                    "OpenAI chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                    model_for_log,
+                    requested_reasoning
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("none"),
+                    observed_reasoning_signal,
+                    reasoning_chars
+                );
+                logged_summary = true;
             }
+            Ok(chunks)
         });
 
         Ok(stream)
@@ -1062,6 +1058,52 @@ mod tests {
         );
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_production_stream_preserves_same_frame_text_and_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":768},\"completion_tokens_details\":{\"reasoning_tokens\":20}}}\n",
+                            "\n",
+                            "data: [DONE]\n",
+                            "\n",
+                        ),
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAIProvider::new("test-key").with_base_url(server.uri());
+
+        let mut stream = provider
+            .chat_stream(&[Message::user("hello")], &[], None, "gpt-4o")
+            .await
+            .expect("chat stream");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.expect("stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "answer"));
+        assert!(matches!(
+            chunks[1],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                reasoning_tokens: Some(20),
+                cache_read_input_tokens: Some(768),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[2], LLMChunk::Done));
     }
 
     #[tokio::test]

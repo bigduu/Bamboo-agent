@@ -14,9 +14,9 @@ use serde_json::json;
 use crate::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::openai_compat::{
-    build_openai_compat_body, parse_openai_compat_sse_data_strict,
+    build_openai_compat_body, parse_openai_compat_sse_data_strict_multi,
 };
-use crate::providers::common::sse::llm_stream_from_sse;
+use crate::providers::common::sse::{llm_stream_from_sse, llm_stream_from_sse_multi};
 use crate::types::LLMChunk;
 use bamboo_config::KeywordMaskingConfig;
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
@@ -237,15 +237,11 @@ impl BodhiProvider {
             )));
         }
 
-        let stream = llm_stream_from_sse(response, |_event, data| {
+        let stream = llm_stream_from_sse_multi(response, |_event, data| {
             if data.trim().is_empty() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
-            let chunk = parse_openai_compat_sse_data_strict(data)?;
-            match chunk {
-                LLMChunk::Done => Ok(Some(LLMChunk::Done)),
-                other => Ok(Some(other)),
-            }
+            parse_openai_compat_sse_data_strict_multi(data)
         });
 
         Ok(stream)
@@ -442,6 +438,7 @@ impl BodhiProvider {
 mod tests {
     use super::*;
     use bamboo_domain::FunctionSchema;
+    use futures::StreamExt;
     use serde_json::Value;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -472,6 +469,51 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn openai_proxy_stream_preserves_same_frame_text_and_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/openai/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":768}}}\n",
+                            "\n",
+                            "data: [DONE]\n",
+                            "\n",
+                        ),
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = BodhiProvider::new("test-key").with_base_url(server.uri());
+
+        let mut stream = provider
+            .chat_stream(&[Message::user("hello")], &[], None, "gpt-4o")
+            .await
+            .expect("Bodhi OpenAI proxy stream");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.expect("stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "answer"));
+        assert!(matches!(
+            chunks[1],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                cache_read_input_tokens: Some(768),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[2], LLMChunk::Done));
     }
 
     #[tokio::test]
