@@ -83,3 +83,31 @@ impl AgentError {
         matches!(self, AgentError::HookSuspended(_))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AgentError;
+
+    #[test]
+    fn empty_assistant_response_is_typed_and_has_secret_free_diagnostics() {
+        let with_id = AgentError::EmptyAssistantResponse {
+            response_id: Some("resp_740".to_string()),
+        };
+        assert!(matches!(
+            &with_id,
+            AgentError::EmptyAssistantResponse {
+                response_id: Some(response_id)
+            } if response_id == "resp_740"
+        ));
+        assert_eq!(
+            with_id.to_string(),
+            "Empty assistant response from LLM (response_id=Some(\"resp_740\"))"
+        );
+
+        let without_id = AgentError::EmptyAssistantResponse { response_id: None };
+        assert_eq!(
+            without_id.to_string(),
+            "Empty assistant response from LLM (response_id=None)"
+        );
+    }
+}
