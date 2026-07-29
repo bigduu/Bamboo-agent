@@ -94,11 +94,23 @@ pub struct StreamHandlingOutput {
     /// chunk was observed. Repeated cumulative snapshots are idempotent, absent
     /// fields do not erase known values, and explicit zeros remain `Some(0)`.
     pub provider_usage: Option<ProviderUsageSnapshot>,
-    /// Provider-reported total input when a [`bamboo_llm::LLMChunk::ProviderUsage`]
-    /// snapshot is available. Legacy cache-only chunks retain their historical
-    /// fresh-input semantics; callers can distinguish cached input through the
-    /// adjacent cache counters.
+    /// Normalized non-cached ("fresh") input, disjoint from the adjacent cache
+    /// counters. When a provider total is available this is derived from that
+    /// total with a saturating, cache-subset policy; the raw total remains in
+    /// [`Self::provider_usage`].
     pub input_tokens: u64,
+}
+
+impl StreamHandlingOutput {
+    /// Prompt usage for runtime budget enforcement.
+    ///
+    /// Provider-reported totals are authoritative when present. Legacy streams
+    /// retain their historical fallback to the flat fresh-input counter.
+    pub(crate) fn prompt_tokens_for_runtime_budget(&self) -> u64 {
+        self.provider_usage
+            .and_then(|usage| usage.input_tokens)
+            .unwrap_or(self.input_tokens)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

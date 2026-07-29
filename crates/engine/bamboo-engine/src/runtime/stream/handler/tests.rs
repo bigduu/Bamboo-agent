@@ -177,7 +177,7 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
             .await
             .expect("stream should succeed");
 
-    assert_eq!(output.input_tokens, 101);
+    assert_eq!(output.input_tokens, 72);
     assert_eq!(output.output_tokens, 37);
     assert_eq!(output.thinking_tokens, 11);
     assert_eq!(output.cache_creation_input_tokens, 0);
@@ -269,15 +269,14 @@ async fn openai_chat_usage_parser_reaches_stream_output_once() {
     .await
     .expect("stream should succeed");
 
-    assert_eq!(output.input_tokens, 1000);
+    assert_eq!(output.input_tokens, 232);
     assert_eq!(output.output_tokens, 120);
     assert_eq!(output.thinking_tokens, 20);
     assert_eq!(output.cache_creation_input_tokens, 0);
     assert_eq!(output.cache_read_input_tokens, 768);
     assert_eq!(
-        output.input_tokens - output.cache_read_input_tokens,
-        232,
-        "fresh input remains derivable from the authoritative total"
+        output.provider_usage.and_then(|usage| usage.input_tokens),
+        Some(1000)
     );
 }
 
@@ -313,15 +312,83 @@ async fn openai_responses_completed_usage_reaches_stream_output_once() {
 
     assert_eq!(output.response_id.as_deref(), Some("resp_usage"));
     assert_eq!(output.content, "answer");
-    assert_eq!(output.input_tokens, 55);
+    assert_eq!(output.input_tokens, 42);
     assert_eq!(output.output_tokens, 21);
     assert_eq!(output.thinking_tokens, 8);
     assert_eq!(output.cache_creation_input_tokens, 0);
     assert_eq!(output.cache_read_input_tokens, 13);
     assert_eq!(
-        output.input_tokens - output.cache_read_input_tokens,
-        42,
-        "fresh input remains derivable without emitting a second cache chunk"
+        output.provider_usage.and_then(|usage| usage.input_tokens),
+        Some(55)
+    );
+}
+
+#[tokio::test]
+async fn provider_total_clamps_flat_cache_subset_without_mutating_raw_snapshot() {
+    let aggregate_overflow = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: Some(50),
+                cache_read_input_tokens: Some(80),
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-cache-overflow",
+    )
+    .await
+    .expect("aggregate cache overflow");
+
+    assert_eq!(aggregate_overflow.input_tokens, 0);
+    assert_eq!(aggregate_overflow.cache_read_input_tokens, 80);
+    assert_eq!(aggregate_overflow.cache_creation_input_tokens, 20);
+    assert_eq!(
+        aggregate_overflow.input_tokens
+            + aggregate_overflow.cache_read_input_tokens
+            + aggregate_overflow.cache_creation_input_tokens,
+        100
+    );
+    assert_eq!(
+        aggregate_overflow.provider_usage,
+        Some(ProviderUsageSnapshot {
+            input_tokens: Some(100),
+            output_tokens: None,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: Some(50),
+            cache_read_input_tokens: Some(80),
+        }),
+        "raw anomalous provider values remain available for diagnostics"
+    );
+
+    let cache_exceeds_input = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_creation_input_tokens: Some(30),
+                cache_read_input_tokens: Some(120),
+            }),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-cache-exceeds-input",
+    )
+    .await
+    .expect("cache exceeds input");
+
+    assert_eq!(cache_exceeds_input.input_tokens, 0);
+    assert_eq!(cache_exceeds_input.cache_read_input_tokens, 100);
+    assert_eq!(cache_exceeds_input.cache_creation_input_tokens, 0);
+    assert_eq!(
+        cache_exceeds_input.input_tokens
+            + cache_exceeds_input.cache_read_input_tokens
+            + cache_exceeds_input.cache_creation_input_tokens,
+        100,
+        "normalized compatibility fields never exceed authoritative input"
     );
 }
 

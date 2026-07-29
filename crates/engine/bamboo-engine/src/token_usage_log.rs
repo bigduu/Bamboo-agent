@@ -37,6 +37,9 @@ pub struct TokenUsageRecord {
     /// `input_tokens + cache_read + cache_creation`, and the exact cache-hit
     /// ratio is `cache_read / that_sum`.
     pub input_tokens: u64,
+    /// Total provider output. For reasoning-capable OpenAI-compatible models,
+    /// `thinking_tokens` is a subset breakdown of this value, not an additional
+    /// quantity.
     pub output_tokens: u64,
     pub thinking_tokens: u64,
 
@@ -144,5 +147,34 @@ mod tests {
         assert!(line.contains("\"cache_read_input_tokens\":12000"));
         assert!(line.contains("\"input_tokens\":800"));
         assert!(line.contains("\"session_id\":\"sess-1\""));
+    }
+
+    #[test]
+    fn openai_flat_log_contract_keeps_fresh_cache_and_total_disjoint() {
+        let record = TokenUsageRecord::new(
+            "2026-07-29T00:00:00Z".to_string(),
+            "sess-openai",
+            "gpt-5",
+            "openai",
+            4,
+            None,
+            0,
+            768,
+            232,
+            120,
+            20,
+        );
+
+        let prompt_total = record
+            .input_tokens
+            .saturating_add(record.cache_read_input_tokens)
+            .saturating_add(record.cache_creation_input_tokens);
+        let cache_hit_ratio = record.cache_read_input_tokens as f64 / prompt_total as f64;
+
+        assert_eq!(record.input_tokens, 232);
+        assert_eq!(prompt_total, 1000);
+        assert!((cache_hit_ratio - 0.768).abs() < f64::EPSILON);
+        assert_eq!(record.output_tokens, 120);
+        assert_eq!(record.thinking_tokens, 20);
     }
 }

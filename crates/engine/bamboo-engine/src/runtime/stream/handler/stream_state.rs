@@ -97,6 +97,7 @@ impl StreamAccumulationState {
         // message_start. Take the max rather than accumulating so a delta that
         // echoes it does not double-count.
         self.input_tokens = self.input_tokens.max(input);
+        self.normalize_provider_input_compatibility_view();
     }
 
     /// Record an authoritative provider usage snapshot.
@@ -114,27 +115,72 @@ impl StreamAccumulationState {
         cache_creation_input_tokens: Option<u64>,
         cache_read_input_tokens: Option<u64>,
     ) {
-        let snapshot = self.provider_usage.get_or_insert_default();
-        if let Some(input_tokens) = input_tokens {
-            snapshot.input_tokens = Some(input_tokens);
-            self.input_tokens = input_tokens;
+        {
+            let snapshot = self.provider_usage.get_or_insert_default();
+            if let Some(input_tokens) = input_tokens {
+                snapshot.input_tokens = Some(input_tokens);
+            }
+            if let Some(output_tokens) = output_tokens {
+                snapshot.output_tokens = Some(output_tokens);
+            }
+            if let Some(reasoning_tokens) = reasoning_tokens {
+                snapshot.reasoning_tokens = Some(reasoning_tokens);
+            }
+            if let Some(cache_creation_input_tokens) = cache_creation_input_tokens {
+                snapshot.cache_creation_input_tokens = Some(cache_creation_input_tokens);
+            }
+            if let Some(cache_read_input_tokens) = cache_read_input_tokens {
+                snapshot.cache_read_input_tokens = Some(cache_read_input_tokens);
+            }
         }
+
         if let Some(output_tokens) = output_tokens {
-            snapshot.output_tokens = Some(output_tokens);
             self.output_tokens = output_tokens;
         }
         if let Some(reasoning_tokens) = reasoning_tokens {
-            snapshot.reasoning_tokens = Some(reasoning_tokens);
             self.thinking_tokens = reasoning_tokens;
         }
         if let Some(cache_creation_input_tokens) = cache_creation_input_tokens {
-            snapshot.cache_creation_input_tokens = Some(cache_creation_input_tokens);
             self.cache_creation_input_tokens = cache_creation_input_tokens;
         }
         if let Some(cache_read_input_tokens) = cache_read_input_tokens {
-            snapshot.cache_read_input_tokens = Some(cache_read_input_tokens);
             self.cache_read_input_tokens = cache_read_input_tokens;
         }
+        self.normalize_provider_input_compatibility_view();
+    }
+
+    /// Normalize the historical flat counters without mutating the raw provider
+    /// snapshot.
+    ///
+    /// Cache counts must form a subset of the authoritative prompt total so
+    /// legacy analytics can continue using
+    /// `fresh + cache_read + cache_creation`. Cache-read is retained first
+    /// because it carries the cache-hit/badge semantics; cache-creation is
+    /// clamped to the remaining total, and fresh input receives the remainder.
+    /// This also handles malformed `cache > input` reports without inflating
+    /// the normalized prompt beyond the provider total.
+    fn normalize_provider_input_compatibility_view(&mut self) {
+        let Some(snapshot) = self.provider_usage else {
+            return;
+        };
+        let Some(total_input_tokens) = snapshot.input_tokens else {
+            return;
+        };
+
+        let raw_cache_read = snapshot
+            .cache_read_input_tokens
+            .unwrap_or(self.cache_read_input_tokens);
+        let normalized_cache_read = raw_cache_read.min(total_input_tokens);
+        let after_cache_read = total_input_tokens.saturating_sub(normalized_cache_read);
+
+        let raw_cache_creation = snapshot
+            .cache_creation_input_tokens
+            .unwrap_or(self.cache_creation_input_tokens);
+        let normalized_cache_creation = raw_cache_creation.min(after_cache_read);
+
+        self.cache_read_input_tokens = normalized_cache_read;
+        self.cache_creation_input_tokens = normalized_cache_creation;
+        self.input_tokens = after_cache_read.saturating_sub(normalized_cache_creation);
     }
 
     pub(super) fn into_output(self) -> StreamHandlingOutput {

@@ -508,10 +508,16 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
         other => panic!("unexpected second event: {other:?}"),
     }
 
-    assert_eq!(stream_output.input_tokens, 100);
+    assert_eq!(stream_output.input_tokens, 66);
     assert_eq!(stream_output.output_tokens, 80);
     assert_eq!(stream_output.thinking_tokens, 24);
     assert_eq!(stream_output.cache_read_input_tokens, 34);
+    assert_eq!(
+        stream_output
+            .provider_usage
+            .and_then(|usage| usage.input_tokens),
+        Some(100)
+    );
     assert_eq!(
         session
             .token_usage

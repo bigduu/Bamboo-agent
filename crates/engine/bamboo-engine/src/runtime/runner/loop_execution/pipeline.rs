@@ -150,7 +150,7 @@ impl RoundActivity {
     fn absorb_attempt(&mut self, stream_output: &StreamHandlingOutput) {
         self.prompt_tokens = self
             .prompt_tokens
-            .saturating_add(stream_output.input_tokens);
+            .saturating_add(stream_output.prompt_tokens_for_runtime_budget());
         self.completion_tokens = self
             .completion_tokens
             .saturating_add(stream_output.output_tokens);
@@ -4286,6 +4286,41 @@ mod tests {
         activity.absorb_attempt(&attempt(u64::MAX, u64::MAX, vec![]));
         assert_eq!(activity.prompt_tokens, u64::MAX);
         assert_eq!(activity.completion_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn round_activity_prefers_provider_prompt_total_without_adding_reasoning_twice() {
+        use crate::runtime::stream::handler::{ProviderUsageSnapshot, StreamHandlingOutput};
+
+        let output = StreamHandlingOutput {
+            response_id: None,
+            content: "answer".to_string(),
+            reasoning_content: "thought".to_string(),
+            reasoning_signature: None,
+            token_count: 6,
+            tool_calls: Vec::new(),
+            output_tokens: 120,
+            thinking_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 768,
+            provider_usage: Some(ProviderUsageSnapshot {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                reasoning_tokens: Some(20),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(768),
+            }),
+            input_tokens: 232,
+        };
+
+        let mut activity = super::RoundActivity::default();
+        activity.absorb_attempt(&output);
+
+        assert_eq!(activity.prompt_tokens, 1000);
+        assert_eq!(
+            activity.completion_tokens, 120,
+            "reasoning is a subset of provider output, not additional output"
+        );
     }
 
     /// PR #539 review #2: `runtime.budget_exceeded_kind` must be cleared at
