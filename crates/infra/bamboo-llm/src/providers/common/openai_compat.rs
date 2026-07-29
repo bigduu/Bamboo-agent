@@ -10,6 +10,8 @@ use futures::{stream, StreamExt};
 use reqwest::Response;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::sse::{llm_stream_from_sse_multi, sse_error_is_present};
 use super::tool_schema::sanitize_openai_function_parameters_schema;
@@ -396,25 +398,35 @@ pub fn parse_openai_compat_sse_data_lenient_multi(data: &str) -> Result<Vec<LLMC
 /// arrives between those two signals. Stateless frame parsing therefore
 /// produces `Done -> ProviderUsage -> Done`.
 ///
-/// This Chat-only boundary defers every upstream `Done` until physical EOF,
-/// then emits exactly one terminal marker after all business and usage chunks.
-/// If parsing or transport fails, the error terminates the stream and no
-/// synthetic successful `Done` is emitted. Responses API streams deliberately
-/// continue to use the generic SSE adapter and retain their existing terminal
-/// parser semantics.
-pub fn openai_compat_chat_stream_from_sse<H>(response: Response, handler: H) -> LLMStream
+/// This Chat-only boundary defers `finish_reason` markers while usage may still
+/// follow. An explicit `[DONE]` emits the one terminal marker immediately and
+/// stops polling the HTTP body; when a provider omits `[DONE]`, a pending
+/// `finish_reason` is finalized at normal EOF. If parsing or transport fails,
+/// the error terminates the stream and no synthetic successful `Done` is
+/// emitted. Responses API streams deliberately continue to use the generic SSE
+/// adapter and retain their existing terminal parser semantics.
+pub fn openai_compat_chat_stream_from_sse<H>(response: Response, mut handler: H) -> LLMStream
 where
     H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
 {
     struct TerminalState {
         upstream: LLMStream,
-        saw_done: bool,
+        sentinel_seen: Arc<AtomicBool>,
+        pending_finish: bool,
         finished: bool,
     }
 
+    let sentinel_seen = Arc::new(AtomicBool::new(false));
+    let sentinel_seen_by_handler = Arc::clone(&sentinel_seen);
     let state = TerminalState {
-        upstream: llm_stream_from_sse_multi(response, handler),
-        saw_done: false,
+        upstream: llm_stream_from_sse_multi(response, move |event, data| {
+            if data.trim() == "[DONE]" {
+                sentinel_seen_by_handler.store(true, Ordering::Release);
+            }
+            handler(event, data)
+        }),
+        sentinel_seen,
+        pending_finish: false,
         finished: false,
     };
 
@@ -426,14 +438,18 @@ where
         loop {
             match state.upstream.next().await {
                 Some(Ok(LLMChunk::Done)) => {
-                    state.saw_done = true;
+                    if state.sentinel_seen.swap(false, Ordering::AcqRel) {
+                        state.finished = true;
+                        return Some((Ok(LLMChunk::Done), state));
+                    }
+                    state.pending_finish = true;
                 }
                 Some(Ok(chunk)) => return Some((Ok(chunk), state)),
                 Some(Err(error)) => {
                     state.finished = true;
                     return Some((Err(error), state));
                 }
-                None if state.saw_done => {
+                None if state.pending_finish => {
                     state.finished = true;
                     return Some((Ok(LLMChunk::Done), state));
                 }
@@ -1303,9 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn colocated_business_usage_and_finish_preserve_all_chunks_before_done() {
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
-        );
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n";
 
         for parse in [
             super::parse_openai_compat_sse_data_strict_multi as MultiParser,
@@ -1349,6 +1363,61 @@ mod tests {
             assert_eq!(chunks.len(), 2);
             assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
             assert!(matches!(chunks[1], LLMChunk::Done));
+        }
+    }
+
+    #[tokio::test]
+    async fn done_sentinel_terminates_without_waiting_for_http_eof() {
+        let body_stream = futures::stream::once(async {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+        })
+        .chain(futures::stream::pending::<
+            std::result::Result<bytes::Bytes, std::io::Error>,
+        >());
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(reqwest::Body::wrap_stream(body_stream))
+                .expect("streaming http response"),
+        );
+        let mut stream = super::openai_compat_chat_stream_from_sse(response, |_event, data| {
+            super::parse_openai_compat_sse_data_strict_multi(data)
+        });
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("[DONE] must not wait for physical EOF")
+            .expect("terminal chunk")
+            .expect("successful terminal chunk");
+        assert!(matches!(item, LLMChunk::Done));
+
+        let end = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream must stop polling the never-ending HTTP tail");
+        assert!(end.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_finish_and_done_signals_emit_one_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 1);
+            assert!(matches!(chunks[0], LLMChunk::Done));
         }
     }
 
