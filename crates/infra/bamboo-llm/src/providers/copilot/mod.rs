@@ -19,8 +19,8 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 
 use super::common::openai_compat::{
-    messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient_multi,
-    tools_to_openai_compat_json,
+    messages_to_openai_compat_json, openai_compat_chat_stream_from_sse,
+    parse_openai_compat_sse_data_lenient_multi, tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
     build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
@@ -1398,7 +1398,7 @@ impl LLMProvider for CopilotProvider {
                     }
 
                     if retry.status().is_success() {
-                        let stream = llm_stream_from_sse_multi(retry, |_event, data| {
+                        let stream = openai_compat_chat_stream_from_sse(retry, |_event, data| {
                             parse_openai_compat_sse_data_lenient_multi(data)
                         });
                         return Ok(stream);
@@ -1462,7 +1462,7 @@ impl LLMProvider for CopilotProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = llm_stream_from_sse_multi(response, move |_event, data| {
+        let stream = openai_compat_chat_stream_from_sse(response, move |_event, data| {
             let mut reasoning_chunk_to_emit: Option<String> = None;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 if let Some(delta) = v
@@ -1535,6 +1535,7 @@ impl LLMProvider for CopilotProvider {
 mod tests {
     use super::*;
     use bamboo_domain::FunctionSchema;
+    use futures::StreamExt;
 
     // Helper to skip tests in CODEX_SANDBOX environment
     fn should_skip() -> bool {
@@ -1579,6 +1580,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("required tool schema 'load_skill' was not offered"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_production_adapter_keeps_usage_before_one_terminal_done() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                    .to_string(),
+                )
+                .expect("http response"),
+        );
+        let mut stream = openai_compat_chat_stream_from_sse(response, |_event, data| {
+            parse_openai_compat_sse_data_lenient_multi(data)
+        });
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("Copilot chat stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
+        assert!(matches!(chunks[1], LLMChunk::ProviderUsage { .. }));
+        assert!(matches!(chunks[2], LLMChunk::Done));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                .count(),
+            1
+        );
     }
 
     #[test]

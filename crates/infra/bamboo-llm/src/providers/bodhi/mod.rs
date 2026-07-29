@@ -14,9 +14,10 @@ use serde_json::json;
 use crate::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::openai_compat::{
-    build_openai_compat_body, parse_openai_compat_sse_data_strict_multi,
+    build_openai_compat_body, openai_compat_chat_stream_from_sse,
+    parse_openai_compat_sse_data_strict_multi,
 };
-use crate::providers::common::sse::{llm_stream_from_sse, llm_stream_from_sse_multi};
+use crate::providers::common::sse::llm_stream_from_sse;
 use bamboo_config::KeywordMaskingConfig;
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
 
@@ -236,7 +237,7 @@ impl BodhiProvider {
             )));
         }
 
-        let stream = llm_stream_from_sse_multi(response, |_event, data| {
+        let stream = openai_compat_chat_stream_from_sse(response, |_event, data| {
             if data.trim().is_empty() {
                 return Ok(Vec::new());
             }
@@ -481,9 +482,7 @@ mod tests {
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(
                         concat!(
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":768}}}\n",
-                            "\n",
-                            "data: [DONE]\n",
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":768}}}\n",
                             "\n",
                         ),
                     ),
@@ -514,6 +513,13 @@ mod tests {
             }
         ));
         assert!(matches!(chunks[2], LLMChunk::Done));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

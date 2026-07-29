@@ -6,12 +6,16 @@
 
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePart, Role};
+use futures::{stream, StreamExt};
+use reqwest::Response;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use super::sse::sse_error_is_present;
+use super::sse::{llm_stream_from_sse_multi, sse_error_is_present};
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use crate::provider::{LLMError, Result};
+use crate::provider::{LLMError, LLMStream, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::ReasoningEffort;
 
@@ -385,12 +389,131 @@ pub fn parse_openai_compat_sse_data_lenient_multi(data: &str) -> Result<Vec<LLMC
     }
 }
 
+/// Build an OpenAI-compatible **Chat Completions** stream with one globally
+/// terminal [`LLMChunk::Done`].
+///
+/// Chat providers may signal completion twice: first with a choice
+/// `finish_reason`, then with the `[DONE]` SSE sentinel. When
+/// `stream_options.include_usage` is enabled, the cumulative usage trailer
+/// arrives between those two signals. Stateless frame parsing therefore
+/// produces `Done -> ProviderUsage -> Done`.
+///
+/// This Chat-only boundary defers `finish_reason` markers while usage may still
+/// follow. An explicit `[DONE]` emits the one terminal marker immediately and
+/// stops polling the HTTP body; when a provider omits `[DONE]`, a pending
+/// `finish_reason` is finalized at normal EOF. If parsing or transport fails,
+/// the error terminates the stream and no synthetic successful `Done` is
+/// emitted. Responses API streams deliberately continue to use the generic SSE
+/// adapter and retain their existing terminal parser semantics.
+pub fn openai_compat_chat_stream_from_sse<H>(response: Response, mut handler: H) -> LLMStream
+where
+    H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
+{
+    let sentinel_seen = Arc::new(AtomicBool::new(false));
+    let sentinel_seen_by_handler = Arc::clone(&sentinel_seen);
+    let upstream = llm_stream_from_sse_multi(response, move |event, data| {
+        if data.trim() == "[DONE]" {
+            sentinel_seen_by_handler.store(true, Ordering::Release);
+        }
+        handler(event, data)
+    });
+
+    coordinate_openai_compat_chat_terminal(upstream, sentinel_seen)
+}
+
+fn coordinate_openai_compat_chat_terminal(
+    upstream: LLMStream,
+    sentinel_seen: Arc<AtomicBool>,
+) -> LLMStream {
+    struct TerminalState {
+        upstream: LLMStream,
+        sentinel_seen: Arc<AtomicBool>,
+        pending_finish: bool,
+        finished: bool,
+    }
+
+    let state = TerminalState {
+        upstream,
+        sentinel_seen,
+        pending_finish: false,
+        finished: false,
+    };
+
+    Box::pin(stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
+
+        loop {
+            match state.upstream.next().await {
+                Some(Ok(LLMChunk::Done)) => {
+                    if state.sentinel_seen.swap(false, Ordering::AcqRel) {
+                        state.finished = true;
+                        return Some((Ok(LLMChunk::Done), state));
+                    }
+                    state.pending_finish = true;
+                    cooperative_yield_once().await;
+                }
+                Some(Ok(chunk)) => return Some((Ok(chunk), state)),
+                Some(Err(error)) => {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+                None if state.pending_finish => {
+                    state.finished = true;
+                    return Some((Ok(LLMChunk::Done), state));
+                }
+                None => return None,
+            }
+        }
+    }))
+}
+
+async fn cooperative_yield_once() {
+    // Suppressed finish markers are intentionally invisible to consumers, but
+    // an always-ready upstream can otherwise keep this `unfold` future inside
+    // one poll forever. Force exactly one self-waking Pending boundary so
+    // cancellation, timeouts, and sibling tasks remain observable.
+    let mut yielded = false;
+    futures::future::poll_fn(move |context| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::provider::Result;
     use crate::types::LLMChunk;
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
+    use futures::{Future, StreamExt};
+
+    type MultiParser = fn(&str) -> Result<Vec<LLMChunk>>;
+
+    async fn collect_chat_stream(body: &str, parse: MultiParser) -> Vec<Result<LLMChunk>> {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.to_string())
+                .expect("http response"),
+        );
+        let mut stream =
+            super::openai_compat_chat_stream_from_sse(response, move |_event, data| parse(data));
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item);
+        }
+        chunks
+    }
 
     fn tool_call(id: &str, name: &str) -> ToolCall {
         ToolCall {
@@ -1187,5 +1310,238 @@ mod tests {
         let out = super::messages_to_openai_compat_json(&messages);
 
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "");
+    }
+
+    #[tokio::test]
+    async fn official_usage_sequence_has_one_terminal_done_at_end() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 3);
+            assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
+            assert!(matches!(chunks[1], LLMChunk::ProviderUsage { .. }));
+            assert!(matches!(chunks[2], LLMChunk::Done));
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn colocated_business_usage_and_finish_preserve_all_chunks_before_done() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n";
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 4);
+            assert!(matches!(
+                &chunks[0],
+                LLMChunk::ToolCallsIndexed(calls)
+                    if calls.len() == 1 && calls[0].1.function.name == "search"
+            ));
+            assert!(matches!(&chunks[1], LLMChunk::Token(token) if token == "answer"));
+            assert!(matches!(chunks[2], LLMChunk::ProviderUsage { .. }));
+            assert!(matches!(chunks[3], LLMChunk::Done));
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_reason_without_usage_or_done_sentinel_completes_at_eof() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 2);
+            assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
+            assert!(matches!(chunks[1], LLMChunk::Done));
+        }
+    }
+
+    #[tokio::test]
+    async fn done_sentinel_terminates_without_waiting_for_http_eof() {
+        let body_stream = futures::stream::once(async {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+        })
+        .chain(futures::stream::pending::<
+            std::result::Result<bytes::Bytes, std::io::Error>,
+        >());
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(reqwest::Body::wrap_stream(body_stream))
+                .expect("streaming http response"),
+        );
+        let mut stream = super::openai_compat_chat_stream_from_sse(response, |_event, data| {
+            super::parse_openai_compat_sse_data_strict_multi(data)
+        });
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("[DONE] must not wait for physical EOF")
+            .expect("terminal chunk")
+            .expect("successful terminal chunk");
+        assert!(matches!(item, LLMChunk::Done));
+
+        let end = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream must stop polling the never-ending HTTP tail");
+        assert!(end.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_finish_and_done_signals_emit_one_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 1);
+            assert!(matches!(chunks[0], LLMChunk::Done));
+        }
+    }
+
+    #[test]
+    fn always_ready_duplicate_finish_source_has_bounded_poll_work() {
+        let upstream_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_in_stream = std::sync::Arc::clone(&upstream_polls);
+        let upstream: crate::provider::LLMStream =
+            Box::pin(futures::stream::poll_fn(move |_context| {
+                polls_in_stream.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::task::Poll::Ready(Some(Ok(LLMChunk::Done)))
+            }));
+        let sentinel_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut stream = super::coordinate_openai_compat_chat_terminal(upstream, sentinel_seen);
+        let mut next = Box::pin(stream.next());
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+
+        assert!(matches!(
+            next.as_mut().poll(&mut context),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            upstream_polls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one downstream poll must not spin through duplicate finish markers"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn infinite_duplicate_finish_source_is_cooperative_and_cancellable() {
+        let upstream_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polls_in_stream = std::sync::Arc::clone(&upstream_polls);
+        let upstream: crate::provider::LLMStream =
+            Box::pin(futures::stream::poll_fn(move |_context| {
+                polls_in_stream.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::task::Poll::Ready(Some(Ok(LLMChunk::Done)))
+            }));
+        let sentinel_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut stream = super::coordinate_openai_compat_chat_terminal(upstream, sentinel_seen);
+
+        let reader = tokio::spawn(async move { stream.next().await });
+        let sibling_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling_flag = std::sync::Arc::clone(&sibling_ran);
+        let sibling = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            sibling_flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        sibling.await.expect("sibling task");
+        assert!(sibling_ran.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            upstream_polls.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the infinite reader must have started before cancellation"
+        );
+        assert!(
+            !reader.is_finished(),
+            "duplicate finish markers must stay deferred"
+        );
+
+        reader.abort();
+        assert!(
+            reader
+                .await
+                .expect_err("reader must be aborted")
+                .is_cancelled(),
+            "a cooperative read must remain cancellable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_error_after_finish_reason_has_no_synthetic_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"error\":{\"message\":\"connection failed\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse).await;
+
+            assert_eq!(chunks.len(), 2);
+            assert!(matches!(
+                &chunks[0],
+                Ok(LLMChunk::Token(token)) if token == "partial"
+            ));
+            assert!(
+                matches!(&chunks[1], Err(crate::provider::LLMError::Stream(message))
+                if message.contains("connection failed"))
+            );
+            assert!(!chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(LLMChunk::Done))));
+        }
     }
 }
