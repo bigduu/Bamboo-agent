@@ -22,7 +22,8 @@ use bamboo_domain::ToolSchema;
 
 use super::common::model_fetcher;
 use super::common::openai_compat::{
-    build_openai_compat_body, parse_openai_compat_sse_data_strict_multi,
+    build_openai_compat_body, openai_compat_chat_stream_from_sse,
+    parse_openai_compat_sse_data_strict_multi,
 };
 use super::common::openai_responses::{
     build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
@@ -529,7 +530,7 @@ impl LLMProvider for OpenAIProvider {
                     .await?;
 
                 if fallback.status().is_success() {
-                    let stream = llm_stream_from_sse_multi(fallback, |_event, data| {
+                    let stream = openai_compat_chat_stream_from_sse(fallback, |_event, data| {
                         if data.trim().is_empty() {
                             return Ok(Vec::new());
                         }
@@ -580,7 +581,7 @@ impl LLMProvider for OpenAIProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = llm_stream_from_sse_multi(response, move |_event, data| {
+        let stream = openai_compat_chat_stream_from_sse(response, move |_event, data| {
             if data.trim().is_empty() {
                 return Ok(Vec::new());
             }
@@ -1061,7 +1062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_production_stream_preserves_same_frame_text_and_usage() {
+    async fn chat_completions_production_stream_defers_done_until_usage_trailer() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -1070,7 +1071,11 @@ mod tests {
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(
                         concat!(
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":768},\"completion_tokens_details\":{\"reasoning_tokens\":20}}}\n",
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n",
+                            "\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n",
+                            "\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":768},\"completion_tokens_details\":{\"reasoning_tokens\":20}}}\n",
                             "\n",
                             "data: [DONE]\n",
                             "\n",
@@ -1104,6 +1109,13 @@ mod tests {
             }
         ));
         assert!(matches!(chunks[2], LLMChunk::Done));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
