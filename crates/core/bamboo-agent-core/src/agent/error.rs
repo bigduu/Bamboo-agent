@@ -15,6 +15,17 @@ pub enum AgentError {
     #[error("LLM error: {0}")]
     LLM(String),
 
+    /// The provider completed an assistant response without visible content or
+    /// tool calls. Kept distinct from transient provider failures so turn-level
+    /// retry logic cannot replay the same billable empty response.
+    #[error("Empty assistant response from LLM (response_id={response_id:?})")]
+    EmptyAssistantResponse {
+        /// Provider response identifier when one was emitted. Response IDs are
+        /// diagnostic correlation handles; no request content or credentials
+        /// are retained here.
+        response_id: Option<String>,
+    },
+
     /// LLM request exceeded provider context/input limits and requires
     /// host-side overflow recovery before retry.
     #[error("LLM overflow: {0}")]
@@ -70,5 +81,33 @@ impl AgentError {
     /// Returns `true` when a lifecycle hook intentionally suspended the run.
     pub fn is_hook_suspended(&self) -> bool {
         matches!(self, AgentError::HookSuspended(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentError;
+
+    #[test]
+    fn empty_assistant_response_is_typed_and_has_secret_free_diagnostics() {
+        let with_id = AgentError::EmptyAssistantResponse {
+            response_id: Some("resp_740".to_string()),
+        };
+        assert!(matches!(
+            &with_id,
+            AgentError::EmptyAssistantResponse {
+                response_id: Some(response_id)
+            } if response_id == "resp_740"
+        ));
+        assert_eq!(
+            with_id.to_string(),
+            "Empty assistant response from LLM (response_id=Some(\"resp_740\"))"
+        );
+
+        let without_id = AgentError::EmptyAssistantResponse { response_id: None };
+        assert_eq!(
+            without_id.to_string(),
+            "Empty assistant response from LLM (response_id=None)"
+        );
     }
 }

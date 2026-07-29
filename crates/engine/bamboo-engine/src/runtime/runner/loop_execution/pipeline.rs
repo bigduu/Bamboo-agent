@@ -4569,6 +4569,19 @@ mod tests {
         assert!(should_retry_turn_error(&AgentError::LLM(
             "API error: HTTP 503: Service Unavailable".to_string(),
         )));
+    }
+
+    #[test]
+    fn empty_assistant_response_is_terminal_by_variant_not_message_text() {
+        assert!(!should_retry_turn_error(
+            &AgentError::EmptyAssistantResponse {
+                response_id: Some("resp_740".to_string()),
+            }
+        ));
+
+        // Unknown provider failures retain the existing allow-by-default
+        // behavior. The empty-response decision is made by the typed variant,
+        // not by matching this legacy message text.
         assert!(should_retry_turn_error(&AgentError::LLM(
             "empty assistant response".to_string(),
         )));
@@ -4708,6 +4721,7 @@ mod tests {
     fn test_map_turn_error_only_cancelled_gets_cancelled_status() {
         let errors = vec![
             AgentError::LLM("error".to_string()),
+            AgentError::EmptyAssistantResponse { response_id: None },
             AgentError::Tool("error".to_string()),
             AgentError::SessionNotFound("id".to_string()),
             AgentError::Budget("error".to_string()),
