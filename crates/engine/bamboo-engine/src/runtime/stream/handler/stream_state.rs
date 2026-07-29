@@ -85,8 +85,13 @@ impl StreamAccumulationState {
     }
 
     pub(super) fn record_usage(&mut self, output_tokens: u64, thinking_tokens: u64) {
-        self.output_tokens = output_tokens;
-        self.thinking_tokens = thinking_tokens;
+        let provider_usage = self.provider_usage.unwrap_or_default();
+        if provider_usage.output_tokens.is_none() {
+            self.output_tokens = output_tokens;
+        }
+        if provider_usage.reasoning_tokens.is_none() {
+            self.thinking_tokens = thinking_tokens;
+        }
     }
 
     pub(super) fn record_cache(&mut self, creation: u64, read: u64, input: u64) {
@@ -163,6 +168,18 @@ impl StreamAccumulationState {
         let Some(snapshot) = self.provider_usage else {
             return;
         };
+
+        // Provider cache fields are independently authoritative even when the
+        // provider omitted its input total. Restore them before considering
+        // legacy cache deltas so arrival order cannot turn one cumulative
+        // provider value into an accidental sum.
+        if let Some(cache_read_input_tokens) = snapshot.cache_read_input_tokens {
+            self.cache_read_input_tokens = cache_read_input_tokens;
+        }
+        if let Some(cache_creation_input_tokens) = snapshot.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = cache_creation_input_tokens;
+        }
+
         let Some(total_input_tokens) = snapshot.input_tokens else {
             return;
         };

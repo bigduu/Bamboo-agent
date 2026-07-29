@@ -463,6 +463,17 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: Some(34),
         },
+        // Later legacy summaries/cache frames must not overwrite authoritative
+        // provider fields or double the cache badge.
+        LLMChunk::UsageSummary {
+            output_tokens: 56,
+            thinking_tokens: 78,
+        },
+        LLMChunk::CacheUsage {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 34,
+            input_tokens: 66,
+        },
         LLMChunk::Done,
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();

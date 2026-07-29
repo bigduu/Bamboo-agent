@@ -153,7 +153,7 @@ impl RoundActivity {
             .saturating_add(stream_output.prompt_tokens_for_runtime_budget());
         self.completion_tokens = self
             .completion_tokens
-            .saturating_add(stream_output.output_tokens);
+            .saturating_add(stream_output.completion_tokens_for_runtime_budget());
         self.tool_call_count = self
             .tool_call_count
             .saturating_add(stream_output.tool_calls.len() as u32);
@@ -4292,15 +4292,17 @@ mod tests {
     fn round_activity_prefers_provider_prompt_total_without_adding_reasoning_twice() {
         use crate::runtime::stream::handler::{ProviderUsageSnapshot, StreamHandlingOutput};
 
-        let output = StreamHandlingOutput {
+        let mut output = StreamHandlingOutput {
             response_id: None,
             content: "answer".to_string(),
             reasoning_content: "thought".to_string(),
             reasoning_signature: None,
             token_count: 6,
             tool_calls: Vec::new(),
-            output_tokens: 120,
-            thinking_tokens: 20,
+            // Deliberately conflicting legacy flat values prove runtime
+            // guardrails consult the authoritative provider snapshot.
+            output_tokens: 56,
+            thinking_tokens: 78,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 768,
             provider_usage: Some(ProviderUsageSnapshot {
@@ -4320,6 +4322,18 @@ mod tests {
         assert_eq!(
             activity.completion_tokens, 120,
             "reasoning is a subset of provider output, not additional output"
+        );
+
+        output
+            .provider_usage
+            .as_mut()
+            .expect("provider usage")
+            .output_tokens = Some(0);
+        let mut zero_activity = super::RoundActivity::default();
+        zero_activity.absorb_attempt(&output);
+        assert_eq!(
+            zero_activity.completion_tokens, 0,
+            "explicit provider zero must beat a nonzero legacy flat value"
         );
     }
 

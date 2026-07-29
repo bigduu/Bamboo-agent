@@ -111,6 +111,16 @@ impl StreamHandlingOutput {
             .and_then(|usage| usage.input_tokens)
             .unwrap_or(self.input_tokens)
     }
+
+    /// Completion usage for runtime budget enforcement.
+    ///
+    /// A provider-reported output total (including explicit zero) wins over
+    /// legacy summaries. Reasoning is a subset breakdown and is never added.
+    pub(crate) fn completion_tokens_for_runtime_budget(&self) -> u64 {
+        self.provider_usage
+            .and_then(|usage| usage.output_tokens)
+            .unwrap_or(self.output_tokens)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
