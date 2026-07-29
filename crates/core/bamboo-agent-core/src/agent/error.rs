@@ -15,6 +15,17 @@ pub enum AgentError {
     #[error("LLM error: {0}")]
     LLM(String),
 
+    /// The provider completed an assistant response without visible content or
+    /// tool calls. Kept distinct from transient provider failures so turn-level
+    /// retry logic cannot replay the same billable empty response.
+    #[error("Empty assistant response from LLM (response_id={response_id:?})")]
+    EmptyAssistantResponse {
+        /// Provider response identifier when one was emitted. Response IDs are
+        /// diagnostic correlation handles; no request content or credentials
+        /// are retained here.
+        response_id: Option<String>,
+    },
+
     /// LLM request exceeded provider context/input limits and requires
     /// host-side overflow recovery before retry.
     #[error("LLM overflow: {0}")]

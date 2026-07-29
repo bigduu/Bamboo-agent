@@ -58,6 +58,7 @@ fn interruption_kind(error: &AgentError) -> &'static str {
         AgentError::Cancelled => "cancelled",
         AgentError::StreamTimeout(_) => "stream_timeout",
         AgentError::LLMOverflow(_) => "llm_overflow",
+        AgentError::EmptyAssistantResponse { .. } => "empty_assistant_response",
         AgentError::LLM(_) => "llm_error",
         _ => "execution_error",
     }
