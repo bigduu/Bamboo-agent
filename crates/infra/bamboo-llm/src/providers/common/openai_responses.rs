@@ -2168,6 +2168,32 @@ mod tests {
     }
 
     #[test]
+    fn parser_empty_output_text_done_does_not_hide_completed_message() {
+        let mut parser = ResponsesSseParser::new();
+        let done = parser
+            .handle_event(
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_terminal","output_index":0,"content_index":0,"text":""}"#,
+            )
+            .expect("empty text done");
+        assert!(done.is_none());
+
+        let completed = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"real terminal text"}]}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(completed.len(), 2);
+        assert!(matches!(
+            &completed[0],
+            LLMChunk::Token(text) if text == "real terminal text"
+        ));
+        assert!(matches!(completed[1], LLMChunk::Done));
+    }
+
+    #[test]
     fn parser_skips_output_text_done_after_streaming_delta_for_same_item() {
         let mut p = ResponsesSseParser::new();
         let _ = p
@@ -2210,6 +2236,36 @@ mod tests {
         match out {
             Some(LLMChunk::Token(t)) => assert_eq!(t, "hello from part done"),
             other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_empty_or_non_text_content_part_done_does_not_hide_completed_message() {
+        let done_payloads = [
+            r#"{"type":"response.content_part.done","item_id":"msg_terminal","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}"#,
+            r#"{"type":"response.content_part.done","item_id":"msg_terminal","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":"not output text"}}"#,
+        ];
+
+        for done_payload in done_payloads {
+            let mut parser = ResponsesSseParser::new();
+            let done = parser
+                .handle_event("response.content_part.done", done_payload)
+                .expect("content part done");
+            assert!(done.is_none());
+
+            let completed = parser
+                .handle_event_multi(
+                    "response.completed",
+                    r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"real terminal text"}]}]}}"#,
+                )
+                .expect("completed event");
+
+            assert_eq!(completed.len(), 2);
+            assert!(matches!(
+                &completed[0],
+                LLMChunk::Token(text) if text == "real terminal text"
+            ));
+            assert!(matches!(completed[1], LLMChunk::Done));
         }
     }
 
@@ -2674,6 +2730,39 @@ mod tests {
                 r#"{"type":"response.output_item.done","item_id":"fc_outer","item":{"type":"function_call"}}"#,
             )
             .expect("tool item done");
+
+        assert!(matches!(
+            chunk,
+            Some(LLMChunk::ToolCalls(calls))
+                if calls.len() == 1
+                    && calls[0].id == "call_outer"
+                    && calls[0].function.name == "search"
+                    && calls[0].function.arguments == r#"{"q":"outer"}"#
+        ));
+    }
+
+    #[test]
+    fn parser_sparse_function_done_call_id_reuses_outer_item_accumulator() {
+        let mut parser = ResponsesSseParser::new();
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item_id":"fc_outer","item":{"type":"function_call","call_id":"call_outer","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_outer","delta":"{\"q\":\"outer\"}"}"#,
+            )
+            .expect("tool arguments delta");
+
+        let chunk = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item_id":"fc_outer","item":{"type":"function_call","call_id":"call_outer"}}"#,
+            )
+            .expect("sparse tool item done");
 
         assert!(matches!(
             chunk,
