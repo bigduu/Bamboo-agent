@@ -1159,7 +1159,7 @@ impl ResponsesSseParser {
         Some(LLMChunk::ResponseId(response_id.to_string()))
     }
 
-    fn handle_event_value(&mut self, event_type: &str, v: &Value) -> Result<Option<LLMChunk>> {
+    fn handle_event_value(&mut self, event_type: &str, v: Value) -> Result<Option<LLMChunk>> {
         match event_type {
             // `summary_part.added` is typically a shape/placeholder signal; text is usually empty.
             "response.reasoning_summary_part.added" => {
@@ -1518,7 +1518,7 @@ impl ResponsesSseParser {
             return Ok(chunks);
         }
 
-        if let Some(chunk) = self.handle_event_value(event_type.as_str(), &v)? {
+        if let Some(chunk) = self.handle_event_value(event_type.as_str(), v)? {
             chunks.push(chunk);
         }
         Ok(chunks)
