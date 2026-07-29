@@ -119,6 +119,52 @@ pub fn cache_usage_from_openai_usage(usage: &Value) -> Option<LLMChunk> {
     })
 }
 
+/// Preserve every authoritative token field reported by an OpenAI-compatible
+/// terminal usage object in one [`LLMChunk::ProviderUsage`] snapshot.
+///
+/// Chat Completions and Responses use different field names, so both spellings
+/// are accepted. Each value remains optional: an explicit zero is retained,
+/// while an absent or non-numeric field is not synthesized. OpenAI reports
+/// reasoning tokens as a subset of output/completion tokens.
+pub fn provider_usage_from_openai_usage(usage: &Value) -> Option<LLMChunk> {
+    fn direct_u64(value: &Value, key: &str) -> Option<u64> {
+        value.get(key).and_then(Value::as_u64)
+    }
+
+    fn nested_u64(value: &Value, parent: &str, key: &str) -> Option<u64> {
+        value
+            .get(parent)
+            .and_then(|details| details.get(key))
+            .and_then(Value::as_u64)
+    }
+
+    let input_tokens =
+        direct_u64(usage, "prompt_tokens").or_else(|| direct_u64(usage, "input_tokens"));
+    let output_tokens =
+        direct_u64(usage, "completion_tokens").or_else(|| direct_u64(usage, "output_tokens"));
+    let reasoning_tokens = nested_u64(usage, "completion_tokens_details", "reasoning_tokens")
+        .or_else(|| nested_u64(usage, "output_tokens_details", "reasoning_tokens"))
+        .or_else(|| direct_u64(usage, "reasoning_tokens"));
+    let cache_read_input_tokens = nested_u64(usage, "prompt_tokens_details", "cached_tokens")
+        .or_else(|| nested_u64(usage, "input_tokens_details", "cached_tokens"));
+
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && reasoning_tokens.is_none()
+        && cache_read_input_tokens.is_none()
+    {
+        return None;
+    }
+
+    Some(LLMChunk::ProviderUsage {
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens,
+    })
+}
+
 /// Normalize a Gemini `usageMetadata` object into a [`LLMChunk::CacheUsage`], if
 /// it reports cached content tokens (`cachedContentTokenCount`).
 pub fn cache_usage_from_gemini_usage(usage_metadata: &Value) -> Option<LLMChunk> {
@@ -203,6 +249,54 @@ mod tests {
         let usage = serde_json::json!({"prompt_tokens_details": {"cached_tokens": 0}});
         assert!(cache_usage_from_openai_usage(&usage).is_none());
         assert!(cache_usage_from_openai_usage(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn openai_provider_usage_preserves_chat_and_responses_fields() {
+        let chat = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 30,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 7}
+        });
+        assert!(matches!(
+            provider_usage_from_openai_usage(&chat),
+            Some(LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(30),
+                reasoning_tokens: Some(7),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(0),
+            })
+        ));
+
+        let responses = serde_json::json!({
+            "input_tokens": 80,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 24},
+            "output_tokens_details": {"reasoning_tokens": 5}
+        });
+        assert!(matches!(
+            provider_usage_from_openai_usage(&responses),
+            Some(LLMChunk::ProviderUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(20),
+                reasoning_tokens: Some(5),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(24),
+            })
+        ));
+    }
+
+    #[test]
+    fn openai_provider_usage_does_not_invent_missing_fields() {
+        assert!(provider_usage_from_openai_usage(&serde_json::json!({})).is_none());
+        assert!(provider_usage_from_openai_usage(&serde_json::json!({
+            "total_tokens": 42,
+            "prompt_tokens": null,
+            "output_tokens_details": {}
+        }))
+        .is_none());
     }
 
     #[test]

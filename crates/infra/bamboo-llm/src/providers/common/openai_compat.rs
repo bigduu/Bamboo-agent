@@ -209,11 +209,13 @@ struct OpenAICompatFunctionDelta {
 
 /// Convert a single OpenAI-compatible stream chunk into an [`LLMChunk`].
 pub fn parse_openai_compat_chunk(chunk: OpenAICompatStreamChunk) -> LLMChunk {
-    // Final usage chunk (empty choices): surface provider-side prompt cache hits
-    // so the cache badge works for OpenAI-compatible providers too.
+    // Final usage chunk (normally empty choices): preserve provider-reported
+    // input/output/reasoning totals and cache data together. Returning one
+    // combined snapshot is required because this parser emits one chunk per
+    // Chat Completions SSE event.
     if let Some(usage) = &chunk.usage {
-        if let Some(cache_chunk) = crate::cache::cache_usage_from_openai_usage(usage) {
-            return cache_chunk;
+        if let Some(usage_chunk) = crate::cache::provider_usage_from_openai_usage(usage) {
+            return usage_chunk;
         }
     }
 
@@ -723,31 +725,48 @@ mod tests {
     }
 
     #[test]
-    fn parse_openai_compat_usage_chunk_yields_cache_usage() {
-        // Final usage chunk with empty choices and cached prompt tokens.
-        let data = r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":768}}}"#;
+    fn parse_openai_compat_usage_chunk_preserves_totals_reasoning_and_cache() {
+        let data = r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":120,"prompt_tokens_details":{"cached_tokens":768},"completion_tokens_details":{"reasoning_tokens":20}}}"#;
 
         let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
 
-        match chunk {
-            LLMChunk::CacheUsage {
-                cache_read_input_tokens,
-                ..
-            } => assert_eq!(cache_read_input_tokens, 768),
-            other => panic!("expected LLMChunk::CacheUsage, got {other:?}"),
-        }
+        assert!(matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                reasoning_tokens: Some(20),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(768),
+            }
+        ));
     }
 
     #[test]
-    fn parse_openai_compat_usage_chunk_without_cache_yields_empty_token() {
-        let data = r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":0}}}"#;
+    fn parse_openai_compat_usage_chunk_preserves_totals_with_zero_cache() {
+        let data = r#"{"id":"chatcmpl_1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":120,"prompt_tokens_details":{"cached_tokens":0}}}"#;
 
         let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
 
-        match chunk {
-            LLMChunk::Token(token) => assert!(token.is_empty()),
-            other => panic!("expected empty LLMChunk::Token, got {other:?}"),
-        }
+        assert!(matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(0),
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_openai_compat_usage_chunk_does_not_invent_missing_totals() {
+        let data = r#"{"id":"chatcmpl_1","choices":[],"usage":{"total_tokens":1120}}"#;
+
+        let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
+
+        assert!(matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
     }
 
     #[test]
