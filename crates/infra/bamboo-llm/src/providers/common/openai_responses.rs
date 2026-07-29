@@ -2220,6 +2220,168 @@ mod tests {
         assert!(out.is_none());
     }
 
+    #[test]
+    fn parser_recovers_terminal_only_message_from_completed_output() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from completion"}]}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        match &chunks[0] {
+            LLMChunk::Token(text) => assert_eq!(text, "Hello from completion"),
+            other => panic!("expected terminal token, got {other:?}"),
+        }
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_recovers_terminal_only_function_call_from_completed_output() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"fc_terminal","type":"function_call","call_id":"call_terminal","name":"search","arguments":"{\"q\":\"bamboo\"}"}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        match &chunks[0] {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_terminal");
+                assert_eq!(calls[0].function.name, "search");
+                assert_eq!(calls[0].function.arguments, r#"{"q":"bamboo"}"#);
+            }
+            other => panic!("expected terminal tool call, got {other:?}"),
+        }
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_fallback_does_not_repeat_normally_streamed_text_or_tool() {
+        let mut parser = ResponsesSseParser::new();
+
+        let created = parser
+            .handle_event(
+                "response.created",
+                r#"{"type":"response.created","response":{"id":"resp_streamed"}}"#,
+            )
+            .expect("created event");
+        assert!(matches!(
+            created,
+            Some(LLMChunk::ResponseId(response_id)) if response_id == "resp_streamed"
+        ));
+
+        let text = parser
+            .handle_event(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_streamed","output_index":0,"content_index":0,"delta":"already streamed"}"#,
+            )
+            .expect("text delta");
+        assert!(matches!(
+            text,
+            Some(LLMChunk::Token(token)) if token == "already streamed"
+        ));
+
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_streamed","output_index":1,"delta":"{\"q\":\"streamed\"}"}"#,
+            )
+            .expect("tool arguments delta");
+        let tool = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":"{\"q\":\"streamed\"}"}}"#,
+            )
+            .expect("tool item done");
+        assert!(matches!(tool, Some(LLMChunk::ToolCalls(calls)) if calls.len() == 1));
+
+        let completed = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_streamed","output":[{"id":"msg_streamed","type":"message","content":[{"type":"output_text","text":"already streamed"}]},{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":"{\"q\":\"streamed\"}"}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(completed.len(), 1);
+        assert!(matches!(completed[0], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_output_preserves_multiple_mixed_items_and_ignores_unknowns() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"first"},{"type":"refusal","refusal":"ignored"},{"type":"output_text","text":" message"}]},{"type":"computer_call","id":"unknown_1"},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a\"}"},{"id":"fc_bad","type":"function_call","call_id":"call_bad","arguments":"{}"},{"id":"msg_2","type":"message","content":[{"type":"output_text","text":"second message"}]},{"id":"fc_2","type":"function_call","call_id":"call_2","name":"read_file","arguments":"{\"path\":\"b\"}"},null]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 5);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "first message"));
+        assert!(
+            matches!(&chunks[1], LLMChunk::ToolCalls(calls) if calls.len() == 1 && calls[0].id == "call_1")
+        );
+        assert!(matches!(&chunks[2], LLMChunk::Token(text) if text == "second message"));
+        assert!(
+            matches!(&chunks[3], LLMChunk::ToolCalls(calls) if calls.len() == 1 && calls[0].id == "call_2")
+        );
+        assert!(matches!(chunks[4], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_only_response_id_coexists_with_output_cache_and_done() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_terminal","output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"terminal answer"}]}],"usage":{"input_tokens":21,"input_tokens_details":{"cached_tokens":8}}}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 4);
+        assert!(matches!(&chunks[0], LLMChunk::ResponseId(id) if id == "resp_terminal"));
+        assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
+        assert!(matches!(
+            chunks[2],
+            LLMChunk::CacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 8,
+                input_tokens: 13,
+            }
+        ));
+        assert!(matches!(chunks[3], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_is_lenient_for_malformed_payloads() {
+        let mut parser = ResponsesSseParser::new();
+        assert!(parser
+            .handle_event_multi("response.completed", "not-json")
+            .expect("malformed keepalive")
+            .is_empty());
+
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":"not-an-array"}}"#,
+            )
+            .expect("malformed output");
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], LLMChunk::Done));
+    }
+
     /// #237 finding 4: an aggregator that puts a non-empty `arguments` snapshot
     /// in `output_item.added` AND also streams `function_call_arguments.delta`
     /// must not yield `snapshot + deltas`. The delta stream is authoritative, so
