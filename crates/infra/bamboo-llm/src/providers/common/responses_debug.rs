@@ -63,7 +63,7 @@ pub fn append_responses_sse_record(
     model: &str,
     event: &str,
     data: &str,
-    parsed: &Result<Option<LLMChunk>>,
+    parsed: &Result<Vec<LLMChunk>>,
 ) {
     if !debug_enabled() {
         return;
@@ -76,8 +76,8 @@ pub fn append_responses_sse_record(
     };
 
     let parsed_summary = match parsed {
-        Ok(Some(chunk)) => format!("ok:{chunk:?}"),
-        Ok(None) => "ok:none".to_string(),
+        Ok(chunks) if chunks.is_empty() => "ok:none".to_string(),
+        Ok(chunks) => format!("ok:{chunks:?}"),
         Err(error) => format!("err:{}", escaped(error.to_string().as_str())),
     };
 

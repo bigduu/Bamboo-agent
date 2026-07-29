@@ -27,7 +27,7 @@ use super::common::openai_responses::{
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::llm_stream_from_sse;
+use super::common::sse::{llm_stream_from_sse, llm_stream_from_sse_multi};
 
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
@@ -288,8 +288,8 @@ impl OpenAIProvider {
                 let mut parser =
                     ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
                 let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse(fallback, move |event, data| {
-                    let parsed = parser.handle_event(event, data);
+                let stream = llm_stream_from_sse_multi(fallback, move |event, data| {
+                    let parsed = parser.handle_event_multi(event, data);
                     append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
                     parsed
                 });
@@ -347,8 +347,8 @@ impl OpenAIProvider {
 
                 let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None);
                 let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse(fallback, move |event, data| {
-                    let parsed = parser.handle_event(event, data);
+                let stream = llm_stream_from_sse_multi(fallback, move |event, data| {
+                    let parsed = parser.handle_event_multi(event, data);
                     append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
                     parsed
                 });
@@ -360,8 +360,8 @@ impl OpenAIProvider {
 
         let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
         let model_for_debug = model.to_string();
-        let stream = llm_stream_from_sse(response, move |event, data| {
-            let parsed = parser.handle_event(event, data);
+        let stream = llm_stream_from_sse_multi(response, move |event, data| {
+            let parsed = parser.handle_event_multi(event, data);
             append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
             parsed
         });

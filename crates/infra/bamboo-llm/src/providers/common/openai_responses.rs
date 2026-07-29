@@ -5,8 +5,7 @@
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use crate::provider::ResponsesRequestOptions;
-use crate::provider::Result;
+use crate::provider::{LLMError, ResponsesRequestOptions, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::MessagePart;
 use bamboo_domain::ReasoningEffort;
@@ -455,6 +454,13 @@ pub struct ResponsesSseParser {
     // Output indexes that already surfaced any user-visible text stream.
     // Used to suppress redundant message snapshots in `response.output_item.done`.
     streamed_text_output_indexes: HashSet<i64>,
+    // Function-call item IDs, provider call IDs, and output indexes that already
+    // produced a downstream ToolCalls chunk. A completed response can repeat the
+    // authoritative output_item.done snapshot, so all three identities are
+    // retained to suppress the fallback without relying on any one optional key.
+    emitted_tool_item_ids: HashSet<String>,
+    emitted_tool_call_ids: HashSet<String>,
+    emitted_tool_output_indexes: HashSet<i64>,
     // Reasoning output item IDs that have already emitted summary text.
     streamed_reasoning_item_ids: HashSet<String>,
     // Some upstreams omit item_id on reasoning deltas; use the same done-fallback guard
@@ -507,6 +513,9 @@ impl ResponsesSseParser {
             text_delta_stream_keys: HashSet::new(),
             text_done_stream_keys: HashSet::new(),
             streamed_text_output_indexes: HashSet::new(),
+            emitted_tool_item_ids: HashSet::new(),
+            emitted_tool_call_ids: HashSet::new(),
+            emitted_tool_output_indexes: HashSet::new(),
             streamed_reasoning_item_ids: HashSet::new(),
             saw_unkeyed_reasoning_delta: false,
             reasoning_item_content: HashMap::new(),
@@ -600,6 +609,107 @@ impl ResponsesSseParser {
                 arguments: acc.arguments,
             },
         })
+    }
+
+    fn function_call_item_key(item: &Value, output_index: Option<i64>) -> Option<String> {
+        item.get("id")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("call_id").and_then(Value::as_str))
+            .map(str::to_string)
+            .filter(|id| !id.is_empty())
+            .or_else(|| output_index.map(|index| format!("output:{index}")))
+    }
+
+    fn tool_call_was_emitted(
+        &self,
+        item_key: &str,
+        call_id: Option<&str>,
+        output_index: Option<i64>,
+    ) -> bool {
+        self.emitted_tool_item_ids.contains(item_key)
+            || call_id.is_some_and(|id| self.emitted_tool_call_ids.contains(id))
+            || output_index.is_some_and(|index| self.emitted_tool_output_indexes.contains(&index))
+    }
+
+    fn mark_tool_call_emitted(&mut self, item_key: &str, call_id: &str, output_index: Option<i64>) {
+        self.emitted_tool_item_ids.insert(item_key.to_string());
+        if !call_id.is_empty() {
+            self.emitted_tool_call_ids.insert(call_id.to_string());
+        }
+        if let Some(output_index) = output_index {
+            self.emitted_tool_output_indexes.insert(output_index);
+        }
+    }
+
+    fn emit_function_call_item(
+        &mut self,
+        item: &Value,
+        output_index: Option<i64>,
+    ) -> Option<LLMChunk> {
+        let item_key = Self::function_call_item_key(item, output_index)?;
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if self.tool_call_was_emitted(item_key.as_str(), call_id, output_index) {
+            return None;
+        }
+
+        self.apply_done_fn_call_item(item_key.as_str(), item);
+        let call = self.finalize_tool_call(item_key.as_str())?;
+        self.mark_tool_call_emitted(item_key.as_str(), call.id.as_str(), output_index);
+        Some(LLMChunk::ToolCalls(vec![call]))
+    }
+
+    fn emit_completed_message_item(&mut self, item: &Value, output_index: i64) -> Option<LLMChunk> {
+        if self.streamed_text_output_indexes.contains(&output_index) {
+            return None;
+        }
+
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let text = Self::message_item_output_text(item);
+        let out = self.emit_done_text(item_id, text.as_str());
+        if out.is_some() {
+            self.streamed_text_output_indexes.insert(output_index);
+        }
+        out
+    }
+
+    fn completed_output_chunks(&mut self, value: &Value) -> Vec<LLMChunk> {
+        let Some(output) = value
+            .get("response")
+            .and_then(|response| response.get("output"))
+            .or_else(|| value.get("output"))
+            .and_then(Value::as_array)
+        else {
+            return Vec::new();
+        };
+
+        let mut chunks = Vec::new();
+        for (output_index, item) in output.iter().enumerate() {
+            let output_index = output_index as i64;
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message" => {
+                    if let Some(chunk) = self.emit_completed_message_item(item, output_index) {
+                        chunks.push(chunk);
+                    }
+                }
+                "function_call" => {
+                    if let Some(chunk) = self.emit_function_call_item(item, Some(output_index)) {
+                        chunks.push(chunk);
+                    }
+                }
+                // Unknown and malformed terminal items are intentionally ignored:
+                // gateways vary, and one unsupported output must not discard valid
+                // siblings from the same completed response.
+                _ => {}
+            }
+        }
+        chunks
     }
 
     fn text_item_id(v: &Value) -> Option<String> {
@@ -1039,18 +1149,7 @@ impl ResponsesSseParser {
         Some(LLMChunk::ResponseId(response_id.to_string()))
     }
 
-    pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            // Be lenient: some upstreams occasionally send non-JSON keepalives.
-            return Ok(None);
-        };
-
-        let event_type = self.event_type(event, &v);
-
-        if let Some(chunk) = self.maybe_emit_response_id(event_type, &v) {
-            return Ok(Some(chunk));
-        }
-
+    fn handle_event_value(&mut self, event_type: &str, v: &Value) -> Result<Option<LLMChunk>> {
         match event_type {
             // `summary_part.added` is typically a shape/placeholder signal; text is usually empty.
             "response.reasoning_summary_part.added" => {
@@ -1313,6 +1412,7 @@ impl ResponsesSseParser {
             "response.output_item.done" => {
                 // Emit tool call when the function_call item is done.
                 let item_id = Self::text_item_id(&v).unwrap_or_default();
+                let output_index = Self::text_output_index(&v);
 
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1331,7 +1431,6 @@ impl ResponsesSseParser {
                         ));
                     }
                     if item_type == "message" {
-                        let output_index = Self::text_output_index(&v);
                         if output_index
                             .is_some_and(|index| self.streamed_text_output_indexes.contains(&index))
                         {
@@ -1353,8 +1452,8 @@ impl ResponsesSseParser {
                         }
                         return Ok(out);
                     }
-                    if item_type == "function_call" && !item_id.is_empty() {
-                        self.apply_done_fn_call_item(&item_id, item);
+                    if item_type == "function_call" {
+                        return Ok(self.emit_function_call_item(item, output_index));
                     }
                 }
 
@@ -1365,29 +1464,66 @@ impl ResponsesSseParser {
                 let Some(call) = self.finalize_tool_call(&item_id) else {
                     return Ok(None);
                 };
-
+                self.mark_tool_call_emitted(item_id.as_str(), call.id.as_str(), output_index);
                 Ok(Some(LLMChunk::ToolCalls(vec![call])))
             }
 
-            "response.completed" => {
-                let usage = v
-                    .get("response")
-                    .and_then(|response| response.get("usage"))
-                    .or_else(|| v.get("usage"));
-                self.log_reasoning_summary_if_needed(usage);
-                // Surface provider-side prompt cache hits so the same accounting
-                // and frontend badge work for the Responses API. `Done` is only an
-                // informational log downstream (the stream terminates on EOF), so
-                // emitting CacheUsage here in its place is safe.
-                if let Some(cache_chunk) =
-                    usage.and_then(crate::cache::cache_usage_from_openai_usage)
-                {
-                    return Ok(Some(cache_chunk));
-                }
-                Ok(Some(LLMChunk::Done))
-            }
-
             _ => Ok(None),
+        }
+    }
+
+    /// Parse one Responses SSE event into every logical downstream chunk it carries.
+    ///
+    /// Most events produce zero or one chunk. `response.completed` can carry a
+    /// response ID, several output items, cache usage, and terminal completion in
+    /// the same frame; returning a vector keeps all of them without deferring state
+    /// to a later event that may never arrive.
+    pub fn handle_event_multi(&mut self, event: &str, data: &str) -> Result<Vec<LLMChunk>> {
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            // Be lenient: some upstreams occasionally send non-JSON keepalives.
+            return Ok(Vec::new());
+        };
+
+        let event_type = self.event_type(event, &v).to_string();
+        let mut chunks = Vec::new();
+        if let Some(chunk) = self.maybe_emit_response_id(event_type.as_str(), &v) {
+            chunks.push(chunk);
+        }
+
+        if event_type == "response.completed" {
+            chunks.extend(self.completed_output_chunks(&v));
+            let usage = v
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .or_else(|| v.get("usage"));
+            self.log_reasoning_summary_if_needed(usage);
+            if let Some(cache_chunk) = usage.and_then(crate::cache::cache_usage_from_openai_usage) {
+                chunks.push(cache_chunk);
+            }
+            chunks.push(LLMChunk::Done);
+            return Ok(chunks);
+        }
+
+        if let Some(chunk) = self.handle_event_value(event_type.as_str(), &v)? {
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+
+    /// Backward-compatible helper for callers that only accept one chunk per event.
+    ///
+    /// Responses provider streams use [`Self::handle_event_multi`]. Returning an
+    /// explicit error here prevents a multi-output terminal frame from being
+    /// silently truncated by legacy callers.
+    #[allow(dead_code)]
+    pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
+        let mut chunks = self.handle_event_multi(event, data)?;
+        match chunks.len() {
+            0 => Ok(None),
+            1 => Ok(chunks.pop()),
+            count => Err(LLMError::Stream(format!(
+                "Responses SSE event produced {count} chunks; use handle_event_multi"
+            ))),
         }
     }
 }
