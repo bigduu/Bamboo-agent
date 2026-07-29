@@ -6,12 +6,14 @@
 
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePart, Role};
+use futures::{stream, StreamExt};
+use reqwest::Response;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::sse::sse_error_is_present;
+use super::sse::{llm_stream_from_sse_multi, sse_error_is_present};
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use crate::provider::{LLMError, Result};
+use crate::provider::{LLMError, LLMStream, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::ReasoningEffort;
 
@@ -385,12 +387,89 @@ pub fn parse_openai_compat_sse_data_lenient_multi(data: &str) -> Result<Vec<LLMC
     }
 }
 
+/// Build an OpenAI-compatible **Chat Completions** stream with one globally
+/// terminal [`LLMChunk::Done`].
+///
+/// Chat providers may signal completion twice: first with a choice
+/// `finish_reason`, then with the `[DONE]` SSE sentinel. When
+/// `stream_options.include_usage` is enabled, the cumulative usage trailer
+/// arrives between those two signals. Stateless frame parsing therefore
+/// produces `Done -> ProviderUsage -> Done`.
+///
+/// This Chat-only boundary defers every upstream `Done` until physical EOF,
+/// then emits exactly one terminal marker after all business and usage chunks.
+/// If parsing or transport fails, the error terminates the stream and no
+/// synthetic successful `Done` is emitted. Responses API streams deliberately
+/// continue to use the generic SSE adapter and retain their existing terminal
+/// parser semantics.
+pub fn openai_compat_chat_stream_from_sse<H>(response: Response, handler: H) -> LLMStream
+where
+    H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
+{
+    struct TerminalState {
+        upstream: LLMStream,
+        saw_done: bool,
+        finished: bool,
+    }
+
+    let state = TerminalState {
+        upstream: llm_stream_from_sse_multi(response, handler),
+        saw_done: false,
+        finished: false,
+    };
+
+    Box::pin(stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
+
+        loop {
+            match state.upstream.next().await {
+                Some(Ok(LLMChunk::Done)) => {
+                    state.saw_done = true;
+                }
+                Some(Ok(chunk)) => return Some((Ok(chunk), state)),
+                Some(Err(error)) => {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+                None if state.saw_done => {
+                    state.finished = true;
+                    return Some((Ok(LLMChunk::Done), state));
+                }
+                None => return None,
+            }
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::provider::Result;
     use crate::types::LLMChunk;
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
+    use futures::StreamExt;
+
+    type MultiParser = fn(&str) -> Result<Vec<LLMChunk>>;
+
+    async fn collect_chat_stream(body: &str, parse: MultiParser) -> Vec<Result<LLMChunk>> {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(body.to_string())
+                .expect("http response"),
+        );
+        let mut stream =
+            super::openai_compat_chat_stream_from_sse(response, move |_event, data| parse(data));
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item);
+        }
+        chunks
+    }
 
     fn tool_call(id: &str, name: &str) -> ToolCall {
         ToolCall {
@@ -1187,5 +1266,118 @@ mod tests {
         let out = super::messages_to_openai_compat_json(&messages);
 
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "");
+    }
+
+    #[tokio::test]
+    async fn official_usage_sequence_has_one_terminal_done_at_end() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 3);
+            assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
+            assert!(matches!(chunks[1], LLMChunk::ProviderUsage { .. }));
+            assert!(matches!(chunks[2], LLMChunk::Done));
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn colocated_business_usage_and_finish_preserve_all_chunks_before_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 4);
+            assert!(matches!(
+                &chunks[0],
+                LLMChunk::ToolCallsIndexed(calls)
+                    if calls.len() == 1 && calls[0].1.function.name == "search"
+            ));
+            assert!(matches!(&chunks[1], LLMChunk::Token(token) if token == "answer"));
+            assert!(matches!(chunks[2], LLMChunk::ProviderUsage { .. }));
+            assert!(matches!(chunks[3], LLMChunk::Done));
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_reason_without_usage_or_done_sentinel_completes_at_eof() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .expect("successful stream");
+
+            assert_eq!(chunks.len(), 2);
+            assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
+            assert!(matches!(chunks[1], LLMChunk::Done));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_after_finish_reason_has_no_synthetic_done() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"error\":{\"message\":\"connection failed\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        for parse in [
+            super::parse_openai_compat_sse_data_strict_multi as MultiParser,
+            super::parse_openai_compat_sse_data_lenient_multi as MultiParser,
+        ] {
+            let chunks = collect_chat_stream(body, parse).await;
+
+            assert_eq!(chunks.len(), 2);
+            assert!(matches!(
+                &chunks[0],
+                Ok(LLMChunk::Token(token)) if token == "partial"
+            ));
+            assert!(
+                matches!(&chunks[1], Err(crate::provider::LLMError::Stream(message))
+                if message.contains("connection failed"))
+            );
+            assert!(!chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(LLMChunk::Done))));
+        }
     }
 }
