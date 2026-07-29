@@ -315,7 +315,7 @@ fn verify_password(config: &Config, password: &str) -> bool {
     let Some(access) = config.access_control.as_ref() else {
         return false;
     };
-    if !access.password_enabled {
+    if access.repair_required || !access.password_enabled {
         return false;
     }
 
@@ -408,6 +408,9 @@ pub(crate) fn verify_device_token(config: &Config, device_id: &str, token: &str)
     let Some(access) = config.access_control.as_ref() else {
         return false;
     };
+    if access.repair_required {
+        return false;
+    }
     // device_id is a public, non-secret companion id; a plain `==` lookup here is
     // intentional. Only the token hash compare below must be constant-time.
     let Some(device) = access.devices.iter().find(|d| d.device_id == device_id) else {
@@ -431,6 +434,13 @@ fn has_active_devices(config: &Config) -> bool {
         .as_ref()
         .map(|access| access.devices.iter().any(|d| !d.revoked))
         .unwrap_or(false)
+}
+
+fn access_repair_required(config: &Config) -> bool {
+    config
+        .access_control
+        .as_ref()
+        .is_some_and(|access| access.repair_required)
 }
 
 /// Extract a presented device token from a request.
@@ -477,7 +487,7 @@ fn request_has_valid_device_token(req: &HttpRequest, config: &Config) -> bool {
 
 fn access_verification_cookie_value(config: &Config) -> Option<String> {
     let access = config.access_control.as_ref()?;
-    if !access.password_enabled {
+    if access.repair_required || !access.password_enabled {
         return None;
     }
 
@@ -575,6 +585,14 @@ fn is_public_access_route(path: &str) -> bool {
 /// This MUST stay a pure extraction of the middleware's prior allow expression:
 /// changing it changes the gate for every route at once.
 pub(crate) fn request_is_authorized(req: &HttpRequest, config: &Config) -> bool {
+    if access_repair_required(config) {
+        // A quarantined access document may still contain a verifier that was
+        // structurally recoverable. Do not let that partial recovery reopen
+        // remote access. The existing loopback/localhost bypass remains the
+        // only allow path until an explicit repair/reset transaction clears
+        // the server-owned flag.
+        return is_local_request(req);
+    }
     !build_access_status(config, req).requires_password
         || request_has_verified_access_cookie(req, config)
         || request_has_valid_device_token(req, config)
@@ -651,25 +669,14 @@ fn build_access_status(config: &Config, req: &HttpRequest) -> AccessStatusRespon
     let password_enabled = config
         .access_control
         .as_ref()
-        .map(|access| {
-            access.password_enabled
-                && access
-                    .password_hash
-                    .as_deref()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false)
-                && access
-                    .password_salt
-                    .as_deref()
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false)
-        })
+        .map(|access| access.password_enabled)
         .unwrap_or(false);
     let local_bypass = is_local_request(req);
     // v2-P2 (#181): once any device is paired, public access requires a
     // credential even if the root password itself is unset — the device tokens
     // become the gating mechanism. No devices + no password ⇒ unchanged behavior.
-    let credential_required = password_enabled || has_active_devices(config);
+    let credential_required =
+        password_enabled || has_active_devices(config) || access_repair_required(config);
 
     AccessStatusResponse {
         password_enabled,
@@ -680,42 +687,27 @@ fn build_access_status(config: &Config, req: &HttpRequest) -> AccessStatusRespon
 
 fn build_exact_access_status(
     config: &Config,
-    statuses: &[bamboo_config::CredentialStatus],
-    health: &bamboo_config::CredentialStoreHealth,
+    _statuses: &[bamboo_config::CredentialStatus],
+    _health: &bamboo_config::CredentialStoreHealth,
     req: &HttpRequest,
 ) -> AccessStatusResponse {
-    let status_for = |reference: &bamboo_config::CredentialRef| {
-        statuses
-            .iter()
-            .find(|status| &status.credential_ref == reference)
-    };
-    let password_enabled = config.access_control.as_ref().is_some_and(|access| {
-        access.password_enabled
-            && credential_status_view(
-                access.password_credential_ref.as_ref(),
-                access.password_configured,
-                access.password_credential_ref.as_ref().and_then(status_for),
-                health,
-            )
-            .configured
-    });
-    let has_device = config.access_control.as_ref().is_some_and(|access| {
-        access.devices.iter().any(|device| {
-            !device.revoked
-                && credential_status_view(
-                    device.token_credential_ref.as_ref(),
-                    device.token_configured,
-                    device.token_credential_ref.as_ref().and_then(status_for),
-                    health,
-                )
-                .configured
-        })
-    });
+    // Durable `password_enabled` is the authentication intent. Missing or
+    // unreadable verifier material is a degraded repair state, not permission
+    // to silently reopen remote access; verification will simply fail closed.
+    let password_enabled = config
+        .access_control
+        .as_ref()
+        .is_some_and(|access| access.password_enabled);
+    let has_device = config
+        .access_control
+        .as_ref()
+        .is_some_and(|access| access.devices.iter().any(|device| !device.revoked));
+    let repair_required = access_repair_required(config);
     let local_bypass = is_local_request(req);
     AccessStatusResponse {
         password_enabled,
         local_bypass,
-        requires_password: (password_enabled || has_device) && !local_bypass,
+        requires_password: (password_enabled || has_device || repair_required) && !local_bypass,
     }
 }
 
@@ -1643,6 +1635,82 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn quarantined_access_is_fail_closed_and_recovery_credentials_stay_private() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0xb7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let secret_fragment = "server-api-private-access-fragment";
+        let mut root = serde_json::to_value(Config::default()).unwrap();
+        root["access_control"] = serde_json::json!({
+            "password_enabled": "yes",
+            "password_hash": secret_fragment
+        });
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec_pretty(&root).unwrap(),
+        )
+        .unwrap();
+
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        assert!(state
+            .config
+            .read()
+            .await
+            .access_control
+            .as_ref()
+            .is_some_and(|access| access.repair_required));
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/access/status", web::get().to(get_access_status))
+                .route(
+                    "/credentials",
+                    web::get().to(crate::handlers::settings::list_credentials),
+                )
+                .route(
+                    "/credentials/{credential_ref}",
+                    web::get().to(crate::handlers::settings::get_credential_status),
+                ),
+        )
+        .await;
+
+        let status = test::call_service(
+            &app,
+            TestRequest::get()
+                .uri("/access/status")
+                .peer_addr("203.0.113.8:5700".parse().unwrap())
+                .insert_header((header::HOST, "bamboo.example.com"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        let status: serde_json::Value = test::read_body_json(status).await;
+        assert_eq!(status["requires_password"], true);
+        assert_eq!(status["status"], "degraded");
+        let serialized_status = status.to_string();
+        assert!(!serialized_status.contains("access_repair."));
+        assert!(!serialized_status.contains(secret_fragment));
+
+        let list =
+            test::call_service(&app, TestRequest::get().uri("/credentials").to_request()).await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let serialized_list = String::from_utf8(test::read_body(list).await.to_vec()).unwrap();
+        assert!(!serialized_list.contains("access_repair."));
+        assert!(!serialized_list.contains(secret_fragment));
+
+        let direct = test::call_service(
+            &app,
+            TestRequest::get()
+                .uri("/credentials/access_repair.root.payload")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(direct.status(), StatusCode::BAD_REQUEST);
+        let direct = String::from_utf8(test::read_body(direct).await.to_vec()).unwrap();
+        assert!(!direct.contains(secret_fragment));
+        assert!(!direct.contains("access_repair.root.payload"));
+    }
+
+    #[actix_web::test]
     async fn access_status_reports_valid_ciphertext_with_invalid_verifier_as_error() {
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
@@ -1702,9 +1770,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = test::read_body_json(response).await;
         assert_eq!(body["revision"], 1);
-        assert_eq!(body["password_enabled"], false);
+        assert_eq!(body["password_enabled"], true);
+        assert_eq!(body["requires_password"], true);
         assert_eq!(body["password_configured"], false);
         assert_eq!(body["credential_state"], "error");
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(
+            body["last_error"],
+            "access-control credential repair is required"
+        );
 
         let (_, revision, metadata, section) = state
             .update_access_control_credentials(1, true, BTreeSet::new(), |config| {
@@ -2140,6 +2214,7 @@ mod tests {
         let config = test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: true,
+                repair_required: false,
                 password_hash: Some(hash),
                 password_salt: Some(salt_hex),
                 password_credential_ref: None,
@@ -2161,6 +2236,7 @@ mod tests {
         test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: true,
+                repair_required: false,
                 password_hash: Some(hash),
                 password_salt: Some(salt_hex),
                 password_credential_ref: None,
@@ -2259,12 +2335,36 @@ mod tests {
     }
 
     #[test]
+    fn enabled_password_with_missing_verifier_fails_closed_for_remote_requests() {
+        let config = test_config! {
+            access_control: Some(AccessControlConfig {
+                password_enabled: true,
+                repair_required: false,
+                password_hash: None,
+                password_salt: None,
+                password_credential_ref: None,
+                password_configured: false,
+                updated_at: None,
+                devices: Vec::new(),
+            }),
+        };
+        let remote = remote_req();
+        let local = local_req();
+        assert!(build_access_status(&config, &remote).password_enabled);
+        assert!(build_access_status(&config, &remote).requires_password);
+        assert!(!verify_password(&config, "any-password"));
+        assert!(!request_is_authorized(&remote, &config));
+        assert!(request_is_authorized(&local, &config));
+    }
+
+    #[test]
     fn device_presence_requires_credential_even_without_password() {
         // A device paired but no root password still gates remote access.
         let (cred, _t) = issue_device_token("d");
         let config = test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: false,
+                repair_required: false,
                 password_hash: None,
                 password_salt: None,
                 password_credential_ref: None,
@@ -2326,6 +2426,7 @@ mod tests {
         let config = test_config! {
             access_control: Some(AccessControlConfig {
                 password_enabled: false,
+                repair_required: false,
                 password_hash: None,
                 password_salt: None,
                 password_credential_ref: None,
@@ -2368,6 +2469,39 @@ mod tests {
             .insert_header((DEVICE_ID_HEADER, device_id))
             .to_http_request();
         assert!(request_is_authorized(&req, &config));
+    }
+
+    #[test]
+    fn repair_required_rejects_valid_remote_credentials_but_keeps_local_bypass() {
+        let (cred, token) = issue_device_token("repair-device");
+        let device_id = cred.device_id.clone();
+        let mut config = config_with_password();
+        config.access_control.as_mut().unwrap().devices.push(cred);
+        let previously_valid_cookie = access_verification_cookie_value(&config)
+            .expect("healthy password verifier produces a cookie");
+        config.access_control.as_mut().unwrap().repair_required = true;
+
+        let remote_cookie = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .cookie(Cookie::new(
+                ACCESS_VERIFIED_COOKIE_NAME,
+                previously_valid_cookie,
+            ))
+            .to_http_request();
+        let remote_device = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {token}")))
+            .insert_header((DEVICE_ID_HEADER, device_id.clone()))
+            .to_http_request();
+
+        assert!(build_access_status(&config, &remote_cookie).requires_password);
+        assert!(!build_access_status(&config, &local_req()).requires_password);
+        assert!(!verify_password(&config, "secret"));
+        assert!(!verify_device_token(&config, &device_id, &token));
+        assert!(access_verification_cookie_value(&config).is_none());
+        assert!(!request_is_authorized(&remote_cookie, &config));
+        assert!(!request_is_authorized(&remote_device, &config));
+        assert!(request_is_authorized(&local_req(), &config));
     }
 
     #[test]

@@ -441,6 +441,9 @@ impl AppState {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
+                    if !event.public_workflow {
+                        continue;
+                    }
                     let event = match event.kind {
                         bamboo_skills::WorkflowCatalogEventKind::Changed => {
                             AgentEvent::WorkflowChanged {

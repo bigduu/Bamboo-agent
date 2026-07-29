@@ -88,10 +88,9 @@ async fn test_list_commands_includes_workflows_and_skills() {
     .await
     .expect("watcher should publish the imported workflow command");
 
-    assert_eq!(command["id"], "skill-example");
-    assert_eq!(command["type"], "skill");
-    assert_eq!(
-        command["description"],
-        "Imported legacy workflow 'example'."
-    );
+    assert_eq!(command["id"], "workflow-example");
+    assert_eq!(command["type"], "workflow");
+    assert!(command["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("Legacy workflow 'example'")));
 }

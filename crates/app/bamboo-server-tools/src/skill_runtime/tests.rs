@@ -1318,7 +1318,7 @@ Use this demo skill."#,
 }
 
 #[tokio::test]
-async fn session_workspace_catalog_selection_and_runtime_roots_are_isolated() {
+async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolated() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let global_skills = temp_dir.path().join("data/skills");
     let workspace_one = temp_dir.path().join("workspace-one");
@@ -1372,15 +1372,17 @@ async fn session_workspace_catalog_selection_and_runtime_roots_are_isolated() {
         .expect("initialize manager");
 
     let catalog_one = skill_manager
-        .store()
-        .workflow_catalog_for_workspace(&workspace_one)
+        .store_for_workspace(Some(&workspace_one))
         .await
-        .expect("workspace one catalog");
+        .expect("workspace one store")
+        .skill_catalog_snapshot()
+        .await;
     let catalog_two = skill_manager
-        .store()
-        .workflow_catalog_for_workspace(&workspace_two)
+        .store_for_workspace(Some(&workspace_two))
         .await
-        .expect("workspace two catalog");
+        .expect("workspace two store")
+        .skill_catalog_snapshot()
+        .await;
     assert_eq!(
         catalog_one
             .entries

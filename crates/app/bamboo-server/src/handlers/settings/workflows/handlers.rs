@@ -1,6 +1,5 @@
 use actix_web::{http::StatusCode, web, HttpResponse};
-use bamboo_skills::legacy::{LegacySyncOutcome, LegacyWorkflowMigrationOutcome};
-use bamboo_skills::types::SkillDefinition;
+use bamboo_skills::legacy::LegacyWorkflowMigrationOutcome;
 use bamboo_skills::LegacyWorkflowMigrationStatus;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -142,10 +141,10 @@ pub async fn list_workflow_catalog(
     };
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "no-store"))
-        .json(snapshot))
+        .json(snapshot.public_workflows()))
 }
 
-/// Clone one read-only workspace/plugin legacy workflow into the trusted
+/// Clone one read-only global/workspace/plugin legacy workflow into the trusted
 /// session workspace's canonical `.bamboo/skills/<id>/SKILL.md` bundle.
 ///
 /// The legacy source is never changed or removed, and an existing target is
@@ -257,9 +256,12 @@ pub async fn migrate_workflow(
         )));
     }
 
-    let source = store.get_skill_root(&workflow_id).await.map_err(|error| {
-        AppError::BadRequest(format!("Legacy workflow is unavailable: {error}"))
-    })?;
+    let source = store
+        .get_legacy_workflow_source(&workflow_id)
+        .await
+        .map_err(|error| {
+            AppError::BadRequest(format!("Legacy workflow is unavailable: {error}"))
+        })?;
     let source = tokio::fs::canonicalize(&source).await.map_err(|error| {
         AppError::BadRequest(format!("Legacy workflow source is unavailable: {error}"))
     })?;
@@ -295,11 +297,31 @@ pub async fn migrate_workflow(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(AppError::StorageError(error)),
         };
+    let global_workflows = app_state.app_data_dir.join("workflows");
+    let global_source_identity = match tokio::fs::symlink_metadata(&global_workflows).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            let canonical_app_data = tokio::fs::canonicalize(&app_state.app_data_dir).await?;
+            let root = tokio::fs::canonicalize(&global_workflows).await?;
+            if root.starts_with(&canonical_app_data) && source.parent() == Some(root.as_path()) {
+                source
+                    .file_name()
+                    .and_then(|filename| filename.to_str())
+                    .map(|filename| format!("workflows/{filename}"))
+            } else {
+                None
+            }
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(AppError::StorageError(error)),
+    };
     let source_identity = workspace_source_identity
+        .or(global_source_identity)
         .or(plugin_source_identity)
         .ok_or_else(|| {
             AppError::Forbidden(
-                "Legacy workflow source is outside a migratable workspace/plugin scope".to_string(),
+                "Legacy workflow source is outside a migratable global/workspace/plugin scope"
+                    .to_string(),
             )
         })?;
 
@@ -358,20 +380,35 @@ pub async fn migrate_workflow(
 /// - `200 OK`: Successfully retrieved workflow list
 pub async fn list_workflows(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let workflows_dir = app_state.app_data_dir.join("workflows");
-    let mut workflows: Vec<WorkflowListItem> = app_state
-        .skill_manager
-        .store()
-        .list_skills(None, false)
-        .await
-        .into_iter()
-        .filter(|skill| legacy_source(skill, &workflows_dir).is_some())
-        .map(|skill| WorkflowListItem {
-            name: legacy_name(&skill).to_string(),
-            filename: format!("{}.md", legacy_name(&skill)),
-            size: skill.prompt.len() as u64,
+    let mut workflows = Vec::new();
+    let mut entries = match fs::read_dir(&workflows_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(legacy_response().json(workflows));
+        }
+        Err(error) => return Err(AppError::StorageError(error)),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(name) = filename.strip_suffix(".md") else {
+            continue;
+        };
+        if !is_safe_workflow_name(name) {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        workflows.push(WorkflowListItem {
+            name: name.to_string(),
+            filename,
+            size: entry.metadata().await?.len(),
             modified_at: None,
-        })
-        .collect();
+        });
+    }
 
     workflows.sort_by(|left, right| left.name.cmp(&right.name));
 
@@ -395,17 +432,20 @@ pub async fn get_workflow(
 
     let dir = app_state.app_data_dir.join("workflows");
     let filename = format!("{name}.md");
-    let skill_id = bamboo_skills::legacy::legacy_workflow_skill_id(&name);
-    let skill = app_state
-        .skill_manager
-        .store()
-        .get_skill(&skill_id)
-        .await
-        .map_err(|_| AppError::NotFound(format!("Workflow '{name}'")))?;
-    if legacy_source(&skill, &dir).is_none() || legacy_name(&skill) != name {
+    let file_path = dir.join(&filename);
+    let metadata = match fs::symlink_metadata(&file_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::NotFound(format!("Workflow '{name}'")));
+        }
+        Err(error) => return Err(AppError::StorageError(error)),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(AppError::NotFound(format!("Workflow '{name}'")));
     }
-    let content = skill.prompt;
+    let content = bamboo_skills::legacy::read_legacy_markdown_workflow(&file_path)
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Workflow '{name}' is invalid: {error}")))?;
     let size = content.len() as u64;
 
     Ok(legacy_response().json(WorkflowGetResponse {
@@ -435,24 +475,6 @@ pub async fn save_workflow(
     fs::create_dir_all(&dir).await?;
 
     let file_path = dir.join(format!("{}.md", name));
-    let skill_id = bamboo_skills::legacy::legacy_workflow_skill_id(name);
-    let preflight = bamboo_skills::legacy::legacy_bundle_preflight(
-        &file_path,
-        &app_state.app_data_dir.join("skills"),
-        &skill_id,
-    )
-    .await;
-    match preflight {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(AppError::BadRequest(format!(
-                "Workflow '{name}' conflicts with a non-legacy skill bundle"
-            )))
-        }
-        Err(error) => {
-            return Err(AppError::InternalError(anyhow::anyhow!(error)));
-        }
-    }
 
     let temporary = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
     let mut staging = fs::OpenOptions::new()
@@ -473,25 +495,12 @@ pub async fn save_workflow(
         return Err(error.into());
     }
 
-    // Source is authoritative and durable first. If bundle sync fails, the watcher/import pass
-    // retries from this committed source instead of leaving an unrecoverable split-brain write.
-    let outcome = bamboo_skills::legacy::sync_legacy_markdown_bundle(
-        &file_path,
-        &app_state.app_data_dir.join("skills"),
-        &skill_id,
-        &payload.content,
-    )
-    .await
-    .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
-    if outcome == LegacySyncOutcome::Conflict {
-        return Err(AppError::BadRequest(format!(
-            "Workflow '{name}' ownership changed during update; source was committed and will not overwrite the bundle"
-        )));
-    }
+    // The legacy source remains a Workflow. Reload discovers it through the
+    // read-only adapter; saving must never materialize or overwrite a Skill.
     app_state
         .skill_manager
         .store()
-        .reload()
+        .reload_global_workflow_views()
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
 
@@ -518,48 +527,34 @@ pub async fn delete_workflow(
 
     let dir = app_state.app_data_dir.join("workflows");
     let file_path = dir.join(format!("{}.md", name));
-    let skill_id = bamboo_skills::legacy::legacy_workflow_skill_id(&name);
-
-    if !file_path.exists() {
-        return Err(AppError::NotFound(format!("Workflow '{}'", name)));
+    let metadata = match fs::symlink_metadata(&file_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::NotFound(format!("Workflow '{name}'")));
+        }
+        Err(error) => return Err(AppError::StorageError(error)),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(AppError::NotFound(format!("Workflow '{name}'")));
     }
-
-    let removed_bundle = app_state
+    let skill_id = bamboo_skills::legacy::legacy_workflow_skill_id(&name);
+    let removed = app_state
         .skill_manager
         .store()
         .remove_legacy_workflow(&file_path, &skill_id)
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
-    if !removed_bundle {
-        return Err(AppError::BadRequest(format!(
-            "Workflow '{name}' is not owned by the legacy adapter"
-        )));
+    if !removed {
+        return Err(AppError::NotFound(format!("Workflow '{name}'")));
     }
+    app_state
+        .skill_manager
+        .store()
+        .reload_global_workflow_views()
+        .await
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
 
     Ok(legacy_response().json(serde_json::json!({ "success": true })))
-}
-
-fn legacy_source(skill: &SkillDefinition, workflows_dir: &std::path::Path) -> Option<String> {
-    let metadata = skill.metadata.as_ref()?;
-    if metadata
-        .get("legacy_import")
-        .and_then(|value| value.as_bool())
-        != Some(true)
-    {
-        return None;
-    }
-    let source = metadata.get("original_source")?.as_str()?;
-    let expected = workflows_dir.join(format!("{}.md", legacy_name(skill)));
-    (std::path::Path::new(source) == expected).then(|| source.to_string())
-}
-
-fn legacy_name(skill: &SkillDefinition) -> &str {
-    skill
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("legacy_name"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(&skill.id)
 }
 
 fn legacy_response() -> actix_web::HttpResponseBuilder {

@@ -14,6 +14,7 @@ use super::reset::remove_config_file_if_exists;
 fn access_control_fixture() -> bamboo_config::AccessControlConfig {
     bamboo_config::AccessControlConfig {
         password_enabled: true,
+        repair_required: false,
         password_hash: Some("a".repeat(64)),
         password_salt: Some("00112233445566778899aabbccddeeff".to_string()),
         password_credential_ref: None,

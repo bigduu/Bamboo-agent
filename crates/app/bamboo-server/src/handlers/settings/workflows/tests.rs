@@ -1,7 +1,7 @@
 use super::validation::is_safe_workflow_name;
 
 #[actix_web::test]
-async fn workflow_catalog_api_returns_metadata_without_skill_body() {
+async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_metadata() {
     let data = tempfile::tempdir().expect("data dir");
     let skill = data.path().join("skills/review");
     tokio::fs::create_dir_all(&skill).await.expect("skill dir");
@@ -11,6 +11,22 @@ async fn workflow_catalog_api_returns_metadata_without_skill_body() {
     )
     .await
     .expect("skill");
+    let workflow = data.path().join("skills/deploy");
+    tokio::fs::create_dir_all(&workflow)
+        .await
+        .expect("workflow dir");
+    tokio::fs::write(
+        workflow.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Deploys changes\n---\nWORKFLOW SECRET BODY\n",
+    )
+    .await
+    .expect("workflow skill");
+    tokio::fs::write(
+        workflow.join("workflow.yaml"),
+        "id: deploy\nname: Deploy\ndescription: Deploys changes\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .await
+    .expect("workflow metadata");
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
             .await
@@ -26,9 +42,11 @@ async fn workflow_catalog_api_returns_metadata_without_skill_body() {
         .to_request();
     let body = actix_web::test::call_and_read_body(&app, request).await;
     let text = std::str::from_utf8(&body).expect("utf8 response");
-    assert!(text.contains("Reviews changes"));
+    assert!(!text.contains("Reviews changes"));
+    assert!(text.contains("Deploys changes"));
     assert!(text.contains("\"revision\""));
     assert!(!text.contains("TOP SECRET INSTRUCTIONS"));
+    assert!(!text.contains("WORKFLOW SECRET BODY"));
     assert!(!text.contains("SKILL.md"));
 }
 
@@ -43,6 +61,12 @@ async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
     )
     .await
     .expect("skill");
+    tokio::fs::write(
+        skill.join("workflow.yaml"),
+        "id: global-review\nname: Global review\ndescription: Global review workflow\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .await
+    .expect("workflow metadata");
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
             .await
@@ -94,6 +118,13 @@ async fn assigned_project_workflow_catalog_reports_workspace_then_project_source
             format!("---\nname: {id}\ndescription: {description}\n---\nPROJECT BODY\n"),
         )
         .expect("write Project skill");
+        std::fs::write(
+            skill.join("workflow.yaml"),
+            format!(
+                "id: {id}\nname: {id}\ndescription: {description}\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {{}}\n"
+            ),
+        )
+        .expect("write Project workflow metadata");
     }
     let workspace_skill = workspace.path().join(".bamboo/skills/shared-workflow");
     std::fs::create_dir_all(&workspace_skill).expect("workspace skill");
@@ -102,6 +133,11 @@ async fn assigned_project_workflow_catalog_reports_workspace_then_project_source
         "---\nname: shared-workflow\ndescription: Workspace overlay workflow\n---\nWORKSPACE BODY\n",
     )
     .expect("write workspace skill");
+    std::fs::write(
+        workspace_skill.join("workflow.yaml"),
+        "id: shared-workflow\nname: shared-workflow\ndescription: Workspace overlay workflow\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .expect("write workspace workflow metadata");
 
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
@@ -258,7 +294,7 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
     );
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(state)
+            .app_data(state.clone())
             .route(
                 "/catalog",
                 actix_web::web::get().to(super::list_workflow_catalog),
@@ -333,6 +369,22 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
     assert_eq!(second["outcome"], "already_migrated");
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
 
+    let store = state
+        .skill_manager
+        .store_for_workspace(Some(workspace.path()))
+        .await
+        .expect("workspace SkillStore");
+    let skill_catalog = store.skill_catalog_snapshot().await;
+    let migrated_skill = skill_catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == "daily-report")
+        .expect("migrated Skill entry");
+    assert_eq!(
+        migrated_skill.migration_status,
+        Some(bamboo_skills::LegacyWorkflowMigrationStatus::Migrated)
+    );
+
     let after: serde_json::Value = actix_web::test::call_and_read_body_json(
         &app,
         actix_web::test::TestRequest::get()
@@ -340,21 +392,117 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
             .to_request(),
     )
     .await;
-    let migrated = after["entries"]
+    let source_workflow = after["entries"]
         .as_array()
         .expect("catalog entries")
         .iter()
         .find(|entry| entry["id"] == "daily-report")
-        .expect("migrated workflow entry");
-    assert_eq!(migrated["migration_status"], "migrated");
+        .expect("source Workflow entry");
+    assert_eq!(source_workflow["migration_status"], "available");
+    assert!(source_workflow.get("shadowed_candidates").is_none());
+}
+
+#[actix_web::test]
+async fn global_legacy_workflow_advertised_as_available_migrates_into_session_workspace() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let global_workflows = data.path().join("workflows");
+    std::fs::create_dir_all(&global_workflows).expect("global workflows");
+    let source = global_workflows.join("global-review.md");
+    let original =
+        "---\ndescription: Review changes from the global Workflow.\n---\nReview the diff.\n";
+    std::fs::write(&source, original).expect("global legacy workflow");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut session = bamboo_agent_core::Session::new("global-migration-session", "test-model");
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/catalog/{workflow_id}/migrate",
+                actix_web::web::post().to(super::migrate_workflow),
+            ),
+    )
+    .await;
+
+    let before: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=global-migration-session")
+            .to_request(),
+    )
+    .await;
+    let advertised = before["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .find(|entry| entry["id"] == "global-review")
+        .expect("global Workflow");
+    assert_eq!(advertised["source"], "user");
+    assert_eq!(advertised["migration_status"], "available");
+
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/global-review/migrate")
+            .set_json(serde_json::json!({
+                "session_id": "global-migration-session"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert_eq!(body["outcome"], "migrated");
+    assert_eq!(body["source_preserved"], true);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+
+    let target = workspace
+        .path()
+        .join(".bamboo/skills/global-review/SKILL.md");
+    let migrated = std::fs::read_to_string(&target).expect("migrated Skill");
+    assert!(migrated.contains("workflows/global-review.md"));
+    assert!(!migrated.contains(data.path().to_string_lossy().as_ref()));
+    let scoped = state
+        .skill_manager
+        .store_for_workspace(Some(workspace.path()))
+        .await
+        .expect("workspace store");
     assert_eq!(
-        migrated["shadowed_candidates"][0]["migration_status"],
-        "available"
+        scoped
+            .get_skill("global-review")
+            .await
+            .expect("real migrated Skill")
+            .prompt,
+        "Review the diff."
+    );
+    assert_eq!(
+        std::fs::canonicalize(
+            scoped
+                .get_legacy_workflow_source("global-review")
+                .await
+                .expect("preserved source Workflow")
+        )
+        .unwrap(),
+        std::fs::canonicalize(&source).unwrap()
     );
 }
 
 #[actix_web::test]
-async fn legacy_api_writes_through_bundle_and_bridges_catalog_event() {
+async fn legacy_api_keeps_workflow_source_only_and_bridges_catalog_event() {
     let data = tempfile::tempdir().expect("data dir");
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
@@ -372,6 +520,10 @@ async fn legacy_api_writes_through_bundle_and_bridges_catalog_event() {
             .route(
                 "/workflows/{name}",
                 actix_web::web::get().to(super::get_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::delete().to(super::delete_workflow),
             ),
     )
     .await;
@@ -389,10 +541,8 @@ async fn legacy_api_writes_through_bundle_and_bridges_catalog_event() {
     let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
     assert_eq!(body["content"], "Second body");
     assert!(
-        tokio::fs::read_to_string(data.path().join("skills/legacy/SKILL.md"))
-            .await
-            .expect("adapter bundle")
-            .contains("Second body")
+        !data.path().join("skills/legacy/SKILL.md").exists(),
+        "legacy Workflow writes must not materialize a Skill"
     );
 
     let bridged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -415,7 +565,285 @@ async fn legacy_api_writes_through_bundle_and_bridges_catalog_event() {
 }
 
 #[actix_web::test]
-async fn concurrent_legacy_updates_leave_source_and_bundle_consistent() {
+async fn global_workflow_create_update_delete_is_immediate_in_cached_session_views() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create("Workflow cache Project", None)
+        .expect("Project");
+    let mut workspace_session =
+        bamboo_agent_core::Session::new("workspace-cache-session", "test-model");
+    workspace_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        workspace_session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(workspace_session)),
+    );
+    let mut project_session =
+        bamboo_agent_core::Session::new("project-cache-session", "test-model");
+    project_session.set_project_id_meta(project.id.to_string());
+    project_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        project_session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(project_session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/workflows",
+                actix_web::web::post().to(super::save_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::delete().to(super::delete_workflow),
+            ),
+    )
+    .await;
+
+    let session_ids = ["workspace-cache-session", "project-cache-session"];
+    let mut initial_revisions = Vec::new();
+    for session_id in session_ids {
+        let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!("/catalog?session_id={session_id}"))
+                .to_request(),
+        )
+        .await;
+        initial_revisions.push(catalog["revision"].as_u64().expect("catalog revision"));
+        assert!(!catalog["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|entry| entry["id"] == "live-global"));
+    }
+
+    for (description, body) in [
+        ("First global Workflow.", "First body"),
+        ("Second global Workflow.", "Second body"),
+    ] {
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/workflows")
+                .set_json(serde_json::json!({
+                    "name": "live-global",
+                    "content": format!(
+                        "---\ndescription: {description}\n---\n{body}\n"
+                    )
+                }))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        for (index, session_id) in session_ids.iter().enumerate() {
+            let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri(&format!("/catalog?session_id={session_id}"))
+                    .to_request(),
+            )
+            .await;
+            assert!(catalog["revision"].as_u64().unwrap() > initial_revisions[index]);
+            let entry = catalog["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .find(|entry| entry["id"] == "live-global")
+                .expect("same-request publication");
+            assert_eq!(entry["description"], description);
+            assert_eq!(entry["migration_status"], "available");
+            initial_revisions[index] = catalog["revision"].as_u64().unwrap();
+        }
+    }
+
+    let deleted = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::delete()
+            .uri("/workflows/live-global")
+            .to_request(),
+    )
+    .await;
+    assert!(deleted.status().is_success());
+    for (index, session_id) in session_ids.iter().enumerate() {
+        let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!("/catalog?session_id={session_id}"))
+                .to_request(),
+        )
+        .await;
+        assert!(catalog["revision"].as_u64().unwrap() > initial_revisions[index]);
+        assert!(!catalog["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|entry| entry["id"] == "live-global"));
+    }
+}
+
+#[actix_web::test]
+async fn historical_legacy_import_remains_a_workflow_without_rewriting_its_bundle() {
+    let data = tempfile::tempdir().expect("data dir");
+    let source = data.path().join("workflows/legacy.md");
+    tokio::fs::create_dir_all(source.parent().expect("workflow parent"))
+        .await
+        .expect("workflow dir");
+    tokio::fs::write(&source, "Current Workflow source\n")
+        .await
+        .expect("workflow source");
+    let bundle = data.path().join("skills/legacy/SKILL.md");
+    tokio::fs::create_dir_all(bundle.parent().expect("bundle parent"))
+        .await
+        .expect("bundle dir");
+    let old_bundle = format!(
+        "---\nname: legacy\ndescription: Imported legacy workflow\nmetadata:\n  legacy_import: true\n  legacy_name: legacy\n  original_source: '{}'\n---\nHistorical copied body\n",
+        source.display()
+    );
+    tokio::fs::write(&bundle, &old_bundle)
+        .await
+        .expect("legacy bundle");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::get().to(super::get_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::delete().to(super::delete_workflow),
+            ),
+    )
+    .await;
+
+    let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let entry = catalog["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .find(|entry| entry["id"] == "legacy")
+        .expect("legacy Workflow");
+    assert_eq!(entry["legacy"], true);
+    assert_eq!(entry["migration_status"], "available");
+
+    let workflow: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/workflows/legacy")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(workflow["content"], "Current Workflow source\n");
+    assert_eq!(
+        tokio::fs::read_to_string(&bundle)
+            .await
+            .expect("bundle preserved"),
+        old_bundle
+    );
+
+    let deleted = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::delete()
+            .uri("/workflows/legacy")
+            .to_request(),
+    )
+    .await;
+    assert!(deleted.status().is_success());
+    assert!(!source.exists());
+    assert!(
+        !bundle.exists(),
+        "explicit deletion may clean only the adapter owned by this source"
+    );
+    let after: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    assert!(!after["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .any(|entry| entry["id"] == "legacy"));
+}
+
+#[actix_web::test]
+async fn deleting_legacy_source_never_deletes_a_same_id_ordinary_skill() {
+    let data = tempfile::tempdir().expect("data dir");
+    let source = data.path().join("workflows/shared.md");
+    tokio::fs::create_dir_all(source.parent().expect("workflow parent"))
+        .await
+        .expect("workflow dir");
+    tokio::fs::write(&source, "Workflow source\n")
+        .await
+        .expect("workflow source");
+    let skill = data.path().join("skills/shared/SKILL.md");
+    tokio::fs::create_dir_all(skill.parent().expect("skill parent"))
+        .await
+        .expect("skill dir");
+    let ordinary = "---\nname: shared\ndescription: Ordinary Skill\n---\nOrdinary Skill body\n";
+    tokio::fs::write(&skill, ordinary)
+        .await
+        .expect("ordinary skill");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/workflows/{name}",
+        actix_web::web::delete().to(super::delete_workflow),
+    ))
+    .await;
+
+    let deleted = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::delete()
+            .uri("/workflows/shared")
+            .to_request(),
+    )
+    .await;
+    assert!(deleted.status().is_success());
+    assert!(!source.exists());
+    assert_eq!(
+        tokio::fs::read_to_string(&skill)
+            .await
+            .expect("ordinary Skill preserved"),
+        ordinary
+    );
+}
+
+#[actix_web::test]
+async fn concurrent_legacy_updates_leave_one_source_and_no_skill_bundle() {
     let data = tempfile::tempdir().expect("data dir");
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
@@ -444,10 +872,11 @@ async fn concurrent_legacy_updates_leave_source_and_bundle_consistent() {
     let source = tokio::fs::read_to_string(data.path().join("workflows/race.md"))
         .await
         .expect("source");
-    let bundle = tokio::fs::read_to_string(data.path().join("skills/race/SKILL.md"))
-        .await
-        .expect("bundle");
-    assert!(bundle.contains(&source));
+    assert!(source == "body one" || source == "body two");
+    assert!(
+        !data.path().join("skills/race/SKILL.md").exists(),
+        "concurrent Workflow writes must not create a Skill"
+    );
     let mut entries = tokio::fs::read_dir(data.path().join("workflows"))
         .await
         .expect("workflow dir");

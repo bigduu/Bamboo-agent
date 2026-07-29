@@ -556,6 +556,80 @@ async fn snapshot_skill_resources(
     Ok(snapshots)
 }
 
+fn skill_metadata_flag(skill: &SkillDefinition, name: &str) -> bool {
+    skill.metadata.as_ref().is_some_and(|metadata| {
+        metadata.get(name).and_then(serde_json::Value::as_bool) == Some(true)
+    })
+}
+
+async fn loaded_record_is_workflow(
+    record: &LoadedSkillRecord,
+    previous_workflow_roots: &HashMap<SkillId, PathBuf>,
+) -> bool {
+    // Explicit user-requested migration materializes a real Skill. The
+    // read-only source adapter remains a separate Workflow with the same ID.
+    if skill_metadata_flag(&record.skill, "legacy_migration") {
+        return false;
+    }
+    if skill_metadata_flag(&record.skill, "legacy_adapter")
+        || skill_metadata_flag(&record.skill, "legacy_import")
+    {
+        return true;
+    }
+    if tokio::fs::try_exists(record.skill_root.join("workflow.yaml"))
+        .await
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    match load_bundle_metadata(&record.skill_root).await {
+        Ok(metadata) => metadata.kind == WorkflowKind::Orchestration,
+        Err(_) => previous_workflow_roots.get(&record.skill.id) == Some(&record.skill_root),
+    }
+}
+
+async fn failed_record_is_workflow(
+    record: &FailedSkillRecord,
+    previous_workflow_roots: &HashMap<SkillId, PathBuf>,
+) -> bool {
+    if record
+        .skill_root
+        .extension()
+        .and_then(|value| value.to_str())
+        == Some("md")
+        || tokio::fs::try_exists(record.skill_root.join("workflow.yaml"))
+            .await
+            .unwrap_or(false)
+    {
+        return true;
+    }
+    record
+        .skill_id
+        .as_ref()
+        .is_some_and(|id| previous_workflow_roots.get(id) == Some(&record.skill_root))
+}
+
+fn preserve_catalog_entry_revisions(
+    entries: &mut [WorkflowCatalogEntry],
+    previous_catalog: &WorkflowCatalogSnapshot,
+    definition_changed: &HashSet<String>,
+) {
+    for entry in entries {
+        let Some(previous) = previous_catalog
+            .entries
+            .iter()
+            .find(|previous| previous.id == entry.id)
+        else {
+            continue;
+        };
+        let mut comparable = entry.clone();
+        comparable.revision = previous.revision;
+        if !definition_changed.contains(&entry.id) && comparable == *previous {
+            entry.revision = previous.revision;
+        }
+    }
+}
+
 /// Persistent storage for skills with in-memory caching.
 ///
 /// Manages a collection of skills loaded from Markdown files on disk.
@@ -590,6 +664,14 @@ pub struct SkillStore {
     /// Immutable bytes for every resource in the currently published generation.
     /// Activations retain these snapshots after a watcher publishes a newer bundle.
     skill_resources: RwLock<HashMap<SkillId, SkillResourceSnapshot>>,
+    /// Policy metadata for prompt/explicit Skill activation only.
+    skill_catalog: RwLock<WorkflowCatalogSnapshot>,
+    /// Workflow definitions are published independently from Skills so equal
+    /// IDs can coexist without either identity shadowing the other.
+    workflow_definitions: RwLock<HashMap<SkillId, SkillDefinition>>,
+    workflow_roots: RwLock<HashMap<SkillId, PathBuf>>,
+    workflow_resources: RwLock<HashMap<SkillId, SkillResourceSnapshot>>,
+    /// Public Workflow catalog (legacy adapters and orchestration bundles).
     catalog: RwLock<WorkflowCatalogSnapshot>,
     /// Session/activation-scoped immutable workflow generations. The cache is bounded,
     /// and normal runtime finalization explicitly removes completed activations.
@@ -843,6 +925,10 @@ impl SkillStore {
             skills: RwLock::new(HashMap::new()),
             skill_roots: RwLock::new(HashMap::new()),
             skill_resources: RwLock::new(HashMap::new()),
+            skill_catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
+            workflow_definitions: RwLock::new(HashMap::new()),
+            workflow_roots: RwLock::new(HashMap::new()),
+            workflow_resources: RwLock::new(HashMap::new()),
             catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
             pinned_activations: RwLock::new(PinnedSkillActivations::default()),
             next_revision: AtomicU64::new(1),
@@ -905,17 +991,6 @@ impl SkillStore {
             .parent()
             .map(|parent| parent.join("workflows"))
             .unwrap_or_else(|| PathBuf::from("workflows"));
-        let report = crate::legacy::import_legacy_markdown_workflows(
-            &workflows_dir,
-            &self.config.skills_dir,
-        )
-        .await?;
-        if !report.imported.is_empty() {
-            info!("Imported legacy workflows as skills: {:?}", report.imported);
-        }
-        for diagnostic in report.diagnostics {
-            tracing::warn!("Legacy workflow import: {diagnostic}");
-        }
         self.create_builtin_skills().await?;
         for diagnostic in
             crate::legacy::migrate_legacy_yaml_workflows(&workflows_dir, &self.config.skills_dir)
@@ -961,6 +1036,13 @@ impl SkillStore {
         .await?;
         let mut legacy_dirs =
             crate::legacy::discover_plugin_legacy_workflow_dirs(&plugins_root).await;
+        if let Some(data_dir) = self.config.skills_dir.parent() {
+            legacy_dirs.push(SkillDiscoveryDir {
+                dir: data_dir.join("workflows"),
+                source: SkillDirectorySource::Global,
+                mode: None,
+            });
+        }
         if let Some(workspace) = self.workspace_overlay_dir.as_ref() {
             legacy_dirs.push(SkillDiscoveryDir {
                 dir: workspace.join(".bamboo").join("workflows"),
@@ -979,36 +1061,96 @@ impl SkillStore {
         report.loaded.extend(legacy_report.loaded);
         report.failed.extend(legacy_report.failed);
 
-        let (previous_skills, previous_roots, previous_resources, previous_catalog) = {
+        let (
+            previous_skills,
+            previous_roots,
+            previous_resources,
+            previous_skill_catalog,
+            previous_workflows,
+            previous_workflow_roots,
+            previous_workflow_resources,
+            previous_catalog,
+        ) = {
             let _snapshot_guard = self.snapshot_publish_lock.read().await;
             (
                 self.skills.read().await.clone(),
                 self.skill_roots.read().await.clone(),
                 self.skill_resources.read().await.clone(),
+                self.skill_catalog.read().await.clone(),
+                self.workflow_definitions.read().await.clone(),
+                self.workflow_roots.read().await.clone(),
+                self.workflow_resources.read().await.clone(),
                 self.catalog.read().await.clone(),
             )
         };
+        let mut skill_loaded = Vec::new();
+        let mut workflow_loaded = Vec::new();
+        for record in report.loaded {
+            if loaded_record_is_workflow(&record, &previous_workflow_roots).await {
+                workflow_loaded.push(record);
+            } else {
+                skill_loaded.push(record);
+            }
+        }
+        let mut skill_failed = Vec::new();
+        let mut workflow_failed = Vec::new();
+        for record in report.failed {
+            if failed_record_is_workflow(&record, &previous_workflow_roots).await {
+                workflow_failed.push(record);
+            } else {
+                skill_failed.push(record);
+            }
+        }
+
         let revision = self.next_revision.load(Ordering::SeqCst);
-        let (resolved_skills, resolved_roots, mut entries) = self
+        let (resolved_skills, resolved_roots, mut skill_entries) = self
             .resolve_catalog(
-                report.loaded,
-                report.failed,
+                skill_loaded,
+                skill_failed,
                 &previous_skills,
                 &previous_roots,
+                &previous_skill_catalog,
+                revision,
+            )
+            .await;
+        let (resolved_workflows, resolved_workflow_roots, mut workflow_entries) = self
+            .resolve_catalog(
+                workflow_loaded,
+                workflow_failed,
+                &previous_workflows,
+                &previous_workflow_roots,
                 &previous_catalog,
                 revision,
             )
             .await;
-        let count = resolved_skills.len();
+        for entry in &mut workflow_entries {
+            if !entry.legacy && entry.kind != WorkflowKind::Orchestration {
+                // This partition contains only Workflow identities. A brand
+                // new invalid workflow.yaml has no parsed metadata yet, but it
+                // must remain catalog-visible as a degraded orchestration.
+                entry.kind = WorkflowKind::Orchestration;
+            }
+        }
+        let count = resolved_skills
+            .len()
+            .saturating_add(resolved_workflows.len());
         let resolved_resources = snapshot_skill_resources(
             &resolved_roots,
             &resolved_skills,
-            &entries,
+            &skill_entries,
             &previous_resources,
             self.snapshot_limits,
         )
         .await?;
-        let definition_changed: HashSet<String> = resolved_skills
+        let resolved_workflow_resources = snapshot_skill_resources(
+            &resolved_workflow_roots,
+            &resolved_workflows,
+            &workflow_entries,
+            &previous_workflow_resources,
+            self.snapshot_limits,
+        )
+        .await?;
+        let skill_definition_changed: HashSet<String> = resolved_skills
             .iter()
             .filter(|(id, skill)| {
                 previous_skills.get(*id) != Some(*skill)
@@ -1017,37 +1159,54 @@ impl SkillStore {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        // `WorkflowCatalogEntry::revision` identifies the revision of that workflow,
-        // not merely the revision of the containing snapshot. Preserve it across
-        // unrelated catalog updates so an activation can pin a meaningful definition
-        // revision. Prompt-only changes are covered by `definition_changed` even though
-        // the metadata-only public entry would otherwise compare equal.
-        for entry in &mut entries {
-            let Some(previous) = previous_catalog
-                .entries
-                .iter()
-                .find(|previous| previous.id == entry.id)
-            else {
-                continue;
-            };
-            let mut comparable = entry.clone();
-            comparable.revision = previous.revision;
-            if !definition_changed.contains(&entry.id) && comparable == *previous {
-                entry.revision = previous.revision;
-            }
-        }
-        let next_catalog = WorkflowCatalogSnapshot { revision, entries };
+        let workflow_definition_changed: HashSet<String> = resolved_workflows
+            .iter()
+            .filter(|(id, workflow)| {
+                previous_workflows.get(*id) != Some(*workflow)
+                    || previous_workflow_roots.get(*id) != resolved_workflow_roots.get(*id)
+                    || previous_workflow_resources.get(*id) != resolved_workflow_resources.get(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        // Entry revisions identify each definition generation rather than the
+        // containing publication. Preserve them independently in both
+        // namespaces across unrelated updates.
+        preserve_catalog_entry_revisions(
+            &mut skill_entries,
+            &previous_skill_catalog,
+            &skill_definition_changed,
+        );
+        preserve_catalog_entry_revisions(
+            &mut workflow_entries,
+            &previous_catalog,
+            &workflow_definition_changed,
+        );
+        let next_skill_catalog = WorkflowCatalogSnapshot {
+            revision,
+            entries: skill_entries,
+        };
+        let next_catalog = WorkflowCatalogSnapshot {
+            revision,
+            entries: workflow_entries,
+        };
+        let mut comparable_previous_skill_catalog = previous_skill_catalog.clone();
+        comparable_previous_skill_catalog.revision = revision;
         let mut comparable_previous = previous_catalog.clone();
         comparable_previous.revision = revision;
         if resolved_skills == previous_skills
             && resolved_roots == previous_roots
             && resolved_resources == previous_resources
+            && next_skill_catalog == comparable_previous_skill_catalog
+            && resolved_workflows == previous_workflows
+            && resolved_workflow_roots == previous_workflow_roots
+            && resolved_workflow_resources == previous_workflow_resources
             && next_catalog == comparable_previous
         {
             return Ok(count);
         }
         let publication_definition_bytes = resolved_skills
             .values()
+            .chain(resolved_workflows.values())
             .map(|skill| {
                 serde_json::to_vec(skill)
                     .map(|bytes| bytes.len())
@@ -1055,7 +1214,10 @@ impl SkillStore {
             })
             .sum::<usize>();
         let mut publication_resources = HashMap::<usize, usize>::new();
-        for snapshot in resolved_resources.values() {
+        for snapshot in resolved_resources
+            .values()
+            .chain(resolved_workflow_resources.values())
+        {
             for bytes in snapshot.values() {
                 publication_resources
                     .entry(Arc::as_ptr(bytes) as usize)
@@ -1069,6 +1231,10 @@ impl SkillStore {
         let mut skills_guard = self.skills.write().await;
         let mut roots_guard = self.skill_roots.write().await;
         let mut resources_guard = self.skill_resources.write().await;
+        let mut skill_catalog_guard = self.skill_catalog.write().await;
+        let mut workflows_guard = self.workflow_definitions.write().await;
+        let mut workflow_roots_guard = self.workflow_roots.write().await;
+        let mut workflow_resources_guard = self.workflow_resources.write().await;
         let mut catalog_guard = self.catalog.write().await;
         self.retained_budget.replace_publication(
             self.store_token,
@@ -1080,13 +1246,25 @@ impl SkillStore {
         *skills_guard = resolved_skills;
         *roots_guard = resolved_roots;
         *resources_guard = resolved_resources;
+        *skill_catalog_guard = next_skill_catalog;
+        *workflows_guard = resolved_workflows;
+        *workflow_roots_guard = resolved_workflow_roots;
+        *workflow_resources_guard = resolved_workflow_resources;
         *catalog_guard = next_catalog.clone();
         drop(catalog_guard);
+        drop(workflow_resources_guard);
+        drop(workflow_roots_guard);
+        drop(workflows_guard);
+        drop(skill_catalog_guard);
         drop(resources_guard);
         drop(roots_guard);
         drop(skills_guard);
         drop(_snapshot_guard);
-        self.publish_catalog_events(&previous_catalog, &next_catalog, &definition_changed);
+        self.publish_catalog_events(
+            &previous_catalog,
+            &next_catalog,
+            &workflow_definition_changed,
+        );
 
         Ok(count)
     }
@@ -1155,6 +1333,42 @@ impl SkillStore {
                     Self::Invalid(_) => None,
                 }
             }
+            fn identity_rank(&self) -> u8 {
+                match self {
+                    Self::Valid(record)
+                        if record.skill.metadata.as_ref().is_some_and(|metadata| {
+                            metadata
+                                .get("legacy_import")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                        }) =>
+                    {
+                        1
+                    }
+                    Self::Valid(record)
+                        if record.skill.metadata.as_ref().is_some_and(|metadata| {
+                            metadata
+                                .get("legacy_adapter")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                        }) =>
+                    {
+                        2
+                    }
+                    Self::Invalid(record)
+                        if record
+                            .skill_root
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            == Some("md") =>
+                    {
+                        2
+                    }
+                    // A normal Skill or an explicitly migrated legacy bundle
+                    // keeps existing precedence over a read-only adapter.
+                    _ => 3,
+                }
+            }
         }
 
         let mut grouped: HashMap<String, Vec<Candidate>> = HashMap::new();
@@ -1185,6 +1399,7 @@ impl SkillStore {
                 Self::source_rank(right.source())
                     .cmp(&Self::source_rank(left.source()))
                     .then_with(|| right.mode().is_some().cmp(&left.mode().is_some()))
+                    .then_with(|| right.identity_rank().cmp(&left.identity_rank()))
                     .then_with(|| left.root().cmp(right.root()))
             });
             let Some(winner) = candidates.first() else {
@@ -1283,6 +1498,24 @@ impl SkillStore {
         self.catalog.read().await.clone()
     }
 
+    /// Return Skill activation metadata from the same publication machinery as
+    /// the public Workflow catalog, but from its independent namespace.
+    pub async fn skill_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
+        let _snapshot_guard = self.snapshot_publish_lock.read().await;
+        self.skill_catalog.read().await.clone()
+    }
+
+    /// Return both command-facing namespaces from one publication generation.
+    pub async fn command_catalog_snapshots(
+        &self,
+    ) -> (WorkflowCatalogSnapshot, WorkflowCatalogSnapshot) {
+        let _snapshot_guard = self.snapshot_publish_lock.read().await;
+        (
+            self.skill_catalog.read().await.clone(),
+            self.catalog.read().await.clone(),
+        )
+    }
+
     /// Pin every new-format orchestration definition from one validated store
     /// publication. `workflow.yaml` bytes come from the immutable resource
     /// snapshot (including LKG recovery), never from a second filesystem read.
@@ -1298,7 +1531,7 @@ impl SkillStore {
         }
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         let catalog = self.catalog.read().await;
-        let resources = self.skill_resources.read().await;
+        let resources = self.workflow_resources.read().await;
         let mut definitions = BTreeMap::new();
         for entry in catalog
             .entries
@@ -1412,7 +1645,7 @@ impl SkillStore {
         skills.sort_by_key(|skill| skill.name.clone());
         let roots = store.skill_roots.read().await.clone();
         let resources = store.skill_resources.read().await.clone();
-        let catalog = store.catalog.read().await.clone();
+        let catalog = store.skill_catalog.read().await.clone();
         Ok((skills, roots, resources, catalog))
     }
 
@@ -2086,6 +2319,8 @@ impl SkillStore {
                 workflow_id: entry.id.clone(),
                 revision: next.revision,
                 kind,
+                public_workflow: entry.is_public_workflow()
+                    || old.is_some_and(WorkflowCatalogEntry::is_public_workflow),
                 scope: "global".to_string(),
             });
         }
@@ -2099,6 +2334,7 @@ impl SkillStore {
                 workflow_id: removed.id.clone(),
                 revision: next.revision,
                 kind: WorkflowCatalogEventKind::Changed,
+                public_workflow: removed.is_public_workflow(),
                 scope: "global".to_string(),
             });
         }
@@ -2297,6 +2533,45 @@ impl SkillStore {
             }
         }
         unique
+    }
+
+    async fn cached_dependent_stores(&self) -> Vec<std::sync::Arc<SkillStore>> {
+        let mut unique = HashMap::<u64, std::sync::Arc<SkillStore>>::new();
+        for store in self.mode_stores.read().await.values() {
+            unique
+                .entry(store.store_token)
+                .or_insert_with(|| store.clone());
+        }
+        for store in self.workspace_stores.read().await.values() {
+            unique
+                .entry(store.store_token)
+                .or_insert_with(|| store.clone());
+        }
+        for store in self.project_workspace_stores.read().await.values() {
+            unique
+                .entry(store.store_token)
+                .or_insert_with(|| store.clone());
+        }
+        unique.into_values().collect()
+    }
+
+    /// Publish a global Workflow source mutation synchronously to every cached
+    /// catalog view. Workspace, Project/workspace, and mode stores own
+    /// independent immutable snapshots; relying on their filesystem watchers
+    /// would leave the mutating request with a stale same-session read and has
+    /// a registration window in which the event can be lost entirely.
+    pub async fn reload_global_workflow_views(&self) -> SkillResult<()> {
+        self.reload().await?;
+        let mut pending = self.cached_dependent_stores().await;
+        let mut visited = HashSet::new();
+        while let Some(store) = pending.pop() {
+            if !visited.insert(store.store_token) {
+                continue;
+            }
+            store.reload().await?;
+            pending.extend(store.cached_dependent_stores().await);
+        }
+        Ok(())
     }
 
     /// Resolve an isolated catalog view for a specific session workspace without changing the
@@ -2526,14 +2801,6 @@ impl SkillStore {
             .parent()
             .map(|parent| parent.join("workflows"))
             .unwrap_or_else(|| PathBuf::from("workflows"));
-        let report = crate::legacy::import_legacy_markdown_workflows(
-            &workflows_dir,
-            &self.config.skills_dir,
-        )
-        .await?;
-        for diagnostic in report.diagnostics {
-            tracing::warn!("Legacy workflow import: {diagnostic}");
-        }
         for diagnostic in
             crate::legacy::migrate_legacy_yaml_workflows(&workflows_dir, &self.config.skills_dir)
                 .await
@@ -2545,29 +2812,27 @@ impl SkillStore {
         self.load_locked().await
     }
 
-    /// Remove a legacy workflow source and its generated skill bundle while
-    /// excluding watcher reloads. Without one lock across both files, a watcher
-    /// can observe the still-present source after the bundle is removed and
-    /// immediately re-import the workflow being deleted.
+    /// Remove a legacy workflow source and, when present, only the historical
+    /// adapter bundle whose metadata confirms ownership by that source.
+    /// Same-id ordinary or explicitly migrated Skills are never removed.
     pub async fn remove_legacy_workflow(&self, source: &Path, id: &str) -> SkillResult<bool> {
         let _reload_guard = self.reload_lock.lock().await;
-        let removed =
+        let removed_bundle =
             crate::legacy::remove_legacy_markdown_bundle(source, &self.config.skills_dir, id)
                 .await?;
-        if !removed {
-            return Ok(false);
-        }
         if let Err(error) = tokio::fs::remove_file(source).await {
             // Restore the owned bundle when the authoritative source could not
             // be removed, so callers never observe a silent partial deletion.
-            if let Ok(body) = tokio::fs::read_to_string(source).await {
-                let _ = crate::legacy::sync_legacy_markdown_bundle(
-                    source,
-                    &self.config.skills_dir,
-                    id,
-                    &body,
-                )
-                .await;
+            if removed_bundle {
+                if let Ok(body) = tokio::fs::read_to_string(source).await {
+                    let _ = crate::legacy::sync_legacy_markdown_bundle(
+                        source,
+                        &self.config.skills_dir,
+                        id,
+                        &body,
+                    )
+                    .await;
+                }
             }
             return Err(error.into());
         }
@@ -2601,6 +2866,17 @@ impl SkillStore {
         filter: Option<SkillFilter>,
         refresh: bool,
     ) -> Vec<SkillDefinition> {
+        self.skills_and_catalog_snapshot(filter, refresh).await.0
+    }
+
+    /// Clone the visible Skills and their activation policy catalog while
+    /// holding one publication read lock. API callers can therefore never
+    /// combine generation N definitions with generation N+1 identity data.
+    pub async fn skills_and_catalog_snapshot(
+        &self,
+        filter: Option<SkillFilter>,
+        refresh: bool,
+    ) -> (Vec<SkillDefinition>, WorkflowCatalogSnapshot) {
         // Optionally reload from disk to pick up new/updated skills
         if refresh {
             if let Err(e) = self.reload().await {
@@ -2610,6 +2886,7 @@ impl SkillStore {
 
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         let skills = self.skills.read().await;
+        let catalog = self.skill_catalog.read().await.clone();
 
         let mut result: Vec<SkillDefinition> = skills
             .values()
@@ -2621,7 +2898,7 @@ impl SkillStore {
             .collect();
 
         result.sort_by_key(|s| s.name.clone());
-        result
+        (result, catalog)
     }
 
     /// List skills with an optional mode override (without mutating in-memory cache).
@@ -2744,6 +3021,42 @@ impl SkillStore {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         let roots = self.skill_roots.read().await;
         roots
+            .get(id)
+            .cloned()
+            .ok_or_else(|| SkillError::NotFound(id.to_string()))
+    }
+
+    /// Get the immutable publication root for a Workflow identity. Legacy
+    /// markdown adapters use the source file itself as this root.
+    pub async fn get_workflow_root(&self, id: &str) -> SkillResult<PathBuf> {
+        let _snapshot_guard = self.snapshot_publish_lock.read().await;
+        self.workflow_roots
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| SkillError::NotFound(id.to_string()))
+    }
+
+    /// Resolve only a source-backed legacy Workflow command. Historical
+    /// auto-imports and orchestration definitions intentionally have no
+    /// command-palette content endpoint.
+    pub async fn get_legacy_workflow_source(&self, id: &str) -> SkillResult<PathBuf> {
+        let _snapshot_guard = self.snapshot_publish_lock.read().await;
+        let catalog = self.catalog.read().await;
+        let selectable = catalog.entries.iter().any(|entry| {
+            entry.id == id
+                && entry.winner
+                && entry.kind == WorkflowKind::Instruction
+                && entry.status == WorkflowStatus::Valid
+                && entry.migration_status == Some(LegacyWorkflowMigrationStatus::Available)
+        });
+        if !selectable {
+            return Err(SkillError::NotFound(id.to_string()));
+        }
+        self.workflow_roots
+            .read()
+            .await
             .get(id)
             .cloned()
             .ok_or_else(|| SkillError::NotFound(id.to_string()))
@@ -3093,7 +3406,7 @@ mod tests {
     use crate::store::storage::write_skill_file;
     use crate::store::storage::SkillDirectorySource;
     use crate::types::SkillStoreConfig;
-    use crate::{SkillManager, WorkflowCatalogEventKind, WorkflowSource, WorkflowStatus};
+    use crate::{SkillManager, WorkflowSource, WorkflowStatus};
 
     #[test]
     fn agents_skill_precedence_is_below_bamboo_global_and_above_plugin() {
@@ -3194,7 +3507,7 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn workflow_builtins_are_versioned_instruction_catalog_entries() {
+    async fn skill_builtins_are_versioned_instruction_catalog_entries() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SkillStore::new(SkillStoreConfig {
             skills_dir: directory.path().join("skills"),
@@ -3202,7 +3515,7 @@ Use this skill for testing.
         });
         store.initialize().await.expect("initialize");
 
-        let catalog = store.workflow_catalog_snapshot().await;
+        let catalog = store.skill_catalog_snapshot().await;
         for (id, automatic) in WORKFLOW_BUILTINS {
             let entry = catalog
                 .entries
@@ -3286,7 +3599,7 @@ Use this skill for testing.
         );
         assert_eq!(
             store
-                .workflow_catalog_snapshot()
+                .skill_catalog_snapshot()
                 .await
                 .entries
                 .into_iter()
@@ -3338,7 +3651,7 @@ Use this skill for testing.
             .contains("User customization must survive"));
         assert_eq!(
             store
-                .workflow_catalog_snapshot()
+                .skill_catalog_snapshot()
                 .await
                 .entries
                 .into_iter()
@@ -3413,7 +3726,7 @@ Use this skill for testing.
             .await
             .expect("canonical expected root");
         assert_eq!(resolved_root, expected_root);
-        let catalog = store.workflow_catalog_snapshot().await;
+        let catalog = store.skill_catalog_snapshot().await;
         let entry = catalog
             .entries
             .iter()
@@ -3650,7 +3963,7 @@ Use this skill for testing.
             skill.description, "alpha version",
             "lowest-sorting plugin id must deterministically win a same-id collision"
         );
-        let catalog = store.workflow_catalog_snapshot().await;
+        let catalog = store.skill_catalog_snapshot().await;
         let entry = catalog
             .entries
             .iter()
@@ -3756,7 +4069,7 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn mode_override_uses_catalog_validation_and_retains_lkg() {
+    async fn mode_orchestration_stays_out_of_skills_and_retains_workflow_lkg() {
         let directory = tempfile::tempdir().expect("tempdir");
         let data_dir = directory.path().join("data");
         let global_skills_dir = data_dir.join("skills");
@@ -3784,11 +4097,28 @@ Use this skill for testing.
             active_mode: None,
         });
         store.initialize().await.expect("initialize");
+        assert!(store
+            .get_skill_for_mode("mode-catalog", Some("code"))
+            .await
+            .is_err());
+        let mode_store = store
+            .skill_store_for_mode(Some("code"))
+            .await
+            .expect("mode store")
+            .expect("non-default mode");
+        assert!(mode_store
+            .skill_catalog_snapshot()
+            .await
+            .entries
+            .iter()
+            .all(|entry| entry.id != "mode-catalog"));
         assert_eq!(
-            store
-                .get_skill_for_mode("mode-catalog", Some("code"))
+            mode_store
+                .workflow_definitions
+                .read()
                 .await
-                .expect("initial mode skill")
+                .get("mode-catalog")
+                .expect("initial workflow")
                 .prompt,
             "Mode prompt v1"
         );
@@ -3802,14 +4132,20 @@ Use this skill for testing.
         fs::write(mode_root.join("workflow.yaml"), "version: 2\n")
             .await
             .expect("invalid workflow metadata");
+        mode_store
+            .reload()
+            .await
+            .expect("invalid reload is isolated");
         assert_eq!(
-            store
-                .get_skill_for_mode("mode-catalog", Some("code"))
+            mode_store
+                .workflow_definitions
+                .read()
                 .await
-                .expect("mode LKG")
+                .get("mode-catalog")
+                .expect("workflow LKG")
                 .prompt,
             "Mode prompt v1",
-            "invalid mode metadata must not activate new instructions"
+            "invalid mode metadata must not activate new workflow instructions"
         );
 
         fs::write(
@@ -3818,18 +4154,21 @@ Use this skill for testing.
         )
         .await
         .expect("recovered metadata");
+        mode_store.reload().await.expect("recovered workflow");
         assert_eq!(
-            store
-                .get_skill_for_mode("mode-catalog", Some("code"))
+            mode_store
+                .workflow_definitions
+                .read()
                 .await
-                .expect("recovered mode skill")
+                .get("mode-catalog")
+                .expect("recovered workflow")
                 .prompt,
             "Mode prompt v2"
         );
     }
 
     #[tokio::test]
-    async fn invalid_reload_retains_lkg_and_emits_invalid_then_recovered() {
+    async fn invalid_skill_reload_retains_lkg_without_workflow_events() {
         const PRIVATE_FIELD: &str = "private-lkg-frontmatter-field";
         const PRIVATE_INSTRUCTIONS: &str = "Private LKG replacement instructions";
         let directory = tempfile::tempdir().expect("tempdir");
@@ -3856,7 +4195,7 @@ Use this skill for testing.
         let skill = store.get_skill("steady").await.expect("LKG retained");
         assert_eq!(skill.description, "original");
         let invalid = store
-            .workflow_catalog_snapshot()
+            .skill_catalog_snapshot()
             .await
             .entries
             .into_iter()
@@ -3868,10 +4207,10 @@ Use this skill for testing.
         assert!(!public_error.contains(PRIVATE_FIELD));
         assert!(!public_error.contains(PRIVATE_INSTRUCTIONS));
         assert!(!public_error.contains(root.to_string_lossy().as_ref()));
-        assert_eq!(
-            events.recv().await.expect("invalid event").kind,
-            WorkflowCatalogEventKind::Invalid
-        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
 
         write_skill(
             root.parent().expect("skills root"),
@@ -3890,10 +4229,10 @@ Use this skill for testing.
                 .description,
             "recovered"
         );
-        assert_eq!(
-            events.recv().await.expect("recovered event").kind,
-            WorkflowCatalogEventKind::Recovered
-        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -3953,7 +4292,14 @@ Use this skill for testing.
         assert_eq!(invalid.status, WorkflowStatus::Invalid);
         assert_eq!(invalid.kind, crate::WorkflowKind::Orchestration);
         assert_eq!(invalid.version, "2");
-        let active = store.get_skill("orchestrate").await.expect("LKG active");
+        assert!(store.get_skill("orchestrate").await.is_err());
+        let active = store
+            .workflow_definitions
+            .read()
+            .await
+            .get("orchestrate")
+            .cloned()
+            .expect("workflow LKG active");
         assert_eq!(active.description, "orchestrates");
         assert_eq!(active.prompt, "Instructions");
         let public_error = invalid.last_error.as_deref().expect("public error");
@@ -4131,7 +4477,7 @@ Use this skill for testing.
         });
 
         store.initialize().await.expect("isolate invalid skill");
-        let serialized = serde_json::to_string(&store.workflow_catalog_snapshot().await)
+        let serialized = serde_json::to_string(&store.skill_catalog_snapshot().await)
             .expect("serialize catalog");
 
         assert!(
@@ -4170,7 +4516,7 @@ Use this skill for testing.
         });
 
         store.initialize().await.expect("initialize");
-        let snapshot = store.workflow_catalog_snapshot().await;
+        let snapshot = store.skill_catalog_snapshot().await;
         let serialized = serde_json::to_string(&snapshot).expect("serialize catalog");
         let entry = snapshot
             .entries
@@ -4204,7 +4550,7 @@ Use this skill for testing.
             ..Default::default()
         });
         store.initialize().await.expect("initialize");
-        let before = store.workflow_catalog_snapshot().await;
+        let before = store.skill_catalog_snapshot().await;
         let alpha_before = before
             .entries
             .iter()
@@ -4226,7 +4572,7 @@ Use this skill for testing.
         .expect("update alpha");
         store.reload().await.expect("reload");
 
-        let after = store.workflow_catalog_snapshot().await;
+        let after = store.skill_catalog_snapshot().await;
         assert!(after.revision > before.revision);
         assert!(
             after
@@ -4259,7 +4605,7 @@ Use this skill for testing.
             ..Default::default()
         });
         manager.initialize().await.expect("initialize manager");
-        let initial_revision = manager.store().workflow_catalog_snapshot().await.revision;
+        let initial_revision = manager.store().skill_catalog_snapshot().await.revision;
         let plugin_skills = directory.path().join("data/plugins/late/skills");
         write_skill(&plugin_skills, "hot-plugin", "hot discovered", "Prompt")
             .await
@@ -4267,7 +4613,7 @@ Use this skill for testing.
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let snapshot = manager.store().workflow_catalog_snapshot().await;
+                let snapshot = manager.store().skill_catalog_snapshot().await;
                 if snapshot.revision > initial_revision
                     && snapshot
                         .entries
@@ -4283,7 +4629,7 @@ Use this skill for testing.
         .expect("watcher should publish plugin without explicit refresh");
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let stable_revision = manager.store().workflow_catalog_snapshot().await.revision;
+        let stable_revision = manager.store().skill_catalog_snapshot().await.revision;
         fs::create_dir_all(directory.path().join("data/sessions"))
             .await
             .expect("sessions dir");
@@ -4292,7 +4638,7 @@ Use this skill for testing.
             .expect("unrelated write");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(
-            manager.store().workflow_catalog_snapshot().await.revision,
+            manager.store().skill_catalog_snapshot().await.revision,
             stable_revision,
             "unrelated data-dir writes must not publish a catalog revision"
         );
@@ -4368,23 +4714,22 @@ Use this skill for testing.
         });
         store.initialize().await.expect("initialize");
         let mut events = store.subscribe_workflow_catalog();
-        let first = store
-            .workflow_catalog_for_workspace(&one)
+        let first_store = store
+            .skill_store_for_workspace(&one)
             .await
-            .expect("first view");
-        let second = store
-            .workflow_catalog_for_workspace(&two)
+            .expect("first store");
+        let second_store = store
+            .skill_store_for_workspace(&two)
             .await
-            .expect("second view");
+            .expect("second store");
+        let first = first_store.skill_catalog_snapshot().await;
+        let second = second_store.skill_catalog_snapshot().await;
         assert!(first.entries.iter().any(|entry| entry.id == "only-one"));
         assert!(!first.entries.iter().any(|entry| entry.id == "only-two"));
         assert!(second.entries.iter().any(|entry| entry.id == "only-two"));
         assert!(!second.entries.iter().any(|entry| entry.id == "only-one"));
 
-        let repeated = store
-            .workflow_catalog_for_workspace(&one)
-            .await
-            .expect("cached first view");
+        let repeated = first_store.skill_catalog_snapshot().await;
         assert_eq!(repeated.revision, first.revision, "read must not bump");
 
         let skill_file = one.join(".bamboo/skills/only-one/SKILL.md");
@@ -4398,25 +4743,27 @@ Use this skill for testing.
         fs::rename(&staging, &skill_file)
             .await
             .expect("atomic rename");
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let updated = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let event = events.recv().await.expect("workspace event");
-                if event.workflow_id == "only-one" {
-                    break event;
+                let snapshot = first_store.skill_catalog_snapshot().await;
+                if snapshot.revision > first.revision
+                    && snapshot
+                        .entries
+                        .iter()
+                        .any(|entry| entry.id == "only-one" && entry.description == "one changed")
+                {
+                    break snapshot;
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             }
         })
         .await
-        .expect("workspace watcher event");
-        assert!(event.scope.starts_with("workspace:"));
-        let updated = store
-            .workflow_catalog_for_workspace(&one)
-            .await
-            .expect("updated first view");
-        let untouched = store
-            .workflow_catalog_for_workspace(&two)
-            .await
-            .expect("untouched second view");
+        .expect("workspace watcher publication");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let untouched = second_store.skill_catalog_snapshot().await;
         assert!(updated.revision > first.revision);
         assert_eq!(untouched.revision, second.revision);
         assert_eq!(
@@ -4898,7 +5245,7 @@ Use this skill for testing.
             },
         );
         store.reload().await.expect("publish N");
-        let catalog_n = store.workflow_catalog_snapshot().await;
+        let catalog_n = store.skill_catalog_snapshot().await;
         let ids = vec!["bounded-bytes".to_string()];
         store
             .pin_current_activation("bounded-active", &ids, None)
@@ -4909,7 +5256,7 @@ Use this skill for testing.
             .expect("oversize resource");
         let error = store.reload().await.expect_err("oversize reload rejected");
         assert!(error.to_string().contains("per-file limit"));
-        assert_eq!(store.workflow_catalog_snapshot().await, catalog_n);
+        assert_eq!(store.skill_catalog_snapshot().await, catalog_n);
         assert_eq!(
             store
                 .get_pinned_skill_with_root("bounded-active", "bounded-bytes")
@@ -5006,13 +5353,13 @@ Use this skill for testing.
             .await
             .expect("resource N+1");
         store.reload().await.expect("publish N+1");
-        let catalog_n1 = store.workflow_catalog_snapshot().await;
+        let catalog_n1 = store.skill_catalog_snapshot().await;
         let error = store
             .pin_current_activation("new-n1", &ids, None)
             .await
             .expect_err("N and current N+1 fit, but pinning retained N+1 must exceed budget");
         assert!(error.to_string().contains("budget"));
-        assert_eq!(store.workflow_catalog_snapshot().await, catalog_n1);
+        assert_eq!(store.skill_catalog_snapshot().await, catalog_n1);
         assert_eq!(
             store
                 .read_pinned_skill_resource(
@@ -5116,6 +5463,174 @@ Use this skill for testing.
     }
 
     #[tokio::test]
+    async fn global_legacy_workflow_is_discovered_without_materializing_a_skill() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data = directory.path().join("data");
+        let workflows = data.join("workflows");
+        fs::create_dir_all(&workflows).await.expect("workflows");
+        let source = workflows.join("daily-report.md");
+        fs::write(
+            &source,
+            "---\ndescription: Use for the daily report.\n---\nReport instructions.\n",
+        )
+        .await
+        .expect("legacy workflow");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: data.join("skills"),
+            ..Default::default()
+        });
+
+        store.initialize().await.expect("initialize");
+        let catalog = store.workflow_catalog_snapshot().await;
+        let entry = catalog
+            .public_workflows()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "daily-report")
+            .expect("legacy workflow");
+        assert!(entry.legacy);
+        assert_eq!(
+            entry.migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+        assert!(source.exists());
+        assert!(
+            !data.join("skills/daily-report/SKILL.md").exists(),
+            "discovery must not turn a Workflow into a Skill"
+        );
+
+        store.reload().await.expect("reload");
+        assert!(
+            !data.join("skills/daily-report/SKILL.md").exists(),
+            "reload must remain read-only for legacy Workflow sources"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_id_skill_and_legacy_workflow_publish_independent_winners() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data = directory.path().join("data");
+        let skill_root = write_skill(
+            &data.join("skills"),
+            "shared",
+            "Independent Skill",
+            "Skill instructions.",
+        )
+        .await
+        .expect("skill");
+        let workflow_source = data.join("workflows/shared.md");
+        fs::create_dir_all(workflow_source.parent().unwrap())
+            .await
+            .expect("workflows");
+        fs::write(
+            &workflow_source,
+            "---\ndescription: Independent Workflow\n---\nWorkflow instructions.\n",
+        )
+        .await
+        .expect("workflow");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: data.join("skills"),
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+
+        let skills = store.list_skills(None, false).await;
+        let shared = skills
+            .iter()
+            .filter(|skill| skill.id == "shared")
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].description, "Independent Skill");
+        let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+        assert_eq!(
+            skill_catalog.revision, workflow_catalog.revision,
+            "cross-namespace readers must observe one publication generation"
+        );
+        let skill_entry = skill_catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "shared")
+            .expect("skill winner");
+        assert!(skill_entry.winner);
+        assert!(!skill_entry.legacy);
+        assert_eq!(skill_entry.description, "Independent Skill");
+        let workflow_entry = workflow_catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "shared")
+            .expect("workflow winner");
+        assert!(workflow_entry.winner);
+        assert_eq!(
+            workflow_entry.migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+        assert_eq!(workflow_entry.description, "Independent Workflow");
+        assert_eq!(store.get_skill_root("shared").await.unwrap(), skill_root);
+        assert_eq!(
+            store.get_workflow_root("shared").await.unwrap(),
+            workflow_source
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_legacy_source_wins_over_stale_automatic_import_bundle() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data = directory.path().join("data");
+        let source = data.join("workflows/legacy.md");
+        fs::create_dir_all(source.parent().unwrap())
+            .await
+            .expect("workflows");
+        fs::write(
+            &source,
+            "---\ndescription: Current Workflow description.\n---\nCurrent Workflow body.\n",
+        )
+        .await
+        .expect("source");
+        let bundle = data.join("skills/legacy/SKILL.md");
+        fs::create_dir_all(bundle.parent().unwrap())
+            .await
+            .expect("skills");
+        let stale = format!(
+            "---\nname: legacy\ndescription: Stale imported description\nmetadata:\n  legacy_import: true\n  legacy_name: legacy\n  original_source: '{}'\n---\nStale copied body.\n",
+            source.display()
+        );
+        fs::write(&bundle, &stale).await.expect("stale bundle");
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: data.join("skills"),
+            ..Default::default()
+        });
+
+        store.initialize().await.expect("initialize");
+        assert!(store.get_skill("legacy").await.is_err());
+        assert!(store
+            .skill_catalog_snapshot()
+            .await
+            .entries
+            .iter()
+            .all(|entry| entry.id != "legacy"));
+        let entry = store
+            .workflow_catalog_snapshot()
+            .await
+            .public_workflows()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "legacy")
+            .expect("workflow catalog entry");
+        assert_eq!(entry.description, "Current Workflow description.");
+        assert_eq!(
+            entry.migration_status,
+            Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+        assert!(entry.shadowed_candidates.iter().any(|candidate| {
+            candidate.migration_status == Some(crate::LegacyWorkflowMigrationStatus::Migrated)
+        }));
+        assert_eq!(
+            fs::read_to_string(&bundle).await.expect("bundle preserved"),
+            stale
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_legacy_workflow_is_read_only_catalog_input_with_lkg() {
         let directory = tempfile::tempdir().expect("tempdir");
         let workspace = directory.path().join("workspace");
@@ -5150,13 +5665,19 @@ Use this skill for testing.
         );
         assert_eq!(entry.status, WorkflowStatus::Valid);
         assert_eq!(entry.invocation_policy["automatic"], true);
+        assert!(workspace_store.get_skill("review").await.is_err());
         assert_eq!(
-            workspace_store
-                .get_skill("review")
+            fs::canonicalize(
+                workspace_store
+                    .get_legacy_workflow_source("review")
+                    .await
+                    .expect("legacy source")
+            )
+            .await
+            .expect("canonical resolved source"),
+            fs::canonicalize(&source)
                 .await
-                .expect("legacy skill")
-                .prompt,
-            "Stable review instructions."
+                .expect("canonical expected source")
         );
         assert!(source.exists());
         assert!(!workspace.join(".bamboo/skills/review/SKILL.md").exists());
@@ -5187,18 +5708,15 @@ Use this skill for testing.
         assert!(!public.contains("private-broken-value"));
         assert!(!public.contains("PRIVATE BROKEN BODY"));
         assert!(!public.contains(workspace.to_string_lossy().as_ref()));
-        assert_eq!(
-            workspace_store
-                .get_skill("review")
-                .await
-                .expect("retained LKG skill")
-                .prompt,
-            "Stable review instructions."
-        );
+        assert!(workspace_store.get_skill("review").await.is_err());
+        assert!(workspace_store
+            .get_legacy_workflow_source("review")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
-    async fn migrated_workspace_bundle_wins_and_reports_legacy_shadow() {
+    async fn explicit_migrated_skill_coexists_with_legacy_workflow_source() {
         let directory = tempfile::tempdir().expect("tempdir");
         let workspace = directory.path().join("workspace");
         let workflows = workspace.join(".bamboo/workflows");
@@ -5226,23 +5744,48 @@ Use this skill for testing.
         .await
         .expect("migration");
         workspace_store.reload().await.expect("reload migration");
-        let catalog = workspace_store.workflow_catalog_snapshot().await;
-        let entry = catalog
+        let (skill_catalog, workflow_catalog) = workspace_store.command_catalog_snapshots().await;
+        assert_eq!(skill_catalog.revision, workflow_catalog.revision);
+        let skill_entry = skill_catalog
             .entries
             .iter()
             .find(|entry| entry.id == "review")
-            .expect("migrated winner");
-        assert!(entry.legacy);
+            .expect("migrated Skill");
+        assert!(skill_entry.legacy);
         assert_eq!(
-            entry.migration_status,
+            skill_entry.migration_status,
             Some(crate::LegacyWorkflowMigrationStatus::Migrated)
         );
-        assert_eq!(entry.source, crate::WorkflowSource::Workspace);
-        assert_eq!(entry.shadowed_candidates.len(), 1);
-        assert!(entry.shadowed_candidates[0].legacy);
+        assert_eq!(skill_entry.source, crate::WorkflowSource::Workspace);
+        let workflow_entry = workflow_catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review")
+            .expect("source Workflow");
         assert_eq!(
-            entry.shadowed_candidates[0].migration_status,
+            workflow_entry.migration_status,
             Some(crate::LegacyWorkflowMigrationStatus::Available)
+        );
+        assert_eq!(
+            workspace_store
+                .get_skill("review")
+                .await
+                .expect("migrated Skill")
+                .prompt,
+            "Review the diff."
+        );
+        assert_eq!(
+            fs::canonicalize(
+                workspace_store
+                    .get_workflow_root("review")
+                    .await
+                    .expect("source Workflow")
+            )
+            .await
+            .expect("canonical resolved source"),
+            fs::canonicalize(&source)
+                .await
+                .expect("canonical expected source")
         );
     }
 

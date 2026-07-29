@@ -126,6 +126,14 @@ async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>
     Ok(bytes)
 }
 
+/// Read one legacy Workflow source without following symlinks and with the
+/// same size bound used by catalog discovery.
+pub async fn read_legacy_markdown_workflow(path: &Path) -> SkillResult<String> {
+    let bytes = read_bounded_file(path, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
+    String::from_utf8(bytes)
+        .map_err(|_| SkillError::Validation("legacy workflow is not valid UTF-8".to_string()))
+}
+
 fn validate_legacy_description(description: &str) -> SkillResult<()> {
     if description.contains('<') || description.contains('>') {
         return Err(SkillError::Validation(
@@ -199,8 +207,9 @@ fn parse_legacy_markdown_adapter(
 
 /// Discover legacy markdown workflows without modifying their source directory.
 ///
-/// Each source file becomes a virtual instruction Skill whose root identity is
-/// the source file itself. Virtual legacy skills expose no sibling resources.
+/// Each source file becomes a virtual instruction Workflow whose root identity
+/// is the source file itself. Virtual legacy workflows expose no sibling
+/// resources and never enter Skill activation.
 pub async fn load_legacy_markdown_workflow_records(
     discovery_dirs: &[SkillDiscoveryDir],
     max_file_bytes: usize,

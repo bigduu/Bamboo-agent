@@ -228,6 +228,13 @@ fn materialize_facade_effective_config(
         config.clear_access_control_runtime_verifiers();
         failures.insert(SectionId::AccessControl);
     }
+    if config
+        .access_control
+        .as_ref()
+        .is_some_and(|access| access.repair_required)
+    {
+        failures.insert(SectionId::AccessControl);
+    }
     if let Some(broker) = config.subagents_mut().broker.as_mut() {
         if let Err(error) = broker.hydrate_credential_from_store(data_dir) {
             tracing::warn!(error = %error, "external broker credential hydration unavailable");
@@ -243,7 +250,14 @@ pub(super) fn load_facade_effective_config(
     facade: &bamboo_config::ConfigFacade,
     data_dir: &Path,
 ) -> Config {
-    materialize_facade_effective_config(facade, data_dir).config
+    let materialized = materialize_facade_effective_config(facade, data_dir);
+    for section in &materialized.failures {
+        facade.registry().mark_runtime_degraded(
+            *section,
+            "configuration runtime credential repair is required",
+        );
+    }
+    materialized.config
 }
 
 fn load_committed_effective_config(data_dir: &Path) -> Result<Config, ConfigStoreError> {

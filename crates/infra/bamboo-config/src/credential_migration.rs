@@ -16,6 +16,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
+use base64::Engine as _;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -715,14 +716,16 @@ pub(crate) fn plan_facade_compound_credentials(
         .map(ToOwned::to_owned)
     {
         primary_authority.access_control = true;
-        if let Some(section) = plan_access_control_document(original, &mut primary_extracted, 1)? {
+        if let Some(section) =
+            plan_access_control_document(original, &mut primary_extracted, 1, "section")?
+        {
             source_overrides.insert(ACCESS_CONTROL_FILE.to_string(), section.bytes);
         }
     }
 
     if let Some(original) = source_snapshot.bytes(CONFIG_FILE)?.map(ToOwned::to_owned) {
         let mut root_extracted = Vec::new();
-        let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1)?;
+        let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1, "root")?;
         let mut candidate = planned
             .as_ref()
             .map(|section| section.bytes.clone())
@@ -859,8 +862,12 @@ pub(crate) fn plan_facade_compound_credentials(
         if let Some(original) = source_snapshot.bytes(&access_name)?.map(ToOwned::to_owned) {
             if serde_json::from_slice::<Value>(&original).is_ok() {
                 let mut access_extracted = Vec::new();
-                let planned =
-                    plan_access_control_document(original.clone(), &mut access_extracted, 1)?;
+                let planned = plan_access_control_document(
+                    original.clone(),
+                    &mut access_extracted,
+                    1,
+                    &format!("section.{suffix}"),
+                )?;
                 discard_shadowed_sidecar_backup_secrets(&mut access_extracted, &primary_authority);
                 if let Some(section) = planned {
                     generation_extracted.extend(access_extracted);
@@ -878,7 +885,12 @@ pub(crate) fn plan_facade_compound_credentials(
         if let Some(original) = source_snapshot.bytes(&config_name)?.map(ToOwned::to_owned) {
             if serde_json::from_slice::<Value>(&original).is_ok() {
                 let mut root_extracted = Vec::new();
-                let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1)?;
+                let planned = plan_facade_root_document(
+                    original.clone(),
+                    &mut root_extracted,
+                    1,
+                    &format!("root.{suffix}"),
+                )?;
                 let mut candidate = planned
                     .as_ref()
                     .map(|section| section.bytes.clone())
@@ -975,6 +987,9 @@ enum ExtractedSecretKind {
     ExternalBroker,
     Connect,
     AccessControl,
+    /// Server-owned encrypted recovery payload for malformed legacy access
+    /// data. It is never referenced by the public runtime projection.
+    AccessControlRepair,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1252,6 +1267,22 @@ pub(crate) fn migrate_cluster_credentials_locked(
     migrate_cluster_locked(data_dir, None)
 }
 
+pub(crate) fn migrate_access_control_credentials_for_facade_locked(
+    data_dir: &Path,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    migrate_access_control_locked(data_dir, None)
+}
+
+pub(crate) fn access_control_requires_opaque_repair(data_dir: &Path) -> ConfigStoreResult<bool> {
+    let Some(bytes) = read_optional_target(&data_dir.join(ACCESS_CONTROL_FILE))? else {
+        return Ok(false);
+    };
+    let Ok(mut document) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(true);
+    };
+    Ok(section_data_mut(&mut document).is_err())
+}
+
 /// Run the provider/MCP/root planner and every ownership/decryption check
 /// without creating the migration lock or staging any bytes. This is the
 /// facade's zero-write gate before independently-scoped migrations begin.
@@ -1279,7 +1310,7 @@ pub(crate) fn preflight_provider_mcp_credential_migration(
     };
     let mut root_extracted = Vec::new();
     let root = match read_optional_target(&data_dir.join(CONFIG_FILE))? {
-        Some(original) => plan_facade_root_document(original, &mut root_extracted, 1)?,
+        Some(original) => plan_facade_root_document(original, &mut root_extracted, 1, "root")?,
         None => None,
     };
     discard_shadowed_root_secrets(&mut root_extracted, &authority);
@@ -2246,7 +2277,7 @@ pub fn read_exact_credential_section_snapshot(
         )?;
         ensure_provider_mcp_migration_ready(data_dir)?;
 
-        let (config, envelope) = if expected_revision.is_some() {
+        let (config, mut envelope) = if expected_revision.is_some() {
             crate::section_facade::load_durable_effective_section_under_migration_lock(
                 data_dir, section,
             )?
@@ -2290,6 +2321,38 @@ pub fn read_exact_credential_section_snapshot(
                 });
             (config, credential_statuses, credential_health)
         };
+        if section == crate::SectionId::AccessControl
+            && runtime.access_control.as_ref().is_some_and(|access| {
+                let password_invalid = access.password_enabled
+                    && (!access.password_configured
+                        || access
+                            .password_credential_ref
+                            .as_ref()
+                            .is_none_or(|reference| {
+                                !credential_statuses.iter().any(|status| {
+                                    &status.credential_ref == reference && status.configured
+                                })
+                            }));
+                let device_invalid = access.devices.iter().any(|device| {
+                    !device.token_configured
+                        || device
+                            .token_credential_ref
+                            .as_ref()
+                            .is_none_or(|reference| {
+                                !credential_statuses.iter().any(|status| {
+                                    &status.credential_ref == reference && status.configured
+                                })
+                            })
+                });
+                access.repair_required
+                    || password_invalid
+                    || device_invalid
+                    || credential_health.status == crate::SectionStatus::Degraded
+            })
+        {
+            envelope.status = crate::SectionStatus::Degraded;
+            envelope.last_error = Some("access-control credential repair is required".to_string());
+        }
 
         Ok(ExactCredentialSectionReadSnapshot {
             section: envelope,
@@ -3964,6 +4027,19 @@ fn persist_exact_credential_transaction_inner(
         .as_ref()
         .map(|section| section.legacy_root.as_slice())
         .unwrap_or(config_original.as_slice());
+    if access_only
+        && !reset_is(ExactTransactionScope::AccessControl)
+        && access_repair_required_from_document(domain_original)?
+        && !config
+            .access_control
+            .as_ref()
+            .is_some_and(|access| access.repair_required)
+    {
+        return Err(ConfigStoreError::Validation(
+            "access-control repair state is server-owned and requires an explicit reset"
+                .to_string(),
+        ));
+    }
     let persisted_instance_refs = provider_instance_refs_from_document(
         if exact_scope == Some(ExactTransactionScope::Providers) {
             domain_original
@@ -4026,6 +4102,7 @@ fn persist_exact_credential_transaction_inner(
             ExactTransactionScope::AccessControl => {
                 references.extend(persisted_access_refs.password.iter().cloned());
                 references.extend(persisted_access_refs.devices.values().cloned());
+                references.extend(access_repair_credential_refs()?);
             }
             ExactTransactionScope::ClusterFabric => {
                 for metadata in persisted_cluster_refs.values() {
@@ -4287,7 +4364,11 @@ fn persist_exact_credential_transaction_inner(
         )
     } else if access_only {
         (
-            prepare_access_control_config_document(domain_original, config)?,
+            prepare_access_control_config_document(
+                domain_original,
+                config,
+                reset_is(ExactTransactionScope::AccessControl),
+            )?,
             providers_original.clone(),
         )
     } else if mcp_only {
@@ -5107,6 +5188,97 @@ fn migrate_broker_locked(
     })
 }
 
+fn migrate_access_control_locked(
+    data_dir: &Path,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    cleanup_orphan_transaction_dirs(data_dir)?;
+    if let Some(outcome) = recover_committed(
+        data_dir,
+        #[cfg(test)]
+        fault,
+    )? {
+        return Ok(outcome);
+    }
+    discard_uncommitted(data_dir)?;
+
+    let mut extracted = Vec::new();
+    let Some(section) = plan_access_control_section(data_dir, &mut extracted, 1)? else {
+        return Ok(CredentialMigrationOutcome {
+            migrated_credentials: 0,
+            resumed: false,
+        });
+    };
+    let credential_original = read_optional_target(&data_dir.join(CREDENTIALS_FILE))?;
+    let store = CredentialStore::open(data_dir);
+    let resolved = resolve_extracted_secrets(&store, extracted)?;
+    let prepared_credentials = store.prepare_migration(resolved)?;
+
+    let transaction_id = Uuid::new_v4().to_string();
+    let stage_dir_name = format!("{STAGE_PREFIX}{transaction_id}");
+    let stage_dir = data_dir.join(&stage_dir_name);
+    let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{transaction_id}"));
+    create_private_dir(&stage_dir)?;
+    create_private_dir(&backup_dir)?;
+    sync_dir(data_dir)?;
+
+    let mut staged = Vec::new();
+    stage_file(
+        &stage_dir,
+        &backup_dir,
+        CREDENTIALS_FILE,
+        &prepared_credentials.bytes,
+        credential_original.as_deref(),
+        true,
+        None,
+        InstallMode::Migration,
+        None,
+        &mut staged,
+    )?;
+    stage_file(
+        &stage_dir,
+        &backup_dir,
+        ACCESS_CONTROL_FILE,
+        &section.bytes,
+        Some(&section.original),
+        false,
+        Some(section.migration_generation),
+        InstallMode::Migration,
+        None,
+        &mut staged,
+    )?;
+    restrict_directory_files_to_owner(&stage_dir)?;
+    restrict_directory_files_to_owner(&backup_dir)?;
+    sync_dir(&stage_dir)?;
+    sync_dir(&backup_dir)?;
+
+    let manifest = MigrationManifest {
+        version: MIGRATION_VERSION,
+        transaction_id,
+        stage_dir: stage_dir_name,
+        state: MigrationState::Pending,
+        exact_scope: None,
+        migration_scope: None,
+        source_attestation: BTreeMap::new(),
+        files: staged,
+    };
+    write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
+    write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+    let mut manifest = manifest;
+    install_pending(
+        data_dir,
+        &mut manifest,
+        None,
+        #[cfg(test)]
+        fault,
+    )?;
+    finish_transaction(data_dir, manifest)?;
+    Ok(CredentialMigrationOutcome {
+        migrated_credentials: prepared_credentials.added,
+        resumed: false,
+    })
+}
+
 #[cfg(test)]
 fn migrate_cluster_with_fault(
     data_dir: &Path,
@@ -5501,10 +5673,18 @@ fn resolve_extracted_secrets(
         // also makes a fresh plan after an uncommitted crash idempotent.
         let status = store.status_unchecked(&secret.credential_ref)?;
         if status.configured && status.source != crate::CredentialSource::Migrated {
-            if secret.kind == ExtractedSecretKind::EnvVar {
-                return Err(ConfigStoreError::Validation(
-                    "legacy env credential target is already user-managed".to_string(),
-                ));
+            match secret.kind {
+                ExtractedSecretKind::EnvVar => {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy env credential target is already user-managed".to_string(),
+                    ));
+                }
+                ExtractedSecretKind::AccessControlRepair => {
+                    return Err(ConfigStoreError::Validation(
+                        "access recovery target credential is already user-managed".to_string(),
+                    ));
+                }
+                _ => {}
             }
             continue;
         }
@@ -5533,10 +5713,18 @@ fn resolve_extracted_secrets_from_sources(
             .get(&secret.credential_ref)
             .is_some_and(|source| *source != crate::CredentialSource::Migrated)
         {
-            if secret.kind == ExtractedSecretKind::EnvVar {
-                return Err(ConfigStoreError::Validation(
-                    "legacy env credential target is already user-managed".to_string(),
-                ));
+            match secret.kind {
+                ExtractedSecretKind::EnvVar => {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy env credential target is already user-managed".to_string(),
+                    ));
+                }
+                ExtractedSecretKind::AccessControlRepair => {
+                    return Err(ConfigStoreError::Validation(
+                        "access recovery target credential is already user-managed".to_string(),
+                    ));
+                }
+                _ => {}
             }
             continue;
         }
@@ -5568,10 +5756,18 @@ fn resolve_compound_extracted_secrets_from_sources(
     for secret in primary {
         if let Some(source) = sources.get(&secret.credential_ref) {
             if *source != crate::CredentialSource::Migrated {
-                if secret.kind == ExtractedSecretKind::EnvVar {
-                    return Err(ConfigStoreError::Validation(
-                        "legacy env credential target is already user-managed".to_string(),
-                    ));
+                match secret.kind {
+                    ExtractedSecretKind::EnvVar => {
+                        return Err(ConfigStoreError::Validation(
+                            "legacy env credential target is already user-managed".to_string(),
+                        ));
+                    }
+                    ExtractedSecretKind::AccessControlRepair => {
+                        return Err(ConfigStoreError::Validation(
+                            "access recovery target credential is already user-managed".to_string(),
+                        ));
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -5588,12 +5784,21 @@ fn resolve_compound_extracted_secrets_from_sources(
         let mut generation_selected = BTreeMap::<CredentialRef, (String, u64)>::new();
         for secret in generation {
             if let Some(source) = sources.get(&secret.credential_ref) {
-                if secret.kind == ExtractedSecretKind::EnvVar
-                    && *source != crate::CredentialSource::Migrated
-                {
-                    return Err(ConfigStoreError::Validation(
-                        "legacy env credential target is already user-managed".to_string(),
-                    ));
+                if *source != crate::CredentialSource::Migrated {
+                    match secret.kind {
+                        ExtractedSecretKind::EnvVar => {
+                            return Err(ConfigStoreError::Validation(
+                                "legacy env credential target is already user-managed".to_string(),
+                            ));
+                        }
+                        ExtractedSecretKind::AccessControlRepair => {
+                            return Err(ConfigStoreError::Validation(
+                                "access recovery target credential is already user-managed"
+                                    .to_string(),
+                            ));
+                        }
+                        _ => {}
+                    }
                 }
                 continue;
             }
@@ -7268,6 +7473,7 @@ fn plan_facade_root_document(
     original: Vec<u8>,
     extracted: &mut Vec<ExtractedSecret>,
     migration_generation: u64,
+    access_repair_slot: &str,
 ) -> ConfigStoreResult<Option<PlannedSection>> {
     let provider =
         plan_provider_instance_document(original.clone(), extracted, migration_generation, true)?;
@@ -7314,7 +7520,14 @@ fn plan_facade_root_document(
     let access_changed = root_after_cluster
         .as_object_mut()
         .and_then(|root| root.get_mut("access_control"))
-        .map(|access| migrate_access_control_credentials(access, extracted, migration_generation))
+        .map(|access| {
+            migrate_access_control_credentials(
+                access,
+                extracted,
+                migration_generation,
+                access_repair_slot,
+            )
+        })
         .transpose()?
         .unwrap_or(false);
     if !provider_changed && !root_mcp && !cluster_changed && !connect_changed && !access_changed {
@@ -7332,24 +7545,44 @@ fn plan_facade_root_document(
     }))
 }
 
+fn plan_access_control_section(
+    data_dir: &Path,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let path = data_dir.join(ACCESS_CONTROL_FILE);
+    let original = match read_file_reject_symlink(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let structurally_parseable = serde_json::from_slice::<Value>(&original)
+        .ok()
+        .is_some_and(|mut document| section_data_mut(&mut document).is_ok());
+    if structurally_parseable {
+        plan_access_control_document(original, extracted, minimum_generation, "section")
+    } else {
+        let migration_generation =
+            opaque_access_control_repair_generation(data_dir, minimum_generation)?;
+        plan_opaque_access_control_document(original, extracted, migration_generation, "section")
+            .map(Some)
+    }
+}
+
 fn plan_access_control_document(
     original: Vec<u8>,
     extracted: &mut Vec<ExtractedSecret>,
     minimum_generation: u64,
+    repair_slot: &str,
 ) -> ConfigStoreResult<Option<PlannedSection>> {
     let mut root: Value = serde_json::from_slice(&original)?;
     let (data, revision) = section_data_mut(&mut root)?;
     let migration_generation = next_revision(revision.unwrap_or(0))?.max(minimum_generation);
-    if !migrate_access_control_credentials(data, extracted, migration_generation)? {
+    if !migrate_access_control_credentials(data, extracted, migration_generation, repair_slot)? {
         return Ok(None);
     }
     let access: Option<crate::AccessControlConfig> = serde_json::from_value(data.clone())?;
     if let Some(access) = access.as_ref() {
-        if access.password_enabled && !access.password_configured {
-            return Err(ConfigStoreError::Validation(
-                "enabled access-control password has no verifier".to_string(),
-            ));
-        }
         if access.devices.iter().any(|device| !device.token_configured) {
             return Err(ConfigStoreError::Validation(
                 "access-control device has no token verifier".to_string(),
@@ -7365,85 +7598,328 @@ fn plan_access_control_document(
     }))
 }
 
+fn opaque_access_control_repair_generation(
+    data_dir: &Path,
+    minimum_generation: u64,
+) -> ConfigStoreResult<u64> {
+    let mut revision_floor = minimum_generation.saturating_sub(1);
+    if let Some(marker) = read_optional_target(&data_dir.join(crate::SECTION_LAYOUT_FILE))? {
+        if let Ok(completion) =
+            crate::section_facade::validate_completed_section_layout_marker(&marker)
+        {
+            if let Some(access) = completion.members.get(ACCESS_CONTROL_FILE) {
+                revision_floor = revision_floor.max(access.revision);
+            }
+        }
+    }
+    for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+        let Some(bytes) =
+            read_optional_target(&data_dir.join(format!("{ACCESS_CONTROL_FILE}{suffix}")))?
+        else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(object) = document.as_object() else {
+            continue;
+        };
+        if object.get("schema_version").and_then(Value::as_u64) == Some(1)
+            && object.contains_key("data")
+        {
+            if let Some(revision) = object.get("revision").and_then(Value::as_u64) {
+                revision_floor = revision_floor.max(revision);
+            }
+        }
+    }
+    next_revision(revision_floor)
+}
+
+fn plan_opaque_access_control_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+    repair_slot: &str,
+) -> ConfigStoreResult<PlannedSection> {
+    let reference = CredentialRef::parse(format!("access_repair.{repair_slot}.payload"))?;
+    let payload = serde_json::to_string(&serde_json::json!({
+        "schema_version": 1,
+        "source_slot": repair_slot,
+        "encoding": "base64",
+        "access_control_bytes": base64::engine::general_purpose::STANDARD.encode(&original),
+    }))?;
+    extracted.push(ExtractedSecret {
+        credential_ref: reference,
+        value: LegacySecret::Plaintext(payload),
+        migration_generation,
+        kind: ExtractedSecretKind::AccessControlRepair,
+        env_owner: None,
+        provider_owner: None,
+        mcp_owner: None,
+        connect_owner: None,
+    });
+    let repaired = serde_json::json!({
+        "schema_version": 1,
+        "revision": migration_generation,
+        "data": {
+            "password_enabled": true,
+            "repair_required": true,
+            "password_configured": false
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&repaired)?;
+    crate::section_facade::validate_section_envelope(
+        ACCESS_CONTROL_FILE,
+        &bytes,
+        migration_generation,
+    )?;
+    Ok(PlannedSection {
+        name: ACCESS_CONTROL_FILE,
+        bytes,
+        original,
+        migration_generation,
+    })
+}
+
+/// Apply the migration projection without publishing any extracted values.
+/// Section-facade preflight uses this exact code path so malformed legacy
+/// AccessControl data cannot pass one parser and fail a later planner.
+pub(crate) fn sanitize_access_control_for_preflight(value: &mut Value) -> ConfigStoreResult<()> {
+    let mut extracted = Vec::new();
+    migrate_access_control_credentials(value, &mut extracted, 1, "preflight")?;
+    Ok(())
+}
+
 fn migrate_access_control_credentials(
     value: &mut Value,
     extracted: &mut Vec<ExtractedSecret>,
     migration_generation: u64,
+    repair_slot: &str,
 ) -> ConfigStoreResult<bool> {
     if value.is_null() {
         return Ok(false);
     }
-    let access = value.as_object_mut().ok_or_else(|| {
-        ConfigStoreError::Validation("access_control must be an object or null".to_string())
-    })?;
-    let mut changed = false;
-    let password_hash = take_nonempty_string(access, "password_hash")?;
-    let password_salt = take_nonempty_string(access, "password_salt")?;
-    match (password_hash, password_salt) {
-        (Some(hash), Some(salt)) => {
-            let reference = existing_or_generated_ref(
-                access.get("password_credential_ref"),
-                "access",
-                "root",
-                "password_verifier",
-            )?;
-            let value = crate::config_crypto::encode_access_verifier(&hash, &salt)?;
-            access.insert(
-                "password_credential_ref".to_string(),
-                Value::String(reference.as_str().to_string()),
-            );
-            access.insert("password_configured".to_string(), Value::Bool(true));
-            extracted.push(ExtractedSecret {
-                credential_ref: reference,
-                value: LegacySecret::Plaintext(value),
-                migration_generation,
-                kind: ExtractedSecretKind::AccessControl,
-                env_owner: None,
-                provider_owner: None,
-                mcp_owner: None,
-                connect_owner: None,
-            });
-            changed = true;
+    let original = value.clone();
+    let mut repair_required = false;
+    let mut access = match value.as_object() {
+        Some(access) => access.clone(),
+        None => {
+            repair_required = true;
+            Map::from_iter([
+                ("password_enabled".to_string(), Value::Bool(true)),
+                ("password_configured".to_string(), Value::Bool(false)),
+            ])
         }
-        (None, None) => {}
-        _ => {
-            return Err(ConfigStoreError::Validation(
-                "legacy access-control password verifier is incomplete".to_string(),
-            ));
+    };
+    let known_access_fields = [
+        "password_enabled",
+        "password_hash",
+        "password_salt",
+        "password_credential_ref",
+        "password_configured",
+        "updated_at",
+        "devices",
+        "repair_required",
+    ];
+    if access
+        .keys()
+        .any(|key| !known_access_fields.contains(&key.as_str()))
+    {
+        repair_required = true;
+        access.retain(|key, _| known_access_fields.contains(&key.as_str()));
+    }
+
+    match access.get("password_enabled") {
+        Some(Value::Bool(_)) | None => {}
+        Some(_) => {
+            // A malformed enablement value must not turn remote authentication
+            // off. Preserve the conservative intent until an explicit repair.
+            access.insert("password_enabled".to_string(), Value::Bool(true));
+            repair_required = true;
         }
     }
-    if let Some(devices) = access.get_mut("devices").and_then(Value::as_array_mut) {
-        for device in devices {
-            let device = device.as_object_mut().ok_or_else(|| {
-                ConfigStoreError::Validation("access-control device must be an object".to_string())
-            })?;
-            let device_id = device
-                .get("device_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| {
-                    ConfigStoreError::Validation("access-control device id is missing".to_string())
-                })?
-                .to_string();
-            let token_hash = take_nonempty_string(device, "token_hash")?;
-            let token_salt = take_nonempty_string(device, "token_salt")?;
-            match (token_hash, token_salt) {
-                (Some(hash), Some(salt)) => {
-                    let reference = existing_or_generated_ref(
-                        device.get("token_credential_ref"),
-                        "access",
-                        &device_id,
-                        "device_token_verifier",
-                    )?;
-                    let value = crate::config_crypto::encode_access_verifier(&hash, &salt)?;
+    let durable_repair = match access.get("repair_required") {
+        Some(Value::Bool(value)) => *value,
+        None => false,
+        Some(_) => {
+            repair_required = true;
+            true
+        }
+    };
+    if access
+        .get("updated_at")
+        .is_some_and(|updated| !updated.is_null() && !updated.is_string())
+    {
+        access.remove("updated_at");
+        repair_required = true;
+    }
+
+    let password_hash = access.remove("password_hash");
+    let password_salt = access.remove("password_salt");
+    let previous_password_ref = access.remove("password_credential_ref");
+    let previous_password_configured = access.remove("password_configured");
+    let canonical_password = crate::config_crypto::access_password_credential_ref()?;
+    let raw_password_present = password_hash.is_some() || password_salt.is_some();
+    let migrated_password = match (password_hash.as_ref(), password_salt.as_ref()) {
+        (Some(Value::String(hash)), Some(Value::String(salt)))
+            if !hash.is_empty() && !salt.is_empty() =>
+        {
+            match crate::config_crypto::encode_access_verifier(hash, salt) {
+                Ok(verifier) => Some(verifier),
+                Err(_) => {
+                    repair_required = true;
+                    None
+                }
+            }
+        }
+        (None, None) => None,
+        _ => {
+            repair_required = true;
+            None
+        }
+    };
+    if let Some(verifier) = migrated_password {
+        let metadata_valid = previous_password_configured
+            .as_ref()
+            .is_none_or(|value| value.as_bool() == Some(true))
+            && previous_password_ref
+                .as_ref()
+                .is_none_or(|value| value.as_str() == Some(canonical_password.as_str()));
+        repair_required |= !metadata_valid;
+        access.insert(
+            "password_credential_ref".to_string(),
+            Value::String(canonical_password.as_str().to_string()),
+        );
+        access.insert("password_configured".to_string(), Value::Bool(true));
+        extracted.push(ExtractedSecret {
+            credential_ref: canonical_password,
+            value: LegacySecret::Plaintext(verifier),
+            migration_generation,
+            kind: ExtractedSecretKind::AccessControl,
+            env_owner: None,
+            provider_owner: None,
+            mcp_owner: None,
+            connect_owner: None,
+        });
+    } else if !raw_password_present {
+        let configured = previous_password_configured
+            .as_ref()
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let reference = previous_password_ref.as_ref().and_then(Value::as_str);
+        let binding_valid = (configured && reference == Some(canonical_password.as_str()))
+            || (!configured && reference.is_none());
+        let metadata_typed = previous_password_configured
+            .as_ref()
+            .is_none_or(Value::is_boolean)
+            && previous_password_ref.as_ref().is_none_or(Value::is_string);
+        if binding_valid && metadata_typed {
+            if configured {
+                access.insert(
+                    "password_credential_ref".to_string(),
+                    Value::String(canonical_password.as_str().to_string()),
+                );
+                access.insert("password_configured".to_string(), Value::Bool(true));
+            } else if previous_password_configured.is_some() {
+                access.insert("password_configured".to_string(), Value::Bool(false));
+            }
+        } else {
+            repair_required = true;
+            access.insert("password_configured".to_string(), Value::Bool(false));
+        }
+    } else {
+        access.insert("password_configured".to_string(), Value::Bool(false));
+    }
+
+    let original_had_devices = access.contains_key("devices");
+    let original_devices = access.remove("devices");
+    let mut sanitized_devices = Vec::new();
+    let mut seen_device_ids = BTreeSet::new();
+    match original_devices {
+        None => {}
+        Some(Value::Array(devices)) => {
+            for raw_device in devices {
+                let Some(mut device) = raw_device.as_object().cloned() else {
+                    repair_required = true;
+                    continue;
+                };
+                let known_device_fields = [
+                    "device_id",
+                    "label",
+                    "token_hash",
+                    "token_salt",
+                    "token_credential_ref",
+                    "token_configured",
+                    "created_at",
+                    "last_used_at",
+                    "revoked",
+                ];
+                if device
+                    .keys()
+                    .any(|key| !known_device_fields.contains(&key.as_str()))
+                {
+                    repair_required = true;
+                    device.retain(|key, _| known_device_fields.contains(&key.as_str()));
+                }
+                let Some(device_id) = device
+                    .get("device_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+                else {
+                    repair_required = true;
+                    continue;
+                };
+                if !seen_device_ids.insert(device_id.clone())
+                    || !device.get("label").is_some_and(Value::is_string)
+                    || !device.get("created_at").is_some_and(Value::is_string)
+                    || device
+                        .get("last_used_at")
+                        .is_some_and(|item| !item.is_null() && !item.is_string())
+                    || device.get("revoked").is_some_and(|item| !item.is_boolean())
+                {
+                    repair_required = true;
+                    continue;
+                }
+
+                let token_hash = device.remove("token_hash");
+                let token_salt = device.remove("token_salt");
+                let previous_ref = device.remove("token_credential_ref");
+                let previous_configured = device.remove("token_configured");
+                let Ok(canonical) = crate::config_crypto::access_device_credential_ref(&device_id)
+                else {
+                    repair_required = true;
+                    continue;
+                };
+                let raw_token_present = token_hash.is_some() || token_salt.is_some();
+                let migrated_token = match (token_hash.as_ref(), token_salt.as_ref()) {
+                    (Some(Value::String(hash)), Some(Value::String(salt)))
+                        if !hash.is_empty() && !salt.is_empty() =>
+                    {
+                        crate::config_crypto::encode_access_verifier(hash, salt).ok()
+                    }
+                    _ => None,
+                };
+                if raw_token_present && migrated_token.is_none() {
+                    repair_required = true;
+                    continue;
+                }
+                if let Some(verifier) = migrated_token {
+                    let metadata_valid = previous_configured
+                        .as_ref()
+                        .is_none_or(|item| item.as_bool() == Some(true))
+                        && previous_ref
+                            .as_ref()
+                            .is_none_or(|item| item.as_str() == Some(canonical.as_str()));
+                    repair_required |= !metadata_valid;
                     device.insert(
                         "token_credential_ref".to_string(),
-                        Value::String(reference.as_str().to_string()),
+                        Value::String(canonical.as_str().to_string()),
                     );
                     device.insert("token_configured".to_string(), Value::Bool(true));
                     extracted.push(ExtractedSecret {
-                        credential_ref: reference,
-                        value: LegacySecret::Plaintext(value),
+                        credential_ref: canonical,
+                        value: LegacySecret::Plaintext(verifier),
                         migration_generation,
                         kind: ExtractedSecretKind::AccessControl,
                         env_owner: None,
@@ -7451,16 +7927,66 @@ fn migrate_access_control_credentials(
                         mcp_owner: None,
                         connect_owner: None,
                     });
-                    changed = true;
+                } else {
+                    let configured = previous_configured
+                        .as_ref()
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let metadata_valid = configured
+                        && previous_ref.as_ref().and_then(Value::as_str)
+                            == Some(canonical.as_str())
+                        && previous_configured.as_ref().is_some_and(Value::is_boolean)
+                        && previous_ref.as_ref().is_some_and(Value::is_string);
+                    if !metadata_valid {
+                        repair_required = true;
+                        continue;
+                    }
+                    device.insert(
+                        "token_credential_ref".to_string(),
+                        Value::String(canonical.as_str().to_string()),
+                    );
+                    device.insert("token_configured".to_string(), Value::Bool(true));
                 }
-                (None, None) => {}
-                _ => {
-                    return Err(ConfigStoreError::Validation(format!(
-                        "legacy access-control device '{device_id}' verifier is incomplete"
-                    )));
+                if serde_json::from_value::<crate::DeviceCredential>(Value::Object(device.clone()))
+                    .is_err()
+                {
+                    repair_required = true;
+                    continue;
                 }
+                sanitized_devices.push(Value::Object(device));
             }
         }
+        Some(_) => {
+            repair_required = true;
+        }
+    }
+    if original_had_devices || !sanitized_devices.is_empty() {
+        access.insert("devices".to_string(), Value::Array(sanitized_devices));
+    }
+
+    access.insert(
+        "repair_required".to_string(),
+        Value::Bool(durable_repair || repair_required),
+    );
+    *value = Value::Object(access);
+    let changed = *value != original;
+    if repair_required {
+        let reference = CredentialRef::parse(format!("access_repair.{repair_slot}.payload"))?;
+        let payload = serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "source_slot": repair_slot,
+            "access_control": original.clone(),
+        }))?;
+        extracted.push(ExtractedSecret {
+            credential_ref: reference,
+            value: LegacySecret::Plaintext(payload),
+            migration_generation,
+            kind: ExtractedSecretKind::AccessControlRepair,
+            env_owner: None,
+            provider_owner: None,
+            mcp_owner: None,
+            connect_owner: None,
+        });
     }
     Ok(changed)
 }
@@ -8906,6 +9432,35 @@ fn connect_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult
     Ok(current.get("connect") != candidate.get("connect"))
 }
 
+fn access_repair_required_from_document(bytes: &[u8]) -> ConfigStoreResult<bool> {
+    let root = parse_config_root_object(
+        bytes,
+        "config.json is invalid during access-control credential transaction",
+    )?;
+    Ok(root
+        .get("access_control")
+        .and_then(Value::as_object)
+        .and_then(|access| access.get("repair_required"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
+fn access_repair_credential_refs() -> ConfigStoreResult<Vec<CredentialRef>> {
+    [
+        "section",
+        "section.bak",
+        "section.bak.1",
+        "section.bak.2",
+        "root",
+        "root.bak",
+        "root.bak.1",
+        "root.bak.2",
+    ]
+    .into_iter()
+    .map(|slot| CredentialRef::parse(format!("access_repair.{slot}.payload")))
+    .collect()
+}
+
 fn access_refs_from_document(
     bytes: &[u8],
 ) -> ConfigStoreResult<crate::credential_store::PersistedAccessCredentialRefs> {
@@ -8968,7 +9523,20 @@ fn access_refs_from_document(
 fn prepare_access_control_config_document(
     current: &[u8],
     candidate: &crate::Config,
+    allow_repair_clear: bool,
 ) -> ConfigStoreResult<Vec<u8>> {
+    if !allow_repair_clear
+        && access_repair_required_from_document(current)?
+        && !candidate
+            .access_control
+            .as_ref()
+            .is_some_and(|access| access.repair_required)
+    {
+        return Err(ConfigStoreError::Validation(
+            "access-control repair state is server-owned and requires an explicit reset"
+                .to_string(),
+        ));
+    }
     let mut root = parse_config_root_object(
         current,
         "config.json is invalid during access-control credential transaction",
@@ -10353,6 +10921,11 @@ fn ensure_access_consumers_or_abort(
     let staged_refs = access_refs_from_document(&staged)?;
     let original_refs = access_refs_from_document(&original)?;
     for raw in &credential_file.touched_credential_refs {
+        if raw.starts_with("access_repair.") {
+            // Internal quarantine records intentionally have no public config
+            // consumer. An explicit AccessControl reset owns and clears them.
+            continue;
+        }
         let owner = if staged_refs
             .password
             .as_ref()
@@ -12350,6 +12923,9 @@ fn rebase_changed_section(
         PROVIDERS_FILE => plan_provider_section(data_dir, &mut extracted, minimum_generation)?,
         MCP_FILE => plan_mcp_section(data_dir, &mut extracted, minimum_generation)?,
         BROKER_FILE => plan_broker_section(data_dir, &mut extracted, minimum_generation)?,
+        ACCESS_CONTROL_FILE => {
+            plan_access_control_section(data_dir, &mut extracted, minimum_generation)?
+        }
         CONFIG_FILE if manifest.migration_scope == Some(MigrationScope::ClusterFabric) => {
             plan_cluster_section(data_dir, &mut extracted, minimum_generation, false)?
         }
@@ -16593,6 +17169,7 @@ mod tests {
                 let marker = format!("{:064x}", suffix + 1);
                 config.access_control = Some(crate::AccessControlConfig {
                     password_enabled: true,
+                    repair_required: false,
                     password_hash: Some(marker.clone()),
                     password_salt: Some("03".repeat(16)),
                     password_credential_ref: None,
@@ -17010,6 +17587,7 @@ mod tests {
             let unrelated = install_unrelated_credential(dir.path(), "access-unrelated-winner");
             candidate.access_control = Some(crate::AccessControlConfig {
                 password_enabled: true,
+                repair_required: false,
                 password_hash: Some("a".repeat(64)),
                 password_salt: Some("01".repeat(16)),
                 password_credential_ref: None,
@@ -17094,6 +17672,7 @@ mod tests {
                 ExactTransactionScope::AccessControl => {
                     candidate.access_control = Some(crate::AccessControlConfig {
                         password_enabled: true,
+                        repair_required: false,
                         password_hash: Some("b".repeat(64)),
                         password_salt: Some("02".repeat(16)),
                         password_credential_ref: None,
@@ -17629,6 +18208,7 @@ mod tests {
         let (mut candidate, revision) = active_facade_config_and_credential_revision(dir.path());
         candidate.access_control = Some(crate::AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some("a".repeat(64)),
             password_salt: Some("01".repeat(16)),
             password_credential_ref: None,

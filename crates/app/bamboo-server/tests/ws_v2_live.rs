@@ -371,6 +371,7 @@ fn with_device(config: &mut bamboo_config::Config) -> (DeviceCredential, String)
     };
     config.access_control = Some(AccessControlConfig {
         password_enabled: false,
+        repair_required: false,
         password_hash: None,
         password_salt: None,
         password_credential_ref: None,

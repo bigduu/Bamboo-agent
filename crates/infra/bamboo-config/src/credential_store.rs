@@ -266,6 +266,10 @@ impl CredentialDocumentLkg {
         self.document
             .entries
             .iter()
+            // Recovery payloads are server-owned quarantine records, not
+            // runtime credentials. Do not disclose their fixed slots through
+            // status/list APIs; AccessControl exposes only repair_required.
+            .filter(|(credential_ref, _)| !credential_ref.as_str().starts_with("access_repair."))
             .map(|(credential_ref, entry)| {
                 let configured = if active_refs.contains(credential_ref) {
                     crate::encryption::decrypt(&entry.ciphertext)
@@ -382,6 +386,7 @@ impl CredentialStore {
         &self,
         credential_ref: &CredentialRef,
     ) -> ConfigStoreResult<(CredentialStatus, CredentialStoreHealth)> {
+        reject_internal_recovery_ref(credential_ref)?;
         self.with_transaction_lock(|| self.status_with_health_unchecked(credential_ref))
     }
 
@@ -571,6 +576,7 @@ impl CredentialStore {
         expected_revision: u64,
         authority: CredentialCommitAuthority<'_>,
     ) -> ConfigStoreResult<CredentialMutation> {
+        reject_internal_recovery_ref(&credential_ref)?;
         if secret.trim().is_empty() || crate::patch::is_masked_api_key(secret) {
             return Err(ConfigStoreError::Validation(
                 "credential value must not be empty or a mask; use clear instead".to_string(),
@@ -693,9 +699,13 @@ impl CredentialStore {
                         .to_string(),
                 ));
             }
+            let (mut document, _) = self.load_document_with_health()?;
+            document
+                .entries
+                .retain(|reference, _| is_internal_recovery_ref(reference));
             let revision = self.store.commit(
                 expected_revision,
-                CredentialDocument::default(),
+                document,
                 validate_document,
             )?;
             Ok((revision, Vec::new()))
@@ -802,6 +812,7 @@ impl CredentialStore {
         expected_revision: u64,
         authority: CredentialCommitAuthority<'_>,
     ) -> ConfigStoreResult<CredentialMutation> {
+        reject_internal_recovery_ref(credential_ref)?;
         let mut document = match authority.document(expected_revision)? {
             Some(document) => document,
             None => self.load_document()?,
@@ -2915,10 +2926,24 @@ impl CredentialStore {
     }
 }
 
+fn is_internal_recovery_ref(credential_ref: &CredentialRef) -> bool {
+    credential_ref.as_str().starts_with("access_repair.")
+}
+
+fn reject_internal_recovery_ref(credential_ref: &CredentialRef) -> ConfigStoreResult<()> {
+    if is_internal_recovery_ref(credential_ref) {
+        return Err(ConfigStoreError::Validation(
+            "credential reference is reserved for internal recovery".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn credential_statuses(document: &CredentialDocument) -> Vec<CredentialStatus> {
     document
         .entries
         .iter()
+        .filter(|(credential_ref, _)| !is_internal_recovery_ref(credential_ref))
         .map(|(credential_ref, entry)| CredentialStatus {
             credential_ref: credential_ref.clone(),
             configured: true,

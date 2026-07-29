@@ -1099,7 +1099,7 @@ mod tests {
             ),
             (
                 "access_control",
-                r#"{"password_enabled":true,"password_credential_ref":"access.root.password_verifier","password_configured":true}"#,
+                r#"{"password_enabled":true,"repair_required":false,"password_credential_ref":"access.root.password_verifier","password_configured":true}"#,
             ),
         ] {
             let error = run_config_set(key, value, Some(data_dir.clone()), false).unwrap_err();
