@@ -18,8 +18,8 @@ use tracing::{debug, trace, warn};
 
 use crate::config::{HeaderConfig, StreamableHttpConfig};
 use crate::error::{McpError, Result};
-use crate::protocol::client::{McpTransport, McpTransportMetadata};
-use crate::protocol::models::JsonRpcError;
+use crate::protocol::client::{McpCancellationMetadata, McpTransport, McpTransportMetadata};
+use crate::protocol::models::{JsonRpcError, JsonRpcNotification};
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
@@ -252,16 +252,17 @@ impl StreamableHttpTransport {
             // error directly instead of routing it through `JsonRpcResponse`,
             // whose response correlation necessarily requires an id.
             if let Some(error) = Self::parse_json_rpc_error_response(&body) {
-                return Err(McpError::RemoteProtocol {
+                return Err(McpError::HttpProtocol {
+                    status: status.as_u16(),
                     code: error.code,
                     message: error.message,
                     data: error.data,
                 });
             }
-            return Err(McpError::Transport(format!(
-                "POST failed: {} - {}",
-                status, body
-            )));
+            return Err(McpError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
         }
 
         let content_type = response
@@ -633,20 +634,64 @@ impl McpTransport for StreamableHttpTransport {
         Ok(())
     }
 
-    async fn cancel_request(&self, request_id: u64, _reason: &str) -> Result<()> {
-        let mut handles = self.post_sse_handles.lock().await;
-        if let Some(index) = handles
-            .iter()
-            .position(|entry| entry.request_id == Some(request_id))
-        {
-            let entry = handles.remove(index);
-            entry.handle.abort();
-            trace!(
-                "Cancelled MCP StreamableHTTP request by closing response stream (id={})",
-                request_id
-            );
+    async fn cancel_request(
+        &self,
+        request_id: u64,
+        reason: &str,
+        metadata: McpCancellationMetadata,
+    ) -> Result<()> {
+        if metadata.modern {
+            let mut handles = self.post_sse_handles.lock().await;
+            if let Some(index) = handles
+                .iter()
+                .position(|entry| entry.request_id == Some(request_id))
+            {
+                let entry = handles.remove(index);
+                entry.handle.abort();
+                trace!(
+                    "Cancelled modern MCP StreamableHTTP request by closing response stream (id={})",
+                    request_id
+                );
+            }
+            return Ok(());
         }
-        Ok(())
+
+        // Initialization-based Streamable HTTP revisions use the JSON-RPC
+        // cancellation notification, just like stdio. They do not assign an
+        // SSE response stream as the cancellation primitive.
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/cancelled".to_string(),
+            params: Some(serde_json::json!({
+                "requestId": request_id,
+                "reason": reason,
+            })),
+        };
+        self.send_with_metadata(
+            serde_json::to_string(&notification)?,
+            McpTransportMetadata {
+                request_id: None,
+                protocol_version: metadata.protocol_version,
+                modern: false,
+                method: notification.method,
+                name: None,
+                tool_parameter_headers: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    fn is_legacy_fallback_error(&self, error: &McpError) -> bool {
+        matches!(
+            error,
+            McpError::HttpStatus {
+                status: 400..=499,
+                ..
+            } | McpError::HttpProtocol {
+                status: 400..=499,
+                ..
+            }
+        )
     }
 
     fn requires_tool_parameter_headers(&self) -> bool {
@@ -745,6 +790,62 @@ mod tests {
                 .expect("write test response");
         });
         format!("http://{address}/mcp")
+    }
+
+    async fn serve_http_once_and_capture(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let status = status.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test request");
+            let mut request = Vec::new();
+            let expected_len = loop {
+                let mut chunk = [0_u8; 2048];
+                let read = socket.read(&mut chunk).await.expect("read test request");
+                assert!(read > 0, "request closed before headers completed");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                break header_end + 4 + content_len;
+            };
+            while request.len() < expected_len {
+                let mut chunk = [0_u8; 2048];
+                let read = socket.read(&mut chunk).await.expect("read test body");
+                assert!(read > 0, "request closed before body completed");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+        });
+        (format!("http://{address}/mcp"), request_rx)
     }
 
     #[test]
@@ -968,8 +1069,77 @@ mod tests {
             .expect_err("HTTP JSON-RPC error must surface");
         assert!(matches!(
             error,
-            McpError::RemoteProtocol { code: -32022, .. }
+            McpError::HttpProtocol {
+                status: 400,
+                code: -32022,
+                ..
+            }
         ));
+    }
+
+    #[tokio::test]
+    async fn non_json_http_errors_preserve_status_for_era_detection() {
+        for (status_line, expected_status) in [
+            ("400 Bad Request", 400_u16),
+            ("404 Not Found", 404_u16),
+            ("503 Service Unavailable", 503_u16),
+        ] {
+            let url = serve_http_once(status_line, "text/plain", "not JSON-RPC").await;
+            let transport = StreamableHttpTransport::new(StreamableHttpConfig {
+                url,
+                headers: Vec::new(),
+                connect_timeout_ms: 1000,
+            });
+            let error = transport
+                .post_and_route_response(
+                    r#"{"jsonrpc":"2.0","id":7,"method":"server/discover","params":{}}"#
+                        .to_string(),
+                    &McpTransportMetadata {
+                        request_id: Some(7),
+                        protocol_version: Some("2026-07-28".to_string()),
+                        modern: true,
+                        method: "server/discover".to_string(),
+                        name: None,
+                        tool_parameter_headers: Vec::new(),
+                    },
+                )
+                .await
+                .expect_err("HTTP status must surface");
+            assert!(matches!(
+                error,
+                McpError::HttpStatus {
+                    status,
+                    ref body
+                } if status == expected_status && body == "not JSON-RPC"
+            ));
+        }
+    }
+
+    #[test]
+    fn only_http_4xx_is_a_legacy_fallback_signal() {
+        let transport = StreamableHttpTransport::new(create_test_config());
+        assert!(transport.is_legacy_fallback_error(&McpError::HttpStatus {
+            status: 400,
+            body: "legacy".to_string(),
+        }));
+        assert!(transport.is_legacy_fallback_error(&McpError::HttpStatus {
+            status: 404,
+            body: "legacy".to_string(),
+        }));
+        assert!(transport.is_legacy_fallback_error(&McpError::HttpProtocol {
+            status: 400,
+            code: -32601,
+            message: "Method not found".to_string(),
+            data: None,
+        }));
+        assert!(!transport.is_legacy_fallback_error(&McpError::HttpStatus {
+            status: 503,
+            body: "temporary failure".to_string(),
+        }));
+        assert!(!transport
+            .is_legacy_fallback_error(&McpError::Timeout("modern probe timed out".to_string(),)));
+        assert!(!transport
+            .is_legacy_fallback_error(&McpError::Transport("connection refused".to_string(),)));
     }
 
     #[tokio::test]
@@ -1242,7 +1412,14 @@ mod tests {
         }
 
         transport
-            .cancel_request(7, "test timeout")
+            .cancel_request(
+                7,
+                "test timeout",
+                McpCancellationMetadata {
+                    protocol_version: Some("2026-07-28".to_string()),
+                    modern: true,
+                },
+            )
             .await
             .expect("cancel stream");
         tokio::task::yield_now().await;
@@ -1251,6 +1428,43 @@ mod tests {
         assert_eq!(transport.post_sse_handles.lock().await.len(), 1);
 
         second_abort.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_http_cancellation_sends_notification_instead_of_closing_stream() {
+        let (url, request_rx) =
+            serve_http_once_and_capture("202 Accepted", "application/json", "").await;
+        let mut transport = StreamableHttpTransport::new(StreamableHttpConfig {
+            url,
+            headers: Vec::new(),
+            connect_timeout_ms: 1000,
+        });
+        transport.connect().await.expect("connect");
+
+        transport
+            .cancel_request(
+                19,
+                "legacy timeout",
+                McpCancellationMetadata {
+                    protocol_version: Some("2025-11-25".to_string()),
+                    modern: false,
+                },
+            )
+            .await
+            .expect("send legacy cancellation");
+
+        let request = request_rx.await.expect("captured cancellation");
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request_lower.contains("mcp-protocol-version: 2025-11-25"));
+        let body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("HTTP body");
+        let notification: serde_json::Value =
+            serde_json::from_str(body).expect("cancellation notification JSON");
+        assert_eq!(notification["method"], "notifications/cancelled");
+        assert_eq!(notification["params"]["requestId"], 19);
+        assert_eq!(notification["params"]["reason"], "legacy timeout");
     }
 
     #[tokio::test]

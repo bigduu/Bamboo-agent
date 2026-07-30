@@ -83,8 +83,10 @@ pub struct McpTool {
 /// let result = McpCallResult {
 ///     content: vec![McpContentItem::Text {
 ///         text: "File contents here".to_string(),
+///         metadata: McpContentMetadata::default(),
 ///     }],
 ///     is_error: false,
+///     structured_content: McpStructuredContent::Missing,
 /// };
 ///
 /// if !result.is_error {
@@ -154,12 +156,14 @@ impl McpStructuredContent {
 /// // Text content
 /// let text = McpContentItem::Text {
 ///     text: "Hello, world!".to_string(),
+///     metadata: McpContentMetadata::default(),
 /// };
 ///
 /// // Image content
 /// let image = McpContentItem::Image {
 ///     data: base64_encoded_data,
 ///     mime_type: "image/png".to_string(),
+///     metadata: McpContentMetadata::default(),
 /// };
 ///
 /// // Resource reference
@@ -169,9 +173,58 @@ impl McpStructuredContent {
 ///         mime_type: Some("text/plain".to_string()),
 ///         text: Some("file contents".to_string()),
 ///         blob: None,
+///         meta: None,
 ///     },
+///     metadata: McpContentMetadata::default(),
 /// };
 /// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpContentMetadata {
+    /// Optional hints about intended audience, priority, and freshness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpAnnotations>,
+    /// Protocol/application metadata whose prefixed keys must round-trip.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<f64>,
+    #[serde(
+        rename = "lastModified",
+        alias = "last_modified",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_modified: Option<String>,
+    /// Preserve future annotation fields instead of silently discarding them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpIcon {
+    pub src: String,
+    #[serde(
+        rename = "mimeType",
+        alias = "mime_type",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// Preserve future icon fields instead of silently discarding them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum McpContentItem {
@@ -180,6 +233,8 @@ pub enum McpContentItem {
     Text {
         /// The text content
         text: String,
+        #[serde(flatten)]
+        metadata: McpContentMetadata,
     },
     /// Image content (base64-encoded)
     #[serde(rename = "image")]
@@ -190,6 +245,8 @@ pub enum McpContentItem {
         /// MCP sends this as `mimeType`; accept legacy `mime_type` too.
         #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
+        #[serde(flatten)]
+        metadata: McpContentMetadata,
     },
     /// Audio content (base64-encoded).
     #[serde(rename = "audio")]
@@ -199,6 +256,8 @@ pub enum McpContentItem {
         /// MIME type of the audio.
         #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
+        #[serde(flatten)]
+        metadata: McpContentMetadata,
     },
     /// Link to a resource that the server can read.
     #[serde(rename = "resource_link")]
@@ -224,12 +283,19 @@ pub enum McpContentItem {
         /// Optional raw resource size in bytes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<u64>,
+        /// Optional display icons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icons: Option<Vec<McpIcon>>,
+        #[serde(flatten)]
+        metadata: McpContentMetadata,
     },
     /// Resource reference
     #[serde(rename = "resource")]
     Resource {
         /// The resource being referenced
         resource: McpResource,
+        #[serde(flatten)]
+        metadata: McpContentMetadata,
     },
 }
 
@@ -258,6 +324,7 @@ pub enum McpContentItem {
 ///     mime_type: Some("text/plain".to_string()),
 ///     text: Some("File contents here".to_string()),
 ///     blob: None,
+///     meta: None,
 /// };
 ///
 /// // Binary file resource
@@ -266,6 +333,7 @@ pub enum McpContentItem {
 ///     mime_type: Some("image/png".to_string()),
 ///     text: None,
 ///     blob: Some(base64_encoded_data),
+///     meta: None,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +354,9 @@ pub struct McpResource {
     /// Binary content as base64 (for binary resources)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
+    /// Metadata attached directly to the embedded resource contents.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Server runtime status indicator.
@@ -536,6 +607,7 @@ mod tests {
         let result = McpCallResult {
             content: vec![McpContentItem::Text {
                 text: "success".to_string(),
+                metadata: McpContentMetadata::default(),
             }],
             is_error: false,
             structured_content: McpStructuredContent::Missing,
@@ -549,6 +621,7 @@ mod tests {
         let result = McpCallResult {
             content: vec![McpContentItem::Text {
                 text: "error occurred".to_string(),
+                metadata: McpContentMetadata::default(),
             }],
             is_error: true,
             structured_content: McpStructuredContent::Missing,
@@ -560,9 +633,10 @@ mod tests {
     fn test_mcp_content_item_text() {
         let item = McpContentItem::Text {
             text: "hello".to_string(),
+            metadata: McpContentMetadata::default(),
         };
         match item {
-            McpContentItem::Text { text } => assert_eq!(text, "hello"),
+            McpContentItem::Text { text, .. } => assert_eq!(text, "hello"),
             _ => panic!("Expected Text variant"),
         }
     }
@@ -572,9 +646,12 @@ mod tests {
         let item = McpContentItem::Image {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
+            metadata: McpContentMetadata::default(),
         };
         match item {
-            McpContentItem::Image { data, mime_type } => {
+            McpContentItem::Image {
+                data, mime_type, ..
+            } => {
                 assert_eq!(data, "base64data");
                 assert_eq!(mime_type, "image/png");
             }
@@ -590,7 +667,9 @@ mod tests {
         let json = r#"{"type":"image","data":"abc","mimeType":"image/jpeg"}"#;
         let item: McpContentItem = serde_json::from_str(json).expect("parse mimeType image");
         match item {
-            McpContentItem::Image { data, mime_type } => {
+            McpContentItem::Image {
+                data, mime_type, ..
+            } => {
                 assert_eq!(data, "abc");
                 assert_eq!(mime_type, "image/jpeg");
             }
@@ -603,29 +682,91 @@ mod tests {
     }
 
     #[test]
-    fn modern_audio_and_resource_link_content_deserialize() {
+    fn modern_content_metadata_and_resource_icons_round_trip() {
+        let audio_json = serde_json::json!({
+            "type": "audio",
+            "data": "UklGRg==",
+            "mimeType": "audio/wav",
+            "annotations": {
+                "audience": ["assistant"],
+                "priority": 0.8,
+                "futureHint": true
+            },
+            "_meta": {"example.com/trace": "trace-1"}
+        });
         let audio: McpContentItem =
-            serde_json::from_str(r#"{"type":"audio","data":"UklGRg==","mimeType":"audio/wav"}"#)
-                .expect("parse modern audio");
+            serde_json::from_value(audio_json.clone()).expect("parse modern audio");
         assert!(matches!(
-            audio,
-            McpContentItem::Audio { ref data, ref mime_type }
-                if data == "UklGRg==" && mime_type == "audio/wav"
+            &audio,
+            McpContentItem::Audio {
+                data,
+                mime_type,
+                metadata
+            } if data == "UklGRg=="
+                && mime_type == "audio/wav"
+                && metadata.annotations.as_ref().is_some_and(|annotations| {
+                    annotations.extra.get("futureHint") == Some(&serde_json::Value::Bool(true))
+                })
         ));
+        assert_eq!(
+            serde_json::to_value(&audio).expect("serialize audio"),
+            audio_json
+        );
 
-        let link: McpContentItem = serde_json::from_str(
-            r#"{"type":"resource_link","uri":"file:///report.json","name":"report","title":"Report","mimeType":"application/json","size":42}"#,
-        )
-        .expect("parse modern resource link");
+        let link_json = serde_json::json!({
+            "type": "resource_link",
+            "uri": "file:///report.json",
+            "name": "report",
+            "title": "Report",
+            "mimeType": "application/json",
+            "size": 42,
+            "icons": [{
+                "src": "data:image/png;base64,AA==",
+                "mimeType": "image/png",
+                "sizes": ["16x16"],
+                "theme": "dark",
+                "futureIconField": "kept"
+            }],
+            "annotations": {"lastModified": "2026-07-30T00:00:00Z"},
+            "_meta": {"example.com/source": "fixture"}
+        });
+        let link: McpContentItem =
+            serde_json::from_value(link_json.clone()).expect("parse modern resource link");
         assert!(matches!(
-            link,
+            &link,
             McpContentItem::ResourceLink {
-                ref uri,
-                ref name,
+                uri,
+                name,
                 size: Some(42),
+                icons: Some(icons),
                 ..
-            } if uri == "file:///report.json" && name == "report"
+            } if uri == "file:///report.json"
+                && name == "report"
+                && icons[0].extra.get("futureIconField")
+                    == Some(&serde_json::Value::String("kept".to_string()))
         ));
+        assert_eq!(
+            serde_json::to_value(&link).expect("serialize link"),
+            link_json
+        );
+
+        let embedded_json = serde_json::json!({
+            "type": "resource",
+            "resource": {
+                "uri": "file:///payload.bin",
+                "mimeType": "application/octet-stream",
+                "blob": "AAEC",
+                "_meta": {"example.com/checksum": "abc"}
+            },
+            "annotations": {"audience": ["user"]},
+            "_meta": {"example.com/container": true}
+        });
+        let embedded: McpContentItem =
+            serde_json::from_value(embedded_json.clone()).expect("parse embedded resource");
+        assert_eq!(
+            serde_json::to_value(&embedded).expect("serialize embedded resource"),
+            embedded_json
+        );
     }
 
     #[test]
@@ -656,10 +797,12 @@ mod tests {
                 mime_type: Some("text/plain".to_string()),
                 text: Some("content".to_string()),
                 blob: None,
+                meta: None,
             },
+            metadata: McpContentMetadata::default(),
         };
         match item {
-            McpContentItem::Resource { resource } => {
+            McpContentItem::Resource { resource, .. } => {
                 assert_eq!(resource.uri, "file:///test.txt");
             }
             _ => panic!("Expected Resource variant"),
@@ -673,6 +816,7 @@ mod tests {
             mime_type: Some("text/plain".to_string()),
             text: Some("file content".to_string()),
             blob: None,
+            meta: None,
         };
         assert_eq!(resource.uri, "file:///test.txt");
         assert_eq!(resource.mime_type, Some("text/plain".to_string()));

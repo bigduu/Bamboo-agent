@@ -5,6 +5,17 @@ pub enum McpError {
     #[error("Transport error: {0}")]
     Transport(String),
 
+    #[error("HTTP request failed with status {status}: {body}")]
+    HttpStatus { status: u16, body: String },
+
+    #[error("HTTP {status} returned protocol error {code}: {message}")]
+    HttpProtocol {
+        status: u16,
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+
     #[error("Protocol error: {0}")]
     Protocol(String),
 

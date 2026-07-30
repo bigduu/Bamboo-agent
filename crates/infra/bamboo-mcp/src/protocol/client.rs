@@ -28,6 +28,9 @@ const NOTIFICATION_CHANNEL_CAPACITY: usize = 100;
 /// ignores pre-initialize requests does not consume the full operation timeout
 /// (60 seconds by default) before Bamboo falls back to `initialize`.
 const MODERN_DISCOVERY_PROBE_TIMEOUT_MS: u64 = 5_000;
+/// Cancellation is best-effort and must never turn an already-expired request
+/// into another unbounded wait (for example, on a stalled stdio writer).
+const CANCELLATION_ATTEMPT_TIMEOUT_MS: u64 = 250;
 const SUBSCRIPTION_ACK_METHOD: &str = "notifications/subscriptions/acknowledged";
 const SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
 
@@ -47,6 +50,14 @@ pub struct McpTransportMetadata {
     /// Raw `x-mcp-header` name/value pairs. The HTTP transport performs the
     /// required safe header-value encoding.
     pub tool_parameter_headers: Vec<(String, String)>,
+}
+
+/// Protocol-era context needed to choose the transport-specific cancellation
+/// mechanism without consulting mutable post-negotiation client state.
+#[derive(Debug, Clone, Default)]
+pub struct McpCancellationMetadata {
+    pub protocol_version: Option<String>,
+    pub modern: bool,
 }
 
 /// Transport trait for MCP communication
@@ -72,7 +83,12 @@ pub trait McpTransport: Send + Sync {
     ///
     /// stdio cancellation is a JSON-RPC notification. Streamable HTTP
     /// overrides this hook and closes the request's response stream instead.
-    async fn cancel_request(&self, request_id: u64, reason: &str) -> Result<()> {
+    async fn cancel_request(
+        &self,
+        request_id: u64,
+        reason: &str,
+        _metadata: McpCancellationMetadata,
+    ) -> Result<()> {
         let notification = JsonRpcNotification {
             jsonrpc: "2.0".to_string(),
             method: "notifications/cancelled".to_string(),
@@ -86,6 +102,13 @@ pub trait McpTransport: Send + Sync {
 
     /// Whether this transport can speak the stateless MCP 2026-07-28 protocol.
     fn supports_modern_protocol(&self) -> bool {
+        true
+    }
+
+    /// Whether an unrecognized modern discovery error proves that this server
+    /// is legacy. stdio falls back on any unrecognized error. Streamable HTTP
+    /// overrides this and permits fallback only for an explicit 4xx response.
+    fn is_legacy_fallback_error(&self, _error: &McpError) -> bool {
         true
     }
 
@@ -189,6 +212,7 @@ pub struct McpProtocolClient {
     notification_queue_full: Arc<AtomicBool>,
     protocol_mode: RwLock<ProtocolMode>,
     tool_header_specs: RwLock<HashMap<String, Vec<ToolHeaderSpec>>>,
+    tool_output_validators: RwLock<HashMap<String, Arc<jsonschema::Validator>>>,
     /// Long-lived `subscriptions/listen` request used by modern servers to
     /// deliver `notifications/tools/list_changed`.
     tool_subscription: Arc<Mutex<ToolSubscriptionState>>,
@@ -210,6 +234,7 @@ impl McpProtocolClient {
             notification_queue_full: Arc::new(AtomicBool::new(false)),
             protocol_mode: RwLock::new(ProtocolMode::Unnegotiated),
             tool_header_specs: RwLock::new(HashMap::new()),
+            tool_output_validators: RwLock::new(HashMap::new()),
             tool_subscription: Arc::new(Mutex::new(ToolSubscriptionState::default())),
             modern_tool_list_changes: Arc::new(AtomicBool::new(false)),
         }
@@ -526,6 +551,16 @@ impl McpProtocolClient {
         tool_parameter_headers: Vec<(String, String)>,
     ) -> Result<JsonRpcResponse> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let cancellation_metadata = match &protocol {
+            RequestProtocol::Modern { version } => McpCancellationMetadata {
+                protocol_version: Some(version.clone()),
+                modern: true,
+            },
+            RequestProtocol::Legacy { version } => McpCancellationMetadata {
+                protocol_version: version.clone(),
+                modern: false,
+            },
+        };
 
         let params = match &protocol {
             RequestProtocol::Modern { version } => {
@@ -549,10 +584,10 @@ impl McpProtocolClient {
             pending.insert(id, PendingRequest { sender: tx });
         }
 
-        let metadata = match protocol {
+        let metadata = match &protocol {
             RequestProtocol::Modern { version } => McpTransportMetadata {
                 request_id: Some(id),
-                protocol_version: Some(version),
+                protocol_version: Some(version.clone()),
                 modern: true,
                 method: method.to_string(),
                 name,
@@ -560,7 +595,7 @@ impl McpProtocolClient {
             },
             RequestProtocol::Legacy { version } => McpTransportMetadata {
                 request_id: Some(id),
-                protocol_version: version,
+                protocol_version: version.clone(),
                 modern: false,
                 method: method.to_string(),
                 name,
@@ -588,7 +623,13 @@ impl McpProtocolClient {
             }
             Err(_) => {
                 drop(transport);
-                self.cancel_timed_out_request(id, method, timeout_ms).await;
+                self.cancel_timed_out_request(
+                    id,
+                    method,
+                    timeout_ms,
+                    cancellation_metadata.clone(),
+                )
+                .await;
                 return Err(McpError::Timeout(format!(
                     "Request {id} timed out after {timeout_ms}ms"
                 )));
@@ -611,7 +652,8 @@ impl McpProtocolClient {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(McpError::Disconnected),
             Err(_) => {
-                self.cancel_timed_out_request(id, method, timeout_ms).await;
+                self.cancel_timed_out_request(id, method, timeout_ms, cancellation_metadata)
+                    .await;
                 Err(McpError::Timeout(format!(
                     "Request {id} timed out after {timeout_ms}ms"
                 )))
@@ -619,17 +661,43 @@ impl McpProtocolClient {
         }
     }
 
-    async fn cancel_timed_out_request(&self, id: u64, method: &str, timeout_ms: u64) {
+    async fn cancel_timed_out_request(
+        &self,
+        id: u64,
+        method: &str,
+        timeout_ms: u64,
+        metadata: McpCancellationMetadata,
+    ) {
         self.pending_requests.write().await.remove(&id);
         let reason = format!("Request timed out after {timeout_ms}ms");
-        let transport = self.transport.read().await;
-        if let Err(error) = transport.cancel_request(id, &reason).await {
-            warn!(
-                "MCP request cancellation failed after timeout (id={}, method={}): {}",
-                id, method, error
-            );
+        // Initialization-based protocol revisions explicitly forbid cancelling
+        // `initialize`. A timeout still removes the local pending request.
+        if method != "initialize" {
+            let attempt = async {
+                let transport = self.transport.read().await;
+                transport.cancel_request(id, &reason, metadata).await
+            };
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(CANCELLATION_ATTEMPT_TIMEOUT_MS),
+                attempt,
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(
+                        "MCP request cancellation failed after timeout (id={}, method={}): {}",
+                        id, method, error
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "MCP request cancellation attempt timed out (id={}, method={}, cancellation_timeout_ms={})",
+                        id, method, CANCELLATION_ATTEMPT_TIMEOUT_MS
+                    );
+                }
+            }
         }
-        drop(transport);
         warn!(
             "MCP JSON-RPC request timed out (id={}, method={}, timeout_ms={})",
             id, method, timeout_ms
@@ -698,7 +766,7 @@ impl McpProtocolClient {
         &self,
         timeout_ms: u64,
     ) -> std::result::Result<McpInitializeResult, ModernDiscoveryError> {
-        let response = self
+        let response = match self
             .send_request_using(
                 "server/discover",
                 Some(serde_json::json!({})),
@@ -709,13 +777,20 @@ impl McpProtocolClient {
                 Vec::new(),
             )
             .await
-            .map_err(|error| {
+        {
+            Ok(response) => response,
+            Err(error) => {
                 if Self::is_recognized_modern_error(&error) {
-                    ModernDiscoveryError::Pinned(error)
-                } else {
-                    ModernDiscoveryError::Fallback(error)
+                    return Err(ModernDiscoveryError::Pinned(error));
                 }
-            })?;
+                let may_fallback = self.transport.read().await.is_legacy_fallback_error(&error);
+                return Err(if may_fallback {
+                    ModernDiscoveryError::Fallback(error)
+                } else {
+                    ModernDiscoveryError::Pinned(error)
+                });
+            }
+        };
 
         // A successful `server/discover` response pins the server to the
         // modern era. Any malformed or incompatible result must surface as a
@@ -927,12 +1002,38 @@ impl McpProtocolClient {
         }
         drop(subscription);
 
-        let transport = self.transport.read().await;
-        if let Err(error) = transport.cancel_request(id, reason).await {
-            warn!(
-                "Failed to cancel MCP subscriptions/listen (id={}): {}",
-                id, error
-            );
+        let attempt = async {
+            let transport = self.transport.read().await;
+            transport
+                .cancel_request(
+                    id,
+                    reason,
+                    McpCancellationMetadata {
+                        protocol_version: Some(LATEST_PROTOCOL_VERSION.to_string()),
+                        modern: true,
+                    },
+                )
+                .await
+        };
+        match tokio::time::timeout(
+            tokio::time::Duration::from_millis(CANCELLATION_ATTEMPT_TIMEOUT_MS),
+            attempt,
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(
+                    "Failed to cancel MCP subscriptions/listen (id={}): {}",
+                    id, error
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "MCP subscriptions/listen cancellation timed out (id={}, cancellation_timeout_ms={})",
+                    id, CANCELLATION_ATTEMPT_TIMEOUT_MS
+                );
+            }
         }
     }
 
@@ -1005,6 +1106,11 @@ impl McpProtocolClient {
                     | MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR
                     | UNSUPPORTED_PROTOCOL_VERSION_ERROR,
                 ..
+            } | McpError::HttpProtocol {
+                code: HEADER_MISMATCH_ERROR
+                    | MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR
+                    | UNSUPPORTED_PROTOCOL_VERSION_ERROR,
+                ..
             }
         )
     }
@@ -1062,6 +1168,7 @@ impl McpProtocolClient {
         }
 
         let mut header_specs = HashMap::new();
+        let mut output_validators = HashMap::new();
         let mut tools = Vec::with_capacity(tool_infos.len());
 
         for tool in tool_infos {
@@ -1074,6 +1181,19 @@ impl McpProtocolClient {
                     continue;
                 }
                 schema => schema,
+            };
+            let output_validator = match output_schema.as_ref() {
+                Some(schema) => match jsonschema::validator_for(schema) {
+                    Ok(validator) => Some(Arc::new(validator)),
+                    Err(error) => {
+                        warn!(
+                            "Ignoring MCP tool '{}' because outputSchema is invalid: {}",
+                            tool.name, error
+                        );
+                        continue;
+                    }
+                },
+                None => None,
             };
             let parameters = match tool.input_schema {
                 Some(parameters)
@@ -1108,6 +1228,9 @@ impl McpProtocolClient {
                     }
                 }
             }
+            if let Some(validator) = output_validator {
+                output_validators.insert(tool.name.clone(), validator);
+            }
             tools.push(McpTool {
                 name: tool.name,
                 description: tool.description,
@@ -1116,6 +1239,7 @@ impl McpProtocolClient {
             });
         }
         *self.tool_header_specs.write().await = header_specs;
+        *self.tool_output_validators.write().await = output_validators;
         Ok(tools)
     }
 
@@ -1164,6 +1288,21 @@ impl McpProtocolClient {
                 .ok_or_else(|| McpError::Protocol("Missing result".to_string()))?,
         )?;
         Self::ensure_complete_result(result.result_type.as_deref(), self.is_modern().await)?;
+        if let Some(validator) = self.tool_output_validators.read().await.get(name).cloned() {
+            match result.structured_content.to_json_value() {
+                Some(value) => validator.validate(&value).map_err(|error| {
+                    McpError::Protocol(format!(
+                        "MCP tool '{name}' structuredContent does not conform to outputSchema: {error}"
+                    ))
+                })?,
+                None if !result.is_error => {
+                    return Err(McpError::Protocol(format!(
+                        "MCP tool '{name}' declared outputSchema but omitted structuredContent"
+                    )));
+                }
+                None => {}
+            }
+        }
 
         Ok(McpCallResult {
             content: result.content,
@@ -1536,8 +1675,10 @@ mod tests {
         message_rx: TokioMutex<Option<mpsc::Receiver<String>>>,
         response_tx: mpsc::Sender<String>,
         responses: TokioMutex<VecDeque<Option<Value>>>,
+        send_failures: TokioMutex<VecDeque<McpError>>,
         captured: CapturedMessages,
         supports_modern: bool,
+        http_fallback_rules: bool,
         requires_tool_parameter_headers: bool,
         legacy_version: &'static str,
     }
@@ -1552,8 +1693,10 @@ mod tests {
                     message_rx: TokioMutex::new(Some(message_rx)),
                     response_tx,
                     responses: TokioMutex::new(responses.into()),
+                    send_failures: TokioMutex::new(VecDeque::new()),
                     captured: captured.clone(),
                     supports_modern: true,
+                    http_fallback_rules: false,
                     requires_tool_parameter_headers: false,
                     legacy_version: LATEST_LEGACY_PROTOCOL_VERSION,
                 },
@@ -1563,6 +1706,16 @@ mod tests {
 
         fn with_tool_parameter_headers(mut self) -> Self {
             self.requires_tool_parameter_headers = true;
+            self
+        }
+
+        fn with_send_failures(self, failures: Vec<McpError>) -> Self {
+            *self.send_failures.try_lock().expect("uncontended failures") = failures.into();
+            self
+        }
+
+        fn with_http_fallback_rules(mut self) -> Self {
+            self.http_fallback_rules = true;
             self
         }
 
@@ -1649,6 +1802,9 @@ mod tests {
             self.captured.lock().await.push((request, metadata));
 
             if let Some(id) = id {
+                if let Some(error) = self.send_failures.lock().await.pop_front() {
+                    return Err(error);
+                }
                 let response = self.responses.lock().await.pop_front().ok_or_else(|| {
                     McpError::Transport("script has no response for request".to_string())
                 })?;
@@ -1669,6 +1825,20 @@ mod tests {
             self.supports_modern
         }
 
+        fn is_legacy_fallback_error(&self, error: &McpError) -> bool {
+            !self.http_fallback_rules
+                || matches!(
+                    error,
+                    McpError::HttpStatus {
+                        status: 400..=499,
+                        ..
+                    } | McpError::HttpProtocol {
+                        status: 400..=499,
+                        ..
+                    }
+                )
+        }
+
         fn latest_legacy_protocol_version(&self) -> &'static str {
             self.legacy_version
         }
@@ -1683,6 +1853,50 @@ mod tests {
 
         async fn receive(&self) -> Result<Option<String>> {
             Err(McpError::Disconnected)
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+    }
+
+    struct HangingCancellationTransport {
+        connected: bool,
+        cancellation_started: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl McpTransport for HangingCancellationTransport {
+        async fn connect(&mut self) -> Result<()> {
+            self.connected = true;
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<()> {
+            self.connected = false;
+            Ok(())
+        }
+
+        async fn send(&self, _message: String) -> Result<()> {
+            Ok(())
+        }
+
+        async fn cancel_request(
+            &self,
+            _request_id: u64,
+            _reason: &str,
+            _metadata: McpCancellationMetadata,
+        ) -> Result<()> {
+            self.cancellation_started.store(true, Ordering::SeqCst);
+            std::future::pending::<Result<()>>().await
+        }
+
+        async fn take_message_receiver(&self) -> Option<mpsc::Receiver<String>> {
+            None
+        }
+
+        async fn receive(&self) -> Result<Option<String>> {
+            Ok(None)
         }
 
         fn is_connected(&self) -> bool {
@@ -1952,6 +2166,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_4xx_without_modern_error_falls_back_to_legacy_initialization() {
+        let (transport, captured) =
+            ScriptedTransport::new(vec![ScriptedTransport::success(serde_json::json!({
+                "protocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "serverInfo": {
+                    "name": "legacy-http-server",
+                    "version": "1.0.0"
+                }
+            }))]);
+        let transport = transport
+            .with_http_fallback_rules()
+            .with_send_failures(vec![McpError::HttpProtocol {
+                status: 400,
+                code: -32601,
+                message: "Method not found".to_string(),
+                data: None,
+            }]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+
+        let initialized = client.initialize(1000).await.expect("legacy fallback");
+        assert_eq!(initialized.protocol_version, LATEST_LEGACY_PROTOCOL_VERSION);
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0].0["method"], "server/discover");
+        assert_eq!(captured[1].0["method"], "initialize");
+        assert_eq!(captured[2].0["method"], "notifications/initialized");
+    }
+
+    #[tokio::test]
+    async fn http_timeout_network_and_5xx_never_fall_back_to_initialize() {
+        let failures = [
+            McpError::Timeout("probe timeout".to_string()),
+            McpError::Transport("connection reset".to_string()),
+            McpError::HttpProtocol {
+                status: 503,
+                code: -32603,
+                message: "temporary outage".to_string(),
+                data: None,
+            },
+        ];
+
+        for failure in failures {
+            let (transport, captured) =
+                ScriptedTransport::new(vec![ScriptedTransport::success(serde_json::json!({
+                    "protocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "serverInfo": {"name": "must-not-run", "version": "1"}
+                }))]);
+            let transport = transport
+                .with_http_fallback_rules()
+                .with_send_failures(vec![failure]);
+            let mut client = McpProtocolClient::new(Box::new(transport));
+            client.connect().await.expect("connect");
+
+            client
+                .initialize(1000)
+                .await
+                .expect_err("HTTP transport failure must pin the probe error");
+            let captured = captured.lock().await;
+            assert_eq!(
+                captured.len(),
+                1,
+                "HTTP failure must not send legacy initialize"
+            );
+            assert_eq!(captured[0].0["method"], "server/discover");
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_style_timeout_remains_a_legacy_fallback_signal() {
+        let (transport, captured) =
+            ScriptedTransport::new(vec![ScriptedTransport::success(serde_json::json!({
+                "protocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "serverInfo": {"name": "legacy-stdio", "version": "1"}
+            }))]);
+        let transport =
+            transport.with_send_failures(vec![McpError::Timeout("silent probe".to_string())]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+
+        client.initialize(1000).await.expect("stdio fallback");
+        let captured = captured.lock().await;
+        assert_eq!(captured[0].0["method"], "server/discover");
+        assert_eq!(captured[1].0["method"], "initialize");
+    }
+
+    #[tokio::test]
     async fn recognized_modern_error_never_falls_back_to_initialize() {
         let (transport, captured) = ScriptedTransport::new(vec![ScriptedTransport::error(
             UNSUPPORTED_PROTOCOL_VERSION_ERROR,
@@ -1970,6 +2274,34 @@ mod tests {
         assert!(matches!(
             error,
             McpError::RemoteProtocol {
+                code: UNSUPPORTED_PROTOCOL_VERSION_ERROR,
+                ..
+            }
+        ));
+        assert_eq!(captured.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recognized_modern_http_error_never_falls_back_to_initialize() {
+        let (transport, captured) = ScriptedTransport::new(Vec::new());
+        let transport = transport
+            .with_http_fallback_rules()
+            .with_send_failures(vec![McpError::HttpProtocol {
+                status: 400,
+                code: UNSUPPORTED_PROTOCOL_VERSION_ERROR,
+                message: "Unsupported protocol version".to_string(),
+                data: Some(serde_json::json!({"supported": ["2099-01-01"]})),
+            }]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+
+        let error = client
+            .initialize(1000)
+            .await
+            .expect_err("recognized modern HTTP error must surface");
+        assert!(matches!(
+            error,
+            McpError::HttpProtocol {
                 code: UNSUPPORTED_PROTOCOL_VERSION_ERROR,
                 ..
             }
@@ -2291,8 +2623,11 @@ mod tests {
                     "description": "Return a report",
                     "inputSchema": {"type": "object"},
                     "outputSchema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
                         "type": "object",
-                        "properties": {"count": {"type": "integer"}}
+                        "properties": {"count": {"type": "integer"}},
+                        "required": ["count"],
+                        "additionalProperties": false
                     }
                 }],
                 "ttlMs": 1000,
@@ -2304,17 +2639,30 @@ mod tests {
                     {
                         "type": "audio",
                         "data": "UklGRg==",
-                        "mimeType": "audio/wav"
+                        "mimeType": "audio/wav",
+                        "annotations": {"audience": ["assistant"], "priority": 0.8},
+                        "_meta": {"example.com/trace": "trace-1"}
                     },
                     {
                         "type": "resource_link",
                         "uri": "file:///report.json",
                         "name": "report",
                         "mimeType": "application/json",
-                        "size": 42
+                        "size": 42,
+                        "icons": [{"src": "data:image/png;base64,AA=="}],
+                        "_meta": {"example.com/link": true}
+                    },
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": "file:///report.bin",
+                            "blob": "AAEC",
+                            "_meta": {"example.com/checksum": "abc"}
+                        },
+                        "annotations": {"audience": ["user"]}
                     }
                 ],
-                "structuredContent": null
+                "structuredContent": {"count": 42}
             })),
         ]);
         let mut client = McpProtocolClient::new(Box::new(transport));
@@ -2325,8 +2673,11 @@ mod tests {
         assert_eq!(
             tools[0].output_schema,
             Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "properties": {"count": {"type": "integer"}}
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+                "additionalProperties": false
             }))
         );
 
@@ -2342,10 +2693,99 @@ mod tests {
             result.content[1],
             crate::types::McpContentItem::ResourceLink { .. }
         ));
+        assert!(matches!(
+            result.content[2],
+            crate::types::McpContentItem::Resource { .. }
+        ));
+        let serialized_content =
+            serde_json::to_value(&result.content).expect("serialize preserved content");
+        assert_eq!(
+            serialized_content[0]["_meta"]["example.com/trace"],
+            "trace-1"
+        );
+        assert_eq!(
+            serialized_content[1]["icons"][0]["src"],
+            "data:image/png;base64,AA=="
+        );
+        assert_eq!(
+            serialized_content[2]["resource"]["_meta"]["example.com/checksum"],
+            "abc"
+        );
         assert_eq!(
             result.structured_content,
-            crate::types::McpStructuredContent::Null
+            crate::types::McpStructuredContent::Value(serde_json::json!({"count": 42}))
         );
+    }
+
+    #[tokio::test]
+    async fn tool_structured_content_is_validated_before_returning_to_executor() {
+        let (transport, _) = ScriptedTransport::new(vec![
+            ScriptedTransport::success(ScriptedTransport::discover_result(false)),
+            ScriptedTransport::success(serde_json::json!({
+                "resultType": "complete",
+                "tools": [{
+                    "name": "numbers",
+                    "description": "Return integers",
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "array",
+                        "items": {"type": "integer"}
+                    }
+                }],
+                "ttlMs": 1000,
+                "cacheScope": "private"
+            })),
+            ScriptedTransport::success(serde_json::json!({
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "[1, \"invalid\"]"}],
+                "structuredContent": [1, "invalid"]
+            })),
+        ]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+        client.initialize(1000).await.expect("modern discovery");
+        client.list_tools(1000).await.expect("tools/list");
+
+        let error = client
+            .call_tool("numbers", serde_json::json!({}), 1000)
+            .await
+            .expect_err("invalid structured content must not reach the executor");
+        let message = error.to_string();
+        assert!(message.contains("structuredContent"));
+        assert!(message.contains("outputSchema"));
+    }
+
+    #[tokio::test]
+    async fn successful_tool_with_output_schema_must_return_structured_content() {
+        let (transport, _) = ScriptedTransport::new(vec![
+            ScriptedTransport::success(ScriptedTransport::discover_result(false)),
+            ScriptedTransport::success(serde_json::json!({
+                "resultType": "complete",
+                "tools": [{
+                    "name": "report",
+                    "description": "Return a report",
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {"type": "object"}
+                }],
+                "ttlMs": 1000,
+                "cacheScope": "private"
+            })),
+            ScriptedTransport::success(serde_json::json!({
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "missing structured result"}]
+            })),
+        ]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+        client.initialize(1000).await.expect("modern discovery");
+        client.list_tools(1000).await.expect("tools/list");
+
+        let error = client
+            .call_tool("report", serde_json::json!({}), 1000)
+            .await
+            .expect_err("missing structured content must fail");
+        assert!(error.to_string().contains("omitted structuredContent"));
     }
 
     #[test]
@@ -2415,6 +2855,42 @@ mod tests {
         let cancellation: Value = serde_json::from_str(&sent[1]).expect("cancellation JSON");
         assert_eq!(cancellation["method"], "notifications/cancelled");
         assert_eq!(cancellation["params"]["requestId"], 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_initialize_timeout_is_never_cancelled() {
+        let (mut transport, captured) = ScriptedTransport::new(vec![None]);
+        transport.supports_modern = false;
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+
+        let error = client
+            .initialize(20)
+            .await
+            .expect_err("silent initialize must time out");
+        assert!(matches!(error, McpError::Timeout(_)));
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 1, "initialize must not be cancelled");
+        assert_eq!(captured[0].0["method"], "initialize");
+    }
+
+    #[tokio::test]
+    async fn timed_out_request_does_not_wait_forever_for_cancellation() {
+        let cancellation_started = Arc::new(AtomicBool::new(false));
+        let transport = HangingCancellationTransport {
+            connected: true,
+            cancellation_started: cancellation_started.clone(),
+        };
+        let client = McpProtocolClient::new(Box::new(transport));
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            client.send_request("tools/call", None, 10),
+        )
+        .await
+        .expect("bounded cancellation must return");
+        assert!(matches!(result, Err(McpError::Timeout(_))));
+        assert!(cancellation_started.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
