@@ -344,6 +344,24 @@ pub struct ConversationSummary {
     pub content: String,
     pub message_count: usize,
     pub token_count: u32,
+    /// Number of raw source tokens represented by this summary across all
+    /// compression passes. Legacy summaries deserialize as `0`, which signals
+    /// that callers must use the conservative existing-summary fallback.
+    #[serde(default)]
+    pub represented_source_tokens: u32,
+    /// Desired summary size for the logical compression pass that produced this
+    /// value. `token_count` remains the actual rendered summary token count.
+    #[serde(default)]
+    pub target_token_count: u32,
+    /// Source-to-summary target ratio used by the logical compression pass.
+    #[serde(default)]
+    pub target_ratio: f64,
+    /// Whether model/context capacity or an underfilled model response left the
+    /// summary materially below its desired source-derived token budget.
+    #[serde(default)]
+    pub budget_clamped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_clamp_reason: Option<String>,
 }
 
 impl ConversationSummary {
@@ -355,7 +373,29 @@ impl ConversationSummary {
             content: content.into(),
             message_count,
             token_count,
+            represented_source_tokens: 0,
+            target_token_count: 0,
+            target_ratio: 0.0,
+            budget_clamped: false,
+            budget_clamp_reason: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_compression_metrics(
+        mut self,
+        represented_source_tokens: u32,
+        target_token_count: u32,
+        target_ratio: f64,
+        budget_clamped: bool,
+        budget_clamp_reason: Option<String>,
+    ) -> Self {
+        self.represented_source_tokens = represented_source_tokens;
+        self.target_token_count = target_token_count;
+        self.target_ratio = target_ratio;
+        self.budget_clamped = budget_clamped;
+        self.budget_clamp_reason = budget_clamp_reason;
+        self
     }
 
     pub fn update(&mut self, content: impl Into<String>, message_count: usize, token_count: u32) {
@@ -389,6 +429,10 @@ pub struct CompressionEvent {
     pub usage_after_percent: f64,
     #[serde(default)]
     pub summary_tokens: u32,
+    /// Actual token count of the summary body, excluding the system-envelope
+    /// wrapper tracked by the legacy `summary_tokens` field.
+    #[serde(default)]
+    pub actual_summary_tokens: u32,
     #[serde(default)]
     pub trigger_type: CompressionTriggerType,
     #[serde(default)]
@@ -397,6 +441,34 @@ pub struct CompressionEvent {
     pub model_used: Option<String>,
     #[serde(default)]
     pub latency_ms: u64,
+    /// Raw source tokens newly archived by this event.
+    #[serde(default)]
+    pub source_tokens: u32,
+    /// Active prompt tokens outside `Session.messages` that were included in
+    /// the post-compression target calculation.
+    #[serde(default)]
+    pub fixed_prompt_tokens: u32,
+    /// Source-derived summary budget for the completed logical pass.
+    #[serde(default)]
+    pub target_summary_tokens: u32,
+    /// Configured source-to-summary target ratio.
+    #[serde(default)]
+    pub summary_target_ratio: f64,
+    /// Actual summary/source ratio after the pass.
+    #[serde(default)]
+    pub actual_summary_ratio: f64,
+    /// Whether capacity or output quality left the persisted summary below its
+    /// source-derived target.
+    #[serde(default)]
+    pub summary_budget_clamped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_budget_clamp_reason: Option<String>,
+    #[serde(default)]
+    pub summarization_map_calls: u32,
+    #[serde(default)]
+    pub summarization_reduce_calls: u32,
+    #[serde(default)]
+    pub summarization_fallback_used: bool,
 }
 
 impl CompressionEvent {
@@ -420,10 +492,21 @@ impl CompressionEvent {
             usage_before_percent,
             usage_after_percent,
             summary_tokens,
+            actual_summary_tokens: 0,
             trigger_type,
             compression_ratio,
             model_used,
             latency_ms,
+            source_tokens: 0,
+            fixed_prompt_tokens: 0,
+            target_summary_tokens: 0,
+            summary_target_ratio: 0.0,
+            actual_summary_ratio: 0.0,
+            summary_budget_clamped: false,
+            summary_budget_clamp_reason: None,
+            summarization_map_calls: 0,
+            summarization_reduce_calls: 0,
+            summarization_fallback_used: false,
         }
     }
 }
@@ -552,11 +635,12 @@ pub struct Session {
     pub metadata: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<TokenBudget>,
-    /// Per-process cache of the model-limit-derived budget, keyed by the model it
-    /// was resolved for. Never persisted (`#[serde(skip)]`), so a reloaded session
-    /// re-resolves from the current `model_limits.json`, and a mid-session model
-    /// switch invalidates it (the key no longer matches). `token_budget` above
-    /// stays the persisted genuine/child override that takes priority. (#180)
+    /// Runtime snapshot of the model-limit-derived budget for downstream readers
+    /// in the current round, keyed by model. It is never persisted and never
+    /// short-circuits the next round's resolution, so live `model_limits.json`
+    /// edits and provider-metadata refreshes take effect without reloading the
+    /// session. `token_budget` above remains the persisted genuine/child override
+    /// that takes priority. (#180, #763)
     #[serde(skip)]
     pub resolved_token_budget: Option<(String, TokenBudget)>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -617,11 +701,11 @@ impl Session {
     }
 
     /// The effective token budget: a genuine/child override (`token_budget`) if
-    /// set, otherwise the per-process resolved-budget cache
+    /// set, otherwise the current round's resolved-budget snapshot
     /// (`resolved_token_budget`). Both are `None` until the first resolution.
     /// Downstream readers should use this rather than `token_budget` directly so
     /// they observe the engine-resolved budget without persisting it. Note the
-    /// cache is returned regardless of which model it was resolved for; that is
+    /// snapshot is returned regardless of which model it was resolved for; that is
     /// safe because `resolve_token_budget` runs at round start (re-keying to the
     /// current model) before any reader — don't call this expecting model-freshness
     /// without a preceding same-round resolve. (#180)
@@ -1252,13 +1336,7 @@ mod tests {
             thinking_tokens: 0,
             cache_read_input_tokens: 0,
         });
-        session.conversation_summary = Some(ConversationSummary {
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            content: "summary".to_string(),
-            message_count: 5,
-            token_count: 100,
-        });
+        session.conversation_summary = Some(ConversationSummary::new("summary", 5, 100));
         session.compression_events = vec![CompressionEvent::new(
             1,
             2,
@@ -1378,7 +1456,7 @@ mod tests {
 
     #[test]
     fn compression_event_extended_fields_roundtrip() {
-        let event = CompressionEvent::new(
+        let mut event = CompressionEvent::new(
             42,   // messages_compressed
             10,   // segments_removed
             92.5, // usage_before_percent
@@ -1389,6 +1467,18 @@ mod tests {
             Some("gpt-5.4-mini".to_string()),
             1500, // latency_ms
         );
+        event.source_tokens = 2_500;
+        event.fixed_prompt_tokens = 300;
+        event.actual_summary_tokens = 480;
+        event.target_summary_tokens = 500;
+        event.summary_target_ratio = 0.20;
+        event.actual_summary_ratio = 0.192;
+        event.summary_budget_clamped = true;
+        event.summary_budget_clamp_reason =
+            Some("model_returned_below_80_percent_of_target".to_string());
+        event.summarization_map_calls = 4;
+        event.summarization_reduce_calls = 2;
+        event.summarization_fallback_used = false;
 
         let json = serde_json::to_string(&event).unwrap();
         let back: CompressionEvent = serde_json::from_str(&json).unwrap();
@@ -1402,6 +1492,37 @@ mod tests {
         assert!((back.compression_ratio - 2.63).abs() < 0.01);
         assert_eq!(back.model_used.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(back.latency_ms, 1500);
+        assert_eq!(back.source_tokens, 2_500);
+        assert_eq!(back.fixed_prompt_tokens, 300);
+        assert_eq!(back.actual_summary_tokens, 480);
+        assert_eq!(back.target_summary_tokens, 500);
+        assert_eq!(back.summary_target_ratio, 0.20);
+        assert_eq!(back.actual_summary_ratio, 0.192);
+        assert!(back.summary_budget_clamped);
+        assert_eq!(
+            back.summary_budget_clamp_reason.as_deref(),
+            Some("model_returned_below_80_percent_of_target")
+        );
+        assert_eq!(back.summarization_map_calls, 4);
+        assert_eq!(back.summarization_reduce_calls, 2);
+        assert!(!back.summarization_fallback_used);
+    }
+
+    #[test]
+    fn conversation_summary_backward_compat_defaults_compression_metrics() {
+        let json = r#"{
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "content": "legacy summary",
+            "message_count": 10,
+            "token_count": 200
+        }"#;
+        let summary: ConversationSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(summary.represented_source_tokens, 0);
+        assert_eq!(summary.target_token_count, 0);
+        assert_eq!(summary.target_ratio, 0.0);
+        assert!(!summary.budget_clamped);
+        assert!(summary.budget_clamp_reason.is_none());
     }
 
     #[test]

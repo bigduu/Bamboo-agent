@@ -52,7 +52,9 @@ pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
 pub struct ProviderModelInfo {
     /// Model identifier.
     pub id: String,
-    /// Maximum context window (input + output) in tokens when known.
+    /// Maximum total context window (input + output) in tokens when known.
+    /// Provider adapters that receive an input-only limit must add the model's
+    /// output capacity before populating this field.
     pub max_context_tokens: Option<u32>,
     /// Maximum output/completion tokens when known.
     pub max_output_tokens: Option<u32>,

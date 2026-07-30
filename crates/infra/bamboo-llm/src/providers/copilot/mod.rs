@@ -918,15 +918,17 @@ impl CopilotProvider {
     }
 
     fn parse_model_info(payload: serde_json::Value) -> Result<Vec<ProviderModelInfo>> {
-        const CONTEXT_KEYS: &[&str] = &[
+        const TOTAL_CONTEXT_KEYS: &[&str] = &[
             "max_context_tokens",
-            "max_input_tokens",
-            "max_prompt_tokens",
             "context_window",
             "context_window_tokens",
+            "context_length",
+        ];
+        const INPUT_KEYS: &[&str] = &[
+            "max_input_tokens",
+            "max_prompt_tokens",
             "input_token_limit",
             "prompt_token_limit",
-            "context_length",
         ];
         const OUTPUT_KEYS: &[&str] = &[
             "max_output_tokens",
@@ -954,8 +956,13 @@ impl CopilotProvider {
                 continue;
             };
 
-            let context_tokens = Self::find_max_token_limit_by_keys(model, CONTEXT_KEYS);
             let output_tokens = Self::find_max_token_limit_by_keys(model, OUTPUT_KEYS);
+            let context_tokens = Self::find_max_token_limit_by_keys(model, TOTAL_CONTEXT_KEYS)
+                .or_else(|| {
+                    Self::find_max_token_limit_by_keys(model, INPUT_KEYS).map(|input_tokens| {
+                        input_tokens.saturating_add(output_tokens.unwrap_or_default())
+                    })
+                });
 
             dedup
                 .entry(id.to_string())
@@ -1554,6 +1561,42 @@ mod tests {
 
         let provider = CopilotProvider::new();
         assert!(!provider.is_authenticated());
+    }
+
+    #[test]
+    fn model_info_adds_output_capacity_to_input_only_limit() {
+        let models = CopilotProvider::parse_model_info(serde_json::json!({
+            "data": [{
+                "id": "dynamic-model",
+                "capabilities": {
+                    "limits": {
+                        "max_input_tokens": 200_000,
+                        "max_output_tokens": 64_000
+                    }
+                }
+            }]
+        }))
+        .expect("parse model metadata");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].max_context_tokens, Some(264_000));
+        assert_eq!(models[0].max_output_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn model_info_does_not_add_output_to_explicit_total_context_window() {
+        let models = CopilotProvider::parse_model_info(serde_json::json!({
+            "data": [{
+                "id": "dynamic-model",
+                "context_window": 200_000,
+                "max_output_tokens": 64_000
+            }]
+        }))
+        .expect("parse model metadata");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].max_context_tokens, Some(200_000));
+        assert_eq!(models[0].max_output_tokens, Some(64_000));
     }
 
     #[tokio::test]
