@@ -564,7 +564,8 @@ pub fn estimate_context_compression_exposure(
     configured_budget: Option<&TokenBudget>,
 ) -> ContextCompressionExposure {
     // When a budget was already resolved upstream (the production path — see
-    // `resolve_token_budget`, which caches it in `session.resolved_token_budget` (#180),
+    // `resolve_token_budget`, which publishes the current-round snapshot in
+    // `session.resolved_token_budget` (#180),
     // issue #20 bug 1), use it directly. Only when none is available do we fall
     // back to a model-derived budget. No `model_limits.json` registry is in
     // scope synchronously here, so this fallback resolves to the global default
@@ -1183,8 +1184,9 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
     // Instead of clearing token_usage entirely (which forces the next round
     // to rely on heuristic estimates that don't account for tool schema
     // tokens), recompute an approximate post-compression snapshot.  We
-    // preserve the context-window denominator from the previous usage snapshot
-    // so percentages stay consistent across rounds.
+    // preserve both the total context-window denominator and the request input
+    // limit from the previous usage snapshot so their meanings stay distinct
+    // across rounds.
     let counter = TiktokenTokenCounter::default();
     let remaining_active: Vec<_> = session
         .messages
@@ -1214,10 +1216,12 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
     let budget_limit = previous_usage
         .as_ref()
         .map(|u| {
-            if u.max_context_tokens > 0 {
-                u.max_context_tokens
-            } else {
+            if u.budget_limit > 0 {
                 u.budget_limit
+            } else {
+                // Legacy snapshots used the total context window as the only
+                // denominator.
+                u.max_context_tokens
             }
         })
         .unwrap_or(0);

@@ -100,11 +100,15 @@ pub fn prepare_hybrid_context(
     // 2. Count system tokens
     let system_tokens = counter.count_messages(&system_messages);
 
-    // 3. Check if system prompt alone exceeds context window
-    let hard_limit = budget.max_context_tokens;
-    if system_tokens > hard_limit {
+    // 3. Check if the system prompt alone exceeds the request input limit.
+    // The provider's context window covers input + output, so reserve the
+    // configured output allowance and tokenizer safety margin before fitting
+    // prompt messages.
+    let hard_limit = budget.max_request_input_tokens();
+    let required_prompt_tokens = system_tokens.saturating_add(summary_tokens);
+    if required_prompt_tokens > hard_limit {
         return Err(BudgetError::SystemPromptTooLarge {
-            system_tokens,
+            system_tokens: required_prompt_tokens,
             available_tokens: hard_limit,
         });
     }
@@ -1188,7 +1192,7 @@ mod tests {
         session.conversation_summary = Some(ConversationSummary::new(summary_text, 2, 30));
 
         let prepared = prepare_hybrid_context(&session, &budget, &counter).unwrap();
-        let hard_limit = budget.max_context_tokens;
+        let hard_limit = budget.max_request_input_tokens();
 
         assert!(
             prepared.truncation_occurred,
@@ -1212,6 +1216,36 @@ mod tests {
                 .any(|message| message.content.contains(summary_text)),
             "prepared context should include the conversation summary"
         );
+    }
+
+    #[test]
+    fn required_summary_and_system_prompt_must_fit_reserved_input_limit() {
+        let summary_text = "oversized-required-summary";
+        let summary_message = compression_summary_message(summary_text);
+        let counter = DeterministicCounter::new(1)
+            .with_message_token("System", 10)
+            .with_message_token(summary_message.content, 55);
+        let budget = TokenBudget::with_safety_margin(
+            100,
+            40,
+            BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            0,
+        );
+        let mut session = make_session_with_messages(vec![Message::system("System")]);
+        session.conversation_summary = Some(ConversationSummary::new(summary_text, 1, 55));
+
+        let result = prepare_hybrid_context(&session, &budget, &counter);
+
+        assert!(matches!(
+            result,
+            Err(BudgetError::SystemPromptTooLarge {
+                system_tokens: 65,
+                available_tokens: 60
+            })
+        ));
     }
 
     #[test]
@@ -1268,6 +1302,19 @@ mod tests {
             prepared.token_usage.total_tokens,
             prepared.token_usage.budget_limit
         );
+        assert_eq!(
+            prepared.token_usage.budget_limit,
+            budget.max_request_input_tokens()
+        );
+        assert!(
+            prepared
+                .token_usage
+                .total_tokens
+                .saturating_add(budget.max_output_tokens)
+                .saturating_add(budget.safety_margin)
+                <= budget.max_context_tokens,
+            "Prepared input + output reserve + safety margin must fit the total context window"
+        );
     }
 
     #[test]
@@ -1275,7 +1322,8 @@ mod tests {
         // Test that segments exceeding remaining budget are skipped
         let counter = TiktokenTokenCounter::default();
         // Tight budget: large message should not fit, but small message should.
-        let budget = TokenBudget::new(100, 50, BudgetStrategy::Window { size: 50 });
+        let budget =
+            TokenBudget::with_safety_margin(100, 50, BudgetStrategy::Window { size: 50 }, 0);
 
         // Use diverse text — BPE tokenizers compress repeated chars (e.g. "xxx...")
         // into very few tokens, so varied words produce a reliably large token count.

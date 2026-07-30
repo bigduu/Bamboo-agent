@@ -114,14 +114,14 @@ mod tests {
     }
 
     #[test]
-    fn trigger_percent_zero_means_disabled() {
+    fn trigger_percent_zero_disables_proactive_trigger_but_respects_request_limit() {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
         budget.working_reserve_tokens = 0; // use legacy percentage mode
         budget.compression_trigger_percent = 0;
         assert_eq!(
             budget.compression_trigger_context_tokens(),
-            budget.max_context_tokens
+            budget.max_request_input_tokens()
         );
     }
 

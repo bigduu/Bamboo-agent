@@ -635,11 +635,12 @@ pub struct Session {
     pub metadata: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<TokenBudget>,
-    /// Per-process cache of the model-limit-derived budget, keyed by the model it
-    /// was resolved for. Never persisted (`#[serde(skip)]`), so a reloaded session
-    /// re-resolves from the current `model_limits.json`, and a mid-session model
-    /// switch invalidates it (the key no longer matches). `token_budget` above
-    /// stays the persisted genuine/child override that takes priority. (#180)
+    /// Runtime snapshot of the model-limit-derived budget for downstream readers
+    /// in the current round, keyed by model. It is never persisted and never
+    /// short-circuits the next round's resolution, so live `model_limits.json`
+    /// edits and provider-metadata refreshes take effect without reloading the
+    /// session. `token_budget` above remains the persisted genuine/child override
+    /// that takes priority. (#180, #763)
     #[serde(skip)]
     pub resolved_token_budget: Option<(String, TokenBudget)>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -700,11 +701,11 @@ impl Session {
     }
 
     /// The effective token budget: a genuine/child override (`token_budget`) if
-    /// set, otherwise the per-process resolved-budget cache
+    /// set, otherwise the current round's resolved-budget snapshot
     /// (`resolved_token_budget`). Both are `None` until the first resolution.
     /// Downstream readers should use this rather than `token_budget` directly so
     /// they observe the engine-resolved budget without persisting it. Note the
-    /// cache is returned regardless of which model it was resolved for; that is
+    /// snapshot is returned regardless of which model it was resolved for; that is
     /// safe because `resolve_token_budget` runs at round start (re-keying to the
     /// current model) before any reader — don't call this expecting model-freshness
     /// without a preceding same-round resolve. (#180)

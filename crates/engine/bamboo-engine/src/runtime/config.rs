@@ -437,10 +437,10 @@ pub struct AgentLoopConfig {
     /// Token budget for context management (optional, defaults to model's limits)
     pub(crate) token_budget: Option<TokenBudget>,
     /// Legacy `config.json` `model_limits` value, snapshotted from the live
-    /// in-memory Config when this loop config is built. Consulted only by
-    /// `resolve_token_budget` as a last-resort fallback when `model_limits.json`
-    /// fails to load — so the engine never does a fresh disk-reading
-    /// `Config::new()` (which would also clobber the global env-var cache). #38.
+    /// in-memory Config when this loop config is built. Consulted per model when
+    /// the instance-local `model_limits.json` has no matching entry or cannot be
+    /// loaded, so the engine never does a fresh disk-reading `Config::new()`
+    /// (which would also clobber the global env-var cache). #38.
     pub(crate) legacy_model_limits: Option<serde_json::Value>,
     /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
     ///
