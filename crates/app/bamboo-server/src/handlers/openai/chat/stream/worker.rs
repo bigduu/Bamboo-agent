@@ -67,6 +67,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 }
             }
             Ok(LLMChunk::TransportActivity)
+            | Ok(LLMChunk::ResponsesEvent { .. })
             | Ok(LLMChunk::CacheUsage { .. })
             | Ok(LLMChunk::ProviderUsage { .. })
             | Ok(LLMChunk::UsageSummary { .. })

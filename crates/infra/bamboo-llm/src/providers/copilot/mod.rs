@@ -27,7 +27,7 @@ use super::common::openai_responses::{
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::llm_stream_from_sse_multi;
+use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 
 const COPILOT_TRANSPORT_MAX_ATTEMPTS: usize = 2;
 const COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS: u64 = 250;
@@ -586,6 +586,13 @@ impl CopilotProvider {
             );
         }
         effective_responses_options.store = Some(false);
+        let retain_protocol_events = effective_responses_options.retain_protocol_events;
+        // OpenAI-specific cache controls are not part of Copilot's documented
+        // Responses request shape. Keep this unrelated provider byte-compatible
+        // with its pre-cache-control behavior.
+        effective_responses_options.prompt_cache_key = None;
+        effective_responses_options.prompt_cache_options = None;
+        effective_responses_options.raw_input_with_cache_breakpoints = None;
         let input_selection =
             select_responses_input_messages(messages, Some(&effective_responses_options));
         let input_source = match input_selection.source {
@@ -600,6 +607,7 @@ impl CopilotProvider {
             reasoning_effort,
             Some(&effective_responses_options),
             parallel_tool_calls,
+            None,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -732,6 +740,7 @@ impl CopilotProvider {
                         None,
                         Some(&fallback_options),
                         parallel_tool_calls,
+                        None,
                     );
                     request_overrides::apply_overrides_to_body(
                         &mut fallback_body,
@@ -798,19 +807,24 @@ impl CopilotProvider {
 
                     if fallback.status().is_success() {
                         let mut parser =
-                            ResponsesSseParser::new_with_context("Copilot", model, None);
+                            ResponsesSseParser::new_with_context("Copilot", model, None)
+                                .with_protocol_events(retain_protocol_events);
                         let model_for_debug = model.to_string();
-                        let stream = llm_stream_from_sse_multi(fallback, move |event, data| {
-                            let parsed = parser.handle_event_multi(event, data);
-                            append_responses_sse_record(
-                                "Copilot",
-                                &model_for_debug,
-                                event,
-                                data,
-                                &parsed,
-                            );
-                            parsed
-                        });
+                        let stream = llm_stream_from_sse_multi_requiring_done(
+                            fallback,
+                            move |event, data| {
+                                let parsed = parser.handle_event_multi(event, data);
+                                append_responses_sse_record(
+                                    "Copilot",
+                                    &model_for_debug,
+                                    event,
+                                    data,
+                                    &parsed,
+                                );
+                                parsed
+                            },
+                            "Copilot Responses",
+                        );
                         return Ok(stream);
                     }
                 }
@@ -860,13 +874,18 @@ impl CopilotProvider {
             }
         }
 
-        let mut parser = ResponsesSseParser::new_with_context("Copilot", model, reasoning_effort);
+        let mut parser = ResponsesSseParser::new_with_context("Copilot", model, reasoning_effort)
+            .with_protocol_events(retain_protocol_events);
         let model_for_debug = model.to_string();
-        let stream = llm_stream_from_sse_multi(response, move |event, data| {
-            let parsed = parser.handle_event_multi(event, data);
-            append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
-            parsed
-        });
+        let stream = llm_stream_from_sse_multi_requiring_done(
+            response,
+            move |event, data| {
+                let parsed = parser.handle_event_multi(event, data);
+                append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
+                parsed
+            },
+            "Copilot Responses",
+        );
         Ok(stream)
     }
 
@@ -1902,27 +1921,45 @@ mod tests {
     }
 
     #[test]
-    fn copilot_responses_forces_store_false_before_building_body() {
+    fn copilot_responses_forces_store_false_and_strips_openai_cache_controls() {
         let mut effective_responses_options = ResponsesRequestOptions {
             store: Some(true),
             instructions: Some("Stable instructions".to_string()),
+            prompt_cache_key: Some("openai-only".to_string()),
+            prompt_cache_options: Some(json!({"mode": "explicit"})),
+            raw_input_with_cache_breakpoints: Some(json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "raw",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }]
+            }])),
             ..Default::default()
         };
         if effective_responses_options.store == Some(true) {
             effective_responses_options.store = Some(false);
         }
+        effective_responses_options.prompt_cache_key = None;
+        effective_responses_options.prompt_cache_options = None;
+        effective_responses_options.raw_input_with_cache_breakpoints = None;
 
         let body = build_responses_body(
-            "gpt-4o",
+            "gpt-5.6",
             &[Message::user("hello")],
             &[],
             None,
             None,
             Some(&effective_responses_options),
             None,
+            None,
         );
 
         assert_eq!(body["store"], false);
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_options").is_none());
+        assert_eq!(body["input"][0]["content"], "hello");
     }
 
     #[test]

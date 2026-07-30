@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::mpsc;
 
 use crate::storage::{MetricsStorage, ToolCallCompletion};
-use crate::types::{RoundStatus, SessionStatus, TokenUsage};
+use crate::types::{ForwardTokenDetails, RoundStatus, SessionStatus, TokenUsage};
 
 #[derive(Debug)]
 enum CollectorCommand {
@@ -77,6 +77,7 @@ enum CollectorCommand {
         status_code: Option<u16>,
         status: crate::types::ForwardStatus,
         usage: Option<TokenUsage>,
+        token_details: Option<ForwardTokenDetails>,
         error: Option<String>,
     },
     Prune {
@@ -229,6 +230,7 @@ impl MetricsCollector {
                         status_code,
                         status,
                         usage,
+                        token_details,
                         error,
                     } => {
                         storage
@@ -238,6 +240,7 @@ impl MetricsCollector {
                                 status_code,
                                 status,
                                 usage,
+                                token_details,
                                 error,
                             )
                             .await
@@ -409,12 +412,35 @@ impl MetricsCollector {
         usage: Option<TokenUsage>,
         error: Option<String>,
     ) {
+        self.forward_completed_with_details(
+            forward_id,
+            completed_at,
+            status_code,
+            status,
+            usage,
+            None,
+            error,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_completed_with_details(
+        &self,
+        forward_id: impl Into<String>,
+        completed_at: DateTime<Utc>,
+        status_code: Option<u16>,
+        status: crate::types::ForwardStatus,
+        usage: Option<TokenUsage>,
+        token_details: Option<ForwardTokenDetails>,
+        error: Option<String>,
+    ) {
         let _ = self.tx.send(CollectorCommand::ForwardCompleted {
             forward_id: forward_id.into(),
             completed_at,
             status_code,
             status,
             usage,
+            token_details,
             error,
         });
     }

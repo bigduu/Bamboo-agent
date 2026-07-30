@@ -4308,9 +4308,11 @@ mod tests {
             provider_usage: Some(ProviderUsageSnapshot {
                 input_tokens: Some(1000),
                 output_tokens: Some(120),
+                total_tokens: Some(1120),
                 reasoning_tokens: Some(20),
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: Some(768),
+                cache_write_input_tokens: None,
             }),
             input_tokens: 232,
         };

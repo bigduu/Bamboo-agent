@@ -2,6 +2,7 @@ mod non_stream;
 mod output;
 mod prepare;
 mod stream;
+mod usage;
 
 use actix_web::{web, HttpMessage, HttpRequest, HttpResponse};
 

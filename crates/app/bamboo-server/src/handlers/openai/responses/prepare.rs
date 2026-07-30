@@ -3,8 +3,9 @@ use actix_web::web;
 use crate::{app_state::AppState, error::AppError};
 
 use super::super::helpers::{
-    convert_messages, convert_responses_tools, parse_parallel_tool_calls, parse_reasoning_effort,
-    parse_responses_request_options, responses_input_to_chat_messages,
+    convert_messages, convert_responses_tools, has_responses_prompt_cache_breakpoint,
+    parse_parallel_tool_calls, parse_reasoning_effort, parse_responses_request_options,
+    responses_input_to_chat_messages,
 };
 use super::super::types::ResponsesCreateRequest;
 use super::PreparedResponsesRequest;
@@ -33,6 +34,8 @@ pub(super) async fn prepare_request(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
+    let raw_input_with_cache_breakpoints =
+        has_responses_prompt_cache_breakpoint(&request.input).then(|| request.input.clone());
     let input_messages = responses_input_to_chat_messages(request.input)?;
 
     if input_messages.is_empty() && instructions.is_none() {
@@ -71,6 +74,7 @@ pub(super) async fn prepare_request(
     let parallel_tool_calls = parse_parallel_tool_calls(&request.parameters);
     let mut responses_options = parse_responses_request_options(&request.parameters);
     responses_options.instructions = instructions.clone();
+    responses_options.raw_input_with_cache_breakpoints = raw_input_with_cache_breakpoints;
 
     let estimated_prompt_tokens = estimate_prompt_tokens(&internal_messages).saturating_add(
         instructions

@@ -30,6 +30,10 @@ pub(super) fn responses_input_to_chat_messages(
     responses_input::responses_input_to_chat_messages(input)
 }
 
+pub(super) fn has_responses_prompt_cache_breakpoint(input: &serde_json::Value) -> bool {
+    responses_options::has_responses_prompt_cache_breakpoint(input)
+}
+
 pub(super) fn now_unix_ts() -> u64 {
     stream_utils::now_unix_ts()
 }

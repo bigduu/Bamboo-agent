@@ -94,9 +94,27 @@ pub(super) struct ResponsesUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) input_tokens_details: Option<ResponsesInputTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) output_tokens_details: Option<ResponsesOutputTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(super) struct ResponsesInputTokensDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cached_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cache_write_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(super) struct ResponsesOutputTokensDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -155,6 +173,7 @@ pub(super) struct ResponsesCreateResponse {
 pub(super) struct ResponsesStreamEvent<T> {
     #[serde(rename = "type")]
     pub(super) event_type: String,
+    pub(super) sequence_number: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) response: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,6 +186,12 @@ pub(super) struct ResponsesStreamEvent<T> {
     pub(super) content_index: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) delta: Option<String>,
+    /// Content part for `response.content_part.added` / `.done`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) part: Option<ResponsesTextContent>,
+    /// Full text for `response.output_text.done`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) text: Option<String>,
     /// Full item object for `response.output_item.added` / `.done` (#525).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) item: Option<ResponsesOutputItem>,
@@ -181,12 +206,15 @@ impl<T> Default for ResponsesStreamEvent<T> {
     fn default() -> Self {
         Self {
             event_type: String::new(),
+            sequence_number: 0,
             response: None,
             response_id: None,
             item_id: None,
             output_index: None,
             content_index: None,
             delta: None,
+            part: None,
+            text: None,
             item: None,
             arguments: None,
         }
@@ -280,20 +308,32 @@ mod tests {
     fn test_responses_usage_serialization() {
         let usage = ResponsesUsage {
             input_tokens: Some(100),
+            input_tokens_details: Some(ResponsesInputTokensDetails {
+                cached_tokens: Some(25),
+                cache_write_tokens: Some(64),
+            }),
             output_tokens: Some(50),
+            output_tokens_details: Some(ResponsesOutputTokensDetails {
+                reasoning_tokens: Some(10),
+            }),
             total_tokens: Some(150),
         };
 
         let json = serde_json::to_string(&usage).unwrap();
         assert!(json.contains("\"input_tokens\":100"));
         assert!(json.contains("\"output_tokens\":50"));
+        assert!(json.contains("\"cached_tokens\":25"));
+        assert!(json.contains("\"cache_write_tokens\":64"));
+        assert!(json.contains("\"reasoning_tokens\":10"));
     }
 
     #[test]
     fn test_responses_usage_minimal() {
         let usage = ResponsesUsage {
             input_tokens: None,
+            input_tokens_details: None,
             output_tokens: None,
+            output_tokens_details: None,
             total_tokens: None,
         };
 
@@ -404,7 +444,9 @@ mod tests {
     fn test_responses_create_response_with_usage() {
         let usage = ResponsesUsage {
             input_tokens: Some(100),
+            input_tokens_details: None,
             output_tokens: Some(50),
+            output_tokens_details: None,
             total_tokens: Some(150),
         };
 

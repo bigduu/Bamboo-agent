@@ -5,6 +5,7 @@
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
 use super::tool_schema::sanitize_openai_function_parameters_schema;
+use crate::cache::PromptCachePlan;
 use crate::provider::{LLMError, ResponsesRequestOptions, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::MessagePart;
@@ -31,6 +32,101 @@ use std::collections::{HashMap, HashSet};
 ///
 /// For tool-result messages (`Role::Tool`), we emit a `function_call_output` item.
 pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
+    messages_to_responses_input_json_with_cache(messages, None).0
+}
+
+fn message_supports_explicit_breakpoint(message: &Message) -> bool {
+    matches!(message.role, Role::System | Role::User | Role::Tool)
+}
+
+fn explicit_breakpoint_message_ids(
+    messages: &[Message],
+    cache_plan: Option<&PromptCachePlan>,
+) -> HashSet<String> {
+    let Some(cache_plan) = cache_plan.filter(|plan| plan.is_enabled()) else {
+        return HashSet::new();
+    };
+
+    let mut selected = HashSet::new();
+    for requested_id in &cache_plan.breakpoint_message_ids {
+        let Some(requested_index) = messages
+            .iter()
+            .position(|message| message.id == *requested_id)
+        else {
+            continue;
+        };
+        // Responses only permits markers on input_text/input_image/input_file.
+        // When a provider-neutral plan ends on an assistant/function item,
+        // select the nearest preceding cacheable input block rather than
+        // emitting an invalid marker or expanding the prefix past the target.
+        if let Some(message) = messages[..=requested_index]
+            .iter()
+            .rev()
+            .find(|message| message_supports_explicit_breakpoint(message))
+        {
+            selected.insert(message.id.clone());
+        }
+    }
+    selected
+}
+
+fn add_explicit_breakpoint(content: &mut Value) -> bool {
+    let marker = json!({"mode": "explicit"});
+    match content {
+        Value::String(text) => {
+            let text = std::mem::take(text);
+            *content = json!([{
+                "type": "input_text",
+                "text": text,
+                "prompt_cache_breakpoint": marker,
+            }]);
+            true
+        }
+        Value::Array(parts) => {
+            let Some(part) = parts.iter_mut().rev().find(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "input_image" | "input_file")
+                )
+            }) else {
+                return false;
+            };
+            part["prompt_cache_breakpoint"] = marker;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn count_responses_explicit_breakpoints(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(count_responses_explicit_breakpoints)
+            .sum(),
+        Value::Object(object) => {
+            let this_block = (matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_text" | "input_image" | "input_file")
+            ) && object
+                .get("prompt_cache_breakpoint")
+                .and_then(|breakpoint| breakpoint.get("mode"))
+                .and_then(Value::as_str)
+                == Some("explicit")) as usize;
+            this_block
+                + object
+                    .values()
+                    .map(count_responses_explicit_breakpoints)
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn messages_to_responses_input_json_with_cache(
+    messages: &[Message],
+    cache_plan: Option<&PromptCachePlan>,
+) -> (Vec<Value>, usize) {
     // If any message contains image parts, emit a "typed" content array shape so
     // multimodal inputs have a chance to reach upstream Responses implementations.
     let has_images = messages.iter().any(|m| {
@@ -42,6 +138,8 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
     });
 
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let breakpoint_message_ids = explicit_breakpoint_message_ids(messages, cache_plan);
+    let mut rendered_breakpoints = 0usize;
 
     for m in messages {
         match m.role {
@@ -78,11 +176,17 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 // Emit tool result as a structured function_call_output item.
                 let call_id = m.tool_call_id.as_deref().unwrap_or("");
                 if !call_id.is_empty() {
-                    out.push(json!({
+                    let mut item = json!({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": tool_output_value(m),
-                    }));
+                    });
+                    if breakpoint_message_ids.contains(&m.id)
+                        && add_explicit_breakpoint(&mut item["output"])
+                    {
+                        rendered_breakpoints = rendered_breakpoints.saturating_add(1);
+                    }
+                    out.push(item);
                 } else {
                     // Fallback: no call_id available — degrade to user message with
                     // prefix. Preserve any image parts as a typed content array so
@@ -95,11 +199,17 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                     } else {
                         json!(prefixed)
                     };
-                    out.push(json!({
+                    let mut item = json!({
                         "type": "message",
                         "role": "user",
                         "content": content,
-                    }));
+                    });
+                    if breakpoint_message_ids.contains(&m.id)
+                        && add_explicit_breakpoint(&mut item["content"])
+                    {
+                        rendered_breakpoints = rendered_breakpoints.saturating_add(1);
+                    }
+                    out.push(item);
                 }
             }
 
@@ -110,16 +220,22 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                     "user"
                 };
                 let content = build_content_value(m, has_images, None, "input_text");
-                out.push(json!({
+                let mut item = json!({
                     "type": "message",
                     "role": role,
                     "content": content,
-                }));
+                });
+                if breakpoint_message_ids.contains(&m.id)
+                    && add_explicit_breakpoint(&mut item["content"])
+                {
+                    rendered_breakpoints = rendered_breakpoints.saturating_add(1);
+                }
+                out.push(item);
             }
         }
     }
 
-    out
+    (out, rendered_breakpoints)
 }
 
 fn assistant_phase_for_responses_input(message: &Message) -> Option<&'static str> {
@@ -314,6 +430,7 @@ pub fn select_responses_input_messages<'a>(
 }
 
 /// Build a standard Responses API streaming request body.
+#[allow(clippy::too_many_arguments)]
 pub fn build_responses_body(
     model: &str,
     messages: &[Message],
@@ -322,6 +439,7 @@ pub fn build_responses_body(
     reasoning_effort: Option<ReasoningEffort>,
     responses_options: Option<&ResponsesRequestOptions>,
     parallel_tool_calls: Option<bool>,
+    cache_plan: Option<&PromptCachePlan>,
 ) -> Value {
     let instructions = responses_options
         .and_then(|opts| opts.instructions.as_deref())
@@ -330,9 +448,29 @@ pub fn build_responses_body(
     let input_selection = select_responses_input_messages(messages, responses_options);
     let effective_messages = input_selection.input_messages;
 
+    let explicit_cache_supported = supports_openai_explicit_prompt_cache(model);
+    let caller_cache_input = explicit_cache_supported
+        .then(|| {
+            responses_options.and_then(|options| options.raw_input_with_cache_breakpoints.as_ref())
+        })
+        .flatten();
+    let (input, rendered_breakpoints, generated_breakpoints) =
+        if let Some(raw_input) = caller_cache_input {
+            (
+                raw_input.clone(),
+                count_responses_explicit_breakpoints(raw_input),
+                false,
+            )
+        } else {
+            let (input, rendered_breakpoints) = messages_to_responses_input_json_with_cache(
+                effective_messages,
+                explicit_cache_supported.then_some(cache_plan).flatten(),
+            );
+            (Value::Array(input), rendered_breakpoints, true)
+        };
     let mut body = json!({
         "model": model,
-        "input": messages_to_responses_input_json(effective_messages),
+        "input": input,
         "stream": true,
     });
 
@@ -407,7 +545,70 @@ pub fn build_responses_body(
         .unwrap_or(false);
     body["store"] = json!(store);
 
+    if explicit_cache_supported {
+        if let Some(prompt_cache_key) = responses_options
+            .and_then(|opts| opts.prompt_cache_key.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            body["prompt_cache_key"] = json!(prompt_cache_key);
+        }
+
+        if let Some(prompt_cache_options) =
+            responses_options.and_then(|opts| opts.prompt_cache_options.as_ref())
+        {
+            if generated_breakpoints && rendered_breakpoints > 0 {
+                let mut merged =
+                    serde_json::Map::from_iter([("mode".to_string(), json!("explicit"))]);
+                if let Some(caller_fields) = prompt_cache_options.as_object() {
+                    merged.extend(caller_fields.clone());
+                    body["prompt_cache_options"] = Value::Object(merged);
+                } else {
+                    // Direct internal callers can construct a non-object value;
+                    // preserve it so the upstream returns the authoritative
+                    // validation error instead of silently changing intent.
+                    body["prompt_cache_options"] = prompt_cache_options.clone();
+                }
+            } else {
+                body["prompt_cache_options"] = prompt_cache_options.clone();
+            }
+        } else if generated_breakpoints && rendered_breakpoints > 0 {
+            body["prompt_cache_options"] = json!({"mode": "explicit"});
+        }
+    }
+
     body
+}
+
+/// Explicit prompt-cache controls were introduced for GPT-5.6 and later GPT
+/// model families. Unknown aliases fail closed because older models reject the
+/// fields with HTTP 400.
+pub fn supports_openai_explicit_prompt_cache(model: &str) -> bool {
+    let normalized = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
+    let Some(version) = normalized.strip_prefix("gpt-") else {
+        return false;
+    };
+    let numeric = version
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .next()
+        .unwrap_or("");
+    let mut components = numeric.split('.');
+    let Some(major) = components
+        .next()
+        .and_then(|component| component.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let minor = components
+        .next()
+        .and_then(|component| component.parse::<u64>().ok())
+        .unwrap_or(0);
+    major > 5 || major == 5 && minor >= 6
 }
 
 #[derive(Debug, Default)]
@@ -487,6 +688,12 @@ pub struct ResponsesSseParser {
     reasoning_text_chars: usize,
     logged_summary: bool,
     emitted_response_id: Option<String>,
+    retain_protocol_events: bool,
+    /// Once a protocol terminal is observed, every later frame is ignored.
+    ///
+    /// Responses usage and `Done` are cumulative terminal data, so accepting a
+    /// duplicated `response.completed` frame would double-publish both.
+    terminal_seen: bool,
 }
 
 impl Default for ResponsesSseParser {
@@ -531,7 +738,14 @@ impl ResponsesSseParser {
             reasoning_text_chars: 0,
             logged_summary: false,
             emitted_response_id: None,
+            retain_protocol_events: false,
+            terminal_seen: false,
         }
+    }
+
+    pub fn with_protocol_events(mut self, retain_protocol_events: bool) -> Self {
+        self.retain_protocol_events = retain_protocol_events;
+        self
     }
 
     fn event_type<'a>(&self, event: &'a str, v: &'a Value) -> &'a str {
@@ -1178,6 +1392,34 @@ impl ResponsesSseParser {
         Some(LLMChunk::ResponseId(response_id.to_string()))
     }
 
+    fn terminal_error_message(event_type: &str, value: &Value) -> String {
+        let response = value.get("response").unwrap_or(value);
+        let error = response
+            .get("error")
+            .or_else(|| value.get("error"))
+            .unwrap_or(response);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.as_str())
+            .or_else(|| value.get("message").and_then(Value::as_str));
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .or_else(|| response.get("status").and_then(Value::as_str));
+        let incomplete_reason = response
+            .get("incomplete_details")
+            .or_else(|| value.get("incomplete_details"))
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str);
+
+        let detail = message
+            .or(incomplete_reason)
+            .or(code)
+            .unwrap_or("upstream returned no error details");
+        format!("OpenAI Responses {event_type}: {detail}")
+    }
+
     fn handle_event_value(&mut self, event_type: &str, v: Value) -> Result<Option<LLMChunk>> {
         match event_type {
             // `summary_part.added` is typically a shape/placeholder signal; text is usually empty.
@@ -1524,12 +1766,51 @@ impl ResponsesSseParser {
         };
 
         let event_type = self.event_type(event, &v).to_string();
+        if self.terminal_seen {
+            return Ok(Vec::new());
+        }
+
+        let response_status = v
+            .get("response")
+            .and_then(|response| response.get("status"))
+            .and_then(Value::as_str);
+        let top_level_error = v.get("error").is_some_and(super::sse::sse_error_is_present);
+        if top_level_error
+            || matches!(response_status, Some("failed" | "incomplete" | "cancelled"))
+            || matches!(
+                event_type.as_str(),
+                "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.error"
+                    | "error"
+            )
+        {
+            self.terminal_seen = true;
+            let terminal_type = if event_type.is_empty() {
+                "error"
+            } else {
+                event_type.as_str()
+            };
+            return Err(LLMError::Stream(Self::terminal_error_message(
+                terminal_type,
+                &v,
+            )));
+        }
+
         let mut chunks = Vec::new();
+        if self.retain_protocol_events && event_type.starts_with("response.") {
+            chunks.push(LLMChunk::ResponsesEvent {
+                event_type: event_type.clone(),
+                data: Box::new(v.clone()),
+            });
+        }
         if let Some(chunk) = self.maybe_emit_response_id(event_type.as_str(), &v) {
             chunks.push(chunk);
         }
 
         if event_type == "response.completed" {
+            self.terminal_seen = true;
             chunks.extend(self.completed_output_chunks(&v));
             let usage = v
                 .get("response")
@@ -1579,7 +1860,8 @@ mod tests {
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
-        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None, None, None);
+        let body =
+            build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None, None, None, None);
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 123);
@@ -1604,7 +1886,12 @@ mod tests {
                 previous_response_id: Some("resp_123".to_string()),
                 truncation: Some("auto".to_string()),
                 text_verbosity: Some("high".to_string()),
+                prompt_cache_key: None,
+                prompt_cache_options: None,
+                raw_input_with_cache_breakpoints: None,
+                retain_protocol_events: false,
             }),
+            None,
             None,
         );
         assert_eq!(body["reasoning"]["effort"], "high");
@@ -1622,7 +1909,7 @@ mod tests {
 
     #[test]
     fn build_responses_body_with_parallel_tool_calls() {
-        let body = build_responses_body("gpt-5.4", &[], &[], None, None, None, Some(false));
+        let body = build_responses_body("gpt-5.4", &[], &[], None, None, None, Some(false), None);
         assert_eq!(body["parallel_tool_calls"], false);
     }
 
@@ -1642,6 +1929,7 @@ mod tests {
                 instructions: Some("Stable instructions".to_string()),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -1671,6 +1959,7 @@ mod tests {
                 input_messages: Some(explicit_input_messages),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -1704,6 +1993,7 @@ mod tests {
                 previous_response_id: Some("resp_123".to_string()),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -1753,6 +2043,7 @@ mod tests {
                 previous_response_id: Some("resp_tool".to_string()),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -2458,6 +2749,7 @@ mod tests {
                 reasoning_tokens: Some(5),
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: Some(8),
+                ..
             }
         ));
         assert!(matches!(chunks[3], LLMChunk::Done));
@@ -2496,6 +2788,7 @@ mod tests {
                 reasoning_tokens: Some(3),
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: Some(0),
+                ..
             }
         ));
         assert!(matches!(chunks[1], LLMChunk::Done));
@@ -2511,8 +2804,20 @@ mod tests {
             )
             .expect("completed event");
 
-        assert_eq!(chunks.len(), 1);
-        assert!(matches!(chunks[0], LLMChunk::Done));
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            chunks[0],
+            LLMChunk::ProviderUsage {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: Some(46),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+            }
+        ));
+        assert!(matches!(chunks[1], LLMChunk::Done));
     }
 
     #[test]
@@ -3195,7 +3500,8 @@ mod tests {
                 }]),
             ),
         ];
-        let mut body = build_responses_body("gpt-5.4", &messages, &[], None, None, None, None);
+        let mut body =
+            build_responses_body("gpt-5.4", &messages, &[], None, None, None, None, None);
         let config = KeywordMaskingConfig {
             entries: vec![KeywordEntry {
                 pattern: "hunter2".to_string(),
@@ -3217,5 +3523,402 @@ mod tests {
         // ...but the correlation id and tool name are preserved.
         assert_eq!(function_call["call_id"], "call_1");
         assert_eq!(function_call["name"], "search");
+    }
+
+    #[test]
+    fn gpt_5_6_lowers_stable_plan_to_explicit_breakpoint() {
+        let mut stable_user = Message::user("stable prefix");
+        stable_user.id = "stable-user".to_string();
+        let mut assistant = Message::assistant("stable answer", None);
+        assistant.id = "stable-assistant".to_string();
+        let mut volatile_user = Message::user("changing suffix");
+        volatile_user.id = "volatile-user".to_string();
+        let messages = vec![stable_user, assistant, volatile_user];
+        let plan = PromptCachePlan {
+            cache_tools: true,
+            cache_system: true,
+            // Assistant output blocks cannot carry Responses breakpoints, so
+            // lowering must select the nearest preceding input block.
+            breakpoint_message_ids: vec!["stable-assistant".to_string()],
+            ..Default::default()
+        };
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("tenant:stable".to_string()),
+            ..Default::default()
+        };
+
+        let body = build_responses_body(
+            "gpt-5.6-sol",
+            &messages,
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(body["prompt_cache_key"], "tenant:stable");
+        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(
+            body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert!(body["input"][1]["content"]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert!(body["input"][2]["content"]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+    }
+
+    #[test]
+    fn caller_cache_policy_wins_and_legacy_models_are_gated() {
+        let mut stable = Message::user("stable");
+        stable.id = "stable".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["stable".to_string()],
+            ..Default::default()
+        };
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("cache-key".to_string()),
+            prompt_cache_options: Some(json!({"mode": "implicit", "ttl": "30m"})),
+            ..Default::default()
+        };
+
+        let supported = build_responses_body(
+            "gpt-5.6-terra",
+            std::slice::from_ref(&stable),
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+        assert_eq!(
+            supported["prompt_cache_options"],
+            json!({"mode": "implicit", "ttl": "30m"})
+        );
+
+        let ttl_only_options = ResponsesRequestOptions {
+            prompt_cache_options: Some(json!({"ttl": "30m"})),
+            ..Default::default()
+        };
+        let ttl_only = build_responses_body(
+            "gpt-5.6-terra",
+            std::slice::from_ref(&stable),
+            &[],
+            None,
+            None,
+            Some(&ttl_only_options),
+            None,
+            Some(&plan),
+        );
+        assert_eq!(
+            ttl_only["prompt_cache_options"],
+            json!({"mode": "explicit", "ttl": "30m"})
+        );
+
+        let legacy = build_responses_body(
+            "gpt-5.5",
+            &[stable],
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+        assert!(legacy.get("prompt_cache_key").is_none());
+        assert!(legacy.get("prompt_cache_options").is_none());
+        assert!(legacy["input"][0]["content"].is_string());
+    }
+
+    #[test]
+    fn caller_authored_responses_breakpoints_survive_without_policy_rewrite() {
+        let raw_input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_file",
+                    "file_id": "file_123",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                },
+                {
+                    "type": "input_text",
+                    "text": "volatile question"
+                }
+            ]
+        }]);
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("tenant:file-prefix".to_string()),
+            raw_input_with_cache_breakpoints: Some(raw_input.clone()),
+            ..Default::default()
+        };
+
+        let body =
+            build_responses_body("gpt-5.6", &[], &[], None, None, Some(&options), None, None);
+        assert_eq!(body["input"], raw_input);
+        assert_eq!(body["prompt_cache_key"], "tenant:file-prefix");
+        assert!(
+            body.get("prompt_cache_options").is_none(),
+            "the caller omitted policy, so OpenAI's implicit default must remain"
+        );
+
+        let explicit_options = ResponsesRequestOptions {
+            prompt_cache_options: Some(json!({"mode": "explicit", "ttl": "30m"})),
+            ..options.clone()
+        };
+        let explicit = build_responses_body(
+            "gpt-5.6",
+            &[],
+            &[],
+            None,
+            None,
+            Some(&explicit_options),
+            None,
+            None,
+        );
+        assert_eq!(
+            explicit["prompt_cache_options"],
+            json!({"mode": "explicit", "ttl": "30m"})
+        );
+
+        let legacy =
+            build_responses_body("gpt-5.5", &[], &[], None, None, Some(&options), None, None);
+        assert_eq!(legacy["input"], json!([]));
+        assert!(legacy.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn explicit_breakpoint_keeps_same_stable_prefix_when_tail_changes() {
+        let mut stable = Message::user("same stable prefix");
+        stable.id = "stable".to_string();
+        let mut volatile_a = Message::user("volatile A");
+        volatile_a.id = "tail-a".to_string();
+        let mut volatile_b = Message::user("volatile B");
+        volatile_b.id = "tail-b".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["stable".to_string()],
+            ..Default::default()
+        };
+
+        let first = build_responses_body(
+            "gpt-5.6",
+            &[stable.clone(), volatile_a],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
+        let second = build_responses_body(
+            "gpt-5.6",
+            &[stable, volatile_b],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(first["input"][0], second["input"][0]);
+        assert_eq!(
+            first["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_ne!(first["input"][1], second["input"][1]);
+    }
+
+    #[test]
+    fn explicit_breakpoint_can_end_after_typed_tool_output() {
+        let mut tool_output = Message::tool_result("call_1", "stable tool output");
+        tool_output.id = "tool-output".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["tool-output".to_string()],
+            ..Default::default()
+        };
+
+        let body = build_responses_body(
+            "gpt-5.6",
+            &[tool_output],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(body["input"][0]["type"], "function_call_output");
+        assert_eq!(
+            body["input"][0]["output"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(body["input"][0]["output"][0]["text"], "stable tool output");
+    }
+
+    #[test]
+    fn request_overrides_run_after_generated_cache_defaults() {
+        use bamboo_config::{
+            BodyPatch, BodyPatchOp, PatchValue, RequestOverridesConfig, RequestScopeOverride,
+        };
+
+        let mut stable = Message::user("stable");
+        stable.id = "stable".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["stable".to_string()],
+            ..Default::default()
+        };
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("generated".to_string()),
+            ..Default::default()
+        };
+        let mut body = build_responses_body(
+            "gpt-5.6",
+            &[stable],
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+        let overrides = RequestOverridesConfig {
+            common: RequestScopeOverride {
+                headers: Default::default(),
+                body_patch: vec![
+                    BodyPatch {
+                        path: "prompt_cache_key".to_string(),
+                        op: BodyPatchOp::Set,
+                        value: Some(PatchValue::Json(json!("operator-key"))),
+                    },
+                    BodyPatch {
+                        path: "prompt_cache_options".to_string(),
+                        op: BodyPatchOp::Remove,
+                        value: None,
+                    },
+                ],
+            },
+            endpoints: Default::default(),
+            rules: Vec::new(),
+        };
+
+        crate::providers::common::request_overrides::apply_overrides_to_body_with_env(
+            &mut body,
+            Some(&overrides),
+            crate::providers::common::request_overrides::ENDPOINT_RESPONSES,
+            Some("gpt-5.6"),
+            &HashMap::new(),
+        );
+
+        assert_eq!(body["prompt_cache_key"], "operator-key");
+        assert!(body.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn explicit_cache_model_gate_is_fail_closed() {
+        assert!(supports_openai_explicit_prompt_cache("gpt-5.6"));
+        assert!(supports_openai_explicit_prompt_cache("openai/gpt-5.6-luna"));
+        assert!(supports_openai_explicit_prompt_cache("gpt-6"));
+        assert!(!supports_openai_explicit_prompt_cache("gpt-5.5"));
+        assert!(!supports_openai_explicit_prompt_cache("chat-latest"));
+    }
+
+    #[test]
+    fn failure_and_incomplete_events_are_terminal_errors() {
+        for (event, payload, detail) in [
+            (
+                "response.failed",
+                r#"{"type":"response.failed","response":{"error":{"message":"quota exhausted"}}}"#,
+                "quota exhausted",
+            ),
+            (
+                "response.incomplete",
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+                "max_output_tokens",
+            ),
+            (
+                "error",
+                r#"{"type":"error","error":{"message":"bad gateway"}}"#,
+                "bad gateway",
+            ),
+            (
+                "response.cancelled",
+                r#"{"type":"response.cancelled","response":{"status":"cancelled","error":{"message":"request cancelled"}}}"#,
+                "request cancelled",
+            ),
+            (
+                "",
+                r#"{"error":{"message":"untyped upstream error"}}"#,
+                "untyped upstream error",
+            ),
+        ] {
+            let mut parser = ResponsesSseParser::new();
+            let error = parser
+                .handle_event_multi(event, payload)
+                .expect_err("terminal event must fail");
+            assert!(error.to_string().contains(detail));
+            assert!(parser
+                .handle_event_multi(
+                    "response.completed",
+                    r#"{"type":"response.completed","response":{}}"#,
+                )
+                .expect("post-terminal frame is ignored")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn duplicate_completed_emits_usage_and_done_once() {
+        let mut parser = ResponsesSseParser::new();
+        let payload = r#"{"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":5},"output_tokens_details":{"reasoning_tokens":1}}}}"#;
+        let first = parser
+            .handle_event_multi("response.completed", payload)
+            .expect("first terminal");
+        assert!(matches!(
+            first.as_slice(),
+            [
+                LLMChunk::ProviderUsage {
+                    input_tokens: Some(8),
+                    output_tokens: Some(2),
+                    total_tokens: Some(10),
+                    reasoning_tokens: Some(1),
+                    cache_read_input_tokens: Some(3),
+                    cache_write_input_tokens: Some(5),
+                    ..
+                },
+                LLMChunk::Done
+            ]
+        ));
+        assert!(parser
+            .handle_event_multi("response.completed", payload)
+            .expect("duplicate terminal is ignored")
+            .is_empty());
+    }
+
+    #[test]
+    fn provider_parser_retains_raw_protocol_event_before_normalized_chunks() {
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None)
+            .with_protocol_events(true);
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","sequence_number":42,"response":{"id":"resp_raw","output":[{"id":"msg_a","type":"message","content":[{"type":"output_text","text":"a"}]},{"id":"rs_a","type":"reasoning","summary":[{"type":"summary_text","text":"why"}]},{"id":"msg_b","type":"message","content":[{"type":"output_text","text":"b"}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}"#,
+            )
+            .expect("completed event");
+
+        assert!(matches!(
+            &chunks[0],
+            LLMChunk::ResponsesEvent { event_type, data }
+                if event_type == "response.completed"
+                    && data["response"]["output"].as_array().is_some_and(|items| items.len() == 3)
+                    && data["sequence_number"] == 42
+        ));
+        assert!(matches!(chunks.last(), Some(LLMChunk::Done)));
     }
 }

@@ -30,7 +30,7 @@ use super::common::openai_responses::{
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::llm_stream_from_sse_multi;
+use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
@@ -162,11 +162,14 @@ impl OpenAIProvider {
         reasoning_effort: Option<ReasoningEffort>,
         responses_options: Option<&ResponsesRequestOptions>,
         parallel_tool_calls: Option<bool>,
+        cache_plan: Option<&crate::cache::PromptCachePlan>,
         required_tool: Option<&str>,
         reasoning_source: &str,
         request_purpose: &str,
         session_log_id: &str,
     ) -> Result<LLMStream> {
+        let retain_protocol_events =
+            responses_options.is_some_and(|options| options.retain_protocol_events);
         let input_selection = select_responses_input_messages(messages, responses_options);
         let input_source = match input_selection.source {
             ResponsesInputSource::Explicit => "explicit",
@@ -180,6 +183,7 @@ impl OpenAIProvider {
             reasoning_effort,
             responses_options,
             parallel_tool_calls,
+            cache_plan,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -257,6 +261,7 @@ impl OpenAIProvider {
                     reasoning_effort,
                     Some(&fallback_options),
                     parallel_tool_calls,
+                    cache_plan,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -289,13 +294,24 @@ impl OpenAIProvider {
                 }
 
                 let mut parser =
-                    ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
+                    ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
+                        .with_protocol_events(retain_protocol_events);
                 let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse_multi(fallback, move |event, data| {
-                    let parsed = parser.handle_event_multi(event, data);
-                    append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
-                    parsed
-                });
+                let stream = llm_stream_from_sse_multi_requiring_done(
+                    fallback,
+                    move |event, data| {
+                        let parsed = parser.handle_event_multi(event, data);
+                        append_responses_sse_record(
+                            "OpenAI",
+                            &model_for_debug,
+                            event,
+                            data,
+                            &parsed,
+                        );
+                        parsed
+                    },
+                    "OpenAI Responses",
+                );
                 return Ok(stream);
             }
 
@@ -317,6 +333,7 @@ impl OpenAIProvider {
                     None,
                     Some(&fallback_options),
                     parallel_tool_calls,
+                    cache_plan,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -348,26 +365,42 @@ impl OpenAIProvider {
                     )));
                 }
 
-                let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None);
+                let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None)
+                    .with_protocol_events(retain_protocol_events);
                 let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse_multi(fallback, move |event, data| {
-                    let parsed = parser.handle_event_multi(event, data);
-                    append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
-                    parsed
-                });
+                let stream = llm_stream_from_sse_multi_requiring_done(
+                    fallback,
+                    move |event, data| {
+                        let parsed = parser.handle_event_multi(event, data);
+                        append_responses_sse_record(
+                            "OpenAI",
+                            &model_for_debug,
+                            event,
+                            data,
+                            &parsed,
+                        );
+                        parsed
+                    },
+                    "OpenAI Responses",
+                );
                 return Ok(stream);
             }
 
             return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
         }
 
-        let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
+            .with_protocol_events(retain_protocol_events);
         let model_for_debug = model.to_string();
-        let stream = llm_stream_from_sse_multi(response, move |event, data| {
-            let parsed = parser.handle_event_multi(event, data);
-            append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
-            parsed
-        });
+        let stream = llm_stream_from_sse_multi_requiring_done(
+            response,
+            move |event, data| {
+                let parsed = parser.handle_event_multi(event, data);
+                append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
+                parsed
+            },
+            "OpenAI Responses",
+        );
         Ok(stream)
     }
 }
@@ -407,6 +440,7 @@ impl LLMProvider for OpenAIProvider {
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
         let responses_options = options.and_then(|o| o.responses.as_ref());
+        let cache_plan = options.and_then(|o| o.cache.as_ref());
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
@@ -431,6 +465,7 @@ impl LLMProvider for OpenAIProvider {
                     reasoning_effort,
                     responses_options,
                     parallel_tool_calls,
+                    cache_plan,
                     required_tool,
                     reasoning_source,
                     request_purpose,
@@ -565,6 +600,7 @@ impl LLMProvider for OpenAIProvider {
                         reasoning_effort,
                         responses_options,
                         parallel_tool_calls,
+                        cache_plan,
                         required_tool,
                         reasoning_source,
                         request_purpose,

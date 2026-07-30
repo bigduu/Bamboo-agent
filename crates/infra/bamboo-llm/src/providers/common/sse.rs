@@ -90,6 +90,47 @@ where
     Box::pin(stream)
 }
 
+/// Like [`llm_stream_from_sse_multi`], but requires an explicit protocol
+/// completion chunk.
+///
+/// A clean HTTP/SSE EOF is transport completion, not proof that an OpenAI
+/// Responses request succeeded. This adapter stops after the first `Done` or
+/// error and turns a premature EOF into one stream error.
+pub fn llm_stream_from_sse_multi_requiring_done<H>(
+    response: Response,
+    handler: H,
+    protocol: &'static str,
+) -> LLMStream
+where
+    H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
+{
+    require_done_terminal(llm_stream_from_sse_multi(response, handler), protocol)
+}
+
+fn require_done_terminal(upstream: LLMStream, protocol: &'static str) -> LLMStream {
+    let stream = stream::unfold(
+        (upstream, false),
+        move |(mut upstream, terminal)| async move {
+            if terminal {
+                return None;
+            }
+
+            match upstream.next().await {
+                Some(Ok(LLMChunk::Done)) => Some((Ok(LLMChunk::Done), (upstream, true))),
+                Some(Err(error)) => Some((Err(error), (upstream, true))),
+                Some(other) => Some((other, (upstream, false))),
+                None => Some((
+                    Err(LLMError::Stream(format!(
+                        "{protocol} stream ended before a protocol terminal event"
+                    ))),
+                    (upstream, true),
+                )),
+            }
+        },
+    );
+    Box::pin(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +282,7 @@ mod tests {
                 reasoning_tokens: Some(5),
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: Some(8),
+                ..
             }
         ));
         assert!(matches!(chunks[3], LLMChunk::Done));
@@ -311,5 +353,39 @@ mod tests {
             Err(LLMError::Stream(msg)) => assert!(msg.contains("API error")),
             Err(other) => panic!("expected LLMError::Stream, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn required_done_turns_clean_eof_into_one_error() {
+        let upstream: LLMStream = Box::pin(stream::iter(vec![Ok(LLMChunk::Token(
+            "partial".to_string(),
+        ))]));
+        let mut stream = require_done_terminal(upstream, "Responses");
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LLMChunk::Token(text))) if text == "partial"
+        ));
+        let error = stream
+            .next()
+            .await
+            .expect("premature EOF error")
+            .expect_err("EOF must not synthesize success");
+        assert!(error
+            .to_string()
+            .contains("ended before a protocol terminal"));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn required_done_stops_after_first_success_terminal() {
+        let upstream: LLMStream = Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Done),
+            Ok(LLMChunk::Token("after".to_string())),
+        ]));
+        let mut stream = require_done_terminal(upstream, "Responses");
+
+        assert!(matches!(stream.next().await, Some(Ok(LLMChunk::Done))));
+        assert!(stream.next().await.is_none());
     }
 }

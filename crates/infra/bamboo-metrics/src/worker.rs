@@ -250,6 +250,7 @@ impl MetricsWorker {
                         Some(*status_code),
                         *status,
                         *usage,
+                        None,
                         error.clone(),
                     )
                     .await?;

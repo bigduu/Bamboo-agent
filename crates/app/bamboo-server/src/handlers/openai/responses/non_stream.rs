@@ -7,8 +7,9 @@ use bamboo_metrics::types::ForwardStatus;
 
 use super::super::helpers::now_unix_ts;
 use super::output::{build_completed_response, build_output_items};
+use super::usage::ResponsesUsageAccumulator;
 use super::PreparedResponsesRequest;
-use crate::handlers::llm_compat::usage::{build_estimated_usage, estimate_completion_tokens};
+use crate::handlers::llm_compat::usage::estimate_completion_tokens;
 
 pub(super) async fn handle_non_streaming_response(
     app_state: web::Data<AppState>,
@@ -57,28 +58,58 @@ pub(super) async fn handle_non_streaming_response(
         .map_err(map_provider_error)?;
 
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     // Merge partial tool-call fragments by index/id — a raw Vec shatters one
     // call into N broken output items (#525). Same as the streaming worker.
     let mut tool_calls = bamboo_agent_core::tools::ToolCallAccumulator::new();
     let mut upstream_response_id: Option<String> = None;
+    let mut provider_usage = ResponsesUsageAccumulator::default();
+    let mut saw_done = false;
+    let mut raw_completed_response: Option<serde_json::Value> = None;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
+            Ok(bamboo_llm::types::LLMChunk::ResponsesEvent { event_type, data }) => {
+                if event_type == "response.completed" {
+                    raw_completed_response = data.get("response").cloned();
+                }
+            }
             Ok(bamboo_llm::types::LLMChunk::ResponseId(response_id)) => {
                 upstream_response_id = Some(response_id);
             }
             Ok(bamboo_llm::types::LLMChunk::Token(text)) => content.push_str(&text),
-            // Keep parity with streaming behavior: expose reasoning narration as text.
-            Ok(bamboo_llm::types::LLMChunk::ReasoningToken(text)) => content.push_str(&text),
+            // Native Responses events retain reasoning items structurally.
+            // Never relabel provider-neutral reasoning as assistant output text.
+            Ok(bamboo_llm::types::LLMChunk::ReasoningToken(text)) => {
+                reasoning_content.push_str(&text)
+            }
             Ok(bamboo_llm::types::LLMChunk::ToolCalls(calls)) => tool_calls.extend(calls),
             // Indexed variant: route fragments by provider index (#236/#525).
             Ok(bamboo_llm::types::LLMChunk::ToolCallsIndexed(calls)) => {
                 tool_calls.extend_indexed(calls)
             }
-            Ok(bamboo_llm::types::LLMChunk::Done) => break,
+            Ok(bamboo_llm::types::LLMChunk::Done) => {
+                saw_done = true;
+                break;
+            }
+            Ok(bamboo_llm::types::LLMChunk::ProviderUsage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                reasoning_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+                ..
+            }) => provider_usage.record(
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                reasoning_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+            ),
             Ok(bamboo_llm::types::LLMChunk::TransportActivity)
             | Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
-            | Ok(bamboo_llm::types::LLMChunk::ProviderUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
             | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {
@@ -98,7 +129,21 @@ pub(super) async fn handle_non_streaming_response(
         }
     }
 
-    let completion_tokens = estimate_completion_tokens(&content);
+    if !saw_done {
+        let message = "Stream ended before a protocol completion event";
+        app_state.metrics_service.collector().forward_completed(
+            forward_id,
+            chrono::Utc::now(),
+            None,
+            ForwardStatus::Error,
+            None,
+            Some(message.to_string()),
+        );
+        return Err(AppError::InternalError(anyhow::anyhow!(message)));
+    }
+
+    let completion_tokens = estimate_completion_tokens(&content)
+        .saturating_add(estimate_completion_tokens(&reasoning_content));
     let response_id =
         upstream_response_id.unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4()));
     let message_id = format!("msg_{}", uuid::Uuid::new_v4());
@@ -115,18 +160,40 @@ pub(super) async fn handle_non_streaming_response(
         );
     }
     let output = build_output_items(&message_id, content, finalized_calls);
-    let resp = build_completed_response(response_id, created_at, display_model, output);
+    let response_usage = provider_usage.response_usage();
+    let (metrics_usage, metrics_details) =
+        provider_usage.metrics_usage(prepared.estimated_prompt_tokens, completion_tokens);
+    app_state
+        .metrics_service
+        .collector()
+        .forward_completed_with_details(
+            forward_id,
+            chrono::Utc::now(),
+            Some(200),
+            ForwardStatus::Success,
+            Some(metrics_usage),
+            metrics_details,
+            None,
+        );
 
-    app_state.metrics_service.collector().forward_completed(
-        forward_id,
-        chrono::Utc::now(),
-        Some(200),
-        ForwardStatus::Success,
-        Some(build_estimated_usage(
-            prepared.estimated_prompt_tokens,
-            completion_tokens,
-        )),
-        None,
+    if let Some(mut raw_response) = raw_completed_response {
+        if raw_response
+            .get("usage")
+            .is_none_or(serde_json::Value::is_null)
+        {
+            if let Some(usage) = response_usage.as_ref() {
+                raw_response["usage"] = serde_json::to_value(usage).unwrap_or_default();
+            }
+        }
+        return Ok(HttpResponse::Ok().json(raw_response));
+    }
+
+    let resp = build_completed_response(
+        response_id,
+        created_at,
+        display_model,
+        output,
+        response_usage,
     );
 
     Ok(HttpResponse::Ok().json(resp))
