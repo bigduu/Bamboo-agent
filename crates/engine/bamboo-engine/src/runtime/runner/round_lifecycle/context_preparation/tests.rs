@@ -644,7 +644,7 @@ impl AgentHook for CompressionInstructionHook {
 }
 
 #[tokio::test]
-async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_request() {
+async fn maybe_apply_host_context_compression_uses_fast_model_for_every_summary_stage() {
     let mut session = Session::new("session-cp-fast-model", "main-model");
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 1200,
@@ -721,7 +721,11 @@ async fn maybe_apply_host_context_compression_uses_fast_model_for_summary_reques
     let models = models
         .lock()
         .expect("recorded model list lock should not be poisoned");
-    assert_eq!(models.as_slice(), ["fast-model"]);
+    assert_eq!(
+        models.as_slice(),
+        ["fast-model", "fast-model"],
+        "even a small compression candidate must route both map and reduce through the selected background model"
+    );
 }
 
 #[tokio::test]
