@@ -72,8 +72,7 @@ impl NotificationSink for CommandSink {
 mod tests {
     use super::*;
     use bamboo_config::{
-        LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType,
-        DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+        LifecycleHookGroup, LifecycleHookHandler, DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
     };
 
     fn sample_notification() -> SinkNotification {
@@ -101,11 +100,10 @@ mod tests {
             notification: vec![LifecycleHookGroup {
                 enabled: true,
                 matcher: None,
-                hooks: vec![LifecycleHookCommand {
-                    hook_type: LifecycleHookType::Command,
+                hooks: vec![LifecycleHookHandler::command(
                     command,
-                    timeout_ms: DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-                }],
+                    DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                )],
             }],
             ..Default::default()
         };

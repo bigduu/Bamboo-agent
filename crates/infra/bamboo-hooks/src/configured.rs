@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bamboo_agent_core::{AgentHook, Session};
-use bamboo_config::{
-    LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType, LifecycleHooksConfig,
-};
+use bamboo_config::{LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig};
 use bamboo_domain::{
     AgentHookPoint, HookPayload, HookResult, SessionEndStatus, SessionStartSource,
 };
@@ -15,18 +16,19 @@ use bamboo_infrastructure::{
 };
 use chrono::Utc;
 use regex::Regex;
+use rquickjs::{CatchResultExt, Context, Promise, Runtime};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tracing::warn;
 
-use super::HookRunner;
+use crate::HookDispatcher;
 
 const HOOK_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 /// User-facing lifecycle events that currently map to engine hook seams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShellHookEvent {
+pub enum LifecycleHookEvent {
     SessionStart,
     UserPromptSubmit,
     PreToolUse,
@@ -37,11 +39,9 @@ pub enum ShellHookEvent {
     Notification,
 }
 
-/// Raw process result returned by the settings dry-run endpoint. Unlike the
-/// normal hook path, this deliberately exposes captured streams so users can
-/// diagnose a command before enabling it.
+/// Raw handler result returned by the settings dry-run endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ShellHookTestOutput {
+pub struct LifecycleHookTestOutput {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
@@ -50,7 +50,12 @@ pub struct ShellHookTestOutput {
     pub stderr_truncated: bool,
 }
 
-impl ShellHookEvent {
+/// Backward-compatible name for the command-only dry-run response.
+pub type ShellHookTestOutput = LifecycleHookTestOutput;
+/// Backward-compatible name retained for SDK consumers.
+pub type ShellHookEvent = LifecycleHookEvent;
+
+impl LifecycleHookEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionStart => "SessionStart",
@@ -84,7 +89,7 @@ impl ShellHookEvent {
 
 /// One config-driven lifecycle shell command.
 pub struct ShellCommandHook {
-    event: ShellHookEvent,
+    event: LifecycleHookEvent,
     event_name_override: Option<&'static str>,
     command: String,
     timeout: Duration,
@@ -95,8 +100,9 @@ pub struct ShellCommandHook {
 
 impl ShellCommandHook {
     pub fn new(
-        event: ShellHookEvent,
-        config: &LifecycleHookCommand,
+        event: LifecycleHookEvent,
+        command: impl Into<String>,
+        timeout_ms: u64,
         matcher: Option<&str>,
         fallback_cwd: Option<PathBuf>,
         sequence: usize,
@@ -105,8 +111,8 @@ impl ShellCommandHook {
         Ok(Self {
             event,
             event_name_override: None,
-            command: config.command.clone(),
-            timeout: Duration::from_millis(config.timeout_ms.max(1)),
+            command: command.into(),
+            timeout: Duration::from_millis(timeout_ms.max(1)),
             matcher,
             fallback_cwd,
             name: format!("lifecycle_shell:{}:{sequence}", event.as_str()),
@@ -134,113 +140,7 @@ impl ShellCommandHook {
         session: &Session,
         cwd: Option<&PathBuf>,
     ) -> HookEnvelope {
-        let (
-            tool_name,
-            tool_input,
-            tool_response,
-            prompt,
-            source,
-            stop_hook_active,
-            terminal_status,
-            completion_reason,
-        ) = match payload {
-            HookPayload::SessionSetup {
-                initial_message,
-                source,
-            } => (
-                None,
-                None,
-                None,
-                Some(initial_message.clone()),
-                Some(*source),
-                None,
-                None,
-                None,
-            ),
-            HookPayload::Prompt { prompt } => (
-                None,
-                None,
-                None,
-                Some(prompt.clone()),
-                None,
-                None,
-                None,
-                None,
-            ),
-            HookPayload::ToolExecution {
-                tool_name,
-                parsed_args,
-                ..
-            } => (
-                Some(tool_name.clone()),
-                Some(parsed_args.clone()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            HookPayload::ToolResult {
-                tool_name, outcome, ..
-            } => (
-                Some(tool_name.clone()),
-                None,
-                serde_json::to_value(outcome).ok(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            HookPayload::Finalize { stop_hook_active } => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(*stop_hook_active),
-                None,
-                None,
-            ),
-            HookPayload::SessionEnd {
-                status,
-                completion_reason,
-            } => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(*status),
-                completion_reason.clone(),
-            ),
-            HookPayload::None
-            | HookPayload::Round { .. }
-            | HookPayload::Compression { .. }
-            | HookPayload::Notification { .. } => (None, None, None, None, None, None, None, None),
-        };
-
-        HookEnvelope {
-            schema_version: 1,
-            hook_event_name: self.event_name().to_string(),
-            session_id: session.id.clone(),
-            workspace_path: cwd
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            model: session.model.clone(),
-            payload: payload.clone(),
-            tool_name,
-            tool_input,
-            tool_response,
-            prompt,
-            source,
-            stop_hook_active,
-            terminal_status,
-            completion_reason,
-            timestamp: Utc::now().to_rfc3339(),
-        }
+        build_hook_envelope(self.event_name(), payload, session, cwd)
     }
 
     async fn execute(
@@ -378,44 +278,19 @@ impl ShellCommandHook {
                 return HookResult::Continue;
             }
         };
-        let HookResponse {
-            decision,
-            reason,
-            additional_context,
-            suppress_output: _suppress_output,
-        } = response;
-        let result = match decision {
-            Some(HookDecision::Block) => HookResult::Deny {
-                reason: reason
-                    .filter(|reason| !reason.trim().is_empty())
-                    .unwrap_or_else(|| "blocked by lifecycle hook".to_string()),
-            },
-            Some(HookDecision::Allow) => HookResult::Allow,
-            Some(HookDecision::Ask) => HookResult::Ask,
-            None => HookResult::Continue,
-        };
-        match additional_context.filter(|context| !context.trim().is_empty()) {
-            Some(text) if matches!(result, HookResult::Continue) => {
-                HookResult::InjectContext { text }
-            }
-            Some(text) => HookResult::WithContext {
-                result: Box::new(result),
-                text,
-            },
-            None => result,
-        }
+        interpret_response(response)
     }
 
     async fn test(
         &self,
         payload: &HookPayload,
         session: &Session,
-    ) -> Result<ShellHookTestOutput, String> {
+    ) -> Result<LifecycleHookTestOutput, String> {
         let cwd = self.effective_cwd(session);
         let input = serde_json::to_vec(&self.envelope(payload, session, cwd.as_ref()))
             .map_err(|error| format!("failed serializing lifecycle hook test payload: {error}"))?;
         let output = self.execute(input, cwd.as_ref(), session).await?;
-        Ok(ShellHookTestOutput {
+        Ok(LifecycleHookTestOutput {
             exit_code: output.exit_code,
             stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
@@ -426,33 +301,81 @@ impl ShellCommandHook {
     }
 }
 
-/// Execute one lifecycle command against a deterministic synthetic payload.
-/// This shares the production shell/environment/timeout/output-capping path;
-/// only hook-result interpretation is skipped so callers receive raw output.
+/// Execute one configured handler against a deterministic synthetic payload.
+/// Production runtime limits and output caps are preserved, while result
+/// interpretation is skipped so callers receive raw diagnostics.
+pub async fn test_lifecycle_handler(
+    event_name: &str,
+    handler: &LifecycleHookHandler,
+    fallback_cwd: Option<PathBuf>,
+) -> Result<LifecycleHookTestOutput, String> {
+    let (event, payload) = synthetic_test_payload(event_name)?;
+    let session = Session::new("lifecycle-hook-test", "hook-test");
+
+    match handler {
+        LifecycleHookHandler::Command {
+            command,
+            timeout_ms,
+        } => {
+            let mut hook =
+                ShellCommandHook::new(event, command, *timeout_ms, None, fallback_cwd, 0)
+                    .map_err(|error| format!("invalid lifecycle hook matcher: {error}"))?;
+            hook.name = format!("lifecycle_shell_test:{event_name}");
+            hook.test(&payload, &session).await
+        }
+        LifecycleHookHandler::JavaScript {
+            source,
+            timeout_ms,
+            memory_limit_bytes,
+        } => {
+            let mut hook = JavaScriptHook::new(
+                event,
+                source,
+                *timeout_ms,
+                *memory_limit_bytes,
+                None,
+                fallback_cwd,
+                0,
+            )
+            .map_err(|error| format!("invalid lifecycle hook matcher: {error}"))?;
+            hook.name = format!("lifecycle_javascript_test:{event_name}");
+            hook.test(&payload, &session).await
+        }
+    }
+}
+
+/// Backward-compatible command-only dry-run entry point.
 pub async fn test_lifecycle_shell_command(
     event_name: &str,
-    config: &LifecycleHookCommand,
+    command: &str,
+    timeout_ms: u64,
     fallback_cwd: Option<PathBuf>,
-) -> Result<ShellHookTestOutput, String> {
-    let (event, event_name_override, payload) = match event_name {
+) -> Result<LifecycleHookTestOutput, String> {
+    test_lifecycle_handler(
+        event_name,
+        &LifecycleHookHandler::command(command, timeout_ms),
+        fallback_cwd,
+    )
+    .await
+}
+
+fn synthetic_test_payload(event_name: &str) -> Result<(LifecycleHookEvent, HookPayload), String> {
+    let value = match event_name {
         "SessionStart" => (
-            ShellHookEvent::SessionStart,
-            None,
+            LifecycleHookEvent::SessionStart,
             HookPayload::SessionSetup {
                 initial_message: "Lifecycle hook test".to_string(),
                 source: SessionStartSource::Startup,
             },
         ),
         "UserPromptSubmit" => (
-            ShellHookEvent::UserPromptSubmit,
-            None,
+            LifecycleHookEvent::UserPromptSubmit,
             HookPayload::Prompt {
                 prompt: "Lifecycle hook test".to_string(),
             },
         ),
         "PreToolUse" => (
-            ShellHookEvent::PreToolUse,
-            None,
+            LifecycleHookEvent::PreToolUse,
             HookPayload::ToolExecution {
                 tool_name: "Bash".to_string(),
                 tool_call_id: "hook-test-call".to_string(),
@@ -460,8 +383,7 @@ pub async fn test_lifecycle_shell_command(
             },
         ),
         "PostToolUse" => (
-            ShellHookEvent::PostToolUse,
-            None,
+            LifecycleHookEvent::PostToolUse,
             HookPayload::ToolResult {
                 tool_name: "Bash".to_string(),
                 tool_call_id: "hook-test-call".to_string(),
@@ -475,23 +397,20 @@ pub async fn test_lifecycle_shell_command(
             },
         ),
         "Stop" => (
-            ShellHookEvent::Stop,
-            None,
+            LifecycleHookEvent::Stop,
             HookPayload::Finalize {
                 stop_hook_active: false,
             },
         ),
         "SessionEnd" => (
-            ShellHookEvent::SessionEnd,
-            None,
+            LifecycleHookEvent::SessionEnd,
             HookPayload::SessionEnd {
                 status: SessionEndStatus::Completed,
                 completion_reason: Some("lifecycle hook test".to_string()),
             },
         ),
         "PreCompact" => (
-            ShellHookEvent::PreCompact,
-            None,
+            LifecycleHookEvent::PreCompact,
             HookPayload::Compression {
                 estimated_tokens: 1_000,
                 usage_percent: 50.0,
@@ -502,8 +421,7 @@ pub async fn test_lifecycle_shell_command(
             },
         ),
         "Notification" => (
-            ShellHookEvent::Notification,
-            None,
+            LifecycleHookEvent::Notification,
             HookPayload::Notification {
                 id: Some("notification-test".to_string()),
                 category: "custom".to_string(),
@@ -517,13 +435,7 @@ pub async fn test_lifecycle_shell_command(
         ),
         other => return Err(format!("unknown lifecycle hook event '{other}'")),
     };
-
-    let mut hook = ShellCommandHook::new(event, config, None, fallback_cwd, 0)
-        .map_err(|error| format!("invalid lifecycle hook matcher: {error}"))?;
-    hook.event_name_override = event_name_override;
-    hook.name = format!("lifecycle_shell_test:{event_name}");
-    let session = Session::new("lifecycle-hook-test", "hook-test");
-    hook.test(&payload, &session).await
+    Ok(value)
 }
 
 #[cfg(unix)]
@@ -601,6 +513,415 @@ impl AgentHook for ShellCommandHook {
     }
 }
 
+const JAVASCRIPT_HOOK_MAX_STACK_BYTES: usize = 512 * 1024;
+const JAVASCRIPT_INVOKE_SOURCE: &str = r#"
+(async () => {
+    "use strict";
+    const hookFunction = globalThis.hook;
+    if (typeof hookFunction !== "function") {
+        throw new TypeError("JavaScript lifecycle hook must define globalThis.hook(input)");
+    }
+    const input = Object.freeze(JSON.parse(globalThis.__bamboo_hook_input_json));
+    const output = await hookFunction(input);
+    if (output === undefined || output === null) {
+        return "{}";
+    }
+    const encoded = JSON.stringify(output);
+    if (encoded === undefined) {
+        throw new TypeError("JavaScript lifecycle hook result must be JSON-serializable");
+    }
+    return encoded;
+})()
+"#;
+
+/// One config-driven JavaScript lifecycle handler.
+///
+/// Every invocation gets a fresh QuickJS runtime and context. No module loader
+/// or host functions are installed, so scripts cannot access Bamboo's
+/// filesystem, network, process, or environment through this runtime.
+pub struct JavaScriptHook {
+    event: LifecycleHookEvent,
+    source: String,
+    timeout: Duration,
+    memory_limit_bytes: usize,
+    matcher: Option<Regex>,
+    fallback_cwd: Option<PathBuf>,
+    name: String,
+}
+
+impl JavaScriptHook {
+    pub fn new(
+        event: LifecycleHookEvent,
+        source: impl Into<String>,
+        timeout_ms: u64,
+        memory_limit_bytes: usize,
+        matcher: Option<&str>,
+        fallback_cwd: Option<PathBuf>,
+        sequence: usize,
+    ) -> Result<Self, regex::Error> {
+        Ok(Self {
+            event,
+            source: source.into(),
+            timeout: Duration::from_millis(timeout_ms.max(1)),
+            memory_limit_bytes: memory_limit_bytes.max(1),
+            matcher: matcher.map(Regex::new).transpose()?,
+            fallback_cwd,
+            name: format!("lifecycle_javascript:{}:{sequence}", event.as_str()),
+        })
+    }
+
+    fn effective_cwd(&self, session: &Session) -> Option<PathBuf> {
+        session
+            .workspace
+            .as_deref()
+            .filter(|workspace| !workspace.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| self.fallback_cwd.clone())
+            .or_else(|| std::env::current_dir().ok())
+    }
+
+    fn envelope(
+        &self,
+        payload: &HookPayload,
+        session: &Session,
+        cwd: Option<&PathBuf>,
+    ) -> HookEnvelope {
+        build_hook_envelope(self.event.as_str(), payload, session, cwd)
+    }
+
+    async fn execute(&self, input_json: String) -> Result<JavaScriptExecutionOutput, String> {
+        let source = self.source.clone();
+        let timeout = self.timeout;
+        let memory_limit_bytes = self.memory_limit_bytes;
+        tokio::task::spawn_blocking(move || {
+            execute_javascript(source, input_json, timeout, memory_limit_bytes)
+        })
+        .await
+        .map_err(|error| format!("JavaScript lifecycle hook task failed: {error}"))
+    }
+
+    fn interpret(&self, output: &JavaScriptExecutionOutput) -> HookResult {
+        if output.timed_out {
+            warn!(hook = %self.name, "JavaScript lifecycle hook exceeded its deadline");
+            return HookResult::Continue;
+        }
+        if !output.stderr.is_empty() {
+            warn!(
+                hook = %self.name,
+                error = %output.stderr,
+                "JavaScript lifecycle hook failed non-blocking"
+            );
+            return HookResult::Continue;
+        }
+        if output.stdout_truncated {
+            warn!(
+                hook = %self.name,
+                "JavaScript lifecycle hook result exceeded the output limit"
+            );
+            return HookResult::Continue;
+        }
+        match serde_json::from_str::<HookResponse>(&output.stdout) {
+            Ok(response) => interpret_response(response),
+            Err(error) => {
+                warn!(
+                    hook = %self.name,
+                    error = %error,
+                    "ignoring malformed JavaScript lifecycle hook response"
+                );
+                HookResult::Continue
+            }
+        }
+    }
+
+    async fn test(
+        &self,
+        payload: &HookPayload,
+        session: &Session,
+    ) -> Result<LifecycleHookTestOutput, String> {
+        let cwd = self.effective_cwd(session);
+        let input_json = serde_json::to_string(&self.envelope(payload, session, cwd.as_ref()))
+            .map_err(|error| format!("failed serializing lifecycle hook test payload: {error}"))?;
+        let output = self.execute(input_json).await?;
+        Ok(LifecycleHookTestOutput {
+            exit_code: None,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            timed_out: output.timed_out,
+            stdout_truncated: output.stdout_truncated,
+            stderr_truncated: output.stderr_truncated,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentHook for JavaScriptHook {
+    fn point(&self) -> AgentHookPoint {
+        self.event.point()
+    }
+
+    async fn run(
+        &self,
+        _point: AgentHookPoint,
+        payload: &HookPayload,
+        session: &Session,
+    ) -> HookResult {
+        let cwd = self.effective_cwd(session);
+        let input_json = match serde_json::to_string(&self.envelope(payload, session, cwd.as_ref()))
+        {
+            Ok(input) => input,
+            Err(error) => {
+                warn!(
+                    hook = %self.name,
+                    error = %error,
+                    "failed serializing JavaScript lifecycle hook payload"
+                );
+                return HookResult::Continue;
+            }
+        };
+        match self.execute(input_json).await {
+            Ok(output) => self.interpret(&output),
+            Err(error) => {
+                warn!(
+                    hook = %self.name,
+                    error = %error,
+                    "JavaScript lifecycle hook execution failed non-blocking"
+                );
+                HookResult::Continue
+            }
+        }
+    }
+
+    fn matches(&self, payload: &HookPayload) -> bool {
+        let Some(matcher) = &self.matcher else {
+            return true;
+        };
+        match payload {
+            HookPayload::ToolExecution { tool_name, .. }
+            | HookPayload::ToolResult { tool_name, .. } => matcher.is_match(tool_name),
+            _ => false,
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Debug, Default)]
+struct JavaScriptExecutionOutput {
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+fn execute_javascript(
+    source: String,
+    input_json: String,
+    timeout: Duration,
+    memory_limit_bytes: usize,
+) -> JavaScriptExecutionOutput {
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let runtime = match Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return javascript_error_output(format!("failed creating QuickJS runtime: {error}"));
+        }
+    };
+    runtime.set_memory_limit(memory_limit_bytes);
+    runtime.set_max_stack_size(JAVASCRIPT_HOOK_MAX_STACK_BYTES);
+    let deadline = Instant::now() + timeout;
+    let interrupt_timed_out = timed_out.clone();
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        let expired = Instant::now() >= deadline;
+        if expired {
+            interrupt_timed_out.store(true, Ordering::Relaxed);
+        }
+        expired
+    })));
+
+    let context = match Context::full(&runtime) {
+        Ok(context) => context,
+        Err(error) => {
+            return javascript_error_output(format!("failed creating QuickJS context: {error}"));
+        }
+    };
+    let result = context.with(|ctx| -> Result<String, String> {
+        ctx.eval::<(), _>(source.as_str())
+            .catch(&ctx)
+            .map_err(|error| error.to_string())?;
+        ctx.globals()
+            .set("__bamboo_hook_input_json", input_json)
+            .catch(&ctx)
+            .map_err(|error| error.to_string())?;
+        let promise: Promise = ctx
+            .eval(JAVASCRIPT_INVOKE_SOURCE)
+            .catch(&ctx)
+            .map_err(|error| error.to_string())?;
+        promise
+            .finish::<String>()
+            .catch(&ctx)
+            .map_err(|error| error.to_string())
+    });
+
+    match result {
+        Ok(stdout) => {
+            let (stdout, stdout_truncated) = cap_text(stdout);
+            JavaScriptExecutionOutput {
+                stdout,
+                stdout_truncated,
+                ..JavaScriptExecutionOutput::default()
+            }
+        }
+        Err(error) => {
+            let (stderr, stderr_truncated) = cap_text(error);
+            JavaScriptExecutionOutput {
+                stderr,
+                timed_out: timed_out.load(Ordering::Relaxed),
+                stderr_truncated,
+                ..JavaScriptExecutionOutput::default()
+            }
+        }
+    }
+}
+
+fn javascript_error_output(error: String) -> JavaScriptExecutionOutput {
+    let (stderr, stderr_truncated) = cap_text(error);
+    JavaScriptExecutionOutput {
+        stderr,
+        stderr_truncated,
+        ..JavaScriptExecutionOutput::default()
+    }
+}
+
+fn cap_text(mut text: String) -> (String, bool) {
+    if text.len() <= HOOK_OUTPUT_LIMIT_BYTES {
+        return (text, false);
+    }
+    let mut boundary = HOOK_OUTPUT_LIMIT_BYTES;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    (text, true)
+}
+
+fn build_hook_envelope(
+    event_name: &str,
+    payload: &HookPayload,
+    session: &Session,
+    cwd: Option<&PathBuf>,
+) -> HookEnvelope {
+    let (
+        tool_name,
+        tool_input,
+        tool_response,
+        prompt,
+        source,
+        stop_hook_active,
+        terminal_status,
+        completion_reason,
+    ) = match payload {
+        HookPayload::SessionSetup {
+            initial_message,
+            source,
+        } => (
+            None,
+            None,
+            None,
+            Some(initial_message.clone()),
+            Some(*source),
+            None,
+            None,
+            None,
+        ),
+        HookPayload::Prompt { prompt } => (
+            None,
+            None,
+            None,
+            Some(prompt.clone()),
+            None,
+            None,
+            None,
+            None,
+        ),
+        HookPayload::ToolExecution {
+            tool_name,
+            parsed_args,
+            ..
+        } => (
+            Some(tool_name.clone()),
+            Some(parsed_args.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        HookPayload::ToolResult {
+            tool_name, outcome, ..
+        } => (
+            Some(tool_name.clone()),
+            None,
+            serde_json::to_value(outcome).ok(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        HookPayload::Finalize { stop_hook_active } => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(*stop_hook_active),
+            None,
+            None,
+        ),
+        HookPayload::SessionEnd {
+            status,
+            completion_reason,
+        } => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(*status),
+            completion_reason.clone(),
+        ),
+        HookPayload::None
+        | HookPayload::Round { .. }
+        | HookPayload::Compression { .. }
+        | HookPayload::Notification { .. } => (None, None, None, None, None, None, None, None),
+    };
+
+    HookEnvelope {
+        schema_version: 1,
+        hook_event_name: event_name.to_string(),
+        session_id: session.id.clone(),
+        workspace_path: cwd
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        model: session.model.clone(),
+        payload: payload.clone(),
+        tool_name,
+        tool_input,
+        tool_response,
+        prompt,
+        source,
+        stop_hook_active,
+        terminal_status,
+        completion_reason,
+        timestamp: Utc::now().to_rfc3339(),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HookEnvelope {
     schema_version: u8,
@@ -650,6 +971,33 @@ enum HookDecision {
     Ask,
 }
 
+fn interpret_response(response: HookResponse) -> HookResult {
+    let HookResponse {
+        decision,
+        reason,
+        additional_context,
+        suppress_output: _suppress_output,
+    } = response;
+    let result = match decision {
+        Some(HookDecision::Block) => HookResult::Deny {
+            reason: reason
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| "blocked by lifecycle hook".to_string()),
+        },
+        Some(HookDecision::Allow) => HookResult::Allow,
+        Some(HookDecision::Ask) => HookResult::Ask,
+        None => HookResult::Continue,
+    };
+    match additional_context.filter(|context| !context.trim().is_empty()) {
+        Some(text) if matches!(result, HookResult::Continue) => HookResult::InjectContext { text },
+        Some(text) => HookResult::WithContext {
+            result: Box::new(result),
+            text,
+        },
+        None => result,
+    }
+}
+
 #[derive(Debug)]
 struct CommandOutput {
     exit_code: Option<i32>,
@@ -680,8 +1028,8 @@ async fn read_capped(mut reader: impl AsyncRead + Unpin) -> Result<CapturedOutpu
     Ok(captured)
 }
 
-pub(super) fn register_configured_shell_hooks(
-    runner: &mut HookRunner,
+pub(super) fn register_configured_hooks(
+    dispatcher: &mut HookDispatcher,
     config: &LifecycleHooksConfig,
     fallback_cwd: Option<PathBuf>,
 ) {
@@ -689,15 +1037,18 @@ pub(super) fn register_configured_shell_hooks(
         return;
     }
 
-    let events: [(ShellHookEvent, &[LifecycleHookGroup]); 8] = [
-        (ShellHookEvent::SessionStart, &config.session_start),
-        (ShellHookEvent::UserPromptSubmit, &config.user_prompt_submit),
-        (ShellHookEvent::PreToolUse, &config.pre_tool_use),
-        (ShellHookEvent::PostToolUse, &config.post_tool_use),
-        (ShellHookEvent::Stop, &config.stop),
-        (ShellHookEvent::SessionEnd, &config.session_end),
-        (ShellHookEvent::PreCompact, &config.pre_compact),
-        (ShellHookEvent::Notification, &config.notification),
+    let events: [(LifecycleHookEvent, &[LifecycleHookGroup]); 8] = [
+        (LifecycleHookEvent::SessionStart, &config.session_start),
+        (
+            LifecycleHookEvent::UserPromptSubmit,
+            &config.user_prompt_submit,
+        ),
+        (LifecycleHookEvent::PreToolUse, &config.pre_tool_use),
+        (LifecycleHookEvent::PostToolUse, &config.post_tool_use),
+        (LifecycleHookEvent::Stop, &config.stop),
+        (LifecycleHookEvent::SessionEnd, &config.session_end),
+        (LifecycleHookEvent::PreCompact, &config.pre_compact),
+        (LifecycleHookEvent::Notification, &config.notification),
     ];
     let mut sequence = 0_usize;
     for (event, groups) in events {
@@ -717,23 +1068,43 @@ pub(super) fn register_configured_shell_hooks(
                 }
                 None
             };
-            for command in &group.hooks {
-                match command.hook_type {
-                    LifecycleHookType::Command => {
-                        match ShellCommandHook::new(
-                            event,
-                            command,
-                            matcher,
-                            fallback_cwd.clone(),
-                            sequence,
-                        ) {
-                            Ok(hook) => runner.register(std::sync::Arc::new(hook)),
-                            Err(error) => warn!(
-                                event = event.as_str(),
-                                error = %error,
-                                "skipping lifecycle hook with invalid matcher"
-                            ),
-                        }
+            for handler in &group.hooks {
+                let hook: Result<Arc<dyn AgentHook>, regex::Error> = match handler {
+                    LifecycleHookHandler::Command {
+                        command,
+                        timeout_ms,
+                    } => ShellCommandHook::new(
+                        event,
+                        command,
+                        *timeout_ms,
+                        matcher,
+                        fallback_cwd.clone(),
+                        sequence,
+                    )
+                    .map(|hook| Arc::new(hook) as Arc<dyn AgentHook>),
+                    LifecycleHookHandler::JavaScript {
+                        source,
+                        timeout_ms,
+                        memory_limit_bytes,
+                    } => JavaScriptHook::new(
+                        event,
+                        source,
+                        *timeout_ms,
+                        *memory_limit_bytes,
+                        matcher,
+                        fallback_cwd.clone(),
+                        sequence,
+                    )
+                    .map(|hook| Arc::new(hook) as Arc<dyn AgentHook>),
+                };
+                match hook {
+                    Ok(hook) => dispatcher.register(hook),
+                    Err(error) => {
+                        warn!(
+                            event = event.as_str(),
+                            error = %error,
+                            "skipping lifecycle hook with invalid matcher"
+                        );
                     }
                 }
                 sequence += 1;
@@ -745,16 +1116,51 @@ pub(super) fn register_configured_shell_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS;
+    use bamboo_config::{
+        DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES, DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+    };
     use serde_json::json;
     use std::time::Instant;
 
-    fn command(command: impl Into<String>, timeout_ms: u64) -> LifecycleHookCommand {
-        LifecycleHookCommand {
-            hook_type: LifecycleHookType::Command,
-            command: command.into(),
+    fn command(command: impl Into<String>, timeout_ms: u64) -> LifecycleHookHandler {
+        LifecycleHookHandler::command(command, timeout_ms)
+    }
+
+    fn javascript(source: impl Into<String>, timeout_ms: u64) -> LifecycleHookHandler {
+        LifecycleHookHandler::javascript(
+            source,
             timeout_ms,
-        }
+            DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+        )
+    }
+
+    fn shell_hook(
+        event: LifecycleHookEvent,
+        command: impl Into<String>,
+        timeout_ms: u64,
+        matcher: Option<&str>,
+        sequence: usize,
+    ) -> ShellCommandHook {
+        ShellCommandHook::new(event, command, timeout_ms, matcher, None, sequence).unwrap()
+    }
+
+    fn javascript_hook(
+        event: LifecycleHookEvent,
+        source: impl Into<String>,
+        timeout_ms: u64,
+        memory_limit_bytes: usize,
+        matcher: Option<&str>,
+    ) -> JavaScriptHook {
+        JavaScriptHook::new(
+            event,
+            source,
+            timeout_ms,
+            memory_limit_bytes,
+            matcher,
+            None,
+            0,
+        )
+        .unwrap()
     }
 
     fn session(workspace: &std::path::Path) -> Session {
@@ -766,14 +1172,13 @@ mod tests {
     #[tokio::test]
     async fn exit_zero_without_output_passes_through() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = ShellCommandHook::new(
+        let hook = shell_hook(
             ShellHookEvent::SessionStart,
-            &command("printf ''", DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS),
-            None,
+            "printf ''",
+            DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
             None,
             0,
-        )
-        .unwrap();
+        );
         let result = hook
             .run(
                 AgentHookPoint::AfterSessionSetup,
@@ -790,14 +1195,13 @@ mod tests {
     #[tokio::test]
     async fn exit_two_blocks_with_stderr_reason() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = ShellCommandHook::new(
+        let hook = shell_hook(
             ShellHookEvent::PreToolUse,
-            &command("printf 'blocked by policy' >&2; exit 2", 1_000),
-            None,
+            "printf 'blocked by policy' >&2; exit 2",
+            1_000,
             None,
             0,
-        )
-        .unwrap();
+        );
         let result = hook
             .run(
                 AgentHookPoint::BeforeToolExecution,
@@ -821,14 +1225,7 @@ mod tests {
     async fn versioned_json_protocol_is_delivered_on_stdin() {
         let dir = tempfile::tempdir().unwrap();
         let shell = r#"payload=$(cat); case "$payload" in *'"hook_event_name":"PreToolUse"'*'"tool_name":"bash"'*) printf '%s' '{"decision":"allow"}' ;; *) printf 'bad payload' >&2; exit 2 ;; esac"#;
-        let hook = ShellCommandHook::new(
-            ShellHookEvent::PreToolUse,
-            &command(shell, 1_000),
-            None,
-            None,
-            0,
-        )
-        .unwrap();
+        let hook = shell_hook(ShellHookEvent::PreToolUse, shell, 1_000, None, 0);
         let result = hook
             .run(
                 AgentHookPoint::BeforeToolExecution,
@@ -870,14 +1267,7 @@ mod tests {
             ),
         ] {
             let shell = format!("printf '%s' '{body}'");
-            let hook = ShellCommandHook::new(
-                ShellHookEvent::SessionStart,
-                &command(shell, 1_000),
-                None,
-                None,
-                0,
-            )
-            .unwrap();
+            let hook = shell_hook(ShellHookEvent::SessionStart, shell, 1_000, None, 0);
             assert_eq!(
                 hook.run(
                     AgentHookPoint::AfterSessionSetup,
@@ -893,46 +1283,36 @@ mod tests {
     #[tokio::test]
     async fn runner_preserves_decision_and_context_from_one_response() {
         let dir = tempfile::tempdir().unwrap();
-        let mut runner = HookRunner::new();
-        runner.register(std::sync::Arc::new(
-            ShellCommandHook::new(
-                ShellHookEvent::SessionStart,
-                &command(
-                    r#"printf '%s' '{"decision":"allow","additional_context":"keep me"}'"#,
-                    1_000,
-                ),
-                None,
-                None,
-                0,
-            )
-            .unwrap(),
-        ));
+        let mut runner = HookDispatcher::new();
+        runner.register(Arc::new(shell_hook(
+            ShellHookEvent::SessionStart,
+            r#"printf '%s' '{"decision":"allow","additional_context":"keep me"}'"#,
+            1_000,
+            None,
+            0,
+        )));
         let session = session(dir.path());
-        let mut state = bamboo_domain::AgentRuntimeState::new("run-1");
-        let outcome = runner
+        let report = runner
             .run_hooks(
                 AgentHookPoint::AfterSessionSetup,
                 &HookPayload::None,
                 &session,
-                &mut state,
-                None,
             )
             .await;
-        assert_eq!(outcome.decision, HookResult::Allow);
-        assert_eq!(outcome.injected_contexts, vec!["keep me"]);
+        assert_eq!(report.outcome.decision, HookResult::Allow);
+        assert_eq!(report.outcome.injected_contexts, vec!["keep me"]);
     }
 
     #[tokio::test]
     async fn malformed_json_is_non_blocking() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = ShellCommandHook::new(
+        let hook = shell_hook(
             ShellHookEvent::SessionStart,
-            &command("printf 'not-json'", 1_000),
-            None,
+            "printf 'not-json'",
+            1_000,
             None,
             0,
-        )
-        .unwrap();
+        );
         assert_eq!(
             hook.run(
                 AgentHookPoint::AfterSessionSetup,
@@ -947,14 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_hook_and_continues() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = ShellCommandHook::new(
-            ShellHookEvent::SessionStart,
-            &command("sleep 5", 25),
-            None,
-            None,
-            0,
-        )
-        .unwrap();
+        let hook = shell_hook(ShellHookEvent::SessionStart, "sleep 5", 25, None, 0);
         let started = Instant::now();
         let result = hook
             .run(
@@ -967,16 +1340,234 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[tokio::test]
+    async fn javascript_hook_reads_envelope_and_awaits_promises() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = javascript_hook(
+            LifecycleHookEvent::PreToolUse,
+            r#"
+                async function hook(input) {
+                    await Promise.resolve();
+                    return {
+                        decision: "allow",
+                        additional_context: `${input.hook_event_name}:${input.tool_name}:${input.tool_input.command}`
+                    };
+                }
+            "#,
+            1_000,
+            DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+            Some("^Bash$"),
+        );
+        let result = hook
+            .run(
+                AgentHookPoint::BeforeToolExecution,
+                &HookPayload::ToolExecution {
+                    tool_name: "Bash".to_string(),
+                    tool_call_id: "call-js-1".to_string(),
+                    parsed_args: json!({"command": "pwd"}),
+                },
+                &session(dir.path()),
+            )
+            .await;
+
+        assert_eq!(
+            result,
+            HookResult::WithContext {
+                result: Box::new(HookResult::Allow),
+                text: "PreToolUse:Bash:pwd".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn javascript_errors_are_diagnostic_and_non_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = javascript_hook(
+            LifecycleHookEvent::SessionStart,
+            "function hook() { throw new Error('policy exploded'); }",
+            1_000,
+            DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+            None,
+        );
+
+        assert_eq!(
+            hook.run(
+                AgentHookPoint::AfterSessionSetup,
+                &HookPayload::None,
+                &session(dir.path()),
+            )
+            .await,
+            HookResult::Continue
+        );
+        let output = hook
+            .test(&HookPayload::None, &session(dir.path()))
+            .await
+            .unwrap();
+        assert!(output.stderr.contains("policy exploded"), "{output:?}");
+        assert!(!output.timed_out);
+    }
+
+    #[tokio::test]
+    async fn javascript_infinite_loop_is_interrupted_by_wall_clock_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = javascript_hook(
+            LifecycleHookEvent::SessionStart,
+            "function hook() { while (true) {} }",
+            25,
+            DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+            None,
+        );
+        let started = Instant::now();
+        let output = hook
+            .test(&HookPayload::None, &session(dir.path()))
+            .await
+            .unwrap();
+
+        assert!(output.timed_out, "{output:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn javascript_memory_limit_stops_unbounded_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = javascript_hook(
+            LifecycleHookEvent::SessionStart,
+            r#"
+                function hook() {
+                    const values = [];
+                    while (true) {
+                        values.push("x".repeat(4096));
+                    }
+                }
+            "#,
+            2_000,
+            4 * 1024 * 1024,
+            None,
+        );
+        let output = hook
+            .test(&HookPayload::None, &session(dir.path()))
+            .await
+            .unwrap();
+
+        assert!(!output.stderr.is_empty(), "{output:?}");
+        assert!(!output.timed_out, "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn javascript_result_is_capped_before_interpretation() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = javascript_hook(
+            LifecycleHookEvent::SessionStart,
+            r#"
+                function hook() {
+                    return { additional_context: "x".repeat(128 * 1024) };
+                }
+            "#,
+            1_000,
+            DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+            None,
+        );
+        let output = hook
+            .test(&HookPayload::None, &session(dir.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout.len(), HOOK_OUTPUT_LIMIT_BYTES);
+        assert!(output.stdout_truncated, "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(
+            hook.run(
+                AgentHookPoint::AfterSessionSetup,
+                &HookPayload::None,
+                &session(dir.path()),
+            )
+            .await,
+            HookResult::Continue,
+            "a truncated response must fail open instead of applying partial JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn javascript_runtime_exposes_no_host_io_globals() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = javascript_hook(
+            LifecycleHookEvent::SessionStart,
+            r#"
+                function hook() {
+                    return {
+                        additional_context: [
+                            typeof process,
+                            typeof require,
+                            typeof fetch,
+                            typeof Deno,
+                            typeof Bun
+                        ].join(",")
+                    };
+                }
+            "#,
+            1_000,
+            DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+            None,
+        );
+
+        assert_eq!(
+            hook.run(
+                AgentHookPoint::AfterSessionSetup,
+                &HookPayload::None,
+                &session(dir.path()),
+            )
+            .await,
+            HookResult::InjectContext {
+                text: "undefined,undefined,undefined,undefined,undefined".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_javascript_handler_matches_tools_and_returns_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LifecycleHooksConfig {
+            enabled: true,
+            pre_tool_use: vec![LifecycleHookGroup {
+                enabled: true,
+                matcher: Some("^Bash$".to_string()),
+                hooks: vec![javascript(
+                    "function hook() { return { decision: 'block', reason: 'blocked in JS' }; }",
+                    1_000,
+                )],
+            }],
+            ..LifecycleHooksConfig::default()
+        };
+        let dispatcher = HookDispatcher::new().with_lifecycle_config(&config, None);
+
+        let report = dispatcher
+            .run_hooks(
+                AgentHookPoint::BeforeToolExecution,
+                &HookPayload::ToolExecution {
+                    tool_name: "Bash".to_string(),
+                    tool_call_id: "call-js-2".to_string(),
+                    parsed_args: json!({}),
+                },
+                &session(dir.path()),
+            )
+            .await;
+        assert_eq!(
+            report.outcome.decision,
+            HookResult::Deny {
+                reason: "blocked in JS".to_string(),
+            }
+        );
+    }
+
     #[test]
     fn matcher_filters_tool_names() {
-        let hook = ShellCommandHook::new(
+        let hook = shell_hook(
             ShellHookEvent::PreToolUse,
-            &command("exit 2", 1_000),
+            "exit 2",
+            1_000,
             Some("^(bash|write_file)$"),
-            None,
             0,
-        )
-        .unwrap();
+        );
         let payload = |tool_name: &str| HookPayload::ToolExecution {
             tool_name: tool_name.to_string(),
             tool_call_id: "call-1".to_string(),
@@ -989,14 +1580,7 @@ mod tests {
     #[test]
     fn envelope_contains_versioned_protocol_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = ShellCommandHook::new(
-            ShellHookEvent::PreToolUse,
-            &command("true", 1_000),
-            None,
-            None,
-            0,
-        )
-        .unwrap();
+        let hook = shell_hook(ShellHookEvent::PreToolUse, "true", 1_000, None, 0);
         let session = session(dir.path());
         let payload = HookPayload::ToolExecution {
             tool_name: "bash".to_string(),
@@ -1049,8 +1633,7 @@ mod tests {
                 ("terminal_status", json!("cancelled")),
             ),
         ] {
-            let hook =
-                ShellCommandHook::new(event, &command("true", 1_000), None, None, 0).expect("hook");
+            let hook = shell_hook(event, "true", 1_000, None, 0);
             let value = serde_json::to_value(hook.envelope(
                 &payload,
                 &session,
@@ -1098,7 +1681,7 @@ mod tests {
             ..LifecycleHooksConfig::default()
         };
 
-        let base = HookRunner::new();
+        let base = HookDispatcher::new();
         let configured = base.with_lifecycle_config(&config, None);
         assert!(
             base.is_empty(),
@@ -1124,7 +1707,7 @@ mod tests {
             ..LifecycleHooksConfig::default()
         };
 
-        let configured = HookRunner::new().with_lifecycle_config(&config, None);
+        let configured = HookDispatcher::new().with_lifecycle_config(&config, None);
 
         assert!(configured.is_empty());
     }
@@ -1144,9 +1727,8 @@ mod tests {
             }],
             ..LifecycleHooksConfig::default()
         };
-        let runner = HookRunner::new().with_lifecycle_config(&config, None);
-        let mut state = bamboo_domain::AgentRuntimeState::new("run-ordered");
-        let outcome = runner
+        let runner = HookDispatcher::new().with_lifecycle_config(&config, None);
+        let report = runner
             .run_hooks(
                 AgentHookPoint::BeforeToolExecution,
                 &HookPayload::ToolExecution {
@@ -1155,17 +1737,15 @@ mod tests {
                     parsed_args: json!({}),
                 },
                 &session(dir.path()),
-                &mut state,
-                None,
             )
             .await;
         assert_eq!(
-            outcome.decision,
+            report.outcome.decision,
             HookResult::Deny {
                 reason: "first".to_string()
             }
         );
-        assert_eq!(state.checkpoints.len(), 1);
+        assert_eq!(report.executions.len(), 1);
     }
 
     #[tokio::test]
@@ -1186,9 +1766,8 @@ mod tests {
             }],
             ..LifecycleHooksConfig::default()
         };
-        let runner = HookRunner::new().with_lifecycle_config(&config, None);
-        let mut state = bamboo_domain::AgentRuntimeState::new("run-precompact");
-        let outcome = runner
+        let runner = HookDispatcher::new().with_lifecycle_config(&config, None);
+        let report = runner
             .run_observer_hooks(
                 AgentHookPoint::BeforeCompression,
                 &HookPayload::Compression {
@@ -1200,14 +1779,12 @@ mod tests {
                     phase: "pre-turn".to_string(),
                 },
                 &session(dir.path()),
-                &mut state,
-                None,
             )
             .await;
 
-        assert_eq!(state.checkpoints.len(), 2);
+        assert_eq!(report.executions.len(), 2);
         assert_eq!(
-            outcome.injected_contexts,
+            report.outcome.injected_contexts,
             vec!["preserve the failing assertion".to_string()]
         );
     }
@@ -1223,7 +1800,7 @@ mod tests {
             }],
             ..LifecycleHooksConfig::default()
         };
-        let configured = HookRunner::new().with_lifecycle_config(&config, None);
+        let configured = HookDispatcher::new().with_lifecycle_config(&config, None);
         assert!(configured.is_empty());
     }
 

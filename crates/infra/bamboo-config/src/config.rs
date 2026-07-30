@@ -1527,7 +1527,7 @@ pub struct ConfigValues {
     #[serde(default)]
     pub hooks: HooksConfig,
 
-    /// User-configured agent lifecycle command hooks.
+    /// User-configured agent lifecycle command or JavaScript handlers.
     ///
     /// This is intentionally separate from `hooks`, which is already the
     /// provider HTTP request-hook namespace. Lifecycle hooks are snapshotted
@@ -2208,6 +2208,14 @@ pub struct HooksConfig {
 
 /// Default deadline for one lifecycle command hook.
 pub const DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 60_000;
+/// Default deadline for one embedded JavaScript lifecycle hook.
+pub const DEFAULT_JAVASCRIPT_HOOK_TIMEOUT_MS: u64 = 1_000;
+/// Default QuickJS heap limit for one JavaScript hook invocation (16 MiB).
+pub const DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+/// Smallest accepted JavaScript heap limit (1 MiB).
+pub const MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES: usize = 1024 * 1024;
+/// Largest accepted JavaScript heap limit (256 MiB).
+pub const MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// Smallest accepted lifecycle hook deadline at the config API boundary.
 pub const MIN_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 1;
 /// Largest accepted lifecycle hook deadline (10 minutes). Lifecycle hooks run
@@ -2233,6 +2241,22 @@ fn default_lifecycle_hook_timeout_ms() -> u64 {
 
 fn lifecycle_hook_timeout_is_default(value: &u64) -> bool {
     *value == DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
+}
+
+fn default_javascript_hook_timeout_ms() -> u64 {
+    DEFAULT_JAVASCRIPT_HOOK_TIMEOUT_MS
+}
+
+fn javascript_hook_timeout_is_default(value: &u64) -> bool {
+    *value == DEFAULT_JAVASCRIPT_HOOK_TIMEOUT_MS
+}
+
+fn default_javascript_hook_memory_limit_bytes() -> usize {
+    DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES
+}
+
+fn javascript_hook_memory_limit_is_default(value: &usize) -> bool {
+    *value == DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES
 }
 
 fn lifecycle_hook_enabled_default() -> bool {
@@ -2295,7 +2319,7 @@ impl LifecycleHooksConfig {
     }
 }
 
-/// A matcher and its ordered command-hook list for one lifecycle event.
+/// A matcher and its ordered handler list for one lifecycle event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleHookGroup {
     /// A disabled group remains persisted and editable but is not registered
@@ -2308,7 +2332,7 @@ pub struct LifecycleHookGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     #[serde(default)]
-    pub hooks: Vec<LifecycleHookCommand>,
+    pub hooks: Vec<LifecycleHookHandler>,
 }
 
 impl Default for LifecycleHookGroup {
@@ -2321,24 +2345,62 @@ impl Default for LifecycleHookGroup {
     }
 }
 
-/// Supported lifecycle hook implementation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LifecycleHookType {
-    Command,
+/// One configured lifecycle hook handler.
+///
+/// The internally tagged representation preserves the existing command JSON
+/// while allowing handler-specific validation and defaults for embedded
+/// JavaScript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LifecycleHookHandler {
+    Command {
+        command: String,
+        #[serde(
+            default = "default_lifecycle_hook_timeout_ms",
+            skip_serializing_if = "lifecycle_hook_timeout_is_default"
+        )]
+        timeout_ms: u64,
+    },
+    JavaScript {
+        source: String,
+        #[serde(
+            default = "default_javascript_hook_timeout_ms",
+            skip_serializing_if = "javascript_hook_timeout_is_default"
+        )]
+        timeout_ms: u64,
+        #[serde(
+            default = "default_javascript_hook_memory_limit_bytes",
+            skip_serializing_if = "javascript_hook_memory_limit_is_default"
+        )]
+        memory_limit_bytes: usize,
+    },
 }
 
-/// One configured lifecycle shell command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LifecycleHookCommand {
-    #[serde(rename = "type")]
-    pub hook_type: LifecycleHookType,
-    pub command: String,
-    #[serde(
-        default = "default_lifecycle_hook_timeout_ms",
-        skip_serializing_if = "lifecycle_hook_timeout_is_default"
-    )]
-    pub timeout_ms: u64,
+impl LifecycleHookHandler {
+    pub fn command(command: impl Into<String>, timeout_ms: u64) -> Self {
+        Self::Command {
+            command: command.into(),
+            timeout_ms,
+        }
+    }
+
+    pub fn javascript(
+        source: impl Into<String>,
+        timeout_ms: u64,
+        memory_limit_bytes: usize,
+    ) -> Self {
+        Self::JavaScript {
+            source: source.into(),
+            timeout_ms,
+            memory_limit_bytes,
+        }
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::Command { timeout_ms, .. } | Self::JavaScript { timeout_ms, .. } => *timeout_ms,
+        }
+    }
 }
 
 /// Request override configuration for provider-specific HTTP behavior.
@@ -5012,11 +5074,11 @@ mod tests {
             "legacy groups without an enabled flag remain active"
         );
         assert_eq!(
-            config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms,
+            config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms(),
             DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
         );
         assert_eq!(
-            config.lifecycle_hooks.session_start[0].hooks[0].timeout_ms,
+            config.lifecycle_hooks.session_start[0].hooks[0].timeout_ms(),
             25
         );
 
@@ -5037,6 +5099,28 @@ mod tests {
             .get("timeout_ms")
             .is_none());
         assert!(json.get("hooks").is_some());
+    }
+
+    #[test]
+    fn javascript_lifecycle_hook_uses_handler_specific_defaults() {
+        let handler: LifecycleHookHandler = serde_json::from_value(serde_json::json!({
+            "type": "javascript",
+            "source": "function hook(input) { return { additional_context: input.hook_event_name }; }"
+        }))
+        .expect("javascript lifecycle hook should deserialize");
+
+        assert_eq!(handler.timeout_ms(), DEFAULT_JAVASCRIPT_HOOK_TIMEOUT_MS);
+        assert!(matches!(
+            handler,
+            LifecycleHookHandler::JavaScript {
+                memory_limit_bytes: DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+                ..
+            }
+        ));
+        let json = serde_json::to_value(handler).expect("javascript hook should serialize");
+        assert_eq!(json["type"], "javascript");
+        assert!(json.get("timeout_ms").is_none());
+        assert!(json.get("memory_limit_bytes").is_none());
     }
 
     #[test]

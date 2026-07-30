@@ -125,7 +125,8 @@ pub use bamboo_infrastructure as infrastructure;
 pub use bamboo_sdk::agent;
 pub use bamboo_sdk::{
     Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
-    HookToolOutcome, ShellCommandHook, ShellHookEvent,
+    HookToolOutcome, JavaScriptHook, LifecycleHookEvent, LifecycleHookTestOutput, ShellCommandHook,
+    ShellHookEvent,
 };
 
 // Re-export the runtime config crate so consumers can reach config, paths,

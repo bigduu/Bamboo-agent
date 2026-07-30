@@ -1,11 +1,15 @@
-# Lifecycle command hooks
+# Lifecycle hooks
 
-Bamboo can run user-configured shell commands at agent lifecycle events. Use
-the Hooks settings page, or edit the `lifecycle_hooks` object in
+Bamboo can run ordered command or embedded JavaScript handlers at agent
+lifecycle events. Configure them in the `lifecycle_hooks` object in
 `$BAMBOO_DATA_DIR/hooks.json` (normally `~/.bamboo/hooks.json`). Changes are
 validated and hot-reloaded. Engine-owned hooks are snapshotted when an
 execution starts. Notification hooks read the current configuration, and a
 background Bash completion reads the configuration available when it arrives.
+
+Hook matching and handler execution live in the standalone `bamboo-hooks`
+crate. The engine owns the lifecycle seams and applies returned decisions or
+context.
 
 ## Configuration
 
@@ -19,8 +23,14 @@ background Bash completion reads the configuration available when it arrives.
         "hooks": [
           {
             "type": "command",
-            "command": ".bamboo/hooks/block-dangerous-bash.sh",
+            "command": ".bamboo/hooks/audit-bash.sh",
             "timeout_ms": 5000
+          },
+          {
+            "type": "javascript",
+            "source": "function hook(input) { if ((input.tool_input.command || '').includes('rm -rf /')) return { decision: 'block', reason: 'root deletion is forbidden' }; return {}; }",
+            "timeout_ms": 1000,
+            "memory_limit_bytes": 16777216
           }
         ]
       }
@@ -31,11 +41,25 @@ background Bash completion reads the configuration available when it arrives.
 
 Each event contains ordered groups. A group and the whole section can be
 disabled without deleting them. `matcher` is a Rust regular expression over
-the tool name and is supported only for `PreToolUse` and `PostToolUse`. A
-command runs through Bamboo's preferred Bash-compatible shell. Agent events use
-the session workspace; server-owned notification hooks fall back to the
-configured default work area and then the server process directory. `timeout_ms`
-defaults to 60000 and must be between 1 and 600000.
+the tool name and is supported only for `PreToolUse` and `PostToolUse`.
+
+Handlers run sequentially in configuration order. A control decision stops
+normal dispatch; observer events always run every matching handler. Programmatic
+hooks and configured handlers share the same dispatcher and priority ordering.
+
+Handler settings:
+
+| Type | Required field | Default timeout | Other limits |
+|---|---|---:|---|
+| `command` | `command` | 60000 ms | stdout and stderr are each capped at 64 KiB |
+| `javascript` | `source` | 1000 ms | heap defaults to 16 MiB; result/error is capped at 64 KiB |
+
+Every `timeout_ms` must be between 1 and 600000. JavaScript
+`memory_limit_bytes` must be between 1 MiB and 256 MiB.
+
+Command handlers run through Bamboo's preferred Bash-compatible shell. Agent
+events use the session workspace; server-owned notification hooks fall back to
+the configured default work area and then the server process directory.
 
 Supported events:
 
@@ -50,14 +74,11 @@ Supported events:
 | `PreCompact` | Immediately before LLM context summarization | `additional_context` becomes custom summarizer instructions. Decisions are ignored because blocking compaction risks context overflow. |
 | `Notification` | After notification policy and dedup, alongside desktop/ntfy/Bark delivery | Fire-and-forget observer; decisions and output are ignored. |
 
-## Command protocol
+## Input envelope
 
-The command receives one JSON object on stdin and these environment variables:
-
-- `BAMBOO_HOOK_EVENT`: the event name from the table above.
-- `BAMBOO_SESSION_ID`: the owning session id.
-
-Every stdin envelope has stable common fields and an event-specific `payload`:
+Both handler types receive the same schema-versioned object. A command reads
+its JSON representation from stdin. JavaScript receives the object as the
+`input` argument to `hook(input)`.
 
 ```json
 {
@@ -85,8 +106,14 @@ A delivered notification payload contains `id`, `category`, `priority`,
 Tool-oriented envelopes also keep the convenience fields `tool_name`,
 `tool_input`, and `tool_response` for compatibility.
 
-For decision-capable events, exit 0 with no stdout means continue. Exit 0 may
-instead print exactly one JSON response:
+Command handlers also receive:
+
+- `BAMBOO_HOOK_EVENT`: the event name from the table above.
+- `BAMBOO_SESSION_ID`: the owning session id.
+
+## Output contract
+
+For decision-capable events, a handler can return one response object:
 
 ```json
 {
@@ -97,15 +124,50 @@ instead print exactly one JSON response:
 ```
 
 `decision` is `allow`, `block`, or `ask`. `additional_context` can be returned
-with or without a decision. Exit 2 blocks with stderr as the reason. Other
-non-zero exits, malformed stdout, and timeouts are logged and treated as
-non-blocking failures. Stdout and stderr are each capped at 64 KiB.
+with or without a decision.
+
+A command exits 0 and writes either no stdout or exactly one JSON response.
+Exit 2 blocks with stderr as the reason. Other non-zero exits, malformed
+stdout, and timeouts are logged and treated as non-blocking failures.
+
+A JavaScript handler defines a global `hook` function and returns the response
+object directly. It may be synchronous or return a Promise:
+
+```javascript
+async function hook(input) {
+  await Promise.resolve();
+  if (input.hook_event_name === "PreToolUse" && input.tool_name === "Bash") {
+    return {
+      decision: "ask",
+      reason: "Review this shell command before execution",
+    };
+  }
+  return {};
+}
+```
+
+Returning `undefined`, `null`, or an empty object continues. A thrown error,
+rejected Promise, malformed response, resource-limit failure, or timeout is
+logged and treated as a non-blocking failure.
 
 Observer events (`SessionEnd`, `Notification`) never change control flow.
-`PreCompact` consumes only `additional_context`; its decision and exit-2 block
-signal are deliberately ignored.
+`PreCompact` consumes only `additional_context`; its decision and a command's
+exit-2 block signal are deliberately ignored.
 
-## Examples
+## JavaScript isolation
+
+Each invocation gets a fresh QuickJS runtime and context. Bamboo installs no
+module loader or host functions, so the script has no direct filesystem,
+network, process, environment-variable, or timer API. Globals such as
+`process`, `require`, `fetch`, `Deno`, and `Bun` are absent.
+
+The runtime enforces a wall-clock deadline, a configurable heap limit, a fixed
+stack limit, and a bounded serialized result. These are capability and resource
+guardrails inside the Bamboo process, not an operating-system process or
+container boundary. Only user-owned global hook configuration should be
+enabled; project-local hook discovery requires a separate trust gate.
+
+## Command example
 
 Block dangerous Bash commands (`.bamboo/hooks/block-dangerous-bash.sh`):
 
@@ -131,16 +193,6 @@ Auto-format after an edit:
 }
 ```
 
-Send a desktop notification when a run stops:
-
-```json
-{
-  "Stop": [{
-    "hooks": [{"type": "command", "command": "notify-send 'Bamboo' 'Agent run stopped'"}]
-  }]
-}
-```
-
-Use the Hooks settings page's dry-run action before enabling a command. The
-test uses the production shell, environment, timeout, output cap, and a
+The lifecycle-hook dry-run endpoint accepts either handler type and uses the
+production input schema, timeout, memory/output limits, shell/runtime, and a
 deterministic synthetic payload for the selected event.

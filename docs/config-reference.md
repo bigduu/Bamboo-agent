@@ -168,10 +168,10 @@ TLS termination — no ACME/auto-cert). All overridable per-invocation with
 - `hooks.image_fallback` — how image parts are handled when the effective
   model/path is text-only (drop, OCR-replace, etc. — see
   `ImageFallbackHookConfig`).
-- `lifecycle_hooks` — config-driven shell commands for session, prompt, tool,
-  compaction, and notification events. It lives in `hooks.json`; see the
-  [lifecycle hooks guide](lifecycle-hooks.md) for the complete schema and
-  stdin/stdout contract.
+- `lifecycle_hooks` — config-driven command or sandboxed JavaScript handlers
+  for session, prompt, tool, compaction, and notification events. It lives in
+  `hooks.json`; see the [lifecycle hooks guide](lifecycle-hooks.md) for the
+  complete schema, isolation limits, and input/output contract.
 
 ## LLM stream timeouts
 

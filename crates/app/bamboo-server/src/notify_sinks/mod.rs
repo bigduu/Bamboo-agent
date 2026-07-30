@@ -218,11 +218,10 @@ mod tests {
             notification: vec![bamboo_config::LifecycleHookGroup {
                 enabled: true,
                 matcher: None,
-                hooks: vec![bamboo_config::LifecycleHookCommand {
-                    hook_type: bamboo_config::LifecycleHookType::Command,
-                    command: "true".to_string(),
-                    timeout_ms: bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-                }],
+                hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                    "true",
+                    bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                )],
             }],
             ..Default::default()
         };

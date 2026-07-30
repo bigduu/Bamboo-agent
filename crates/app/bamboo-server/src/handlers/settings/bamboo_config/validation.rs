@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use actix_web::{web, HttpResponse};
 use bamboo_config::{
-    LifecycleHookGroup, LifecycleHooksConfig, LIFECYCLE_HOOK_EVENT_NAMES,
-    MAX_LIFECYCLE_HOOK_TIMEOUT_MS, MIN_LIFECYCLE_HOOK_TIMEOUT_MS,
+    LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig, LIFECYCLE_HOOK_EVENT_NAMES,
+    MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES, MAX_LIFECYCLE_HOOK_TIMEOUT_MS,
+    MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES, MIN_LIFECYCLE_HOOK_TIMEOUT_MS,
 };
 use regex::Regex;
 use serde_json::Value;
@@ -343,21 +344,39 @@ fn validate_lifecycle_hooks_shape(value: &Value) -> Vec<ValidationIssue> {
                     continue;
                 };
                 match hook.get("type").and_then(Value::as_str) {
-                    Some("command") => {}
+                    Some("command") => {
+                        if !hook.get("command").is_some_and(Value::is_string) {
+                            issues.push(issue(
+                                format!("{hook_path}.command"),
+                                "command must be a string",
+                            ));
+                        }
+                    }
+                    Some("javascript") => {
+                        if !hook.get("source").is_some_and(Value::is_string) {
+                            issues.push(issue(
+                                format!("{hook_path}.source"),
+                                "source must be a string",
+                            ));
+                        }
+                        if hook
+                            .get("memory_limit_bytes")
+                            .is_some_and(|value| value.as_u64().is_none())
+                        {
+                            issues.push(issue(
+                                format!("{hook_path}.memory_limit_bytes"),
+                                "memory_limit_bytes must be a non-negative integer",
+                            ));
+                        }
+                    }
                     Some(other) => issues.push(issue(
                         format!("{hook_path}.type"),
                         format!("unsupported lifecycle hook type '{other}'"),
                     )),
                     None => issues.push(issue(
                         format!("{hook_path}.type"),
-                        "hook type must be 'command'",
+                        "hook type must be 'command' or 'javascript'",
                     )),
-                }
-                if !hook.get("command").is_some_and(Value::is_string) {
-                    issues.push(issue(
-                        format!("{hook_path}.command"),
-                        "command must be a string",
-                    ));
                 }
                 if hook
                     .get("timeout_ms")
@@ -400,14 +419,42 @@ fn validate_lifecycle_hooks_config(config: &LifecycleHooksConfig) -> Vec<Validat
             }
             for (hook_index, hook) in group.hooks.iter().enumerate() {
                 let hook_path = format!("{group_path}.hooks[{hook_index}]");
-                if hook.command.trim().is_empty() {
-                    issues.push(issue(
-                        format!("{hook_path}.command"),
-                        "command must not be empty",
-                    ));
+                let timeout_ms = hook.timeout_ms();
+                match hook {
+                    LifecycleHookHandler::Command { command, .. } => {
+                        if command.trim().is_empty() {
+                            issues.push(issue(
+                                format!("{hook_path}.command"),
+                                "command must not be empty",
+                            ));
+                        }
+                    }
+                    LifecycleHookHandler::JavaScript {
+                        source,
+                        memory_limit_bytes,
+                        ..
+                    } => {
+                        if source.trim().is_empty() {
+                            issues.push(issue(
+                                format!("{hook_path}.source"),
+                                "source must not be empty",
+                            ));
+                        }
+                        if !(MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES
+                            ..=MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES)
+                            .contains(memory_limit_bytes)
+                        {
+                            issues.push(issue(
+                                format!("{hook_path}.memory_limit_bytes"),
+                                format!(
+                                    "memory_limit_bytes must be between {MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES} and {MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES}"
+                                ),
+                            ));
+                        }
+                    }
                 }
                 if !(MIN_LIFECYCLE_HOOK_TIMEOUT_MS..=MAX_LIFECYCLE_HOOK_TIMEOUT_MS)
-                    .contains(&hook.timeout_ms)
+                    .contains(&timeout_ms)
                 {
                     issues.push(issue(
                         format!("{hook_path}.timeout_ms"),
