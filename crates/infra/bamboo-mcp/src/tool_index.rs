@@ -150,11 +150,13 @@ mod tests {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
                 parameters: serde_json::json!({}),
+                output_schema: None,
             },
             McpTool {
                 name: "write_file".to_string(),
                 description: "Write a file".to_string(),
                 parameters: serde_json::json!({}),
+                output_schema: None,
             },
         ];
 
@@ -176,11 +178,13 @@ mod tests {
                 name: "read_file".to_string(),
                 description: "Read".to_string(),
                 parameters: serde_json::json!({}),
+                output_schema: None,
             },
             McpTool {
                 name: "delete_file".to_string(),
                 description: "Delete".to_string(),
                 parameters: serde_json::json!({}),
+                output_schema: None,
             },
         ];
 
@@ -197,11 +201,13 @@ mod tests {
                 name: "read_file".to_string(),
                 description: "Read".to_string(),
                 parameters: serde_json::json!({}),
+                output_schema: None,
             },
             McpTool {
                 name: "delete_file".to_string(),
                 description: "Delete".to_string(),
                 parameters: serde_json::json!({}),
+                output_schema: None,
             },
         ];
 
@@ -217,6 +223,7 @@ mod tests {
             name: "read_file".to_string(),
             description: "Read".to_string(),
             parameters: serde_json::json!({}),
+            output_schema: None,
         }];
 
         index.register_server_tools("fs", &tools, &[], &[]);

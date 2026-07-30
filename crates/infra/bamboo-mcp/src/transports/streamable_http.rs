@@ -19,12 +19,19 @@ use tracing::{debug, trace, warn};
 use crate::config::{HeaderConfig, StreamableHttpConfig};
 use crate::error::{McpError, Result};
 use crate::protocol::client::{McpTransport, McpTransportMetadata};
+use crate::protocol::models::JsonRpcError;
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const MCP_METHOD_HEADER: &str = "mcp-method";
 const MCP_NAME_HEADER: &str = "mcp-name";
 const ACCEPT_HEADER: &str = "application/json, text/event-stream";
+const RESPONSE_STREAM_CLOSED_ERROR: i32 = -32000;
+
+struct PostSseHandle {
+    request_id: Option<u64>,
+    handle: tokio::task::JoinHandle<()>,
+}
 
 pub struct StreamableHttpTransport {
     config: StreamableHttpConfig,
@@ -40,7 +47,7 @@ pub struct StreamableHttpTransport {
     // Per-POST SSE forwarder tasks. Stored so they can be aborted
     // deterministically in disconnect() (they otherwise exit only on the next
     // send-Err once the receiver is dropped).
-    post_sse_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    post_sse_handles: Mutex<Vec<PostSseHandle>>,
 }
 
 impl StreamableHttpTransport {
@@ -241,13 +248,15 @@ impl StreamableHttpTransport {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            // Modern negotiation errors use HTTP 400 with a JSON-RPC error body.
-            // Route a well-formed error through the normal response channel so
-            // the protocol client can distinguish modern errors from legacy
-            // fallback signals.
-            if Self::is_json_rpc_error_response(&body) {
-                self.route_message(body).await?;
-                return Ok(());
+            // Modern negotiation errors may omit the JSON-RPC id. Return the
+            // error directly instead of routing it through `JsonRpcResponse`,
+            // whose response correlation necessarily requires an id.
+            if let Some(error) = Self::parse_json_rpc_error_response(&body) {
+                return Err(McpError::RemoteProtocol {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                });
             }
             return Err(McpError::Transport(format!(
                 "POST failed: {} - {}",
@@ -267,24 +276,34 @@ impl StreamableHttpTransport {
             let Some(tx) = self.message_tx.clone() else {
                 return Ok(()); // disconnected
             };
-            let url = self.config.url.clone();
             let connected = self.connected.clone();
+            let request_id = metadata.request_id;
 
             // We need to consume the response body in a spawned task to avoid
             // blocking the caller. Events from this POST's SSE response are
             // forwarded to the channel so receive() can pick them up.
             let handle = tokio::spawn(async move {
                 let mut stream = response.bytes_stream().eventsource();
+                let mut saw_terminal_response = false;
                 while let Some(event) = stream.next().await {
                     match event {
                         Ok(evt) => {
                             if !evt.data.trim().is_empty() {
+                                let is_terminal = request_id.is_some_and(|id| {
+                                    StreamableHttpTransport::is_terminal_response_for(&evt.data, id)
+                                });
+                                if is_terminal {
+                                    saw_terminal_response = true;
+                                }
                                 trace!(
                                     "MCP StreamableHTTP POST SSE event (event='{}', data_len={})",
                                     evt.event,
                                     evt.data.len()
                                 );
                                 if tx.send(evt.data).await.is_err() {
+                                    break;
+                                }
+                                if is_terminal {
                                     break;
                                 }
                             }
@@ -295,15 +314,27 @@ impl StreamableHttpTransport {
                         }
                     }
                 }
-                let _ = (url, connected); // suppress unused warnings
+                if !saw_terminal_response && connected.load(Ordering::SeqCst) {
+                    if let Some(id) = request_id {
+                        let synthetic = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": RESPONSE_STREAM_CLOSED_ERROR,
+                                "message": "Streamable HTTP response stream closed before a terminal response"
+                            }
+                        });
+                        let _ = tx.send(synthetic.to_string()).await;
+                    }
+                }
             });
 
             // Track the forwarder so disconnect() can abort it deterministically.
             // Also prune any already-finished handles so the Vec doesn't grow
             // unbounded across many POSTs.
             let mut handles = self.post_sse_handles.lock().await;
-            handles.retain(|h| !h.is_finished());
-            handles.push(handle);
+            handles.retain(|entry| !entry.handle.is_finished());
+            handles.push(PostSseHandle { request_id, handle });
         } else {
             // JSON response — forward the body directly.
             let body = response.text().await?;
@@ -326,12 +357,27 @@ impl StreamableHttpTransport {
         tx.send(body).await.map_err(|_| McpError::Disconnected)
     }
 
-    fn is_json_rpc_error_response(body: &str) -> bool {
+    fn parse_json_rpc_error_response(body: &str) -> Option<JsonRpcError> {
+        let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+        if value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+            return None;
+        }
+        serde_json::from_value(value.get("error")?.clone()).ok()
+    }
+
+    fn is_terminal_response_for(body: &str, request_id: u64) -> bool {
         serde_json::from_str::<serde_json::Value>(body)
             .ok()
             .is_some_and(|value| {
-                value.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
-                    && value.get("error").is_some_and(serde_json::Value::is_object)
+                (value.get("id").and_then(serde_json::Value::as_u64) == Some(request_id)
+                    && (value.get("result").is_some() || value.get("error").is_some()))
+                    || (value.get("method").and_then(serde_json::Value::as_str)
+                        == Some("notifications/cancelled")
+                        && value
+                            .get("params")
+                            .and_then(|params| params.get("requestId"))
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(request_id))
             })
     }
 
@@ -470,8 +516,8 @@ impl McpTransport for StreamableHttpTransport {
         }
         {
             let mut handles = self.post_sse_handles.lock().await;
-            for handle in handles.drain(..) {
-                handle.abort();
+            for entry in handles.drain(..) {
+                entry.handle.abort();
             }
         }
 
@@ -503,8 +549,8 @@ impl McpTransport for StreamableHttpTransport {
         // next send-Err, but aborting is immediate and leaves no leaked tasks.
         {
             let mut handles = self.post_sse_handles.lock().await;
-            for handle in handles.drain(..) {
-                handle.abort();
+            for entry in handles.drain(..) {
+                entry.handle.abort();
             }
         }
 
@@ -587,6 +633,22 @@ impl McpTransport for StreamableHttpTransport {
         Ok(())
     }
 
+    async fn cancel_request(&self, request_id: u64, _reason: &str) -> Result<()> {
+        let mut handles = self.post_sse_handles.lock().await;
+        if let Some(index) = handles
+            .iter()
+            .position(|entry| entry.request_id == Some(request_id))
+        {
+            let entry = handles.remove(index);
+            entry.handle.abort();
+            trace!(
+                "Cancelled MCP StreamableHTTP request by closing response stream (id={})",
+                request_id
+            );
+        }
+        Ok(())
+    }
+
     fn requires_tool_parameter_headers(&self) -> bool {
         true
     }
@@ -641,8 +703,8 @@ impl Drop for StreamableHttpTransport {
             }
         }
         if let Ok(mut handles) = self.post_sse_handles.try_lock() {
-            for handle in handles.drain(..) {
-                handle.abort();
+            for entry in handles.drain(..) {
+                entry.handle.abort();
             }
         }
     }
@@ -651,6 +713,7 @@ impl Drop for StreamableHttpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn create_test_config() -> StreamableHttpConfig {
         StreamableHttpConfig {
@@ -658,6 +721,30 @@ mod tests {
             headers: vec![],
             connect_timeout_ms: 5000,
         }
+    }
+
+    async fn serve_http_once(status: &str, content_type: &str, body: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let status = status.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test request");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read test request");
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+        });
+        format!("http://{address}/mcp")
     }
 
     #[test]
@@ -757,6 +844,7 @@ mod tests {
         StreamableHttpTransport::apply_request_metadata(
             &mut headers,
             &McpTransportMetadata {
+                request_id: Some(7),
                 protocol_version: Some("2026-07-28".to_string()),
                 modern: true,
                 method: "tools/call".to_string(),
@@ -794,6 +882,7 @@ mod tests {
         StreamableHttpTransport::apply_request_metadata(
             &mut headers,
             &McpTransportMetadata {
+                request_id: Some(7),
                 protocol_version: Some("2025-11-25".to_string()),
                 modern: false,
                 method: "tools/call".to_string(),
@@ -830,15 +919,119 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_json_rpc_error_bodies_for_http_negotiation() {
-        assert!(StreamableHttpTransport::is_json_rpc_error_response(
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"unsupported"}}"#
-        ));
-        assert!(!StreamableHttpTransport::is_json_rpc_error_response(
+    fn parses_json_rpc_error_bodies_with_or_without_id() {
+        let with_id = StreamableHttpTransport::parse_json_rpc_error_response(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"unsupported"}}"#,
+        )
+        .expect("error with id");
+        assert_eq!(with_id.code, -32022);
+        let without_id = StreamableHttpTransport::parse_json_rpc_error_response(
+            r#"{"jsonrpc":"2.0","error":{"code":-32023,"message":"missing capability"}}"#,
+        )
+        .expect("error without id");
+        assert_eq!(without_id.code, -32023);
+        assert!(StreamableHttpTransport::parse_json_rpc_error_response(
             r#"{"jsonrpc":"2.0","id":1,"result":{}}"#
+        )
+        .is_none());
+        assert!(
+            StreamableHttpTransport::parse_json_rpc_error_response("legacy error page").is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_success_json_rpc_error_without_id_surfaces_directly() {
+        let url = serve_http_once(
+            "400 Bad Request",
+            "application/json",
+            r#"{"jsonrpc":"2.0","error":{"code":-32022,"message":"unsupported"}}"#,
+        )
+        .await;
+        let transport = StreamableHttpTransport::new(StreamableHttpConfig {
+            url,
+            headers: Vec::new(),
+            connect_timeout_ms: 1000,
+        });
+        let error = transport
+            .post_and_route_response(
+                r#"{"jsonrpc":"2.0","id":7,"method":"server/discover","params":{}}"#.to_string(),
+                &McpTransportMetadata {
+                    request_id: Some(7),
+                    protocol_version: Some("2026-07-28".to_string()),
+                    modern: true,
+                    method: "server/discover".to_string(),
+                    name: None,
+                    tool_parameter_headers: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("HTTP JSON-RPC error must surface");
+        assert!(matches!(
+            error,
+            McpError::RemoteProtocol { code: -32022, .. }
         ));
-        assert!(!StreamableHttpTransport::is_json_rpc_error_response(
-            "legacy error page"
+    }
+
+    #[tokio::test]
+    async fn abrupt_post_sse_eof_resolves_the_owning_request() {
+        let url = serve_http_once("200 OK", "text/event-stream", "").await;
+        let mut transport = StreamableHttpTransport::new(StreamableHttpConfig {
+            url,
+            headers: Vec::new(),
+            connect_timeout_ms: 1000,
+        });
+        transport.connect().await.expect("connect");
+        let mut receiver = transport
+            .take_message_receiver()
+            .await
+            .expect("message receiver");
+        transport
+            .post_and_route_response(
+                r#"{"jsonrpc":"2.0","id":7,"method":"subscriptions/listen","params":{}}"#
+                    .to_string(),
+                &McpTransportMetadata {
+                    request_id: Some(7),
+                    protocol_version: Some("2026-07-28".to_string()),
+                    modern: true,
+                    method: "subscriptions/listen".to_string(),
+                    name: None,
+                    tool_parameter_headers: Vec::new(),
+                },
+            )
+            .await
+            .expect("accepted SSE response");
+
+        let routed = tokio::time::timeout(tokio::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("synthetic response timeout")
+            .expect("synthetic response");
+        let response: serde_json::Value =
+            serde_json::from_str(&routed).expect("synthetic response JSON");
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], RESPONSE_STREAM_CLOSED_ERROR);
+    }
+
+    #[test]
+    fn terminal_response_detection_requires_matching_request_id() {
+        assert!(StreamableHttpTransport::is_terminal_response_for(
+            r#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
+            7
+        ));
+        assert!(StreamableHttpTransport::is_terminal_response_for(
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"failed"}}"#,
+            7
+        ));
+        assert!(StreamableHttpTransport::is_terminal_response_for(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+            7
+        ));
+        assert!(!StreamableHttpTransport::is_terminal_response_for(
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#,
+            7
+        ));
+        assert!(!StreamableHttpTransport::is_terminal_response_for(
+            r#"{"jsonrpc":"2.0","id":8,"result":{}}"#,
+            7
         ));
     }
 
@@ -974,7 +1167,10 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
             }
         });
-        transport.post_sse_handles.lock().await.push(handle);
+        transport.post_sse_handles.lock().await.push(PostSseHandle {
+            request_id: Some(1),
+            handle,
+        });
 
         // Let the task begin.
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
@@ -1004,7 +1200,10 @@ mod tests {
             }
         });
         let abort_handle = forever.abort_handle();
-        transport.post_sse_handles.lock().await.push(forever);
+        transport.post_sse_handles.lock().await.push(PostSseHandle {
+            request_id: Some(1),
+            handle: forever,
+        });
 
         assert!(!abort_handle.is_finished(), "task should be running");
 
@@ -1016,6 +1215,42 @@ mod tests {
             abort_handle.is_finished(),
             "disconnect should have aborted the forwarder task"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_request_aborts_only_its_response_stream() {
+        let config = create_test_config();
+        let transport = StreamableHttpTransport::new(config);
+        let first = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let first_abort = first.abort_handle();
+        let second = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let second_abort = second.abort_handle();
+        {
+            let mut handles = transport.post_sse_handles.lock().await;
+            handles.push(PostSseHandle {
+                request_id: Some(7),
+                handle: first,
+            });
+            handles.push(PostSseHandle {
+                request_id: Some(8),
+                handle: second,
+            });
+        }
+
+        transport
+            .cancel_request(7, "test timeout")
+            .await
+            .expect("cancel stream");
+        tokio::task::yield_now().await;
+        assert!(first_abort.is_finished());
+        assert!(!second_abort.is_finished());
+        assert_eq!(transport.post_sse_handles.lock().await.len(), 1);
+
+        second_abort.abort();
     }
 
     #[tokio::test]
@@ -1031,7 +1266,10 @@ mod tests {
             }
         });
         let abort_handle = forever.abort_handle();
-        transport.post_sse_handles.lock().await.push(forever);
+        transport.post_sse_handles.lock().await.push(PostSseHandle {
+            request_id: Some(1),
+            handle: forever,
+        });
 
         assert!(!abort_handle.is_finished());
 

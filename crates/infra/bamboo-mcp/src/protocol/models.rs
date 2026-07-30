@@ -488,6 +488,14 @@ pub struct McpToolInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub input_schema: Option<Value>,
+    /// Optional JSON Schema for `structuredContent` returned by this tool.
+    #[serde(
+        rename = "outputSchema",
+        alias = "output_schema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_schema: Option<Value>,
 }
 
 /// Tool call request to invoke a tool.
@@ -542,8 +550,12 @@ pub struct McpToolCallResult {
     #[serde(rename = "resultType", default)]
     pub result_type: Option<String>,
     /// Optional structured result defined by the tool's output schema.
-    #[serde(rename = "structuredContent", default)]
-    pub structured_content: Option<Value>,
+    #[serde(
+        rename = "structuredContent",
+        default,
+        skip_serializing_if = "crate::types::McpStructuredContent::is_missing"
+    )]
+    pub structured_content: crate::types::McpStructuredContent,
 }
 
 #[cfg(test)]
@@ -777,6 +789,7 @@ mod tests {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
             input_schema: Some(serde_json::json!({"type": "object"})),
+            output_schema: None,
         };
         assert_eq!(tool.name, "read_file");
         assert_eq!(tool.description, "Read a file");
@@ -810,7 +823,7 @@ mod tests {
             content: vec![],
             is_error: false,
             result_type: None,
-            structured_content: None,
+            structured_content: crate::types::McpStructuredContent::Missing,
         };
         assert!(!result.is_error);
         assert!(result.content.is_empty());

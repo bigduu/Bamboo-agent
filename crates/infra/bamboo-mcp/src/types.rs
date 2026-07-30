@@ -56,6 +56,9 @@ pub struct McpTool {
     pub description: String,
     /// JSON Schema describing the tool's input parameters
     pub parameters: serde_json::Value,
+    /// Optional JSON Schema describing the tool's structured output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 /// Result of calling an MCP tool.
@@ -97,6 +100,41 @@ pub struct McpCallResult {
     /// Whether the tool execution encountered an error
     #[serde(default)]
     pub is_error: bool,
+    /// Optional structured result. `Missing` and an explicit JSON `null` stay
+    /// distinct so the 2026-07-28 wire value is preserved exactly.
+    #[serde(default, skip_serializing_if = "McpStructuredContent::is_missing")]
+    pub structured_content: McpStructuredContent,
+}
+
+/// Presence-aware structured tool output.
+///
+/// MCP permits any JSON value, including `null`, in `structuredContent`.
+/// A plain `Option<Value>` would collapse an explicit `null` into a missing
+/// field during deserialization.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum McpStructuredContent {
+    /// An explicitly returned JSON `null`.
+    Null,
+    /// Any non-null JSON value.
+    Value(serde_json::Value),
+    /// The server omitted `structuredContent`.
+    #[default]
+    Missing,
+}
+
+impl McpStructuredContent {
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub fn to_json_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Missing => None,
+            Self::Null => Some(serde_json::Value::Null),
+            Self::Value(value) => Some(value.clone()),
+        }
+    }
 }
 
 /// Content item returned by MCP tools.
@@ -152,6 +190,40 @@ pub enum McpContentItem {
         /// MCP sends this as `mimeType`; accept legacy `mime_type` too.
         #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
+    },
+    /// Audio content (base64-encoded).
+    #[serde(rename = "audio")]
+    Audio {
+        /// Base64-encoded audio data.
+        data: String,
+        /// MIME type of the audio.
+        #[serde(rename = "mimeType", alias = "mime_type")]
+        mime_type: String,
+    },
+    /// Link to a resource that the server can read.
+    #[serde(rename = "resource_link")]
+    ResourceLink {
+        /// Resource URI.
+        uri: String,
+        /// Programmatic resource name.
+        name: String,
+        /// Optional display title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Optional human-readable description.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// Optional resource MIME type.
+        #[serde(
+            rename = "mimeType",
+            alias = "mime_type",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        mime_type: Option<String>,
+        /// Optional raw resource size in bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
     },
     /// Resource reference
     #[serde(rename = "resource")]
@@ -453,6 +525,7 @@ mod tests {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
             parameters: serde_json::json!({"type": "object"}),
+            output_schema: None,
         };
         assert_eq!(tool.name, "read_file");
         assert_eq!(tool.description, "Read a file");
@@ -465,6 +538,7 @@ mod tests {
                 text: "success".to_string(),
             }],
             is_error: false,
+            structured_content: McpStructuredContent::Missing,
         };
         assert!(!result.is_error);
         assert_eq!(result.content.len(), 1);
@@ -477,6 +551,7 @@ mod tests {
                 text: "error occurred".to_string(),
             }],
             is_error: true,
+            structured_content: McpStructuredContent::Missing,
         };
         assert!(result.is_error);
     }
@@ -525,6 +600,52 @@ mod tests {
         // Legacy snake_case still accepted via alias.
         let legacy = r#"{"type":"image","data":"abc","mime_type":"image/png"}"#;
         assert!(serde_json::from_str::<McpContentItem>(legacy).is_ok());
+    }
+
+    #[test]
+    fn modern_audio_and_resource_link_content_deserialize() {
+        let audio: McpContentItem =
+            serde_json::from_str(r#"{"type":"audio","data":"UklGRg==","mimeType":"audio/wav"}"#)
+                .expect("parse modern audio");
+        assert!(matches!(
+            audio,
+            McpContentItem::Audio { ref data, ref mime_type }
+                if data == "UklGRg==" && mime_type == "audio/wav"
+        ));
+
+        let link: McpContentItem = serde_json::from_str(
+            r#"{"type":"resource_link","uri":"file:///report.json","name":"report","title":"Report","mimeType":"application/json","size":42}"#,
+        )
+        .expect("parse modern resource link");
+        assert!(matches!(
+            link,
+            McpContentItem::ResourceLink {
+                ref uri,
+                ref name,
+                size: Some(42),
+                ..
+            } if uri == "file:///report.json" && name == "report"
+        ));
+    }
+
+    #[test]
+    fn structured_content_distinguishes_missing_null_and_value() {
+        let missing: McpCallResult =
+            serde_json::from_str(r#"{"content":[],"is_error":false}"#).expect("missing");
+        assert_eq!(missing.structured_content, McpStructuredContent::Missing);
+
+        let explicit_null: McpCallResult =
+            serde_json::from_str(r#"{"content":[],"is_error":false,"structured_content":null}"#)
+                .expect("explicit null");
+        assert_eq!(explicit_null.structured_content, McpStructuredContent::Null);
+
+        let value: McpCallResult =
+            serde_json::from_str(r#"{"content":[],"structured_content":{"answer":42}}"#)
+                .expect("object value");
+        assert_eq!(
+            value.structured_content,
+            McpStructuredContent::Value(serde_json::json!({"answer": 42}))
+        );
     }
 
     #[test]

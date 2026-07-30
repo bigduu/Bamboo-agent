@@ -28,6 +28,8 @@ const NOTIFICATION_CHANNEL_CAPACITY: usize = 100;
 /// ignores pre-initialize requests does not consume the full operation timeout
 /// (60 seconds by default) before Bamboo falls back to `initialize`.
 const MODERN_DISCOVERY_PROBE_TIMEOUT_MS: u64 = 5_000;
+const SUBSCRIPTION_ACK_METHOD: &str = "notifications/subscriptions/acknowledged";
+const SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
 
 /// HTTP-envelope metadata derived from an MCP request.
 ///
@@ -35,6 +37,9 @@ const MODERN_DISCOVERY_PROBE_TIMEOUT_MS: u64 = 5_000;
 /// the modern protocol's body metadata into mandatory request headers.
 #[derive(Debug, Clone, Default)]
 pub struct McpTransportMetadata {
+    /// JSON-RPC request ID, used to associate a Streamable HTTP response stream
+    /// with the operation that owns it.
+    pub request_id: Option<u64>,
     pub protocol_version: Option<String>,
     pub modern: bool,
     pub method: String,
@@ -61,6 +66,22 @@ pub trait McpTransport: Send + Sync {
         _metadata: McpTransportMetadata,
     ) -> Result<()> {
         self.send(message).await
+    }
+
+    /// Cancel an in-flight request after Bamboo stops waiting for its result.
+    ///
+    /// stdio cancellation is a JSON-RPC notification. Streamable HTTP
+    /// overrides this hook and closes the request's response stream instead.
+    async fn cancel_request(&self, request_id: u64, reason: &str) -> Result<()> {
+        let notification = JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "notifications/cancelled".to_string(),
+            params: Some(serde_json::json!({
+                "requestId": request_id,
+                "reason": reason,
+            })),
+        };
+        self.send(serde_json::to_string(&notification)?).await
     }
 
     /// Whether this transport can speak the stateless MCP 2026-07-28 protocol.
@@ -120,6 +141,20 @@ enum RequestProtocol {
     Legacy { version: Option<String> },
 }
 
+enum ModernDiscoveryError {
+    /// No successful modern response was received, so a legacy probe is safe.
+    Fallback(McpError),
+    /// A modern response or a normative modern error pinned the protocol era.
+    Pinned(McpError),
+}
+
+#[derive(Default)]
+struct ToolSubscriptionState {
+    id: Option<u64>,
+    acknowledged: bool,
+    ack_sender: Option<oneshot::Sender<Result<()>>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ToolHeaderValueType {
     String,
@@ -156,7 +191,10 @@ pub struct McpProtocolClient {
     tool_header_specs: RwLock<HashMap<String, Vec<ToolHeaderSpec>>>,
     /// Long-lived `subscriptions/listen` request used by modern servers to
     /// deliver `notifications/tools/list_changed`.
-    tool_subscription_id: Mutex<Option<u64>>,
+    tool_subscription: Arc<Mutex<ToolSubscriptionState>>,
+    /// Whether the current modern discovery result requires a tool-change
+    /// subscription. Shared with the inbound handler for stdio correlation.
+    modern_tool_list_changes: Arc<AtomicBool>,
 }
 
 impl McpProtocolClient {
@@ -172,7 +210,8 @@ impl McpProtocolClient {
             notification_queue_full: Arc::new(AtomicBool::new(false)),
             protocol_mode: RwLock::new(ProtocolMode::Unnegotiated),
             tool_header_specs: RwLock::new(HashMap::new()),
-            tool_subscription_id: Mutex::new(None),
+            tool_subscription: Arc::new(Mutex::new(ToolSubscriptionState::default())),
+            modern_tool_list_changes: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -205,7 +244,13 @@ impl McpProtocolClient {
         }
 
         self.pending_requests.write().await.clear();
-        *self.tool_subscription_id.lock().await = None;
+        let mut subscription = self.tool_subscription.lock().await;
+        if let Some(sender) = subscription.ack_sender.take() {
+            let _ = sender.send(Err(McpError::Disconnected));
+        }
+        *subscription = ToolSubscriptionState::default();
+        self.modern_tool_list_changes.store(false, Ordering::SeqCst);
+        drop(subscription);
 
         let mut transport = self.transport.write().await;
         transport.disconnect().await
@@ -222,6 +267,8 @@ impl McpProtocolClient {
         let pending_requests = self.pending_requests.clone();
         let notification_tx = self.notification_tx.clone();
         let notification_queue_full = self.notification_queue_full.clone();
+        let tool_subscription = self.tool_subscription.clone();
+        let modern_tool_list_changes = self.modern_tool_list_changes.clone();
 
         let handler = tokio::spawn(async move {
             // Await the next message from the channel. When the channel closes
@@ -235,12 +282,24 @@ impl McpProtocolClient {
                     &pending_requests,
                     &notification_tx,
                     &notification_queue_full,
+                    &tool_subscription,
+                    &modern_tool_list_changes,
                 )
                 .await
                 {
                     warn!("Failed to handle message: {}", e);
                 }
             }
+            let mut pending = pending_requests.write().await;
+            for (_, request) in pending.drain() {
+                let _ = request.sender.send(Err(McpError::Disconnected));
+            }
+            drop(pending);
+            let mut subscription = tool_subscription.lock().await;
+            if let Some(sender) = subscription.ack_sender.take() {
+                let _ = sender.send(Err(McpError::Disconnected));
+            }
+            *subscription = ToolSubscriptionState::default();
             trace!("MCP message handler exited (channel closed)");
         });
 
@@ -252,6 +311,8 @@ impl McpProtocolClient {
         pending_requests: &RwLock<std::collections::HashMap<u64, PendingRequest>>,
         notification_tx: &mpsc::Sender<JsonRpcNotification>,
         notification_queue_full: &AtomicBool,
+        tool_subscription: &Mutex<ToolSubscriptionState>,
+        modern_tool_list_changes: &AtomicBool,
     ) -> Result<()> {
         // Try to parse as response
         if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(message) {
@@ -276,6 +337,16 @@ impl McpProtocolClient {
                 "MCP JSON-RPC notification received (method={})",
                 notification.method
             );
+            if Self::handle_subscription_notification(
+                &notification,
+                pending_requests,
+                tool_subscription,
+                modern_tool_list_changes,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             // Non-blocking: this handler loop ALSO matches JSON-RPC responses to
             // their pending requests, so a blocking `send().await` would wedge
             // response delivery once the (undrained) queue fills — timing out
@@ -306,6 +377,100 @@ impl McpProtocolClient {
         }
 
         Err(McpError::Protocol("Unknown message type".to_string()))
+    }
+
+    async fn handle_subscription_notification(
+        notification: &JsonRpcNotification,
+        pending_requests: &RwLock<std::collections::HashMap<u64, PendingRequest>>,
+        tool_subscription: &Mutex<ToolSubscriptionState>,
+        modern_tool_list_changes: &AtomicBool,
+    ) -> Result<bool> {
+        if notification.method == SUBSCRIPTION_ACK_METHOD {
+            let received_id = Self::notification_subscription_id(notification);
+            let accepts_tool_changes = notification
+                .params
+                .as_ref()
+                .and_then(|params| params.get("notifications"))
+                .and_then(|notifications| notifications.get("toolsListChanged"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let mut subscription = tool_subscription.lock().await;
+            let Some(expected_id) = subscription.id else {
+                warn!("Ignoring MCP subscription acknowledgment with no active subscription");
+                return Ok(true);
+            };
+            if received_id != Some(expected_id) {
+                warn!(
+                    "Ignoring MCP subscription acknowledgment with mismatched id (expected={:?}, received={:?})",
+                    subscription.id, received_id
+                );
+                return Ok(true);
+            }
+            if !accepts_tool_changes {
+                let error = McpError::Protocol(
+                    "MCP subscription acknowledgment omitted requested toolsListChanged"
+                        .to_string(),
+                );
+                if let Some(sender) = subscription.ack_sender.take() {
+                    let _ = sender.send(Err(error));
+                }
+                return Ok(true);
+            }
+            subscription.acknowledged = true;
+            if let Some(sender) = subscription.ack_sender.take() {
+                let _ = sender.send(Ok(()));
+            }
+            return Ok(true);
+        }
+
+        if notification.method == "notifications/cancelled" {
+            let request_id = notification
+                .params
+                .as_ref()
+                .and_then(|params| params.get("requestId"))
+                .and_then(Value::as_u64);
+            let mut subscription = tool_subscription.lock().await;
+            if let Some(id) = request_id.filter(|id| Some(*id) == subscription.id) {
+                if let Some(sender) = subscription.ack_sender.take() {
+                    let _ = sender.send(Err(McpError::Protocol(
+                        "MCP server cancelled subscriptions/listen".to_string(),
+                    )));
+                }
+                *subscription = ToolSubscriptionState::default();
+                drop(subscription);
+                if let Some(request) = pending_requests.write().await.remove(&id) {
+                    let _ = request.sender.send(Err(McpError::Protocol(
+                        "MCP server cancelled subscriptions/listen".to_string(),
+                    )));
+                }
+                return Ok(true);
+            }
+        }
+
+        if notification.method == "notifications/tools/list_changed"
+            && modern_tool_list_changes.load(Ordering::SeqCst)
+        {
+            let received_id = Self::notification_subscription_id(notification);
+            let subscription = tool_subscription.lock().await;
+            if !subscription.acknowledged || received_id != subscription.id {
+                warn!(
+                    "Ignoring uncorrelated MCP tools/list_changed notification (active={:?}, acknowledged={}, received={:?})",
+                    subscription.id, subscription.acknowledged, received_id
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn notification_subscription_id(notification: &JsonRpcNotification) -> Option<u64> {
+        notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get(SUBSCRIPTION_ID_META_KEY))
+            .and_then(Value::as_u64)
     }
 
     /// Records that a notification was dropped because the queue was full, and
@@ -386,6 +551,7 @@ impl McpProtocolClient {
 
         let metadata = match protocol {
             RequestProtocol::Modern { version } => McpTransportMetadata {
+                request_id: Some(id),
                 protocol_version: Some(version),
                 modern: true,
                 method: method.to_string(),
@@ -393,6 +559,7 @@ impl McpProtocolClient {
                 tool_parameter_headers,
             },
             RequestProtocol::Legacy { version } => McpTransportMetadata {
+                request_id: Some(id),
                 protocol_version: version,
                 modern: false,
                 method: method.to_string(),
@@ -401,19 +568,35 @@ impl McpProtocolClient {
             },
         };
 
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
         let transport = self.transport.read().await;
-        if let Err(e) = transport.send_with_metadata(request_json, metadata).await {
-            // Avoid leaking pending requests on send failure.
-            self.pending_requests.write().await.remove(&id);
-            warn!(
-                "MCP JSON-RPC request send failed (id={}, method={}): {}",
-                id, method, e
-            );
-            return Err(e);
+        match tokio::time::timeout_at(
+            deadline,
+            transport.send_with_metadata(request_json, metadata),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                // Avoid leaking pending requests on send failure.
+                self.pending_requests.write().await.remove(&id);
+                warn!(
+                    "MCP JSON-RPC request send failed (id={}, method={}): {}",
+                    id, method, error
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                drop(transport);
+                self.cancel_timed_out_request(id, method, timeout_ms).await;
+                return Err(McpError::Timeout(format!(
+                    "Request {id} timed out after {timeout_ms}ms"
+                )));
+            }
         }
         drop(transport);
 
-        match tokio::time::timeout(tokio::time::Duration::from_millis(timeout_ms), rx).await {
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(response))) => {
                 if let Some(error) = response.error {
                     Err(McpError::RemoteProtocol {
@@ -428,17 +611,29 @@ impl McpProtocolClient {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(McpError::Disconnected),
             Err(_) => {
-                self.pending_requests.write().await.remove(&id);
-                warn!(
-                    "MCP JSON-RPC request timed out (id={}, method={}, timeout_ms={})",
-                    id, method, timeout_ms
-                );
+                self.cancel_timed_out_request(id, method, timeout_ms).await;
                 Err(McpError::Timeout(format!(
-                    "Request {} timed out after {}ms",
-                    id, timeout_ms
+                    "Request {id} timed out after {timeout_ms}ms"
                 )))
             }
         }
+    }
+
+    async fn cancel_timed_out_request(&self, id: u64, method: &str, timeout_ms: u64) {
+        self.pending_requests.write().await.remove(&id);
+        let reason = format!("Request timed out after {timeout_ms}ms");
+        let transport = self.transport.read().await;
+        if let Err(error) = transport.cancel_request(id, &reason).await {
+            warn!(
+                "MCP request cancellation failed after timeout (id={}, method={}): {}",
+                id, method, error
+            );
+        }
+        drop(transport);
+        warn!(
+            "MCP JSON-RPC request timed out (id={}, method={}, timeout_ms={})",
+            id, method, timeout_ms
+        );
     }
 
     fn with_modern_request_metadata(params: Option<Value>, version: &str) -> Result<Value> {
@@ -486,8 +681,8 @@ impl McpProtocolClient {
             let probe_timeout_ms = timeout_ms.min(MODERN_DISCOVERY_PROBE_TIMEOUT_MS);
             match self.discover_modern(probe_timeout_ms).await {
                 Ok(result) => return Ok(result),
-                Err(error) if Self::is_recognized_modern_error(&error) => return Err(error),
-                Err(error) => {
+                Err(ModernDiscoveryError::Pinned(error)) => return Err(error),
+                Err(ModernDiscoveryError::Fallback(error)) => {
                     debug!(
                         "MCP server did not complete modern discovery; falling back to legacy initialization: {}",
                         error
@@ -499,7 +694,10 @@ impl McpProtocolClient {
         self.initialize_legacy(timeout_ms).await
     }
 
-    async fn discover_modern(&self, timeout_ms: u64) -> Result<McpInitializeResult> {
+    async fn discover_modern(
+        &self,
+        timeout_ms: u64,
+    ) -> std::result::Result<McpInitializeResult, ModernDiscoveryError> {
         let response = self
             .send_request_using(
                 "server/discover",
@@ -510,15 +708,32 @@ impl McpProtocolClient {
                 },
                 Vec::new(),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if Self::is_recognized_modern_error(&error) {
+                    ModernDiscoveryError::Pinned(error)
+                } else {
+                    ModernDiscoveryError::Fallback(error)
+                }
+            })?;
+
+        // A successful `server/discover` response pins the server to the
+        // modern era. Any malformed or incompatible result must surface as a
+        // protocol error rather than being retried as legacy initialization.
+        *self.protocol_mode.write().await = ProtocolMode::Modern {
+            version: LATEST_PROTOCOL_VERSION.to_string(),
+        };
 
         let result: McpDiscoverResult = serde_json::from_value(
             response
                 .result
-                .ok_or_else(|| McpError::Protocol("Missing discovery result".to_string()))?,
-        )?;
+                .ok_or_else(|| McpError::Protocol("Missing discovery result".to_string()))
+                .map_err(ModernDiscoveryError::Pinned)?,
+        )
+        .map_err(McpError::from)
+        .map_err(ModernDiscoveryError::Pinned)?;
 
-        Self::validate_modern_discovery(&result)?;
+        Self::validate_modern_discovery(&result).map_err(ModernDiscoveryError::Pinned)?;
 
         let server_info = result.server_info().unwrap_or_else(|| Implementation {
             name: "unnamed-mcp-server".to_string(),
@@ -535,16 +750,12 @@ impl McpProtocolClient {
             server_info,
             instructions: result.instructions,
         };
-        *self.protocol_mode.write().await = ProtocolMode::Modern {
-            version: LATEST_PROTOCOL_VERSION.to_string(),
-        };
+        self.modern_tool_list_changes
+            .store(supports_tool_list_changes, Ordering::SeqCst);
         if supports_tool_list_changes {
-            if let Err(error) = self.start_tool_change_subscription().await {
-                warn!(
-                    "MCP server advertised tool-list changes but Bamboo could not open subscriptions/listen: {}",
-                    error
-                );
-            }
+            self.start_tool_change_subscription(timeout_ms)
+                .await
+                .map_err(ModernDiscoveryError::Pinned)?;
         }
         Ok(normalized)
     }
@@ -566,10 +777,18 @@ impl McpProtocolClient {
         Ok(())
     }
 
-    async fn start_tool_change_subscription(&self) -> Result<()> {
-        let mut subscription_id = self.tool_subscription_id.lock().await;
-        if subscription_id.is_some() {
-            return Ok(());
+    async fn start_tool_change_subscription(&self, timeout_ms: u64) -> Result<()> {
+        {
+            let subscription = self.tool_subscription.lock().await;
+            if subscription.id.is_some() {
+                return if subscription.acknowledged {
+                    Ok(())
+                } else {
+                    Err(McpError::Protocol(
+                        "MCP tool-change subscription acknowledgment is still pending".to_string(),
+                    ))
+                };
+            }
         }
 
         let version = match self.protocol_mode.read().await.clone() {
@@ -581,6 +800,13 @@ impl McpProtocolClient {
             }
         };
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        {
+            let mut subscription = self.tool_subscription.lock().await;
+            subscription.id = Some(id);
+            subscription.acknowledged = false;
+            subscription.ack_sender = Some(ack_tx);
+        }
         let params = Self::with_modern_request_metadata(
             Some(serde_json::json!({
                 "notifications": {
@@ -601,29 +827,60 @@ impl McpProtocolClient {
             .await
             .insert(id, PendingRequest { sender: tx });
 
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
         let transport = self.transport.read().await;
-        let send_result = transport
-            .send_with_metadata(
+        let send_result = tokio::time::timeout_at(
+            deadline,
+            transport.send_with_metadata(
                 request_json,
                 McpTransportMetadata {
+                    request_id: Some(id),
                     protocol_version: Some(version),
                     modern: true,
                     method: "subscriptions/listen".to_string(),
                     name: None,
                     tool_parameter_headers: Vec::new(),
                 },
-            )
-            .await;
+            ),
+        )
+        .await;
         drop(transport);
-        if let Err(error) = send_result {
-            self.pending_requests.write().await.remove(&id);
-            return Err(error);
+        match send_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.pending_requests.write().await.remove(&id);
+                let mut subscription = self.tool_subscription.lock().await;
+                if subscription.id == Some(id) {
+                    *subscription = ToolSubscriptionState::default();
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                let error = McpError::Timeout(format!(
+                    "MCP subscriptions/listen send timed out after {timeout_ms}ms"
+                ));
+                self.cancel_tool_subscription(id, "Subscription send timed out")
+                    .await;
+                return Err(error);
+            }
         }
 
-        // A graceful server-side close eventually resolves this request. It is
-        // not an operation result the manager needs to await.
+        // A graceful server-side close eventually resolves this request.
+        // Clear the active state so the next health probe can reopen it.
+        let subscription = self.tool_subscription.clone();
         tokio::spawn(async move {
-            match rx.await {
+            let result = rx.await;
+            let mut state = subscription.lock().await;
+            if state.id == Some(id) {
+                if let Some(sender) = state.ack_sender.take() {
+                    let _ = sender.send(Err(McpError::Protocol(
+                        "MCP subscriptions/listen ended before acknowledgment".to_string(),
+                    )));
+                }
+                *state = ToolSubscriptionState::default();
+            }
+            drop(state);
+            match result {
                 Ok(Ok(response)) if response.error.is_some() => {
                     warn!(
                         "MCP subscriptions/listen closed with an error: {:?}",
@@ -636,8 +893,47 @@ impl McpProtocolClient {
                 _ => {}
             }
         });
-        *subscription_id = Some(id);
-        Ok(())
+
+        let acknowledgment = tokio::time::timeout_at(deadline, ack_rx).await;
+        let error = match acknowledgment {
+            Ok(Ok(Ok(()))) => {
+                let subscription = self.tool_subscription.lock().await;
+                if subscription.id == Some(id) && subscription.acknowledged {
+                    return Ok(());
+                }
+                McpError::Protocol(
+                    "MCP subscriptions/listen closed during acknowledgment".to_string(),
+                )
+            }
+            Ok(Ok(Err(error))) => error,
+            Ok(Err(_)) => McpError::Disconnected,
+            Err(_) => McpError::Timeout(format!(
+                "MCP subscriptions/listen acknowledgment timed out after {timeout_ms}ms"
+            )),
+        };
+        self.cancel_tool_subscription(id, "Subscription acknowledgment failed")
+            .await;
+        Err(error)
+    }
+
+    async fn cancel_tool_subscription(&self, id: u64, reason: &str) {
+        self.pending_requests.write().await.remove(&id);
+        let mut subscription = self.tool_subscription.lock().await;
+        if subscription.id == Some(id) {
+            if let Some(sender) = subscription.ack_sender.take() {
+                let _ = sender.send(Err(McpError::Protocol(reason.to_string())));
+            }
+            *subscription = ToolSubscriptionState::default();
+        }
+        drop(subscription);
+
+        let transport = self.transport.read().await;
+        if let Err(error) = transport.cancel_request(id, reason).await {
+            warn!(
+                "Failed to cancel MCP subscriptions/listen (id={}): {}",
+                id, error
+            );
+        }
     }
 
     async fn initialize_legacy(&self, timeout_ms: u64) -> Result<McpInitializeResult> {
@@ -682,6 +978,7 @@ impl McpProtocolClient {
             .send_with_metadata(
                 serde_json::to_string(&initialized)?,
                 McpTransportMetadata {
+                    request_id: None,
                     protocol_version: Some(result.protocol_version.clone()),
                     modern: false,
                     method: initialized.method.clone(),
@@ -695,6 +992,7 @@ impl McpProtocolClient {
         *self.protocol_mode.write().await = ProtocolMode::Legacy {
             version: result.protocol_version.clone(),
         };
+        self.modern_tool_list_changes.store(false, Ordering::SeqCst);
 
         Ok(result)
     }
@@ -767,6 +1065,16 @@ impl McpProtocolClient {
         let mut tools = Vec::with_capacity(tool_infos.len());
 
         for tool in tool_infos {
+            let output_schema = match tool.output_schema {
+                Some(schema) if modern && !schema.is_object() => {
+                    warn!(
+                        "Ignoring modern MCP tool '{}' because outputSchema must be a JSON Schema object",
+                        tool.name
+                    );
+                    continue;
+                }
+                schema => schema,
+            };
             let parameters = match tool.input_schema {
                 Some(parameters)
                     if !modern
@@ -804,6 +1112,7 @@ impl McpProtocolClient {
                 name: tool.name,
                 description: tool.description,
                 parameters,
+                output_schema,
             });
         }
         *self.tool_header_specs.write().await = header_specs;
@@ -859,6 +1168,7 @@ impl McpProtocolClient {
         Ok(McpCallResult {
             content: result.content,
             is_error: result.is_error,
+            structured_content: result.structured_content,
         })
     }
 
@@ -1079,6 +1389,16 @@ impl McpProtocolClient {
                     .ok_or_else(|| McpError::Protocol("Missing discovery result".to_string()))?,
             )?;
             Self::validate_modern_discovery(&result)?;
+            let supports_tool_list_changes = result
+                .capabilities
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.list_changed);
+            self.modern_tool_list_changes
+                .store(supports_tool_list_changes, Ordering::SeqCst);
+            if supports_tool_list_changes {
+                self.start_tool_change_subscription(timeout_ms).await?;
+            }
         } else {
             self.send_request("ping", None, timeout_ms).await?;
         }
@@ -1285,6 +1605,21 @@ mod tests {
                 "cacheScope": "private"
             })
         }
+
+        fn subscription_ack(id: u64, tools_list_changed: bool) -> Option<Value> {
+            Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": SUBSCRIPTION_ACK_METHOD,
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/subscriptionId": id
+                    },
+                    "notifications": {
+                        "toolsListChanged": tools_list_changed
+                    }
+                }
+            }))
+        }
     }
 
     #[async_trait]
@@ -1318,7 +1653,9 @@ mod tests {
                     McpError::Transport("script has no response for request".to_string())
                 })?;
                 if let Some(mut response) = response {
-                    response["id"] = id;
+                    if response.get("method").is_none() {
+                        response["id"] = id;
+                    }
                     self.response_tx
                         .send(response.to_string())
                         .await
@@ -1644,7 +1981,7 @@ mod tests {
     async fn modern_tool_change_capability_opens_subscription_stream() {
         let (transport, captured) = ScriptedTransport::new(vec![
             ScriptedTransport::success(ScriptedTransport::discover_result(true)),
-            None,
+            ScriptedTransport::subscription_ack(2, true),
         ]);
         let mut client = McpProtocolClient::new(Box::new(transport));
         client.connect().await.expect("connect");
@@ -1661,12 +1998,158 @@ mod tests {
             captured[1].0["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
             LATEST_PROTOCOL_VERSION
         );
-        assert_eq!(*client.tool_subscription_id.lock().await, Some(2));
+        let subscription = client.tool_subscription.lock().await;
+        assert_eq!(subscription.id, Some(2));
+        assert!(subscription.acknowledged);
+        drop(subscription);
         assert!(client.pending_requests.read().await.contains_key(&2));
         drop(captured);
 
         client.disconnect().await.expect("disconnect");
         assert!(client.pending_requests.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscription_is_not_active_until_requested_filter_is_acknowledged() {
+        let (transport, captured) = ScriptedTransport::new(vec![
+            ScriptedTransport::success(ScriptedTransport::discover_result(true)),
+            ScriptedTransport::subscription_ack(2, false),
+        ]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+
+        let error = client
+            .initialize(1000)
+            .await
+            .expect_err("rejected subscription filter must fail initialization");
+        assert!(error.to_string().contains("toolsListChanged"));
+        assert!(client.tool_subscription.lock().await.id.is_none());
+        assert!(client.pending_requests.read().await.is_empty());
+
+        let captured = captured.lock().await;
+        assert_eq!(captured[0].0["method"], "server/discover");
+        assert_eq!(captured[1].0["method"], "subscriptions/listen");
+        assert_eq!(captured[2].0["method"], "notifications/cancelled");
+        assert_eq!(captured[2].0["params"]["requestId"], 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_modern_discovery_never_downgrades_to_legacy() {
+        let (transport, captured) = ScriptedTransport::new(vec![
+            ScriptedTransport::success(serde_json::json!({
+                "resultType": "complete",
+                "supportedVersions": [LATEST_PROTOCOL_VERSION],
+                "capabilities": {},
+                "ttlMs": 1000
+            })),
+            ScriptedTransport::success(serde_json::json!({
+                "protocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "serverInfo": {"name": "must-not-run", "version": "1"}
+            })),
+        ]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+
+        let error = client
+            .initialize(1000)
+            .await
+            .expect_err("malformed modern result must surface");
+        assert!(error.to_string().contains("cacheScope"));
+        assert_eq!(
+            captured.lock().await.len(),
+            1,
+            "successful server/discover response must pin the modern era"
+        );
+        assert!(matches!(
+            &*client.protocol_mode.read().await,
+            ProtocolMode::Modern { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn modern_tool_change_notifications_require_acknowledged_matching_subscription() {
+        use std::collections::HashMap;
+
+        let pending: RwLock<HashMap<u64, PendingRequest>> = RwLock::new(HashMap::new());
+        let (notification_tx, mut notification_rx) = mpsc::channel(4);
+        let queue_full = AtomicBool::new(false);
+        let subscription = Mutex::new(ToolSubscriptionState {
+            id: Some(7),
+            acknowledged: true,
+            ack_sender: None,
+        });
+        let modern_tool_list_changes = AtomicBool::new(true);
+
+        let mismatched = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":8}}}"#;
+        McpProtocolClient::handle_message(
+            mismatched,
+            &pending,
+            &notification_tx,
+            &queue_full,
+            &subscription,
+            &modern_tool_list_changes,
+        )
+        .await
+        .expect("ignore mismatched notification");
+        assert!(notification_rx.try_recv().is_err());
+
+        let matched = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":7}}}"#;
+        McpProtocolClient::handle_message(
+            matched,
+            &pending,
+            &notification_tx,
+            &queue_full,
+            &subscription,
+            &modern_tool_list_changes,
+        )
+        .await
+        .expect("accept correlated notification");
+        assert_eq!(
+            notification_rx
+                .try_recv()
+                .expect("correlated notification")
+                .method,
+            "notifications/tools/list_changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_reopens_a_closed_tool_change_subscription() {
+        let (transport, captured) = ScriptedTransport::new(vec![
+            ScriptedTransport::success(ScriptedTransport::discover_result(true)),
+            ScriptedTransport::subscription_ack(2, true),
+            ScriptedTransport::success(ScriptedTransport::discover_result(true)),
+            ScriptedTransport::subscription_ack(4, true),
+        ]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+        client.initialize(1000).await.expect("initial subscription");
+
+        let close = r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#;
+        McpProtocolClient::handle_message(
+            close,
+            &client.pending_requests,
+            &client.notification_tx,
+            &client.notification_queue_full,
+            &client.tool_subscription,
+            &client.modern_tool_list_changes,
+        )
+        .await
+        .expect("route graceful close");
+        tokio::task::yield_now().await;
+        assert!(client.tool_subscription.lock().await.id.is_none());
+
+        client.ping(1000).await.expect("health probe resubscribes");
+        let subscription = client.tool_subscription.lock().await;
+        assert_eq!(subscription.id, Some(4));
+        assert!(subscription.acknowledged);
+        drop(subscription);
+
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 4);
+        assert_eq!(captured[2].0["method"], "server/discover");
+        assert_eq!(captured[3].0["method"], "subscriptions/listen");
     }
 
     #[tokio::test]
@@ -1797,6 +2280,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn modern_tool_output_schema_and_all_content_blocks_are_preserved() {
+        let (transport, _) = ScriptedTransport::new(vec![
+            ScriptedTransport::success(ScriptedTransport::discover_result(false)),
+            ScriptedTransport::success(serde_json::json!({
+                "resultType": "complete",
+                "tools": [{
+                    "name": "report",
+                    "description": "Return a report",
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"count": {"type": "integer"}}
+                    }
+                }],
+                "ttlMs": 1000,
+                "cacheScope": "private"
+            })),
+            ScriptedTransport::success(serde_json::json!({
+                "resultType": "complete",
+                "content": [
+                    {
+                        "type": "audio",
+                        "data": "UklGRg==",
+                        "mimeType": "audio/wav"
+                    },
+                    {
+                        "type": "resource_link",
+                        "uri": "file:///report.json",
+                        "name": "report",
+                        "mimeType": "application/json",
+                        "size": 42
+                    }
+                ],
+                "structuredContent": null
+            })),
+        ]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+        client.initialize(1000).await.expect("modern discovery");
+
+        let tools = client.list_tools(1000).await.expect("tools/list");
+        assert_eq!(
+            tools[0].output_schema,
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {"count": {"type": "integer"}}
+            }))
+        );
+
+        let result = client
+            .call_tool("report", serde_json::json!({}), 1000)
+            .await
+            .expect("tools/call");
+        assert!(matches!(
+            result.content[0],
+            crate::types::McpContentItem::Audio { .. }
+        ));
+        assert!(matches!(
+            result.content[1],
+            crate::types::McpContentItem::ResourceLink { .. }
+        ));
+        assert_eq!(
+            result.structured_content,
+            crate::types::McpStructuredContent::Null
+        );
+    }
+
     #[test]
     fn invalid_tool_header_annotations_are_rejected() {
         let duplicate = serde_json::json!({
@@ -1849,8 +2400,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_request_timeout() {
-        let transport = Box::new(MockTransport::new()); // Won't respond
-        let client = McpProtocolClient::new(transport);
+        let transport = MockTransport::new(); // Won't respond
+        let messages = transport.messages_sent.clone();
+        let client = McpProtocolClient::new(Box::new(transport));
 
         let result = client.send_request("test", None, 100).await;
         assert!(result.is_err());
@@ -1858,6 +2410,11 @@ mod tests {
             McpError::Timeout(_) => {}
             _ => panic!("Expected Timeout error"),
         }
+        let sent = messages.read().await;
+        assert_eq!(sent.len(), 2, "request plus cancellation notification");
+        let cancellation: Value = serde_json::from_str(&sent[1]).expect("cancellation JSON");
+        assert_eq!(cancellation["method"], "notifications/cancelled");
+        assert_eq!(cancellation["params"]["requestId"], 1);
     }
 
     #[tokio::test]
@@ -1921,6 +2478,8 @@ mod tests {
             .expect("first notification fills the cap-1 queue");
 
         let queue_full = AtomicBool::new(false);
+        let subscription = Mutex::new(ToolSubscriptionState::default());
+        let modern_tool_list_changes = AtomicBool::new(false);
 
         // A pending request awaiting its JSON-RPC response.
         let pending: RwLock<HashMap<u64, PendingRequest>> = RwLock::new(HashMap::new());
@@ -1936,7 +2495,14 @@ mod tests {
         let notif_json = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            McpProtocolClient::handle_message(notif_json, &pending, &notif_tx, &queue_full),
+            McpProtocolClient::handle_message(
+                notif_json,
+                &pending,
+                &notif_tx,
+                &queue_full,
+                &subscription,
+                &modern_tool_list_changes,
+            ),
         )
         .await
         .expect("handle_message must not block on a full notification queue")
@@ -1952,9 +2518,16 @@ mod tests {
         // 2) A JSON-RPC response must still be dispatched to its pending request,
         //    even though the notification queue is saturated.
         let resp_json = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
-        McpProtocolClient::handle_message(resp_json, &pending, &notif_tx, &queue_full)
-            .await
-            .expect("handle_message returns Ok");
+        McpProtocolClient::handle_message(
+            resp_json,
+            &pending,
+            &notif_tx,
+            &queue_full,
+            &subscription,
+            &modern_tool_list_changes,
+        )
+        .await
+        .expect("handle_message returns Ok");
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx)
             .await
             .expect("response must be delivered despite a full notification queue");
@@ -2021,13 +2594,22 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<JsonRpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let pending: RwLock<HashMap<u64, PendingRequest>> = RwLock::new(HashMap::new());
         let queue_full = AtomicBool::new(false);
+        let subscription = Mutex::new(ToolSubscriptionState::default());
+        let modern_tool_list_changes = AtomicBool::new(false);
 
         // Fill exactly to capacity via the production send path — all accepted.
         for i in 0..NOTIFICATION_CHANNEL_CAPACITY {
             let json = format!(r#"{{"jsonrpc":"2.0","method":"notifications/message/{i}"}}"#);
-            McpProtocolClient::handle_message(&json, &pending, &tx, &queue_full)
-                .await
-                .expect("handle_message returns Ok");
+            McpProtocolClient::handle_message(
+                &json,
+                &pending,
+                &tx,
+                &queue_full,
+                &subscription,
+                &modern_tool_list_changes,
+            )
+            .await
+            .expect("handle_message returns Ok");
         }
         assert!(
             !queue_full.load(Ordering::Relaxed),
@@ -2040,7 +2622,14 @@ mod tests {
             let json = format!(r#"{{"jsonrpc":"2.0","method":"notifications/overflow/{i}"}}"#);
             tokio::time::timeout(
                 std::time::Duration::from_millis(500),
-                McpProtocolClient::handle_message(&json, &pending, &tx, &queue_full),
+                McpProtocolClient::handle_message(
+                    &json,
+                    &pending,
+                    &tx,
+                    &queue_full,
+                    &subscription,
+                    &modern_tool_list_changes,
+                ),
             )
             .await
             .expect("over-capacity send must not block")

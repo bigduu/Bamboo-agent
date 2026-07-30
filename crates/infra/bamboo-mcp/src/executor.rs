@@ -9,7 +9,7 @@ use tracing::{debug, error, warn};
 use crate::error::McpError;
 use crate::manager::McpServerManager;
 use crate::tool_index::ToolIndex;
-use crate::types::McpContentItem;
+use crate::types::{McpContentItem, McpStructuredContent};
 
 /// MCP tool executor that delegates to the MCP server manager
 pub struct McpToolExecutor {
@@ -56,6 +56,21 @@ impl McpToolExecutor {
                     });
                     parts.push(format!("[image returned: {mime_type}]"));
                 }
+                McpContentItem::Audio { mime_type, .. } => {
+                    parts.push(format!("[audio returned: {mime_type}]"));
+                }
+                McpContentItem::ResourceLink {
+                    uri,
+                    name,
+                    description,
+                    ..
+                } => {
+                    if let Some(description) = description {
+                        parts.push(format!("[Resource link {name} ({uri})]: {description}"));
+                    } else {
+                        parts.push(format!("[Resource link {name} ({uri})]"));
+                    }
+                }
                 McpContentItem::Resource { resource } => {
                     if let Some(text) = &resource.text {
                         parts.push(format!("[Resource {}]: {}", resource.uri, text));
@@ -66,6 +81,26 @@ impl McpToolExecutor {
             }
         }
         (parts.join("\n"), images)
+    }
+
+    fn append_structured_content(
+        mut text: String,
+        structured_content: &McpStructuredContent,
+    ) -> String {
+        let Some(value) = structured_content.to_json_value() else {
+            return text;
+        };
+        let encoded = serde_json::to_string(&value)
+            .unwrap_or_else(|error| format!("[unserializable structured content: {error}]"));
+        if text.trim() == encoded {
+            return text;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+            text.push_str("[structured content]: ");
+        }
+        text.push_str(&encoded);
+        text
     }
 }
 
@@ -113,6 +148,7 @@ impl ToolExecutor for McpToolExecutor {
         {
             Ok(result) => {
                 let (text, images) = Self::format_result_content(&result.content);
+                let text = Self::append_structured_content(text, &result.structured_content);
                 if result.is_error {
                     // Errors are textual; don't forward images.
                     Ok(ToolResult {
@@ -551,6 +587,30 @@ mod tests {
         assert!(text.contains("Result:"));
         assert!(text.contains("[image returned:"));
         assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn structured_content_is_preserved_without_duplicating_text_fallback() {
+        let structured = McpStructuredContent::Value(serde_json::json!({
+            "temperature": 22.5,
+            "condition": "clear"
+        }));
+        let encoded = r#"{"condition":"clear","temperature":22.5}"#;
+        assert_eq!(
+            McpToolExecutor::append_structured_content(String::new(), &structured),
+            encoded
+        );
+        assert_eq!(
+            McpToolExecutor::append_structured_content(encoded.to_string(), &structured),
+            encoded
+        );
+        assert_eq!(
+            McpToolExecutor::append_structured_content(
+                "Weather result".to_string(),
+                &McpStructuredContent::Null,
+            ),
+            "Weather result\n[structured content]: null"
+        );
     }
 
     #[tokio::test]
