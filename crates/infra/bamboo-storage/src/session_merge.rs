@@ -342,6 +342,33 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         self.merge_save_runtime(session).await
     }
 
+    async fn save_runtime_control_plane(&self, session: &mut Session) -> std::io::Result<()> {
+        self.save_runtime_only(session).await
+    }
+
+    async fn load_runtime_control_plane(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.storage.load_runtime_control_plane(session_id).await
+    }
+
+    async fn update_task_list_control_plane(
+        &self,
+        session_id: &str,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
+            return Ok(false);
+        };
+        latest.set_task_list(task_list.clone());
+        latest.set_task_list_version_meta(version.to_string());
+        self.storage.save_runtime_state(&latest).await?;
+        Ok(true)
+    }
+
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         LockedSessionStore::checkpoint_runtime_session(self, session).await
     }
@@ -471,6 +498,39 @@ mod tests {
     use super::*;
     use crate::v2::SessionStoreV2;
     use bamboo_domain::session::types::Session;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingControlPlaneStorage {
+        inner: Arc<SessionStoreV2>,
+        control_plane_loads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CountingControlPlaneStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(session_id).await
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(session_id).await
+        }
+
+        async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_runtime_state(session).await
+        }
+
+        async fn load_runtime_control_plane(
+            &self,
+            session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            self.control_plane_loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_runtime_control_plane(session_id).await
+        }
+    }
 
     async fn make_storage() -> (tempfile::TempDir, Arc<dyn Storage>) {
         let temp = tempfile::tempdir().unwrap();
@@ -1169,6 +1229,148 @@ mod tests {
         assert_eq!(after.metadata_version, 5);
         assert_eq!(after.messages.len(), 1);
         assert_eq!(after.messages[0].content, "keep me");
+    }
+
+    #[tokio::test]
+    async fn runtime_control_plane_port_uses_sidecar_without_rewriting_messages() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-control-plane";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(Message::user("durable transcript"));
+        storage.save_session(&durable).await.unwrap();
+
+        let mut runtime = durable.clone();
+        runtime.model = "updated-control-plane-model".to_string();
+        runtime.add_message(Message::assistant("uncheckpointed runtime message", None));
+        RuntimeSessionPersistence::save_runtime_control_plane(&store, &mut runtime)
+            .await
+            .unwrap();
+
+        let control_plane =
+            RuntimeSessionPersistence::load_runtime_control_plane(&store, session_id)
+                .await
+                .unwrap()
+                .expect("control-plane exists");
+        assert!(
+            control_plane.messages.is_empty(),
+            "LockedSessionStore must expose its message-free sidecar"
+        );
+        assert_eq!(control_plane.model, "updated-control-plane-model");
+
+        let reloaded = storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .expect("session exists");
+        assert_eq!(reloaded.model, "updated-control-plane-model");
+        assert_eq!(
+            reloaded.messages.len(),
+            1,
+            "control-plane save must not write the uncheckpointed message"
+        );
+        assert_eq!(reloaded.messages[0].content, "durable transcript");
+    }
+
+    #[tokio::test]
+    async fn atomic_task_patch_loads_inside_lock_and_preserves_interleaved_runtime_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("storage init"),
+        );
+        let session_id = "atomic-task-patch";
+        inner
+            .save_session(&fresh(session_id))
+            .await
+            .expect("seed session");
+
+        let counted = Arc::new(CountingControlPlaneStorage {
+            inner: inner.clone(),
+            control_plane_loads: AtomicUsize::new(0),
+        });
+        let storage: Arc<dyn Storage> = counted.clone();
+        let store = Arc::new(LockedSessionStore::new(storage));
+        let guard = store.acquire_lock(session_id).await;
+        let now = chrono::Utc::now();
+        let task_list = bamboo_domain::TaskList {
+            session_id: session_id.to_string(),
+            title: "Atomic Task patch".to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let patch_store = store.clone();
+        let patch = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            RuntimeSessionPersistence::update_task_list_control_plane(
+                patch_store.as_ref(),
+                session_id,
+                &task_list,
+                "9",
+            )
+            .await
+        });
+        started_rx.await.expect("patch task started");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counted.control_plane_loads.load(Ordering::SeqCst),
+            0,
+            "Task patch must acquire the session lock before loading its snapshot"
+        );
+
+        // Publish a newer unrelated runtime transition while the Task patch is
+        // queued on the same session lock. Once the guard releases, the patch
+        // must load this latest snapshot and change only Task-owned fields.
+        let mut latest = inner
+            .load_runtime_control_plane(session_id)
+            .await
+            .expect("load latest control-plane")
+            .expect("control-plane exists");
+        latest.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("latest-run"));
+        latest
+            .metadata
+            .insert("concurrent.runtime".to_string(), "preserve".to_string());
+        inner
+            .save_runtime_state(&latest)
+            .await
+            .expect("publish concurrent runtime transition");
+        drop(guard);
+
+        assert!(
+            patch.await.expect("patch join").expect("patch succeeds"),
+            "existing root must be patched"
+        );
+        assert_eq!(counted.control_plane_loads.load(Ordering::SeqCst), 1);
+        let reloaded = inner
+            .load_session(session_id)
+            .await
+            .expect("reload")
+            .expect("session exists");
+        assert_eq!(
+            reloaded
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.run_id.as_str()),
+            Some("latest-run")
+        );
+        assert_eq!(
+            reloaded
+                .metadata
+                .get("concurrent.runtime")
+                .map(String::as_str),
+            Some("preserve")
+        );
+        assert_eq!(reloaded.task_list_version_meta().as_deref(), Some("9"));
+        assert_eq!(
+            reloaded.task_list.as_ref().map(|list| list.title.as_str()),
+            Some("Atomic Task patch")
+        );
     }
 
     // ── LockedSessionStore tests ────────────────────────────────────
