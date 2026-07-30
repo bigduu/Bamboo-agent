@@ -193,7 +193,6 @@ reqwest-retry = "0.9"
 
 # Encryption
 aes-gcm = "0.11"
-base64 = "0.22"
 sha2 = "0.11"
 hex = "0.4"
 rand = "0.10"
