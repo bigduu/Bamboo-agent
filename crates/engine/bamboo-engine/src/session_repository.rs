@@ -279,39 +279,39 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     }
 
     async fn save_runtime_control_plane(&self, session: &mut Session) -> std::io::Result<()> {
-        let result = self.persistence.save_runtime_only(session).await;
+        self.persistence
+            .save_runtime_only_and_publish(session, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("save", &saved.id);
 
-        #[cfg(test)]
-        self.run_post_durable_hook("save", &session.id);
-
-        // A control-plane snapshot may intentionally carry no messages (for
-        // example, child Task synchronization loads the root's runtime
-        // sidecar). Publish its fresh runtime fields without replacing a
-        // cache-resident transcript with that empty snapshot. SessionInbox
-        // admission is coupled to transcript persistence and is therefore
-        // preserved alongside the cached messages, matching the V2 sidecar
-        // overlay contract.
-        if let Some(cached) = self.cache.get(&session.id) {
-            let mut cached = cached.write();
-            let messages = cached.messages.clone();
-            let admission = cached
-                .runtime_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.session_inbox_admission.clone());
-            let mut refreshed = session.clone();
-            refreshed.messages = messages;
-            if let Some(admission) = admission {
-                refreshed
-                    .runtime_metadata
-                    .get_or_insert_with(Default::default)
-                    .session_inbox_admission = Some(admission);
-            } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
-                metadata.session_inbox_admission = None;
-            }
-            *cached = refreshed;
-        }
-
-        result
+                // A control-plane snapshot may intentionally carry no messages
+                // (for example, child Task synchronization loads the root's
+                // runtime sidecar). Publish its fresh runtime fields without
+                // replacing a cache-resident transcript with that empty
+                // snapshot. SessionInbox admission is coupled to transcript
+                // persistence and is therefore preserved alongside the cached
+                // messages, matching the V2 sidecar overlay contract.
+                if let Some(cached) = self.cache.get(&saved.id) {
+                    let mut cached = cached.write();
+                    let messages = cached.messages.clone();
+                    let admission = cached
+                        .runtime_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.session_inbox_admission.clone());
+                    let mut refreshed = saved.clone();
+                    refreshed.messages = messages;
+                    if let Some(admission) = admission {
+                        refreshed
+                            .runtime_metadata
+                            .get_or_insert_with(Default::default)
+                            .session_inbox_admission = Some(admission);
+                    } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
+                        metadata.session_inbox_admission = None;
+                    }
+                    *cached = refreshed;
+                }
+            })
+            .await
     }
 
     async fn load_runtime_control_plane(
@@ -331,30 +331,23 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         task_list: &bamboo_domain::TaskList,
         version: &str,
     ) -> std::io::Result<bool> {
-        let updated = bamboo_domain::RuntimeSessionPersistence::update_task_list_control_plane(
-            self.persistence.as_ref(),
-            session_id,
-            task_list,
-            version,
-        )
-        .await?;
-        if !updated {
-            return Ok(false);
-        }
+        self.persistence
+            .update_task_list_control_plane_and_publish(session_id, task_list, version, |_| {
+                #[cfg(test)]
+                self.run_post_durable_hook("task", version);
 
-        #[cfg(test)]
-        self.run_post_durable_hook("task", version);
-
-        // The durable transaction changed only Task-owned fields. Mirror that
-        // same narrow patch into the cache so a concurrent round/status/child
-        // transition already present in memory cannot be replaced by a stale
-        // whole-control-plane snapshot.
-        if let Some(cached) = self.cache.get(session_id) {
-            let mut cached = cached.write();
-            cached.set_task_list(task_list.clone());
-            cached.set_task_list_version_meta(version.to_string());
-        }
-        Ok(true)
+                // The durable transaction changed only Task-owned fields.
+                // Mirror that same narrow patch into the cache so a
+                // concurrent round/status/child transition already present
+                // in memory cannot be replaced by a stale whole-control-
+                // plane snapshot.
+                if let Some(cached) = self.cache.get(session_id) {
+                    let mut cached = cached.write();
+                    cached.set_task_list(task_list.clone());
+                    cached.set_task_list_version_meta(version.to_string());
+                }
+            })
+            .await
     }
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {

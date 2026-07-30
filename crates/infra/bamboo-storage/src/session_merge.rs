@@ -151,6 +151,26 @@ impl LockedSessionStore {
     /// Callers MUST NOT use this when they have appended messages: the in-memory
     /// `messages` are ignored by the sidecar and would not be persisted.
     pub async fn save_runtime_only(&self, session: &mut Session) -> std::io::Result<()> {
+        self.save_runtime_only_and_publish(session, |_| {}).await
+    }
+
+    /// Save the runtime control-plane and synchronously publish the committed
+    /// snapshot before releasing this session's serialization lock.
+    ///
+    /// `publish` must remain a short, non-blocking operation. Its synchronous
+    /// shape intentionally prevents callers from holding an in-memory cache
+    /// guard across an await. The callback also runs when the durable save
+    /// fails, preserving [`RuntimeSessionPersistence::save_runtime_control_plane`]
+    /// implementations that publish current runtime authorization state while
+    /// still returning the storage error.
+    pub async fn save_runtime_only_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         if let Ok(Some(latest)) = self.storage.load_runtime_control_plane(&session.id).await {
             apply_authoritative_metadata(session, &latest);
@@ -158,7 +178,36 @@ impl LockedSessionStore {
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
             adopt_disk_bypass_permissions(session, &latest);
         }
-        self.storage.save_runtime_state(session).await
+        let result = self.storage.save_runtime_state(session).await;
+        publish(session);
+        result
+    }
+
+    /// Atomically patch Task-owned control-plane fields and publish the saved
+    /// value before releasing this session's serialization lock.
+    ///
+    /// This couples durable commit order to cache publication order for
+    /// repository callers. The synchronous callback may take a cache guard but
+    /// cannot hold one across an await.
+    pub async fn update_task_list_control_plane_and_publish<F>(
+        &self,
+        session_id: &str,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+        publish: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
+            return Ok(false);
+        };
+        latest.set_task_list(task_list.clone());
+        latest.set_task_list_version_meta(version.to_string());
+        self.storage.save_runtime_state(&latest).await?;
+        publish(&latest);
+        Ok(true)
     }
 
     /// Authoritative metadata commit.
@@ -359,14 +408,8 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         task_list: &bamboo_domain::TaskList,
         version: &str,
     ) -> std::io::Result<bool> {
-        let _guard = self.acquire_lock(session_id).await;
-        let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
-            return Ok(false);
-        };
-        latest.set_task_list(task_list.clone());
-        latest.set_task_list_version_meta(version.to_string());
-        self.storage.save_runtime_state(&latest).await?;
-        Ok(true)
+        self.update_task_list_control_plane_and_publish(session_id, task_list, version, |_| {})
+            .await
     }
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
