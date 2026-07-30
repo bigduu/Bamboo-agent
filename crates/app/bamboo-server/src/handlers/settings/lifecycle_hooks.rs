@@ -1,9 +1,7 @@
 use actix_web::{web, HttpResponse};
 use bamboo_config::{
-    LifecycleHookHandler, DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
-    DEFAULT_JAVASCRIPT_HOOK_TIMEOUT_MS, DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-    LIFECYCLE_HOOK_EVENT_NAMES, MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
-    MAX_LIFECYCLE_HOOK_TIMEOUT_MS, MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES,
+    lifecycle_script_extension, LifecycleHookHandler, LifecycleScriptRunner,
+    DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS, LIFECYCLE_HOOK_EVENT_NAMES, MAX_LIFECYCLE_HOOK_TIMEOUT_MS,
     MIN_LIFECYCLE_HOOK_TIMEOUT_MS,
 };
 use regex::Regex;
@@ -16,7 +14,7 @@ use crate::{app_state::AppState, error::AppError};
 enum LifecycleHookTestType {
     #[default]
     Command,
-    JavaScript,
+    Script,
 }
 
 /// One lifecycle handler selected in the settings editor for a dry run.
@@ -31,11 +29,11 @@ pub struct LifecycleHookTestRequest {
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
-    source: Option<String>,
+    path: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
-    memory_limit_bytes: Option<usize>,
+    runner: Option<LifecycleScriptRunner>,
 }
 
 /// Execute one command against Bamboo's deterministic synthetic lifecycle
@@ -53,10 +51,9 @@ pub async fn test_lifecycle_hook(
             payload.event
         )));
     }
-    let timeout_ms = payload.timeout_ms.unwrap_or(match payload.hook_type {
-        LifecycleHookTestType::Command => DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-        LifecycleHookTestType::JavaScript => DEFAULT_JAVASCRIPT_HOOK_TIMEOUT_MS,
-    });
+    let timeout_ms = payload
+        .timeout_ms
+        .unwrap_or(DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS);
     if !(MIN_LIFECYCLE_HOOK_TIMEOUT_MS..=MAX_LIFECYCLE_HOOK_TIMEOUT_MS).contains(&timeout_ms) {
         return Err(AppError::BadRequest(format!(
             "timeout_ms must be between {MIN_LIFECYCLE_HOOK_TIMEOUT_MS} and {MAX_LIFECYCLE_HOOK_TIMEOUT_MS}"
@@ -84,24 +81,28 @@ pub async fn test_lifecycle_hook(
             }
             LifecycleHookHandler::command(command, timeout_ms)
         }
-        LifecycleHookTestType::JavaScript => {
-            let source = payload.source.unwrap_or_default();
-            if source.trim().is_empty() {
+        LifecycleHookTestType::Script => {
+            let path = payload.path.unwrap_or_default();
+            let path = path.trim();
+            if path.is_empty() {
                 return Err(AppError::BadRequest(
-                    "JavaScript lifecycle hook source must not be empty".to_string(),
+                    "lifecycle script path must not be empty".to_string(),
                 ));
             }
-            let memory_limit_bytes = payload
-                .memory_limit_bytes
-                .unwrap_or(DEFAULT_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES);
-            if !(MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES..=MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES)
-                .contains(&memory_limit_bytes)
-            {
+            if lifecycle_script_extension(path).is_none() {
+                return Err(AppError::BadRequest(
+                    "lifecycle script path must end in .js, .mjs, .cjs, .py, .sh, .ps1, .bat, or .cmd"
+                        .to_string(),
+                ));
+            }
+            let runner = payload.runner.unwrap_or_default();
+            if !runner.supports_path(path) {
                 return Err(AppError::BadRequest(format!(
-                    "memory_limit_bytes must be between {MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES} and {MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES}"
+                    "lifecycle script runner '{}' is incompatible with path '{path}'",
+                    runner.as_str()
                 )));
             }
-            LifecycleHookHandler::javascript(source, timeout_ms, memory_limit_bytes)
+            LifecycleHookHandler::script(path, runner, timeout_ms)
         }
     };
     let output = bamboo_engine::test_lifecycle_handler(&payload.event, &handler, fallback_cwd)
@@ -178,8 +179,21 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn dry_run_executes_javascript_handler() {
+    async fn dry_run_executes_external_script_handler() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("hook.js"),
+            r#"
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => raw += chunk);
+process.stdin.on("end", () => {
+  const input = JSON.parse(raw);
+  process.stdout.write(JSON.stringify({additional_context: input.tool_name}));
+});
+"#,
+        )
+        .unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let app = test::init_service(
             App::new()
@@ -194,8 +208,9 @@ mod tests {
                 .uri("/hooks/test")
                 .set_json(serde_json::json!({
                     "event": "PreToolUse",
-                    "type": "javascript",
-                    "source": "function hook(input) { return { additional_context: input.tool_name }; }"
+                    "type": "script",
+                    "path": "hook.js",
+                    "runner": "node"
                 }))
                 .to_request(),
         )
@@ -203,7 +218,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = test::read_body_json(response).await;
-        assert_eq!(body["exit_code"], serde_json::Value::Null);
+        assert_eq!(body["exit_code"], 0);
         assert_eq!(body["timed_out"], false);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(body["stdout"].as_str().unwrap()).unwrap()

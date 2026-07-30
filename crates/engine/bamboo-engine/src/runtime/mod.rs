@@ -32,8 +32,8 @@ pub use config::{
 // through `AgentRuntime::execute`.
 pub use execution::runner_state::{AgentRunner, AgentStatus};
 pub use hooks::{
-    test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, JavaScriptHook,
-    LifecycleHookEvent, LifecycleHookTestOutput, ShellCommandHook, ShellHookEvent,
+    test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, LifecycleHookEvent,
+    LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
     ShellHookTestOutput,
 };
 pub use managers::{

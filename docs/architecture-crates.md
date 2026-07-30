@@ -77,8 +77,9 @@ flowchart TD
 - **`bamboo-engine`** (blue) — owns the agent loop **and** the port traits that
   let generic tools reach server runtime state without depending on the server.
 - **`bamboo-hooks`** — owns lifecycle registration, matcher evaluation,
-  deterministic dispatch, and the command/embedded-JavaScript runtimes. The
-  engine owns lifecycle seams and applies returned control or context effects.
+  deterministic dispatch, command execution, and external script runtime
+  selection. The engine owns lifecycle seams and applies returned control or
+  context effects.
 
 ## 2. The port pattern (dependency inversion)
 

@@ -11,8 +11,8 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 
 pub use bamboo_hooks::{
-    test_lifecycle_handler, test_lifecycle_shell_command, HookRunOutcome, JavaScriptHook,
-    LifecycleHookEvent, LifecycleHookTestOutput, ShellCommandHook, ShellHookEvent,
+    test_lifecycle_handler, test_lifecycle_shell_command, HookRunOutcome, LifecycleHookEvent,
+    LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
     ShellHookTestOutput,
 };
 

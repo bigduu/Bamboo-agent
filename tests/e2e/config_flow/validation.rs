@@ -58,18 +58,15 @@ async fn test_validate_lifecycle_hooks_reports_structured_field_errors() {
                     }],
                     "SessionStart": [{
                         "hooks": [{
-                            "type": "javascript",
-                            "source": "   ",
-                            "memory_limit_bytes":
-                                bamboo_config::MIN_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES - 1
+                            "type": "script",
+                            "path": "   "
                         }]
                     }],
                     "Stop": [{
                         "hooks": [{
-                            "type": "javascript",
-                            "source": "function hook() {}",
-                            "memory_limit_bytes":
-                                bamboo_config::MAX_JAVASCRIPT_HOOK_MEMORY_LIMIT_BYTES + 1
+                            "type": "script",
+                            "path": "guard.py",
+                            "runner": "node"
                         }]
                     }]
                 }
@@ -91,9 +88,8 @@ async fn test_validate_lifecycle_hooks_reports_structured_field_errors() {
     assert!(paths.contains(&"lifecycle_hooks.PreToolUse[0].hooks[0].command"));
     assert!(paths.contains(&"lifecycle_hooks.PreToolUse[0].hooks[0].timeout_ms"));
     assert!(paths.contains(&"lifecycle_hooks.SessionEnd[0].hooks[0].timeout_ms"));
-    assert!(paths.contains(&"lifecycle_hooks.SessionStart[0].hooks[0].source"));
-    assert!(paths.contains(&"lifecycle_hooks.SessionStart[0].hooks[0].memory_limit_bytes"));
-    assert!(paths.contains(&"lifecycle_hooks.Stop[0].hooks[0].memory_limit_bytes"));
+    assert!(paths.contains(&"lifecycle_hooks.SessionStart[0].hooks[0].path"));
+    assert!(paths.contains(&"lifecycle_hooks.Stop[0].hooks[0].runner"));
 
     let response = test::call_service(
         &app,
