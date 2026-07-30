@@ -9,7 +9,7 @@ use tracing::{debug, error, warn};
 use crate::error::McpError;
 use crate::manager::McpServerManager;
 use crate::tool_index::ToolIndex;
-use crate::types::McpContentItem;
+use crate::types::{McpContentItem, McpContentMetadata, McpStructuredContent};
 
 /// MCP tool executor that delegates to the MCP server manager
 pub struct McpToolExecutor {
@@ -48,24 +48,90 @@ impl McpToolExecutor {
         let mut images = Vec::new();
         for item in content {
             match item {
-                McpContentItem::Text { text } => parts.push(text.clone()),
-                McpContentItem::Image { data, mime_type } => {
+                McpContentItem::Text { text, metadata } => {
+                    parts.push(Self::append_content_metadata(text.clone(), metadata));
+                }
+                McpContentItem::Image {
+                    data,
+                    mime_type,
+                    metadata,
+                } => {
                     images.push(ToolResultImage {
                         mime_type: mime_type.clone(),
                         data: data.clone(),
                     });
-                    parts.push(format!("[image returned: {mime_type}]"));
+                    parts.push(Self::append_content_metadata(
+                        format!("[image returned: {mime_type}]"),
+                        metadata,
+                    ));
                 }
-                McpContentItem::Resource { resource } => {
+                McpContentItem::Audio { .. } => {
+                    parts.push(Self::serialized_content_block("audio content", item));
+                }
+                McpContentItem::ResourceLink { .. } => {
+                    parts.push(Self::serialized_content_block("resource link", item));
+                }
+                McpContentItem::Resource { resource, metadata } => {
                     if let Some(text) = &resource.text {
-                        parts.push(format!("[Resource {}]: {}", resource.uri, text));
+                        let rendered = format!("[Resource {}]: {}", resource.uri, text);
+                        if resource.meta.is_some()
+                            || metadata.annotations.is_some()
+                            || metadata.meta.is_some()
+                        {
+                            parts.push(format!(
+                                "{rendered}\n{}",
+                                Self::serialized_content_block("embedded resource metadata", item)
+                            ));
+                        } else {
+                            parts.push(rendered);
+                        }
                     } else {
-                        parts.push(format!("[Resource {}]", resource.uri));
+                        // Binary embedded resources have no native ToolResult
+                        // carrier. Preserve the base64 payload and all metadata
+                        // in an explicit JSON content block for the model.
+                        parts.push(Self::serialized_content_block("embedded resource", item));
                     }
                 }
             }
         }
         (parts.join("\n"), images)
+    }
+
+    fn append_content_metadata(mut rendered: String, metadata: &McpContentMetadata) -> String {
+        if metadata.annotations.is_none() && metadata.meta.is_none() {
+            return rendered;
+        }
+        let encoded = serde_json::to_string(metadata)
+            .unwrap_or_else(|error| format!("{{\"serializationError\":\"{error}\"}}"));
+        rendered.push_str("\n[MCP content metadata]: ");
+        rendered.push_str(&encoded);
+        rendered
+    }
+
+    fn serialized_content_block(label: &str, item: &McpContentItem) -> String {
+        let encoded = serde_json::to_string(item)
+            .unwrap_or_else(|error| format!("{{\"serializationError\":\"{error}\"}}"));
+        format!("[MCP {label}]: {encoded}")
+    }
+
+    fn append_structured_content(
+        mut text: String,
+        structured_content: &McpStructuredContent,
+    ) -> String {
+        let Some(value) = structured_content.to_json_value() else {
+            return text;
+        };
+        let encoded = serde_json::to_string(&value)
+            .unwrap_or_else(|error| format!("[unserializable structured content: {error}]"));
+        if text.trim() == encoded {
+            return text;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+            text.push_str("[structured content]: ");
+        }
+        text.push_str(&encoded);
+        text
     }
 }
 
@@ -113,6 +179,7 @@ impl ToolExecutor for McpToolExecutor {
         {
             Ok(result) => {
                 let (text, images) = Self::format_result_content(&result.content);
+                let text = Self::append_structured_content(text, &result.structured_content);
                 if result.is_error {
                     // Errors are textual; don't forward images.
                     Ok(ToolResult {
@@ -454,10 +521,12 @@ mod tests {
         let content = vec![
             McpContentItem::Text {
                 text: "screenshot 1280x536".to_string(),
+                metadata: McpContentMetadata::default(),
             },
             McpContentItem::Image {
                 data: "abc123".to_string(),
                 mime_type: "image/jpeg".to_string(),
+                metadata: McpContentMetadata::default(),
             },
         ];
         let (text, images) = McpToolExecutor::format_result_content(&content);
@@ -483,9 +552,11 @@ mod tests {
         let content = vec![
             McpContentItem::Text {
                 text: "Hello".to_string(),
+                metadata: McpContentMetadata::default(),
             },
             McpContentItem::Text {
                 text: "World".to_string(),
+                metadata: McpContentMetadata::default(),
             },
         ];
         let (text, images) = McpToolExecutor::format_result_content(&content);
@@ -498,6 +569,7 @@ mod tests {
         let content = vec![McpContentItem::Image {
             data: "base64imagedata".to_string(),
             mime_type: "image/png".to_string(),
+            metadata: McpContentMetadata::default(),
         }];
         // The image is no longer flattened to a placeholder; it is collected
         // separately, with a short marker left in the text.
@@ -516,7 +588,9 @@ mod tests {
                 mime_type: Some("text/plain".to_string()),
                 text: Some("File content".to_string()),
                 blob: None,
+                meta: None,
             },
+            metadata: McpContentMetadata::default(),
         }];
         let (text, _images) = McpToolExecutor::format_result_content(&content);
         assert_eq!(text, "[Resource file:///test.txt]: File content");
@@ -530,10 +604,61 @@ mod tests {
                 mime_type: None,
                 text: None,
                 blob: Some("base64data".to_string()),
+                meta: None,
             },
+            metadata: McpContentMetadata::default(),
         }];
         let (text, _images) = McpToolExecutor::format_result_content(&content);
-        assert_eq!(text, "[Resource file:///test.bin]");
+        assert!(text.starts_with("[MCP embedded resource]: "));
+        assert!(text.contains("\"blob\":\"base64data\""));
+    }
+
+    #[test]
+    fn non_native_content_and_metadata_reach_the_model_without_data_loss() {
+        let audio: McpContentItem = serde_json::from_value(serde_json::json!({
+            "type": "audio",
+            "data": "UklGRg==",
+            "mimeType": "audio/wav",
+            "annotations": {"audience": ["assistant"]},
+            "_meta": {"example.com/trace": "trace-1"}
+        }))
+        .expect("audio block");
+        let link: McpContentItem = serde_json::from_value(serde_json::json!({
+            "type": "resource_link",
+            "uri": "file:///report.json",
+            "name": "report",
+            "icons": [{"src": "data:image/png;base64,AA=="}],
+            "_meta": {"example.com/link": true}
+        }))
+        .expect("resource link block");
+        let blob: McpContentItem = serde_json::from_value(serde_json::json!({
+            "type": "resource",
+            "resource": {
+                "uri": "file:///payload.bin",
+                "blob": "AAEC",
+                "_meta": {"example.com/checksum": "abc"}
+            },
+            "annotations": {"priority": 1.0}
+        }))
+        .expect("embedded blob block");
+
+        let (text, images) = McpToolExecutor::format_result_content(&[audio, link, blob]);
+        assert!(images.is_empty());
+        for preserved in [
+            "UklGRg==",
+            "audio/wav",
+            "example.com/trace",
+            "data:image/png;base64,AA==",
+            "example.com/link",
+            "AAEC",
+            "example.com/checksum",
+            "\"priority\":1.0",
+        ] {
+            assert!(
+                text.contains(preserved),
+                "formatted content omitted {preserved}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -541,16 +666,42 @@ mod tests {
         let content = vec![
             McpContentItem::Text {
                 text: "Result:".to_string(),
+                metadata: McpContentMetadata::default(),
             },
             McpContentItem::Image {
                 data: "img".to_string(),
                 mime_type: "image/png".to_string(),
+                metadata: McpContentMetadata::default(),
             },
         ];
         let (text, images) = McpToolExecutor::format_result_content(&content);
         assert!(text.contains("Result:"));
         assert!(text.contains("[image returned:"));
         assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn structured_content_is_preserved_without_duplicating_text_fallback() {
+        let structured = McpStructuredContent::Value(serde_json::json!({
+            "temperature": 22.5,
+            "condition": "clear"
+        }));
+        let encoded = r#"{"condition":"clear","temperature":22.5}"#;
+        assert_eq!(
+            McpToolExecutor::append_structured_content(String::new(), &structured),
+            encoded
+        );
+        assert_eq!(
+            McpToolExecutor::append_structured_content(encoded.to_string(), &structured),
+            encoded
+        );
+        assert_eq!(
+            McpToolExecutor::append_structured_content(
+                "Weather result".to_string(),
+                &McpStructuredContent::Null,
+            ),
+            "Weather result\n[structured content]: null"
+        );
     }
 
     #[tokio::test]

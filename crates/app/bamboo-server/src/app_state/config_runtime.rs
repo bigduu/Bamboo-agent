@@ -6384,6 +6384,13 @@ for line in sys.stdin:
     request_id = request.get("id")
     if request_id is None:
         continue
+    if request.get("method") == "server/discover":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Method not found"},
+        }), flush=True)
+        continue
     if request.get("method") == "initialize":
         result = {
             "protocolVersion": "2024-11-05",
