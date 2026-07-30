@@ -85,11 +85,14 @@ pub struct SessionSummary {
     pub running_child_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gold_config: Option<GoldConfig>,
-    /// Per-session "bypass permissions" toggle, read from the session's runtime
-    /// state. Only populated by the detail endpoint (which loads the full
-    /// session); list endpoints leave it `false`.
+    /// Compatibility indicator for clients that predate typed permission
+    /// modes. It is true for both Bypass and Auto.
     #[serde(default)]
     pub bypass_permissions: bool,
+    /// First-class session permission mode. Unlike the compatibility boolean,
+    /// this distinguishes legacy Bypass from zero-prompt Auto.
+    #[serde(default)]
+    pub permission_mode: bamboo_domain::SessionPermissionMode,
     /// Which machine this session's agent runs on (deployment kind + host).
     /// Always present: a session with no stamped placement (root sessions,
     /// local children, legacy rows) defaults to this backend's own local host,
@@ -111,6 +114,16 @@ impl SessionSummary {
                 })
                 .ok()
         });
+        let permission_mode = if entry.permission_mode
+            == bamboo_domain::SessionPermissionMode::Default
+            && entry.bypass_permissions
+        {
+            // Old index rows only carried the boolean. Interpret that bounded
+            // legacy representation as Bypass, never as Auto.
+            bamboo_domain::SessionPermissionMode::Bypass
+        } else {
+            entry.permission_mode
+        };
         Self {
             id: entry.id,
             project_id,
@@ -144,7 +157,9 @@ impl SessionSummary {
             plan_mode: entry.plan_mode,
             running_child_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
-            bypass_permissions: entry.bypass_permissions,
+            bypass_permissions: entry.bypass_permissions
+                || permission_mode != bamboo_domain::SessionPermissionMode::Default,
+            permission_mode,
             placement: entry.placement.unwrap_or_else(local_placement),
         }
     }
@@ -321,10 +336,14 @@ pub struct PatchSessionRequest {
     pub clear_reasoning_effort: Option<bool>,
     #[serde(default)]
     pub gold_config: Option<serde_json::Value>,
-    /// Toggle the per-session "bypass permissions" mode. When `true`, tool
-    /// permission checks are skipped for this session only.
+    /// Legacy toggle for per-session Bypass. New clients should use
+    /// `permission_mode`; this boolean can never select Auto.
     #[serde(default)]
     pub bypass_permissions: Option<bool>,
+    /// Set the first-class session permission behavior. Clients must send this
+    /// or the legacy boolean, never both in the same request.
+    #[serde(default)]
+    pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,6 +422,7 @@ mod tests {
         assert!(req.model.is_none());
         assert!(req.reasoning_effort.is_none());
         assert!(req.clear_reasoning_effort.is_none());
+        assert!(req.permission_mode.is_none());
     }
 
     #[test]
@@ -438,6 +458,19 @@ mod tests {
         assert!(req.model.is_none());
         assert!(req.reasoning_effort.is_none());
         assert!(req.clear_reasoning_effort.is_none());
+        assert!(req.permission_mode.is_none());
+    }
+
+    #[test]
+    fn test_patch_session_request_auto_permission_mode() {
+        let req: PatchSessionRequest =
+            serde_json::from_str(r#"{"permission_mode":"auto"}"#).unwrap();
+
+        assert_eq!(
+            req.permission_mode,
+            Some(bamboo_domain::SessionPermissionMode::Auto)
+        );
+        assert!(req.bypass_permissions.is_none());
     }
 
     #[test]
@@ -484,6 +517,7 @@ mod tests {
             id: "test-id".to_string(),
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
+            permission_mode: bamboo_domain::SessionPermissionMode::Default,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
@@ -531,6 +565,7 @@ mod tests {
             id: "session-123".to_string(),
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
+            permission_mode: bamboo_domain::SessionPermissionMode::Default,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Child,
             title: "My Session".to_string(),
@@ -666,6 +701,7 @@ mod tests {
             id: "test".to_string(),
             project_id: None,
             bypass_permissions: false,
+            permission_mode: bamboo_domain::SessionPermissionMode::Default,
             placement: local_placement(),
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),

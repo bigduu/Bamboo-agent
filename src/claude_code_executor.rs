@@ -242,7 +242,11 @@ impl ClaudeCodeExecutor {
     /// `resume_id`: when `Some`, append `--resume <id>` (step 2 of the
     /// activation logic — reattach to a persisted Claude Code session
     /// instead of spawning fresh).
-    fn build_command(&self, resume_id: Option<&str>) -> Command {
+    fn build_command(
+        &self,
+        resume_id: Option<&str>,
+        permission_mode_override: Option<&str>,
+    ) -> Command {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("--output-format")
             .arg("stream-json")
@@ -260,8 +264,11 @@ impl ClaudeCodeExecutor {
         // engages the local-decide policy in `decide_and_respond` below
         // ("no host bridge -> deny unless bypassPermissions") instead of
         // that policy being unreachable dead code.
-        cmd.arg("--permission-mode")
-            .arg(self.permission_mode.as_deref().unwrap_or("default"));
+        cmd.arg("--permission-mode").arg(
+            permission_mode_override
+                .or(self.permission_mode.as_deref())
+                .unwrap_or("default"),
+        );
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
@@ -329,6 +336,7 @@ impl ClaudeCodeExecutor {
         write_tx: &mpsc::UnboundedSender<Value>,
         pending: &mut HashMap<String, JoinHandle<()>>,
         last_text: &mut String,
+        auto_approve_permissions: bool,
     ) -> Option<ChildOutcome> {
         let frame_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         match frame_type {
@@ -398,7 +406,13 @@ impl ClaudeCodeExecutor {
                 Some(ChildOutcome::completed(final_text))
             }
             "control_request" => {
-                self.handle_control_request(value, events, write_tx, pending);
+                self.handle_control_request(
+                    value,
+                    events,
+                    write_tx,
+                    pending,
+                    auto_approve_permissions,
+                );
                 None
             }
             "control_cancel_request" => {
@@ -429,6 +443,7 @@ impl ClaudeCodeExecutor {
         events: &EventSink,
         write_tx: &mpsc::UnboundedSender<Value>,
         pending: &mut HashMap<String, JoinHandle<()>>,
+        auto_approve_permissions: bool,
     ) {
         let request_id = value
             .get("request_id")
@@ -456,6 +471,10 @@ impl ClaudeCodeExecutor {
             .unwrap_or("")
             .to_string();
         let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
+        if auto_approve_permissions {
+            send_control_response(write_tx, &request_id, true, Some(input), None);
+            return;
+        }
         let host = events.host().cloned();
         let permission_mode = self.permission_mode.clone();
         let relay_timeout = self.relay_timeout;
@@ -519,8 +538,14 @@ impl ClaudeCodeExecutor {
         resume_id: Option<&str>,
         events: &EventSink,
         cancel: &CancellationToken,
+        auto_approve_permissions: bool,
     ) -> (ChildOutcome, bool) {
-        let mut child = match spawn_with_etxtbsy_retry(|| self.build_command(resume_id)).await {
+        let permission_mode_override = auto_approve_permissions.then_some("bypassPermissions");
+        let mut child = match spawn_with_etxtbsy_retry(|| {
+            self.build_command(resume_id, permission_mode_override)
+        })
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 return (
@@ -587,7 +612,14 @@ impl ClaudeCodeExecutor {
                                 }
                             };
                             if let Some(outcome) = self
-                                .handle_frame(value, events, &write_tx, &mut pending, &mut last_text)
+                                .handle_frame(
+                                    value,
+                                    events,
+                                    &write_tx,
+                                    &mut pending,
+                                    &mut last_text,
+                                    auto_approve_permissions,
+                                )
                                 .await
                             {
                                 break (outcome, false);
@@ -683,10 +715,20 @@ impl ChildExecutor for ClaudeCodeExecutor {
 
         // Step 3: fallback body when there's history but no usable id.
         let body = build_turn_body(&spec, resume_id.as_deref());
+        let auto_approve_permissions = spec
+            .permission_policy
+            .as_ref()
+            .is_some_and(|policy| policy.auto_approve_permissions);
 
         let used_resume = resume_id.is_some();
         let (outcome, exited_without_result) = self
-            .run_once(&body, resume_id.as_deref(), &events, &cancel)
+            .run_once(
+                &body,
+                resume_id.as_deref(),
+                &events,
+                &cancel,
+                auto_approve_permissions,
+            )
             .await;
 
         // Step 4: retry-once, ONLY when the failed attempt itself used
@@ -698,9 +740,15 @@ impl ChildExecutor for ClaudeCodeExecutor {
             );
             self.delete_state_file().await;
             let fallback_body = build_turn_body(&spec, None);
-            self.run_once(&fallback_body, None, &events, &cancel)
-                .await
-                .0
+            self.run_once(
+                &fallback_body,
+                None,
+                &events,
+                &cancel,
+                auto_approve_permissions,
+            )
+            .await
+            .0
         } else {
             outcome
         };
@@ -1157,6 +1205,25 @@ mod tests {
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }
+    }
+
+    #[test]
+    fn auto_override_maps_to_claude_bypass_permissions_mode() {
+        let executor = executor(PathBuf::from("claude"));
+        let command = executor.build_command(None, Some("bypassPermissions"));
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let mode_index = args
+            .iter()
+            .position(|arg| arg == "--permission-mode")
+            .expect("explicit permission mode argument");
+        assert_eq!(
+            args.get(mode_index + 1).map(String::as_str),
+            Some("bypassPermissions")
+        );
     }
 
     fn msg(role: &str, content: &str) -> Value {

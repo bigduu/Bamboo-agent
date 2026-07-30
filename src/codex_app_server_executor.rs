@@ -148,6 +148,13 @@ impl Drop for AppServerConnection {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AppServerRunPolicy<'a> {
+    sandbox: &'a str,
+    approval_policy: &'a str,
+    network_access: bool,
+}
+
 /// `codex app-server` implementation of the Codex executor mode.
 pub struct CodexAppServerExecutor {
     binary: PathBuf,
@@ -494,11 +501,11 @@ impl CodexAppServerExecutor {
         Ok(slot.as_mut().expect("connection installed"))
     }
 
-    fn thread_params(&self, sandbox: &str) -> Value {
+    fn thread_params(&self, policy: AppServerRunPolicy<'_>) -> Value {
         let mut params = json!({
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
-            "sandbox": sandbox,
+            "approvalPolicy": policy.approval_policy,
+            "approvalsReviewer": (policy.approval_policy != "never").then_some("user"),
+            "sandbox": policy.sandbox,
             "cwd": self.workspace,
             "model": self.model,
         });
@@ -509,10 +516,10 @@ impl CodexAppServerExecutor {
     async fn start_thread(
         &self,
         connection: &AppServerConnection,
-        sandbox: &str,
+        policy: AppServerRunPolicy<'_>,
     ) -> Result<String, String> {
         let result = connection
-            .request("thread/start", self.thread_params(sandbox))
+            .request("thread/start", self.thread_params(policy))
             .await?;
         result
             .pointer("/thread/id")
@@ -526,9 +533,9 @@ impl CodexAppServerExecutor {
         &self,
         connection: &AppServerConnection,
         thread_id: &str,
-        sandbox: &str,
+        policy: AppServerRunPolicy<'_>,
     ) -> Result<(), String> {
-        let mut params = self.thread_params(sandbox);
+        let mut params = self.thread_params(policy);
         params["threadId"] = Value::String(thread_id.to_string());
         connection
             .request("thread/resume", params)
@@ -541,19 +548,22 @@ impl CodexAppServerExecutor {
         connection: &AppServerConnection,
         thread_id: &str,
         prompt: &str,
-        sandbox: &str,
-        network_access: bool,
         reasoning_effort: Option<&str>,
+        policy: AppServerRunPolicy<'_>,
     ) -> Result<String, String> {
         let mut params = json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt, "text_elements": []}],
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
+            "approvalPolicy": policy.approval_policy,
+            "approvalsReviewer": (policy.approval_policy != "never").then_some("user"),
             "cwd": self.workspace,
             "model": self.model,
             "effort": reasoning_effort,
-            "sandboxPolicy": sandbox_policy(sandbox, self.workspace.as_deref(), network_access),
+            "sandboxPolicy": sandbox_policy(
+                policy.sandbox,
+                self.workspace.as_deref(),
+                policy.network_access,
+            ),
         });
         remove_null_object_fields(&mut params);
         let result = connection.request("turn/start", params).await?;
@@ -575,6 +585,7 @@ impl CodexAppServerExecutor {
         steer: &mut SteerInbox,
         approval_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
         force_cancelled: bool,
+        auto_approve_permissions: bool,
     ) -> ChildOutcome {
         let mut state = AppRunState::default();
         let mut steer_open = true;
@@ -613,12 +624,16 @@ impl CodexAppServerExecutor {
                                 let _ = connection.send(approval_response(&message, false));
                                 continue;
                             }
-                            approval_tasks.push(spawn_approval_relay(
-                                connection.write_tx.clone(),
-                                message,
-                                events.host().cloned(),
-                                self.approval_timeout,
-                            ));
+                            if auto_approve_permissions {
+                                let _ = connection.send(approval_response(&message, true));
+                            } else {
+                                approval_tasks.push(spawn_approval_relay(
+                                    connection.write_tx.clone(),
+                                    message,
+                                    events.host().cloned(),
+                                    self.approval_timeout,
+                                ));
+                            }
                         } else {
                             let id = message.get("id").cloned().unwrap_or(Value::Null);
                             let _ = connection.send(json!({
@@ -670,8 +685,22 @@ impl CodexAppServerExecutor {
             .as_ref()
             .map(|policy| policy.bypass_permissions)
             .unwrap_or(self.permissions.provisioned_bypass());
+        let auto_approve_permissions = spec
+            .permission_policy
+            .as_ref()
+            .is_some_and(|policy| policy.auto_approve_permissions);
+        let approval_policy = if auto_approve_permissions {
+            "never"
+        } else {
+            "on-request"
+        };
         let (sandbox, network_access, warnings) =
             self.permissions.app_server_posture(parent_bypass);
+        let run_policy = AppServerRunPolicy {
+            sandbox: &sandbox,
+            approval_policy,
+            network_access,
+        };
         for warning in warnings {
             events.emit(json!({
                 "type": "runner_progress",
@@ -692,8 +721,8 @@ impl CodexAppServerExecutor {
             "auth_mode": self.auth.mode().as_str(),
             "codex_home_mode": self.codex_home_mode(),
             "sandbox": sandbox,
-            "approval_policy": "on-request",
-            "approvals_reviewer": "user",
+            "approval_policy": approval_policy,
+            "approvals_reviewer": (!auto_approve_permissions).then_some("user"),
             "network_access": network_access,
             "permission_profile": self.permissions.permission_profile(),
         }));
@@ -714,7 +743,7 @@ impl CodexAppServerExecutor {
             self.stored_thread(&logical_session).await
         };
         let (thread_id, prompt) = if let Some(thread_id) = stored {
-            match self.resume_thread(connection, &thread_id, &sandbox).await {
+            match self.resume_thread(connection, &thread_id, run_policy).await {
                 Ok(()) => (thread_id, spec.assignment.clone()),
                 Err(error) => {
                     tracing::warn!(%error, "codex app-server: resume failed; rehydrating once");
@@ -727,7 +756,7 @@ impl CodexAppServerExecutor {
                         "message": "resume failed; starting a new thread with bounded history rehydration",
                     }));
                     self.forget_thread(&logical_session).await;
-                    let new_id = match self.start_thread(connection, &sandbox).await {
+                    let new_id = match self.start_thread(connection, run_policy).await {
                         Ok(id) => id,
                         Err(error) => return ChildOutcome::error(error),
                     };
@@ -738,7 +767,7 @@ impl CodexAppServerExecutor {
                 }
             }
         } else {
-            let thread_id = match self.start_thread(connection, &sandbox).await {
+            let thread_id = match self.start_thread(connection, run_policy).await {
                 Ok(id) => id,
                 Err(error) => return ChildOutcome::error(error),
             };
@@ -756,9 +785,8 @@ impl CodexAppServerExecutor {
                 connection,
                 &thread_id,
                 &prompt,
-                &sandbox,
-                network_access,
                 spec.reasoning_effort.as_deref(),
+                run_policy,
             )
             .await
         {
@@ -779,6 +807,7 @@ impl CodexAppServerExecutor {
                 steer,
                 &mut approval_tasks,
                 false,
+                auto_approve_permissions,
             ) => outcome,
             _ = cancel.cancelled() => {
                 let interrupt = connection.request_with_timeout(
@@ -799,6 +828,7 @@ impl CodexAppServerExecutor {
                         steer,
                         &mut approval_tasks,
                         true,
+                        auto_approve_permissions,
                     ),
                 ).await {
                     Ok(_) => ChildOutcome::cancelled(),
@@ -1381,7 +1411,10 @@ while IFS= read -r ignored; do :; done
     }
 
     #[cfg(unix)]
-    async fn run_stub_with_decision(approved: bool) -> (ChildOutcome, Vec<Value>) {
+    async fn run_stub(
+        approved: Option<bool>,
+        auto_approve_permissions: bool,
+    ) -> (ChildOutcome, Vec<Value>) {
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("codex-stub.sh");
         write_stub_codex(&binary);
@@ -1407,12 +1440,17 @@ while IFS= read -r ignored; do :; done
         .await
         .unwrap();
         let (sink, mut event_rx) = EventSink::channel();
-        let (host, mut host_rx) = HostBridge::channel();
-        let approval_task = tokio::spawn(async move {
-            let request = host_rx.recv().await.expect("approval request");
-            assert_eq!(request.body["tool_name"], "Bash");
-            request.reply.send(json!({"approved": approved})).unwrap();
-        });
+        let (sink, approval_task) = if let Some(approved) = approved {
+            let (host, mut host_rx) = HostBridge::channel();
+            let task = tokio::spawn(async move {
+                let request = host_rx.recv().await.expect("approval request");
+                assert_eq!(request.body["tool_name"], "Bash");
+                request.reply.send(json!({"approved": approved})).unwrap();
+            });
+            (sink.with_host_bridge(host), Some(task))
+        } else {
+            (sink, None)
+        };
         let outcome = executor
             .run(
                 RunSpec {
@@ -1423,7 +1461,8 @@ while IFS= read -r ignored; do :; done
                     permission_policy: Some(PermissionPolicyContext {
                         revision: 1,
                         bypass_permissions: false,
-                        session_id: format!("stub-{approved}"),
+                        auto_approve_permissions,
+                        session_id: format!("stub-{approved:?}-{auto_approve_permissions}"),
                         workspace_path: Some(root.path().to_string_lossy().into_owned()),
                         inherit_session_grants: false,
                         policy: json!({}),
@@ -1433,12 +1472,14 @@ while IFS= read -r ignored; do :; done
                     initial_session_messages: Vec::new(),
                     secrets: RunSecrets::default(),
                 },
-                sink.with_host_bridge(host),
+                sink,
                 SteerInbox::disconnected(),
                 CancellationToken::new(),
             )
             .await;
-        approval_task.await.unwrap();
+        if let Some(task) = approval_task {
+            task.await.unwrap();
+        }
         let mut events = Vec::new();
         while let Ok(event) = event_rx.try_recv() {
             events.push(event);
@@ -1560,7 +1601,7 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn subprocess_stub_completes_full_handshake_and_allow_path() {
-        let (outcome, events) = run_stub_with_decision(true).await;
+        let (outcome, events) = run_stub(Some(true), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub approved"));
         assert!(events.iter().any(|event| event["type"] == "complete"));
     }
@@ -1568,11 +1609,23 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn subprocess_stub_returns_denial_to_model_and_completes() {
-        let (outcome, events) = run_stub_with_decision(false).await;
+        let (outcome, events) = run_stub(Some(false), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub denied"));
         assert!(events
             .iter()
             .any(|event| event["type"] == "token" && event["content"] == "stub denied"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_uses_never_policy_and_accepts_unexpected_approval_without_host() {
+        let (outcome, events) = run_stub(None, true).await;
+        assert_eq!(outcome.result.as_deref(), Some("stub approved"));
+        assert!(events.iter().any(|event| {
+            event["executor"] == "codex_app_server"
+                && event["approval_policy"] == "never"
+                && event["approvals_reviewer"].is_null()
+        }));
     }
 
     #[cfg(unix)]

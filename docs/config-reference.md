@@ -476,11 +476,12 @@ catch-all — not yet promoted to a typed top-level field). Shape
 `whitelist: Vec<PermissionRule>`, `enabled: bool`, `session_grant_duration_secs`
 (default `1800`), `mode: Option<PermissionMode>`, `confirm_threshold:
 Option<RiskLevel>`, `ask_rules: Vec<String>` — glob-ish patterns like
-`"Bash(rm -rf *)"` that force a confirmation prompt even under a bypass
-permission mode. The design invariant: bypass mode means "run everything
-without prompting" *except* the user's own `ask_rules` and a small hard-coded
-set of catastrophic commands (`sudo`, `curl | sh`, `dd`, `rm -rf /`, …), which
-always prompt regardless of mode.
+`"Bash(rm -rf *)"` that force a confirmation prompt even under the legacy
+`bypassPermissions` mode. The design invariant: bypass skips ordinary prompts
+but still asks for the user's own `ask_rules` and a small hard-coded set of
+catastrophic commands (`sudo`, `curl | sh`, `dd`, `rm -rf /`, …). The stronger
+`auto` mode emits no approval prompt, including for those forced-ask cases, but
+still enforces explicit policy and platform denials.
 
 ## Model limits (`model_limits.json`)
 

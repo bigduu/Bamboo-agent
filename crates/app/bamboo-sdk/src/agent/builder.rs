@@ -420,8 +420,9 @@ impl AgentBuilder {
     /// built-in tool executor.
     ///
     /// [`PermissionMode::BypassPermissions`] is exactly equivalent to
-    /// [`bypass_permissions`](Self::bypass_permissions). Every other mode
-    /// installs Bamboo's canonical `PermissionConfig` +
+    /// [`bypass_permissions`](Self::bypass_permissions). Every other mode,
+    /// including zero-prompt [`PermissionMode::Auto`], installs Bamboo's
+    /// canonical `PermissionConfig` +
     /// `ConfigPermissionChecker` + `ModeAwarePermissionChecker` stack. Calls to
     /// this method, [`permission_checker`](Self::permission_checker), and
     /// [`bypass_permissions`](Self::bypass_permissions) are last-call-wins,
@@ -923,6 +924,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1464,6 +1466,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blocked_path = tmp.path().join("plan-blocked.txt");
         let allowed_path = tmp.path().join("accept-edits.txt");
+        let auto_path = tmp.path().join("auto-forced.txt");
         let config = Arc::new(RwLock::new(Config::default()));
 
         let plan = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
@@ -1486,7 +1489,7 @@ mod tests {
         assert!(!blocked_path.exists());
 
         let accept_edits = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
-            config,
+            config.clone(),
             permission_checker_for_mode(PermissionMode::AcceptEdits).unwrap(),
         );
         let allowed = ToolCall {
@@ -1506,6 +1509,26 @@ mod tests {
             .await
             .expect("AcceptEdits should allow Write through the executor");
         assert_eq!(std::fs::read_to_string(allowed_path).unwrap(), "written");
+
+        let auto = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+            config,
+            permission_checker_for_mode(PermissionMode::Auto).unwrap(),
+        );
+        let forced = ToolCall {
+            id: "auto-forced".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("eval 'printf auto > {}'", auto_path.display())
+                })
+                .to_string(),
+            },
+        };
+        auto.execute(&forced)
+            .await
+            .expect("Auto should suppress forced confirmation");
+        assert_eq!(std::fs::read_to_string(auto_path).unwrap(), "auto");
 
         let assembled_dir = tempfile::tempdir().unwrap();
         write_test_config(assembled_dir.path());

@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::tools::{BashCompletionSink, ToolSchema};
 use crate::{AgentEvent, Session};
+use bamboo_domain::SessionPermissionMode;
 
 /// Per-session flags that flow into every tool call's [`ToolExecutionContext`].
 ///
@@ -28,17 +29,23 @@ pub struct ToolExecutionSessionFlags {
     /// When `true`, the session is in "bypass permissions" mode and tool
     /// permission checks are skipped. Sourced from the session's runtime state.
     pub bypass_permissions: bool,
+    /// When `true`, approval requests are suppressed even for hard-dangerous
+    /// and always-ask operations. Hard policy denials remain enforced.
+    pub auto_approve_permissions: bool,
 }
 
 impl ToolExecutionSessionFlags {
     /// Derive the per-session tool-execution flags from a session's runtime
     /// state. This is the single source of truth for both agent loops.
     pub fn from_session(session: &Session) -> Self {
+        let permission_mode = session
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
         Self {
-            bypass_permissions: session
-                .agent_runtime_state
-                .as_ref()
-                .is_some_and(|state| state.bypass_permissions),
+            bypass_permissions: permission_mode == SessionPermissionMode::Bypass,
+            auto_approve_permissions: permission_mode == SessionPermissionMode::Auto,
         }
     }
 }
@@ -66,6 +73,9 @@ pub struct ToolExecutionContext<'a> {
     /// tool permission checks are skipped. Sourced per-session from the
     /// session's runtime state (`runtime.json`), not the global checker.
     pub bypass_permissions: bool,
+    /// Stronger, explicitly selected auto mode. This skips every approval
+    /// request but is still evaluated behind platform and explicit deny rules.
+    pub auto_approve_permissions: bool,
     /// When `true`, the executing agent loop can suspend the current turn for a
     /// backgrounded shell and self-resume once it finishes (i.e. a
     /// `bash_resume_hook` AND persistence are wired). The Bash tool uses this to
@@ -109,6 +119,7 @@ impl std::fmt::Debug for ToolExecutionContext<'_> {
             .field("event_tx", &self.event_tx)
             .field("available_tool_schemas", &self.available_tool_schemas)
             .field("bypass_permissions", &self.bypass_permissions)
+            .field("auto_approve_permissions", &self.auto_approve_permissions)
             .field("can_async_resume", &self.can_async_resume)
             .field("bash_completion_sink", &self.bash_completion_sink.is_some())
             .field("pre_parsed_args", &self.pre_parsed_args)
@@ -124,6 +135,7 @@ impl<'a> ToolExecutionContext<'a> {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -167,6 +179,7 @@ impl<'a> ToolExecutionContext<'a> {
             event_tx: Some(event_tx),
             available_tool_schemas: Some(available_tool_schemas),
             bypass_permissions: flags.bypass_permissions,
+            auto_approve_permissions: flags.auto_approve_permissions,
             can_async_resume,
             bash_completion_sink,
             pre_parsed_args,
@@ -246,7 +259,8 @@ mod session_flags_tests {
         assert_eq!(
             ToolExecutionSessionFlags::from_session(&session),
             ToolExecutionSessionFlags {
-                bypass_permissions: false
+                bypass_permissions: false,
+                auto_approve_permissions: false,
             }
         );
     }
@@ -258,6 +272,19 @@ mod session_flags_tests {
         runtime.bypass_permissions = true;
         session.agent_runtime_state = Some(runtime);
         assert!(ToolExecutionSessionFlags::from_session(&session).bypass_permissions);
+        assert!(!ToolExecutionSessionFlags::from_session(&session).auto_approve_permissions);
+    }
+
+    #[test]
+    fn from_session_distinguishes_auto_from_legacy_bypass() {
+        let mut session = Session::new("s-auto", "test-model");
+        let mut runtime = AgentRuntimeState::new("run-1");
+        runtime.set_permission_mode(SessionPermissionMode::Auto);
+        session.agent_runtime_state = Some(runtime);
+
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        assert!(!flags.bypass_permissions);
+        assert!(flags.auto_approve_permissions);
     }
 
     #[test]
@@ -270,6 +297,7 @@ mod session_flags_tests {
             &[],
             ToolExecutionSessionFlags {
                 bypass_permissions: true,
+                auto_approve_permissions: false,
             },
             true,
             None,
@@ -277,6 +305,7 @@ mod session_flags_tests {
         );
         assert_eq!(ctx.session_id, Some("s1"));
         assert!(ctx.bypass_permissions);
+        assert!(!ctx.auto_approve_permissions);
         assert!(ctx.can_async_resume);
         assert!(ctx.pre_parsed_args.is_none());
     }
@@ -317,6 +346,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -347,6 +377,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -379,6 +410,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -422,6 +454,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -476,6 +509,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -503,6 +537,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -535,6 +570,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -566,6 +602,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -594,6 +631,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -626,6 +664,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -654,6 +693,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -680,6 +720,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,

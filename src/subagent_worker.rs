@@ -297,6 +297,9 @@ pub struct BambooRuntimeExecutor {
     /// AND it propagates to grandchildren (whose forced-ask actions then get the
     /// installed model-reviewer). Phase 6, Part B.
     bypass: bool,
+    /// Stronger zero-prompt posture. Kept distinct so Auto can suppress forced
+    /// approvals without disabling the sandbox behavior tied to legacy bypass.
+    auto_approve_permissions: bool,
     /// Live policy updated from the host at every activation boundary. Keeping
     /// the same Arc as the builtin executor lets warm and remote workers adopt
     /// new durable revisions without rebuilding their tool surface.
@@ -734,6 +737,7 @@ impl BambooRuntimeExecutor {
             run_tools,
             spawn_depth: spec.identity.depth,
             bypass: spec.capabilities.bypass,
+            auto_approve_permissions: spec.capabilities.auto_approve_permissions,
             permission_config,
             no_human_review,
             child_runner,
@@ -1064,7 +1068,13 @@ impl ChildExecutor for BambooRuntimeExecutor {
         if let Some(project_id) = run.project_id.as_ref() {
             session.set_project_id_meta(project_id.as_str());
         }
-        let mut effective_bypass = self.bypass;
+        let mut effective_permission_mode = if self.auto_approve_permissions {
+            bamboo_domain::SessionPermissionMode::Auto
+        } else if self.bypass {
+            bamboo_domain::SessionPermissionMode::Bypass
+        } else {
+            bamboo_domain::SessionPermissionMode::Default
+        };
         let mut effective_workspace = self.workspace.clone();
         if let (Some(context), Some(config)) = (
             run.permission_policy.as_ref(),
@@ -1075,7 +1085,13 @@ impl ChildExecutor for BambooRuntimeExecutor {
             ) {
                 Ok(policy) => {
                     config.publish_persistent_policy(context.revision, &policy);
-                    effective_bypass = context.bypass_permissions;
+                    effective_permission_mode = if context.auto_approve_permissions {
+                        bamboo_domain::SessionPermissionMode::Auto
+                    } else if context.bypass_permissions {
+                        bamboo_domain::SessionPermissionMode::Bypass
+                    } else {
+                        bamboo_domain::SessionPermissionMode::Default
+                    };
                     effective_workspace = context.workspace_path.clone().or(effective_workspace);
                     session.metadata.insert(
                         "permission.policy_revision".to_string(),
@@ -1095,7 +1111,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     // for this activation rather than broadening on corrupt wire
                     // data.
                     tracing::warn!(%error, "invalid permission policy update; retaining LKG and disabling bypass");
-                    effective_bypass = false;
+                    effective_permission_mode = bamboo_domain::SessionPermissionMode::Default;
                 }
             }
         }
@@ -1112,11 +1128,11 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Phase 6, Part B: re-establish bypass on the fresh run session so the
         // worker's own tools honor it AND create_child_action propagates it to
         // grandchildren (whose forced-ask actions then reach the model-reviewer).
-        if effective_bypass {
+        if effective_permission_mode != bamboo_domain::SessionPermissionMode::Default {
             session
                 .agent_runtime_state
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .bypass_permissions = true;
+                .set_permission_mode(effective_permission_mode);
         }
         // #73 review (P1): mirror the bypass re-stamp for "no human approver", so
         // create_child_action propagates it to in-process grandchildren. Without
@@ -1788,6 +1804,7 @@ mod tests {
             run_tools: None,
             spawn_depth: 1,
             bypass: false,
+            auto_approve_permissions: false,
             permission_config: None,
             no_human_review: None,
             child_runner: None,

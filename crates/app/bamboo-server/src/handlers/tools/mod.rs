@@ -122,6 +122,7 @@ pub async fn execute_tool(
                 event_tx: None,
                 available_tool_schemas: Some(available_tool_schemas.as_slice()),
                 bypass_permissions: false,
+                auto_approve_permissions: false,
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,

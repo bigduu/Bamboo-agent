@@ -144,6 +144,8 @@ impl std::fmt::Debug for SecretValue {
 pub struct PermissionPolicyContext {
     pub revision: u64,
     pub bypass_permissions: bool,
+    #[serde(default)]
+    pub auto_approve_permissions: bool,
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
@@ -357,6 +359,7 @@ mod tests {
         let context = PermissionPolicyContext {
             revision: 9,
             bypass_permissions: true,
+            auto_approve_permissions: false,
             session_id: "child-1".into(),
             workspace_path: Some("/workspace/project".into()),
             inherit_session_grants: false,
@@ -379,6 +382,20 @@ mod tests {
             panic!("expected run frame");
         };
         assert_eq!(run.permission_policy, Some(context));
+    }
+
+    #[test]
+    fn legacy_permission_policy_context_defaults_auto_to_false() {
+        let frame = ParentFrame::from_text(
+            r#"{"kind":"run","assignment":"work","permission_policy":{"revision":8,"bypass_permissions":true,"session_id":"legacy-child","inherit_session_grants":false,"policy":{}}}"#,
+        )
+        .unwrap();
+        let ParentFrame::Run(run) = frame else {
+            panic!("expected run frame");
+        };
+        let context = run.permission_policy.expect("permission policy");
+        assert!(context.bypass_permissions);
+        assert!(!context.auto_approve_permissions);
     }
 
     #[test]

@@ -750,15 +750,17 @@ impl Tool for SubAgentTool {
                         // flag when reused under another (e.g. parent flipped from
                         // headless to interactive, or toggled bypass). Mirror BOTH
                         // flags so the reused resident matches the current parent.
-                        let (parent_bypass, parent_no_human) = parent
+                        let (parent_permission_mode, parent_no_human) = parent
                             .agent_runtime_state
                             .as_ref()
-                            .map(|s| (s.bypass_permissions, s.no_human_approver))
-                            .unwrap_or((false, false));
+                            .map(|s| {
+                                (s.effective_permission_mode(), s.no_human_approver)
+                            })
+                            .unwrap_or_default();
                         let rs = child
                             .agent_runtime_state
                             .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
-                        rs.bypass_permissions = parent_bypass;
+                        rs.set_permission_mode(parent_permission_mode);
                         rs.no_human_approver = parent_no_human;
                         // Commit posture + the newly requested, already
                         // authorized workspace before publishing runtime state

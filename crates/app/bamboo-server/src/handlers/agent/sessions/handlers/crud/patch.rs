@@ -153,6 +153,23 @@ pub async fn patch_session(
     req: web::Json<PatchSessionRequest>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
+    if req.permission_mode.is_some() && req.bypass_permissions.is_some() {
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value(
+                "permission_mode and bypass_permissions cannot be set together"
+            ),
+            "session_id": session_id,
+        })));
+    }
+    let requested_permission_mode = req.permission_mode.or_else(|| {
+        req.bypass_permissions.map(|enabled| {
+            if enabled {
+                bamboo_domain::SessionPermissionMode::Bypass
+            } else {
+                bamboo_domain::SessionPermissionMode::Default
+            }
+        })
+    });
     // Consumed by the first authoritative setter invoked (see `.take()` below).
     let mut precondition = parse_if_match(&http_req);
 
@@ -547,7 +564,7 @@ pub async fn patch_session(
         || req.model.is_some()
         || req.reasoning_effort.is_some()
         || req.clear_reasoning_effort.unwrap_or(false)
-        || req.bypass_permissions.is_some();
+        || requested_permission_mode.is_some();
 
     if touches_non_metadata {
         let request_model_ref = derive_model_ref(
@@ -561,6 +578,7 @@ pub async fn patch_session(
         // in the request"). `Cell` is fine: the closure runs synchronously.
         let model_changed = std::cell::Cell::new(false);
         let reasoning_changed = std::cell::Cell::new(false);
+        let permission_transition = std::cell::Cell::new(None);
 
         // Apply ONLY the config fields, loading the freshest session under the
         // per-session lock. This must never rewrite `messages`: a config patch
@@ -589,14 +607,18 @@ pub async fn patch_session(
                     session.reasoning_effort = Some(reasoning_effort);
                 }
 
-                // Per-session "bypass permissions" toggle. Stored on the session's
-                // runtime state (runtime.json), creating it on demand so the flag
-                // can be set before the session's first run.
-                if let Some(bypass) = req.bypass_permissions {
-                    session
+                // First-class per-session permission behavior. The typed mode
+                // and legacy mirror are updated together so old clients remain
+                // conservative without gaining a way to select Auto.
+                if let Some(mode) = requested_permission_mode {
+                    let runtime = session
                         .agent_runtime_state
-                        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                        .bypass_permissions = bypass;
+                        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+                    let previous = runtime.effective_permission_mode();
+                    runtime.set_permission_mode(mode);
+                    if previous != mode {
+                        permission_transition.set(Some((previous, mode)));
+                    }
                 }
 
                 model_changed
@@ -625,6 +647,19 @@ pub async fn patch_session(
                 session.messages.len(),
                 model_changed.get(),
                 reasoning_changed.get(),
+            );
+        }
+        if let Some((previous, effective)) = permission_transition.get() {
+            tracing::info!(
+                telemetry_event = "session.permission_mode.transition",
+                session_id = %session_id,
+                previous_mode = previous.as_str(),
+                requested_mode = requested_permission_mode
+                    .map(bamboo_domain::SessionPermissionMode::as_str)
+                    .unwrap_or("unchanged"),
+                effective_mode = effective.as_str(),
+                transitioned_at = %chrono::Utc::now().to_rfc3339(),
+                "session permission mode changed"
             );
         }
 
@@ -703,6 +738,85 @@ mod tests {
             label: None,
             git_common_dir: None,
         }
+    }
+
+    #[actix_web::test]
+    async fn permission_mode_auto_persists_and_is_indexed_distinctly() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({"permission_mode": "auto"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["session"]["permission_mode"], "auto");
+        assert_eq!(body["session"]["bypass_permissions"], true);
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        let runtime = persisted.agent_runtime_state.expect("runtime state");
+        assert_eq!(
+            runtime.effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+        let indexed = state
+            .session_store
+            .get_index_entry(&id)
+            .await
+            .expect("index entry");
+        assert_eq!(
+            indexed.permission_mode,
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+    }
+
+    #[actix_web::test]
+    async fn permission_patch_rejects_ambiguous_new_and_legacy_fields() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({
+                    "permission_mode": "auto",
+                    "bypass_permissions": true
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert!(persisted.agent_runtime_state.is_none());
     }
 
     async fn seed_session(

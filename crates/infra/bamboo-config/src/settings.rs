@@ -17,8 +17,12 @@ pub enum PermissionMode {
     AcceptEdits,
     /// Don't ask mode: auto-deny unless pre-approved by whitelist.
     DontAsk,
-    /// Bypass all permission checks (dangerous, intended for CI/testing only).
+    /// Skip ordinary approval checks. Hard-dangerous and always-ask operations
+    /// can still require confirmation.
     BypassPermissions,
+    /// Never emit an approval prompt. Explicit policy and platform denials are
+    /// still enforced.
+    Auto,
 }
 
 impl PermissionMode {
@@ -28,7 +32,10 @@ impl PermissionMode {
             PermissionMode::Plan => "Plan mode: read-only, no mutations allowed",
             PermissionMode::AcceptEdits => "Accept edits: auto-approve file writes",
             PermissionMode::DontAsk => "Don't ask: auto-deny unless whitelisted",
-            PermissionMode::BypassPermissions => "Bypass: skip all permission checks",
+            PermissionMode::BypassPermissions => {
+                "Bypass: skip ordinary checks; forced confirmations still apply"
+            }
+            PermissionMode::Auto => "Auto: never request approval; hard denials still apply",
         }
     }
 }
@@ -235,6 +242,7 @@ mod tests {
             PermissionMode::AcceptEdits,
             PermissionMode::DontAsk,
             PermissionMode::BypassPermissions,
+            PermissionMode::Auto,
         ];
         for mode in modes {
             let json = serde_json::to_string(&mode).unwrap();

@@ -211,8 +211,8 @@ pub trait ChildSessionPort: Send + Sync {
         child_id: &str,
     ) -> Result<Session, ChildSessionError>;
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError>;
-    /// Save a child session whose `agent_runtime_state` posture flags
-    /// (`bypass_permissions` / `no_human_approver`) the caller just set
+    /// Save a child session whose `agent_runtime_state` posture
+    /// (`permission_mode` / `no_human_approver`) the caller just set
     /// authoritatively (the #74 resident-reuse re-seed) — persists them as-is
     /// instead of adopting the child's stale on-disk value, unlike
     /// [`Self::save_child_session`], which protects a concurrent `PATCH` to a

@@ -701,10 +701,14 @@ impl ActorChildRunner {
         // is a bypassed parent and installs the off-loop model-reviewer for its
         // children's forced-ask actions (Phase 6, Part B). The child session
         // already carries the inherited flag (create_child_action seeds it).
-        spec.capabilities.bypass = session
+        let permission_mode = session
             .agent_runtime_state
             .as_ref()
-            .is_some_and(|s| s.bypass_permissions);
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        spec.capabilities.bypass = permission_mode == bamboo_domain::SessionPermissionMode::Bypass;
+        spec.capabilities.auto_approve_permissions =
+            permission_mode == bamboo_domain::SessionPermissionMode::Auto;
         // #73: propagate "no interactive human approver" (headless / scheduled /
         // deployed root, inherited by the child session). When set, the worker's
         // per-run approval proxy model-reviews a gated action locally instead of
@@ -904,6 +908,11 @@ impl ExternalChildRunner for ActorChildRunner {
             ));
         }
         let project_id = project_id_for_actor_run(session)?;
+        let permission_mode = session
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
         // Policy is captured per activation (not only when a worker is
         // provisioned), so reused local workers and resident remote/broker
         // workers observe the latest durable revision and bypass flag at the
@@ -913,10 +922,10 @@ impl ExternalChildRunner for ActorChildRunner {
                 .ok()
                 .map(|policy| PermissionPolicyContext {
                     revision: config.policy_revision(),
-                    bypass_permissions: session
-                        .agent_runtime_state
-                        .as_ref()
-                        .is_some_and(|state| state.bypass_permissions),
+                    bypass_permissions: permission_mode
+                        == bamboo_domain::SessionPermissionMode::Bypass,
+                    auto_approve_permissions: permission_mode
+                        == bamboo_domain::SessionPermissionMode::Auto,
                     session_id: session.id.clone(),
                     workspace_path: session.workspace.clone(),
                     inherit_session_grants: false,
@@ -3675,61 +3684,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_spec_preserves_inherited_bypass_for_child_worker() {
+    async fn build_spec_preserves_exact_inherited_permission_mode_for_child_worker() {
         // Exercise the real creation path instead of pre-seeding the child by
-        // hand: a bypassed parent's posture must survive both child creation and
-        // the actor provisioning boundary.
-        let runner = bogus_runner(HashMap::new());
-        let mut parent = Session::new("parent-bypass", "test-model");
-        parent
-            .agent_runtime_state
-            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-            .bypass_permissions = true;
-        let workspace = tempfile::tempdir().expect("workspace fixture");
-        let port = RecordingChildSessionPort::default();
-        let child_id = format!("child-bypass-{}", uuid::Uuid::new_v4());
-        crate::session_app::child_session::create_child_action(
-            &port,
-            crate::session_app::child_session::CreateChildInput {
-                parent_session: parent,
-                child_id: child_id.clone(),
-                title: "Bypassed child".to_string(),
-                responsibility: "Run ordinary commands".to_string(),
-                assignment_prompt: "run an ordinary command".to_string(),
-                subagent_type: "explorer".to_string(),
-                workspace: workspace.path().to_string_lossy().into_owned(),
-                workspace_source: crate::project_context::WorkspaceSource::Explicit,
-                model_override: None,
-                model_ref_override: None,
-                runtime_metadata: HashMap::new(),
-                auto_run: false,
-                reasoning_effort: None,
-                lifecycle: None,
-                resident_name: None,
-                resident_context: None,
-                disabled_tools: None,
-                context_fork: None,
-            },
-        )
-        .await
-        .expect("create inherited-bypass child");
-        let child = port.saved_child();
-
-        assert!(
-            child
+        // hand: both legacy Bypass and zero-prompt Auto must survive child
+        // creation and the actor provisioning boundary without collapsing.
+        for (label, mode) in [
+            ("bypass", bamboo_domain::SessionPermissionMode::Bypass),
+            ("auto", bamboo_domain::SessionPermissionMode::Auto),
+        ] {
+            let runner = bogus_runner(HashMap::new());
+            let mut parent = Session::new(format!("parent-{label}"), "test-model");
+            parent
                 .agent_runtime_state
-                .as_ref()
-                .is_some_and(|state| state.bypass_permissions),
-            "create_child_action must inherit bypass from the parent"
-        );
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                .set_permission_mode(mode);
+            let workspace = tempfile::tempdir().expect("workspace fixture");
+            let port = RecordingChildSessionPort::default();
+            let child_id = format!("child-{label}-{}", uuid::Uuid::new_v4());
+            crate::session_app::child_session::create_child_action(
+                &port,
+                crate::session_app::child_session::CreateChildInput {
+                    parent_session: parent,
+                    child_id: child_id.clone(),
+                    title: format!("{label} child"),
+                    responsibility: "Run ordinary commands".to_string(),
+                    assignment_prompt: "run an ordinary command".to_string(),
+                    subagent_type: "explorer".to_string(),
+                    workspace: workspace.path().to_string_lossy().into_owned(),
+                    workspace_source: crate::project_context::WorkspaceSource::Explicit,
+                    model_override: None,
+                    model_ref_override: None,
+                    runtime_metadata: HashMap::new(),
+                    auto_run: false,
+                    reasoning_effort: None,
+                    lifecycle: None,
+                    resident_name: None,
+                    resident_context: None,
+                    disabled_tools: None,
+                    context_fork: None,
+                },
+            )
+            .await
+            .expect("create inherited-permission child");
+            let child = port.saved_child();
 
-        let spec = runner.build_spec(&child, &job_for(&child_id));
+            assert_eq!(
+                child
+                    .agent_runtime_state
+                    .as_ref()
+                    .map(bamboo_domain::AgentRuntimeState::effective_permission_mode),
+                Some(mode),
+                "create_child_action must inherit {label} from the parent"
+            );
 
-        assert!(spec.capabilities.bypass, "child worker must inherit bypass");
-        assert!(
-            spec.capabilities.enforce_permissions,
-            "forced-ask evaluation must remain active under bypass"
-        );
+            let spec = runner.build_spec(&child, &job_for(&child_id));
+
+            assert_eq!(
+                spec.capabilities.bypass,
+                mode == bamboo_domain::SessionPermissionMode::Bypass
+            );
+            assert_eq!(
+                spec.capabilities.auto_approve_permissions,
+                mode == bamboo_domain::SessionPermissionMode::Auto
+            );
+            assert!(
+                spec.capabilities.enforce_permissions,
+                "policy evaluation must remain active under {label}"
+            );
+        }
     }
 
     #[tokio::test]

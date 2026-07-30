@@ -78,6 +78,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                 permission_policy: Some(PermissionPolicyContext {
                     revision: 1,
                     bypass_permissions: false,
+                    auto_approve_permissions: false,
                     session_id: "manual-codex-app-server".to_string(),
                     workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
                     inherit_session_grants: false,
@@ -128,6 +129,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                 permission_policy: Some(PermissionPolicyContext {
                     revision: 2,
                     bypass_permissions: false,
+                    auto_approve_permissions: false,
                     session_id: "manual-codex-app-server".to_string(),
                     workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
                     inherit_session_grants: false,

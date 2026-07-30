@@ -128,6 +128,10 @@ pub struct Capabilities {
     /// an LLM reasonableness check instead of a blind pass.
     #[serde(default)]
     pub bypass: bool,
+    /// Stronger zero-prompt permission posture. Kept separate from `bypass`
+    /// because legacy bypass still routes forced confirmations to an approver.
+    #[serde(default)]
+    pub auto_approve_permissions: bool,
     /// Whether this run has NO interactive human approver (headless `-p`,
     /// scheduled jobs, deployed broker-agents — propagated from the unattended
     /// root). #73: when true, the worker's per-run `ApprovalProxy` decides a
@@ -566,6 +570,7 @@ mod tests {
             nested_spawn: false,
             max_spawn_depth: None,
             bypass: false,
+            auto_approve_permissions: false,
             no_human_approver: false,
             guardian_read_only: false,
         };

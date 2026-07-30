@@ -286,6 +286,36 @@ pub struct PlanModeState {
     pub status: PlanModeStatus,
 }
 
+/// Session-scoped permission behavior.
+///
+/// `Bypass` preserves the existing behavior: ordinary approval gates are
+/// skipped, while hard-dangerous and explicitly configured always-ask
+/// operations can still require confirmation. `Auto` is the stronger,
+/// explicitly selected mode: no approval request is emitted, while hard policy
+/// denials (for example platform or explicit deny rules) remain denials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPermissionMode {
+    #[default]
+    Default,
+    Bypass,
+    Auto,
+}
+
+impl SessionPermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bypass => "bypass",
+            Self::Auto => "auto",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level state
 // ---------------------------------------------------------------------------
@@ -330,14 +360,18 @@ pub struct AgentRuntimeState {
     pub stop_hook_forced_continuations: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<PlanModeState>,
-    /// When `true`, this session skips all tool permission checks (the
-    /// "bypass permissions" mode). Scoped to a single session so concurrent
-    /// sessions are unaffected; persisted in `runtime.json`.
+    /// First-class session permission mode. Omitted for old/default sessions so
+    /// existing runtime files remain compact and backward-compatible.
+    #[serde(default, skip_serializing_if = "SessionPermissionMode::is_default")]
+    pub permission_mode: SessionPermissionMode,
+    /// Legacy compatibility mirror. Old runtime files with `true` are read as
+    /// `Bypass`, never `Auto`; new writes keep this true for either non-default
+    /// mode so older clients do not misrepresent an active permissive mode.
     #[serde(default)]
     pub bypass_permissions: bool,
     /// When `true`, this run has NO interactive human approver — a headless
     /// `-p` run, a scheduled job, or a deployed broker-agent. #73: child
-    /// sub-agents inherit it (alongside `bypass_permissions`), and a sub-agent's
+    /// sub-agents inherit it (alongside `permission_mode`), and a sub-agent's
     /// gated action is then decided by the off-loop model-reviewer locally
     /// instead of escalating to a human who will never answer. Interactive
     /// sessions leave it `false` so approvals reach the human as usual.
@@ -364,9 +398,26 @@ impl AgentRuntimeState {
             hook_contexts: Vec::new(),
             stop_hook_forced_continuations: 0,
             plan_mode: None,
+            permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             no_human_approver: false,
         }
+    }
+
+    /// Resolve the new typed mode with the legacy boolean as a bounded fallback.
+    pub fn effective_permission_mode(&self) -> SessionPermissionMode {
+        if self.permission_mode == SessionPermissionMode::Default && self.bypass_permissions {
+            SessionPermissionMode::Bypass
+        } else {
+            self.permission_mode
+        }
+    }
+
+    /// Update the typed mode and its legacy compatibility mirror atomically on
+    /// the in-memory runtime state.
+    pub fn set_permission_mode(&mut self, mode: SessionPermissionMode) {
+        self.permission_mode = mode;
+        self.bypass_permissions = mode != SessionPermissionMode::Default;
     }
 }
 
@@ -389,6 +440,7 @@ impl Default for AgentRuntimeState {
             hook_contexts: Vec::new(),
             stop_hook_forced_continuations: 0,
             plan_mode: None,
+            permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             no_human_approver: false,
         }
@@ -454,6 +506,38 @@ mod tests {
         assert_eq!(state.status, AgentStatusState::Idle);
         assert!(state.suspension.is_none());
         assert_eq!(state.round.current_round, 0);
+        assert_eq!(
+            state.effective_permission_mode(),
+            SessionPermissionMode::Default
+        );
+    }
+
+    #[test]
+    fn legacy_bypass_boolean_maps_only_to_bypass() {
+        let json = r#"{"version":1,"run_id":"old-run","status":"idle","bypass_permissions":true}"#;
+        let state: AgentRuntimeState = serde_json::from_str(json).unwrap();
+
+        assert_eq!(state.permission_mode, SessionPermissionMode::Default);
+        assert_eq!(
+            state.effective_permission_mode(),
+            SessionPermissionMode::Bypass
+        );
+    }
+
+    #[test]
+    fn auto_mode_round_trips_without_legacy_ambiguity() {
+        let mut state = AgentRuntimeState::new("run-auto");
+        state.set_permission_mode(SessionPermissionMode::Auto);
+
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains(r#""permission_mode":"auto""#));
+        assert!(json.contains(r#""bypass_permissions":true"#));
+
+        let restored: AgentRuntimeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
     }
 
     #[test]

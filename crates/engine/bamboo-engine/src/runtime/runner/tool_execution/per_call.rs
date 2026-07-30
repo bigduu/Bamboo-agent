@@ -223,7 +223,9 @@ pub(super) async fn execute_tool_call_only(
                     AgentHookPoint::BeforeToolExecution,
                     hook_outcome.injected_contexts,
                 );
-                if let Some(outcome) =
+                if ctx.session_flags.auto_approve_permissions {
+                    permission_override = Some(bamboo_tools::HookPermissionOverride::Allow);
+                } else if let Some(outcome) =
                     hook_ask_outcome(ctx.tool_call, ctx.config, session, runtime_state, &args).await
                 {
                     let end_event = match &outcome.result {
@@ -396,6 +398,8 @@ async fn hook_ask_outcome(
         reason_code: bamboo_tools::permission::PermissionReasonCode::ConfiguredAlwaysAsk,
         effective_mode: config.permission_mode.unwrap_or_default(),
         bypass_requested: runtime_state.bypass_permissions,
+        auto_approve_requested: runtime_state.effective_permission_mode()
+            == bamboo_domain::SessionPermissionMode::Auto,
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),

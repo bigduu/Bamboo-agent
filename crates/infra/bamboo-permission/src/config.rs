@@ -1266,15 +1266,19 @@ impl PermissionConfig {
     /// always-ask rules.
     pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
         let configured_mode = self.mode();
-        let effective_mode = if input.bypass_requested {
-            PermissionMode::BypassPermissions
-        } else {
-            configured_mode
-        };
+        let effective_mode =
+            if input.auto_approve_requested || configured_mode == PermissionMode::Auto {
+                PermissionMode::Auto
+            } else if input.bypass_requested {
+                PermissionMode::BypassPermissions
+            } else {
+                configured_mode
+            };
         let effective_policy = EffectivePermissionPolicy {
             revision: self.policy_revision(),
             mode: effective_mode,
             bypass_requested: input.bypass_requested,
+            auto_approve_requested: input.auto_approve_requested,
         };
 
         let deny = |code, message: String, matched_rule| PermissionOutcome::Deny {
@@ -1323,6 +1327,17 @@ impl PermissionConfig {
         {
             return PermissionOutcome::Allow {
                 source: PermissionDecisionSource::OneShot,
+                effective_policy,
+            };
+        }
+
+        // Auto is deliberately ordered after all hard/explicit denials and the
+        // exact one-shot receipt, but before every source of an approval
+        // request. It therefore produces zero prompts without weakening
+        // platform, durable, session, or legacy deny rules.
+        if input.auto_approve_requested || configured_mode == PermissionMode::Auto {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
                 effective_policy,
             };
         }
@@ -1420,6 +1435,7 @@ impl PermissionConfig {
                     effective_policy,
                 };
             }
+            PermissionMode::Auto | PermissionMode::BypassPermissions => {}
             _ => {}
         }
 
@@ -1500,6 +1516,7 @@ impl PermissionConfig {
             reason_code,
             effective_mode,
             bypass_requested: input.bypass_requested,
+            auto_approve_requested: input.auto_approve_requested,
             policy_revision: self.policy_revision(),
             matched_rule,
             allowed_decisions,
@@ -2453,6 +2470,7 @@ mod integration_tests {
         assert!(!PermissionMode::AcceptEdits.description().is_empty());
         assert!(!PermissionMode::DontAsk.description().is_empty());
         assert!(!PermissionMode::BypassPermissions.description().is_empty());
+        assert!(!PermissionMode::Auto.description().is_empty());
     }
 
     #[test]
@@ -2781,6 +2799,7 @@ mod integration_tests {
             operation_summary: format!("execute {resource}"),
             risk_level: RiskLevel::High,
             bypass_requested,
+            auto_approve_requested: false,
             platform_hard_deny: None,
             consume_once: true,
             supported_decisions: crate::policy::PermissionDecisionKind::all_supported(),
@@ -2817,6 +2836,77 @@ mod integration_tests {
                     ..
                 },
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn auto_skips_forced_asks_but_never_overrides_hard_denials() {
+        let config = PermissionConfig::new();
+        config.set_ask_rules(["Bash(eval *)".to_string()]);
+
+        let mut auto = evaluation("auto", "hard", "eval 'echo allowed'", false);
+        auto.auto_approve_requested = true;
+        assert!(matches!(
+            config.evaluate(auto.clone()),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
+                effective_policy: EffectivePermissionPolicy {
+                    mode: PermissionMode::Auto,
+                    auto_approve_requested: true,
+                    ..
+                }
+            }
+        ));
+
+        auto.platform_hard_deny = Some("sandbox policy rejected operation".to_string());
+        assert!(matches!(
+            config.evaluate(auto.clone()),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::PlatformHardDeny,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        auto.platform_hard_deny = None;
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "eval 'echo allowed'",
+            false,
+        ));
+        assert!(matches!(
+            config.evaluate(auto),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::ExplicitDeny,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn configured_auto_mode_uses_the_same_zero_prompt_precedence() {
+        let config = PermissionConfig::new();
+        config.set_mode(PermissionMode::Auto);
+
+        assert!(matches!(
+            config.evaluate(evaluation(
+                "auto",
+                "configured",
+                "eval 'echo configured'",
+                true
+            )),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
+                effective_policy: EffectivePermissionPolicy {
+                    mode: PermissionMode::Auto,
+                    ..
+                }
             }
         ));
     }

@@ -176,7 +176,7 @@ impl LockedSessionStore {
             apply_authoritative_metadata(session, &latest);
             // The control-plane sidecar carries `agent_runtime_state`, so a
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
-            adopt_disk_bypass_permissions(session, &latest);
+            adopt_disk_permission_mode(session, &latest);
         }
         let result = self.storage.save_runtime_state(session).await;
         publish(session);
@@ -234,12 +234,12 @@ impl LockedSessionStore {
     /// This is the locked equivalent of [`merge_save_session`]; prefer it for
     /// server-side paths where an authoritative write may race with this save.
     ///
-    /// Adopts the on-disk `bypass_permissions` so a running loop's save can't
-    /// revert a concurrent `PATCH /sessions` flip (#540). Callers that are
-    /// themselves the authoritative writer of that flag — the parent seeding a
-    /// child's posture (#74) — must use
+    /// Adopts the on-disk typed permission mode so a running loop's save can't
+    /// revert a concurrent `PATCH /sessions` transition (#540/#770). Callers
+    /// that are themselves the authoritative writer of that posture — the
+    /// parent seeding a child's mode (#74) — must use
     /// [`Self::save_runtime_authoritative_flags`] instead, which persists the
-    /// in-memory flag as-is.
+    /// in-memory mode as-is.
     pub async fn merge_save_runtime(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime_and_publish(session, |_, _| {})
             .await
@@ -307,7 +307,7 @@ impl LockedSessionStore {
                 session.messages.len(),
             );
             apply_authoritative_metadata(session, latest);
-            adopt_disk_bypass_permissions(session, latest);
+            adopt_disk_permission_mode(session, latest);
         }
 
         let result = self.storage.save_session(session).await;
@@ -316,7 +316,7 @@ impl LockedSessionStore {
     }
 
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
-    /// `bypass_permissions` — the caller's in-memory value is authoritative and
+    /// permission mode — the caller's in-memory value is authoritative and
     /// persists as-is.
     ///
     /// For parent-side control writes to a child session (e.g. the #74
@@ -388,10 +388,11 @@ impl LockedSessionStore {
             }
             bamboo_domain::merge_session_inbox_admission(session, latest);
             // Never let a running loop's save revert a concurrent mid-run
-            // `PATCH /sessions {bypass_permissions}` flip. #540. Skipped for
+            // `PATCH /sessions {permission_mode|bypass_permissions}` transition.
+            // #540/#770. Skipped for
             // authoritative flag writers (`save_runtime_authoritative_flags`).
             if adopt_bypass {
-                adopt_disk_bypass_permissions(session, latest);
+                adopt_disk_permission_mode(session, latest);
             }
         }
         let result = self.storage.save_session(session).await;
@@ -533,40 +534,40 @@ async fn merge_authoritative_metadata_into_stale(
         apply_authoritative_metadata(session, &latest);
         bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
         bamboo_domain::merge_session_inbox_admission(session, &latest);
-        adopt_disk_bypass_permissions(session, &latest);
+        adopt_disk_permission_mode(session, &latest);
     }
 }
 
-/// Adopt the on-disk `agent_runtime_state.bypass_permissions` into the session
+/// Adopt the on-disk typed permission mode into the session
 /// about to be saved.
 ///
-/// `PATCH /sessions {bypass_permissions}` is the SOLE authoritative writer of
-/// this flag (a running loop only carries it forward from run start). Without
-/// this, a runtime save from an in-flight run — which holds the run-start value
-/// — silently reverts a concurrent mid-run flip on disk. Unlike the metadata
-/// group this is NOT version-gated: the PATCH writes via `update_runtime_config`,
-/// which does not bump `metadata_version`. #540.
-fn adopt_disk_bypass_permissions(session: &mut Session, latest: &Session) {
-    // A disk copy with NO runtime state at all carries no authoritative bypass
+/// `PATCH /sessions {permission_mode|bypass_permissions}` is the authoritative
+/// writer of this posture (a running loop only carries it forward from run
+/// start). Without this, a runtime save from an in-flight run — which holds the
+/// run-start value — silently reverts a concurrent mid-run transition on disk.
+/// Unlike the metadata group this is NOT version-gated: the PATCH writes via
+/// `update_runtime_config`, which does not bump `metadata_version`. #540/#770.
+fn adopt_disk_permission_mode(session: &mut Session, latest: &Session) {
+    // A disk copy with NO runtime state at all carries no authoritative mode
     // value — treat it as "unknown" and leave the in-memory flag untouched,
     // rather than forcing it OFF (which would silently disable a legitimately
     // bypassed run on any backend/path that doesn't round-trip the field). #540.
-    let Some(disk_bypass) = latest
+    let Some(disk_mode) = latest
         .agent_runtime_state
         .as_ref()
-        .map(|state| state.bypass_permissions)
+        .map(|state| state.effective_permission_mode())
     else {
         return;
     };
     match session.agent_runtime_state.as_mut() {
-        Some(state) => state.bypass_permissions = disk_bypass,
+        Some(state) => state.set_permission_mode(disk_mode),
         // No runtime state in memory and disk says "off" → nothing to adopt;
         // avoid allocating a default state just to store `false`.
-        None if disk_bypass => {
-            session
+        None if disk_mode != bamboo_domain::SessionPermissionMode::Default => {
+            let state = session
                 .agent_runtime_state
-                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .bypass_permissions = true;
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+            state.set_permission_mode(disk_mode);
         }
         None => {}
     }
@@ -1082,6 +1083,45 @@ mod tests {
             .agent_runtime_state
             .as_ref()
             .is_some_and(|s| s.bypass_permissions));
+    }
+
+    // #770: the generalized disk-wins path must preserve Auto as a distinct
+    // typed mode rather than collapsing it into the legacy bypass boolean.
+    #[tokio::test]
+    async fn merge_save_runtime_adopts_disk_auto_permission_mode() {
+        use bamboo_domain::{AgentRuntimeState, SessionPermissionMode};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-auto";
+
+        storage.save_session(&fresh(session_id)).await.unwrap();
+        let mut loop_snapshot = storage.load_session(session_id).await.unwrap().unwrap();
+        loop_snapshot.agent_runtime_state = Some(AgentRuntimeState::default());
+
+        store
+            .update_runtime_config(session_id, |session| {
+                session
+                    .agent_runtime_state
+                    .get_or_insert_with(AgentRuntimeState::default)
+                    .set_permission_mode(SessionPermissionMode::Auto);
+            })
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        store.merge_save_runtime(&mut loop_snapshot).await.unwrap();
+
+        let durable = storage.load_session(session_id).await.unwrap().unwrap();
+        for state in [
+            durable.agent_runtime_state.as_ref(),
+            loop_snapshot.agent_runtime_state.as_ref(),
+        ] {
+            assert_eq!(
+                state.map(AgentRuntimeState::effective_permission_mode),
+                Some(SessionPermissionMode::Auto)
+            );
+        }
     }
 
     // The reverse direction: a PATCH turning bypass OFF must also stick against

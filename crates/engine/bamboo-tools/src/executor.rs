@@ -393,6 +393,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let operation_summary = context.operation_description.clone();
                 let risk_level = context.risk_level();
                 let permission_type = context.permission_type;
+                let platform_hard_deny = permission_checker.hard_deny_reason(&context);
                 let config = permission_checker.permission_config();
                 let proxy = crate::approval::current_approval_proxy();
                 let request = if let Some(config) = config.as_ref() {
@@ -424,7 +425,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                         operation_summary: operation_summary.clone(),
                         risk_level,
                         bypass_requested: ctx.bypass_permissions,
-                        platform_hard_deny: None,
+                        auto_approve_requested: ctx.auto_approve_permissions,
+                        platform_hard_deny,
                         consume_once: true,
                         supported_decisions,
                     }) {
@@ -446,13 +448,18 @@ impl ToolExecutor for BuiltinToolExecutor {
                 } else {
                     // Compatibility path for custom checkers that do not expose a
                     // typed config. It remains one-shot only and fail-closed.
+                    if let Some(reason) = platform_hard_deny {
+                        return Err(ToolError::Execution(reason));
+                    }
                     let force_ask =
                         permission_checker.requires_forced_confirmation(&tool_name, &args);
                     let hook_allows = matches!(
                         hook_permission_override,
                         Some(crate::HookPermissionOverride::Allow)
                     );
-                    if (ctx.bypass_permissions || hook_allows) && !force_ask {
+                    if ctx.auto_approve_permissions
+                        || ((ctx.bypass_permissions || hook_allows) && !force_ask)
+                    {
                         continue;
                     }
                     let decision = if force_ask {
@@ -489,6 +496,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                                 },
                                 effective_mode: bamboo_config::settings::PermissionMode::Default,
                                 bypass_requested: ctx.bypass_permissions,
+                                auto_approve_requested: ctx.auto_approve_permissions,
                                 policy_revision: 0,
                                 matched_rule: None,
                                 allowed_decisions:
@@ -1229,6 +1237,7 @@ mod tests {
             event_tx: Some(&event_tx),
             available_tool_schemas: None,
             bypass_permissions: true,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1271,6 +1280,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1319,6 +1329,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1365,6 +1376,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1413,6 +1425,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1445,6 +1458,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1461,6 +1475,89 @@ mod tests {
         );
         assert_eq!(approved_requests.load(Ordering::SeqCst), 1);
         assert_eq!(fs::read_to_string(approved_path).await.unwrap(), "approved");
+    }
+
+    #[tokio::test]
+    async fn auto_executes_forced_ask_without_proxy_or_human_event() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(BashTool::new())
+            .expect("register Bash tool")
+            .with_permission_checker(checker)
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto-forced.txt");
+        let command = format!("eval 'printf auto > {}'", path.display());
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let proxy: Arc<dyn crate::approval::ApprovalProxy> = Arc::new(RecordingApprovalProxy {
+            requests: approval_requests.clone(),
+            approve: false,
+        });
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let call = make_tool_call("Bash", json!({"command": command}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("s-auto"),
+            tool_call_id: &call.id,
+            event_tx: Some(&event_tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = crate::approval::with_approval_proxy(
+            Some(proxy),
+            executor.execute_with_context(&call, ctx),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Auto should execute directly: {result:?}");
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "auto");
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 0);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "Auto must not emit an interactive approval request"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_never_overrides_guardian_read_only_hard_deny() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        let base: Arc<dyn crate::permission::PermissionChecker> = Arc::new(
+            crate::permission::ConfigPermissionChecker::new(config.clone()),
+        );
+        let checker = Arc::new(crate::permission::GuardianReadOnlyChecker::new(base));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(BashTool::new())
+            .expect("register Bash tool")
+            .with_permission_checker(checker)
+            .build();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guardian-mutation.txt");
+        let command = format!("printf blocked > {}", path.display());
+        let call = make_tool_call("Bash", json!({"command": command}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("guardian-auto"),
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let error = executor
+            .execute_with_context(&call, ctx)
+            .await
+            .expect_err("Auto must retain Guardian read-only authority");
+
+        assert!(error.to_string().contains("Guardian reviewer is read-only"));
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -1486,6 +1583,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1520,6 +1618,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: true,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1558,6 +1657,7 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1641,6 +1741,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1679,6 +1780,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1751,6 +1853,7 @@ mod tests {
                     event_tx: Some(&tx),
                     available_tool_schemas: None,
                     bypass_permissions: false,
+                    auto_approve_permissions: false,
                     can_async_resume: false,
                     bash_completion_sink: None,
                     pre_parsed_args: None,
@@ -1868,6 +1971,7 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: pre_parsed,

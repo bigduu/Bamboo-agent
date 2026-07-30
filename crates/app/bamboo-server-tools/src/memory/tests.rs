@@ -39,6 +39,7 @@ fn test_context(session_id: &str) -> ToolCtx {
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        auto_approve_permissions: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,

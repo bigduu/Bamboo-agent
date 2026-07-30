@@ -610,6 +610,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                         event_tx: Some(&mpsc_tx),
                         available_tool_schemas: None,
                         bypass_permissions: false,
+                        auto_approve_permissions: false,
                         can_async_resume: false,
                         bash_completion_sink: None,
                         pre_parsed_args: None,

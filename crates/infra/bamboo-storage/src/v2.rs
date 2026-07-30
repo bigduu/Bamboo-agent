@@ -216,11 +216,14 @@ pub struct SessionIndexEntry {
     /// APIs can surface plan mode without loading every session.json.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<bamboo_domain::PlanModeState>,
-    /// Per-session "bypass permissions" toggle mirrored into the index from
-    /// `session.agent_runtime_state.bypass_permissions`, so the session-list API
-    /// can surface it without loading every session.json.
+    /// Compatibility indicator mirrored from the effective permission mode, so
+    /// old session-list clients still see a permissive session without loading
+    /// every session.json. True for both Bypass and Auto.
     #[serde(default)]
     pub bypass_permissions: bool,
+    /// Typed permission mode mirrored from the session runtime state.
+    #[serde(default)]
+    pub permission_mode: bamboo_domain::SessionPermissionMode,
     /// Last known run status for this session
     /// ("pending" | "running" | "completed" | "error" | "cancelled" | "skipped").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -913,10 +916,12 @@ impl SessionStoreV2 {
             .agent_runtime_state
             .as_ref()
             .and_then(|state| state.plan_mode.clone());
-        let bypass_permissions = session
+        let permission_mode = session
             .agent_runtime_state
             .as_ref()
-            .is_some_and(|state| state.bypass_permissions);
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        let bypass_permissions = permission_mode != bamboo_domain::SessionPermissionMode::Default;
         // Placement (which machine the agent runs on) is stamped by the spawn
         // path into `metadata["placement"]` as a JSON `{kind,host}` object for
         // remote/deployed children; local sessions leave it unset and the DTO
@@ -959,6 +964,7 @@ impl SessionStoreV2 {
                     has_pending_question: session.has_pending_question(),
                     plan_mode,
                     bypass_permissions,
+                    permission_mode,
                     last_run_status,
                     last_run_error,
                     token_usage: session.token_usage.clone(),

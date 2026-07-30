@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_gate_blocks_write_in_pipeline() {
+    async fn plan_mode_gate_remains_authoritative_under_auto() {
         use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
         use bamboo_agent_core::Session;
         use bamboo_config::PermissionMode;
@@ -1052,6 +1052,7 @@ mod tests {
 
         let mut state = RoundExecutionState::default();
         let mut runtime_state = AgentRuntimeState::new("test-session");
+        runtime_state.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
         let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
 
         let tool_call = tool_call_with_args(
