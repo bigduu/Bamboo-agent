@@ -20,6 +20,9 @@ use bamboo_storage::LockedSessionStore;
 
 use crate::{read_cached_session, SessionCache};
 
+#[cfg(test)]
+type PostDurableHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Framework-owned coordinator over a session's cache / storage / persistence
 /// tiers. Cheap to clone (all fields are `Arc`).
 #[derive(Clone)]
@@ -27,6 +30,8 @@ pub struct SessionRepository {
     cache: SessionCache,
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
+    #[cfg(test)]
+    post_durable_hook: Option<PostDurableHook>,
 }
 
 impl SessionRepository {
@@ -39,6 +44,21 @@ impl SessionRepository {
             cache,
             storage,
             persistence,
+            #[cfg(test)]
+            post_durable_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_post_durable_hook(mut self, hook: PostDurableHook) -> Self {
+        self.post_durable_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn run_post_durable_hook(&self, operation: &str, marker: &str) {
+        if let Some(hook) = self.post_durable_hook.as_ref() {
+            hook(operation, marker);
         }
     }
 
@@ -261,6 +281,9 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     async fn save_runtime_control_plane(&self, session: &mut Session) -> std::io::Result<()> {
         let result = self.persistence.save_runtime_only(session).await;
 
+        #[cfg(test)]
+        self.run_post_durable_hook("save", &session.id);
+
         // A control-plane snapshot may intentionally carry no messages (for
         // example, child Task synchronization loads the root's runtime
         // sidecar). Publish its fresh runtime fields without replacing a
@@ -318,6 +341,9 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         if !updated {
             return Ok(false);
         }
+
+        #[cfg(test)]
+        self.run_post_durable_hook("task", version);
 
         // The durable transaction changed only Task-owned fields. Mirror that
         // same narrow patch into the cache so a concurrent round/status/child
@@ -407,7 +433,8 @@ mod tests {
     use bamboo_agent_core::storage::Storage;
     use chrono::Utc;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct MapStorage {
@@ -461,6 +488,212 @@ mod tests {
             session.id.clone(),
             Arc::new(parking_lot::RwLock::new(session.clone())),
         );
+    }
+
+    fn task_list(session_id: &str, title: &str) -> bamboo_domain::TaskList {
+        let now = Utc::now();
+        bamboo_domain::TaskList {
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn durable_cache_fence(
+        operation: &'static str,
+        marker: &'static str,
+    ) -> (
+        PostDurableHook,
+        tokio::sync::oneshot::Receiver<()>,
+        Arc<(Mutex<bool>, Condvar)>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let hook_release = release.clone();
+        let hook: PostDurableHook = Arc::new(move |actual_operation, actual_marker| {
+            if actual_operation != operation || actual_marker != marker {
+                return;
+            }
+            if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                started_tx.send(()).expect("fence observer still present");
+            }
+            let (released, wake) = &*hook_release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        });
+        (hook, started_rx, release)
+    }
+
+    fn release_fence(release: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, wake) = &**release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+
+    async fn assert_second_write_waits_for_cache_publish<T>(
+        first: tokio::task::JoinHandle<std::io::Result<T>>,
+        mut second: tokio::task::JoinHandle<std::io::Result<T>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    ) -> (T, T) {
+        let second_before_release =
+            tokio::time::timeout(Duration::from_millis(100), &mut second).await;
+        let completed_before_release = second_before_release.is_ok();
+        release_fence(&release);
+
+        let first = first
+            .await
+            .expect("first writer joins")
+            .expect("first writer succeeds");
+        let second = match second_before_release {
+            Ok(joined) => joined
+                .expect("second writer joins")
+                .expect("second writer succeeds"),
+            Err(_) => second
+                .await
+                .expect("second writer joins")
+                .expect("second writer succeeds"),
+        };
+        assert!(
+            !completed_before_release,
+            "the second write must remain behind the first write's durable-to-cache fence"
+        );
+        (first, second)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_task_patches_publish_cache_in_durable_order() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let (hook, first_durable, release) = durable_cache_fence("task", "1");
+        let repo = Arc::new(test_repo(storage.clone()).with_post_durable_hook(hook));
+        let id = "concurrent-task-cache-order";
+        let mut initial = Session::new(id, "model");
+        initial.set_task_list(task_list(id, "initial"));
+        initial.set_task_list_version_meta("0");
+        storage.save_session(&initial).await.unwrap();
+        cache_put(&repo, &initial);
+
+        let first_repo = repo.clone();
+        let first_task_list = task_list(id, "first");
+        let first = tokio::spawn(async move {
+            bamboo_domain::RuntimeSessionPersistence::update_task_list_control_plane(
+                first_repo.as_ref(),
+                id,
+                &first_task_list,
+                "1",
+            )
+            .await
+        });
+        first_durable.await.expect("first durable write reached");
+
+        let second_repo = repo.clone();
+        let second_task_list = task_list(id, "second");
+        let second = tokio::spawn(async move {
+            bamboo_domain::RuntimeSessionPersistence::update_task_list_control_plane(
+                second_repo.as_ref(),
+                id,
+                &second_task_list,
+                "2",
+            )
+            .await
+        });
+        let (first_updated, second_updated) =
+            assert_second_write_waits_for_cache_publish(first, second, release).await;
+        assert!(first_updated && second_updated);
+
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("cached root");
+        for (tier, session) in [("durable", durable), ("cache", cached)] {
+            assert_eq!(
+                session.task_list_version_meta().as_deref(),
+                Some("2"),
+                "{tier} must retain the second transaction"
+            );
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some("second"),
+                "{tier} must retain the second transaction"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn root_control_plane_save_and_child_task_patch_share_publish_order() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let (hook, root_durable, release) = durable_cache_fence("save", "root-control-plane-order");
+        let repo = Arc::new(test_repo(storage.clone()).with_post_durable_hook(hook));
+        let id = "root-control-plane-order";
+
+        let mut initial = Session::new(id, "model");
+        initial.add_message(bamboo_agent_core::Message::user("durable transcript"));
+        initial.set_task_list(task_list(id, "initial"));
+        initial.set_task_list_version_meta("0");
+        initial
+            .metadata
+            .insert("unrelated.runtime".to_string(), "keep".to_string());
+        storage.save_session(&initial).await.unwrap();
+        cache_put(&repo, &initial);
+
+        let root_repo = repo.clone();
+        let mut root_snapshot = initial.clone();
+        root_snapshot.set_task_list(task_list(id, "root"));
+        root_snapshot.set_task_list_version_meta("1");
+        let root_save = tokio::spawn(async move {
+            bamboo_domain::RuntimeSessionPersistence::save_runtime_control_plane(
+                root_repo.as_ref(),
+                &mut root_snapshot,
+            )
+            .await
+        });
+        root_durable.await.expect("root durable write reached");
+
+        let child_repo = repo.clone();
+        let child_task_list = task_list(id, "child");
+        let child_patch = tokio::spawn(async move {
+            bamboo_domain::RuntimeSessionPersistence::update_task_list_control_plane(
+                child_repo.as_ref(),
+                id,
+                &child_task_list,
+                "2",
+            )
+            .await
+            .map(|updated| {
+                assert!(updated, "root must exist");
+            })
+        });
+        assert_second_write_waits_for_cache_publish(root_save, child_patch, release).await;
+
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("cached root");
+        for (tier, session) in [("durable", durable), ("cache", cached)] {
+            assert_eq!(
+                session.task_list_version_meta().as_deref(),
+                Some("2"),
+                "{tier} must retain the child transaction"
+            );
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some("child"),
+                "{tier} must retain the child transaction"
+            );
+            assert_eq!(
+                session
+                    .metadata
+                    .get("unrelated.runtime")
+                    .map(String::as_str),
+                Some("keep"),
+                "{tier} must preserve unrelated runtime state"
+            );
+            assert_eq!(
+                session.messages.len(),
+                1,
+                "{tier} must preserve the transcript"
+            );
+        }
     }
 
     #[tokio::test]
