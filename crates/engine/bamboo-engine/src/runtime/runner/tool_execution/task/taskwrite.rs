@@ -82,59 +82,105 @@ pub(in crate::runtime::runner) async fn persist_shared_task_list(
     session_id: &str,
     task_list: &bamboo_domain::TaskList,
 ) {
-    if let Some(ref storage) = config.storage {
-        if let Some(ref persistence) = config.persistence {
-            if let Err(error) = persistence.save_runtime_session(session).await {
+    let Some(ref persistence) = config.persistence else {
+        return;
+    };
+
+    if let Err(error) = persistence.save_runtime_control_plane(session).await {
+        tracing::warn!(
+            "[{}] Failed to save session control-plane after Task update: {}",
+            session_id,
+            error
+        );
+    } else {
+        tracing::debug!(
+            "[{}] Session control-plane saved after Task update",
+            session_id
+        );
+    }
+
+    if shared_session_id == session.id {
+        return;
+    }
+
+    let Some(version) = session.task_list_version_meta() else {
+        tracing::warn!(
+            "[{}] Shared root Task update on {} has no task-list version",
+            session_id,
+            shared_session_id
+        );
+        return;
+    };
+
+    match persistence
+        .update_task_list_control_plane(shared_session_id, task_list, &version)
+        .await
+    {
+        Ok(true) => {
+            tracing::debug!(
+                "[{}] Shared root Task control-plane patched on {}",
+                session_id,
+                shared_session_id
+            );
+        }
+        Ok(false) => {
+            // Save-only legacy/custom persisters leave the default load hook at
+            // `None`, so the default atomic patch cannot find the root. Retain
+            // source-compatible behavior with an explicitly full snapshot and
+            // full save; this path must never feed a message-free sidecar
+            // snapshot into a full-save fallback.
+            let Some(ref storage) = config.storage else {
                 tracing::warn!(
-                    "[{}] Failed to save session after Task update: {}",
+                    "[{}] Root session {} unavailable through persistence and no storage fallback is configured",
                     session_id,
+                    shared_session_id
+                );
+                return;
+            };
+            let mut root_session = match storage.load_session(shared_session_id).await {
+                Ok(Some(root_session)) => root_session,
+                Ok(None) => {
+                    tracing::warn!(
+                        "[{}] Root session {} not found while syncing shared task list",
+                        session_id,
+                        shared_session_id
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[{}] Failed to load root session {} through storage fallback: {}",
+                        session_id,
+                        shared_session_id,
+                        error
+                    );
+                    return;
+                }
+            };
+            root_session.set_task_list(task_list.clone());
+            root_session.set_task_list_version_meta(version);
+            if let Err(error) = persistence.save_runtime_session(&mut root_session).await {
+                tracing::warn!(
+                    "[{}] Failed to full-save shared root Task fallback on {}: {}",
+                    session_id,
+                    shared_session_id,
                     error
                 );
             } else {
-                tracing::debug!("[{}] Session saved after Task update", session_id);
+                tracing::debug!(
+                    "[{}] Shared root Task full-save fallback completed on {}",
+                    session_id,
+                    shared_session_id
+                );
             }
-
-            if shared_session_id != session.id {
-                match storage.load_session(shared_session_id).await {
-                    Ok(Some(mut root_session)) => {
-                        root_session.set_task_list(task_list.clone());
-                        if let Some(version) = session.task_list_version_meta() {
-                            root_session.set_task_list_version_meta(version);
-                        }
-                        if let Err(error) =
-                            persistence.save_runtime_session(&mut root_session).await
-                        {
-                            tracing::warn!(
-                                "[{}] Failed to save shared root task list on {}: {}",
-                                session_id,
-                                shared_session_id,
-                                error
-                            );
-                        } else {
-                            tracing::debug!(
-                                "[{}] Shared root task list saved on {}",
-                                session_id,
-                                shared_session_id
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            "[{}] Root session {} not found while syncing shared task list",
-                            session_id,
-                            shared_session_id
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "[{}] Failed to load root session {} while syncing shared task list: {}",
-                            session_id,
-                            shared_session_id,
-                            error
-                        );
-                    }
-                }
-            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[{}] Failed to patch shared root Task control-plane on {}: {}",
+                session_id,
+                shared_session_id,
+                error
+            );
         }
     }
 }

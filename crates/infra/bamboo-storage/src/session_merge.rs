@@ -151,6 +151,26 @@ impl LockedSessionStore {
     /// Callers MUST NOT use this when they have appended messages: the in-memory
     /// `messages` are ignored by the sidecar and would not be persisted.
     pub async fn save_runtime_only(&self, session: &mut Session) -> std::io::Result<()> {
+        self.save_runtime_only_and_publish(session, |_| {}).await
+    }
+
+    /// Save the runtime control-plane and synchronously publish the committed
+    /// snapshot before releasing this session's serialization lock.
+    ///
+    /// `publish` must remain a short, non-blocking operation. Its synchronous
+    /// shape intentionally prevents callers from holding an in-memory cache
+    /// guard across an await. The callback also runs when the durable save
+    /// fails, preserving [`RuntimeSessionPersistence::save_runtime_control_plane`]
+    /// implementations that publish current runtime authorization state while
+    /// still returning the storage error.
+    pub async fn save_runtime_only_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         if let Ok(Some(latest)) = self.storage.load_runtime_control_plane(&session.id).await {
             apply_authoritative_metadata(session, &latest);
@@ -158,7 +178,36 @@ impl LockedSessionStore {
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
             adopt_disk_bypass_permissions(session, &latest);
         }
-        self.storage.save_runtime_state(session).await
+        let result = self.storage.save_runtime_state(session).await;
+        publish(session);
+        result
+    }
+
+    /// Atomically patch Task-owned control-plane fields and publish the saved
+    /// value before releasing this session's serialization lock.
+    ///
+    /// This couples durable commit order to cache publication order for
+    /// repository callers. The synchronous callback may take a cache guard but
+    /// cannot hold one across an await.
+    pub async fn update_task_list_control_plane_and_publish<F>(
+        &self,
+        session_id: &str,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+        publish: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
+            return Ok(false);
+        };
+        latest.set_task_list(task_list.clone());
+        latest.set_task_list_version_meta(version.to_string());
+        self.storage.save_runtime_state(&latest).await?;
+        publish(&latest);
+        Ok(true)
     }
 
     /// Authoritative metadata commit.
@@ -192,7 +241,26 @@ impl LockedSessionStore {
     /// [`Self::save_runtime_authoritative_flags`] instead, which persists the
     /// in-memory flag as-is.
     pub async fn merge_save_runtime(&self, session: &mut Session) -> std::io::Result<()> {
-        self.merge_save_runtime_inner(session, true).await
+        self.merge_save_runtime_and_publish(session, |_, _| {})
+            .await
+    }
+
+    /// Merge-save a runtime session and synchronously publish the resulting
+    /// snapshot before releasing its per-session serialization lock.
+    ///
+    /// The callback receives whether the durable save committed. It always runs
+    /// after the save attempt so repository callers can preserve their existing
+    /// cache-on-failure policy without reopening a durable-to-cache race.
+    pub async fn merge_save_runtime_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(session, true, publish)
+            .await
     }
 
     /// Persist an execute-boundary transcript checkpoint without allowing a
@@ -204,6 +272,24 @@ impl LockedSessionStore {
     /// latest transcript cannot be read would reintroduce the SHRINK hazard
     /// this checkpoint exists to prevent.
     pub async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.checkpoint_runtime_session_and_publish(session, |_, _| {})
+            .await
+    }
+
+    /// Checkpoint a runtime session and publish its reconciled snapshot before
+    /// releasing the same per-session serialization lock.
+    ///
+    /// The callback runs after the durable save attempt and receives its commit
+    /// status. A load failure returns before publication, matching the
+    /// checkpoint's fail-closed behavior.
+    pub async fn checkpoint_runtime_session_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
 
@@ -224,7 +310,9 @@ impl LockedSessionStore {
             adopt_disk_bypass_permissions(session, latest);
         }
 
-        self.storage.save_session(session).await
+        let result = self.storage.save_session(session).await;
+        publish(session, result.is_ok());
+        result
     }
 
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
@@ -239,14 +327,19 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.merge_save_runtime_inner(session, false).await
+        self.merge_save_runtime_inner_and_publish(session, false, |_, _| {})
+            .await
     }
 
-    async fn merge_save_runtime_inner(
+    async fn merge_save_runtime_inner_and_publish<F>(
         &self,
         session: &mut Session,
         adopt_bypass: bool,
-    ) -> std::io::Result<()> {
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
 
         // Single disk read serves BOTH the SHRINK diagnostic and the
@@ -301,7 +394,9 @@ impl LockedSessionStore {
                 adopt_disk_bypass_permissions(session, latest);
             }
         }
-        self.storage.save_session(session).await
+        let result = self.storage.save_session(session).await;
+        publish(session, result.is_ok());
+        result
     }
 
     /// Apply a config-only mutation to a session without ever clobbering its
@@ -323,13 +418,54 @@ impl LockedSessionStore {
     where
         F: FnOnce(&mut Session),
     {
+        self.update_runtime_config_and_publish(session_id, mutate, |_| {})
+            .await
+    }
+
+    /// Apply a config-only mutation and synchronously publish the saved
+    /// snapshot before releasing the session lock.
+    pub async fn update_runtime_config_and_publish<M, P>(
+        &self,
+        session_id: &str,
+        mutate: M,
+        publish: P,
+    ) -> std::io::Result<Option<Session>>
+    where
+        M: FnOnce(&mut Session),
+        P: FnOnce(&Session),
+    {
         let _guard = self.acquire_lock(session_id).await;
         let Some(mut session) = self.storage.load_session(session_id).await? else {
             return Ok(None);
         };
         mutate(&mut session);
         self.storage.save_session(&session).await?;
+        publish(&session);
         Ok(Some(session))
+    }
+
+    /// Clear the legacy compatibility queue using durable CAS and publish the
+    /// saved full snapshot before releasing the same session lock.
+    pub async fn clear_legacy_pending_messages_and_publish<F>(
+        &self,
+        session_id: &str,
+        expected: &[serde_json::Value],
+        publish: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_session(session_id).await? else {
+            return Ok(false);
+        };
+        if latest.pending_injected_messages().as_deref() != Some(expected) {
+            return Ok(false);
+        }
+        latest.clear_pending_injected_messages();
+        self.storage.save_runtime_state(&latest).await?;
+        publish(&latest);
+        Ok(true)
     }
 }
 
@@ -340,6 +476,27 @@ impl LockedSessionStore {
 impl RuntimeSessionPersistence for LockedSessionStore {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime(session).await
+    }
+
+    async fn save_runtime_control_plane(&self, session: &mut Session) -> std::io::Result<()> {
+        self.save_runtime_only(session).await
+    }
+
+    async fn load_runtime_control_plane(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.storage.load_runtime_control_plane(session_id).await
+    }
+
+    async fn update_task_list_control_plane(
+        &self,
+        session_id: &str,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        self.update_task_list_control_plane_and_publish(session_id, task_list, version, |_| {})
+            .await
     }
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
@@ -355,16 +512,8 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         session_id: &str,
         expected: &[serde_json::Value],
     ) -> std::io::Result<bool> {
-        let _guard = self.acquire_lock(session_id).await;
-        let Some(mut latest) = self.storage.load_session(session_id).await? else {
-            return Ok(false);
-        };
-        if latest.pending_injected_messages().as_deref() != Some(expected) {
-            return Ok(false);
-        }
-        latest.clear_pending_injected_messages();
-        self.storage.save_runtime_state(&latest).await?;
-        Ok(true)
+        self.clear_legacy_pending_messages_and_publish(session_id, expected, |_| {})
+            .await
     }
 }
 
@@ -471,6 +620,39 @@ mod tests {
     use super::*;
     use crate::v2::SessionStoreV2;
     use bamboo_domain::session::types::Session;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingControlPlaneStorage {
+        inner: Arc<SessionStoreV2>,
+        control_plane_loads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CountingControlPlaneStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(session_id).await
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(session_id).await
+        }
+
+        async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_runtime_state(session).await
+        }
+
+        async fn load_runtime_control_plane(
+            &self,
+            session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            self.control_plane_loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load_runtime_control_plane(session_id).await
+        }
+    }
 
     async fn make_storage() -> (tempfile::TempDir, Arc<dyn Storage>) {
         let temp = tempfile::tempdir().unwrap();
@@ -1169,6 +1351,148 @@ mod tests {
         assert_eq!(after.metadata_version, 5);
         assert_eq!(after.messages.len(), 1);
         assert_eq!(after.messages[0].content, "keep me");
+    }
+
+    #[tokio::test]
+    async fn runtime_control_plane_port_uses_sidecar_without_rewriting_messages() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-control-plane";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(Message::user("durable transcript"));
+        storage.save_session(&durable).await.unwrap();
+
+        let mut runtime = durable.clone();
+        runtime.model = "updated-control-plane-model".to_string();
+        runtime.add_message(Message::assistant("uncheckpointed runtime message", None));
+        RuntimeSessionPersistence::save_runtime_control_plane(&store, &mut runtime)
+            .await
+            .unwrap();
+
+        let control_plane =
+            RuntimeSessionPersistence::load_runtime_control_plane(&store, session_id)
+                .await
+                .unwrap()
+                .expect("control-plane exists");
+        assert!(
+            control_plane.messages.is_empty(),
+            "LockedSessionStore must expose its message-free sidecar"
+        );
+        assert_eq!(control_plane.model, "updated-control-plane-model");
+
+        let reloaded = storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .expect("session exists");
+        assert_eq!(reloaded.model, "updated-control-plane-model");
+        assert_eq!(
+            reloaded.messages.len(),
+            1,
+            "control-plane save must not write the uncheckpointed message"
+        );
+        assert_eq!(reloaded.messages[0].content, "durable transcript");
+    }
+
+    #[tokio::test]
+    async fn atomic_task_patch_loads_inside_lock_and_preserves_interleaved_runtime_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("storage init"),
+        );
+        let session_id = "atomic-task-patch";
+        inner
+            .save_session(&fresh(session_id))
+            .await
+            .expect("seed session");
+
+        let counted = Arc::new(CountingControlPlaneStorage {
+            inner: inner.clone(),
+            control_plane_loads: AtomicUsize::new(0),
+        });
+        let storage: Arc<dyn Storage> = counted.clone();
+        let store = Arc::new(LockedSessionStore::new(storage));
+        let guard = store.acquire_lock(session_id).await;
+        let now = chrono::Utc::now();
+        let task_list = bamboo_domain::TaskList {
+            session_id: session_id.to_string(),
+            title: "Atomic Task patch".to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let patch_store = store.clone();
+        let patch = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            RuntimeSessionPersistence::update_task_list_control_plane(
+                patch_store.as_ref(),
+                session_id,
+                &task_list,
+                "9",
+            )
+            .await
+        });
+        started_rx.await.expect("patch task started");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            counted.control_plane_loads.load(Ordering::SeqCst),
+            0,
+            "Task patch must acquire the session lock before loading its snapshot"
+        );
+
+        // Publish a newer unrelated runtime transition while the Task patch is
+        // queued on the same session lock. Once the guard releases, the patch
+        // must load this latest snapshot and change only Task-owned fields.
+        let mut latest = inner
+            .load_runtime_control_plane(session_id)
+            .await
+            .expect("load latest control-plane")
+            .expect("control-plane exists");
+        latest.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("latest-run"));
+        latest
+            .metadata
+            .insert("concurrent.runtime".to_string(), "preserve".to_string());
+        inner
+            .save_runtime_state(&latest)
+            .await
+            .expect("publish concurrent runtime transition");
+        drop(guard);
+
+        assert!(
+            patch.await.expect("patch join").expect("patch succeeds"),
+            "existing root must be patched"
+        );
+        assert_eq!(counted.control_plane_loads.load(Ordering::SeqCst), 1);
+        let reloaded = inner
+            .load_session(session_id)
+            .await
+            .expect("reload")
+            .expect("session exists");
+        assert_eq!(
+            reloaded
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.run_id.as_str()),
+            Some("latest-run")
+        );
+        assert_eq!(
+            reloaded
+                .metadata
+                .get("concurrent.runtime")
+                .map(String::as_str),
+            Some("preserve")
+        );
+        assert_eq!(reloaded.task_list_version_meta().as_deref(), Some("9"));
+        assert_eq!(
+            reloaded.task_list.as_ref().map(|list| list.title.as_str()),
+            Some("Atomic Task patch")
+        );
     }
 
     // ── LockedSessionStore tests ────────────────────────────────────
