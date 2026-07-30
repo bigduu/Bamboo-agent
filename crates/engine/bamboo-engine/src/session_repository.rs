@@ -77,6 +77,10 @@ impl SessionRepository {
     /// Load a session from the memory cache, falling back to durable storage
     /// (and back-filling the cache on a storage hit). `None` if absent in both.
     pub async fn load(&self, session_id: &str) -> Option<Session> {
+        if let Some(session) = read_cached_session(&self.cache, session_id) {
+            return Some(session);
+        }
+
         let _guard = self.persistence.acquire_lock(session_id).await;
         if let Some(session) = read_cached_session(&self.cache, session_id) {
             return Some(session);
@@ -101,10 +105,15 @@ impl SessionRepository {
     /// swallowing them to `None`. Cache hit short-circuits; a storage hit
     /// back-fills the cache.
     pub async fn try_load(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        if let Some(session) = read_cached_session(&self.cache, session_id) {
+            return Ok(Some(session));
+        }
+
         let _guard = self.persistence.acquire_lock(session_id).await;
         if let Some(session) = read_cached_session(&self.cache, session_id) {
             return Ok(Some(session));
         }
+
         let loaded = self.storage.load_session(session_id).await?;
         #[cfg(test)]
         self.run_post_durable_hook("try_load", session_id);
