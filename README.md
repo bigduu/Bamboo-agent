@@ -99,7 +99,7 @@ Long conversations don't grow without bound. Bamboo uses a **hybrid strategy**: 
 
 - `counter` — counts tokens via tiktoken BPE or heuristic estimation (`TiktokenTokenCounter` / `HeuristicTokenCounter`).
 - `segmenter` — preserves the atomicity of tool calls when segmenting (it won't split a single tool call apart).
-- `limits` — **deliberately ships no per-model table**. Real context/output limits come from (1) provider runtime metadata, (2) user overrides in `model_limits.json`; with neither, it falls back to a global default of **200K context / 64K output**. This way the table never goes stale as models are updated.
+- `limits` — **deliberately ships no per-model table**. Explicit user overrides in `model_limits.json` take precedence over provider runtime metadata; with neither, Bamboo falls back to **1M total input+output context / 128K output**. Prompt fitting reserves the output allowance and tokenizer safety margin from that total window, and root sessions re-read the instance-local override file each round.
 - `summarizer` / `preparation` — builds the compression plan, generates the summary message, prepares context against the budget (`prepare_hybrid_context`), and can estimate prompt-cache savings.
 - **Oversized output** — oversized output produced by tools is trimmed/managed at `bamboo-tools/output_manager.rs`, avoiding stuffing the context all at once.
 
