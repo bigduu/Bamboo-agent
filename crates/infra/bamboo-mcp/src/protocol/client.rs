@@ -31,6 +31,7 @@ const MODERN_DISCOVERY_PROBE_TIMEOUT_MS: u64 = 5_000;
 /// Cancellation is best-effort and must never turn an already-expired request
 /// into another unbounded wait (for example, on a stalled stdio writer).
 const CANCELLATION_ATTEMPT_TIMEOUT_MS: u64 = 250;
+const JSON_RPC_METHOD_NOT_FOUND_ERROR: i32 = -32601;
 const SUBSCRIPTION_ACK_METHOD: &str = "notifications/subscriptions/acknowledged";
 const SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
 
@@ -1099,6 +1100,9 @@ impl McpProtocolClient {
     }
 
     fn is_recognized_modern_error(error: &McpError) -> bool {
+        // HTTP uses a structured Method not found response as evidence that
+        // the endpoint understood the modern request envelope. On stdio the
+        // same code is the legacy `server/discover` fallback signal.
         matches!(
             error,
             McpError::RemoteProtocol {
@@ -1107,7 +1111,8 @@ impl McpProtocolClient {
                     | UNSUPPORTED_PROTOCOL_VERSION_ERROR,
                 ..
             } | McpError::HttpProtocol {
-                code: HEADER_MISMATCH_ERROR
+                code: JSON_RPC_METHOD_NOT_FOUND_ERROR
+                    | HEADER_MISMATCH_ERROR
                     | MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR
                     | UNSUPPORTED_PROTOCOL_VERSION_ERROR,
                 ..
@@ -2178,11 +2183,9 @@ mod tests {
             }))]);
         let transport = transport
             .with_http_fallback_rules()
-            .with_send_failures(vec![McpError::HttpProtocol {
+            .with_send_failures(vec![McpError::HttpStatus {
                 status: 400,
-                code: -32601,
-                message: "Method not found".to_string(),
-                data: None,
+                body: "legacy endpoint rejection".to_string(),
             }]);
         let mut client = McpProtocolClient::new(Box::new(transport));
         client.connect().await.expect("connect");
@@ -2194,6 +2197,41 @@ mod tests {
         assert_eq!(captured[0].0["method"], "server/discover");
         assert_eq!(captured[1].0["method"], "initialize");
         assert_eq!(captured[2].0["method"], "notifications/initialized");
+    }
+
+    #[tokio::test]
+    async fn http_method_not_found_error_pins_modern_instead_of_initializing() {
+        let (transport, captured) = ScriptedTransport::new(Vec::new());
+        let transport = transport
+            .with_http_fallback_rules()
+            .with_send_failures(vec![McpError::HttpProtocol {
+                status: 404,
+                code: JSON_RPC_METHOD_NOT_FOUND_ERROR,
+                message: "Method not found".to_string(),
+                data: None,
+            }]);
+        let mut client = McpProtocolClient::new(Box::new(transport));
+        client.connect().await.expect("connect");
+
+        let error = client
+            .initialize(1000)
+            .await
+            .expect_err("HTTP method-not-found body identifies a modern endpoint");
+        assert!(matches!(
+            error,
+            McpError::HttpProtocol {
+                status: 404,
+                code: JSON_RPC_METHOD_NOT_FOUND_ERROR,
+                ..
+            }
+        ));
+        let captured = captured.lock().await;
+        assert_eq!(
+            captured.len(),
+            1,
+            "recognized modern HTTP error must not send initialize"
+        );
+        assert_eq!(captured[0].0["method"], "server/discover");
     }
 
     #[tokio::test]
