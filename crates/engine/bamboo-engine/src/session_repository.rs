@@ -886,6 +886,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cache_hits_do_not_wait_for_the_persistence_lock() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage);
+        let id = "cache-hit-lock-free";
+        let cached = Session::new(id, "cached-model");
+        cache_put(&repo, &cached);
+        let persistence_guard = repo.persistence().acquire_lock(id).await;
+
+        let loaded = tokio::time::timeout(Duration::from_millis(100), repo.load(id)).await;
+        let try_loaded = tokio::time::timeout(Duration::from_millis(100), repo.try_load(id)).await;
+        drop(persistence_guard);
+
+        assert_eq!(
+            loaded
+                .expect("cache hit must not wait for the persistence lock")
+                .expect("cached session")
+                .model,
+            "cached-model"
+        );
+        assert_eq!(
+            try_loaded
+                .expect("fallible cache hit must not wait for the persistence lock")
+                .expect("cache read succeeds")
+                .expect("cached session")
+                .model,
+            "cached-model"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn load_merged_storage_refresh_and_child_task_patch_share_publish_order() {
         let temp = tempfile::tempdir().unwrap();
