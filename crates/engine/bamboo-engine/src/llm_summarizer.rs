@@ -2,17 +2,21 @@
 //!
 //! `LlmSummarizer` is the infrastructure-coupled implementation of
 //! `bamboo_compression::Summarizer`: it calls the session model to produce a
-//! rich summary of compressed/removed messages, falling back to the pure
-//! `HeuristicSummarizer` on failure. It lives in the engine (not in
-//! bamboo-compression) so that the compression crate stays free of any
-//! LLM-provider dependency.
+//! rich summary of compressed/removed messages. Legacy, unbudgeted callers may
+//! fall back to the pure `HeuristicSummarizer`; the bounded map/reduce pipeline
+//! surfaces every failed stage so callers can preserve session state atomically.
+//! It lives in the engine (not in bamboo-compression) so that the compression
+//! crate stays free of any LLM-provider dependency.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 
-use bamboo_compression::{HeuristicSummarizer, Summarizer};
+use bamboo_compression::{
+    HeuristicSummarizer, MessageSegmenter, Summarizer, TiktokenTokenCounter, TokenBudget,
+    TokenCounter,
+};
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message, Role,
@@ -30,14 +34,97 @@ pub enum SummaryMode {
     IncrementalMerge,
 }
 
+/// Hard request limits for a logical compression pass.
+#[derive(Debug, Clone)]
+pub struct SummaryRequestBudget {
+    pub context_window_tokens: u32,
+    pub max_output_tokens: u32,
+    pub safety_margin_tokens: u32,
+    pub safe_window_percent: u8,
+    pub target_summary_tokens: u32,
+    pub target_ratio: f64,
+}
+
+impl SummaryRequestBudget {
+    pub fn from_token_budget(
+        budget: &TokenBudget,
+        safe_window_percent: u8,
+        target_summary_tokens: u32,
+        target_ratio: f64,
+    ) -> Self {
+        Self {
+            context_window_tokens: budget.max_context_tokens.max(1),
+            max_output_tokens: budget.max_output_tokens.max(1),
+            safety_margin_tokens: budget.safety_margin,
+            safe_window_percent: safe_window_percent.clamp(10, 95),
+            target_summary_tokens: target_summary_tokens.max(1),
+            target_ratio: if target_ratio.is_finite() && target_ratio > 0.0 {
+                target_ratio.clamp(0.01, 0.50)
+            } else {
+                0.20
+            },
+        }
+    }
+
+    fn safe_request_tokens(&self) -> u32 {
+        self.context_window_tokens
+            .saturating_mul(self.safe_window_percent as u32)
+            .saturating_div(100)
+            .max(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SummarizationReport {
+    pub content: String,
+    pub represented_source_tokens: u32,
+    pub target_summary_tokens: u32,
+    pub actual_summary_tokens: u32,
+    pub map_calls: u32,
+    pub reduce_calls: u32,
+    pub fallback_used: bool,
+    pub budget_clamped: bool,
+    pub budget_clamp_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SummarizationProgress {
+    pub stage: String,
+    pub stage_index: usize,
+    pub stage_count: usize,
+    pub estimated_input_tokens: u32,
+    pub requested_output_tokens: u32,
+    pub safe_request_tokens: u32,
+    pub model_context_tokens: u32,
+}
+
+type SummarizationProgressCallback = dyn Fn(&SummarizationProgress) + Send + Sync;
+
+#[derive(Debug, Clone)]
+struct SourceUnit {
+    text: String,
+    represented_source_tokens: u32,
+    first_message_id: String,
+    last_message_id: String,
+    continuation_part: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SummaryPart {
+    content: String,
+    represented_source_tokens: u32,
+    first_message_id: String,
+    last_message_id: String,
+}
+
 /// LLM-based summarizer that calls the current session's model to generate
 /// a rich summary of compressed/removed messages.
 ///
-/// Falls back to [`HeuristicSummarizer`] if the LLM call fails, UNLESS
+/// Legacy unbudgeted calls fall back to [`HeuristicSummarizer`] if the LLM call
+/// fails, UNLESS
 /// [`with_heuristic_fallback_on_error(false)`](Self::with_heuristic_fallback_on_error)
-/// is set — in which case a transient LLM *error* surfaces to the caller so a
-/// best-effort caller (mid-turn context compression) can skip and degrade
-/// gracefully instead of silently substituting a low-quality heuristic summary.
+/// is set. Budgeted calls always surface failed map/reduce stages so the archive
+/// transaction cannot commit a heuristic summary that represents a failed pass.
 pub struct LlmSummarizer {
     llm: Arc<dyn LLMProvider>,
     model: String,
@@ -49,12 +136,18 @@ pub struct LlmSummarizer {
     custom_instructions: Option<String>,
     /// Controls how the summarizer handles existing summaries.
     summary_mode: SummaryMode,
-    /// When true (default), a transient LLM call/stream failure is recovered by
-    /// falling back to the [`HeuristicSummarizer`]. When false, that error is
-    /// returned to the caller instead — used by best-effort callers that would
-    /// rather SKIP compression than emit a degraded heuristic summary. The
-    /// empty-response fallback is unaffected either way. (issue #238)
+    /// When true (default), a transient legacy/unbudgeted LLM call failure is
+    /// recovered by falling back to the [`HeuristicSummarizer`]. Budgeted calls
+    /// always return stage failures so a multi-request pass remains atomic. The
+    /// empty-response fallback is unaffected either way. (issues #238, #763)
     heuristic_fallback_on_error: bool,
+    /// Exact selected summarization-model limits and source-derived output goal.
+    request_budget: Option<SummaryRequestBudget>,
+    /// Correlates every map/reduce request with the eventual persisted
+    /// compression event (or with a failed logical pass).
+    logical_pass_id: Option<String>,
+    logical_phase: Option<String>,
+    progress_callback: Option<Arc<SummarizationProgressCallback>>,
 }
 
 impl LlmSummarizer {
@@ -87,13 +180,17 @@ impl LlmSummarizer {
             custom_instructions: None,
             summary_mode: SummaryMode::default(),
             heuristic_fallback_on_error: true,
+            request_budget: None,
+            logical_pass_id: None,
+            logical_phase: None,
+            progress_callback: None,
         }
     }
 
-    /// Control whether a transient LLM *error* recovers via the heuristic
-    /// summarizer (default `true`) or surfaces to the caller (`false`). Set
-    /// `false` for best-effort compression (mid-turn) that should skip rather
-    /// than substitute a heuristic summary. (issue #238)
+    /// Control whether a transient legacy/unbudgeted LLM *error* recovers via
+    /// the heuristic summarizer (default `true`) or surfaces to the caller
+    /// (`false`). Budgeted map/reduce failures always surface. (issues #238,
+    /// #763)
     pub fn with_heuristic_fallback_on_error(mut self, enabled: bool) -> Self {
         self.heuristic_fallback_on_error = enabled;
         self
@@ -112,6 +209,104 @@ impl LlmSummarizer {
     pub fn with_summary_mode(mut self, mode: SummaryMode) -> Self {
         self.summary_mode = mode;
         self
+    }
+
+    pub fn with_request_budget(mut self, budget: SummaryRequestBudget) -> Self {
+        self.request_budget = Some(budget);
+        self
+    }
+
+    pub fn with_logical_pass_context(
+        mut self,
+        logical_pass_id: impl Into<String>,
+        logical_phase: impl Into<String>,
+    ) -> Self {
+        self.logical_pass_id = Some(logical_pass_id.into());
+        self.logical_phase = Some(logical_phase.into());
+        self
+    }
+
+    pub fn with_progress_callback(mut self, callback: Arc<SummarizationProgressCallback>) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
+    fn append_shared_context(&self, user_content: &mut String) {
+        if let Some(ref existing) = self.existing_summary {
+            user_content.push_str("## Previous Summary\n\n");
+            user_content.push_str(existing);
+            user_content.push_str("\n\n---\n\n");
+        }
+
+        if !self.context_blocks.is_empty() {
+            user_content.push_str("## Compression Context Blocks\n\n");
+            for block in &self.context_blocks {
+                user_content.push_str(&format!(
+                    "### {}\n- type: {}\n- priority: {}\n- stability: {}\n\n{}\n\n",
+                    block.title.trim(),
+                    block.block_type.as_str(),
+                    block.priority.as_str(),
+                    block.stability.as_str(),
+                    block.content.trim(),
+                ));
+            }
+            user_content.push_str("---\n\n");
+        }
+
+        if let Some(ref instructions) = self.custom_instructions {
+            if !instructions.trim().is_empty() {
+                user_content.push_str("## Custom Compression Instructions\n\n");
+                user_content.push_str(instructions.trim());
+                user_content.push_str("\n\n---\n\n");
+            }
+        }
+    }
+
+    fn render_message_block(message: &Message) -> Option<String> {
+        let role_label = match message.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::Tool => "Tool Result",
+            Role::System => return None,
+        };
+        let mut block = String::new();
+        if let Some(ref tool_calls) = message.tool_calls {
+            if !tool_calls.is_empty() {
+                let tool_names = tool_calls
+                    .iter()
+                    .map(|call| call.function.name.as_str())
+                    .collect::<Vec<_>>();
+                block.push_str(&format!(
+                    "**{}** [message_id: {}; called tools: {}]:\n",
+                    role_label,
+                    message.id,
+                    tool_names.join(", ")
+                ));
+            } else {
+                block.push_str(&format!(
+                    "**{}** [message_id: {}]:\n",
+                    role_label, message.id
+                ));
+            }
+        } else {
+            block.push_str(&format!(
+                "**{}** [message_id: {}]:\n",
+                role_label, message.id
+            ));
+        }
+        if let Some(ref tool_call_id) = message.tool_call_id {
+            block.push_str(&format!("(tool_call_id: {})\n", tool_call_id));
+        }
+        block.push_str(&message.content);
+        block.push_str("\n\n");
+        Some(block)
+    }
+
+    fn render_messages(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .filter_map(Self::render_message_block)
+            .collect::<String>()
     }
 
     /// Build the summarization prompt for the LLM.
@@ -156,33 +351,14 @@ Guidelines:
 
         let mut user_content = String::new();
 
-        if let Some(ref existing) = self.existing_summary {
-            user_content.push_str("## Previous Summary\n\n");
-            user_content.push_str(existing);
-            user_content.push_str("\n\n---\n\n");
-        }
+        self.append_shared_context(&mut user_content);
 
-        if !self.context_blocks.is_empty() {
-            user_content.push_str("## Compression Context Blocks\n\n");
-            for block in &self.context_blocks {
-                user_content.push_str(&format!(
-                    "### {}\n- type: {}\n- priority: {}\n- stability: {}\n\n{}\n\n",
-                    block.title.trim(),
-                    block.block_type.as_str(),
-                    block.priority.as_str(),
-                    block.stability.as_str(),
-                    block.content.trim(),
-                ));
-            }
-            user_content.push_str("---\n\n");
-        }
-
-        if let Some(ref instructions) = self.custom_instructions {
-            if !instructions.trim().is_empty() {
-                user_content.push_str("## Custom Compression Instructions\n\n");
-                user_content.push_str(instructions.trim());
-                user_content.push_str("\n\n---\n\n");
-            }
+        if let Some(budget) = self.request_budget.as_ref() {
+            user_content.push_str(&format!(
+                "## Summary Size Budget\nTarget approximately {} tokens (about {:.0}% of the represented raw source). Preserve coverage and useful detail up to this budget; do not collapse the result to a tiny synopsis.\n\n",
+                budget.target_summary_tokens,
+                budget.target_ratio * 100.0,
+            ));
         }
 
         user_content.push_str(
@@ -191,47 +367,7 @@ Guidelines:
 
         user_content.push_str("## Messages to Summarize\n\n");
 
-        for message in messages {
-            let role_label = match message.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::Tool => "Tool Result",
-                Role::System => continue,
-            };
-
-            if let Some(ref tool_calls) = message.tool_calls {
-                if !tool_calls.is_empty() {
-                    let tool_names: Vec<&str> = tool_calls
-                        .iter()
-                        .map(|tc| tc.function.name.as_str())
-                        .collect();
-                    user_content.push_str(&format!(
-                        "**{}** [called tools: {}]:\n",
-                        role_label,
-                        tool_names.join(", ")
-                    ));
-                } else {
-                    user_content.push_str(&format!("**{}**:\n", role_label));
-                }
-            } else {
-                user_content.push_str(&format!("**{}**:\n", role_label));
-            }
-
-            if let Some(ref tool_call_id) = message.tool_call_id {
-                user_content.push_str(&format!("(tool_call_id: {})\n", tool_call_id));
-            }
-
-            let content = &message.content;
-            const MAX_CONTENT_CHARS: usize = 2000;
-            if content.chars().count() > MAX_CONTENT_CHARS {
-                let truncated: String = content.chars().take(MAX_CONTENT_CHARS).collect();
-                user_content.push_str(&truncated);
-                user_content.push_str("... [truncated]\n\n");
-            } else {
-                user_content.push_str(content);
-                user_content.push_str("\n\n");
-            }
-        }
+        user_content.push_str(&Self::render_messages(messages));
 
         user_content.push_str(
             "\n---\n\nReturn only the summary text. Be explicit about what is active now versus what is already completed or no longer relevant.",
@@ -242,16 +378,687 @@ Guidelines:
         prompt_messages
     }
 
+    fn build_map_messages(&self, units: &[SourceUnit], target_tokens: u32) -> Vec<Message> {
+        let represented_source_tokens = units.iter().fold(0u32, |total, unit| {
+            total.saturating_add(unit.represented_source_tokens)
+        });
+        let mut user_content = format!(
+            "Summarize this chronological source slice as loss-aware working memory.\n\
+             It represents approximately {represented_source_tokens} raw source tokens.\n\
+             Target approximately {target_tokens} output tokens. Preserve concrete requirements, \
+             decisions, paths, commands, errors, test results, tool outcomes, active work, and next \
+             steps. Do not turn it into a tiny high-level synopsis.\n\n## Source Slice\n\n"
+        );
+        for unit in units {
+            user_content.push_str(&format!(
+                "### Source range {}..{} (continuation part {})\n\n",
+                unit.first_message_id, unit.last_message_id, unit.continuation_part
+            ));
+            user_content.push_str(&unit.text);
+            user_content.push('\n');
+        }
+        user_content.push_str(
+            "\nReturn only the chronological partial summary. Do not claim this is the final conversation summary.",
+        );
+        vec![
+            Message::system(
+                "You are the map stage of a bounded conversation-compression pipeline. \
+                 Preserve detailed facts and ordering for a later reducer.",
+            ),
+            Message::user(user_content),
+        ]
+    }
+
+    fn build_reduce_messages(
+        &self,
+        parts: &[SummaryPart],
+        target_tokens: u32,
+        include_shared_context: bool,
+    ) -> Vec<Message> {
+        let represented_source_tokens = parts.iter().fold(0u32, |total, part| {
+            total.saturating_add(part.represented_source_tokens)
+        });
+        let mut user_content = String::new();
+        if include_shared_context {
+            self.append_shared_context(&mut user_content);
+        }
+        user_content.push_str(&format!(
+            "## Summary Size Budget\nTarget approximately {target_tokens} tokens. The partials \
+             below represent approximately {represented_source_tokens} raw source tokens. Derive \
+             detail from represented source size, not from the already-compressed partial length; \
+             do not apply the target ratio again.\n\n## Ordered Partial Summaries\n\n"
+        ));
+        for (index, part) in parts.iter().enumerate() {
+            user_content.push_str(&format!(
+                "### Partial {} — source {}..{} ({} represented raw tokens)\n\n{}\n\n",
+                index + 1,
+                part.first_message_id,
+                part.last_message_id,
+                part.represented_source_tokens,
+                part.content.trim(),
+            ));
+        }
+        if include_shared_context {
+            user_content.push_str(
+                "## Required Final Sections\n1. Pre-compression in-flight work\n2. Current active objective\n3. Requirement checklist with status and evidence\n4. Active tasks\n5. Completed tasks\n6. Obsolete or superseded tasks\n7. Important context and constraints\n8. Files, code, and tool findings\n9. Open issues and next step\n\n",
+            );
+        }
+        user_content.push_str(
+            "Return only the merged summary. Preserve source chronology and remove only genuine duplication.",
+        );
+        vec![
+            Message::system(if include_shared_context {
+                "You are the final reduce stage of a bounded conversation-compression pipeline. \
+                 Merge all ordered partials and the supplied prior/runtime context into one reliable \
+                 working-memory summary."
+            } else {
+                "You are an intermediate reduce stage of a bounded conversation-compression \
+                 pipeline. Merge ordered partials without compounding the source-to-summary ratio."
+            }),
+            Message::user(user_content),
+        ]
+    }
+
+    fn target_for_source(&self, represented_source_tokens: u32) -> u32 {
+        let ratio = self
+            .request_budget
+            .as_ref()
+            .map(|budget| budget.target_ratio)
+            .unwrap_or(0.20);
+        ((represented_source_tokens as f64) * ratio).ceil().max(1.0) as u32
+    }
+
+    fn request_fits(
+        &self,
+        messages: &[Message],
+        requested_output_tokens: u32,
+        budget: &SummaryRequestBudget,
+    ) -> bool {
+        if requested_output_tokens == 0 || requested_output_tokens > budget.max_output_tokens {
+            return false;
+        }
+        let counter = TiktokenTokenCounter::default();
+        let input_tokens = counter.count_messages(messages);
+        input_tokens
+            .saturating_add(requested_output_tokens)
+            .saturating_add(budget.safety_margin_tokens)
+            <= budget.safe_request_tokens()
+    }
+
+    fn source_units(&self, messages: &[Message]) -> Vec<SourceUnit> {
+        let counter = TiktokenTokenCounter::default();
+        MessageSegmenter::new()
+            .segment(messages.to_vec())
+            .into_iter()
+            .filter(|segment| !segment.messages.is_empty())
+            .map(|segment| {
+                let first_message_id = segment
+                    .messages
+                    .first()
+                    .map(|message| message.id.clone())
+                    .unwrap_or_default();
+                let last_message_id = segment
+                    .messages
+                    .last()
+                    .map(|message| message.id.clone())
+                    .unwrap_or_else(|| first_message_id.clone());
+                SourceUnit {
+                    text: Self::render_messages(&segment.messages),
+                    represented_source_tokens: counter.count_messages(&segment.messages),
+                    first_message_id,
+                    last_message_id,
+                    continuation_part: 1,
+                }
+            })
+            .collect()
+    }
+
+    fn split_oversized_source_unit(
+        &self,
+        unit: SourceUnit,
+        budget: &SummaryRequestBudget,
+    ) -> Result<Vec<SourceUnit>, bamboo_compression::types::BudgetError> {
+        let counter = TiktokenTokenCounter::default();
+        let empty_prompt_tokens = counter.count_messages(&self.build_map_messages(&[], 1));
+        let available = budget
+            .safe_request_tokens()
+            .saturating_sub(budget.safety_margin_tokens)
+            .saturating_sub(empty_prompt_tokens);
+        if available < 2 {
+            return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                "summarization model context is too small for map prompt overhead".to_string(),
+            ));
+        }
+
+        let ratio = budget.target_ratio.max(0.01);
+        let max_by_window = ((available as f64) / (1.0 + ratio)).floor() as u32;
+        let max_by_output = ((budget.max_output_tokens as f64) / ratio).floor() as u32;
+        let initial_piece_tokens = max_by_window.min(max_by_output).max(1);
+
+        let mut remaining = unit.text;
+        let mut remaining_represented = unit.represented_source_tokens;
+        let mut continuation_part = unit.continuation_part;
+        let mut parts = Vec::new();
+        while !remaining.is_empty() {
+            let remaining_text_tokens = counter.count_text(&remaining).max(1);
+            let mut piece_token_budget = initial_piece_tokens.min(remaining_text_tokens).max(1);
+            let (piece_text, piece_represented) = loop {
+                let mut prefix = counter.truncate_to_token_prefix(&remaining, piece_token_budget);
+                if prefix.is_empty() {
+                    prefix = remaining
+                        .chars()
+                        .next()
+                        .map(|character| character.to_string())
+                        .unwrap_or_default();
+                }
+                let is_last = prefix.len() == remaining.len();
+                let prefix_tokens = counter.count_text(&prefix).max(1);
+                let represented = if is_last {
+                    remaining_represented
+                } else if remaining_represented <= 1 {
+                    0
+                } else {
+                    (((remaining_represented as u64) * (prefix_tokens as u64)
+                        / (remaining_text_tokens as u64))
+                        .max(1)
+                        .min(remaining_represented.saturating_sub(1) as u64))
+                        as u32
+                };
+                let candidate = SourceUnit {
+                    text: prefix.clone(),
+                    represented_source_tokens: represented,
+                    first_message_id: unit.first_message_id.clone(),
+                    last_message_id: unit.last_message_id.clone(),
+                    continuation_part,
+                };
+                let requested_output = self.target_for_source(represented);
+                if self.request_fits(
+                    &self.build_map_messages(std::slice::from_ref(&candidate), requested_output),
+                    requested_output,
+                    budget,
+                ) {
+                    break (prefix, represented);
+                }
+                if piece_token_budget <= 1 {
+                    return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                        format!(
+                            "single source continuation cannot fit summarization model window (range {}..{})",
+                            unit.first_message_id, unit.last_message_id
+                        ),
+                    ));
+                }
+                piece_token_budget = (piece_token_budget * 3 / 4).max(1);
+            };
+
+            let consumed_bytes = piece_text.len();
+            parts.push(SourceUnit {
+                text: piece_text,
+                represented_source_tokens: piece_represented,
+                first_message_id: unit.first_message_id.clone(),
+                last_message_id: unit.last_message_id.clone(),
+                continuation_part,
+            });
+            remaining = remaining[consumed_bytes..].to_string();
+            remaining_represented = remaining_represented.saturating_sub(piece_represented);
+            continuation_part += 1;
+        }
+        Ok(parts)
+    }
+
+    fn pack_source_chunks(
+        &self,
+        messages: &[Message],
+        budget: &SummaryRequestBudget,
+    ) -> Result<Vec<Vec<SourceUnit>>, bamboo_compression::types::BudgetError> {
+        let mut bounded_units = Vec::new();
+        for unit in self.source_units(messages) {
+            let requested_output = self.target_for_source(unit.represented_source_tokens);
+            let prompt = self.build_map_messages(std::slice::from_ref(&unit), requested_output);
+            if self.request_fits(&prompt, requested_output, budget) {
+                bounded_units.push(unit);
+            } else {
+                bounded_units.extend(self.split_oversized_source_unit(unit, budget)?);
+            }
+        }
+
+        let mut chunks = Vec::new();
+        let mut current = Vec::<SourceUnit>::new();
+        for unit in bounded_units {
+            let mut candidate = current.clone();
+            candidate.push(unit.clone());
+            let represented = candidate.iter().fold(0u32, |total, item| {
+                total.saturating_add(item.represented_source_tokens)
+            });
+            let requested_output = self.target_for_source(represented);
+            if self.request_fits(
+                &self.build_map_messages(&candidate, requested_output),
+                requested_output,
+                budget,
+            ) {
+                current = candidate;
+                continue;
+            }
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let requested_output = self.target_for_source(unit.represented_source_tokens);
+            if !self.request_fits(
+                &self.build_map_messages(std::slice::from_ref(&unit), requested_output),
+                requested_output,
+                budget,
+            ) {
+                return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                    "split source unit still exceeds summarization request ceiling".to_string(),
+                ));
+            }
+            current.push(unit);
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        if chunks.is_empty() {
+            return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                "no bounded summarization chunks were produced".to_string(),
+            ));
+        }
+        Ok(chunks)
+    }
+
+    fn pack_reduction_groups(
+        &self,
+        parts: &[SummaryPart],
+        budget: &SummaryRequestBudget,
+    ) -> Vec<Vec<SummaryPart>> {
+        let mut groups = Vec::new();
+        let mut current = Vec::<SummaryPart>::new();
+        for part in parts {
+            let mut candidate = current.clone();
+            candidate.push(part.clone());
+            let represented = candidate.iter().fold(0u32, |total, item| {
+                total.saturating_add(item.represented_source_tokens)
+            });
+            let requested_output = self.target_for_source(represented);
+            if self.request_fits(
+                &self.build_reduce_messages(&candidate, requested_output, false),
+                requested_output,
+                budget,
+            ) {
+                current = candidate;
+            } else {
+                if !current.is_empty() {
+                    groups.push(std::mem::take(&mut current));
+                }
+                current.push(part.clone());
+            }
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+        groups
+    }
+
+    async fn execute_bounded_request(
+        &self,
+        stage: &str,
+        stage_index: usize,
+        stage_count: usize,
+        messages: &[Message],
+        requested_output_tokens: u32,
+        budget: &SummaryRequestBudget,
+    ) -> Result<String, bamboo_compression::types::BudgetError> {
+        let counter = TiktokenTokenCounter::default();
+        let input_tokens = counter.count_messages(messages);
+        let safe_request_tokens = budget.safe_request_tokens();
+        if !self.request_fits(messages, requested_output_tokens, budget) {
+            return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                format!(
+                    "bounded summarization invariant failed for {stage}: input={input_tokens}, output={requested_output_tokens}, safety={}, safe_limit={safe_request_tokens}",
+                    budget.safety_margin_tokens,
+                ),
+            ));
+        }
+        let progress = SummarizationProgress {
+            stage: stage.to_string(),
+            stage_index,
+            stage_count,
+            estimated_input_tokens: input_tokens,
+            requested_output_tokens,
+            safe_request_tokens,
+            model_context_tokens: budget.context_window_tokens,
+        };
+        if let Some(callback) = self.progress_callback.as_ref() {
+            callback(&progress);
+        }
+        tracing::info!(
+            logical_pass_id = self.logical_pass_id.as_deref().unwrap_or("untracked"),
+            logical_phase = self.logical_phase.as_deref().unwrap_or("unspecified"),
+            stage,
+            stage_index,
+            stage_count,
+            input_tokens,
+            requested_output_tokens,
+            safe_request_tokens,
+            model_context_tokens = budget.context_window_tokens,
+            model = %self.model,
+            "Executing bounded summarization request"
+        );
+        let content = self
+            .collect_stream_response(messages, requested_output_tokens)
+            .await
+            .map_err(|error| {
+                bamboo_compression::types::BudgetError::TokenCountError(format!(
+                    "{stage} stage {stage_index}/{stage_count} failed: {error}"
+                ))
+            })?;
+        if content.trim().is_empty() {
+            return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                format!(
+                    "{stage} stage {stage_index}/{stage_count} returned an empty completed response"
+                ),
+            ));
+        }
+        Ok(content)
+    }
+
+    fn compose_multipart_summary(&self, parts: &[SummaryPart]) -> String {
+        let mut sections = Vec::new();
+        if let Some(existing) = self
+            .existing_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+        {
+            sections.push(existing.to_string());
+        }
+        sections.extend(
+            parts
+                .iter()
+                .map(|part| part.content.trim())
+                .filter(|content| !content.is_empty())
+                .map(String::from),
+        );
+        sections.join("\n\n")
+    }
+
+    async fn summarize_bounded(
+        &self,
+        messages: &[Message],
+        budget: &SummaryRequestBudget,
+    ) -> Result<SummarizationReport, bamboo_compression::types::BudgetError> {
+        let counter = TiktokenTokenCounter::default();
+        let represented_source_tokens = counter.count_messages(messages);
+        let final_target = budget.target_summary_tokens.max(1);
+        let one_shot_prompt = self.build_summarization_messages(messages);
+        if self.request_fits(&one_shot_prompt, final_target, budget) {
+            let content = self
+                .execute_bounded_request("one_shot", 1, 1, &one_shot_prompt, final_target, budget)
+                .await?;
+            let actual_summary_tokens = counter.count_text(&content);
+            let underfilled =
+                actual_summary_tokens.saturating_mul(5) < final_target.saturating_mul(4);
+            return Ok(SummarizationReport {
+                content,
+                represented_source_tokens,
+                target_summary_tokens: final_target,
+                actual_summary_tokens,
+                map_calls: 0,
+                reduce_calls: 0,
+                fallback_used: false,
+                budget_clamped: underfilled,
+                budget_clamp_reason: underfilled
+                    .then(|| "model_returned_below_80_percent_of_target".to_string()),
+            });
+        }
+
+        let chunks = self.pack_source_chunks(messages, budget)?;
+        let mut map_calls = 0u32;
+        let mut parts = Vec::with_capacity(chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let represented = chunk.iter().fold(0u32, |total, unit| {
+                total.saturating_add(unit.represented_source_tokens)
+            });
+            let requested_output = self.target_for_source(represented);
+            let prompt = self.build_map_messages(chunk, requested_output);
+            let content = self
+                .execute_bounded_request(
+                    "map",
+                    index + 1,
+                    chunks.len(),
+                    &prompt,
+                    requested_output,
+                    budget,
+                )
+                .await?;
+            map_calls = map_calls.saturating_add(1);
+            let first_message_id = chunk
+                .first()
+                .map(|unit| unit.first_message_id.clone())
+                .unwrap_or_else(|| format!("chunk-{index}"));
+            let last_message_id = chunk
+                .last()
+                .map(|unit| unit.last_message_id.clone())
+                .unwrap_or_else(|| first_message_id.clone());
+            parts.push(SummaryPart {
+                content,
+                represented_source_tokens: represented,
+                first_message_id,
+                last_message_id,
+            });
+        }
+
+        let mut reduce_calls = 0u32;
+        let mut depth = 0usize;
+        loop {
+            let final_prompt = self.build_reduce_messages(&parts, final_target, true);
+            if self.request_fits(&final_prompt, final_target, budget) {
+                let content = self
+                    .execute_bounded_request(
+                        "final_reduce",
+                        1,
+                        1,
+                        &final_prompt,
+                        final_target,
+                        budget,
+                    )
+                    .await?;
+                reduce_calls = reduce_calls.saturating_add(1);
+                let actual_summary_tokens = counter.count_text(&content);
+                let underfilled =
+                    actual_summary_tokens.saturating_mul(5) < final_target.saturating_mul(4);
+                return Ok(SummarizationReport {
+                    content,
+                    represented_source_tokens,
+                    target_summary_tokens: final_target,
+                    actual_summary_tokens,
+                    map_calls,
+                    reduce_calls,
+                    fallback_used: false,
+                    budget_clamped: underfilled,
+                    budget_clamp_reason: underfilled
+                        .then(|| "model_returned_below_80_percent_of_target".to_string()),
+                });
+            }
+
+            if parts.len() <= 1 || depth >= 8 {
+                break;
+            }
+            let groups = self.pack_reduction_groups(&parts, budget);
+            if groups.len() >= parts.len() {
+                break;
+            }
+            let mut reduced = Vec::with_capacity(groups.len());
+            let group_count = groups.len();
+            for (group_index, group) in groups.into_iter().enumerate() {
+                if group.len() == 1 {
+                    reduced.push(group.into_iter().next().expect("single reduction part"));
+                    continue;
+                }
+                let represented = group.iter().fold(0u32, |total, part| {
+                    total.saturating_add(part.represented_source_tokens)
+                });
+                let requested_output = self.target_for_source(represented);
+                let prompt = self.build_reduce_messages(&group, requested_output, false);
+                let content = self
+                    .execute_bounded_request(
+                        "intermediate_reduce",
+                        group_index + 1,
+                        group_count,
+                        &prompt,
+                        requested_output,
+                        budget,
+                    )
+                    .await?;
+                reduce_calls = reduce_calls.saturating_add(1);
+                reduced.push(SummaryPart {
+                    content,
+                    represented_source_tokens: represented,
+                    first_message_id: group
+                        .first()
+                        .map(|part| part.first_message_id.clone())
+                        .unwrap_or_default(),
+                    last_message_id: group
+                        .last()
+                        .map(|part| part.last_message_id.clone())
+                        .unwrap_or_default(),
+                });
+            }
+            parts = reduced;
+            depth += 1;
+        }
+
+        // A single final model response cannot represent an arbitrarily large
+        // 20%-of-source target when the selected model has a smaller output
+        // limit. Preserve the bounded partials as one multipart stored summary
+        // instead of applying another 20% pass (which would collapse to ~4%).
+        let content = self.compose_multipart_summary(&parts);
+        let actual_summary_tokens = counter.count_text(&content);
+        let underfilled = actual_summary_tokens.saturating_mul(5) < final_target.saturating_mul(4);
+        tracing::info!(
+            logical_pass_id = self.logical_pass_id.as_deref().unwrap_or("untracked"),
+            logical_phase = self.logical_phase.as_deref().unwrap_or("unspecified"),
+            part_count = parts.len(),
+            actual_summary_tokens,
+            target_summary_tokens = final_target,
+            "Final single-response reduce did not fit; composing bounded multipart summary"
+        );
+        Ok(SummarizationReport {
+            content,
+            represented_source_tokens,
+            target_summary_tokens: final_target,
+            actual_summary_tokens,
+            map_calls,
+            reduce_calls,
+            fallback_used: false,
+            budget_clamped: underfilled,
+            budget_clamp_reason: underfilled
+                .then(|| "multipart_summary_below_80_percent_of_target".to_string()),
+        })
+    }
+
+    async fn heuristic_report(
+        &self,
+        messages: &[Message],
+        target_summary_tokens: u32,
+        reason: &str,
+    ) -> Result<SummarizationReport, bamboo_compression::types::BudgetError> {
+        let counter = TiktokenTokenCounter::default();
+        let heuristic = HeuristicSummarizer::new().summarize(messages).await?;
+        let content = counter.truncate_to_token_prefix(&heuristic, target_summary_tokens.max(1));
+        Ok(SummarizationReport {
+            represented_source_tokens: counter.count_messages(messages),
+            actual_summary_tokens: counter.count_text(&content),
+            target_summary_tokens,
+            content,
+            map_calls: 0,
+            reduce_calls: 0,
+            fallback_used: true,
+            budget_clamped: true,
+            budget_clamp_reason: Some(reason.to_string()),
+        })
+    }
+
+    pub async fn summarize_with_report(
+        &self,
+        messages: &[Message],
+    ) -> Result<SummarizationReport, bamboo_compression::types::BudgetError> {
+        if messages.is_empty() {
+            return Ok(SummarizationReport {
+                content: "No conversation history to summarize.".to_string(),
+                represented_source_tokens: 0,
+                target_summary_tokens: 0,
+                actual_summary_tokens: 0,
+                map_calls: 0,
+                reduce_calls: 0,
+                fallback_used: false,
+                budget_clamped: false,
+                budget_clamp_reason: None,
+            });
+        }
+
+        let target_summary_tokens = self
+            .request_budget
+            .as_ref()
+            .map(|budget| budget.target_summary_tokens)
+            .unwrap_or_else(|| self.estimate_summary_tokens(messages.len()).max(1));
+        let result = if let Some(budget) = self.request_budget.as_ref() {
+            self.summarize_bounded(messages, budget).await
+        } else {
+            let prompt = self.build_summarization_messages(messages);
+            self.collect_stream_response(&prompt, 8192)
+                .await
+                .map(|content| {
+                    let counter = TiktokenTokenCounter::default();
+                    SummarizationReport {
+                        represented_source_tokens: counter.count_messages(messages),
+                        actual_summary_tokens: counter.count_text(&content),
+                        target_summary_tokens,
+                        content,
+                        map_calls: 0,
+                        reduce_calls: 0,
+                        fallback_used: false,
+                        budget_clamped: false,
+                        budget_clamp_reason: None,
+                    }
+                })
+        };
+
+        match result {
+            Ok(report) if !report.content.trim().is_empty() => Ok(report),
+            Ok(_) => {
+                tracing::warn!(
+                    "LlmSummarizer: LLM returned empty summary, falling back to heuristic"
+                );
+                self.heuristic_report(messages, target_summary_tokens, "empty_llm_response")
+                    .await
+            }
+            Err(error) if self.heuristic_fallback_on_error && self.request_budget.is_none() => {
+                tracing::warn!(
+                    "LlmSummarizer: legacy LLM call failed ({}), falling back to heuristic",
+                    error
+                );
+                self.heuristic_report(
+                    messages,
+                    target_summary_tokens,
+                    "llm_error_heuristic_fallback",
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Consume an LLM stream and collect the full text response.
     async fn collect_stream_response(
         &self,
         messages: &[Message],
+        max_output_tokens: u32,
     ) -> Result<String, bamboo_compression::types::BudgetError> {
-        // Summarization is a lightweight auxiliary request; cap reasoning effort at `high`
-        // to stay compatible with fast models (e.g. gpt-5-mini).
+        // Compression calls need most of their output allowance for the summary
+        // itself. Low reasoning keeps dynamic, potentially small output budgets
+        // useful across both reasoning and non-reasoning models.
         let options = LLMRequestOptions {
             session_id: None,
-            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_effort: Some(ReasoningEffort::Low),
             parallel_tool_calls: None,
             required_tool: None,
             responses: None,
@@ -260,7 +1067,13 @@ Guidelines:
         };
         let stream = self
             .llm
-            .chat_stream_with_options(messages, &[], Some(8192), &self.model, Some(&options))
+            .chat_stream_with_options(
+                messages,
+                &[],
+                Some(max_output_tokens.max(1)),
+                &self.model,
+                Some(&options),
+            )
             .await
             .map_err(|e| {
                 bamboo_compression::types::BudgetError::TokenCountError(format!(
@@ -271,17 +1084,18 @@ Guidelines:
 
         let mut content = String::new();
         let mut stream = stream;
+        let mut terminal_done = false;
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(LLMChunk::Token(text)) => content.push_str(&text),
-                Ok(LLMChunk::Done) => break,
+                Ok(LLMChunk::Done) => {
+                    terminal_done = true;
+                    break;
+                }
                 Ok(_) => {} // Ignore reasoning tokens, tool calls, etc.
                 Err(e) => {
                     tracing::warn!("LLM summarization stream error: {}", e);
-                    if !content.is_empty() {
-                        break;
-                    }
                     return Err(bamboo_compression::types::BudgetError::TokenCountError(
                         format!("LLM summarization stream failed: {}", e),
                     ));
@@ -289,6 +1103,11 @@ Guidelines:
             }
         }
 
+        if !terminal_done && !content.is_empty() {
+            return Err(bamboo_compression::types::BudgetError::TokenCountError(
+                "LLM summarization stream ended without terminal completion".to_string(),
+            ));
+        }
         Ok(content)
     }
 }
@@ -299,6 +1118,9 @@ impl std::fmt::Debug for LlmSummarizer {
             .field("model", &self.model)
             .field("has_existing_summary", &self.existing_summary.is_some())
             .field("context_block_count", &self.context_blocks.len())
+            .field("logical_pass_id", &self.logical_pass_id)
+            .field("logical_phase", &self.logical_phase)
+            .field("has_progress_callback", &self.progress_callback.is_some())
             .finish()
     }
 }
@@ -309,60 +1131,37 @@ impl Summarizer for LlmSummarizer {
         &self,
         messages: &[Message],
     ) -> Result<String, bamboo_compression::types::BudgetError> {
-        if messages.is_empty() {
-            return Ok("No conversation history to summarize.".to_string());
-        }
-
-        let prompt_messages = self.build_summarization_messages(messages);
-
         tracing::info!(
             "LlmSummarizer: summarizing {} messages using model '{}' (existing_summary={})",
             messages.len(),
             self.model,
             self.existing_summary.is_some()
         );
-
-        match self.collect_stream_response(&prompt_messages).await {
-            Ok(summary) if !summary.trim().is_empty() => {
-                tracing::info!("LlmSummarizer: generated summary ({} chars)", summary.len());
-                Ok(summary)
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    "LlmSummarizer: LLM returned empty summary, falling back to heuristic"
-                );
-                HeuristicSummarizer::new().summarize(messages).await
-            }
-            Err(e) if self.heuristic_fallback_on_error => {
-                tracing::warn!(
-                    "LlmSummarizer: LLM call failed ({}), falling back to heuristic",
-                    e
-                );
-                HeuristicSummarizer::new().summarize(messages).await
-            }
-            // Best-effort caller opted out of the heuristic fallback: surface the
-            // transient error so the caller can skip compression entirely rather
-            // than substitute a low-quality heuristic summary. (issue #238)
-            Err(e) => {
-                tracing::warn!(
-                    "LlmSummarizer: LLM call failed ({}); surfacing error (heuristic fallback disabled)",
-                    e
-                );
-                Err(e)
-            }
-        }
+        let report = self.summarize_with_report(messages).await?;
+        tracing::info!(
+            chars = report.content.len(),
+            actual_summary_tokens = report.actual_summary_tokens,
+            target_summary_tokens = report.target_summary_tokens,
+            map_calls = report.map_calls,
+            reduce_calls = report.reduce_calls,
+            fallback_used = report.fallback_used,
+            "LlmSummarizer: generated summary"
+        );
+        Ok(report.content)
     }
 
     fn estimate_summary_tokens(&self, message_count: usize) -> u32 {
-        // LLM summaries tend to be more detailed; estimate higher than heuristic
-        (message_count * 80).min(2000) as u32
+        self.request_budget
+            .as_ref()
+            .map(|budget| budget.target_summary_tokens)
+            .unwrap_or_else(|| (message_count * 80).min(2000) as u32)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::ReasoningEffort;
+    use bamboo_domain::{FunctionCall, ReasoningEffort, ToolCall};
     use bamboo_llm::{LLMChunk, LLMError, LLMRequestOptions, LLMStream};
     use futures::stream;
     use std::sync::Mutex;
@@ -476,7 +1275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_summarizer_requests_high_reasoning_effort_for_summary_calls() {
+    async fn llm_summarizer_requests_low_reasoning_effort_for_summary_calls() {
         let provider = Arc::new(ReasoningCaptureProvider::default());
         let summarizer = LlmSummarizer::new(
             provider.clone(),
@@ -499,7 +1298,7 @@ mod tests {
             .captured_reasoning
             .lock()
             .expect("captured reasoning lock should not be poisoned");
-        assert_eq!(captured.as_slice(), [Some(ReasoningEffort::High)]);
+        assert_eq!(captured.as_slice(), [Some(ReasoningEffort::Low)]);
     }
 
     /// Provider that captures both `reasoning_effort` and `max_output_tokens`.
@@ -546,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_summarizer_sufficient_max_tokens_for_high_reasoning() {
+    async fn llm_summarizer_uses_explicit_output_budget_with_low_reasoning() {
         let provider = Arc::new(RequestOptionsCaptureProvider::default());
         let summarizer = LlmSummarizer::new(
             provider.clone(),
@@ -573,14 +1372,9 @@ mod tests {
             .captured_max_tokens
             .lock()
             .expect("lock should not be poisoned");
-        assert_eq!(captured_reasoning.as_slice(), [Some(ReasoningEffort::High)]);
+        assert_eq!(captured_reasoning.as_slice(), [Some(ReasoningEffort::Low)]);
         let max_tokens = captured_max_tokens[0].expect("max_output_tokens should be set");
-        // ReasoningEffort::High targets 4096 thinking budget; max_tokens must leave room for output.
-        assert!(
-            max_tokens > 4096,
-            "max_output_tokens ({}) must exceed thinking budget (4096) to avoid truncation",
-            max_tokens
-        );
+        assert_eq!(max_tokens, 8192);
     }
 
     #[test]
@@ -705,5 +1499,397 @@ mod tests {
             out.is_err(),
             "with the heuristic fallback disabled, a transient LLM error must surface"
         );
+    }
+
+    #[derive(Default)]
+    struct BoundedRequestCaptureProvider {
+        requests: Mutex<Vec<(Vec<Message>, u32)>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for BoundedRequestCaptureProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_domain::ToolSchema],
+            max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.requests
+                .lock()
+                .expect("bounded request capture lock")
+                .push((messages.to_vec(), max_output_tokens.unwrap_or_default()));
+            Ok(Box::pin(stream::iter(vec![
+                Ok::<LLMChunk, LLMError>(LLMChunk::Token(
+                    "Detailed bounded summary with requirements, decisions, files, tests, and next steps. "
+                        .repeat(16),
+                )),
+                Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    fn bounded_budget(
+        context_window_tokens: u32,
+        max_output_tokens: u32,
+        safety_margin_tokens: u32,
+        target_summary_tokens: u32,
+    ) -> SummaryRequestBudget {
+        let token_budget = TokenBudget::with_safety_margin(
+            context_window_tokens,
+            max_output_tokens,
+            bamboo_compression::BudgetStrategy::default(),
+            safety_margin_tokens,
+        );
+        SummaryRequestBudget::from_token_budget(&token_budget, 80, target_summary_tokens, 0.20)
+    }
+
+    #[tokio::test]
+    async fn bounded_one_shot_uses_one_dynamic_request_when_fully_rendered_prompt_fits() {
+        let provider = Arc::new(BoundedRequestCaptureProvider::default());
+        let budget = bounded_budget(10_000, 2_000, 100, 400);
+        let summarizer =
+            LlmSummarizer::new(provider.clone(), "summary-model".to_string(), None, None)
+                .with_request_budget(budget.clone())
+                .with_heuristic_fallback_on_error(false);
+
+        let report = summarizer
+            .summarize_with_report(&summary_messages())
+            .await
+            .expect("bounded one-shot summary");
+        assert_eq!(report.map_calls, 0);
+        assert_eq!(report.reduce_calls, 0);
+
+        let requests = provider.requests.lock().expect("capture lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, 400);
+        let counter = TiktokenTokenCounter::default();
+        assert!(
+            counter
+                .count_messages(&requests[0].0)
+                .saturating_add(requests[0].1)
+                .saturating_add(budget.safety_margin_tokens)
+                <= budget.safe_request_tokens()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_pipeline_chunks_large_source_and_never_compounds_twenty_percent_target() {
+        let provider = Arc::new(BoundedRequestCaptureProvider::default());
+        let budget = bounded_budget(3_000, 800, 100, 600);
+        let summarizer = LlmSummarizer::new(
+            provider.clone(),
+            "small-summary-model".to_string(),
+            Some("Previous durable summary evidence. ".repeat(12)),
+            None,
+        )
+        .with_context_blocks(vec![ContextBlock::new(
+            ContextBlockType::TaskSnapshot,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "Current Task List",
+            "Active compression task with exact acceptance evidence. ".repeat(8),
+        )])
+        .with_custom_instructions(Some(
+            "Keep exact paths, failures, and remaining work.".to_string(),
+        ))
+        .with_request_budget(budget.clone())
+        .with_heuristic_fallback_on_error(false);
+        let messages = (0..80)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!(
+                        "user-{index} {}",
+                        "requirement decision path error evidence ".repeat(24)
+                    ))
+                } else {
+                    Message::assistant(
+                        format!(
+                            "assistant-{index} {}",
+                            "implementation command output test result next step ".repeat(24)
+                        ),
+                        None,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let report = summarizer
+            .summarize_with_report(&messages)
+            .await
+            .expect("chunked summary");
+        assert!(report.map_calls > 1, "large source must use multiple maps");
+        assert!(
+            report.reduce_calls >= 1,
+            "bounded partials should receive a final reduce when it fits"
+        );
+
+        let requests = provider.requests.lock().expect("capture lock");
+        let counter = TiktokenTokenCounter::default();
+        for (request, output_tokens) in requests.iter() {
+            assert!(
+                counter
+                    .count_messages(request)
+                    .saturating_add(*output_tokens)
+                    .saturating_add(budget.safety_margin_tokens)
+                    <= budget.safe_request_tokens(),
+                "every map/reduce request must satisfy the 80% invariant"
+            );
+            assert!(*output_tokens <= budget.max_output_tokens);
+        }
+        assert_eq!(
+            requests.last().map(|(_, output)| *output),
+            Some(600),
+            "the final reduce keeps the global source-derived target instead of taking 20% of map summaries"
+        );
+        assert!(
+            requests.iter().any(|(request, _)| request
+                .iter()
+                .any(|message| { message.content.contains("intermediate reduce stage") })),
+            "large ordered partials should be recursively reduced before the final merge"
+        );
+        let final_request = requests.last().expect("final reduce request");
+        let final_rendered = final_request
+            .0
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(final_rendered.contains("Previous durable summary evidence"));
+        assert!(final_rendered.contains("Current Task List"));
+        assert!(final_rendered.contains("Keep exact paths"));
+    }
+
+    #[test]
+    fn one_hundred_thousand_raw_tokens_receive_twenty_thousand_token_target() {
+        let summarizer = LlmSummarizer::new(
+            Arc::new(DummyProvider),
+            "summary-model".to_string(),
+            None,
+            None,
+        )
+        .with_request_budget(bounded_budget(128_000, 32_000, 1_000, 20_000));
+
+        assert_eq!(summarizer.target_for_source(100_000), 20_000);
+    }
+
+    #[tokio::test]
+    async fn bounded_stage_errors_never_fall_back_to_heuristic_by_default() {
+        let summarizer = LlmSummarizer::new(
+            Arc::new(FailingProvider),
+            "summary-model".to_string(),
+            None,
+            None,
+        )
+        .with_request_budget(bounded_budget(10_000, 2_000, 100, 400));
+
+        let error = summarizer
+            .summarize_with_report(&summary_messages())
+            .await
+            .expect_err("a failed bounded stage must surface atomically");
+        assert!(error.to_string().contains("http 500 transient"));
+    }
+
+    #[tokio::test]
+    async fn hundreds_of_individually_small_messages_never_use_one_unbounded_request() {
+        let provider = Arc::new(BoundedRequestCaptureProvider::default());
+        let messages = (0..400)
+            .map(|index| {
+                if index % 2 == 0 {
+                    Message::user(format!(
+                        "small-user-{index} {}",
+                        "requirement evidence detail ".repeat(4)
+                    ))
+                } else {
+                    Message::assistant(
+                        format!(
+                            "small-assistant-{index} {}",
+                            "result test next-step ".repeat(4)
+                        ),
+                        None,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let counter = TiktokenTokenCounter::default();
+        let represented = counter.count_messages(&messages);
+        let target = ((represented as f64) * 0.20).ceil() as u32;
+        let budget = bounded_budget(3_000, 800, 100, target);
+        let summarizer = LlmSummarizer::new(
+            provider.clone(),
+            "small-summary-model".to_string(),
+            None,
+            None,
+        )
+        .with_request_budget(budget.clone())
+        .with_heuristic_fallback_on_error(false);
+
+        let report = summarizer
+            .summarize_with_report(&messages)
+            .await
+            .expect("hundreds of small messages should chunk");
+        assert!(report.map_calls > 1);
+        assert_eq!(report.target_summary_tokens, target);
+        let requests = provider.requests.lock().expect("capture lock");
+        for (request, output) in requests.iter() {
+            assert!(
+                counter
+                    .count_messages(request)
+                    .saturating_add(*output)
+                    .saturating_add(budget.safety_margin_tokens)
+                    <= budget.safe_request_tokens()
+            );
+        }
+        let raw_map_prompts = requests
+            .iter()
+            .filter(|(request, _)| {
+                request
+                    .iter()
+                    .any(|message| message.content.contains("map stage"))
+            })
+            .flat_map(|(request, _)| request.iter())
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(raw_map_prompts.contains("small-user-0"));
+        assert!(raw_map_prompts.contains("small-assistant-399"));
+    }
+
+    #[tokio::test]
+    async fn map_chunk_boundaries_do_not_split_generic_multi_tool_chains() {
+        let provider = Arc::new(BoundedRequestCaptureProvider::default());
+        let budget = bounded_budget(2_000, 300, 100, 300);
+        let summarizer = LlmSummarizer::new(
+            provider.clone(),
+            "tiny-summary-model".to_string(),
+            None,
+            None,
+        )
+        .with_request_budget(budget)
+        .with_heuristic_fallback_on_error(false);
+        let mut messages = (0..8)
+            .map(|index| {
+                Message::user(format!(
+                    "prefix-{index} {}",
+                    "filler requirement evidence ".repeat(14)
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut chain = Message::assistant("CHAIN_ASSISTANT_763", None);
+        chain.tool_calls = Some(vec![
+            ToolCall {
+                id: "chain-call-a-763".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "search".to_string(),
+                    arguments: r#"{"query":"a"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "chain-call-b-763".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read".to_string(),
+                    arguments: r#"{"path":"b"}"#.to_string(),
+                },
+            },
+        ]);
+        messages.push(chain);
+        messages.push(Message::tool_result(
+            "chain-call-a-763",
+            "CHAIN_RESULT_A_763",
+        ));
+        messages.push(Message::tool_result(
+            "chain-call-b-763",
+            "CHAIN_RESULT_B_763",
+        ));
+        messages.extend((0..8).map(|index| {
+            Message::assistant(
+                format!(
+                    "suffix-{index} {}",
+                    "implementation result evidence ".repeat(14)
+                ),
+                None,
+            )
+        }));
+
+        let report = summarizer
+            .summarize_with_report(&messages)
+            .await
+            .expect("tool-chain source should chunk");
+        assert!(report.map_calls > 1);
+        let requests = provider.requests.lock().expect("capture lock");
+        let chain_map = requests
+            .iter()
+            .flat_map(|(request, _)| request.iter())
+            .find(|message| message.content.contains("CHAIN_RESULT_A_763"))
+            .expect("map request containing tool chain");
+        assert!(chain_map.content.contains("CHAIN_ASSISTANT_763"));
+        assert!(chain_map.content.contains("CHAIN_RESULT_B_763"));
+    }
+
+    #[tokio::test]
+    async fn oversized_single_message_is_split_without_dropping_its_tail() {
+        let provider = Arc::new(BoundedRequestCaptureProvider::default());
+        let budget = bounded_budget(2_000, 300, 100, 300);
+        let summarizer = LlmSummarizer::new(
+            provider.clone(),
+            "tiny-summary-model".to_string(),
+            None,
+            None,
+        )
+        .with_request_budget(budget)
+        .with_heuristic_fallback_on_error(false);
+        let messages = vec![Message::user(format!(
+            "{} TAIL_SENTINEL_763",
+            "very large source message with concrete content ".repeat(2_000)
+        ))];
+
+        let report = summarizer
+            .summarize_with_report(&messages)
+            .await
+            .expect("oversized source should split");
+        assert!(report.map_calls > 1);
+        let requests = provider.requests.lock().expect("capture lock");
+        assert!(
+            requests.iter().any(|(request, _)| request
+                .iter()
+                .any(|message| message.content.contains("TAIL_SENTINEL_763"))),
+            "the deterministic continuation chunks must include the original tail"
+        );
+    }
+
+    struct PartialWithoutDoneProvider;
+
+    #[async_trait]
+    impl LLMProvider for PartialWithoutDoneProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_domain::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok::<LLMChunk, LLMError>(
+                LLMChunk::Token("partial but incomplete summary".to_string()),
+            )])))
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_stream_without_done_is_never_accepted_as_summary() {
+        let summarizer = LlmSummarizer::new(
+            Arc::new(PartialWithoutDoneProvider),
+            "model".to_string(),
+            None,
+            None,
+        )
+        .with_request_budget(bounded_budget(10_000, 2_000, 100, 400))
+        .with_heuristic_fallback_on_error(false);
+        let error = summarizer
+            .summarize_with_report(&summary_messages())
+            .await
+            .expect_err("partial stream must fail");
+        assert!(error.to_string().contains("without terminal completion"));
     }
 }

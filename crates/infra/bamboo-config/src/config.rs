@@ -297,6 +297,16 @@ pub struct MemoryConfig {
     /// Falls back to the provider fast model when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model: Option<String>,
+    /// Desired conversation-summary size as a fraction of the raw source tokens
+    /// represented by that summary. The default keeps roughly 20% of source
+    /// content as durable working memory.
+    #[serde(default = "default_summary_target_ratio")]
+    pub summary_target_ratio: f64,
+    /// Maximum fraction of the summarization model context window consumed by a
+    /// fully rendered map/reduce request, including reserved output and safety
+    /// margin.
+    #[serde(default = "default_summary_safe_window_percent")]
+    pub summary_safe_window_percent: u8,
     /// Whether lightweight automatic Dream-style consolidation should run in the
     /// background. Default ON (memory redesign L4): each tick no-ops when there is
     /// no background model configured or no new candidate sessions, so it is free
@@ -429,6 +439,8 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             background_model: None,
+            summary_target_ratio: default_summary_target_ratio(),
+            summary_safe_window_percent: default_summary_safe_window_percent(),
             auto_dream_enabled: default_true_auto_dream_enabled(),
             auto_dream_interval_secs: default_auto_dream_interval_secs(),
             project_prompt_injection: default_true_memory_project_prompt_injection(),
@@ -454,6 +466,14 @@ impl Default for MemoryConfig {
                 default_true_granularity_freshness_gardener_enabled(),
         }
     }
+}
+
+fn default_summary_target_ratio() -> f64 {
+    0.20
+}
+
+fn default_summary_safe_window_percent() -> u8 {
+    80
 }
 
 fn default_true_granularity_freshness_gardener_enabled() -> bool {
@@ -7475,6 +7495,8 @@ mod tests {
         let legacy = serde_json::json!({
             "memory": MemoryConfig {
                 background_model: Some("dream-fast".to_string()),
+                summary_target_ratio: 0.20,
+                summary_safe_window_percent: 80,
                 auto_dream_enabled: true,
                 auto_dream_interval_secs: 900,
                 project_prompt_injection: false,
@@ -7540,6 +7562,18 @@ mod tests {
             memory.capacity_max_archivals_per_run, 50,
             "omitted field takes the serde default fn"
         );
+    }
+
+    #[test]
+    fn compression_summary_budget_defaults_to_twenty_percent_and_eighty_percent_window() {
+        let defaults = MemoryConfig::default();
+        assert_eq!(defaults.summary_target_ratio, 0.20);
+        assert_eq!(defaults.summary_safe_window_percent, 80);
+
+        let parsed: Config = serde_json::from_str(r#"{"memory":{}}"#).expect("parse");
+        let memory = parsed.memory.as_ref().expect("memory present");
+        assert_eq!(memory.summary_target_ratio, 0.20);
+        assert_eq!(memory.summary_safe_window_percent, 80);
     }
 
     /// L4: the maintenance integrators are ON by default — both via

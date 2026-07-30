@@ -9,10 +9,10 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::{
     AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
-use bamboo_compression::{BudgetStrategy, TokenBudget};
+use bamboo_compression::{BudgetStrategy, TiktokenTokenCounter, TokenBudget, TokenCounter};
 use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, TaskItem, TaskItemStatus, TaskList};
 use bamboo_llm::models::{ContentPart, ImageUrl};
-use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream};
+use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo};
 use bamboo_llm::{LLMChunk, LLMError};
 use futures::stream;
 use tokio::sync::mpsc;
@@ -141,6 +141,470 @@ fn prompt_capture_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<Vec<Message>>>>)
     (llm, requests)
 }
 
+#[derive(Debug, Clone)]
+struct CapturedBoundedRequest {
+    messages: Vec<Message>,
+    max_output_tokens: u32,
+    model: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BoundedFailureMode {
+    None,
+    Call(usize),
+    PartialWithoutDone(usize),
+    Reduce,
+}
+
+struct BoundedCompressionProvider {
+    model_info: ProviderModelInfo,
+    requests: Arc<Mutex<Vec<CapturedBoundedRequest>>>,
+    failure_mode: BoundedFailureMode,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for BoundedCompressionProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        let request = CapturedBoundedRequest {
+            messages: messages.to_vec(),
+            max_output_tokens: max_output_tokens.unwrap_or_default(),
+            model: model.to_string(),
+        };
+        let call_number = {
+            let mut requests = self
+                .requests
+                .lock()
+                .expect("bounded compression request lock");
+            requests.push(request);
+            requests.len()
+        };
+        let is_reduce = messages.iter().any(|message| {
+            message.content.contains("final reduce stage")
+                || message.content.contains("intermediate reduce stage")
+        });
+
+        match self.failure_mode {
+            BoundedFailureMode::Call(failed_call) if call_number == failed_call => {
+                Err(LLMError::Api(format!(
+                    "injected map failure on call {call_number}"
+                )))
+            }
+            BoundedFailureMode::Reduce if is_reduce => {
+                Err(LLMError::Api("injected reduce failure".to_string()))
+            }
+            BoundedFailureMode::PartialWithoutDone(failed_call)
+                if call_number == failed_call =>
+            {
+                Ok(Box::pin(stream::iter(vec![Ok::<LLMChunk, LLMError>(
+                    LLMChunk::Token("partial summary that must not commit".to_string()),
+                )])))
+            }
+            _ => Ok(Box::pin(stream::iter(vec![
+                Ok::<LLMChunk, LLMError>(LLMChunk::Token(format!(
+                    "bounded summary part {call_number} with requirements, decisions, and test evidence"
+                ))),
+                Ok::<LLMChunk, LLMError>(LLMChunk::Done),
+            ]))),
+        }
+    }
+
+    async fn list_model_info(&self) -> bamboo_llm::provider::Result<Vec<ProviderModelInfo>> {
+        Ok(vec![self.model_info.clone()])
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn bounded_compression_llm(
+    failure_mode: BoundedFailureMode,
+) -> (
+    Arc<dyn LLMProvider>,
+    Arc<Mutex<Vec<CapturedBoundedRequest>>>,
+) {
+    bounded_compression_llm_with_limits(failure_mode, 5_000, 2_000)
+}
+
+#[allow(clippy::type_complexity)]
+fn bounded_compression_llm_with_limits(
+    failure_mode: BoundedFailureMode,
+    max_context_tokens: u32,
+    max_output_tokens: u32,
+) -> (
+    Arc<dyn LLMProvider>,
+    Arc<Mutex<Vec<CapturedBoundedRequest>>>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LLMProvider> = Arc::new(BoundedCompressionProvider {
+        model_info: ProviderModelInfo {
+            id: "summary-model-763".to_string(),
+            max_context_tokens: Some(max_context_tokens),
+            max_output_tokens: Some(max_output_tokens),
+        },
+        requests: Arc::clone(&requests),
+        failure_mode,
+    });
+    (llm, requests)
+}
+
+fn bounded_compression_session(id: &str) -> Session {
+    let mut session = Session::new(id, "main-model-763");
+    session.token_budget = Some(TokenBudget {
+        max_context_tokens: 24_000,
+        max_output_tokens: 4_000,
+        strategy: BudgetStrategy::Hybrid {
+            window_size: 20,
+            enable_summarization: true,
+        },
+        safety_margin: 0,
+        compression_trigger_percent: 80,
+        compression_target_percent: 50,
+        working_reserve_tokens: 0,
+        fallback_trigger_percent: 75,
+        prompt_cache_min_tool_output_chars: 1_200,
+        prompt_cache_head_chars: 280,
+        prompt_cache_tail_chars: 180,
+        prompt_cache_recent_user_turns: 2,
+        prompt_cache_recent_tool_chains: 2,
+        max_tool_output_tokens: 0,
+    });
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..40 {
+        let user_marker = if index >= 37 {
+            format!("LATEST_PROTECTED_763_{index}")
+        } else {
+            format!("ARCHIVE_SOURCE_763_{index}")
+        };
+        session.messages.push(Message::user(format!(
+            "{user_marker} {}",
+            "requirement detail evidence alpha beta gamma ".repeat(40)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "assistant-{index} {}",
+                "implementation result test output followup delta ".repeat(40)
+            ),
+            None,
+        ));
+    }
+    let mut never_compress = Message::assistant(
+        format!(
+            "NEVER_COMPRESS_763 {}",
+            "durable protected runtime state ".repeat(40)
+        ),
+        None,
+    );
+    never_compress.never_compress = true;
+    session.messages.insert(5, never_compress);
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 20_000,
+        total_tokens: 20_100,
+        max_context_tokens: 24_000,
+        budget_limit: 24_000,
+        truncation_occurred: true,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+    session.force_manual_compression = Some("Preserve concrete evidence".to_string());
+    session
+}
+
+fn bounded_compression_config(summary_provider: Arc<dyn LLMProvider>) -> AgentLoopConfig {
+    AgentLoopConfig {
+        model_name: Some("main-model-763".to_string()),
+        summarization_model_name: Some("summary-model-763".to_string()),
+        summarization_model_provider: Some(summary_provider),
+        summary_target_ratio: 0.20,
+        summary_safe_window_percent: 80,
+        ..Default::default()
+    }
+}
+
+fn archive_state(session: &Session) -> Vec<(String, bool, Option<String>)> {
+    session
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.id.clone(),
+                message.compressed,
+                message.compressed_by_event_id.clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn bounded_host_compression_uses_auxiliary_model_budget_and_exact_candidates() {
+    let mut session = bounded_compression_session("bounded-success-763");
+    let never_compress_id = session
+        .messages
+        .iter()
+        .find(|message| message.content.contains("NEVER_COMPRESS_763"))
+        .map(|message| message.id.clone())
+        .expect("never-compress fixture");
+    let latest_user_ids = session
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message.role, Role::User) && message.content.contains("LATEST_PROTECTED_763")
+        })
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let (summary_llm, captured) = bounded_compression_llm(BoundedFailureMode::None);
+    let config = bounded_compression_config(summary_llm);
+    let main_llm = noop_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "main-model-763",
+        "bounded-success-763",
+        &[],
+        &main_llm,
+        Some(&event_tx),
+        "pre-turn",
+    )
+    .await
+    .expect("bounded host compression should succeed");
+    assert!(applied);
+    drop(event_tx);
+    let progress_statuses = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::ContextCompressionStatus { status, .. } => Some(status),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(progress_statuses.iter().any(|status| status == "started"));
+    assert!(progress_statuses
+        .iter()
+        .any(|status| status.starts_with("map:")));
+    assert!(progress_statuses
+        .iter()
+        .any(|status| status.starts_with("final_reduce:")
+            || status.starts_with("intermediate_reduce:")));
+    assert!(progress_statuses.iter().any(|status| status == "completed"));
+
+    let requests = captured.lock().expect("bounded capture lock").clone();
+    assert!(
+        requests.len() >= 3,
+        "the much smaller summary model should force multiple bounded map/reduce stages"
+    );
+    let counter = TiktokenTokenCounter::default();
+    for request in &requests {
+        assert_eq!(request.model, "summary-model-763");
+        let input_tokens = counter.count_messages(&request.messages);
+        assert!(
+            input_tokens
+                .saturating_add(request.max_output_tokens)
+                .saturating_add(1_000)
+                <= 4_000,
+            "request exceeded auxiliary model 80% ceiling: input={input_tokens}, output={}",
+            request.max_output_tokens
+        );
+        assert!(request.max_output_tokens <= 2_000);
+    }
+
+    let rendered_requests = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered_requests.contains("ARCHIVE_SOURCE_763_0"));
+    assert!(!rendered_requests.contains("NEVER_COMPRESS_763"));
+    assert!(!rendered_requests.contains("LATEST_PROTECTED_763"));
+
+    let compressed_messages = session
+        .messages
+        .iter()
+        .filter(|message| message.compressed)
+        .collect::<Vec<_>>();
+    assert!(!compressed_messages.is_empty());
+    for message in compressed_messages {
+        assert!(
+            rendered_requests.contains(&message.id),
+            "archived message {} was not represented in a raw map request",
+            message.id
+        );
+    }
+    assert!(session
+        .messages
+        .iter()
+        .find(|message| message.id == never_compress_id)
+        .is_some_and(|message| !message.compressed));
+    for id in latest_user_ids {
+        assert!(
+            session
+                .messages
+                .iter()
+                .find(|message| message.id == id)
+                .is_some_and(|message| !message.compressed),
+            "newest protected user message must remain active"
+        );
+    }
+
+    let event = session
+        .compression_events
+        .last()
+        .expect("successful pass should persist an event");
+    assert!(event.summarization_map_calls > 1);
+    assert!(event.summarization_reduce_calls >= 1);
+    assert_eq!(event.model_used.as_deref(), Some("summary-model-763"));
+    assert_eq!(event.summary_target_ratio, 0.20);
+    assert!(event.target_summary_tokens > 0);
+    assert!(event.actual_summary_tokens > 0);
+    assert!(
+        session
+            .messages
+            .iter()
+            .filter(|message| message.compressed)
+            .all(|message| message.compressed_by_event_id.as_deref() == Some(event.id.as_str())),
+        "logical pass id should correlate requests, archive markers, and event"
+    );
+}
+
+#[tokio::test]
+async fn same_size_chat_and_summary_windows_still_split_near_critical_pressure() {
+    let mut session = bounded_compression_session("same-window-763");
+    let budget = session
+        .token_budget
+        .as_mut()
+        .expect("main token budget fixture");
+    budget.compression_target_percent = 25;
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 100,
+        summary_tokens: 0,
+        window_tokens: 23_500,
+        total_tokens: 23_600,
+        max_context_tokens: 24_000,
+        budget_limit: 24_000,
+        truncation_occurred: true,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+    let (summary_llm, captured) =
+        bounded_compression_llm_with_limits(BoundedFailureMode::None, 24_000, 6_000);
+    let config = bounded_compression_config(summary_llm);
+    let main_llm = noop_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "main-model-763",
+        "same-window-763",
+        &[],
+        &main_llm,
+        None,
+        "pre-turn",
+    )
+    .await
+    .expect("same-window bounded compression");
+    assert!(applied);
+    let event = session
+        .compression_events
+        .last()
+        .expect("compression event");
+    assert!(
+        event.summarization_map_calls > 1,
+        "near-critical source must split even when both models advertise the same context size"
+    );
+
+    let requests = captured.lock().expect("capture lock");
+    let counter = TiktokenTokenCounter::default();
+    for request in requests.iter() {
+        assert!(
+            counter
+                .count_messages(&request.messages)
+                .saturating_add(request.max_output_tokens)
+                .saturating_add(1_000)
+                <= 19_200,
+            "same-window request exceeded the 80% ceiling"
+        );
+    }
+}
+
+async fn assert_failed_bounded_pass_is_atomic(
+    failure_mode: BoundedFailureMode,
+    expected_error: &str,
+) {
+    let mut session = bounded_compression_session("bounded-failure-763");
+    let before_archive = archive_state(&session);
+    let before_summary =
+        serde_json::to_value(&session.conversation_summary).expect("serialize summary");
+    let before_events =
+        serde_json::to_value(&session.compression_events).expect("serialize events");
+    let before_manual = session.force_manual_compression.clone();
+    let (summary_llm, captured) = bounded_compression_llm(failure_mode);
+    let config = bounded_compression_config(summary_llm);
+    let main_llm = noop_llm();
+
+    let error = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "main-model-763",
+        "bounded-failure-763",
+        &[],
+        &main_llm,
+        None,
+        "pre-turn",
+    )
+    .await
+    .expect_err("injected bounded stage failure must surface");
+    assert!(
+        error.to_string().contains(expected_error),
+        "unexpected error: {error}"
+    );
+    assert_eq!(archive_state(&session), before_archive);
+    assert_eq!(
+        serde_json::to_value(&session.conversation_summary).expect("serialize summary"),
+        before_summary
+    );
+    assert_eq!(
+        serde_json::to_value(&session.compression_events).expect("serialize events"),
+        before_events
+    );
+    assert_eq!(session.force_manual_compression, before_manual);
+    assert!(!captured.lock().expect("bounded capture lock").is_empty());
+}
+
+#[tokio::test]
+async fn failed_map_chunk_leaves_archive_summary_and_events_unchanged() {
+    assert_failed_bounded_pass_is_atomic(
+        BoundedFailureMode::Call(2),
+        "injected map failure on call 2",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_reduce_leaves_archive_summary_and_events_unchanged() {
+    assert_failed_bounded_pass_is_atomic(BoundedFailureMode::Reduce, "injected reduce failure")
+        .await;
+}
+
+#[tokio::test]
+async fn partial_stream_leaves_archive_summary_and_events_unchanged() {
+    assert_failed_bounded_pass_is_atomic(
+        BoundedFailureMode::PartialWithoutDone(1),
+        "without terminal completion",
+    )
+    .await;
+}
+
 struct CompressionInstructionHook;
 
 #[async_trait::async_trait]
@@ -160,8 +624,8 @@ impl AgentHook for CompressionInstructionHook {
             HookPayload::Compression {
                 estimated_tokens,
                 usage_percent,
-                max_context_tokens: 1_200,
-                trigger_context_tokens: 960,
+                max_context_tokens: 5_000,
+                trigger_context_tokens: 4_000,
                 trigger,
                 phase,
             } if *estimated_tokens > 0
@@ -424,7 +888,7 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
 async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressure_is_high() {
     let mut session = Session::new("session-cp-2", "test-model");
     session.token_budget = Some(TokenBudget::new(
-        360,
+        600,
         80,
         BudgetStrategy::Window { size: 50 },
     ));
@@ -445,7 +909,7 @@ async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressu
         ..Default::default()
     };
 
-    let llm = noop_llm();
+    let (llm, _) = recording_llm();
     let prepared = prepare_round_context(
         &mut session,
         &config,
@@ -663,7 +1127,7 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         ..Default::default()
     };
 
-    let llm = noop_llm();
+    let (llm, _) = recording_llm();
     let prepared = prepare_round_context(
         &mut session,
         &config,
@@ -748,7 +1212,7 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
         background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
-    let llm = noop_llm();
+    let (llm, _) = recording_llm();
 
     let applied = maybe_apply_host_context_compression(
         &mut session,
@@ -794,7 +1258,7 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
         "## External Memory (Persistent)\n\nSession memory note".to_string(),
     );
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        max_context_tokens: 5000,
         max_output_tokens: 200,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -836,10 +1300,10 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 850,
-        total_tokens: 950,
-        max_context_tokens: 1200,
-        budget_limit: 1000,
+        window_tokens: 4_100,
+        total_tokens: 4_200,
+        max_context_tokens: 5000,
+        budget_limit: 5000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -904,7 +1368,7 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     let mut session = Session::new("session-cp-pre-turn-context-blocks", "test-model");
     activate_plan_mode(&mut session);
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        max_context_tokens: 5000,
         max_output_tokens: 200,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -945,10 +1409,10 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 900,
-        total_tokens: 1000,
-        max_context_tokens: 1200,
-        budget_limit: 1200,
+        window_tokens: 4_100,
+        total_tokens: 4_200,
+        max_context_tokens: 5000,
+        budget_limit: 5000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -1061,7 +1525,7 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
         ..Default::default()
     };
 
-    let llm = noop_llm();
+    let (llm, _) = recording_llm();
     let _prepared = prepare_round_context(
         &mut session,
         &config,
@@ -1219,7 +1683,7 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
-    let llm = noop_llm();
+    let (llm, _) = recording_llm();
 
     let applied = super::force_overflow_context_recovery(
         &mut session,

@@ -751,6 +751,16 @@ impl AgentRuntime {
                 .and_then(|d| d.search.as_ref().or(d.fast.as_ref()))
                 .map(|r| r.model.clone()),
             compression_instructions: None,
+            summary_target_ratio: config
+                .memory()
+                .as_ref()
+                .map(|memory| memory.summary_target_ratio)
+                .unwrap_or(0.20),
+            summary_safe_window_percent: config
+                .memory()
+                .as_ref()
+                .map(|memory| memory.summary_safe_window_percent)
+                .unwrap_or(80),
             summarization_model_name: summarization_model
                 .or_else(|| config.get_task_summary_model()),
             background_model_provider,

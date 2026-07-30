@@ -398,6 +398,12 @@ pub struct AgentLoopConfig {
     ///
     /// Resolution order: session-level > config-level > built-in defaults.
     pub(crate) compression_instructions: Option<String>,
+    /// Desired final summary size relative to the raw source tokens represented
+    /// by it. Values are normalized at the compression boundary.
+    pub(crate) summary_target_ratio: f64,
+    /// Safe request ceiling as a percentage of the selected summarization
+    /// model's context window.
+    pub(crate) summary_safe_window_percent: u8,
     /// Dedicated model for summarization. Falls back to `background_model_name`.
     pub(crate) summarization_model_name: Option<String>,
     /// Optional provider override for memory/background model LLM calls.
@@ -548,6 +554,8 @@ impl Default for AgentLoopConfig {
             planning_model_name: None,
             search_model_name: None,
             compression_instructions: None,
+            summary_target_ratio: 0.20,
+            summary_safe_window_percent: 80,
             summarization_model_name: None,
             background_model_provider: None,
             summarization_model_provider: None,

@@ -4,6 +4,90 @@ use bamboo_compression::limits::{load_model_limits_from_unified_config, ModelLim
 use bamboo_compression::{ModelLimitsRegistry, TokenBudget};
 use bamboo_llm::provider::LLMProvider;
 
+const CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS: u32 = 32_000;
+const CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS: u32 = 8_000;
+const CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN: u32 = 1_000;
+
+/// Resolve the budget for an auxiliary model/provider pair without touching the
+/// chat model's session cache. Compression can route to a completely different
+/// provider and must therefore never inherit the triggering model's limits.
+pub(super) async fn resolve_auxiliary_token_budget(
+    config: &AgentLoopConfig,
+    model_name: &str,
+    llm: &dyn LLMProvider,
+) -> TokenBudget {
+    let mut registry = ModelLimitsRegistry::with_config_path(
+        bamboo_compression::limits::get_default_config_path(&bamboo_config::paths::bamboo_dir()),
+    );
+
+    let provider_limit = match llm.list_model_info().await {
+        Ok(models) => models
+            .into_iter()
+            .find(|entry| entry.id == model_name)
+            .and_then(|model_info| {
+                model_info.max_context_tokens.map(|max_context_tokens| {
+                    let mut limit = ModelLimit::new(model_name.to_string(), max_context_tokens);
+                    limit.max_output_tokens = model_info.max_output_tokens;
+                    limit
+                })
+            }),
+        Err(error) => {
+            tracing::warn!(
+                model = model_name,
+                error = %error,
+                "Failed to resolve summarization-model runtime limits; checking configured overrides"
+            );
+            None
+        }
+    };
+
+    // Legacy config is lower priority than the dedicated model_limits.json
+    // file, but still needs to participate when that file is absent. Apply it
+    // before loading the dedicated file so the latter can overwrite exact
+    // patterns deterministically.
+    apply_legacy_model_limits(&mut registry, config.legacy_model_limits.as_ref());
+
+    match registry.load_user_config().await {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(
+                model = model_name,
+                error = %error,
+                "Failed to load model_limits.json for summarization; using provider/legacy limits"
+            );
+        }
+    }
+
+    // Explicit user overrides (including partial patterns) outrank exact
+    // provider metadata. Keeping provider metadata out of the override registry
+    // avoids an exact provider entry accidentally shadowing a user pattern.
+    let model_limit = match registry.get(model_name).or(provider_limit) {
+        Some(limit) => limit,
+        None => {
+            tracing::warn!(
+                model = model_name,
+                context_tokens = CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
+                output_tokens = CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
+                "No summarization-model limit is known; using conservative bounded fallback"
+            );
+            let mut fallback = ModelLimit::new(
+                model_name.to_string(),
+                CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
+            );
+            fallback.max_output_tokens = Some(CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS);
+            fallback.safety_margin = Some(CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN);
+            fallback
+        }
+    };
+
+    TokenBudget::with_safety_margin(
+        model_limit.max_context_tokens,
+        model_limit.get_max_output_tokens(),
+        bamboo_compression::BudgetStrategy::default(),
+        model_limit.get_safety_margin(),
+    )
+}
+
 pub(super) async fn resolve_token_budget(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -434,5 +518,97 @@ mod tests {
         let limit =
             resolve_provider_runtime_limit(&config, &FailingProvider, "gpt-5.3-codex").await;
         assert!(limit.is_none());
+    }
+
+    #[tokio::test]
+    async fn auxiliary_budget_uses_exact_selected_provider_model_metadata() {
+        let config = AgentLoopConfig {
+            provider_type: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo {
+                id: "summary-model-763".to_string(),
+                max_context_tokens: Some(32_000),
+                max_output_tokens: Some(6_000),
+            }],
+        };
+
+        let budget = resolve_auxiliary_token_budget(&config, "summary-model-763", &provider).await;
+        assert_eq!(budget.max_context_tokens, 32_000);
+        assert_eq!(budget.max_output_tokens, 6_000);
+        assert_eq!(budget.safety_margin, 1_000);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_budget_honors_legacy_model_limit_when_dedicated_file_is_absent() {
+        let model = "legacy-summary-model-763-no-user-file-collision";
+        let config = AgentLoopConfig {
+            legacy_model_limits: Some(serde_json::json!([
+                {
+                    "model_pattern": model,
+                    "max_context_tokens": 12_345,
+                    "max_output_tokens": 2_345,
+                    "safety_margin": 345
+                }
+            ])),
+            ..Default::default()
+        };
+        let provider = MetadataProvider::default();
+
+        let budget = resolve_auxiliary_token_budget(&config, model, &provider).await;
+        assert_eq!(budget.max_context_tokens, 12_345);
+        assert_eq!(budget.max_output_tokens, 2_345);
+        assert_eq!(budget.safety_margin, 345);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_user_pattern_override_outranks_exact_provider_metadata() {
+        let config = AgentLoopConfig {
+            legacy_model_limits: Some(serde_json::json!([
+                {
+                    "model_pattern": "summary-family-763",
+                    "max_context_tokens": 16_000,
+                    "max_output_tokens": 3_000,
+                    "safety_margin": 500
+                }
+            ])),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo {
+                id: "summary-family-763-latest".to_string(),
+                max_context_tokens: Some(64_000),
+                max_output_tokens: Some(8_000),
+            }],
+        };
+
+        let budget =
+            resolve_auxiliary_token_budget(&config, "summary-family-763-latest", &provider).await;
+        assert_eq!(budget.max_context_tokens, 16_000);
+        assert_eq!(budget.max_output_tokens, 3_000);
+        assert_eq!(budget.safety_margin, 500);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_budget_uses_conservative_fallback_when_limit_is_unknown() {
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider::default();
+
+        let budget = resolve_auxiliary_token_budget(
+            &config,
+            "definitely-unknown-summary-model-763",
+            &provider,
+        )
+        .await;
+        assert_eq!(
+            budget.max_context_tokens,
+            CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            budget.max_output_tokens,
+            CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS
+        );
+        assert_eq!(budget.safety_margin, CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN);
     }
 }

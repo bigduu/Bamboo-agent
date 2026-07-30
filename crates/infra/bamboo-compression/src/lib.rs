@@ -23,10 +23,13 @@ pub mod types;
 
 pub use compression_tooling::{
     active_messages_for_budget, apply_compression_plan, build_compression_plan_with_summary,
+    build_forced_compression_candidate_plan,
+    build_forced_compression_candidate_plan_with_fixed_tokens,
     build_forced_compression_plan_with_summary, build_summary_prompt, compression_summary_message,
     context_window_usage_percent, estimate_context_compression_exposure,
-    normalized_trigger_percent, summary_source_messages, CompressionPlan, CompressionPlanError,
-    ContextCompressionExposure,
+    finalize_compression_candidate_plan, normalized_summary_target_ratio,
+    normalized_trigger_percent, summary_source_messages, CompressionCandidatePlan, CompressionPlan,
+    CompressionPlanError, ContextCompressionExposure, DEFAULT_SUMMARY_TARGET_RATIO,
 };
 pub use counter::{HeuristicTokenCounter, TiktokenTokenCounter, TokenCounter};
 pub use limits::{create_budget_for_model, ModelLimitsRegistry};
