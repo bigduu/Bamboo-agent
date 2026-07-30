@@ -77,6 +77,7 @@ impl SessionRepository {
     /// Load a session from the memory cache, falling back to durable storage
     /// (and back-filling the cache on a storage hit). `None` if absent in both.
     pub async fn load(&self, session_id: &str) -> Option<Session> {
+        let _guard = self.persistence.acquire_lock(session_id).await;
         if let Some(session) = read_cached_session(&self.cache, session_id) {
             return Some(session);
         }
@@ -100,6 +101,7 @@ impl SessionRepository {
     /// swallowing them to `None`. Cache hit short-circuits; a storage hit
     /// back-fills the cache.
     pub async fn try_load(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        let _guard = self.persistence.acquire_lock(session_id).await;
         if let Some(session) = read_cached_session(&self.cache, session_id) {
             return Ok(Some(session));
         }
@@ -119,14 +121,18 @@ impl SessionRepository {
     /// storage errors. Use [`save_and_cache`](Self::save_and_cache) for the
     /// fire-and-forget variant that logs and continues on failure.
     pub async fn save(&self, session: &mut Session) -> std::io::Result<()> {
-        self.persistence.merge_save_runtime(session).await?;
-        #[cfg(test)]
-        self.run_post_durable_hook("save_full", &session.id);
-        self.cache.insert(
-            session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
-        );
-        Ok(())
+        self.persistence
+            .merge_save_runtime_and_publish(session, |saved, committed| {
+                if committed {
+                    #[cfg(test)]
+                    self.run_post_durable_hook("save_full", &saved.id);
+                    self.cache.insert(
+                        saved.id.clone(),
+                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    );
+                }
+            })
+            .await
     }
 
     /// Atomically mutate the latest durable runtime session and refresh the
@@ -141,21 +147,20 @@ impl SessionRepository {
     where
         F: FnOnce(&mut Session),
     {
-        let saved = self
-            .persistence
-            .update_runtime_config(session_id, mutate)
-            .await?;
-        if let (Some(saved), Some(cached)) = (saved.as_ref(), self.cache.get(session_id)) {
-            let mut cached = cached.write();
-            for key in metadata_keys {
-                if let Some(value) = saved.metadata.get(*key) {
-                    cached.metadata.insert((*key).to_string(), value.clone());
-                } else {
-                    cached.metadata.remove(*key);
+        self.persistence
+            .update_runtime_config_and_publish(session_id, mutate, |saved| {
+                if let Some(cached) = self.cache.get(session_id) {
+                    let mut cached = cached.write();
+                    for key in metadata_keys {
+                        if let Some(value) = saved.metadata.get(*key) {
+                            cached.metadata.insert((*key).to_string(), value.clone());
+                        } else {
+                            cached.metadata.remove(*key);
+                        }
+                    }
                 }
-            }
-        }
-        Ok(saved)
+            })
+            .await
     }
 
     /// Load a session, creating a fresh `Session::new(id, model)` if absent.
@@ -175,6 +180,7 @@ impl SessionRepository {
     /// `load_merged` never overwrites a newer cached session with an older
     /// storage copy, so it is safe to call from hot read paths.
     pub async fn load_merged(&self, session_id: &str) -> Option<Session> {
+        let _guard = self.persistence.acquire_lock(session_id).await;
         let memory_session = read_cached_session(&self.cache, session_id);
         let storage_session = self
             .storage
@@ -244,16 +250,20 @@ impl SessionRepository {
     /// Persist the session (merge-on-write, preserving concurrent UI edits to
     /// the authoritative metadata group) and refresh the in-memory cache.
     pub async fn save_and_cache(&self, session: &mut Session) {
-        let result = self.persistence.merge_save_runtime(session).await;
-        #[cfg(test)]
-        self.run_post_durable_hook("save_and_cache", &session.id);
+        let result = self
+            .persistence
+            .merge_save_runtime_and_publish(session, |saved, _| {
+                #[cfg(test)]
+                self.run_post_durable_hook("save_and_cache", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(parking_lot::RwLock::new(saved.clone())),
+                );
+            })
+            .await;
         if let Err(error) = result {
             tracing::warn!("[{}] Failed to save session: {}", session.id, error);
         }
-        self.cache.insert(
-            session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
-        );
     }
 }
 
@@ -282,14 +292,16 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         // when durable storage fails so a current activation can never observe
         // a previous run's skill allowlist. The error is still returned to the
         // caller and durable state remains unchanged.
-        let result = self.persistence.merge_save_runtime(session).await;
-        #[cfg(test)]
-        self.run_post_durable_hook("save_runtime_session", &session.id);
-        self.cache.insert(
-            session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
-        );
-        result
+        self.persistence
+            .merge_save_runtime_and_publish(session, |saved, _| {
+                #[cfg(test)]
+                self.run_post_durable_hook("save_runtime_session", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(parking_lot::RwLock::new(saved.clone())),
+                );
+            })
+            .await
     }
 
     async fn save_runtime_control_plane(&self, session: &mut Session) -> std::io::Result<()> {
@@ -371,16 +383,18 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         // checkpoint may have failed to load the latest durable transcript, and
         // replacing a fresher cache entry with the stale runner snapshot would
         // set up a later SHRINK write.
-        let result = self.persistence.checkpoint_runtime_session(session).await;
-        #[cfg(test)]
-        self.run_post_durable_hook("checkpoint", &session.id);
-        if result.is_ok() {
-            self.cache.insert(
-                session.id.clone(),
-                Arc::new(parking_lot::RwLock::new(session.clone())),
-            );
-        }
-        result
+        self.persistence
+            .checkpoint_runtime_session_and_publish(session, |saved, committed| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint", &saved.id);
+                if committed {
+                    self.cache.insert(
+                        saved.id.clone(),
+                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    );
+                }
+            })
+            .await
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
@@ -396,35 +410,16 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         // cache-first, so a stale cache could erase a message concurrently
         // appended to the durable legacy queue. Delegate the compare-and-clear
         // to LockedSessionStore's single per-session critical section.
-        let cleared = bamboo_domain::RuntimeSessionPersistence::clear_legacy_pending_messages(
-            self.persistence.as_ref(),
-            session_id,
-            expected,
-        )
-        .await?;
-        if !cleared {
-            return Ok(false);
-        }
-
-        // Refresh only after the durable CAS succeeds. A failed comparison or
-        // persistence error leaves the live cache untouched.
-        let latest = self
-            .storage
-            .load_session(session_id)
-            .await?
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("session disappeared after clearing legacy inbox: {session_id}"),
-                )
-            })?;
-        #[cfg(test)]
-        self.run_post_durable_hook("clear_legacy", session_id);
-        self.cache.insert(
-            session_id.to_string(),
-            Arc::new(parking_lot::RwLock::new(latest)),
-        );
-        Ok(true)
+        self.persistence
+            .clear_legacy_pending_messages_and_publish(session_id, expected, |latest| {
+                #[cfg(test)]
+                self.run_post_durable_hook("clear_legacy", session_id);
+                self.cache.insert(
+                    session_id.to_string(),
+                    Arc::new(parking_lot::RwLock::new(latest.clone())),
+                );
+            })
+            .await
     }
 
     async fn append_token_usage_record(

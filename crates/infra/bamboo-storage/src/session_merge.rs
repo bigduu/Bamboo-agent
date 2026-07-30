@@ -241,7 +241,26 @@ impl LockedSessionStore {
     /// [`Self::save_runtime_authoritative_flags`] instead, which persists the
     /// in-memory flag as-is.
     pub async fn merge_save_runtime(&self, session: &mut Session) -> std::io::Result<()> {
-        self.merge_save_runtime_inner(session, true).await
+        self.merge_save_runtime_and_publish(session, |_, _| {})
+            .await
+    }
+
+    /// Merge-save a runtime session and synchronously publish the resulting
+    /// snapshot before releasing its per-session serialization lock.
+    ///
+    /// The callback receives whether the durable save committed. It always runs
+    /// after the save attempt so repository callers can preserve their existing
+    /// cache-on-failure policy without reopening a durable-to-cache race.
+    pub async fn merge_save_runtime_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(session, true, publish)
+            .await
     }
 
     /// Persist an execute-boundary transcript checkpoint without allowing a
@@ -253,6 +272,24 @@ impl LockedSessionStore {
     /// latest transcript cannot be read would reintroduce the SHRINK hazard
     /// this checkpoint exists to prevent.
     pub async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.checkpoint_runtime_session_and_publish(session, |_, _| {})
+            .await
+    }
+
+    /// Checkpoint a runtime session and publish its reconciled snapshot before
+    /// releasing the same per-session serialization lock.
+    ///
+    /// The callback runs after the durable save attempt and receives its commit
+    /// status. A load failure returns before publication, matching the
+    /// checkpoint's fail-closed behavior.
+    pub async fn checkpoint_runtime_session_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
 
@@ -273,7 +310,9 @@ impl LockedSessionStore {
             adopt_disk_bypass_permissions(session, latest);
         }
 
-        self.storage.save_session(session).await
+        let result = self.storage.save_session(session).await;
+        publish(session, result.is_ok());
+        result
     }
 
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
@@ -288,14 +327,19 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.merge_save_runtime_inner(session, false).await
+        self.merge_save_runtime_inner_and_publish(session, false, |_, _| {})
+            .await
     }
 
-    async fn merge_save_runtime_inner(
+    async fn merge_save_runtime_inner_and_publish<F>(
         &self,
         session: &mut Session,
         adopt_bypass: bool,
-    ) -> std::io::Result<()> {
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
         let _guard = self.acquire_lock(&session.id).await;
 
         // Single disk read serves BOTH the SHRINK diagnostic and the
@@ -350,7 +394,9 @@ impl LockedSessionStore {
                 adopt_disk_bypass_permissions(session, latest);
             }
         }
-        self.storage.save_session(session).await
+        let result = self.storage.save_session(session).await;
+        publish(session, result.is_ok());
+        result
     }
 
     /// Apply a config-only mutation to a session without ever clobbering its
@@ -372,13 +418,54 @@ impl LockedSessionStore {
     where
         F: FnOnce(&mut Session),
     {
+        self.update_runtime_config_and_publish(session_id, mutate, |_| {})
+            .await
+    }
+
+    /// Apply a config-only mutation and synchronously publish the saved
+    /// snapshot before releasing the session lock.
+    pub async fn update_runtime_config_and_publish<M, P>(
+        &self,
+        session_id: &str,
+        mutate: M,
+        publish: P,
+    ) -> std::io::Result<Option<Session>>
+    where
+        M: FnOnce(&mut Session),
+        P: FnOnce(&Session),
+    {
         let _guard = self.acquire_lock(session_id).await;
         let Some(mut session) = self.storage.load_session(session_id).await? else {
             return Ok(None);
         };
         mutate(&mut session);
         self.storage.save_session(&session).await?;
+        publish(&session);
         Ok(Some(session))
+    }
+
+    /// Clear the legacy compatibility queue using durable CAS and publish the
+    /// saved full snapshot before releasing the same session lock.
+    pub async fn clear_legacy_pending_messages_and_publish<F>(
+        &self,
+        session_id: &str,
+        expected: &[serde_json::Value],
+        publish: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_session(session_id).await? else {
+            return Ok(false);
+        };
+        if latest.pending_injected_messages().as_deref() != Some(expected) {
+            return Ok(false);
+        }
+        latest.clear_pending_injected_messages();
+        self.storage.save_runtime_state(&latest).await?;
+        publish(&latest);
+        Ok(true)
     }
 }
 
@@ -425,16 +512,8 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         session_id: &str,
         expected: &[serde_json::Value],
     ) -> std::io::Result<bool> {
-        let _guard = self.acquire_lock(session_id).await;
-        let Some(mut latest) = self.storage.load_session(session_id).await? else {
-            return Ok(false);
-        };
-        if latest.pending_injected_messages().as_deref() != Some(expected) {
-            return Ok(false);
-        }
-        latest.clear_pending_injected_messages();
-        self.storage.save_runtime_state(&latest).await?;
-        Ok(true)
+        self.clear_legacy_pending_messages_and_publish(session_id, expected, |_| {})
+            .await
     }
 }
 
