@@ -10,10 +10,14 @@
 //!
 //! # Protocol Flow
 //!
-//! 1. Client sends `McpInitializeRequest` to establish connection
-//! 2. Server responds with `McpInitializeResult` and capabilities
-//! 3. Client discovers available tools via `McpToolListRequest`
-//! 4. Client invokes tools using `McpToolCallRequest`
+//! Modern servers use the stateless MCP `2026-07-28` flow:
+//! 1. Client probes with `server/discover`
+//! 2. Every request carries the protocol version, capabilities, and identity
+//! 3. Client discovers available tools via `tools/list`
+//! 4. Client invokes tools using `tools/call`
+//!
+//! Legacy servers (`2025-11-25` and earlier) continue to use the
+//! `initialize` / `notifications/initialized` handshake.
 //!
 //! # Example
 //!
@@ -32,6 +36,22 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Current stable MCP protocol revision implemented by Bamboo.
+pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Latest initialization-based MCP revision used for legacy fallback.
+pub const LATEST_LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Protocol revision used by the deprecated HTTP+SSE transport.
+pub const LEGACY_SSE_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// MCP error returned by a modern server when a request version is unsupported.
+pub const UNSUPPORTED_PROTOCOL_VERSION_ERROR: i32 = -32022;
+
+/// Modern MCP protocol errors that unambiguously identify a modern server.
+pub const HEADER_MISMATCH_ERROR: i32 = -32020;
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR: i32 = -32021;
 
 // JSON-RPC 2.0 base types
 
@@ -195,10 +215,11 @@ pub struct McpInitializeRequest {
 impl Default for McpInitializeRequest {
     /// Creates a default initialization request for the bamboo agent.
     ///
-    /// Uses protocol version "2024-11-05" and the current package version.
+    /// Uses the latest initialization-based revision and the current package
+    /// version. Modern `2026-07-28` servers use `server/discover` instead.
     fn default() -> Self {
         Self {
-            protocol_version: "2024-11-05".to_string(),
+            protocol_version: LATEST_LEGACY_PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities::default(),
             client_info: Implementation {
                 name: "bamboo-agent".to_string(),
@@ -231,6 +252,38 @@ pub struct McpInitializeResult {
     /// Optional instructions for using this server
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+}
+
+/// Result returned by the modern `server/discover` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpDiscoverResult {
+    /// Modern results must carry `resultType = "complete"`.
+    pub result_type: String,
+    /// Protocol revisions supported by the server.
+    pub supported_versions: Vec<String>,
+    /// Capabilities advertised by the server.
+    pub capabilities: ServerCapabilities,
+    /// Optional usage guidance for the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Result metadata, including the optional server implementation identity.
+    #[serde(rename = "_meta", default)]
+    pub meta: Value,
+    /// Server-provided freshness hint for this discovery result.
+    pub ttl_ms: u64,
+    /// Cache isolation requested by the server.
+    pub cache_scope: String,
+}
+
+impl McpDiscoverResult {
+    /// Extract the optional server identity carried in modern result metadata.
+    pub fn server_info(&self) -> Option<Implementation> {
+        self.meta
+            .get("io.modelcontextprotocol/serverInfo")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
 }
 
 /// Client capabilities declaration.
@@ -381,6 +434,18 @@ pub struct McpToolListRequest {}
 pub struct McpToolListResult {
     /// List of available tools
     pub tools: Vec<McpToolInfo>,
+    /// Modern results include a result discriminator. Legacy results omit it.
+    #[serde(rename = "resultType", default)]
+    pub result_type: Option<String>,
+    /// Opaque pagination cursor, when more tools are available.
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
+    /// Modern cache freshness hint.
+    #[serde(rename = "ttlMs", default)]
+    pub ttl_ms: Option<u64>,
+    /// Modern cache isolation scope.
+    #[serde(rename = "cacheScope", default)]
+    pub cache_scope: Option<String>,
 }
 
 /// Tool metadata and schema information.
@@ -414,6 +479,7 @@ pub struct McpToolInfo {
     /// Unique tool identifier
     pub name: String,
     /// Human-readable tool description
+    #[serde(default)]
     pub description: String,
     /// JSON Schema for tool input parameters
     #[serde(
@@ -472,6 +538,12 @@ pub struct McpToolCallResult {
     /// Whether the tool execution encountered an error
     #[serde(default)]
     pub is_error: bool,
+    /// Modern results include a result discriminator. Legacy results omit it.
+    #[serde(rename = "resultType", default)]
+    pub result_type: Option<String>,
+    /// Optional structured result defined by the tool's output schema.
+    #[serde(rename = "structuredContent", default)]
+    pub structured_content: Option<Value>,
 }
 
 #[cfg(test)]
@@ -532,7 +604,7 @@ mod tests {
     #[test]
     fn test_mcp_initialize_request_default() {
         let request = McpInitializeRequest::default();
-        assert_eq!(request.protocol_version, "2024-11-05");
+        assert_eq!(request.protocol_version, LATEST_LEGACY_PROTOCOL_VERSION);
         assert_eq!(request.client_info.name, "bamboo-agent");
     }
 
@@ -558,6 +630,29 @@ mod tests {
         assert_eq!(result.protocol_version, "2024-11-05");
         assert_eq!(result.server_info.name, "test-server");
         assert_eq!(result.server_info.version, "1.0.0");
+    }
+
+    #[test]
+    fn test_mcp_discover_result_extracts_server_info() {
+        let json = r#"{
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "test-server",
+                    "version": "2.0.0"
+                }
+            },
+            "ttlMs": 1000,
+            "cacheScope": "private"
+        }"#;
+        let result: McpDiscoverResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.result_type, "complete");
+        assert_eq!(
+            result.server_info().map(|info| info.name),
+            Some("test-server".to_string())
+        );
     }
 
     #[test]
@@ -714,6 +809,8 @@ mod tests {
         let result = McpToolCallResult {
             content: vec![],
             is_error: false,
+            result_type: None,
+            structured_content: None,
         };
         assert!(!result.is_error);
         assert!(result.content.is_empty());

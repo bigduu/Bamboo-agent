@@ -10,6 +10,7 @@ use tracing::{debug, info, trace, warn};
 use crate::config::{HeaderConfig, SseConfig};
 use crate::error::{McpError, Result};
 use crate::protocol::client::McpTransport;
+use crate::protocol::models::LEGACY_SSE_PROTOCOL_VERSION;
 
 #[derive(Debug, Clone)]
 struct PostResponse {
@@ -411,6 +412,14 @@ impl McpTransport for SseTransport {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn supports_modern_protocol(&self) -> bool {
+        false
+    }
+
+    fn latest_legacy_protocol_version(&self) -> &'static str {
+        LEGACY_SSE_PROTOCOL_VERSION
     }
 }
 

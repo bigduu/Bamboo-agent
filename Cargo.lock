@@ -1177,6 +1177,7 @@ dependencies = [
  "bamboo-domain",
  "bamboo-infrastructure",
  "bamboo-llm",
+ "base64 0.23.0",
  "chrono",
  "dashmap",
  "eventsource-stream",
