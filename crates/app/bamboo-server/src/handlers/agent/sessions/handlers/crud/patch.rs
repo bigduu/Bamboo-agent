@@ -10,6 +10,49 @@ use bamboo_engine::session_app::provider_model::{
 use super::super::super::types::PatchSessionRequest;
 use super::query::get_session;
 use super::running::is_session_running;
+use crate::permission_audit::record_bamboo_runtime_permission_metadata;
+
+#[cfg(test)]
+mod patch_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    pub(super) struct PermissionInterleaveHook {
+        pub(super) reached: Notify,
+        pub(super) resume: Notify,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Arc<PermissionInterleaveHook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<PermissionInterleaveHook>>>> =
+            OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(session_id: &str) -> Arc<PermissionInterleaveHook> {
+        let hook = Arc::new(PermissionInterleaveHook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        hooks()
+            .lock()
+            .expect("permission interleave hooks lock")
+            .insert(session_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause_after_authoritative_fields(session_id: &str) {
+        let hook = hooks()
+            .lock()
+            .expect("permission interleave hooks lock")
+            .remove(session_id);
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+}
 
 /// Parse an `If-Match` header value into the expected `metadata_version`.
 /// Accepts a bare integer or a (weak) quoted ETag: `7`, `"7"`, `W/"7"`.
@@ -182,7 +225,9 @@ pub async fn patch_session(
             }
         })
     });
-    // Consumed by the first authoritative setter invoked (see `.take()` below).
+    // When present, carry the exact version produced by each preceding field
+    // through the whole PATCH. Every authoritative step validates it under the
+    // session lock and advances it only when that step actually changed data.
     let mut precondition = request_precondition;
 
     // Project reassignment and explicit Workspace switching are one
@@ -483,15 +528,14 @@ pub async fn patch_session(
     }
 
     if let Some(title) = req.title.as_ref() {
-        match SessionMetadataService::set_title(
-            state.get_ref(),
-            &session_id,
-            title,
-            precondition.take(),
-        )
-        .await
+        match SessionMetadataService::set_title(state.get_ref(), &session_id, title, precondition)
+            .await
         {
-            Ok(_) => {}
+            Ok(change) => {
+                if change.is_some() {
+                    precondition = precondition.map(|version| version.saturating_add(1));
+                }
+            }
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": crate::error::error_value("Session not found"),
@@ -508,15 +552,14 @@ pub async fn patch_session(
     }
 
     if let Some(pinned) = req.pinned {
-        match SessionMetadataService::set_pinned(
-            state.get_ref(),
-            &session_id,
-            pinned,
-            precondition.take(),
-        )
-        .await
+        match SessionMetadataService::set_pinned(state.get_ref(), &session_id, pinned, precondition)
+            .await
         {
-            Ok(_) => {}
+            Ok(change) => {
+                if change.is_some() {
+                    precondition = precondition.map(|version| version.saturating_add(1));
+                }
+            }
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": crate::error::error_value("Session not found"),
@@ -551,11 +594,15 @@ pub async fn patch_session(
             state.get_ref(),
             &session_id,
             gold_config_json,
-            precondition.take(),
+            precondition,
         )
         .await
         {
-            Ok(_) => {}
+            Ok(change) => {
+                if change.is_some() {
+                    precondition = precondition.map(|version| version.saturating_add(1));
+                }
+            }
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": crate::error::error_value("Session not found"),
@@ -585,34 +632,22 @@ pub async fn patch_session(
             req.model.as_deref(),
         );
 
-        // A typed permission write is authoritative and CAS-guarded. When an
-        // earlier field in this same PATCH already consumed the caller's
-        // precondition, rebase the permission write onto the exact version that
-        // earlier write produced; a third-party edit in the gap then conflicts
-        // instead of silently reordering the user's mode choice.
+        // A typed permission write is authoritative and CAS-guarded. The
+        // expected revision is the exact value produced by the preceding
+        // operations in this request, never a lock-free reload of whatever a
+        // third party may have committed in the gap.
+        #[cfg(test)]
         let earlier_authoritative_field = req.project_id.is_some()
             || req.workspace_path.is_some()
             || req.title.is_some()
             || req.pinned.is_some()
             || req.gold_config.is_some();
-        let permission_expected_version =
-            if req.permission_mode.is_some() && earlier_authoritative_field {
-                state
-                    .persistence
-                    .storage()
-                    .load_session(&session_id)
-                    .await
-                    .map_err(|error| {
-                        crate::error::json_internal_server_error(format!(
-                            "Failed to load session revision: {error}"
-                        ))
-                    })?
-                    .map(|session| session.metadata_version)
-            } else if req.permission_mode.is_some() {
-                request_precondition
-            } else {
-                None
-            };
+        let permission_expected_version = req.permission_mode.and(precondition);
+
+        #[cfg(test)]
+        if req.permission_mode.is_some() && earlier_authoritative_field {
+            patch_test_hooks::pause_after_authoritative_fields(&session_id).await;
+        }
 
         // Apply ONLY the config fields after loading the freshest session under
         // the per-session lock. This cannot clobber messages appended by a
@@ -674,14 +709,25 @@ pub async fn patch_session(
             })
             .map(|(previous, effective)| (previous, effective, chrono::Utc::now().to_rfc3339()));
         if let Some((_, effective, transitioned_at)) = permission_transition.as_ref() {
-            session.metadata.insert(
-                "permission.requested_mode".to_string(),
-                effective.as_str().to_string(),
-            );
-            session.metadata.insert(
-                "permission.effective_mode".to_string(),
-                effective.as_str().to_string(),
-            );
+            if let Some(config) = state.permission_checker.permission_config() {
+                record_bamboo_runtime_permission_metadata(&mut session, config.as_ref());
+            } else {
+                session
+                    .metadata
+                    .insert("permission.policy_revision".to_string(), "0".to_string());
+                session.metadata.insert(
+                    "permission.requested_mode".to_string(),
+                    effective.as_str().to_string(),
+                );
+                session.metadata.insert(
+                    "permission.effective_mode".to_string(),
+                    effective.as_str().to_string(),
+                );
+                session.metadata.insert(
+                    "permission.executor_mapping".to_string(),
+                    format!("bamboo_runtime:{}", effective.as_str()),
+                );
+            }
             session.metadata.insert(
                 "permission.transitioned_at".to_string(),
                 transitioned_at.clone(),
@@ -859,6 +905,14 @@ mod tests {
         );
         assert!(persisted
             .metadata
+            .get("permission.policy_revision")
+            .is_some_and(|revision| revision.parse::<u64>().is_ok()));
+        assert_eq!(
+            persisted.metadata.get("permission.executor_mapping"),
+            Some(&"bamboo_runtime:auto".to_string())
+        );
+        assert!(persisted
+            .metadata
             .get("permission.transitioned_at")
             .is_some_and(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()));
         let runtime = persisted.agent_runtime_state.expect("runtime state");
@@ -954,6 +1008,87 @@ mod tests {
                 .as_ref()
                 .map(bamboo_domain::AgentRuntimeState::effective_permission_mode),
             Some(bamboo_domain::SessionPermissionMode::Auto)
+        );
+    }
+
+    #[actix_web::test]
+    async fn mixed_field_patch_rejects_permission_write_that_loses_an_interleaving_cas() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial_version = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session")
+            .metadata_version;
+        let hook = super::patch_test_hooks::install(&id);
+
+        let mixed_request = test::TestRequest::patch()
+            .uri(&format!("/api/v1/sessions/{id}"))
+            .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
+            .set_json(serde_json::json!({
+                "title": "mixed request title",
+                "permission_mode": "auto"
+            }))
+            .to_request();
+        let mixed = test::call_service(&app, mixed_request);
+        let interleaving = async {
+            hook.reached.notified().await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .insert_header((
+                        header::IF_MATCH,
+                        format!("\"{}\"", initial_version.saturating_add(1)),
+                    ))
+                    .set_json(serde_json::json!({"permission_mode": "bypass"}))
+                    .to_request(),
+            )
+            .await;
+            hook.resume.notify_one();
+            response
+        };
+        let (mixed_response, interleaving_response) = futures::join!(mixed, interleaving);
+
+        assert_eq!(interleaving_response.status(), StatusCode::OK);
+        assert_eq!(mixed_response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            mixed_response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("\"{}\"", initial_version.saturating_add(2)).as_str())
+        );
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(persisted.title, "mixed request title");
+        assert_eq!(
+            persisted.metadata_version,
+            initial_version.saturating_add(2)
+        );
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode),
+            Some(bamboo_domain::SessionPermissionMode::Bypass)
+        );
+        assert_eq!(
+            persisted.metadata.get("permission.requested_mode"),
+            Some(&"bypass".to_string())
         );
     }
 

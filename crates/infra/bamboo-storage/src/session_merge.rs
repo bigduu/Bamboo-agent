@@ -41,6 +41,18 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
 
+// Keep this group out of `AUTHORITATIVE_METADATA_KEYS`: permission posture is
+// adopted independently of unrelated `metadata_version` changes, and
+// `save_runtime_authoritative_flags` must be able to preserve the caller's
+// posture and matching audit record together.
+const PERMISSION_AUDIT_METADATA_KEYS: &[&str] = &[
+    "permission.policy_revision",
+    "permission.requested_mode",
+    "permission.effective_mode",
+    "permission.executor_mapping",
+    "permission.transitioned_at",
+];
+
 // ── LockedSessionStore ────────────────────────────────────────────────
 
 /// Wraps a [`Storage`] implementation with per-session write serialization.
@@ -574,6 +586,20 @@ fn adopt_disk_permission_mode(session: &mut Session, latest: &Session) {
         }
         None => {}
     }
+
+    // The typed posture and its bounded audit record are one authoritative
+    // state. A running loop may have a newer unrelated in-memory snapshot but
+    // an older permission audit; copying these keys from the same durable
+    // record that supplied `disk_mode` prevents its later runtime checkpoint
+    // from restoring stale requested/effective/mapping values or dropping the
+    // transition timestamp.
+    for key in PERMISSION_AUDIT_METADATA_KEYS {
+        if let Some(value) = latest.metadata.get(*key) {
+            session.metadata.insert((*key).to_string(), value.clone());
+        } else {
+            session.metadata.remove(*key);
+        }
+    }
 }
 
 /// Pure merge step: given a freshly-loaded on-disk copy, overwrite the
@@ -1101,6 +1127,18 @@ mod tests {
         storage.save_session(&fresh(session_id)).await.unwrap();
         let mut loop_snapshot = storage.load_session(session_id).await.unwrap().unwrap();
         loop_snapshot.agent_runtime_state = Some(AgentRuntimeState::default());
+        loop_snapshot.metadata.insert(
+            "permission.requested_mode".to_string(),
+            "default".to_string(),
+        );
+        loop_snapshot.metadata.insert(
+            "permission.effective_mode".to_string(),
+            "default".to_string(),
+        );
+        loop_snapshot.metadata.insert(
+            "permission.executor_mapping".to_string(),
+            "bamboo_runtime:default".to_string(),
+        );
 
         store
             .update_runtime_config(session_id, |session| {
@@ -1108,6 +1146,24 @@ mod tests {
                     .agent_runtime_state
                     .get_or_insert_with(AgentRuntimeState::default)
                     .set_permission_mode(SessionPermissionMode::Auto);
+                session
+                    .metadata
+                    .insert("permission.policy_revision".to_string(), "12".to_string());
+                session
+                    .metadata
+                    .insert("permission.requested_mode".to_string(), "auto".to_string());
+                session
+                    .metadata
+                    .insert("permission.effective_mode".to_string(), "auto".to_string());
+                session.metadata.insert(
+                    "permission.executor_mapping".to_string(),
+                    "bamboo_runtime:auto".to_string(),
+                );
+                session.metadata.insert(
+                    "permission.transitioned_at".to_string(),
+                    "2026-07-31T12:00:00Z".to_string(),
+                );
+                session.metadata_version = session.metadata_version.saturating_add(1);
             })
             .await
             .unwrap()
@@ -1125,6 +1181,28 @@ mod tests {
                 Some(SessionPermissionMode::Auto)
             );
         }
+        for session in [&durable, &loop_snapshot] {
+            assert_eq!(
+                session.metadata.get("permission.policy_revision"),
+                Some(&"12".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.requested_mode"),
+                Some(&"auto".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.effective_mode"),
+                Some(&"auto".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.executor_mapping"),
+                Some(&"bamboo_runtime:auto".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.transitioned_at"),
+                Some(&"2026-07-31T12:00:00Z".to_string())
+            );
+        }
     }
 
     // The reverse direction: a PATCH turning bypass OFF must also stick against
@@ -1139,8 +1217,10 @@ mod tests {
 
         // Baseline persisted with bypass ON.
         let mut baseline = fresh(session_id);
-        let mut on_state = AgentRuntimeState::default();
-        on_state.bypass_permissions = true;
+        let on_state = AgentRuntimeState {
+            bypass_permissions: true,
+            ..AgentRuntimeState::default()
+        };
         baseline.agent_runtime_state = Some(on_state);
         storage.save_session(&baseline).await.unwrap();
 
@@ -1173,7 +1253,7 @@ mod tests {
     // #540 review: the authoritative flag writer (#74 child-reseed) must NOT be
     // reverted by the disk-wins protection — its in-memory value persists as-is.
     #[tokio::test]
-    async fn save_runtime_authoritative_flags_persists_in_memory_bypass() {
+    async fn save_runtime_authoritative_flags_persists_in_memory_posture_and_audit() {
         use bamboo_domain::AgentRuntimeState;
 
         let (_temp, storage) = make_storage().await;
@@ -1182,9 +1262,20 @@ mod tests {
 
         // Child on disk has bypass ON (created under a bypassed parent).
         let mut baseline = fresh(session_id);
-        let mut on_state = AgentRuntimeState::default();
-        on_state.bypass_permissions = true;
+        let on_state = AgentRuntimeState {
+            bypass_permissions: true,
+            ..AgentRuntimeState::default()
+        };
         baseline.agent_runtime_state = Some(on_state);
+        for (key, value) in [
+            ("permission.policy_revision", "12"),
+            ("permission.requested_mode", "bypass"),
+            ("permission.effective_mode", "bypass"),
+            ("permission.executor_mapping", "bamboo_runtime:bypass"),
+            ("permission.transitioned_at", "2026-07-31T12:00:00Z"),
+        ] {
+            baseline.metadata.insert(key.to_string(), value.to_string());
+        }
         storage.save_session(&baseline).await.unwrap();
 
         // Parent re-seeds the reused child to OFF (parent flipped bypass off),
@@ -1194,6 +1285,15 @@ mod tests {
             .agent_runtime_state
             .get_or_insert_with(AgentRuntimeState::default)
             .bypass_permissions = false;
+        for (key, value) in [
+            ("permission.policy_revision", "13"),
+            ("permission.requested_mode", "default"),
+            ("permission.effective_mode", "default"),
+            ("permission.executor_mapping", "bamboo_runtime:default"),
+            ("permission.transitioned_at", "2026-07-31T12:01:00Z"),
+        ] {
+            child.metadata.insert(key.to_string(), value.to_string());
+        }
 
         // Authoritative write must persist OFF, not adopt the disk's stale ON.
         store
@@ -1209,6 +1309,15 @@ mod tests {
                 .is_some_and(|s| s.bypass_permissions),
             "authoritative re-seed of bypass=OFF must persist, not be reverted (#540/#74)"
         );
+        for (key, value) in [
+            ("permission.policy_revision", "13"),
+            ("permission.requested_mode", "default"),
+            ("permission.effective_mode", "default"),
+            ("permission.executor_mapping", "bamboo_runtime:default"),
+            ("permission.transitioned_at", "2026-07-31T12:01:00Z"),
+        ] {
+            assert_eq!(after.metadata.get(key).map(String::as_str), Some(value));
+        }
     }
 
     // A disk copy lacking runtime state must not force the in-memory bypass OFF.
@@ -1227,8 +1336,10 @@ mod tests {
 
         // A running loop legitimately carries bypass ON in memory.
         let mut running = storage.load_session(session_id).await.unwrap().unwrap();
-        let mut on_state = AgentRuntimeState::default();
-        on_state.bypass_permissions = true;
+        let on_state = AgentRuntimeState {
+            bypass_permissions: true,
+            ..AgentRuntimeState::default()
+        };
         running.agent_runtime_state = Some(on_state);
 
         store.merge_save_runtime(&mut running).await.unwrap();

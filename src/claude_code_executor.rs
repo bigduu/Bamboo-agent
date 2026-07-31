@@ -121,6 +121,11 @@ pub struct ClaudeCodeExecutor {
     binary: String,
     model: Option<String>,
     permission_mode: Option<String>,
+    /// Provision-time fallback for compatibility callers that legitimately
+    /// omit `RunSpec.permission_policy` (for example `bamboo actor call`). A
+    /// present per-run context always overrides these baked worker flags.
+    provisioned_bypass_permissions: bool,
+    provisioned_auto_approve_permissions: bool,
     /// Working directory for the spawned CLI's file tools. `None` inherits the
     /// worker process's own cwd (mirrors how [`BambooRuntimeExecutor`](crate::subagent_worker::BambooRuntimeExecutor)
     /// treats an absent `ProvisionSpec.workspace`).
@@ -162,12 +167,24 @@ impl ClaudeCodeExecutor {
             binary: binary.unwrap_or_else(|| "claude".to_string()),
             model,
             permission_mode,
+            provisioned_bypass_permissions: false,
+            provisioned_auto_approve_permissions: false,
             workspace,
             state_dir,
             inherit_user_config,
             forward_env,
             relay_timeout: APPROVAL_RELAY_TIMEOUT,
         }
+    }
+
+    pub fn with_provisioned_permission_context(
+        mut self,
+        bypass_permissions: bool,
+        auto_approve_permissions: bool,
+    ) -> Self {
+        self.provisioned_bypass_permissions = bypass_permissions;
+        self.provisioned_auto_approve_permissions = auto_approve_permissions;
+        self
     }
 
     /// Test-only override of [`Self::relay_timeout`] — production callers
@@ -715,17 +732,17 @@ impl ChildExecutor for ClaudeCodeExecutor {
 
         // Step 3: fallback body when there's history but no usable id.
         let body = build_turn_body(&spec, resume_id.as_deref());
-        let auto_approve_permissions = spec
+        let (bypass_permissions, auto_approve_permissions) = spec
             .permission_policy
             .as_ref()
-            .is_some_and(|policy| policy.auto_approve_permissions);
+            .map(|policy| (policy.bypass_permissions, policy.auto_approve_permissions))
+            .unwrap_or((
+                self.provisioned_bypass_permissions,
+                self.provisioned_auto_approve_permissions,
+            ));
         let requested_mode = if auto_approve_permissions {
             "auto"
-        } else if spec
-            .permission_policy
-            .as_ref()
-            .is_some_and(|policy| policy.bypass_permissions)
-        {
+        } else if bypass_permissions {
             "bypass"
         } else {
             "default"
@@ -1362,6 +1379,76 @@ echo '{"type":"result","subtype":"success","result":"done"}'
                 && event["requested_mode"] == "auto"
                 && event["effective_mode"] == "auto"
                 && event["executor_mapping"] == "claude_code:permission_mode=bypassPermissions"
+        }));
+    }
+
+    #[tokio::test]
+    async fn provisioned_auto_is_used_when_run_permission_context_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            dir.path(),
+            r#"
+read -r _assignment
+echo '{"type":"result","subtype":"success","result":"done"}'
+"#,
+        );
+        let (sink, mut rx) = EventSink::channel();
+
+        let outcome = executor(bin)
+            .with_provisioned_permission_context(false, true)
+            .run(
+                run_spec("say hi"),
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["requested_mode"] == "auto"
+                && event["executor_mapping"] == "claude_code:permission_mode=bypassPermissions"
+        }));
+    }
+
+    #[tokio::test]
+    async fn explicit_run_permission_context_replaces_provisioned_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            dir.path(),
+            r#"
+read -r _assignment
+echo '{"type":"result","subtype":"success","result":"done"}'
+"#,
+        );
+        let mut spec = run_spec("say hi");
+        spec.permission_policy = Some(bamboo_subagent::proto::PermissionPolicyContext {
+            revision: 8,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            session_id: "explicit-default".to_string(),
+            workspace_path: None,
+            inherit_session_grants: false,
+            policy: json!({}),
+        });
+        let (sink, mut rx) = EventSink::channel();
+
+        let outcome = executor(bin)
+            .with_provisioned_permission_context(false, true)
+            .run(
+                spec,
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["requested_mode"] == "default"
+                && event["executor_mapping"] == "claude_code:permission_mode=default"
         }));
     }
 

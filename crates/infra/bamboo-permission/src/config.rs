@@ -1398,14 +1398,17 @@ impl PermissionConfig {
     /// always-ask rules.
     pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
         let configured_mode = self.mode();
-        let effective_mode =
-            if input.auto_approve_requested || configured_mode == PermissionMode::Auto {
-                PermissionMode::Auto
-            } else if input.bypass_requested {
-                PermissionMode::BypassPermissions
-            } else {
-                configured_mode
-            };
+        // Per-session posture is more specific than the process default. Keep
+        // explicit Auto strongest, but never let a configured global Auto
+        // reinterpret a legacy/session Bypass request as Auto: Bypass must
+        // retain its forced-confirmation behavior for compatibility.
+        let effective_mode = if input.auto_approve_requested {
+            PermissionMode::Auto
+        } else if input.bypass_requested {
+            PermissionMode::BypassPermissions
+        } else {
+            configured_mode
+        };
         let effective_policy = EffectivePermissionPolicy {
             revision: self.policy_revision(),
             mode: effective_mode,
@@ -1467,7 +1470,7 @@ impl PermissionConfig {
         // exact one-shot receipt, but before every source of an approval
         // request. It therefore produces zero prompts without weakening
         // platform, durable, session, or legacy deny rules.
-        if input.auto_approve_requested || configured_mode == PermissionMode::Auto {
+        if effective_mode == PermissionMode::Auto {
             return PermissionOutcome::Allow {
                 source: PermissionDecisionSource::Auto,
                 effective_policy,
@@ -1535,7 +1538,7 @@ impl PermissionConfig {
             };
         }
 
-        if input.bypass_requested || configured_mode == PermissionMode::BypassPermissions {
+        if effective_mode == PermissionMode::BypassPermissions {
             return PermissionOutcome::Allow {
                 source: PermissionDecisionSource::Bypass,
                 effective_policy,
@@ -3154,7 +3157,7 @@ mod integration_tests {
                 "auto",
                 "configured",
                 "eval 'echo configured'",
-                true
+                false
             )),
             PermissionOutcome::Allow {
                 source: PermissionDecisionSource::Auto,
@@ -3163,6 +3166,28 @@ mod integration_tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn explicit_bypass_overrides_global_auto_without_skipping_forced_confirmation() {
+        let config = PermissionConfig::new();
+        config.set_mode(PermissionMode::Auto);
+
+        assert!(matches!(
+            config.evaluate(evaluation(
+                "legacy-bypass",
+                "configured-auto",
+                "sudo rm -rf /tmp/still-confirmed",
+                true
+            )),
+            PermissionOutcome::Ask(PermissionRequest {
+                reason_code: PermissionReasonCode::HardDangerous,
+                effective_mode: PermissionMode::BypassPermissions,
+                bypass_requested: true,
+                auto_approve_requested: false,
+                ..
+            })
         ));
     }
 

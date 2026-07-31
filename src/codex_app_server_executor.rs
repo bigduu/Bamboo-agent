@@ -674,21 +674,29 @@ impl CodexAppServerExecutor {
             .as_ref()
             .map(|policy| policy.session_id.trim())
             .filter(|id| !id.is_empty())
-        {
-            Some(id) => id.to_string(),
-            None => return ChildOutcome::error(
-                "Codex app-server mode requires a logical session id in RunSpec.permission_policy",
-            ),
+            .map(str::to_string)
+            .or_else(|| {
+                spec.logical_session
+                    .as_ref()
+                    .map(|identity| identity.session_id.trim())
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                self.permissions
+                    .provisioned_session_id()
+                    .map(str::to_string)
+            }) {
+            Some(id) => id,
+            None => {
+                return ChildOutcome::error(
+                    "Codex app-server mode requires a logical or provisioned session id",
+                )
+            }
         };
-        let parent_bypass = spec
-            .permission_policy
-            .as_ref()
-            .map(|policy| policy.bypass_permissions)
-            .unwrap_or(self.permissions.provisioned_bypass());
-        let auto_approve_permissions = spec
-            .permission_policy
-            .as_ref()
-            .is_some_and(|policy| policy.auto_approve_permissions);
+        let (parent_bypass, auto_approve_permissions) = self
+            .permissions
+            .activation_permission_flags(spec.permission_policy.as_ref());
         let approval_policy = if auto_approve_permissions {
             "never"
         } else {
@@ -1424,7 +1432,8 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     async fn run_stub(
         approved: Option<bool>,
-        auto_approve_permissions: bool,
+        run_auto_approve_permissions: Option<bool>,
+        provisioned_auto_approve_permissions: bool,
     ) -> (ChildOutcome, Vec<Value>) {
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("codex-stub.sh");
@@ -1438,7 +1447,11 @@ while IFS= read -r ignored; do :; done
             false,
             false,
         )
-        .unwrap();
+        .unwrap()
+        .with_provisioned_permission_context(
+            provisioned_auto_approve_permissions,
+            "provisioned-stub-session".to_string(),
+        );
         let executor = CodexAppServerExecutor::new(
             Some(binary.to_string_lossy().into_owned()),
             None,
@@ -1469,15 +1482,17 @@ while IFS= read -r ignored; do :; done
                     logical_session: None,
                     project_id: None,
                     reasoning_effort: None,
-                    permission_policy: Some(PermissionPolicyContext {
-                        revision: 1,
-                        bypass_permissions: false,
-                        auto_approve_permissions,
-                        session_id: format!("stub-{approved:?}-{auto_approve_permissions}"),
-                        workspace_path: Some(root.path().to_string_lossy().into_owned()),
-                        inherit_session_grants: false,
-                        policy: json!({}),
-                    }),
+                    permission_policy: run_auto_approve_permissions.map(
+                        |auto_approve_permissions| PermissionPolicyContext {
+                            revision: 1,
+                            bypass_permissions: false,
+                            auto_approve_permissions,
+                            session_id: format!("stub-{approved:?}-{auto_approve_permissions}"),
+                            workspace_path: Some(root.path().to_string_lossy().into_owned()),
+                            inherit_session_grants: false,
+                            policy: json!({}),
+                        },
+                    ),
                     messages: Vec::new(),
                     activation_run_id: None,
                     initial_session_messages: Vec::new(),
@@ -1612,7 +1627,7 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn subprocess_stub_completes_full_handshake_and_allow_path() {
-        let (outcome, events) = run_stub(Some(true), false).await;
+        let (outcome, events) = run_stub(Some(true), Some(false), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub approved"));
         assert!(events.iter().any(|event| event["type"] == "complete"));
     }
@@ -1620,7 +1635,7 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn subprocess_stub_returns_denial_to_model_and_completes() {
-        let (outcome, events) = run_stub(Some(false), false).await;
+        let (outcome, events) = run_stub(Some(false), Some(false), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub denied"));
         assert!(events
             .iter()
@@ -1630,7 +1645,7 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn auto_uses_never_policy_and_accepts_unexpected_approval_without_host() {
-        let (outcome, events) = run_stub(None, true).await;
+        let (outcome, events) = run_stub(None, Some(true), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub approved"));
         assert!(events.iter().any(|event| {
             event["executor"] == "codex_app_server"
@@ -1639,6 +1654,32 @@ while IFS= read -r ignored; do :; done
                 && event["requested_mode"] == "auto"
                 && event["effective_mode"] == "auto"
                 && event["executor_mapping"] == "codex_app_server:approvalPolicy=never"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provisioned_auto_supplies_policy_and_session_when_run_context_is_absent() {
+        let (outcome, events) = run_stub(None, None, true).await;
+        assert_eq!(outcome.result.as_deref(), Some("stub approved"));
+        assert!(events.iter().any(|event| {
+            event["session_id"] == "provisioned-stub-session"
+                && event["approval_policy"] == "never"
+                && event["requested_mode"] == "auto"
+                && event["executor_mapping"] == "codex_app_server:approvalPolicy=never"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_run_context_replaces_provisioned_auto_in_app_server() {
+        let (outcome, events) = run_stub(Some(true), Some(false), true).await;
+        assert_eq!(outcome.result.as_deref(), Some("stub approved"));
+        assert!(events.iter().any(|event| {
+            event["approval_policy"] == "on-request"
+                && event["approvals_reviewer"] == "user"
+                && event["requested_mode"] == "default"
+                && event["executor_mapping"] == "codex_app_server:approvalPolicy=on-request"
         }));
     }
 

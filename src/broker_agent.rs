@@ -171,18 +171,24 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                 ref permission_mode,
                 ref inherit_user_config,
                 ref forward_env,
-            } => Arc::new(crate::claude_code_executor::ClaudeCodeExecutor::new(
-                binary.clone(),
-                model.clone(),
-                permission_mode.clone(),
-                spec.workspace.clone(),
-                Some(crate::claude_code_executor::resolve_claude_code_state_dir(
-                    &spec.storage_dir,
-                    &spec.identity.child_id,
-                )),
-                inherit_user_config.unwrap_or(false),
-                forward_env.clone().unwrap_or_default(),
-            )),
+            } => Arc::new(
+                crate::claude_code_executor::ClaudeCodeExecutor::new(
+                    binary.clone(),
+                    model.clone(),
+                    permission_mode.clone(),
+                    spec.workspace.clone(),
+                    Some(crate::claude_code_executor::resolve_claude_code_state_dir(
+                        &spec.storage_dir,
+                        &spec.identity.child_id,
+                    )),
+                    inherit_user_config.unwrap_or(false),
+                    forward_env.clone().unwrap_or_default(),
+                )
+                .with_provisioned_permission_context(
+                    spec.capabilities.bypass,
+                    spec.capabilities.auto_approve_permissions,
+                ),
+            ),
             ExecutorSpec::Codex {
                 ref binary,
                 ref model,
@@ -225,7 +231,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                                 permission_profile.clone(),
                                 spec.capabilities.bypass,
                                 workspace_owned.unwrap_or(false),
-                            )?;
+                            )?
+                            .with_provisioned_permission_context(
+                                spec.capabilities.auto_approve_permissions,
+                                spec.identity.child_id.clone(),
+                            );
                         Arc::new(
                             crate::codex_cli_executor::CodexExecutor::new(
                                 binary.clone(),
@@ -249,7 +259,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                                 permission_profile.clone(),
                                 spec.capabilities.bypass,
                                 workspace_owned.unwrap_or(false),
-                            )?;
+                            )?
+                            .with_provisioned_permission_context(
+                                spec.capabilities.auto_approve_permissions,
+                                spec.identity.child_id.clone(),
+                            );
                         Arc::new(
                             crate::codex_app_server_executor::CodexAppServerExecutor::new(
                                 binary.clone(),

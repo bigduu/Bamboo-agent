@@ -103,18 +103,24 @@ pub async fn run() -> std::result::Result<(), String> {
             permission_mode,
             inherit_user_config,
             forward_env,
-        } => Arc::new(ClaudeCodeExecutor::new(
-            binary.clone(),
-            model.clone(),
-            permission_mode.clone(),
-            spec.workspace.clone(),
-            Some(crate::claude_code_executor::resolve_claude_code_state_dir(
-                &spec.storage_dir,
-                &spec.identity.child_id,
-            )),
-            inherit_user_config.unwrap_or(false),
-            forward_env.clone().unwrap_or_default(),
-        )),
+        } => Arc::new(
+            ClaudeCodeExecutor::new(
+                binary.clone(),
+                model.clone(),
+                permission_mode.clone(),
+                spec.workspace.clone(),
+                Some(crate::claude_code_executor::resolve_claude_code_state_dir(
+                    &spec.storage_dir,
+                    &spec.identity.child_id,
+                )),
+                inherit_user_config.unwrap_or(false),
+                forward_env.clone().unwrap_or_default(),
+            )
+            .with_provisioned_permission_context(
+                spec.capabilities.bypass,
+                spec.capabilities.auto_approve_permissions,
+            ),
+        ),
         ExecutorSpec::Codex {
             binary,
             model,
@@ -156,7 +162,11 @@ pub async fn run() -> std::result::Result<(), String> {
                         permission_profile.clone(),
                         spec.capabilities.bypass,
                         workspace_owned.unwrap_or(false),
-                    )?;
+                    )?
+                    .with_provisioned_permission_context(
+                        spec.capabilities.auto_approve_permissions,
+                        spec.identity.child_id.clone(),
+                    );
                     Arc::new(
                         CodexExecutor::new(
                             binary.clone(),
@@ -180,7 +190,11 @@ pub async fn run() -> std::result::Result<(), String> {
                             permission_profile.clone(),
                             spec.capabilities.bypass,
                             workspace_owned.unwrap_or(false),
-                        )?;
+                        )?
+                        .with_provisioned_permission_context(
+                            spec.capabilities.auto_approve_permissions,
+                            spec.identity.child_id.clone(),
+                        );
                     Arc::new(
                         CodexAppServerExecutor::new(
                             binary.clone(),

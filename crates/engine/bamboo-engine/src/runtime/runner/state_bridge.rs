@@ -15,6 +15,13 @@ use bamboo_domain::{
 };
 
 const METADATA_KEY: &str = "agent.runtime.state";
+const PERMISSION_AUDIT_METADATA_KEYS: &[&str] = &[
+    "permission.policy_revision",
+    "permission.requested_mode",
+    "permission.effective_mode",
+    "permission.executor_mapping",
+    "permission.transitioned_at",
+];
 #[cfg(test)]
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
@@ -37,6 +44,19 @@ pub fn read_runtime_state(session: &Session) -> Option<AgentRuntimeState> {
 /// was removed after the migration completed.
 pub fn write_runtime_state(session: &mut Session, state: &AgentRuntimeState) {
     session.agent_runtime_state = Some(state.clone());
+}
+
+fn adopt_permission_audit_metadata(session: &mut Session, latest: &Session) {
+    if latest.agent_runtime_state.is_none() {
+        return;
+    }
+    for key in PERMISSION_AUDIT_METADATA_KEYS {
+        if let Some(value) = latest.metadata.get(*key) {
+            session.metadata.insert((*key).to_string(), value.clone());
+        } else {
+            session.metadata.remove(*key);
+        }
+    }
 }
 
 /// Sync runtime state fields from existing metadata keys.
@@ -543,6 +563,11 @@ pub async fn refresh_turn_boundary_with_inbox(
         .map(|state| state.effective_permission_mode());
 
     if let Some(latest) = latest.as_ref() {
+        // Keep the live snapshot's bounded audit record in the same revision as
+        // the typed mode returned below. Runtime persistence also adopts these
+        // keys under its session lock, so both the current round and any later
+        // checkpoint observe one coherent permission transition.
+        adopt_permission_audit_metadata(session, latest);
         // A previous activation may have checkpointed and acked the claim
         // before this live snapshot was loaded/refreshed. Carry its durable
         // cursor forward so finalization never mistakes an admitted duplicate
@@ -1273,11 +1298,26 @@ mod tests {
         let mut state = AgentRuntimeState::new("run-x");
         state.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
         persisted.agent_runtime_state = Some(state);
+        for (key, value) in [
+            ("permission.policy_revision", "17"),
+            ("permission.requested_mode", "auto"),
+            ("permission.effective_mode", "auto"),
+            ("permission.executor_mapping", "bamboo_runtime:auto"),
+            ("permission.transitioned_at", "2026-07-31T12:00:00Z"),
+        ] {
+            persisted
+                .metadata
+                .insert(key.to_string(), value.to_string());
+        }
         storage.save_session(&persisted).await.unwrap();
 
         // A running loop holds a stale copy with bypass OFF.
         let mut running = Session::new("bypass-live", "model");
         running.agent_runtime_state = Some(AgentRuntimeState::new("run-x"));
+        running.metadata.insert(
+            "permission.executor_mapping".to_string(),
+            "bamboo_runtime:default".to_string(),
+        );
 
         let refresh = refresh_turn_boundary_from_disk(&mut running, Some(&storage), None).await;
         assert_eq!(
@@ -1285,6 +1325,15 @@ mod tests {
             Some(bamboo_domain::SessionPermissionMode::Auto)
         );
         assert_eq!(refresh.merged, 0);
+        for (key, value) in [
+            ("permission.policy_revision", "17"),
+            ("permission.requested_mode", "auto"),
+            ("permission.effective_mode", "auto"),
+            ("permission.executor_mapping", "bamboo_runtime:auto"),
+            ("permission.transitioned_at", "2026-07-31T12:00:00Z"),
+        ] {
+            assert_eq!(running.metadata.get(key).map(String::as_str), Some(value));
+        }
     }
 
     #[tokio::test]

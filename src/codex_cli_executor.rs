@@ -406,6 +406,8 @@ pub struct CodexPermissionConfig {
     allow_danger_bypass: bool,
     permission_profile: Option<String>,
     provisioned_bypass: bool,
+    provisioned_auto_approve_permissions: bool,
+    provisioned_session_id: Option<String>,
     workspace_owned: bool,
 }
 
@@ -579,6 +581,8 @@ pub fn resolve_codex_permission_config(
         allow_danger_bypass,
         permission_profile,
         provisioned_bypass,
+        provisioned_auto_approve_permissions: false,
+        provisioned_session_id: None,
         workspace_owned,
     })
 }
@@ -621,11 +625,23 @@ pub fn resolve_codex_app_server_permission_config(
         allow_danger_bypass,
         permission_profile,
         provisioned_bypass,
+        provisioned_auto_approve_permissions: false,
+        provisioned_session_id: None,
         workspace_owned,
     })
 }
 
 impl CodexPermissionConfig {
+    pub(crate) fn with_provisioned_permission_context(
+        mut self,
+        auto_approve_permissions: bool,
+        session_id: String,
+    ) -> Self {
+        self.provisioned_auto_approve_permissions = auto_approve_permissions;
+        self.provisioned_session_id = Some(session_id);
+        self
+    }
+
     pub(crate) fn app_server_posture(&self, bypass: bool) -> (String, bool, Vec<String>) {
         let mut policy = self.effective(bypass, running_as_root());
         policy.approval_policy = CodexApprovalPolicy::OnRequest;
@@ -640,8 +656,20 @@ impl CodexPermissionConfig {
         self.permission_profile.as_deref()
     }
 
-    pub(crate) fn provisioned_bypass(&self) -> bool {
-        self.provisioned_bypass
+    pub(crate) fn provisioned_session_id(&self) -> Option<&str> {
+        self.provisioned_session_id.as_deref()
+    }
+
+    pub(crate) fn activation_permission_flags(
+        &self,
+        context: Option<&bamboo_subagent::proto::PermissionPolicyContext>,
+    ) -> (bool, bool) {
+        context
+            .map(|policy| (policy.bypass_permissions, policy.auto_approve_permissions))
+            .unwrap_or((
+                self.provisioned_bypass,
+                self.provisioned_auto_approve_permissions,
+            ))
     }
 }
 
@@ -1320,15 +1348,9 @@ impl ChildExecutor for CodexExecutor {
         // `codex exec` v1 has no mid-turn steering channel. Drain the inbox so
         // transport senders cannot build an unbounded backlog.
         let steer_drain = tokio::spawn(async move { while steer.recv().await.is_some() {} });
-        let parent_bypass = spec
-            .permission_policy
-            .as_ref()
-            .map(|policy| policy.bypass_permissions)
-            .unwrap_or(self.permissions.provisioned_bypass);
-        let auto_approve_permissions = spec
-            .permission_policy
-            .as_ref()
-            .is_some_and(|policy| policy.auto_approve_permissions);
+        let (parent_bypass, auto_approve_permissions) = self
+            .permissions
+            .activation_permission_flags(spec.permission_policy.as_ref());
         if spec.messages.is_empty() {
             self.delete_session_state().await;
         }
@@ -2077,6 +2099,36 @@ mod tests {
 
     fn default_policy(executor: &CodexExecutor) -> EffectiveCodexPolicy {
         executor.permissions.effective(false, false)
+    }
+
+    #[test]
+    fn run_permission_context_replaces_provisioned_auto_instead_of_sticking() {
+        let permissions = default_permissions()
+            .with_provisioned_permission_context(true, "provisioned-codex".to_string());
+        assert_eq!(permissions.activation_permission_flags(None), (false, true));
+
+        let explicit_default = bamboo_subagent::proto::PermissionPolicyContext {
+            revision: 3,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            session_id: "explicit-default".to_string(),
+            workspace_path: None,
+            inherit_session_grants: false,
+            policy: json!({}),
+        };
+        assert_eq!(
+            permissions.activation_permission_flags(Some(&explicit_default)),
+            (false, false)
+        );
+
+        let explicit_bypass = bamboo_subagent::proto::PermissionPolicyContext {
+            bypass_permissions: true,
+            ..explicit_default
+        };
+        assert_eq!(
+            permissions.activation_permission_flags(Some(&explicit_bypass)),
+            (true, false)
+        );
     }
 
     fn fixture_executor() -> CodexExecutor {
