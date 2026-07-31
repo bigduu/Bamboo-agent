@@ -176,7 +176,7 @@ async fn test_lifecycle_hooks_round_trip_persists_and_reloads() {
     assert!(reloaded.lifecycle_hooks.enabled);
     assert!(!reloaded.lifecycle_hooks.pre_tool_use[0].enabled);
     assert_eq!(
-        reloaded.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms,
+        reloaded.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms(),
         2_500
     );
 

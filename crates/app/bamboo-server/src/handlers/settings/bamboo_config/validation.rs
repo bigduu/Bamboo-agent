@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use actix_web::{web, HttpResponse};
 use bamboo_config::{
-    LifecycleHookGroup, LifecycleHooksConfig, LIFECYCLE_HOOK_EVENT_NAMES,
-    MAX_LIFECYCLE_HOOK_TIMEOUT_MS, MIN_LIFECYCLE_HOOK_TIMEOUT_MS,
+    lifecycle_script_extension, LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig,
+    LIFECYCLE_HOOK_EVENT_NAMES, MAX_LIFECYCLE_HOOK_TIMEOUT_MS, MIN_LIFECYCLE_HOOK_TIMEOUT_MS,
 };
 use regex::Regex;
 use serde_json::Value;
@@ -343,21 +343,44 @@ fn validate_lifecycle_hooks_shape(value: &Value) -> Vec<ValidationIssue> {
                     continue;
                 };
                 match hook.get("type").and_then(Value::as_str) {
-                    Some("command") => {}
+                    Some("command") => {
+                        if !hook.get("command").is_some_and(Value::is_string) {
+                            issues.push(issue(
+                                format!("{hook_path}.command"),
+                                "command must be a string",
+                            ));
+                        }
+                    }
+                    Some("script") => {
+                        if !hook.get("path").is_some_and(Value::is_string) {
+                            issues
+                                .push(issue(format!("{hook_path}.path"), "path must be a string"));
+                        }
+                        if let Some(runner) = hook.get("runner") {
+                            match runner.as_str() {
+                                Some(
+                                    "auto" | "node" | "bun" | "python" | "bash" | "powershell"
+                                    | "cmd",
+                                ) => {}
+                                Some(other) => issues.push(issue(
+                                    format!("{hook_path}.runner"),
+                                    format!("unsupported lifecycle script runner '{other}'"),
+                                )),
+                                None => issues.push(issue(
+                                    format!("{hook_path}.runner"),
+                                    "runner must be a string",
+                                )),
+                            }
+                        }
+                    }
                     Some(other) => issues.push(issue(
                         format!("{hook_path}.type"),
                         format!("unsupported lifecycle hook type '{other}'"),
                     )),
                     None => issues.push(issue(
                         format!("{hook_path}.type"),
-                        "hook type must be 'command'",
+                        "hook type must be 'command' or 'script'",
                     )),
-                }
-                if !hook.get("command").is_some_and(Value::is_string) {
-                    issues.push(issue(
-                        format!("{hook_path}.command"),
-                        "command must be a string",
-                    ));
                 }
                 if hook
                     .get("timeout_ms")
@@ -400,14 +423,39 @@ fn validate_lifecycle_hooks_config(config: &LifecycleHooksConfig) -> Vec<Validat
             }
             for (hook_index, hook) in group.hooks.iter().enumerate() {
                 let hook_path = format!("{group_path}.hooks[{hook_index}]");
-                if hook.command.trim().is_empty() {
-                    issues.push(issue(
-                        format!("{hook_path}.command"),
-                        "command must not be empty",
-                    ));
+                let timeout_ms = hook.timeout_ms();
+                match hook {
+                    LifecycleHookHandler::Command { command, .. } => {
+                        if command.trim().is_empty() {
+                            issues.push(issue(
+                                format!("{hook_path}.command"),
+                                "command must not be empty",
+                            ));
+                        }
+                    }
+                    LifecycleHookHandler::Script { path, runner, .. } => {
+                        let path = path.trim();
+                        if path.is_empty() {
+                            issues
+                                .push(issue(format!("{hook_path}.path"), "path must not be empty"));
+                        } else if lifecycle_script_extension(path).is_none() {
+                            issues.push(issue(
+                                format!("{hook_path}.path"),
+                                "path must end in .js, .mjs, .cjs, .py, .sh, .ps1, .bat, or .cmd",
+                            ));
+                        } else if !runner.supports_path(path) {
+                            issues.push(issue(
+                                format!("{hook_path}.runner"),
+                                format!(
+                                    "runner '{}' is incompatible with lifecycle script path '{path}'",
+                                    runner.as_str()
+                                ),
+                            ));
+                        }
+                    }
                 }
                 if !(MIN_LIFECYCLE_HOOK_TIMEOUT_MS..=MAX_LIFECYCLE_HOOK_TIMEOUT_MS)
-                    .contains(&hook.timeout_ms)
+                    .contains(&timeout_ms)
                 {
                     issues.push(issue(
                         format!("{hook_path}.timeout_ms"),
@@ -501,6 +549,69 @@ fn provider_issue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_script_shape_accepts_documented_runners() {
+        for (path, runner) in [
+            ("guard.js", "node"),
+            ("guard.js", "bun"),
+            ("guard.py", "python"),
+            ("guard.sh", "bash"),
+            ("guard.ps1", "powershell"),
+            ("guard.bat", "cmd"),
+        ] {
+            let value = serde_json::json!({
+                "enabled": true,
+                "PreToolUse": [{
+                    "hooks": [{
+                        "type": "script",
+                        "path": path,
+                        "runner": runner
+                    }]
+                }]
+            });
+            assert!(
+                validate_lifecycle_hooks_shape(&value).is_empty(),
+                "{path} with {runner} should pass shape validation"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_script_validation_rejects_bad_runner_and_extension_pairs() {
+        let shape_issues = validate_lifecycle_hooks_shape(&serde_json::json!({
+            "PreToolUse": [{
+                "hooks": [{
+                    "type": "script",
+                    "path": "guard.js",
+                    "runner": "deno"
+                }]
+            }]
+        }));
+        assert_eq!(
+            shape_issues[0].path,
+            "lifecycle_hooks.PreToolUse[0].hooks[0].runner"
+        );
+
+        let config = LifecycleHooksConfig {
+            enabled: true,
+            pre_tool_use: vec![LifecycleHookGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![LifecycleHookHandler::script(
+                    "guard.py",
+                    bamboo_config::LifecycleScriptRunner::Node,
+                    1_000,
+                )],
+            }],
+            ..LifecycleHooksConfig::default()
+        };
+        let issues = validate_lifecycle_hooks_config(&config);
+        assert_eq!(
+            issues[0].path,
+            "lifecycle_hooks.PreToolUse[0].hooks[0].runner"
+        );
+    }
 
     #[test]
     fn codex_shape_validation_reports_precise_fields() {

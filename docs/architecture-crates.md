@@ -24,6 +24,7 @@ flowchart TD
     subgraph CAP["Capability crates"]
         MEM["bamboo-memory"]
         TLS["bamboo-tools"]
+        HOOKS["bamboo-hooks<br/>registry · matching · handler runtimes"]
         SK["bamboo-skills"]
         MCP["bamboo-mcp"]
         PERM["bamboo-permission"]
@@ -48,12 +49,15 @@ flowchart TD
     STOOLS --> AC
     ENG --> MEM
     ENG --> TLS
+    ENG --> HOOKS
     ENG --> SK
     ENG --> MCP
     ENG --> AC
     ENG --> INFRA
     MEM --> AC
     TLS --> AC
+    HOOKS --> AC
+    HOOKS --> INFRA
     PERM --> INFRA
     AC --> DOM
     INFRA --> DOM
@@ -72,6 +76,10 @@ flowchart TD
   `bamboo-server`/`AppState`.
 - **`bamboo-engine`** (blue) — owns the agent loop **and** the port traits that
   let generic tools reach server runtime state without depending on the server.
+- **`bamboo-hooks`** — owns lifecycle registration, matcher evaluation,
+  deterministic dispatch, command execution, and external script runtime
+  selection. The engine owns lifecycle seams and applies returned control or
+  context effects.
 
 ## 2. The port pattern (dependency inversion)
 

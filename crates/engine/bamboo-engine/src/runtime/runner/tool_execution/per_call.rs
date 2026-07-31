@@ -651,9 +651,7 @@ mod hook_tests {
         AsyncWaitKind, FunctionCall, RunningCompletion, RunningHandle, ToolError,
     };
     use bamboo_agent_core::AgentHook;
-    use bamboo_config::{
-        LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType, LifecycleHooksConfig,
-    };
+    use bamboo_config::{LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct DenyToolHook;
@@ -1008,11 +1006,10 @@ mod hook_tests {
             pre_tool_use: vec![LifecycleHookGroup {
                 enabled: true,
                 matcher: Some("^bash$".to_string()),
-                hooks: vec![LifecycleHookCommand {
-                    hook_type: LifecycleHookType::Command,
-                    command: "printf 'configured bash denial' >&2; exit 2".to_string(),
-                    timeout_ms: 1_000,
-                }],
+                hooks: vec![LifecycleHookHandler::command(
+                    "printf 'configured bash denial' >&2; exit 2",
+                    1_000,
+                )],
             }],
             ..LifecycleHooksConfig::default()
         };
