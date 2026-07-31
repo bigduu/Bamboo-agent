@@ -71,9 +71,13 @@ fn sanitize_identifier(value: &str) -> Option<String> {
 pub struct ProviderUsageSnapshot {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
+    /// OpenAI Responses cache-write volume. This is raw provider metadata and
+    /// is not folded into the disjoint legacy prompt-cache counters.
+    pub cache_write_input_tokens: Option<u64>,
 }
 
 pub struct StreamHandlingOutput {

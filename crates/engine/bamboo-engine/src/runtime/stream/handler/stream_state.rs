@@ -112,13 +112,16 @@ impl StreamAccumulationState {
     /// request, so addition would double-count if an upstream repeats a final
     /// frame. Omitted fields leave existing state untouched; an explicit zero
     /// remains authoritative.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn record_provider_usage(
         &mut self,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        total_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
         cache_creation_input_tokens: Option<u64>,
         cache_read_input_tokens: Option<u64>,
+        cache_write_input_tokens: Option<u64>,
     ) {
         {
             let snapshot = self.provider_usage.get_or_insert_default();
@@ -128,6 +131,9 @@ impl StreamAccumulationState {
             if let Some(output_tokens) = output_tokens {
                 snapshot.output_tokens = Some(output_tokens);
             }
+            if let Some(total_tokens) = total_tokens {
+                snapshot.total_tokens = Some(total_tokens);
+            }
             if let Some(reasoning_tokens) = reasoning_tokens {
                 snapshot.reasoning_tokens = Some(reasoning_tokens);
             }
@@ -136,6 +142,9 @@ impl StreamAccumulationState {
             }
             if let Some(cache_read_input_tokens) = cache_read_input_tokens {
                 snapshot.cache_read_input_tokens = Some(cache_read_input_tokens);
+            }
+            if let Some(cache_write_input_tokens) = cache_write_input_tokens {
+                snapshot.cache_write_input_tokens = Some(cache_write_input_tokens);
             }
         }
 

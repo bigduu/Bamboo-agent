@@ -896,6 +896,7 @@ mod tests {
                 reasoning_tokens: Some(20),
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: Some(768),
+                ..
             }
         ));
     }
@@ -914,6 +915,7 @@ mod tests {
                 reasoning_tokens: None,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: Some(0),
+                ..
             }
         ));
     }
@@ -924,7 +926,15 @@ mod tests {
 
         let chunk = super::parse_openai_compat_sse_data_strict(data).unwrap();
 
-        assert!(matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
+        assert!(matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: Some(1120),
+                ..
+            }
+        ));
     }
 
     #[test]

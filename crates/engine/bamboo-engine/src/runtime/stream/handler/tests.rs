@@ -153,9 +153,11 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
     let usage = LLMChunk::ProviderUsage {
         input_tokens: Some(101),
         output_tokens: Some(37),
+        total_tokens: Some(138),
         reasoning_tokens: Some(11),
         cache_creation_input_tokens: Some(0),
         cache_read_input_tokens: Some(29),
+        cache_write_input_tokens: Some(64),
     };
     let stream = build_stream(vec![
         Ok(usage.clone()),
@@ -165,9 +167,11 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
         Ok(LLMChunk::ProviderUsage {
             input_tokens: None,
             output_tokens: None,
+            total_tokens: None,
             reasoning_tokens: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
         }),
         Ok(LLMChunk::Done),
     ]);
@@ -187,9 +191,11 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
         Some(ProviderUsageSnapshot {
             input_tokens: Some(101),
             output_tokens: Some(37),
+            total_tokens: Some(138),
             reasoning_tokens: Some(11),
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(29),
+            cache_write_input_tokens: Some(64),
         })
     );
 }
@@ -201,9 +207,11 @@ async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field
             Ok(LLMChunk::ProviderUsage {
                 input_tokens: None,
                 output_tokens: None,
+                total_tokens: None,
                 reasoning_tokens: None,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
             }),
             Ok(LLMChunk::Done),
         ]),
@@ -222,16 +230,20 @@ async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field
             Ok(LLMChunk::ProviderUsage {
                 input_tokens: Some(9),
                 output_tokens: Some(9),
+                total_tokens: Some(18),
                 reasoning_tokens: Some(9),
                 cache_creation_input_tokens: Some(9),
                 cache_read_input_tokens: Some(9),
+                cache_write_input_tokens: Some(9),
             }),
             Ok(LLMChunk::ProviderUsage {
                 input_tokens: Some(0),
                 output_tokens: Some(0),
+                total_tokens: Some(0),
                 reasoning_tokens: Some(0),
                 cache_creation_input_tokens: Some(0),
                 cache_read_input_tokens: Some(0),
+                cache_write_input_tokens: Some(0),
             }),
             Ok(LLMChunk::Done),
         ]),
@@ -245,9 +257,11 @@ async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field
         Some(ProviderUsageSnapshot {
             input_tokens: Some(0),
             output_tokens: Some(0),
+            total_tokens: Some(0),
             reasoning_tokens: Some(0),
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
         })
     );
 }
@@ -268,9 +282,11 @@ async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() 
             let provider = LLMChunk::ProviderUsage {
                 input_tokens: None,
                 output_tokens: provider_output,
+                total_tokens: None,
                 reasoning_tokens: provider_reasoning,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
             };
             let legacy = LLMChunk::UsageSummary {
                 output_tokens: 56,
@@ -296,9 +312,11 @@ async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() 
                 Some(ProviderUsageSnapshot {
                     input_tokens: None,
                     output_tokens: provider_output,
+                    total_tokens: None,
                     reasoning_tokens: provider_reasoning,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
                 })
             );
 
@@ -311,6 +329,10 @@ async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() 
                 None,
                 output.cache_creation_input_tokens,
                 output.cache_read_input_tokens,
+                output
+                    .provider_usage
+                    .and_then(|usage| usage.cache_write_input_tokens)
+                    .unwrap_or(0),
                 output.input_tokens,
                 output.output_tokens,
                 output.thinking_tokens,
@@ -336,9 +358,11 @@ async fn provider_cache_reconciles_without_input_total_in_both_orders() {
             let provider = LLMChunk::ProviderUsage {
                 input_tokens: None,
                 output_tokens: None,
+                total_tokens: None,
                 reasoning_tokens: None,
                 cache_creation_input_tokens: provider_creation,
                 cache_read_input_tokens: provider_read,
+                cache_write_input_tokens: None,
             };
             let legacy = LLMChunk::CacheUsage {
                 cache_creation_input_tokens: 11,
@@ -372,9 +396,11 @@ async fn provider_cache_reconciles_without_input_total_in_both_orders() {
                 Some(ProviderUsageSnapshot {
                     input_tokens: None,
                     output_tokens: None,
+                    total_tokens: None,
                     reasoning_tokens: None,
                     cache_creation_input_tokens: provider_creation,
                     cache_read_input_tokens: provider_read,
+                    cache_write_input_tokens: None,
                 })
             );
 
@@ -387,6 +413,10 @@ async fn provider_cache_reconciles_without_input_total_in_both_orders() {
                 None,
                 output.cache_creation_input_tokens,
                 output.cache_read_input_tokens,
+                output
+                    .provider_usage
+                    .and_then(|usage| usage.cache_write_input_tokens)
+                    .unwrap_or(0),
                 output.input_tokens,
                 output.output_tokens,
                 output.thinking_tokens,
@@ -475,9 +505,11 @@ async fn provider_total_clamps_flat_cache_subset_without_mutating_raw_snapshot()
             Ok(LLMChunk::ProviderUsage {
                 input_tokens: Some(100),
                 output_tokens: None,
+                total_tokens: None,
                 reasoning_tokens: None,
                 cache_creation_input_tokens: Some(50),
                 cache_read_input_tokens: Some(80),
+                cache_write_input_tokens: None,
             }),
             Ok(LLMChunk::Done),
         ]),
@@ -501,9 +533,11 @@ async fn provider_total_clamps_flat_cache_subset_without_mutating_raw_snapshot()
         Some(ProviderUsageSnapshot {
             input_tokens: Some(100),
             output_tokens: None,
+            total_tokens: None,
             reasoning_tokens: None,
             cache_creation_input_tokens: Some(50),
             cache_read_input_tokens: Some(80),
+            cache_write_input_tokens: None,
         }),
         "raw anomalous provider values remain available for diagnostics"
     );
@@ -513,9 +547,11 @@ async fn provider_total_clamps_flat_cache_subset_without_mutating_raw_snapshot()
             Ok(LLMChunk::ProviderUsage {
                 input_tokens: Some(100),
                 output_tokens: None,
+                total_tokens: None,
                 reasoning_tokens: None,
                 cache_creation_input_tokens: Some(30),
                 cache_read_input_tokens: Some(120),
+                cache_write_input_tokens: None,
             }),
             Ok(LLMChunk::Done),
         ]),

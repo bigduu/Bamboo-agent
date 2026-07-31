@@ -459,9 +459,11 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
         LLMChunk::ProviderUsage {
             input_tokens: Some(100),
             output_tokens: Some(80),
+            total_tokens: Some(180),
             reasoning_tokens: Some(24),
             cache_creation_input_tokens: None,
             cache_read_input_tokens: Some(34),
+            cache_write_input_tokens: None,
         },
         // Later legacy summaries/cache frames must not overwrite authoritative
         // provider fields or double the cache badge.

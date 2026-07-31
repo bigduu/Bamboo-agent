@@ -984,12 +984,20 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if stream_output.cache_creation_input_tokens > 0 || stream_output.cache_read_input_tokens > 0 {
+    let cache_write_input_tokens = stream_output
+        .provider_usage
+        .and_then(|usage| usage.cache_write_input_tokens)
+        .unwrap_or(0);
+    if stream_output.cache_creation_input_tokens > 0
+        || stream_output.cache_read_input_tokens > 0
+        || cache_write_input_tokens > 0
+    {
         tracing::info!(
-            "[{}] Anthropic prompt cache: creation={}, read={}, output={}, thinking={}",
+            "[{}] Provider prompt cache: creation={}, read={}, write={}, output={}, thinking={}",
             session_id,
             stream_output.cache_creation_input_tokens,
             stream_output.cache_read_input_tokens,
+            cache_write_input_tokens,
             stream_output.output_tokens,
             stream_output.thinking_tokens,
         );
@@ -1017,6 +1025,7 @@ pub(super) async fn execute_llm_stream(
                 session.token_usage.as_ref(),
                 stream_output.cache_creation_input_tokens,
                 stream_output.cache_read_input_tokens,
+                cache_write_input_tokens,
                 stream_output.input_tokens,
                 stream_output.output_tokens,
                 stream_output.thinking_tokens,
