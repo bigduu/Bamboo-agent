@@ -1075,6 +1075,7 @@ dependencies = [
  "bamboo-compression",
  "bamboo-config",
  "bamboo-domain",
+ "bamboo-hooks",
  "bamboo-infrastructure",
  "bamboo-llm",
  "bamboo-mcp",
@@ -1117,6 +1118,27 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "bamboo-hooks"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bamboo-agent-core",
+ "bamboo-config",
+ "bamboo-domain",
+ "bamboo-infrastructure",
+ "bamboo-llm",
+ "chrono",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

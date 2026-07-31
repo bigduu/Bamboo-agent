@@ -16,6 +16,7 @@ bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-a2a = { path = "../../infra/bamboo-a2a" }
 bamboo-memory = { path = "../../infra/bamboo-memory" }
 bamboo-metrics = { path = "../../infra/bamboo-metrics" }
+bamboo-hooks = { path = "../../infra/bamboo-hooks" }
 bamboo-skills = { path = "../../infra/bamboo-skills" }
 bamboo-mcp = { path = "../../infra/bamboo-mcp" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }

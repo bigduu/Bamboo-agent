@@ -1032,11 +1032,10 @@ mod optional_model_e2e {
                 user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
                     enabled: true,
                     matcher: None,
-                    hooks: vec![bamboo_config::LifecycleHookCommand {
-                        hook_type: bamboo_config::LifecycleHookType::Command,
-                        command: "printf 'prompt rejected by policy' >&2; exit 2".to_string(),
-                        timeout_ms: bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-                    }],
+                    hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                        "printf 'prompt rejected by policy' >&2; exit 2",
+                        bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                    )],
                 }],
                 ..Default::default()
             };

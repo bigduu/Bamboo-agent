@@ -1,7 +1,5 @@
 //! Hook runner — dispatches registered hooks at lifecycle points.
 
-mod shell_command;
-
 use std::sync::Arc;
 
 use bamboo_agent_core::{AgentError, AgentEvent, AgentHook, Message, Session};
@@ -12,53 +10,42 @@ use bamboo_domain::{
 use chrono::Utc;
 use tokio::sync::mpsc;
 
-pub use shell_command::{
-    test_lifecycle_shell_command, ShellCommandHook, ShellHookEvent, ShellHookTestOutput,
+pub use bamboo_hooks::{
+    test_lifecycle_handler, test_lifecycle_shell_command, HookRunOutcome, LifecycleHookEvent,
+    LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
+    ShellHookTestOutput,
 };
 
-/// Aggregate output from every hook registered at one seam.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HookRunOutcome {
-    pub decision: HookResult,
-    pub injected_contexts: Vec<String>,
-}
-
-impl Default for HookRunOutcome {
-    fn default() -> Self {
-        Self {
-            decision: HookResult::Continue,
-            injected_contexts: Vec::new(),
-        }
-    }
-}
-
-/// Runs registered hooks at a given hook point.
+/// Engine adapter around the standalone hook dispatcher.
+///
+/// `bamboo-hooks` owns matching and handler execution. This adapter translates
+/// completed executions into engine checkpoints and lifecycle events.
 #[derive(Clone)]
 pub struct HookRunner {
-    hooks: Vec<Arc<dyn AgentHook>>,
+    dispatcher: bamboo_hooks::HookDispatcher,
 }
 
 impl HookRunner {
     pub fn new() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            dispatcher: bamboo_hooks::HookDispatcher::new(),
+        }
     }
 
-    /// Register a hook. Hooks are sorted by priority (lower runs first).
     pub fn register(&mut self, hook: Arc<dyn AgentHook>) {
-        self.hooks.push(hook);
-        self.hooks.sort_by_key(|h| h.priority());
+        self.dispatcher.register(hook);
     }
 
-    /// Clone this registry and append shell hooks from one frozen config
+    /// Clone this registry and append configured handlers from one frozen config
     /// snapshot. The original registry remains reusable by future runs.
     pub fn with_lifecycle_config(
         &self,
         config: &bamboo_config::LifecycleHooksConfig,
         fallback_cwd: Option<std::path::PathBuf>,
     ) -> Self {
-        let mut runner = self.clone();
-        shell_command::register_configured_shell_hooks(&mut runner, config, fallback_cwd);
-        runner
+        Self {
+            dispatcher: self.dispatcher.with_lifecycle_config(config, fallback_cwd),
+        }
     }
 
     /// Run all hooks matching the given point.
@@ -73,8 +60,8 @@ impl HookRunner {
         runtime_state: &mut AgentRuntimeState,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) -> HookRunOutcome {
-        self.run_hooks_with_control(point, payload, session, runtime_state, event_tx, true)
-            .await
+        let report = self.dispatcher.run_hooks(point, payload, session).await;
+        record_dispatch_report(report, runtime_state, event_tx).await
     }
 
     /// Run every matching hook while recording checkpoints/events, but never
@@ -90,93 +77,55 @@ impl HookRunner {
         runtime_state: &mut AgentRuntimeState,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
     ) -> HookRunOutcome {
-        self.run_hooks_with_control(point, payload, session, runtime_state, event_tx, false)
-            .await
+        let report = self
+            .dispatcher
+            .run_observer_hooks(point, payload, session)
+            .await;
+        record_dispatch_report(report, runtime_state, event_tx).await
     }
 
-    async fn run_hooks_with_control(
-        &self,
-        point: AgentHookPoint,
-        payload: &HookPayload,
-        session: &Session,
-        runtime_state: &mut AgentRuntimeState,
-        event_tx: Option<&mpsc::Sender<AgentEvent>>,
-        honor_control_decisions: bool,
-    ) -> HookRunOutcome {
-        let mut outcome = HookRunOutcome::default();
-
-        for hook in &self.hooks {
-            if hook.point() != point || !hook.matches(payload) {
-                continue;
-            }
-
-            let start = std::time::Instant::now();
-            let result = hook.run(point, payload, session).await;
-            let elapsed = start.elapsed();
-
-            runtime_state.checkpoints.push(HookCheckpoint {
-                hook_point: format!("{:?}", point),
-                timestamp: Utc::now(),
-                result: format!("{:?}", result),
-                duration_ms: elapsed.as_millis() as u64,
-            });
-
-            if let Some(event_tx) = event_tx {
-                let _ = event_tx
-                    .send(AgentEvent::HookLifecycle {
-                        hook_name: hook.name().to_string(),
-                        point,
-                        phase: "completed".to_string(),
-                        duration_ms: elapsed.as_millis() as u64,
-                        decision: result.clone(),
-                    })
-                    .await;
-            }
-
-            let (result, mut contexts) = unwrap_context_result(result);
-            outcome.injected_contexts.append(&mut contexts);
-
-            match &result {
-                HookResult::Abort { .. }
-                | HookResult::Suspend { .. }
-                | HookResult::Deny { .. }
-                | HookResult::Ask => {
-                    if honor_control_decisions {
-                        outcome.decision = result;
-                        return outcome;
-                    }
-                }
-                HookResult::InjectContext { text } => {
-                    outcome.injected_contexts.push(text.clone());
-                }
-                HookResult::Mutated => {
-                    if matches!(outcome.decision, HookResult::Continue) {
-                        outcome.decision = HookResult::Mutated;
-                    }
-                }
-                HookResult::Allow => outcome.decision = HookResult::Allow,
-                HookResult::Continue => {}
-                HookResult::WithContext { .. } => unreachable!("context results are unwrapped"),
-            }
-        }
-
-        outcome
-    }
-
-    /// Check if any hooks are registered for the given point.
     pub fn has_hooks_for(&self, point: AgentHookPoint) -> bool {
-        self.hooks.iter().any(|h| h.point() == point)
+        self.dispatcher.has_hooks_for(point)
     }
 
-    /// Number of registered hooks.
     pub fn len(&self) -> usize {
-        self.hooks.len()
+        self.dispatcher.len()
     }
 
-    /// Whether any hooks are registered.
     pub fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
+        self.dispatcher.is_empty()
     }
+}
+
+async fn record_dispatch_report(
+    report: bamboo_hooks::HookDispatchReport,
+    runtime_state: &mut AgentRuntimeState,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+) -> HookRunOutcome {
+    let bamboo_hooks::HookDispatchReport {
+        outcome,
+        executions,
+    } = report;
+    for execution in executions {
+        runtime_state.checkpoints.push(HookCheckpoint {
+            hook_point: format!("{:?}", execution.point),
+            timestamp: Utc::now(),
+            result: format!("{:?}", execution.result),
+            duration_ms: execution.duration_ms,
+        });
+        if let Some(event_tx) = event_tx {
+            let _ = event_tx
+                .send(AgentEvent::HookLifecycle {
+                    hook_name: execution.hook_name,
+                    point: execution.point,
+                    phase: "completed".to_string(),
+                    duration_ms: execution.duration_ms,
+                    decision: execution.result,
+                })
+                .await;
+        }
+    }
+    outcome
 }
 
 /// Fire cleanup/notification hooks after a terminal run. Decisions and context
@@ -228,21 +177,6 @@ pub(crate) async fn run_session_end_hooks(
         )
         .await;
     session.agent_runtime_state = Some(runtime_state);
-}
-
-fn unwrap_context_result(mut result: HookResult) -> (HookResult, Vec<String>) {
-    let mut contexts = Vec::new();
-    while let HookResult::WithContext {
-        result: inner,
-        text,
-    } = result
-    {
-        if !text.trim().is_empty() {
-            contexts.push(text);
-        }
-        result = *inner;
-    }
-    (result, contexts)
 }
 
 /// Apply context injections and non-tool control decisions consistently across

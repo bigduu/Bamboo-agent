@@ -49,7 +49,8 @@ pub use checker::{
 };
 pub use config::{
     PermissionConfig, PermissionMode, PermissionRule, PermissionType, RiskLevel,
-    SerializablePermissionConfig, SessionGrant,
+    SerializablePermissionConfig, SessionGrant, TemporaryPermissionGrant,
+    TemporaryPermissionGrantEffect, TemporaryPermissionGrantScope,
 };
 pub use hierarchy::PermissionRuleSet;
 pub use policy::{
