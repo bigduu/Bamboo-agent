@@ -766,6 +766,13 @@ impl CodexAppServerExecutor {
             approval_policy,
             network_access,
         };
+        events.emit(event_json(AgentEvent::PermissionPostureActivated {
+            session_id: logical_session.clone(),
+            policy_revision: activation.policy_revision,
+            requested_mode: activation.resolution.requested.as_str().to_string(),
+            effective_mode: activation.resolution.effective.as_str().to_string(),
+            executor_mapping: executor_mapping.clone(),
+        }));
         for warning in warnings {
             events.emit(json!({
                 "type": "runner_progress",
@@ -795,13 +802,6 @@ impl CodexAppServerExecutor {
             "requested_mode": activation.resolution.requested.as_str(),
             "effective_mode": activation.resolution.effective.as_str(),
             "executor_mapping": executor_mapping,
-        }));
-        events.emit(event_json(AgentEvent::PermissionPostureActivated {
-            session_id: logical_session.clone(),
-            policy_revision: activation.policy_revision,
-            requested_mode: activation.resolution.requested.as_str().to_string(),
-            effective_mode: activation.resolution.effective.as_str().to_string(),
-            executor_mapping,
         }));
 
         if spec.messages.is_empty() {
@@ -1732,6 +1732,11 @@ while IFS= read -r ignored; do :; done
     async fn auto_uses_never_policy_and_denies_unexpected_approval_without_host() {
         let (outcome, events) = run_stub(None, Some(true), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub denied"));
+        assert_eq!(
+            events.first().and_then(|event| event["type"].as_str()),
+            Some("permission_posture_activated"),
+            "typed permission posture must precede every warning/progress event"
+        );
         assert!(events.iter().any(|event| {
             event["executor"] == "codex_app_server"
                 && event["approval_policy"] == "never"
