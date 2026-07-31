@@ -118,6 +118,15 @@ async fn execute_and_apply_single_tool_call(
     policy_guard: &mut policy::ToolPolicyGuard,
     reserved_calls: usize,
 ) -> Result<SingleToolExecutionControl, AgentError> {
+    // Every sequential/single dispatch is its own externally visible safe
+    // boundary. Re-read only the authoritative permission control-plane before
+    // deriving flags; storage failures abort before ToolStart or executor entry.
+    super::state_bridge::refresh_tool_boundary_permission_posture(
+        session,
+        runtime_state,
+        config.storage.as_ref(),
+    )
+    .await?;
     let session_flags =
         bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session_and_configured_mode(
             session,
@@ -568,6 +577,18 @@ pub(crate) async fn execute_round_tool_calls(
                 continue;
             }
 
+            // A true parallel batch has one admission boundary: refresh once
+            // before any task is spawned, then freeze one flags snapshot across
+            // every already-started call. A transition during the batch applies
+            // at the next sequential call or batch, never nondeterministically
+            // to only part of this batch.
+            super::state_bridge::refresh_tool_boundary_permission_posture(
+                session,
+                runtime_state,
+                config.storage.as_ref(),
+            )
+            .await?;
+
             let tool_names: Vec<&str> = batch.iter().map(|tc| tc.function.name.as_str()).collect();
             tracing::info!(
                 "[{}][round:{}] ⚡ Executing {} parallel-safe tool calls concurrently: {:?}",
@@ -794,13 +815,25 @@ pub(crate) async fn execute_round_tool_calls(
 
 #[cfg(test)]
 mod tests {
-    use super::{scheduling_mode_for_tool_call, ToolSchedulingMode};
-    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutor};
-    use bamboo_agent_core::AgentEvent;
-    use bamboo_domain::AgentRuntimeState;
+    use super::{
+        execute_round_tool_calls, scheduling_mode_for_tool_call, RoundToolExecution,
+        RoundToolExecutionResult, ToolSchedulingMode,
+    };
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{
+        FunctionCall, FunctionSchema, ToolCall, ToolExecutionContext, ToolExecutor, ToolOutcome,
+        ToolResult, ToolSchema,
+    };
+    use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
+    use bamboo_domain::{AgentRuntimeState, PermissionAuditSnapshot, SessionPermissionMode};
+    use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_tools::BuiltinToolExecutor;
+    use futures::stream;
     use serde_json::json;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
 
     fn tool_call(name: &str) -> ToolCall {
         tool_call_with_args(name, json!({}))
@@ -819,6 +852,474 @@ mod tests {
 
     fn builtin_tools() -> Arc<dyn ToolExecutor> {
         Arc::new(BuiltinToolExecutor::new())
+    }
+
+    #[derive(Clone, Copy)]
+    enum BoundaryTransition {
+        Mode(SessionPermissionMode, u64),
+        FailNextLoad,
+        RemoveSession,
+    }
+
+    struct BoundaryStorage {
+        session: Mutex<Option<Session>>,
+        loads: AtomicUsize,
+        fail_on_load: AtomicUsize,
+    }
+
+    impl BoundaryStorage {
+        fn new(session: Session) -> Self {
+            Self {
+                session: Mutex::new(Some(session)),
+                loads: AtomicUsize::new(0),
+                fail_on_load: AtomicUsize::new(0),
+            }
+        }
+
+        fn apply(&self, transition: BoundaryTransition) {
+            match transition {
+                BoundaryTransition::Mode(mode, audit_revision) => {
+                    let mut guard = self.session.lock().expect("boundary storage lock");
+                    let mut session = guard.clone().expect("transition requires session");
+                    session
+                        .agent_runtime_state
+                        .get_or_insert_with(AgentRuntimeState::default)
+                        .set_permission_mode(mode);
+                    permission_audit(mode, audit_revision).write_to(&mut session.metadata);
+                    *guard = Some(session);
+                }
+                BoundaryTransition::FailNextLoad => {
+                    self.fail_on_load
+                        .store(self.loads.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+                }
+                BoundaryTransition::RemoveSession => {
+                    *self.session.lock().expect("boundary storage lock") = None;
+                }
+            }
+        }
+
+        fn load_count(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for BoundaryStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            *self.session.lock().expect("boundary storage lock") = Some(session.clone());
+            Ok(())
+        }
+
+        async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.session.lock().expect("boundary storage lock").clone())
+        }
+
+        async fn load_runtime_control_plane(
+            &self,
+            _session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            let load = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on_load.load(Ordering::SeqCst) == load {
+                return Err(std::io::Error::other("injected control-plane read failure"));
+            }
+            Ok(self.session.lock().expect("boundary storage lock").clone())
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
+            Ok(self
+                .session
+                .lock()
+                .expect("boundary storage lock")
+                .take()
+                .is_some())
+        }
+    }
+
+    struct PermissionBoundaryExecutor {
+        storage: Arc<BoundaryStorage>,
+        transition_on: &'static str,
+        transition: BoundaryTransition,
+        flags: Mutex<HashMap<String, bamboo_agent_core::tools::ToolExecutionSessionFlags>>,
+        approval_requests: AtomicUsize,
+        mutations: AtomicUsize,
+    }
+
+    impl PermissionBoundaryExecutor {
+        fn new(
+            storage: Arc<BoundaryStorage>,
+            transition_on: &'static str,
+            transition: BoundaryTransition,
+        ) -> Self {
+            Self {
+                storage,
+                transition_on,
+                transition,
+                flags: Mutex::new(HashMap::new()),
+                approval_requests: AtomicUsize::new(0),
+                mutations: AtomicUsize::new(0),
+            }
+        }
+
+        fn flags_for(&self, tool: &str) -> bamboo_agent_core::tools::ToolExecutionSessionFlags {
+            *self
+                .flags
+                .lock()
+                .expect("permission probe flags lock")
+                .get(tool)
+                .expect("tool must have entered executor")
+        }
+
+        fn entered(&self, tool: &str) -> bool {
+            self.flags
+                .lock()
+                .expect("permission probe flags lock")
+                .contains_key(tool)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for PermissionBoundaryExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            Ok(ToolResult::text(
+                true,
+                format!("{} complete", call.function.name),
+            ))
+        }
+
+        async fn execute_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolOutcome> {
+            self.flags
+                .lock()
+                .expect("permission probe flags lock")
+                .insert(
+                    call.function.name.clone(),
+                    bamboo_agent_core::tools::ToolExecutionSessionFlags {
+                        bypass_permissions: ctx.bypass_permissions,
+                        auto_approve_permissions: ctx.auto_approve_permissions,
+                        plan_read_only: ctx.plan_read_only,
+                    },
+                );
+            if call.function.name == self.transition_on {
+                self.storage.apply(self.transition);
+            }
+            if matches!(call.function.name.as_str(), "mutation" | "after_batch") {
+                if ctx.auto_approve_permissions {
+                    self.mutations.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.approval_requests.fetch_add(1, Ordering::SeqCst);
+                    return Ok(ToolOutcome::NeedsHuman {
+                        question: bamboo_agent_core::PendingQuestion {
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.function.name.clone(),
+                            question: "Approve mutation?".to_string(),
+                            options: vec!["approve".to_string(), "deny".to_string()],
+                            allow_custom: false,
+                            source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+                        },
+                        result: ToolResult::text(false, "approval required"),
+                    });
+                }
+            }
+            Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                format!("{} complete", call.function.name),
+            )))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            [
+                "prepare",
+                "mutation",
+                "parallel_a",
+                "parallel_b",
+                "after_batch",
+            ]
+            .into_iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: name.to_string(),
+                    description: "permission boundary probe".to_string(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                },
+            })
+            .collect()
+        }
+
+        fn call_parallel_classification(
+            &self,
+            call: &ToolCall,
+        ) -> (bamboo_agent_core::tools::ToolMutability, bool) {
+            if call.function.name.starts_with("parallel_") {
+                (bamboo_agent_core::tools::ToolMutability::ReadOnly, true)
+            } else {
+                (bamboo_agent_core::tools::ToolMutability::Mutating, false)
+            }
+        }
+    }
+
+    struct BoundaryNoopProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for BoundaryNoopProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    fn permission_audit(mode: SessionPermissionMode, revision: u64) -> PermissionAuditSnapshot {
+        let resolution =
+            bamboo_domain::resolve_permission_mode(mode, bamboo_domain::PermissionMode::Default);
+        PermissionAuditSnapshot {
+            audit_revision: revision,
+            policy_revision: revision,
+            resolution,
+            executor_mapping: format!("bamboo_runtime:{}", resolution.effective.as_str()),
+            transitioned_at: format!("2026-07-31T12:00:{:02}Z", revision.min(59)),
+        }
+    }
+
+    fn permission_session(id: &str, mode: SessionPermissionMode, revision: u64) -> Session {
+        let mut session = Session::new(id, "model");
+        let mut runtime_state = AgentRuntimeState::new("permission-boundary-run");
+        runtime_state.set_permission_mode(mode);
+        session.agent_runtime_state = Some(runtime_state);
+        permission_audit(mode, revision).write_to(&mut session.metadata);
+        session
+    }
+
+    fn named_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    async fn run_permission_boundary_calls(
+        storage: Arc<BoundaryStorage>,
+        executor: Arc<PermissionBoundaryExecutor>,
+        mut session: Session,
+        calls: &[ToolCall],
+    ) -> (
+        Result<RoundToolExecutionResult, AgentError>,
+        Session,
+        AgentRuntimeState,
+        Vec<AgentEvent>,
+    ) {
+        let storage_port: Arc<dyn Storage> = storage;
+        let tools: Arc<dyn ToolExecutor> = executor;
+        let config = crate::runtime::config::AgentLoopConfig {
+            storage: Some(storage_port),
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(BoundaryNoopProvider);
+        let session_id = session.id.clone();
+        let frame = crate::runtime::runner::round_frame::RoundFrame {
+            session_id: &session_id,
+            round_id: "permission-boundary-round",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        let tool_schemas = tools.list_tools();
+        let mut runtime_state = session
+            .agent_runtime_state
+            .clone()
+            .expect("permission fixture runtime state");
+        let mut task_context = None;
+        let result = execute_round_tool_calls(RoundToolExecution {
+            tool_calls: calls,
+            frame: &frame,
+            session: &mut session,
+            runtime_state: &mut runtime_state,
+            task_context: &mut task_context,
+            compression_model_name: None,
+            compression_model_provider: None,
+            tool_schemas: &tool_schemas,
+        })
+        .await;
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        (result, session, runtime_state, events)
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_boundary_adopts_default_to_auto_before_call_b() {
+        let session =
+            permission_session("boundary-default-auto", SessionPermissionMode::Default, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "prepare",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 2),
+        ));
+        let calls = [
+            named_call("call-a", "prepare"),
+            named_call("call-b", "mutation"),
+        ];
+
+        let (result, session, runtime_state, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert_eq!(executor.approval_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.mutations.load(Ordering::SeqCst), 1);
+        assert!(executor.flags_for("mutation").auto_approve_permissions);
+        assert_eq!(
+            runtime_state.effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
+        let audit = PermissionAuditSnapshot::from_metadata(&session.metadata).unwrap();
+        assert_eq!(audit.audit_revision, 2);
+        assert_eq!(audit.resolution.requested, SessionPermissionMode::Auto);
+        assert_eq!(storage.load_count(), 2, "one load per sequential call");
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_boundary_adopts_auto_to_default_before_call_b() {
+        let session = permission_session("boundary-auto-default", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "prepare",
+            BoundaryTransition::Mode(SessionPermissionMode::Default, 2),
+        ));
+        let calls = [
+            named_call("call-a", "prepare"),
+            named_call("call-b", "mutation"),
+        ];
+
+        let (result, session, runtime_state, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(result.unwrap().awaiting_clarification);
+        assert_eq!(executor.approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            executor.mutations.load(Ordering::SeqCst),
+            0,
+            "Default call B must stop at approval rather than reuse stale Auto"
+        );
+        assert!(!executor.flags_for("mutation").auto_approve_permissions);
+        assert_eq!(
+            runtime_state.effective_permission_mode(),
+            SessionPermissionMode::Default
+        );
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Default
+        );
+        let audit = PermissionAuditSnapshot::from_metadata(&session.metadata).unwrap();
+        assert_eq!(audit.audit_revision, 2);
+        assert_eq!(audit.resolution.requested, SessionPermissionMode::Default);
+        assert_eq!(storage.load_count(), 2, "one load per sequential call");
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_boundary_fails_closed_before_call_b_on_storage_loss() {
+        for transition in [
+            BoundaryTransition::FailNextLoad,
+            BoundaryTransition::RemoveSession,
+        ] {
+            let session =
+                permission_session("boundary-storage-loss", SessionPermissionMode::Auto, 1);
+            let storage = Arc::new(BoundaryStorage::new(session.clone()));
+            let executor = Arc::new(PermissionBoundaryExecutor::new(
+                storage.clone(),
+                "prepare",
+                transition,
+            ));
+            let calls = [
+                named_call("call-a", "prepare"),
+                named_call("call-b", "mutation"),
+            ];
+
+            let (result, _, _, events) =
+                run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls)
+                    .await;
+
+            let error = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("unreadable authoritative posture must fail closed"),
+            };
+            assert!(error.contains("permission posture refresh failed closed"));
+            assert!(executor.entered("prepare"));
+            assert!(
+                !executor.entered("mutation"),
+                "call B must never enter the executor after an unreadable authoritative posture"
+            );
+            assert_eq!(executor.mutations.load(Ordering::SeqCst), 0);
+            assert!(events.iter().all(|event| {
+                !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "call-b")
+            }));
+            assert_eq!(storage.load_count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_refreshes_once_and_freezes_one_permission_snapshot() {
+        let session = permission_session("boundary-parallel", SessionPermissionMode::Default, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "parallel_a",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 2),
+        ));
+        let calls = [
+            named_call("parallel-a", "parallel_a"),
+            named_call("parallel-b", "parallel_b"),
+            named_call("after-batch", "after_batch"),
+        ];
+
+        let (result, _, _, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(
+            !executor.flags_for("parallel_a").auto_approve_permissions
+                && !executor.flags_for("parallel_b").auto_approve_permissions,
+            "every already-started call in the batch must share its pre-batch Default snapshot"
+        );
+        assert!(
+            executor.flags_for("after_batch").auto_approve_permissions,
+            "the next safe boundary must adopt the mid-batch Default-to-Auto transition"
+        );
+        assert_eq!(
+            storage.load_count(),
+            2,
+            "one load for the two-call parallel batch plus one for the following sequential call"
+        );
     }
 
     #[test]

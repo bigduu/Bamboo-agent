@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use bamboo_agent_core::Session;
+use bamboo_agent_core::{AgentError, Session};
 use bamboo_domain::{
     AgentRuntimeState, SessionInboxPort, SessionMessageBody, SessionMessageContent,
     SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
@@ -93,6 +93,87 @@ pub struct TurnBoundaryRefresh {
     pub merged: usize,
     /// `None` when there was no storage / no on-disk session to read.
     pub disk_permission_mode: Option<bamboo_domain::SessionPermissionMode>,
+}
+
+/// Refresh only the authoritative permission posture at a tool-dispatch safe
+/// boundary.
+///
+/// Unlike [`refresh_turn_boundary_with_inbox`], this deliberately never merges
+/// messages, SessionInbox claims, or any other control-plane field. Sequential
+/// tool calls may have externally visible side effects, so a configured durable
+/// store must be readable before the next call is admitted: keeping an old Auto
+/// posture after an Auto -> Default transition would execute without the newly
+/// required approval. SDK/in-memory runtimes with no store retain their current
+/// posture.
+pub async fn refresh_tool_boundary_permission_posture(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+) -> Result<(), AgentError> {
+    let Some(storage) = storage else {
+        return Ok(());
+    };
+    let latest = storage
+        .load_runtime_control_plane(&session.id)
+        .await
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "authoritative permission posture refresh failed closed: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            AgentError::Tool(
+                "authoritative permission posture refresh failed closed: session missing"
+                    .to_string(),
+            )
+        })?;
+    let disk_mode = latest
+        .agent_runtime_state
+        .as_ref()
+        .map(AgentRuntimeState::effective_permission_mode)
+        .ok_or_else(|| {
+            AgentError::Tool(
+                "authoritative permission posture refresh failed closed: typed mode missing"
+                    .to_string(),
+            )
+        })?;
+    let current_mode = session
+        .agent_runtime_state
+        .as_ref()
+        .map(AgentRuntimeState::effective_permission_mode)
+        .unwrap_or_else(|| runtime_state.effective_permission_mode());
+
+    let should_adopt_audit = bamboo_domain::disk_permission_posture_is_fresher(
+        current_mode,
+        &session.metadata,
+        disk_mode,
+        &latest.metadata,
+    );
+    let fresher_audit = bamboo_domain::fresher_disk_permission_audit(
+        current_mode,
+        &session.metadata,
+        disk_mode,
+        &latest.metadata,
+    );
+    if should_adopt_audit && fresher_audit.is_none() {
+        return Err(AgentError::Tool(
+            "authoritative permission posture refresh failed closed: complete audit unavailable"
+                .to_string(),
+        ));
+    }
+
+    // Commit the coherent pair only after every fallible validation above. A
+    // failed refresh leaves the owned snapshot untouched and dispatch never
+    // enters the executor.
+    if let Some(audit) = fresher_audit {
+        audit.write_to(&mut session.metadata);
+    }
+    runtime_state.set_permission_mode(disk_mode);
+    session
+        .agent_runtime_state
+        .get_or_insert_with(AgentRuntimeState::default)
+        .set_permission_mode(disk_mode);
+    Ok(())
 }
 
 /// Result of migrating only the rolling-upgrade legacy ingress queue.
@@ -811,6 +892,34 @@ mod tests {
         async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
             Ok(self.sessions.write().await.remove(session_id).is_some())
         }
+    }
+
+    #[tokio::test]
+    async fn tool_boundary_permission_refresh_preserves_legacy_same_mode_without_audit() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut persisted = Session::new("legacy-same-mode", "model");
+        persisted.agent_runtime_state = Some(AgentRuntimeState::new("run"));
+        persisted.add_message(bamboo_agent_core::Message::user(
+            "must stay on disk until the next turn boundary",
+        ));
+        storage.save_session(&persisted).await.unwrap();
+
+        let mut running = Session::new("legacy-same-mode", "model");
+        running.agent_runtime_state = Some(AgentRuntimeState::new("run"));
+        let mut runtime_state = AgentRuntimeState::new("run");
+        refresh_tool_boundary_permission_posture(&mut running, &mut runtime_state, Some(&storage))
+            .await
+            .expect("same-mode legacy posture is not a transition to adopt");
+
+        assert_eq!(
+            runtime_state.effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert!(
+            running.messages.is_empty(),
+            "tool-boundary refresh must not merge durable messages mid-round"
+        );
+        assert!(bamboo_domain::PermissionAuditSnapshot::from_metadata(&running.metadata).is_none());
     }
 
     struct TestPersistence(Arc<dyn Storage>);
