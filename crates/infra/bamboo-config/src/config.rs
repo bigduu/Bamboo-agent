@@ -1679,27 +1679,21 @@ struct NetworkConfigSection {
     server: ServerConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProviderRoutingConfigSection {
-    #[serde(default = "default_provider")]
-    provider: String,
+    /// Legacy single-provider routing key.
+    ///
+    /// An explicit provider-instance default is authoritative, so persisting
+    /// this compatibility field in that mode only creates stale state that can
+    /// disagree with `default_provider_instance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     defaults: Option<DefaultsConfig>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     provider_instances: HashMap<String, ProviderInstanceConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_provider_instance: Option<String>,
-}
-
-impl Default for ProviderRoutingConfigSection {
-    fn default() -> Self {
-        Self {
-            provider: default_provider(),
-            defaults: None,
-            provider_instances: HashMap::new(),
-            default_provider_instance: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1864,6 +1858,8 @@ impl From<ConfigValues> for ConfigRoot {
             extra,
         } = values;
 
+        let provider = default_provider_instance.is_none().then_some(provider);
+
         Self {
             network: NetworkConfigSection {
                 http_proxy,
@@ -1971,7 +1967,7 @@ impl From<ConfigRoot> for ConfigValues {
             proxy_auth_encrypted,
             proxy_auth_credential_ref,
             headless_auth,
-            provider,
+            provider: provider.unwrap_or_else(default_provider),
             defaults,
             provider_instances,
             default_provider_instance,
@@ -5243,6 +5239,45 @@ mod tests {
                 semantic_idle_timeout_secs: 300,
             }
         );
+    }
+
+    #[test]
+    fn persistence_omits_legacy_provider_when_instance_default_is_explicit() {
+        let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "enabled": true
+        }))
+        .unwrap();
+        let values = ConfigValues {
+            provider: "gemini".to_string(),
+            provider_instances: std::collections::HashMap::from([("work".to_string(), instance)]),
+            default_provider_instance: Some("work".to_string()),
+            ..ConfigValues::default()
+        };
+
+        let json = serde_json::to_value(ConfigRoot::from(values)).unwrap();
+        assert!(json.get("provider").is_none());
+        assert_eq!(json["default_provider_instance"], "work");
+
+        let root: ConfigRoot = serde_json::from_value(json).unwrap();
+        let round_trip = ConfigValues::from(root);
+        assert_eq!(round_trip.provider, default_provider());
+        assert_eq!(
+            round_trip.default_provider_instance.as_deref(),
+            Some("work")
+        );
+        assert!(round_trip.provider_instances.contains_key("work"));
+    }
+
+    #[test]
+    fn persistence_keeps_legacy_provider_without_instance_default() {
+        let values = ConfigValues {
+            provider: "gemini".to_string(),
+            ..ConfigValues::default()
+        };
+
+        let json = serde_json::to_value(ConfigRoot::from(values)).unwrap();
+        assert_eq!(json["provider"], "gemini");
     }
 
     #[test]

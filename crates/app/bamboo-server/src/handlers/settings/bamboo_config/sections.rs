@@ -2744,6 +2744,100 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn instance_native_provider_settings_save_without_legacy_provider_fields() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x74; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+
+        let saved = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {
+                        "provider": "anthropic",
+                        "providers": {},
+                        "defaults": {
+                            "chat": {"provider": "work", "model": "gpt-instance"}
+                        },
+                        "features": {
+                            "provider_model_ref": true,
+                            "dynamic_model_routing": false
+                        },
+                        "provider_instances": {
+                            "work": {
+                                "provider_type": "openai",
+                                "model": "gpt-instance",
+                                "enabled": true
+                            }
+                        },
+                        "default_provider_instance_id": "work"
+                    },
+                    "credential_changes": {
+                        "provider_instances": {
+                            "work": {"action": "replace", "value": "sk-instance-only"}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = saved.status();
+        let body = String::from_utf8(test::read_body(saved).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected instance-native provider response {status}: {body}"
+        );
+        assert!(!body.contains("sk-instance-only"));
+        let saved: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(saved["revision"], 1);
+        assert_eq!(
+            saved["data"]["credential_status"]["provider_instances"]["work"]["configured"],
+            true
+        );
+
+        let round_trip = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": saved["data"].clone()
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = round_trip.status();
+        let round_trip_body =
+            String::from_utf8(test::read_body(round_trip).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "instance-native settings round trip failed {status}: {round_trip_body}"
+        );
+
+        let provider_document: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        let provider_data = &provider_document["data"];
+        assert!(provider_data.get("provider").is_none());
+        assert!(provider_data.get("openai").is_none());
+        assert!(provider_data.get("anthropic").is_none());
+        assert_eq!(provider_data["default_provider_instance"], "work");
+
+        assert!(state.config.read().await.providers().openai.is_none());
+        assert!(state.config.read().await.providers().anthropic.is_none());
+    }
+
+    #[actix_web::test]
     async fn provider_instance_runtime_fields_are_explicit_editable_and_preserve_unknown_metadata()
     {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);

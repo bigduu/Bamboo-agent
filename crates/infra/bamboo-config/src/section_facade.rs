@@ -246,10 +246,12 @@ pub struct CoreSection {
 /// shape. Routing/default/features fields are additive flattened keys, so the
 /// existing `AtomicJsonStore<ProviderConfigs>` and exact credential transaction
 /// can continue parsing them through `ProviderConfigs::extra`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersSection {
-    #[serde(default = "default_provider_name")]
-    pub provider: String,
+    /// Legacy single-provider routing key. Instance-native configurations with
+    /// an explicit default omit it from durable storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<DefaultsConfig>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -264,19 +266,6 @@ pub struct ProvidersSection {
 
 fn default_provider_name() -> String {
     "openai".to_string()
-}
-
-impl Default for ProvidersSection {
-    fn default() -> Self {
-        Self {
-            provider: default_provider_name(),
-            defaults: None,
-            provider_instances: HashMap::new(),
-            default_provider_instance: None,
-            features: FeatureFlags::default(),
-            providers: ProviderConfigs::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -504,6 +493,8 @@ impl SectionProjection {
             extra,
         } = disk.section_values();
 
+        let provider = default_provider_instance.is_none().then_some(provider);
+
         Ok(Self {
             core: CoreSection {
                 http_proxy,
@@ -614,7 +605,7 @@ impl SectionProjection {
                 proxy_auth_encrypted: None,
                 proxy_auth_credential_ref,
                 headless_auth,
-                provider,
+                provider: provider.unwrap_or_else(default_provider_name),
                 defaults,
                 provider_instances,
                 default_provider_instance,
@@ -1087,7 +1078,11 @@ fn validate_core(value: &CoreSection) -> Result<(), String> {
 }
 
 fn validate_providers(value: &ProvidersSection) -> Result<(), String> {
-    if value.provider.trim().is_empty() {
+    if value
+        .provider
+        .as_ref()
+        .is_some_and(|provider| provider.trim().is_empty())
+    {
         return Err("default provider must not be empty".to_string());
     }
     for (id, instance) in &value.provider_instances {
@@ -2725,7 +2720,7 @@ fn load_strict_planning_input_with_overrides(
             providers,
         } = providers;
         if owns_provider {
-            config.provider = provider;
+            config.provider = provider.unwrap_or_else(default_provider_name);
         }
         if owns_defaults {
             config.defaults = defaults;
@@ -5777,7 +5772,7 @@ mod tests {
     #[test]
     fn providers_section_remains_readable_by_existing_exact_transaction_wire_type() {
         let section = ProvidersSection {
-            provider: "openai".to_string(),
+            provider: Some("openai".to_string()),
             features: FeatureFlags {
                 dynamic_model_routing: true,
                 ..FeatureFlags::default()
@@ -5789,8 +5784,31 @@ mod tests {
         assert_eq!(legacy.extra["provider"], "openai");
         assert_eq!(legacy.extra["features"]["dynamic_model_routing"], true);
         let reparsed: ProvidersSection = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(reparsed.provider, "openai");
+        assert_eq!(reparsed.provider.as_deref(), Some("openai"));
         assert!(reparsed.features.dynamic_model_routing);
+    }
+
+    #[test]
+    fn instance_native_projection_omits_legacy_provider_routing() {
+        let mut config = Config::default();
+        config.provider = "anthropic".to_string();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(json!({
+                "provider_type": "openai",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+
+        let projection =
+            SectionProjection::from_config(&config, ModelLimitsSection::default()).unwrap();
+        let durable = serde_json::to_value(&projection.providers).unwrap();
+
+        assert!(durable.get("provider").is_none());
+        assert_eq!(durable["default_provider_instance"], "work");
+        assert!(durable["provider_instances"]["work"].is_object());
     }
 
     #[test]
@@ -6414,7 +6432,7 @@ mod tests {
 
         let providers = facade.registry().providers.snapshot();
         let mut provider_candidate = providers.data.as_ref().clone();
-        provider_candidate.provider = "anthropic".to_string();
+        provider_candidate.provider = Some("anthropic".to_string());
         facade
             .registry()
             .providers

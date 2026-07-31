@@ -213,6 +213,35 @@ pub async fn create_provider_by_name(
 
 /// Validate provider configuration without creating the provider
 pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
+    if let Some(instance_id) = config.default_provider_instance.as_deref() {
+        let instance = config.provider_instances.get(instance_id).ok_or_else(|| {
+            LLMError::Auth(format!(
+                "Default provider instance '{instance_id}' configuration required"
+            ))
+        })?;
+        if !instance.enabled {
+            return Err(LLMError::Auth(format!(
+                "Default provider instance '{instance_id}' is disabled"
+            )));
+        }
+        return match instance.provider_type.as_str() {
+            "copilot" => Ok(()),
+            "openai" | "anthropic" | "gemini" | "bodhi" => {
+                if instance.api_key.is_empty() {
+                    Err(LLMError::Auth(format!(
+                        "{} API key is required for provider instance '{instance_id}'",
+                        provider_display_name(&instance.provider_type)
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            other => Err(LLMError::Auth(format!(
+                "Unknown provider type '{other}' for provider instance '{instance_id}'"
+            ))),
+        };
+    }
+
     match config.provider.as_str() {
         "copilot" => Ok(()),
 
@@ -275,6 +304,16 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
             "Unknown provider: {}",
             config.provider
         ))),
+    }
+}
+
+fn provider_display_name(provider_type: &str) -> &str {
+    match provider_type {
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        "gemini" => "Gemini",
+        "bodhi" => "Bodhi",
+        other => other,
     }
 }
 
@@ -453,5 +492,43 @@ mod tests {
 
         let result = validate_provider_config(&config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_instance_default_without_legacy_provider_config() {
+        let mut config = config_with_provider("anthropic", ProviderConfigs::default());
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "api_key": "sk-instance",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+
+        assert!(validate_provider_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_instance_default_requires_existing_enabled_instance() {
+        let mut missing = config_with_provider("copilot", ProviderConfigs::default());
+        missing.default_provider_instance = Some("missing".to_string());
+        let error = validate_provider_config(&missing).unwrap_err().to_string();
+        assert!(error.contains("Default provider instance 'missing' configuration required"));
+
+        let mut disabled = config_with_provider("copilot", ProviderConfigs::default());
+        disabled.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "copilot",
+                "enabled": false
+            }))
+            .unwrap(),
+        );
+        disabled.default_provider_instance = Some("work".to_string());
+        let error = validate_provider_config(&disabled).unwrap_err().to_string();
+        assert!(error.contains("Default provider instance 'work' is disabled"));
     }
 }
