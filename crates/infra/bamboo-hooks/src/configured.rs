@@ -406,18 +406,18 @@ async fn capture_hook_child(
 
     let (io_tx, mut io_rx) = mpsc::channel(3);
     let input_tx = io_tx.clone();
-    tokio::spawn(async move {
+    let input_task = tokio::spawn(async move {
         let result = stdin.write_all(&input).await;
         let _ = stdin.shutdown().await;
         let _ = input_tx.send(HookIoEvent::Input(result)).await;
     });
     let stdout_tx = io_tx.clone();
-    tokio::spawn(async move {
+    let stdout_task = tokio::spawn(async move {
         let _ = stdout_tx
             .send(HookIoEvent::Stdout(read_capped(stdout).await))
             .await;
     });
-    tokio::spawn(async move {
+    let stderr_task = tokio::spawn(async move {
         let _ = io_tx
             .send(HookIoEvent::Stderr(read_capped(stderr).await))
             .await;
@@ -437,12 +437,25 @@ async fn capture_hook_child(
         Ok(Err(error)) => return Err(error),
         Err(_) => {
             kill_hook_process_tree(&mut child).await;
-            receive_hook_io(&mut io_rx, &mut io_results).await?;
+            // Do not await pipe EOF after the deadline. A deliberately
+            // detached descendant can escape a Unix process group while still
+            // holding inherited descriptors, so the I/O tasks must be
+            // cancellable for the wall-clock deadline to remain bounded.
+            input_task.abort();
+            stdout_task.abort();
+            stderr_task.abort();
+            while let Ok(event) = io_rx.try_recv() {
+                io_results.record(event)?;
+            }
             (None, true)
         }
     };
 
-    let (stdout, stderr) = io_results.finish(hook_name)?;
+    let (stdout, stderr) = if timed_out {
+        io_results.finish_after_timeout(hook_name)
+    } else {
+        io_results.finish(hook_name)?
+    };
     child.finished = true;
 
     Ok(CommandOutput {
@@ -680,6 +693,34 @@ impl HookIoResults {
             .ok_or_else(|| "lifecycle hook stderr task ended unexpectedly".to_string())?
             .map_err(|error| format!("failed reading lifecycle hook stderr: {error}"))?;
         Ok((stdout, stderr))
+    }
+
+    fn finish_after_timeout(self, hook_name: &str) -> (CapturedOutput, CapturedOutput) {
+        let Self {
+            input,
+            stdout,
+            stderr,
+        } = self;
+        if let Some(Err(error)) = input {
+            warn!(hook = hook_name, error = %error, "failed writing lifecycle hook stdin");
+        }
+        let stdout = match stdout {
+            Some(Ok(stdout)) => stdout,
+            Some(Err(error)) => {
+                warn!(hook = hook_name, error = %error, "failed reading lifecycle hook stdout");
+                CapturedOutput::default()
+            }
+            None => CapturedOutput::default(),
+        };
+        let stderr = match stderr {
+            Some(Ok(stderr)) => stderr,
+            Some(Err(error)) => {
+                warn!(hook = hook_name, error = %error, "failed reading lifecycle hook stderr");
+                CapturedOutput::default()
+            }
+            None => CapturedOutput::default(),
+        };
+        (stdout, stderr)
     }
 }
 
@@ -2162,6 +2203,60 @@ child.unref();
             .parse::<u32>()
             .unwrap();
         assert_process_exits(process_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_timeout_does_not_wait_for_a_pipe_holder_outside_the_process_group() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let process_id_path = dir.path().join("detached-descendant.pid");
+        let process_id_literal = serde_json::to_string(&process_id_path.to_string_lossy()).unwrap();
+        let body = r#"
+const fs = require("node:fs");
+const childProcess = require("node:child_process");
+const child = childProcess.spawn(
+  process.execPath,
+  ["-e", "setTimeout(() => {}, 5000)"],
+  {detached: true, stdio: ["ignore", "inherit", "inherit"]}
+);
+fs.writeFileSync(__PROCESS_ID_PATH__, String(child.pid));
+child.unref();
+"#
+        .replace("__PROCESS_ID_PATH__", &process_id_literal);
+        let path = write_script(&dir, "detached-descendant.js", &body);
+        let hook = script_hook(
+            LifecycleHookEvent::SessionStart,
+            path,
+            LifecycleScriptRunner::Node,
+            1_000,
+            None,
+        );
+        let started = Instant::now();
+        let output = hook
+            .test(&HookPayload::None, &session(dir.path()))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let process_id = std::fs::read_to_string(&process_id_path)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+
+        unsafe {
+            libc::kill(process_id as libc::pid_t, libc::SIGKILL);
+        }
+        assert_process_exits(process_id).await;
+        assert!(output.timed_out, "{output:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
     }
 
     #[tokio::test]
