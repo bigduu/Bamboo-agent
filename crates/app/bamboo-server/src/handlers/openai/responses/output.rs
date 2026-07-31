@@ -22,6 +22,7 @@ pub(super) fn build_output_items(
             content: vec![ResponsesTextContent {
                 content_type: "output_text".to_string(),
                 text: content,
+                annotations: Vec::new(),
             }],
             status: Some("completed".to_string()),
         }));

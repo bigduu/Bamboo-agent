@@ -484,6 +484,7 @@ fn function_call_item_events_emit_standard_sequence() {
 
     let (_, args_done) = &decoded[2];
     assert_eq!(args_done["arguments"], "{\"location\":\"NYC\"}");
+    assert_eq!(args_done["name"], "get_weather");
 
     let (_, item_done) = &decoded[3];
     assert_eq!(item_done["item"]["status"], "completed");

@@ -108,6 +108,7 @@ pub(super) fn message_content_part_added_event(
     event.part = Some(ResponsesTextContent {
         content_type: "output_text".to_string(),
         text: String::new(),
+        annotations: Vec::new(),
     });
     event
 }
@@ -124,6 +125,7 @@ pub(super) fn message_item_done_events(
         .unwrap_or(ResponsesTextContent {
             content_type: "output_text".to_string(),
             text: String::new(),
+            annotations: Vec::new(),
         });
 
     let mut text_done = item_event("response.output_text.done", response_id, &item.id, 0);
@@ -181,6 +183,7 @@ pub(super) fn function_call_item_events(
         output_index,
     );
     arguments_done.arguments = Some(item.arguments.clone());
+    arguments_done.name = Some(item.name.clone());
 
     let mut done = item_event(
         "response.output_item.done",

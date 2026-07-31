@@ -122,6 +122,9 @@ pub(super) struct ResponsesTextContent {
     #[serde(rename = "type")]
     pub(super) content_type: String, // "output_text"
     pub(super) text: String,
+    /// Synthetic output has no citations, but the Responses `output_text`
+    /// object still requires the annotations collection.
+    pub(super) annotations: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -198,6 +201,9 @@ pub(super) struct ResponsesStreamEvent<T> {
     /// Complete arguments for `response.function_call_arguments.done` (#525).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) arguments: Option<String>,
+    /// Function name for `response.function_call_arguments.done`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
 }
 
 /// Manual impl (not derived) so it doesn't require `T: Default` — event
@@ -217,6 +223,7 @@ impl<T> Default for ResponsesStreamEvent<T> {
             text: None,
             item: None,
             arguments: None,
+            name: None,
         }
     }
 }
@@ -347,11 +354,13 @@ mod tests {
         let content = ResponsesTextContent {
             content_type: "output_text".to_string(),
             text: "Hello world".to_string(),
+            annotations: Vec::new(),
         };
 
         let json = serde_json::to_string(&content).unwrap();
         assert!(json.contains("\"type\":\"output_text\""));
         assert!(json.contains("\"text\":\"Hello world\""));
+        assert!(json.contains("\"annotations\":[]"));
     }
 
     #[test]
@@ -363,6 +372,7 @@ mod tests {
             content: vec![ResponsesTextContent {
                 content_type: "output_text".to_string(),
                 text: "Response text".to_string(),
+                annotations: Vec::new(),
             }],
             status: None,
         };
