@@ -14,14 +14,13 @@ use bamboo_config::{
 use bamboo_domain::{
     AgentHookPoint, HookPayload, HookResult, SessionEndStatus, SessionStartSource,
 };
-use bamboo_infrastructure::{
-    build_command_environment, hide_window_for_tokio_command, preferred_bash_shell,
-};
+use bamboo_infrastructure::{build_command_environment, preferred_bash_shell};
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::HookDispatcher;
@@ -155,7 +154,6 @@ impl ShellCommandHook {
         let overrides = bamboo_llm::Config::current_env_vars();
         let prepared_env = build_command_environment(&overrides).await;
         let mut command = Command::new(&shell.program);
-        hide_window_for_tokio_command(&mut command);
         prepared_env.apply_to_tokio_command(&mut command);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -167,20 +165,13 @@ impl ShellCommandHook {
             .env("BAMBOO_HOOK_EVENT", self.event_name())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            // Put every hook in its own process group so a timeout kills the
-            // complete command tree. Killing only the shell can leave a child
-            // holding stdout/stderr open and make the nominal timeout wait for
-            // that child to exit.
-            command.process_group(0);
-        }
+            .stderr(Stdio::piped());
+        configure_hook_process(&mut command);
 
         let child = command
             .spawn()
             .map_err(|error| format!("failed to spawn lifecycle hook: {error}"))?;
+        let child = HookChild::new(child)?;
         capture_hook_child(child, input, self.timeout, &self.name).await
     }
 
@@ -387,52 +378,67 @@ fn synthetic_test_payload(event_name: &str) -> Result<(LifecycleHookEvent, HookP
 }
 
 async fn capture_hook_child(
-    mut child: Child,
+    mut child: HookChild,
     input: Vec<u8>,
     timeout: Duration,
     hook_name: &str,
 ) -> Result<CommandOutput, String> {
     let mut stdin = child
+        .child
         .stdin
         .take()
         .ok_or_else(|| "failed to open lifecycle hook stdin".to_string())?;
     let stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| "failed to capture lifecycle hook stdout".to_string())?;
     let stderr = child
+        .child
         .stderr
         .take()
         .ok_or_else(|| "failed to capture lifecycle hook stderr".to_string())?;
 
-    let input_task = tokio::spawn(async move {
+    let (io_tx, mut io_rx) = mpsc::channel(3);
+    let input_tx = io_tx.clone();
+    tokio::spawn(async move {
         let result = stdin.write_all(&input).await;
         let _ = stdin.shutdown().await;
-        result
+        let _ = input_tx.send(HookIoEvent::Input(result)).await;
     });
-    let stdout_task = tokio::spawn(read_capped(stdout));
-    let stderr_task = tokio::spawn(read_capped(stderr));
+    let stdout_tx = io_tx.clone();
+    tokio::spawn(async move {
+        let _ = stdout_tx
+            .send(HookIoEvent::Stdout(read_capped(stdout).await))
+            .await;
+    });
+    tokio::spawn(async move {
+        let _ = io_tx
+            .send(HookIoEvent::Stderr(read_capped(stderr).await))
+            .await;
+    });
 
-    let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+    let mut io_results = HookIoResults::default();
+    let completion = async {
+        let (status, io_result) = tokio::join!(
+            child.child.wait(),
+            receive_hook_io(&mut io_rx, &mut io_results)
+        );
+        io_result?;
+        status.map_err(|error| format!("failed waiting for lifecycle hook: {error}"))
+    };
+    let (status, timed_out) = match tokio::time::timeout(timeout, completion).await {
         Ok(Ok(status)) => (Some(status), false),
-        Ok(Err(error)) => return Err(format!("failed waiting for lifecycle hook: {error}")),
+        Ok(Err(error)) => return Err(error),
         Err(_) => {
             kill_hook_process_tree(&mut child).await;
+            receive_hook_io(&mut io_rx, &mut io_results).await?;
             (None, true)
         }
     };
 
-    if let Ok(Err(error)) = input_task.await {
-        warn!(hook = hook_name, error = %error, "failed writing lifecycle hook stdin");
-    }
-    let stdout = stdout_task
-        .await
-        .map_err(|error| format!("lifecycle hook stdout task failed: {error}"))?
-        .map_err(|error| format!("failed reading lifecycle hook stdout: {error}"))?;
-    let stderr = stderr_task
-        .await
-        .map_err(|error| format!("lifecycle hook stderr task failed: {error}"))?
-        .map_err(|error| format!("failed reading lifecycle hook stderr: {error}"))?;
+    let (stdout, stderr) = io_results.finish(hook_name)?;
+    child.finished = true;
 
     Ok(CommandOutput {
         exit_code: status.and_then(|status| status.code()),
@@ -442,34 +448,248 @@ async fn capture_hook_child(
     })
 }
 
-#[cfg(unix)]
-async fn kill_hook_process_tree(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        // SAFETY: the child was spawned as the leader of its own process group,
-        // so the negative pid targets only that hook and its descendants.
+fn configure_hook_process(command: &mut Command) {
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // The saved process-group id remains usable after the direct child
+        // exits, so descendants that keep captured pipes open can still be
+        // terminated when the full wall-clock deadline expires.
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+        // Suspend before first instruction so the process can be assigned to a
+        // Job Object before it has any opportunity to spawn descendants.
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    }
+}
+
+struct HookChild {
+    child: Child,
+    #[cfg(unix)]
+    process_group_id: u32,
+    finished: bool,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+impl HookChild {
+    fn new(child: Child) -> Result<Self, String> {
+        let process_id = child
+            .id()
+            .ok_or_else(|| "lifecycle hook exited before process isolation".to_string())?;
+        #[cfg(windows)]
+        let job = WindowsJob::assign_and_resume(&child, process_id)
+            .map_err(|error| format!("failed isolating lifecycle hook process tree: {error}"))?;
+        Ok(Self {
+            child,
+            #[cfg(unix)]
+            process_group_id: process_id,
+            finished: false,
+            #[cfg(windows)]
+            job,
+        })
+    }
+}
+
+impl Drop for HookChild {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        terminate_hook_process_tree(self);
+        let _ = self.child.start_kill();
+    }
+}
+
+async fn kill_hook_process_tree(child: &mut HookChild) {
+    terminate_hook_process_tree(child);
+    let _ = child.child.start_kill();
+    let _ = child.child.wait().await;
+}
+
+fn terminate_hook_process_tree(child: &HookChild) {
+    #[cfg(unix)]
+    {
+        // SAFETY: every hook is spawned as the leader of its own process group,
+        // and the group id is captured before the direct child can exit.
         unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            libc::kill(-(child.process_group_id as libc::pid_t), libc::SIGKILL);
         }
     }
-    let _ = child.wait().await;
+    #[cfg(windows)]
+    {
+        let _ = child.job.terminate();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = child;
+    }
 }
 
 #[cfg(windows)]
-async fn kill_hook_process_tree(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        let pid = pid.to_string();
-        let mut kill = Command::new("taskkill");
-        hide_window_for_tokio_command(&mut kill);
-        let _ = kill.args(["/F", "/T", "/PID", &pid]).status().await;
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+struct WindowsJob {
+    handle: std::os::windows::io::OwnedHandle,
 }
 
-#[cfg(not(any(unix, windows)))]
-async fn kill_hook_process_tree(child: &mut Child) {
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+#[cfg(windows)]
+impl WindowsJob {
+    fn assign_and_resume(child: &Child, process_id: u32) -> std::io::Result<Self> {
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+        use std::ptr;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+        let raw_job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if raw_job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = Self {
+            handle: unsafe {
+                std::os::windows::io::OwnedHandle::from_raw_handle(raw_job as RawHandle)
+            },
+        };
+        let process_handle = child.raw_handle().ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::NotFound,
+                "lifecycle hook exited before Job Object assignment",
+            )
+        })?;
+        if unsafe { AssignProcessToJobObject(job.raw_handle(), process_handle.cast()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        resume_suspended_process(process_id)?;
+        Ok(job)
+    }
+
+    fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle;
+
+        self.handle.as_raw_handle().cast()
+    }
+
+    fn terminate(&self) -> std::io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.raw_handle(), 1) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(process_id: u32) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if raw_snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw_snapshot as RawHandle) };
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut has_entry = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &mut entry) } != 0;
+    while has_entry {
+        if entry.th32OwnerProcessID == process_id {
+            let raw_thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if raw_thread.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let thread = unsafe { OwnedHandle::from_raw_handle(raw_thread as RawHandle) };
+            if unsafe { ResumeThread(thread.as_raw_handle().cast()) } == u32::MAX {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        has_entry = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &mut entry) } != 0;
+    }
+    Err(std::io::Error::new(
+        ErrorKind::NotFound,
+        "suspended lifecycle hook primary thread was not found",
+    ))
+}
+
+enum HookIoEvent {
+    Input(std::io::Result<()>),
+    Stdout(std::io::Result<CapturedOutput>),
+    Stderr(std::io::Result<CapturedOutput>),
+}
+
+#[derive(Default)]
+struct HookIoResults {
+    input: Option<std::io::Result<()>>,
+    stdout: Option<std::io::Result<CapturedOutput>>,
+    stderr: Option<std::io::Result<CapturedOutput>>,
+}
+
+impl HookIoResults {
+    fn is_complete(&self) -> bool {
+        self.input.is_some() && self.stdout.is_some() && self.stderr.is_some()
+    }
+
+    fn record(&mut self, event: HookIoEvent) -> Result<(), String> {
+        match event {
+            HookIoEvent::Input(result) if self.input.is_none() => self.input = Some(result),
+            HookIoEvent::Stdout(result) if self.stdout.is_none() => self.stdout = Some(result),
+            HookIoEvent::Stderr(result) if self.stderr.is_none() => self.stderr = Some(result),
+            HookIoEvent::Input(_) => {
+                return Err("duplicate lifecycle hook stdin result".to_string())
+            }
+            HookIoEvent::Stdout(_) => {
+                return Err("duplicate lifecycle hook stdout result".to_string())
+            }
+            HookIoEvent::Stderr(_) => {
+                return Err("duplicate lifecycle hook stderr result".to_string())
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, hook_name: &str) -> Result<(CapturedOutput, CapturedOutput), String> {
+        let Self {
+            input,
+            stdout,
+            stderr,
+        } = self;
+        match input.ok_or_else(|| "lifecycle hook stdin task ended unexpectedly".to_string())? {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(hook = hook_name, error = %error, "failed writing lifecycle hook stdin");
+            }
+        }
+        let stdout = stdout
+            .ok_or_else(|| "lifecycle hook stdout task ended unexpectedly".to_string())?
+            .map_err(|error| format!("failed reading lifecycle hook stdout: {error}"))?;
+        let stderr = stderr
+            .ok_or_else(|| "lifecycle hook stderr task ended unexpectedly".to_string())?
+            .map_err(|error| format!("failed reading lifecycle hook stderr: {error}"))?;
+        Ok((stdout, stderr))
+    }
+}
+
+async fn receive_hook_io(
+    receiver: &mut mpsc::Receiver<HookIoEvent>,
+    results: &mut HookIoResults,
+) -> Result<(), String> {
+    while !results.is_complete() {
+        let event = receiver
+            .recv()
+            .await
+            .ok_or_else(|| "lifecycle hook I/O task ended unexpectedly".to_string())?;
+        results.record(event)?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -614,7 +834,6 @@ impl ScriptHook {
 
         for invocation in invocations {
             let mut command = Command::new(&invocation.program);
-            hide_window_for_tokio_command(&mut command);
             prepared_env.apply_to_tokio_command(&mut command);
             if let Some(cwd) = cwd {
                 command.current_dir(cwd);
@@ -626,15 +845,12 @@ impl ScriptHook {
                 .env("BAMBOO_HOOK_SCRIPT", &path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            #[cfg(unix)]
-            {
-                command.process_group(0);
-            }
+                .stderr(Stdio::piped());
+            configure_hook_process(&mut command);
 
             match command.spawn() {
                 Ok(child) => {
+                    let child = HookChild::new(child)?;
                     return capture_hook_child(child, input, self.timeout, &self.name).await;
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -1280,6 +1496,48 @@ mod tests {
         session
     }
 
+    #[cfg(unix)]
+    fn process_is_alive(process_id: u32) -> bool {
+        let result = unsafe { libc::kill(process_id as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(windows)]
+    fn process_is_alive(process_id: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+        if handle.is_null() {
+            return false;
+        }
+        let wait_result = unsafe { WaitForSingleObject(handle, 0) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        wait_result == WAIT_TIMEOUT
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn process_is_alive(_process_id: u32) -> bool {
+        false
+    }
+
+    async fn assert_process_exits(process_id: u32) {
+        for _ in 0..100 {
+            if !process_is_alive(process_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !process_is_alive(process_id),
+            "hook descendant process {process_id} survived timeout cleanup"
+        );
+    }
+
     #[tokio::test]
     async fn exit_zero_without_output_passes_through() {
         let dir = tempfile::tempdir().unwrap();
@@ -1810,6 +2068,55 @@ $null = [Console]::In.ReadToEnd()
 
         assert!(output.timed_out, "{output:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn script_timeout_covers_descendant_pipe_drain_and_kills_tree() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let process_id_path = dir.path().join("descendant.pid");
+        let process_id_literal = serde_json::to_string(&process_id_path.to_string_lossy()).unwrap();
+        let body = r#"
+const fs = require("node:fs");
+const childProcess = require("node:child_process");
+const child = childProcess.spawn(
+  process.execPath,
+  ["-e", "setTimeout(() => {}, 10000)"],
+  {stdio: ["ignore", "inherit", "inherit"]}
+);
+fs.writeFileSync(__PROCESS_ID_PATH__, String(child.pid));
+child.unref();
+"#
+        .replace("__PROCESS_ID_PATH__", &process_id_literal);
+        let path = write_script(&dir, "descendant.js", &body);
+        let hook = script_hook(
+            LifecycleHookEvent::SessionStart,
+            path,
+            LifecycleScriptRunner::Node,
+            1_000,
+            None,
+        );
+        let started = Instant::now();
+        let output = hook
+            .test(&HookPayload::None, &session(dir.path()))
+            .await
+            .unwrap();
+
+        assert!(output.timed_out, "{output:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let process_id = std::fs::read_to_string(&process_id_path)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_process_exits(process_id).await;
     }
 
     #[tokio::test]
