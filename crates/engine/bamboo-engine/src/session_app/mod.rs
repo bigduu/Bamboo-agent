@@ -1,5 +1,6 @@
 //! Session management application logic.
 
+pub mod approval_replay;
 pub mod chat;
 pub mod child_completion_coordinator;
 pub mod child_session;

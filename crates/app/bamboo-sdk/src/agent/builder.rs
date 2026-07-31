@@ -182,6 +182,10 @@ pub struct AgentBuilder {
     /// gating at all — every tool call runs unprompted. See
     /// [`permission_checker`](Self::permission_checker).
     permission_checker: Option<Arc<dyn PermissionChecker>>,
+    /// Typed configured posture retained even when no checker is installed.
+    /// This distinguishes explicit legacy Bypass from the historical ungated
+    /// default at approval replay boundaries.
+    permission_mode: PermissionMode,
     /// Explicit dependency overrides are retained outside the wrapped engine
     /// builder so defaults can never overwrite them based on call order.
     provider_override: Option<Arc<dyn LLMProvider>>,
@@ -224,6 +228,7 @@ impl AgentBuilder {
             api_key: None,
             mcp_servers: Vec::new(),
             permission_checker: None,
+            permission_mode: PermissionMode::Default,
             provider_override: None,
             default_tools_override: None,
             config_override: None,
@@ -413,6 +418,7 @@ impl AgentBuilder {
     /// clarification — resolve it with [`Agent::answer`](super::Agent::answer).
     pub fn permission_checker(mut self, checker: Arc<dyn PermissionChecker>) -> Self {
         self.permission_checker = Some(checker);
+        self.permission_mode = PermissionMode::Default;
         self.inner = self.inner.permission_mode(PermissionMode::Default);
         self
     }
@@ -430,6 +436,7 @@ impl AgentBuilder {
     /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir).
     pub fn permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission_checker = permission_checker_for_mode(mode);
+        self.permission_mode = mode;
         self.inner = self.inner.permission_mode(mode);
         self
     }
@@ -440,6 +447,7 @@ impl AgentBuilder {
     /// can say what they mean instead of relying on silent default behavior.
     pub fn bypass_permissions(mut self) -> Self {
         self.permission_checker = None;
+        self.permission_mode = PermissionMode::BypassPermissions;
         self.inner = self
             .inner
             .permission_mode(PermissionMode::BypassPermissions);
@@ -816,6 +824,7 @@ impl AgentBuilder {
             project_id,
             self.session_store,
             self.permission_checker,
+            self.permission_mode,
         ))
     }
 }
@@ -1442,23 +1451,24 @@ mod tests {
 
     #[test]
     fn permission_configuration_is_last_call_wins() {
-        assert!(AgentBuilder::new()
+        let bypass = AgentBuilder::new()
             .permission_mode(PermissionMode::Default)
+            .bypass_permissions();
+        assert!(bypass.permission_checker.is_none());
+        assert_eq!(bypass.permission_mode, PermissionMode::BypassPermissions);
+
+        let plan = AgentBuilder::new()
             .bypass_permissions()
-            .permission_checker
-            .is_none());
-        assert!(AgentBuilder::new()
-            .bypass_permissions()
-            .permission_mode(PermissionMode::Plan)
-            .permission_checker
-            .is_some());
+            .permission_mode(PermissionMode::Plan);
+        assert!(plan.permission_checker.is_some());
+        assert_eq!(plan.permission_mode, PermissionMode::Plan);
 
         let custom = permission_checker_for_mode(PermissionMode::Default).unwrap();
-        assert!(AgentBuilder::new()
+        let custom = AgentBuilder::new()
             .permission_mode(PermissionMode::Plan)
-            .permission_checker(custom)
-            .permission_checker
-            .is_some());
+            .permission_checker(custom);
+        assert!(custom.permission_checker.is_some());
+        assert_eq!(custom.permission_mode, PermissionMode::Default);
         assert!(permission_checker_for_mode(PermissionMode::BypassPermissions).is_some());
     }
 

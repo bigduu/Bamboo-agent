@@ -59,6 +59,32 @@ fn enforce_plan_tool_gate(
     Ok(())
 }
 
+/// Resolve direct-dispatch flags without changing the historical meaning of
+/// `session_id`: Read/Edit callers may use an opaque id solely as their safety
+/// ledger correlation key. A persisted session contributes its typed posture;
+/// an unknown id inherits only the configured process posture.
+fn direct_tool_session_flags(
+    configured_mode: bamboo_domain::PermissionMode,
+    session: Option<&bamboo_agent_core::Session>,
+) -> ToolExecutionSessionFlags {
+    if let Some(session) = session {
+        return ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            configured_mode,
+        );
+    }
+
+    let resolution = bamboo_domain::resolve_permission_mode(
+        bamboo_domain::SessionPermissionMode::Default,
+        configured_mode,
+    );
+    ToolExecutionSessionFlags {
+        bypass_permissions: resolution.bypass_permissions(),
+        auto_approve_permissions: resolution.suppress_approval_prompts(),
+        plan_read_only: resolution.effective == bamboo_domain::PermissionMode::Plan,
+    }
+}
+
 /// Execute a tool directly without agent loop.
 ///
 /// This endpoint allows direct execution of Bamboo's built-in tools
@@ -129,33 +155,14 @@ pub async fn execute_tool(
         .permission_config()
         .map(|config| config.mode())
         .unwrap_or_default();
-    let session_flags = if let Some(session_id) = session_id {
-        let session = app_state
-            .session_repo
-            .try_load(session_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("session {session_id}")))?;
-        let effective_configured = if session
-            .agent_runtime_state
-            .as_ref()
-            .is_some_and(|state| state.plan_mode.is_some())
-        {
-            bamboo_domain::PermissionMode::Plan
-        } else {
-            configured_mode
-        };
-        ToolExecutionSessionFlags::from_session_and_configured_mode(&session, effective_configured)
+    let persisted_session = if let Some(session_id) = session_id {
+        // A genuine storage failure is still an API error. `Ok(None)` is not:
+        // this endpoint has always accepted opaque ids for the Read/Edit ledger.
+        app_state.session_repo.try_load(session_id).await?
     } else {
-        let resolution = bamboo_domain::resolve_permission_mode(
-            bamboo_domain::SessionPermissionMode::Default,
-            configured_mode,
-        );
-        ToolExecutionSessionFlags {
-            bypass_permissions: resolution.bypass_permissions(),
-            auto_approve_permissions: resolution.suppress_approval_prompts(),
-            plan_read_only: resolution.effective == bamboo_domain::PermissionMode::Plan,
-        }
+        None
     };
+    let session_flags = direct_tool_session_flags(configured_mode, persisted_session.as_ref());
 
     enforce_plan_tool_gate(session_flags, &call.function.name)?;
 

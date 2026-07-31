@@ -2,7 +2,7 @@ use crate::error::AppError;
 use bamboo_agent_core::tools::ToolResult;
 
 use super::{
-    enforce_plan_tool_gate,
+    direct_tool_session_flags, enforce_plan_tool_gate,
     models::{ToolExecutionRequest, ToolParameter},
     request::{
         build_tool_call, canonical_tool_name_or_error, parse_arguments, trimmed_session_id,
@@ -10,6 +10,52 @@ use super::{
     },
     response::build_execution_response,
 };
+
+#[test]
+fn direct_http_unknown_session_id_inherits_configured_auto() {
+    let flags = direct_tool_session_flags(bamboo_domain::PermissionMode::Auto, None);
+
+    assert!(flags.auto_approve_permissions);
+    assert!(!flags.bypass_permissions);
+    assert!(!flags.plan_read_only);
+}
+
+#[test]
+fn direct_http_persisted_modes_remain_typed_and_plan_is_authoritative() {
+    let mut auto = bamboo_agent_core::Session::new("http-auto", "model");
+    let mut auto_runtime = bamboo_domain::AgentRuntimeState::new("http-auto");
+    auto_runtime.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+    auto.agent_runtime_state = Some(auto_runtime);
+    let auto_flags = direct_tool_session_flags(bamboo_domain::PermissionMode::Default, Some(&auto));
+    assert!(auto_flags.auto_approve_permissions);
+    assert!(!auto_flags.bypass_permissions);
+
+    let mut bypass = bamboo_agent_core::Session::new("http-bypass", "model");
+    let mut bypass_runtime = bamboo_domain::AgentRuntimeState::new("http-bypass");
+    bypass_runtime.set_permission_mode(bamboo_domain::SessionPermissionMode::Bypass);
+    bypass.agent_runtime_state = Some(bypass_runtime);
+    let bypass_flags =
+        direct_tool_session_flags(bamboo_domain::PermissionMode::Auto, Some(&bypass));
+    assert!(bypass_flags.bypass_permissions);
+    assert!(!bypass_flags.auto_approve_permissions);
+
+    let mut plan_auto = auto;
+    plan_auto
+        .agent_runtime_state
+        .as_mut()
+        .expect("runtime state")
+        .plan_mode = Some(bamboo_domain::PlanModeState {
+        entered_at: chrono::Utc::now(),
+        pre_permission_mode: "auto".to_string(),
+        plan_file_path: None,
+        status: bamboo_domain::PlanModeStatus::Exploring,
+    });
+    let plan_flags =
+        direct_tool_session_flags(bamboo_domain::PermissionMode::Default, Some(&plan_auto));
+    assert!(plan_flags.plan_read_only);
+    assert!(plan_flags.auto_approve_permissions);
+    assert!(!plan_flags.bypass_permissions);
+}
 
 #[test]
 fn direct_http_plan_auto_blocks_mutation_and_keeps_reads_available() {
