@@ -545,8 +545,11 @@ async fn merge_authoritative_metadata_into_stale(
 /// writer of this posture (a running loop only carries it forward from run
 /// start). Without this, a runtime save from an in-flight run — which holds the
 /// run-start value — silently reverts a concurrent mid-run transition on disk.
-/// Unlike the metadata group this is NOT version-gated: the PATCH writes via
-/// `update_runtime_config`, which does not bump `metadata_version`. #540/#770.
+/// Unlike the metadata group this is NOT version-gated: a run-start snapshot
+/// can carry unrelated newer metadata while still holding an older permission
+/// posture, so the latest durable mode remains authoritative. Typed PATCHes
+/// bump `metadata_version` for client-side CAS, but this merge rule must still
+/// adopt the disk value independently. #540/#770.
 fn adopt_disk_permission_mode(session: &mut Session, latest: &Session) {
     // A disk copy with NO runtime state at all carries no authoritative mode
     // value — treat it as "unknown" and leave the in-memory flag untouched,

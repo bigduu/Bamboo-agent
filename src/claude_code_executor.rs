@@ -719,6 +719,33 @@ impl ChildExecutor for ClaudeCodeExecutor {
             .permission_policy
             .as_ref()
             .is_some_and(|policy| policy.auto_approve_permissions);
+        let requested_mode = if auto_approve_permissions {
+            "auto"
+        } else if spec
+            .permission_policy
+            .as_ref()
+            .is_some_and(|policy| policy.bypass_permissions)
+        {
+            "bypass"
+        } else {
+            "default"
+        };
+        let mapped_permission_mode = if auto_approve_permissions {
+            "bypassPermissions"
+        } else {
+            self.permission_mode.as_deref().unwrap_or("default")
+        };
+        events.emit(json!({
+            "type": "runner_progress",
+            "session_id": "claude_code",
+            "round_count": 0,
+            "executor": "claude_code",
+            "phase": "bootstrap",
+            "requested_mode": requested_mode,
+            "effective_mode": requested_mode,
+            "executor_mapping":
+                format!("claude_code:permission_mode={mapped_permission_mode}"),
+        }));
 
         let used_resume = resume_id.is_some();
         let (outcome, exited_without_result) = self
@@ -1279,13 +1306,63 @@ echo '{"type":"result","subtype":"success","result":"done: hi","usage":{"input_t
             .collect();
         assert_eq!(
             types,
-            vec!["token", "tool_start", "tool_complete", "complete"]
+            vec![
+                "runner_progress",
+                "token",
+                "tool_start",
+                "tool_complete",
+                "complete"
+            ]
         );
-        assert_eq!(events[0]["content"], "Working on it");
-        assert_eq!(events[1]["tool_name"], "Bash");
-        assert_eq!(events[2]["result"]["result"], "hi");
-        assert_eq!(events[3]["usage"]["prompt_tokens"], 10);
-        assert_eq!(events[3]["usage"]["completion_tokens"], 5);
+        assert_eq!(events[0]["phase"], "bootstrap");
+        assert_eq!(events[0]["requested_mode"], "default");
+        assert_eq!(events[1]["content"], "Working on it");
+        assert_eq!(events[2]["tool_name"], "Bash");
+        assert_eq!(events[3]["result"]["result"], "hi");
+        assert_eq!(events[4]["usage"]["prompt_tokens"], 10);
+        assert_eq!(events[4]["usage"]["completion_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn auto_bootstrap_audits_explicit_no_prompt_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_stub(
+            dir.path(),
+            r#"
+read -r _assignment
+echo '{"type":"result","subtype":"success","result":"done"}'
+"#,
+        );
+        let mut spec = run_spec("say hi");
+        spec.permission_policy = Some(bamboo_subagent::proto::PermissionPolicyContext {
+            revision: 7,
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            session_id: "auto-audit".to_string(),
+            workspace_path: None,
+            inherit_session_grants: false,
+            policy: json!({}),
+        });
+        let (sink, mut rx) = EventSink::channel();
+
+        let outcome = executor(bin)
+            .run(
+                spec,
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["executor"] == "claude_code"
+                && event["phase"] == "bootstrap"
+                && event["requested_mode"] == "auto"
+                && event["effective_mode"] == "auto"
+                && event["executor_mapping"] == "claude_code:permission_mode=bypassPermissions"
+        }));
     }
 
     #[tokio::test]

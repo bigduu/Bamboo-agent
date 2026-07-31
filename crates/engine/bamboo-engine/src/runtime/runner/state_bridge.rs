@@ -533,9 +533,10 @@ pub async fn refresh_turn_boundary_with_inbox(
         None => None,
     };
 
-    // A disk copy with no runtime state carries no authoritative bypass value —
-    // report `None` (unknown) so the caller leaves the live flag untouched
-    // rather than force-disabling a legitimately bypassed run. #540.
+    // A disk copy with no runtime state carries no authoritative permission
+    // mode — report `None` (unknown) so the caller leaves the live posture
+    // untouched rather than force-disabling a legitimately permissive run.
+    // #540/#770.
     let disk_permission_mode = latest
         .as_ref()
         .and_then(|latest| latest.agent_runtime_state.as_ref())

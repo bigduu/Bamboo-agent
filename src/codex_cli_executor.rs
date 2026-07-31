@@ -480,6 +480,24 @@ impl CodexPermissionConfig {
             warnings,
         }
     }
+
+    /// Resolve the executor posture for one session activation.
+    ///
+    /// Auto removes only the approval gate: it forces Codex's supported
+    /// `never` policy without widening the configured sandbox or borrowing the
+    /// legacy bypass path that can opt into danger-full-access.
+    fn effective_for_session(
+        &self,
+        bypass: bool,
+        auto_approve_permissions: bool,
+        is_root: bool,
+    ) -> EffectiveCodexPolicy {
+        let mut policy = self.effective(bypass, is_root);
+        if auto_approve_permissions {
+            policy.approval_policy = CodexApprovalPolicy::Never;
+        }
+        policy
+    }
 }
 
 fn resolve_danger_request(
@@ -1053,11 +1071,16 @@ impl CodexExecutor {
         resume_id: Option<&str>,
         run_provider_token: Option<&str>,
         parent_bypass: bool,
+        auto_approve_permissions: bool,
         events: &EventSink,
         cancel: &CancellationToken,
     ) -> (ChildOutcome, bool) {
-        let policy = self.permissions.effective(parent_bypass, running_as_root());
-        self.emit_policy_bootstrap(&policy, events);
+        let policy = self.permissions.effective_for_session(
+            parent_bypass,
+            auto_approve_permissions,
+            running_as_root(),
+        );
+        self.emit_policy_bootstrap(&policy, parent_bypass, auto_approve_permissions, events);
         // Warm workers reuse this executor across activations. Reassert the
         // isolated-home invariant at every run boundary so a prior Codex
         // process cannot leave an auth artifact or mutate provider routing for
@@ -1227,7 +1250,24 @@ impl CodexExecutor {
         (outcome, exited_without_turn)
     }
 
-    fn emit_policy_bootstrap(&self, policy: &EffectiveCodexPolicy, events: &EventSink) {
+    fn emit_policy_bootstrap(
+        &self,
+        policy: &EffectiveCodexPolicy,
+        parent_bypass: bool,
+        auto_approve_permissions: bool,
+        events: &EventSink,
+    ) {
+        let requested_mode = if auto_approve_permissions {
+            "auto"
+        } else if parent_bypass {
+            "bypass"
+        } else {
+            "default"
+        };
+        let executor_mapping = format!(
+            "codex_exec:approval_policy={}",
+            policy.approval_policy.as_str()
+        );
         events.emit(json!({
             "type": "runner_progress",
             "session_id": "codex",
@@ -1245,6 +1285,9 @@ impl CodexExecutor {
             "network_access": policy.network_access,
             "policy_invocation": policy.invocation.as_str(),
             "permission_profile": self.permissions.permission_profile.as_deref(),
+            "requested_mode": requested_mode,
+            "effective_mode": requested_mode,
+            "executor_mapping": executor_mapping,
         }));
         for warning in &policy.warnings {
             tracing::warn!(message = %warning, "Codex spawn policy warning");
@@ -1282,6 +1325,10 @@ impl ChildExecutor for CodexExecutor {
             .as_ref()
             .map(|policy| policy.bypass_permissions)
             .unwrap_or(self.permissions.provisioned_bypass);
+        let auto_approve_permissions = spec
+            .permission_policy
+            .as_ref()
+            .is_some_and(|policy| policy.auto_approve_permissions);
         if spec.messages.is_empty() {
             self.delete_session_state().await;
         }
@@ -1306,6 +1353,7 @@ impl ChildExecutor for CodexExecutor {
                 resume_id.as_deref(),
                 run_provider_token,
                 parent_bypass,
+                auto_approve_permissions,
                 &events,
                 &cancel,
             )
@@ -1329,6 +1377,7 @@ impl ChildExecutor for CodexExecutor {
                 None,
                 run_provider_token,
                 parent_bypass,
+                auto_approve_permissions,
                 &events,
                 &cancel,
             )
@@ -2264,6 +2313,29 @@ mod tests {
     }
 
     #[test]
+    fn auto_forces_never_without_widening_the_codex_sandbox() {
+        let permissions = permissions(
+            Some("read-only"),
+            Some("on-failure"),
+            false,
+            true,
+            Some("guardian"),
+            false,
+            true,
+        );
+
+        let baseline = permissions.effective(false, false);
+        assert_eq!(baseline.sandbox, CodexSandbox::ReadOnly);
+        assert_eq!(baseline.approval_policy, CodexApprovalPolicy::OnFailure);
+
+        let auto = permissions.effective_for_session(false, true, false);
+        assert_eq!(auto.sandbox, CodexSandbox::ReadOnly);
+        assert_eq!(auto.approval_policy, CodexApprovalPolicy::Never);
+        assert_eq!(auto.invocation, CodexPolicyInvocation::Explicit);
+        assert!(!auto.network_access);
+    }
+
+    #[test]
     fn command_flags_match_effective_policy_and_workspace_ownership() {
         let workspace = tempfile::tempdir().unwrap();
         let mut executor = fixture_executor();
@@ -2334,7 +2406,7 @@ mod tests {
         );
         let policy = executor.permissions.effective(true, false);
         let (sink, mut receiver) = EventSink::channel();
-        executor.emit_policy_bootstrap(&policy, &sink);
+        executor.emit_policy_bootstrap(&policy, true, false, &sink);
 
         let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| {
@@ -2342,6 +2414,9 @@ mod tests {
                 && event["sandbox"] == "danger-full-access"
                 && event["approval_policy"] == "never"
                 && event["policy_invocation"] == "danger-bypass"
+                && event["requested_mode"] == "bypass"
+                && event["effective_mode"] == "bypass"
+                && event["executor_mapping"] == "codex_exec:approval_policy=never"
         }));
         assert!(events.iter().any(|event| {
             event["phase"] == "policy_warning"

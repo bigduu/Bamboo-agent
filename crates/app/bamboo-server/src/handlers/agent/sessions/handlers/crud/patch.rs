@@ -161,6 +161,18 @@ pub async fn patch_session(
             "session_id": session_id,
         })));
     }
+    let request_precondition = parse_if_match(&http_req);
+    if req.permission_mode.is_some() && request_precondition.is_none() {
+        return Ok(HttpResponse::build(
+            actix_web::http::StatusCode::PRECONDITION_REQUIRED,
+        )
+        .json(serde_json::json!({
+            "error": crate::error::error_value(
+                "If-Match with the current session metadata_version is required for permission_mode changes"
+            ),
+            "session_id": session_id,
+        })));
+    }
     let requested_permission_mode = req.permission_mode.or_else(|| {
         req.bypass_permissions.map(|enabled| {
             if enabled {
@@ -171,7 +183,7 @@ pub async fn patch_session(
         })
     });
     // Consumed by the first authoritative setter invoked (see `.take()` below).
-    let mut precondition = parse_if_match(&http_req);
+    let mut precondition = request_precondition;
 
     // Project reassignment and explicit Workspace switching are one
     // authoritative transaction. The entire validate -> mutate -> persist ->
@@ -573,83 +585,139 @@ pub async fn patch_session(
             req.model.as_deref(),
         );
 
-        // Tracks whether the locked mutation actually changed model/reasoning,
-        // so the log below reports real diffs (not merely "a field was present
-        // in the request"). `Cell` is fine: the closure runs synchronously.
-        let model_changed = std::cell::Cell::new(false);
-        let reasoning_changed = std::cell::Cell::new(false);
-        let permission_transition = std::cell::Cell::new(None);
+        // A typed permission write is authoritative and CAS-guarded. When an
+        // earlier field in this same PATCH already consumed the caller's
+        // precondition, rebase the permission write onto the exact version that
+        // earlier write produced; a third-party edit in the gap then conflicts
+        // instead of silently reordering the user's mode choice.
+        let earlier_authoritative_field = req.project_id.is_some()
+            || req.workspace_path.is_some()
+            || req.title.is_some()
+            || req.pinned.is_some()
+            || req.gold_config.is_some();
+        let permission_expected_version =
+            if req.permission_mode.is_some() && earlier_authoritative_field {
+                state
+                    .persistence
+                    .storage()
+                    .load_session(&session_id)
+                    .await
+                    .map_err(|error| {
+                        crate::error::json_internal_server_error(format!(
+                            "Failed to load session revision: {error}"
+                        ))
+                    })?
+                    .map(|session| session.metadata_version)
+            } else if req.permission_mode.is_some() {
+                request_precondition
+            } else {
+                None
+            };
 
-        // Apply ONLY the config fields, loading the freshest session under the
-        // per-session lock. This must never rewrite `messages`: a config patch
-        // (e.g. model/reasoning-effort) can race a concurrent `POST /chat` that
-        // just appended a user message, and a full-session save from a stale
-        // snapshot would silently revert that append (lost-write bug).
-        let updated = state
+        // Apply ONLY the config fields after loading the freshest session under
+        // the per-session lock. This cannot clobber messages appended by a
+        // concurrent chat write, and the permission CAS check happens under the
+        // same lock as its durable commit.
+        let guard = state.persistence.acquire_lock(&session_id).await;
+        let Some(mut session) = state
             .persistence
-            .update_runtime_config(&session_id, |session| {
-                let prev_model = session.model.clone();
-                let prev_model_ref = session.model_ref.clone();
-                let prev_reasoning = session.reasoning_effort;
-
-                if let Some(model_ref) = request_model_ref.as_ref() {
-                    persist_model_ref(session, model_ref);
-                } else {
-                    persist_legacy_model_provider(
-                        session,
-                        req.model.as_deref(),
-                        req.provider.as_deref(),
-                    );
-                }
-                if req.clear_reasoning_effort.unwrap_or(false) {
-                    session.reasoning_effort = None;
-                } else if let Some(reasoning_effort) = req.reasoning_effort {
-                    session.reasoning_effort = Some(reasoning_effort);
-                }
-
-                // First-class per-session permission behavior. The typed mode
-                // and legacy mirror are updated together so old clients remain
-                // conservative without gaining a way to select Auto.
-                if let Some(mode) = requested_permission_mode {
-                    let runtime = session
-                        .agent_runtime_state
-                        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
-                    let previous = runtime.effective_permission_mode();
-                    runtime.set_permission_mode(mode);
-                    if previous != mode {
-                        permission_transition.set(Some((previous, mode)));
-                    }
-                }
-
-                model_changed
-                    .set(session.model != prev_model || session.model_ref != prev_model_ref);
-                reasoning_changed.set(session.reasoning_effort != prev_reasoning);
-                session.updated_at = chrono::Utc::now();
-            })
+            .storage()
+            .load_session(&session_id)
             .await
             .map_err(|error| {
-                crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
-            })?;
-
-        let Some(session) = updated else {
+                crate::error::json_internal_server_error(format!(
+                    "Failed to load session for config update: {error}"
+                ))
+            })?
+        else {
             return Ok(HttpResponse::NotFound().json(serde_json::json!({
                 "error": crate::error::error_value("Session not found"),
                 "session_id": session_id
             })));
         };
+        if let Some(expected) = permission_expected_version {
+            if session.metadata_version != expected {
+                return Ok(precondition_failed(&session_id, session.metadata_version));
+            }
+        }
+
+        let prev_model = session.model.clone();
+        let prev_model_ref = session.model_ref.clone();
+        let prev_reasoning = session.reasoning_effort;
+
+        if let Some(model_ref) = request_model_ref.as_ref() {
+            persist_model_ref(&mut session, model_ref);
+        } else {
+            persist_legacy_model_provider(
+                &mut session,
+                req.model.as_deref(),
+                req.provider.as_deref(),
+            );
+        }
+        if req.clear_reasoning_effort.unwrap_or(false) {
+            session.reasoning_effort = None;
+        } else if let Some(reasoning_effort) = req.reasoning_effort {
+            session.reasoning_effort = Some(reasoning_effort);
+        }
+
+        // First-class per-session permission behavior. The typed mode and
+        // legacy mirror are updated together so old clients remain
+        // conservative without gaining a way to select Auto.
+        let permission_transition = requested_permission_mode
+            .and_then(|mode| {
+                let runtime = session
+                    .agent_runtime_state
+                    .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+                let previous = runtime.effective_permission_mode();
+                runtime.set_permission_mode(mode);
+                (previous != mode).then_some((previous, mode))
+            })
+            .map(|(previous, effective)| (previous, effective, chrono::Utc::now().to_rfc3339()));
+        if let Some((_, effective, transitioned_at)) = permission_transition.as_ref() {
+            session.metadata.insert(
+                "permission.requested_mode".to_string(),
+                effective.as_str().to_string(),
+            );
+            session.metadata.insert(
+                "permission.effective_mode".to_string(),
+                effective.as_str().to_string(),
+            );
+            session.metadata.insert(
+                "permission.transitioned_at".to_string(),
+                transitioned_at.clone(),
+            );
+            session.metadata_version = session.metadata_version.saturating_add(1);
+        }
+
+        let model_changed = session.model != prev_model || session.model_ref != prev_model_ref;
+        let reasoning_changed = session.reasoning_effort != prev_reasoning;
+        session.updated_at = chrono::Utc::now();
+        state
+            .persistence
+            .storage()
+            .save_session(&session)
+            .await
+            .map_err(|error| {
+                crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
+            })?;
+        state.sessions.insert(
+            session_id.clone(),
+            std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+        drop(guard);
 
         // Only worth a line when something actually changed; a no-op config
         // patch (the common case for repeated/echoed UI writes) stays quiet.
-        if model_changed.get() || reasoning_changed.get() {
+        if model_changed || reasoning_changed {
             tracing::debug!(
                 "[{}] patch_session config update saved under lock: messages preserved={}, model_changed={}, reasoning_changed={}",
                 session_id,
                 session.messages.len(),
-                model_changed.get(),
-                reasoning_changed.get(),
+                model_changed,
+                reasoning_changed,
             );
         }
-        if let Some((previous, effective)) = permission_transition.get() {
+        if let Some((previous, effective, transitioned_at)) = permission_transition {
             tracing::info!(
                 telemetry_event = "session.permission_mode.transition",
                 session_id = %session_id,
@@ -658,15 +726,10 @@ pub async fn patch_session(
                     .map(bamboo_domain::SessionPermissionMode::as_str)
                     .unwrap_or("unchanged"),
                 effective_mode = effective.as_str(),
-                transitioned_at = %chrono::Utc::now().to_rfc3339(),
+                transitioned_at = %transitioned_at,
                 "session permission mode changed"
             );
         }
-
-        state.sessions.insert(
-            session_id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session)),
-        );
     }
 
     // Advertise the new ETag (metadata_version) so clients can send it back as
@@ -750,16 +813,32 @@ mod tests {
         )
         .await;
         let id = create_session!(app);
+        let initial_version = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session")
+            .metadata_version;
 
         let response = test::call_service(
             &app,
             test::TestRequest::patch()
                 .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
                 .set_json(serde_json::json!({"permission_mode": "auto"}))
                 .to_request(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        let expected_etag = format!("\"{}\"", initial_version.saturating_add(1));
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_etag.as_str())
+        );
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["session"]["permission_mode"], "auto");
         assert_eq!(body["session"]["bypass_permissions"], true);
@@ -770,6 +849,18 @@ mod tests {
             .await
             .expect("load")
             .expect("session");
+        assert_eq!(
+            persisted.metadata.get("permission.requested_mode"),
+            Some(&"auto".to_string())
+        );
+        assert_eq!(
+            persisted.metadata.get("permission.effective_mode"),
+            Some(&"auto".to_string())
+        );
+        assert!(persisted
+            .metadata
+            .get("permission.transitioned_at")
+            .is_some_and(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()));
         let runtime = persisted.agent_runtime_state.expect("runtime state");
         assert_eq!(
             runtime.effective_permission_mode(),
@@ -783,6 +874,86 @@ mod tests {
         assert_eq!(
             indexed.permission_mode,
             bamboo_domain::SessionPermissionMode::Auto
+        );
+    }
+
+    #[actix_web::test]
+    async fn typed_permission_mode_requires_cas_and_rejects_stale_reordering() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial_version = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session")
+            .metadata_version;
+        let initial_etag = format!("\"{initial_version}\"");
+
+        let missing = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({"permission_mode": "auto"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let first = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, initial_etag.as_str()))
+                .set_json(serde_json::json!({"permission_mode": "auto"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // A delayed request prepared from the same original snapshot must not
+        // overwrite the newer Auto choice merely because it arrived later.
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, initial_etag.as_str()))
+                .set_json(serde_json::json!({"permission_mode": "default"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        let next_etag = format!("\"{}\"", initial_version.saturating_add(1));
+        assert_eq!(
+            stale
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(next_etag.as_str())
+        );
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(
+            persisted.metadata_version,
+            initial_version.saturating_add(1)
+        );
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode),
+            Some(bamboo_domain::SessionPermissionMode::Auto)
         );
     }
 

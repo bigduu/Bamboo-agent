@@ -419,10 +419,9 @@ impl AgentBuilder {
     /// Configure the standard Bamboo permission policy for the default
     /// built-in tool executor.
     ///
-    /// [`PermissionMode::BypassPermissions`] is exactly equivalent to
-    /// [`bypass_permissions`](Self::bypass_permissions). Every other mode,
-    /// including zero-prompt [`PermissionMode::Auto`], installs Bamboo's
-    /// canonical `PermissionConfig` +
+    /// Every typed mode, including legacy
+    /// [`PermissionMode::BypassPermissions`] and zero-prompt
+    /// [`PermissionMode::Auto`], installs Bamboo's canonical `PermissionConfig` +
     /// `ConfigPermissionChecker` + `ModeAwarePermissionChecker` stack. Calls to
     /// this method, [`permission_checker`](Self::permission_checker), and
     /// [`bypass_permissions`](Self::bypass_permissions) are last-call-wins,
@@ -887,10 +886,6 @@ fn apply_api_key(config: &mut Config, api_key: &str) -> Result<(), SdkError> {
 }
 
 fn permission_checker_for_mode(mode: PermissionMode) -> Option<Arc<dyn PermissionChecker>> {
-    if mode == PermissionMode::BypassPermissions {
-        return None;
-    }
-
     let config = Arc::new(PermissionConfig::new());
     config.set_mode(mode);
     let base: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
@@ -1458,7 +1453,7 @@ mod tests {
             .permission_checker(custom)
             .permission_checker
             .is_some());
-        assert!(permission_checker_for_mode(PermissionMode::BypassPermissions).is_none());
+        assert!(permission_checker_for_mode(PermissionMode::BypassPermissions).is_some());
     }
 
     #[tokio::test]
@@ -1466,6 +1461,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blocked_path = tmp.path().join("plan-blocked.txt");
         let allowed_path = tmp.path().join("accept-edits.txt");
+        let bypass_path = tmp.path().join("bypass-forced.txt");
         let auto_path = tmp.path().join("auto-forced.txt");
         let config = Arc::new(RwLock::new(Config::default()));
 
@@ -1509,6 +1505,27 @@ mod tests {
             .await
             .expect("AcceptEdits should allow Write through the executor");
         assert_eq!(std::fs::read_to_string(allowed_path).unwrap(), "written");
+
+        let bypass = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+            config.clone(),
+            permission_checker_for_mode(PermissionMode::BypassPermissions).unwrap(),
+        );
+        let bypass_forced = ToolCall {
+            id: "bypass-forced".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("eval 'printf bypass > {}'", bypass_path.display())
+                })
+                .to_string(),
+            },
+        };
+        bypass
+            .execute(&bypass_forced)
+            .await
+            .expect_err("Bypass must retain forced confirmations");
+        assert!(!bypass_path.exists());
 
         let auto = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
             config,

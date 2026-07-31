@@ -1068,13 +1068,27 @@ impl ChildExecutor for BambooRuntimeExecutor {
         if let Some(project_id) = run.project_id.as_ref() {
             session.set_project_id_meta(project_id.as_str());
         }
-        let mut effective_permission_mode = if self.auto_approve_permissions {
+        let provisioned_permission_mode = if self.auto_approve_permissions {
             bamboo_domain::SessionPermissionMode::Auto
         } else if self.bypass {
             bamboo_domain::SessionPermissionMode::Bypass
         } else {
             bamboo_domain::SessionPermissionMode::Default
         };
+        let requested_permission_mode = run
+            .permission_policy
+            .as_ref()
+            .map(|context| {
+                if context.auto_approve_permissions {
+                    bamboo_domain::SessionPermissionMode::Auto
+                } else if context.bypass_permissions {
+                    bamboo_domain::SessionPermissionMode::Bypass
+                } else {
+                    bamboo_domain::SessionPermissionMode::Default
+                }
+            })
+            .unwrap_or(provisioned_permission_mode);
+        let mut effective_permission_mode = requested_permission_mode;
         let mut effective_workspace = self.workspace.clone();
         if let (Some(context), Some(config)) = (
             run.permission_policy.as_ref(),
@@ -1085,21 +1099,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
             ) {
                 Ok(policy) => {
                     config.publish_persistent_policy(context.revision, &policy);
-                    effective_permission_mode = if context.auto_approve_permissions {
-                        bamboo_domain::SessionPermissionMode::Auto
-                    } else if context.bypass_permissions {
-                        bamboo_domain::SessionPermissionMode::Bypass
-                    } else {
-                        bamboo_domain::SessionPermissionMode::Default
-                    };
                     effective_workspace = context.workspace_path.clone().or(effective_workspace);
                     session.metadata.insert(
                         "permission.policy_revision".to_string(),
                         context.revision.to_string(),
-                    );
-                    session.metadata.insert(
-                        "permission.effective_mode".to_string(),
-                        format!("{:?}", config.mode()).to_ascii_lowercase(),
                     );
                     session.metadata.insert(
                         "permission.session_grants_inherited".to_string(),
@@ -1115,6 +1118,18 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             }
         }
+        session.metadata.insert(
+            "permission.requested_mode".to_string(),
+            requested_permission_mode.as_str().to_string(),
+        );
+        session.metadata.insert(
+            "permission.effective_mode".to_string(),
+            effective_permission_mode.as_str().to_string(),
+        );
+        session.metadata.insert(
+            "permission.executor_mapping".to_string(),
+            format!("bamboo_runtime:{}", effective_permission_mode.as_str()),
+        );
         session.workspace = effective_workspace;
         if let (Some(config), Some(workspace)) =
             (self.permission_config.as_ref(), session.workspace.as_ref())

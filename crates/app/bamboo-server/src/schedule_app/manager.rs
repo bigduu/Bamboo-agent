@@ -17,6 +17,8 @@ use bamboo_engine::execution::{
 use bamboo_engine::{AuxiliaryModelConfig, ModelRoster};
 use bamboo_storage::LockedSessionStore;
 
+use crate::permission_audit::record_bamboo_runtime_permission_metadata;
+
 use super::store::{ClaimedScheduleRun, ScheduleStore};
 use super::trigger_engine::DynTriggerEngine;
 use bamboo_domain::{ScheduleRunConfig, ScheduleRunStatus};
@@ -407,14 +409,7 @@ async fn run_schedule_job(
         if let Some(workspace) = session.workspace.as_ref() {
             config.register_session_workspace(session_id.clone(), workspace.clone());
         }
-        session.metadata.insert(
-            "permission.policy_revision".to_string(),
-            config.policy_revision().to_string(),
-        );
-        session.metadata.insert(
-            "permission.effective_mode".to_string(),
-            format!("{:?}", config.mode()).to_ascii_lowercase(),
-        );
+        record_bamboo_runtime_permission_metadata(&mut session, config.as_ref());
     }
 
     // #73: a scheduled run has no interactive human approver — mark the root so

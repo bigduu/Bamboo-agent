@@ -500,11 +500,12 @@ impl ActorChildRunner {
         // Codex exec and app-server workers are not interchangeable.
         let executor = serde_json::to_string(&spec.executor).unwrap_or_default();
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}\u{1}executor={executor}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}\u{1}executor={executor}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
             caps.bypass,
+            caps.auto_approve_permissions,
             caps.enforce_permissions,
             caps.max_spawn_depth.unwrap_or(0),
             // #73 review (P1): a worker bakes `no_human_review` ONCE from this flag
@@ -3110,6 +3111,14 @@ mod tests {
             base_fp,
             ActorChildRunner::fingerprint(&bypass),
             "bypass must split"
+        );
+
+        let mut auto = spec_with("explorer", "p", "m", Some("/ws"), None);
+        auto.capabilities.auto_approve_permissions = true;
+        assert_ne!(
+            base_fp,
+            ActorChildRunner::fingerprint(&auto),
+            "auto_approve_permissions must split"
         );
 
         let mut enforce = spec_with("explorer", "p", "m", Some("/ws"), None);

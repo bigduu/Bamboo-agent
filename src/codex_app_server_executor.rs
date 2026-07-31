@@ -694,6 +694,14 @@ impl CodexAppServerExecutor {
         } else {
             "on-request"
         };
+        let requested_mode = if auto_approve_permissions {
+            "auto"
+        } else if parent_bypass {
+            "bypass"
+        } else {
+            "default"
+        };
+        let executor_mapping = format!("codex_app_server:approvalPolicy={approval_policy}");
         let (sandbox, network_access, warnings) =
             self.permissions.app_server_posture(parent_bypass);
         let run_policy = AppServerRunPolicy {
@@ -725,6 +733,9 @@ impl CodexAppServerExecutor {
             "approvals_reviewer": (!auto_approve_permissions).then_some("user"),
             "network_access": network_access,
             "permission_profile": self.permissions.permission_profile(),
+            "requested_mode": requested_mode,
+            "effective_mode": requested_mode,
+            "executor_mapping": executor_mapping,
         }));
 
         if spec.messages.is_empty() {
@@ -1625,6 +1636,9 @@ while IFS= read -r ignored; do :; done
             event["executor"] == "codex_app_server"
                 && event["approval_policy"] == "never"
                 && event["approvals_reviewer"].is_null()
+                && event["requested_mode"] == "auto"
+                && event["effective_mode"] == "auto"
+                && event["executor_mapping"] == "codex_app_server:approvalPolicy=never"
         }));
     }
 
