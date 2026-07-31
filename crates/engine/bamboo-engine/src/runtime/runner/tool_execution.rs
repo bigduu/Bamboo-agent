@@ -9,7 +9,6 @@ use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
-use bamboo_config::PermissionMode;
 use bamboo_domain::{AgentHookPoint, AgentRuntimeState};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
@@ -46,15 +45,6 @@ fn build_task_compression_hint(
     let hint = output_compressor::TaskCompressionHint::from_phrases(phrases);
     (!hint.is_empty()).then_some(hint)
 }
-
-/// Tools exempt from plan-mode blocking (UI pause/clarification tools).
-const PLAN_MODE_EXEMPT_TOOLS: &[&str] = &[
-    "EnterPlanMode",
-    "ExitPlanMode",
-    "request_permissions",
-    "conclusion_with_options",
-    "compact_context",
-];
 
 mod clarification;
 mod events;
@@ -128,13 +118,15 @@ async fn execute_and_apply_single_tool_call(
     policy_guard: &mut policy::ToolPolicyGuard,
     reserved_calls: usize,
 ) -> Result<SingleToolExecutionControl, AgentError> {
+    let session_flags =
+        bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            config.permission_mode.unwrap_or_default(),
+        );
     // Plan mode gate: block mutating tools (except pause/clarification tools)
-    if config.permission_mode == Some(PermissionMode::Plan) {
+    if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
-        if bamboo_tools::orchestrator::classify_tool(tool_name)
-            == bamboo_tools::orchestrator::ToolMutability::Mutating
-            && !PLAN_MODE_EXEMPT_TOOLS.contains(&tool_name)
-        {
+        if !bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name) {
             tracing::warn!(
                 "[{}][round:{}] Plan mode blocked mutating tool: tool_call_id={}, tool_name={}",
                 session_id,
@@ -173,6 +165,7 @@ async fn execute_and_apply_single_tool_call(
                     round,
                     session,
                     tools,
+                    session_flags,
                     config,
                     runtime_state,
                     task_context,
@@ -207,8 +200,6 @@ async fn execute_and_apply_single_tool_call(
                     tool_duration: std::time::Duration::ZERO,
                 }
             } else {
-                let session_flags =
-                    bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session);
                 let before_tool_hooks = config
                     .hook_runner
                     .has_hooks_for(AgentHookPoint::BeforeToolExecution);
@@ -277,6 +268,7 @@ async fn execute_and_apply_single_tool_call(
             round,
             session,
             tools,
+            session_flags,
             config,
             runtime_state,
             task_context,
@@ -591,8 +583,10 @@ pub(crate) async fn execute_round_tool_calls(
             // Derive once before the parallel borrow; the Copy flags struct is
             // captured by each concurrent task (we can't borrow `&mut session`
             // inside them).
-            let session_flags =
-                bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(session);
+            let session_flags = bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session_and_configured_mode(
+                session,
+                config.permission_mode.unwrap_or_default(),
+            );
             let outcomes = tokio::time::timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
@@ -727,6 +721,7 @@ pub(crate) async fn execute_round_tool_calls(
                         round,
                         session,
                         tools,
+                        session_flags,
                         config,
                         runtime_state,
                         task_context,
@@ -801,6 +796,7 @@ pub(crate) async fn execute_round_tool_calls(
 mod tests {
     use super::{scheduling_mode_for_tool_call, ToolSchedulingMode};
     use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutor};
+    use bamboo_agent_core::AgentEvent;
     use bamboo_domain::AgentRuntimeState;
     use bamboo_tools::BuiltinToolExecutor;
     use serde_json::json;
@@ -985,27 +981,33 @@ mod tests {
 
     #[test]
     fn plan_mode_exempt_tools_are_correct() {
-        use super::PLAN_MODE_EXEMPT_TOOLS;
-
-        // These tools must NOT be blocked by plan mode
-        assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"EnterPlanMode"));
-        assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"ExitPlanMode"));
-        assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"request_permissions"));
-        assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"conclusion_with_options"));
-        assert!(PLAN_MODE_EXEMPT_TOOLS.contains(&"compact_context"));
+        for name in [
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "request_permissions",
+            "conclusion_with_options",
+            "compact_context",
+        ] {
+            assert!(
+                bamboo_tools::orchestrator::plan_mode_allows_tool(name),
+                "{name} should be admitted by the shared Plan gate"
+            );
+        }
     }
 
     #[test]
     fn plan_mode_blocks_mutating_tools_via_classify() {
-        use super::PLAN_MODE_EXEMPT_TOOLS;
-
-        let mutating_tools = ["Write", "Edit", "Bash", "NotebookEdit", "KillShell"];
-        for name in &mutating_tools {
-            let is_mutating = bamboo_tools::orchestrator::classify_tool(name)
-                == bamboo_tools::orchestrator::ToolMutability::Mutating;
-            let is_exempt = PLAN_MODE_EXEMPT_TOOLS.contains(name);
+        let mutating_tools = [
+            "Write",
+            "Edit",
+            "Bash",
+            "NotebookEdit",
+            "KillShell",
+            "totally_unknown_tool",
+        ];
+        for name in mutating_tools {
             assert!(
-                is_mutating && !is_exempt,
+                !bamboo_tools::orchestrator::plan_mode_allows_tool(name),
                 "{name} should be blocked in plan mode"
             );
         }
@@ -1025,11 +1027,9 @@ mod tests {
             "session_history",
             "Sleep",
         ];
-        for name in &read_only_tools {
-            let is_readonly = bamboo_tools::orchestrator::classify_tool(name)
-                == bamboo_tools::orchestrator::ToolMutability::ReadOnly;
+        for name in read_only_tools {
             assert!(
-                is_readonly,
+                bamboo_tools::orchestrator::plan_mode_allows_tool(name),
                 "{name} should be read-only (allowed in plan mode)"
             );
         }
@@ -1151,6 +1151,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn auto_request_permissions_returns_error_without_pending_clarification() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use bamboo_config::PermissionMode;
+        use tokio::sync::mpsc;
+
+        let (event_tx, mut event_rx) = mpsc::channel(100);
+        let mut session = Session::new("auto-no-prompt", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Auto),
+            ..Default::default()
+        };
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("auto-no-prompt");
+        runtime_state.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+        let tool_call = tool_call_with_args("request_permissions", json!({}));
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "auto-no-prompt",
+            "auto-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            tools.list_tools().as_slice(),
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(!control.should_break);
+        assert!(!control.stop_round);
+        assert!(!session.has_pending_question());
+        assert!(session.messages.last().is_some_and(|message| message
+            .content
+            .contains("cannot request expanded permissions")));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::NeedClarification { .. })));
     }
 
     #[tokio::test]

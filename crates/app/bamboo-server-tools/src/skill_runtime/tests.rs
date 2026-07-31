@@ -1,4 +1,6 @@
-use super::{LoadSkillTool, ReadSkillResourceTool, SkillToolAccess};
+use super::{
+    load_skill::plan_allows_dynamic_provider, LoadSkillTool, ReadSkillResourceTool, SkillToolAccess,
+};
 use bamboo_skills::access_control::{parse_loaded_skill_ids, serialize_loaded_skill_ids};
 use bamboo_skills::runtime_metadata::{
     LAST_LOADED_SKILL_SUMMARY_METADATA_KEY, LAST_RESOURCE_READ_SUMMARY_METADATA_KEY,
@@ -299,6 +301,8 @@ async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_aliv
         mode: DynamicProviderMode::Complete("MUST_NOT_EXECUTE".to_string()),
         calls: AtomicUsize::new(0),
         saw_bypass: AtomicBool::new(false),
+        saw_auto: AtomicBool::new(false),
+        saw_plan: AtomicBool::new(false),
     });
     let config = Arc::new(RwLock::new(Config::default()));
     let tools = Arc::new(
@@ -498,6 +502,8 @@ Use the dynamic context."#,
         ),
         calls: AtomicUsize::new(0),
         saw_bypass: AtomicBool::new(false),
+        saw_auto: AtomicBool::new(false),
+        saw_plan: AtomicBool::new(false),
     });
     let tool = LoadSkillTool::new(
         manager.clone(),
@@ -513,6 +519,7 @@ Use the dynamic context."#,
         available_tool_schemas: None,
         bypass_permissions: true,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -588,6 +595,7 @@ Use the dynamic context."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -657,6 +665,7 @@ Use the dynamic context."#,
         // must still dispatch with bypass disabled through the #601 checker.
         bypass_permissions: true,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -685,7 +694,8 @@ Use the dynamic context."#,
 }
 
 #[tokio::test]
-async fn dynamic_context_needs_human_degrades_without_activation() {
+async fn dynamic_context_auto_and_plan_flags_survive_read_dispatch_while_invalid_write_fails_closed(
+) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let skill_dir = temp_dir.path().join("skills/dynamic-approval");
     std::fs::create_dir_all(&skill_dir).expect("skill dir");
@@ -704,6 +714,23 @@ metadata:
 Never activate after an approval pause."#,
     )
     .expect("skill file");
+    let mutating_skill_dir = temp_dir.path().join("skills/dynamic-mutation");
+    std::fs::create_dir_all(&mutating_skill_dir).expect("mutating skill dir");
+    std::fs::write(
+        mutating_skill_dir.join("SKILL.md"),
+        r#"---
+name: dynamic-mutation
+description: Dynamic mutating provider
+metadata:
+  dynamic_context:
+    - id: write
+      tool: Write
+      input: {file_path: blocked.txt, content: must-not-run}
+      stop_on_failure: true
+---
+Plan must block this provider before dispatch."#,
+    )
+    .expect("mutating skill file");
     let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
         skills_dir: temp_dir.path().join("skills"),
         project_dir: None,
@@ -716,7 +743,7 @@ Never activate after an approval pause."#,
     std::fs::write(temp_dir.path().join("README.md"), "workspace readme").expect("readme");
     session.metadata.insert(
         SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
-        r#"["dynamic-approval"]"#.to_string(),
+        r#"["dynamic-approval","dynamic-mutation"]"#.to_string(),
     );
     let sessions = test_session_cache(session_id, &session);
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
@@ -727,6 +754,8 @@ Never activate after an approval pause."#,
         mode: DynamicProviderMode::NeedsHuman,
         calls: AtomicUsize::new(0),
         saw_bypass: AtomicBool::new(false),
+        saw_auto: AtomicBool::new(false),
+        saw_plan: AtomicBool::new(false),
     });
     let tool = LoadSkillTool::new(manager, Arc::new(RwLock::new(Config::default())), repo)
         .with_test_context_tools(provider.clone());
@@ -737,7 +766,8 @@ Never activate after an approval pause."#,
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
         bypass_permissions: true,
-        auto_approve_permissions: false,
+        auto_approve_permissions: true,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -756,6 +786,8 @@ Never activate after an approval pause."#,
     assert_eq!(payload["activation_status"], "degraded");
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert!(!provider.saw_bypass.load(Ordering::SeqCst));
+    assert!(provider.saw_auto.load(Ordering::SeqCst));
+    assert!(!provider.saw_plan.load(Ordering::SeqCst));
     assert!(event_rx.try_recv().is_err());
     let saved = storage
         .load_session(session_id)
@@ -765,6 +797,87 @@ Never activate after an approval pause."#,
     assert!(!saved
         .metadata
         .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+
+    let plan_read_context = ToolExecutionContext {
+        session_id: Some(session_id),
+        tool_call_id: "dynamic-plan-read-load",
+        event_tx: Some(&event_tx),
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        auto_approve_permissions: true,
+        plan_read_only: true,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+    let ToolOutcome::Completed(plan_read_result) = tool
+        .invoke(
+            serde_json::json!({"skill_id":"dynamic-approval"}),
+            plan_read_context.to_tool_ctx(),
+        )
+        .await
+        .expect("Plan+Auto read provider degrades without pausing")
+    else {
+        panic!("Plan+Auto read provider must not return a pause")
+    };
+    let plan_read_payload: serde_json::Value =
+        serde_json::from_str(&plan_read_result.result).expect("Plan+Auto read payload");
+    assert_eq!(plan_read_payload["activation_status"], "degraded");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert!(!provider.saw_bypass.load(Ordering::SeqCst));
+    assert!(provider.saw_auto.load(Ordering::SeqCst));
+    assert!(provider.saw_plan.load(Ordering::SeqCst));
+    assert!(event_rx.try_recv().is_err());
+
+    let invalid_write_context = ToolExecutionContext {
+        session_id: Some(session_id),
+        tool_call_id: "dynamic-invalid-write-load",
+        event_tx: Some(&event_tx),
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        auto_approve_permissions: true,
+        plan_read_only: true,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    };
+    let ToolOutcome::Completed(invalid_write_result) = tool
+        .invoke(
+            serde_json::json!({"skill_id":"dynamic-mutation"}),
+            invalid_write_context.to_tool_ctx(),
+        )
+        .await
+        .expect("invalid mutating provider metadata degrades without dispatch")
+    else {
+        panic!("invalid mutating provider metadata must not return a pause")
+    };
+    let invalid_write_payload: serde_json::Value =
+        serde_json::from_str(&invalid_write_result.result)
+            .expect("invalid mutating provider payload");
+    assert_eq!(invalid_write_payload["activation_status"], "degraded");
+    assert_eq!(
+        invalid_write_payload["dynamic_context"][0]["provenance"],
+        "invalid_workflow_metadata"
+    );
+    assert!(
+        invalid_write_payload["dynamic_context"][0]["diagnostic"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid")),
+        "unexpected invalid metadata diagnostic: {invalid_write_payload:#}"
+    );
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "invalid mutating provider metadata must fail closed before dispatch"
+    );
+}
+
+#[test]
+fn dynamic_context_plan_helper_fail_closes_mutating_and_unknown_tools() {
+    assert!(plan_allows_dynamic_provider(true, "Read"));
+    assert!(!plan_allows_dynamic_provider(true, "Write"));
+    assert!(!plan_allows_dynamic_provider(true, "unregistered_tool"));
+    assert!(plan_allows_dynamic_provider(false, "Write"));
 }
 
 /// Build a per-session-locked session cache pre-populated with one session.
@@ -786,6 +899,8 @@ struct DynamicProviderExecutor {
     mode: DynamicProviderMode,
     calls: AtomicUsize,
     saw_bypass: AtomicBool,
+    saw_auto: AtomicBool,
+    saw_plan: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -802,6 +917,9 @@ impl ToolExecutor for DynamicProviderExecutor {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.saw_bypass
             .store(ctx.bypass_permissions, Ordering::SeqCst);
+        self.saw_auto
+            .store(ctx.auto_approve_permissions, Ordering::SeqCst);
+        self.saw_plan.store(ctx.plan_read_only, Ordering::SeqCst);
         Ok(match &self.mode {
             DynamicProviderMode::Complete(output) => {
                 ToolOutcome::Completed(ToolResult::text(true, output.clone()))
@@ -821,14 +939,17 @@ impl ToolExecutor for DynamicProviderExecutor {
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
-        vec![ToolSchema {
-            schema_type: "function".to_string(),
-            function: FunctionSchema {
-                name: "Read".to_string(),
-                description: "read-only dynamic provider".to_string(),
-                parameters: serde_json::json!({"type":"object"}),
-            },
-        }]
+        ["Read", "Write"]
+            .into_iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: name.to_string(),
+                    description: "dynamic context provider".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            })
+            .collect()
     }
 }
 
@@ -911,6 +1032,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -969,6 +1091,7 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
         available_tool_schemas: None,
         bypass_permissions: false,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -1079,6 +1202,7 @@ async fn runtime_generation_marker_prevents_stale_metadata_from_repinning_live_c
         available_tool_schemas: None,
         bypass_permissions: false,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -1196,6 +1320,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -1276,6 +1401,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -1287,6 +1413,7 @@ Use this demo skill."#,
         available_tool_schemas: None,
         bypass_permissions: false,
         auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -1543,6 +1670,7 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,

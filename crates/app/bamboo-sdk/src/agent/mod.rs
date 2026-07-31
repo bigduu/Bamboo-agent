@@ -476,6 +476,7 @@ impl Agent {
                 available_tool_schemas: None,
                 bypass_permissions: false,
                 auto_approve_permissions: false,
+                plan_read_only: false,
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,

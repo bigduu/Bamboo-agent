@@ -156,7 +156,12 @@ pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
         if let Some(workspace) = args.session.workspace.as_deref() {
             config.register_session_workspace(args.session_id.clone(), workspace.to_string());
         }
-        record_bamboo_runtime_permission_metadata(&mut args.session, config.as_ref());
+        if let Err(error) =
+            record_bamboo_runtime_permission_metadata(&mut args.session, config.as_ref())
+        {
+            tracing::error!(%error, session_id = %args.session_id, "agent permission audit failed closed");
+            return;
+        }
     }
     let tools_override = Some(tools_for_execution(
         args.state.as_ref(),

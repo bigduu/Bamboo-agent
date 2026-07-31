@@ -88,12 +88,52 @@ pub async fn create_child_action(
         .as_ref()
         .map(|state| state.effective_permission_mode())
         .unwrap_or_default();
-    if inherited_permission_mode != bamboo_domain::SessionPermissionMode::Default {
-        child
-            .agent_runtime_state
-            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-            .set_permission_mode(inherited_permission_mode);
-    }
+    child
+        .agent_runtime_state
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+        .set_permission_mode(inherited_permission_mode);
+    let parent_audit =
+        bamboo_domain::PermissionAuditSnapshot::from_metadata(&input.parent_session.metadata);
+    let parent_plan_active = input
+        .parent_session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.plan_mode.is_some());
+    let effective = if parent_plan_active {
+        bamboo_domain::PermissionMode::Plan
+    } else {
+        parent_audit
+            .as_ref()
+            .filter(|audit| {
+                audit.resolution.requested == inherited_permission_mode
+                    && audit.resolution.is_consistent()
+            })
+            .map(|audit| audit.resolution.effective)
+            .unwrap_or_else(|| {
+                bamboo_domain::resolve_permission_mode(
+                    inherited_permission_mode,
+                    bamboo_domain::PermissionMode::Default,
+                )
+                .effective
+            })
+    };
+    let resolution = bamboo_domain::PermissionModeResolution {
+        requested: inherited_permission_mode,
+        effective,
+    };
+    bamboo_domain::record_permission_audit(
+        &mut child.metadata,
+        &bamboo_domain::PermissionAuditSeed::new(
+            parent_audit
+                .as_ref()
+                .map(|audit| audit.policy_revision)
+                .unwrap_or_default(),
+            resolution,
+            format!("child_activation:{}", resolution.effective.as_str()),
+        ),
+        Some(&Utc::now().to_rfc3339()),
+    )
+    .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
 
     // #73: children inherit "no interactive human approver" too — if the run has
     // no human to answer approvals (headless / scheduled / deployed), neither do

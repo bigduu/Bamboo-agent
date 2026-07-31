@@ -132,6 +132,12 @@ pub struct Capabilities {
     /// because legacy bypass still routes forced confirmations to an approver.
     #[serde(default)]
     pub auto_approve_permissions: bool,
+    /// Exact requested/effective permission posture provisioned for audit and
+    /// rolling warm-worker activation. Empty values denote a legacy spec.
+    #[serde(default)]
+    pub permission_requested_mode: String,
+    #[serde(default)]
+    pub permission_effective_mode: String,
     /// Whether this run has NO interactive human approver (headless `-p`,
     /// scheduled jobs, deployed broker-agents — propagated from the unattended
     /// root). #73: when true, the worker's per-run `ApprovalProxy` decides a
@@ -155,6 +161,76 @@ pub struct Capabilities {
     /// marker. Mirrors `no_human_approver` above.
     #[serde(default)]
     pub guardian_read_only: bool,
+}
+
+impl Capabilities {
+    /// Decode the exact provision-time permission posture. Typed fields are
+    /// authoritative for new specs; legacy booleans remain readable during a
+    /// rolling upgrade, with Auto normalized independently from Bypass.
+    pub fn permission_resolution(
+        &self,
+    ) -> std::result::Result<bamboo_domain::PermissionModeResolution, String> {
+        if self.auto_approve_permissions && self.bypass {
+            return Err(
+                "provisioned auto_approve_permissions and bypass are mutually exclusive"
+                    .to_string(),
+            );
+        }
+        let has_requested_mode = !self.permission_requested_mode.is_empty();
+        let has_effective_mode = !self.permission_effective_mode.is_empty();
+        if has_requested_mode != has_effective_mode {
+            return Err(
+                "provisioned requested/effective permission modes must be provided together"
+                    .to_string(),
+            );
+        }
+        let requested = if self.permission_requested_mode.is_empty() {
+            if self.auto_approve_permissions {
+                bamboo_domain::SessionPermissionMode::Auto
+            } else if self.bypass {
+                bamboo_domain::SessionPermissionMode::Bypass
+            } else {
+                bamboo_domain::SessionPermissionMode::Default
+            }
+        } else {
+            bamboo_domain::SessionPermissionMode::from_audit_str(&self.permission_requested_mode)
+                .ok_or_else(|| {
+                    format!(
+                        "invalid provisioned requested permission mode '{}'",
+                        self.permission_requested_mode
+                    )
+                })?
+        };
+        let effective = if self.permission_effective_mode.is_empty() {
+            bamboo_domain::resolve_permission_mode(
+                requested,
+                bamboo_domain::PermissionMode::Default,
+            )
+            .effective
+        } else {
+            bamboo_domain::PermissionMode::from_audit_str(&self.permission_effective_mode)
+                .ok_or_else(|| {
+                    format!(
+                        "invalid provisioned effective permission mode '{}'",
+                        self.permission_effective_mode
+                    )
+                })?
+        };
+        let resolution = bamboo_domain::PermissionModeResolution {
+            requested,
+            effective,
+        };
+        if !resolution.is_consistent() {
+            return Err("inconsistent provisioned permission posture".to_string());
+        }
+        if has_requested_mode
+            && (self.bypass != resolution.bypass_permissions()
+                || self.auto_approve_permissions != resolution.suppress_approval_prompts())
+        {
+            return Err("provisioned permission flags disagree with typed posture".to_string());
+        }
+        Ok(resolution)
+    }
 }
 
 /// The mailbox bus an actor dials home to (the unified transport).
@@ -389,6 +465,9 @@ impl ProvisionSpec {
                     .to_string(),
             ));
         }
+        self.capabilities
+            .permission_resolution()
+            .map_err(StoreError::Invalid)?;
         Ok(())
     }
 
@@ -571,6 +650,8 @@ mod tests {
             max_spawn_depth: None,
             bypass: false,
             auto_approve_permissions: false,
+            permission_requested_mode: String::new(),
+            permission_effective_mode: String::new(),
             no_human_approver: false,
             guardian_read_only: false,
         };
@@ -590,6 +671,45 @@ mod tests {
         });
         let parsed = ProvisionSpec::from_json(&minimal.to_string()).unwrap();
         assert_eq!(parsed.capabilities, Capabilities::default());
+    }
+
+    #[test]
+    fn capabilities_reject_partial_typed_permission_mode_pairs() {
+        let mut requested_only = Capabilities {
+            permission_requested_mode: "auto".to_string(),
+            auto_approve_permissions: true,
+            ..Capabilities::default()
+        };
+        assert!(requested_only
+            .permission_resolution()
+            .unwrap_err()
+            .contains("provided together"));
+        let mut invalid_spec = spec();
+        invalid_spec.capabilities = requested_only.clone();
+        assert!(matches!(
+            invalid_spec.validate(),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(invalid_spec.to_json().is_err());
+
+        requested_only.permission_requested_mode.clear();
+        requested_only.permission_effective_mode = "auto".to_string();
+        assert!(requested_only
+            .permission_resolution()
+            .unwrap_err()
+            .contains("provided together"));
+
+        let legacy_auto = Capabilities {
+            auto_approve_permissions: true,
+            ..Capabilities::default()
+        };
+        assert_eq!(
+            legacy_auto.permission_resolution().unwrap(),
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Auto,
+                bamboo_domain::PermissionMode::Default,
+            )
+        );
     }
 
     #[test]

@@ -365,6 +365,19 @@ impl ToolExecutor for BuiltinToolExecutor {
         call: &ToolCall,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
+        let raw_tool_name = normalize_tool_name(&call.function.name);
+        let tool_name = resolve_registered_tool_name(&self.registry, raw_tool_name);
+        if ctx.auto_approve_permissions && tool_name.eq_ignore_ascii_case("request_permissions") {
+            return Err(ToolError::Execution(
+                "Auto mode cannot request expanded permissions; operate within existing hard boundaries"
+                    .to_string(),
+            ));
+        }
+        if ctx.plan_read_only && !crate::orchestrator::plan_mode_allows_tool(&tool_name) {
+            return Err(ToolError::Execution(format!(
+                "Plan mode: {tool_name} operation blocked"
+            )));
+        }
         let Some(permission_checker) = &self.permission_checker else {
             return Ok(None);
         };
@@ -379,11 +392,9 @@ impl ToolExecutor for BuiltinToolExecutor {
         } else {
             parse_tool_args_best_effort(&call.function.arguments).0
         };
-        let raw_tool_name = normalize_tool_name(&call.function.name);
         if let Some(args_obj) = args.as_object_mut() {
             normalize_legacy_builtin_args(raw_tool_name, args_obj);
         }
-        let tool_name = resolve_registered_tool_name(&self.registry, raw_tool_name);
 
         if let Some(contexts) =
             check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
@@ -1238,6 +1249,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1281,6 +1293,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1330,6 +1343,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1377,6 +1391,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1426,6 +1441,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1459,6 +1475,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1503,6 +1520,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: true,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1546,6 +1564,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: true,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1584,6 +1603,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1619,6 +1639,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: true,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1629,6 +1650,81 @@ mod tests {
             matches!(result, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
             "explicit delete deny must beat bypass: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_auto_denies_mutation_but_allows_read_without_a_checker() {
+        let executor = BuiltinToolExecutor::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan-auto.txt");
+        let write = make_tool_call(
+            "Write",
+            json!({"file_path": path, "content": "must not run"}),
+        );
+        let write_ctx = ToolExecutionContext {
+            session_id: Some("plan-auto"),
+            tool_call_id: &write.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            plan_read_only: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let denied = executor.execute_with_context(&write, write_ctx).await;
+        assert!(matches!(
+            denied,
+            Err(ToolError::Execution(ref message)) if message.contains("Plan mode")
+        ));
+        assert!(tokio::fs::metadata(&path).await.is_err());
+
+        tokio::fs::write(&path, "readable").await.unwrap();
+        let read = make_tool_call("Read", json!({"file_path": path}));
+        let read_ctx = ToolExecutionContext {
+            session_id: Some("plan-auto"),
+            tool_call_id: &read.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            plan_read_only: true,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let allowed = executor
+            .execute_with_context(&read, read_ctx)
+            .await
+            .unwrap();
+        assert!(allowed.success);
+    }
+
+    #[tokio::test]
+    async fn auto_request_permissions_fails_without_creating_a_pause() {
+        let executor = BuiltinToolExecutor::new();
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let call = make_tool_call("request_permissions", json!({}));
+        let ctx = ToolExecutionContext {
+            session_id: Some("auto-no-prompt"),
+            tool_call_id: &call.id,
+            event_tx: Some(&event_tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let result = executor.execute_with_context_outcome(&call, ctx).await;
+        assert!(matches!(
+            result,
+            Err(ToolError::Execution(ref message)) if message.contains("cannot request expanded permissions")
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1658,6 +1754,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1742,6 +1839,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1781,6 +1879,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1854,6 +1953,7 @@ mod tests {
                     available_tool_schemas: None,
                     bypass_permissions: false,
                     auto_approve_permissions: false,
+                    plan_read_only: false,
                     can_async_resume: false,
                     bash_completion_sink: None,
                     pre_parsed_args: None,
@@ -1972,6 +2072,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: pre_parsed,

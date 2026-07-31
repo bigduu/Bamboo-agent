@@ -10,7 +10,7 @@ use bamboo_engine::session_app::provider_model::{
 use super::super::super::types::PatchSessionRequest;
 use super::query::get_session;
 use super::running::is_session_running;
-use crate::permission_audit::record_bamboo_runtime_permission_metadata;
+use crate::permission_audit::record_bamboo_runtime_permission_transition_metadata;
 
 #[cfg(test)]
 mod patch_test_hooks {
@@ -710,28 +710,32 @@ pub async fn patch_session(
             .map(|(previous, effective)| (previous, effective, chrono::Utc::now().to_rfc3339()));
         if let Some((_, effective, transitioned_at)) = permission_transition.as_ref() {
             if let Some(config) = state.permission_checker.permission_config() {
-                record_bamboo_runtime_permission_metadata(&mut session, config.as_ref());
+                record_bamboo_runtime_permission_transition_metadata(
+                    &mut session,
+                    config.as_ref(),
+                    transitioned_at,
+                )
+                .map_err(|error| {
+                    crate::error::json_internal_server_error(format!(
+                        "Failed to record permission transition: {error}"
+                    ))
+                })?;
             } else {
-                session
-                    .metadata
-                    .insert("permission.policy_revision".to_string(), "0".to_string());
-                session.metadata.insert(
-                    "permission.requested_mode".to_string(),
-                    effective.as_str().to_string(),
+                let resolution = bamboo_domain::resolve_permission_mode(
+                    *effective,
+                    bamboo_domain::PermissionMode::Default,
                 );
-                session.metadata.insert(
-                    "permission.effective_mode".to_string(),
-                    effective.as_str().to_string(),
-                );
-                session.metadata.insert(
-                    "permission.executor_mapping".to_string(),
-                    format!("bamboo_runtime:{}", effective.as_str()),
-                );
+                bamboo_domain::record_permission_audit(
+                    &mut session.metadata,
+                    &bamboo_domain::PermissionAuditSeed::bamboo_runtime(0, resolution),
+                    Some(transitioned_at),
+                )
+                .map_err(|error| {
+                    crate::error::json_internal_server_error(format!(
+                        "Failed to record permission transition: {error}"
+                    ))
+                })?;
             }
-            session.metadata.insert(
-                "permission.transitioned_at".to_string(),
-                transitioned_at.clone(),
-            );
             session.metadata_version = session.metadata_version.saturating_add(1);
         }
 
@@ -1089,6 +1093,160 @@ mod tests {
         assert_eq!(
             persisted.metadata.get("permission.requested_mode"),
             Some(&"bypass".to_string())
+        );
+    }
+
+    #[actix_web::test]
+    async fn no_op_earlier_field_does_not_blindly_advance_permission_cas_token() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial = state.storage.load_session(&id).await.unwrap().unwrap();
+        let initial_version = initial.metadata_version;
+        let initial_audit =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&initial.metadata);
+        let hook = super::patch_test_hooks::install(&id);
+
+        let no_op_then_auto = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
+                .set_json(serde_json::json!({
+                    "title": initial.title,
+                    "permission_mode": "auto"
+                }))
+                .to_request(),
+        );
+        let interleaving = async {
+            hook.reached.notified().await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
+                    .set_json(serde_json::json!({"pinned": true}))
+                    .to_request(),
+            )
+            .await;
+            hook.resume.notify_one();
+            response
+        };
+        let (stale_auto, third_party) = futures::join!(no_op_then_auto, interleaving);
+
+        assert_eq!(third_party.status(), StatusCode::OK);
+        assert_eq!(stale_auto.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            stale_auto.headers().get(header::ETAG).unwrap(),
+            format!("\"{}\"", initial_version + 1).as_str()
+        );
+        let persisted = state.storage.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(persisted.metadata_version, initial_version + 1);
+        assert!(persisted.pinned);
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode)
+                .unwrap_or_default(),
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert_eq!(
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&persisted.metadata),
+            initial_audit
+        );
+    }
+
+    #[actix_web::test]
+    async fn workspace_then_interleaving_write_makes_mixed_auto_patch_stale() {
+        let state = new_state().await;
+        let first = tempdir().expect("first workspace");
+        let second = tempdir().expect("second workspace");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Mixed CAS Project",
+                None,
+                first.path().to_string_lossy(),
+                vec![binding(second.path())],
+            )
+            .expect("Project");
+        let session_id = "workspace-mixed-permission-cas";
+        seed_session(&state, session_id, Some(&project.id), Some(first.path())).await;
+        let initial = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let initial_audit =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&initial.metadata);
+        let hook = super::patch_test_hooks::install(session_id);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let workspace_then_auto = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "workspace_path": second.path(),
+                    "permission_mode": "auto"
+                }))
+                .to_request(),
+        );
+        let interleaving = async {
+            hook.reached.notified().await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{session_id}"))
+                    .insert_header((header::IF_MATCH, "\"1\""))
+                    .set_json(serde_json::json!({"pinned": true}))
+                    .to_request(),
+            )
+            .await;
+            hook.resume.notify_one();
+            response
+        };
+        let (stale_auto, third_party) = futures::join!(workspace_then_auto, interleaving);
+
+        assert_eq!(third_party.status(), StatusCode::OK);
+        assert_eq!(stale_auto.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale_auto.headers().get(header::ETAG).unwrap(), "\"2\"");
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, 2);
+        assert!(persisted.pinned);
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(display(second.path()).as_str())
+        );
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode)
+                .unwrap_or_default(),
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert_eq!(
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&persisted.metadata),
+            initial_audit
         );
     }
 

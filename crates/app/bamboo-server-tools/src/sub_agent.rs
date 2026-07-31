@@ -750,18 +750,49 @@ impl Tool for SubAgentTool {
                         // flag when reused under another (e.g. parent flipped from
                         // headless to interactive, or toggled bypass). Mirror BOTH
                         // flags so the reused resident matches the current parent.
-                        let (parent_permission_mode, parent_no_human) = parent
+                        let (parent_permission_mode, parent_no_human, parent_plan_active) = parent
                             .agent_runtime_state
                             .as_ref()
                             .map(|s| {
-                                (s.effective_permission_mode(), s.no_human_approver)
+                                (
+                                    s.effective_permission_mode(),
+                                    s.no_human_approver,
+                                    s.plan_mode.is_some(),
+                                )
                             })
                             .unwrap_or_default();
-                        let rs = child
-                            .agent_runtime_state
-                            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
-                        rs.set_permission_mode(parent_permission_mode);
-                        rs.no_human_approver = parent_no_human;
+                        let inherited_audit =
+                            bamboo_domain::PermissionAuditSnapshot::from_metadata(&parent.metadata);
+                        let policy_revision = inherited_audit
+                            .as_ref()
+                            .map(|audit| audit.policy_revision)
+                            .unwrap_or_default();
+                        let inherited_effective = if parent_plan_active {
+                            bamboo_domain::PermissionMode::Plan
+                        } else {
+                            inherited_audit
+                                .as_ref()
+                                .filter(|audit| {
+                                    audit.resolution.requested == parent_permission_mode
+                                        && audit.resolution.is_consistent()
+                                })
+                                .map(|audit| audit.resolution.effective)
+                                .unwrap_or_else(|| {
+                                    bamboo_domain::resolve_permission_mode(
+                                        parent_permission_mode,
+                                        bamboo_domain::PermissionMode::Default,
+                                    )
+                                    .effective
+                                })
+                        };
+                        let resolution = bamboo_domain::PermissionModeResolution {
+                            requested: parent_permission_mode,
+                            effective: inherited_effective,
+                        };
+                        let permission_audit = bamboo_domain::PermissionAuditSeed::bamboo_runtime(
+                            policy_revision,
+                            resolution,
+                        );
                         // Commit posture + the newly requested, already
                         // authorized workspace before publishing runtime state
                         // or enqueueing the next resident task.
@@ -770,6 +801,8 @@ impl Tool for SubAgentTool {
                                 &mut child,
                                 &workspace,
                                 workspace_source,
+                                permission_audit,
+                                parent_no_human,
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;

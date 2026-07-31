@@ -413,6 +413,7 @@ impl AgentBuilder {
     /// clarification — resolve it with [`Agent::answer`](super::Agent::answer).
     pub fn permission_checker(mut self, checker: Arc<dyn PermissionChecker>) -> Self {
         self.permission_checker = Some(checker);
+        self.inner = self.inner.permission_mode(PermissionMode::Default);
         self
     }
 
@@ -429,6 +430,7 @@ impl AgentBuilder {
     /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir).
     pub fn permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission_checker = permission_checker_for_mode(mode);
+        self.inner = self.inner.permission_mode(mode);
         self
     }
 
@@ -438,6 +440,9 @@ impl AgentBuilder {
     /// can say what they mean instead of relying on silent default behavior.
     pub fn bypass_permissions(mut self) -> Self {
         self.permission_checker = None;
+        self.inner = self
+            .inner
+            .permission_mode(PermissionMode::BypassPermissions);
         self
     }
 
@@ -920,6 +925,7 @@ mod tests {
             available_tool_schemas: None,
             bypass_permissions: false,
             auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,

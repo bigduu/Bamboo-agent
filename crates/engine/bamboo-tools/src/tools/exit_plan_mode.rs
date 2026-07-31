@@ -44,7 +44,7 @@ impl Tool for ExitPlanModeTool {
                 },
                 "exit_mode": {
                     "type": "string",
-                    "description": "Suggested permission mode after exiting plan mode: 'default', 'accept_edits', 'dont_ask', or 'bypass_permissions'"
+                    "description": "Suggested permission mode after exiting plan mode: 'default', 'accept_edits', 'dont_ask', 'bypass_permissions', or 'auto'"
                 }
             },
             "required": ["plan"],
@@ -77,6 +77,12 @@ impl Tool for ExitPlanModeTool {
             ],
             Some("bypass_permissions") => vec![
                 "Approve (Bypass permissions)",
+                "Approve (Default mode)",
+                "Stay in plan mode",
+                "Edit plan first",
+            ],
+            Some("auto") => vec![
+                "Approve (Auto mode)",
                 "Approve (Default mode)",
                 "Stay in plan mode",
                 "Edit plan first",
@@ -475,6 +481,28 @@ mod tests {
         let options = payload["options"].as_array().unwrap();
         assert!(options.contains(&json!("Approve (Accept edits mode)")));
         assert!(options[0] == "Approve (Accept edits mode)"); // First option
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_with_auto_exit_mode_surfaces_real_auto_choice() {
+        let tool = ExitPlanModeTool::new();
+        let out = tool
+            .invoke(
+                json!({
+                    "plan": "Test",
+                    "exit_mode": "auto"
+                }),
+                ToolCtx::none("t"),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let options = payload["options"].as_array().unwrap();
+        assert_eq!(options[0], "Approve (Auto mode)");
+        assert!(options.contains(&json!("Approve (Default mode)")));
     }
 
     #[tokio::test]

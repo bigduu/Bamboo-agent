@@ -48,8 +48,8 @@ pub use checker::{
     PermissionError, PermissionResult,
 };
 pub use config::{
-    PermissionConfig, PermissionMode, PermissionRule, PermissionType, RiskLevel,
-    SerializablePermissionConfig, SessionGrant, TemporaryPermissionGrant,
+    explicit_deny_policy_reason, PermissionConfig, PermissionMode, PermissionRule, PermissionType,
+    RiskLevel, SerializablePermissionConfig, SessionGrant, TemporaryPermissionGrant,
     TemporaryPermissionGrantEffect, TemporaryPermissionGrantScope,
 };
 pub use hierarchy::PermissionRuleSet;

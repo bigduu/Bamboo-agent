@@ -123,6 +123,7 @@ async fn need_clarification_sends_event() {
         &event_tx,
         &mut session,
         tools.as_ref(),
+        bamboo_agent_core::tools::ToolExecutionSessionFlags::default(),
         None,
     )
     .await;
@@ -203,6 +204,7 @@ async fn need_more_actions_executes_sub_actions() {
         &event_tx,
         &mut session,
         tools.as_ref(),
+        bamboo_agent_core::tools::ToolExecutionSessionFlags::default(),
         None,
     )
     .await;

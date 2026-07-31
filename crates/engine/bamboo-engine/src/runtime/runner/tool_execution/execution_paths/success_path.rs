@@ -158,6 +158,7 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         ctx.event_tx,
         ctx.session,
         ctx.tools.as_ref(),
+        ctx.session_flags,
         // Legacy ad-hoc CompositionExecutor dispatch is intentionally disabled
         // in the agent runtime. Catalog-pinned workflow_run is the single
         // production orchestration authority (#578).

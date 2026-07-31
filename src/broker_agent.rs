@@ -153,6 +153,7 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                 .to_string(),
             );
         }
+        let provisioned_permission = spec.capabilities.permission_resolution()?;
         let me = AgentRef {
             session_id: spec.identity.child_id.clone(),
             role: Some(spec.identity.role.clone()),
@@ -184,10 +185,7 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                     inherit_user_config.unwrap_or(false),
                     forward_env.clone().unwrap_or_default(),
                 )
-                .with_provisioned_permission_context(
-                    spec.capabilities.bypass,
-                    spec.capabilities.auto_approve_permissions,
-                ),
+                .with_provisioned_permission_resolution(provisioned_permission),
             ),
             ExecutorSpec::Codex {
                 ref binary,
@@ -229,11 +227,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                                 network_access.unwrap_or(false),
                                 allow_danger_bypass.unwrap_or(false),
                                 permission_profile.clone(),
-                                spec.capabilities.bypass,
+                                provisioned_permission.bypass_permissions(),
                                 workspace_owned.unwrap_or(false),
                             )?
-                            .with_provisioned_permission_context(
-                                spec.capabilities.auto_approve_permissions,
+                            .with_provisioned_permission_resolution(
+                                provisioned_permission,
                                 spec.identity.child_id.clone(),
                             );
                         Arc::new(
@@ -257,11 +255,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                                 network_access.unwrap_or(false),
                                 allow_danger_bypass.unwrap_or(false),
                                 permission_profile.clone(),
-                                spec.capabilities.bypass,
+                                provisioned_permission.bypass_permissions(),
                                 workspace_owned.unwrap_or(false),
                             )?
-                            .with_provisioned_permission_context(
-                                spec.capabilities.auto_approve_permissions,
+                            .with_provisioned_permission_resolution(
+                                provisioned_permission,
                                 spec.identity.child_id.clone(),
                             );
                         Arc::new(

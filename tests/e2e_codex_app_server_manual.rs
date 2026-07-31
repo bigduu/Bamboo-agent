@@ -77,12 +77,17 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                 reasoning_effort: None,
                 permission_policy: Some(PermissionPolicyContext {
                     revision: 1,
+                    requested_mode: "default".to_string(),
+                    effective_mode: "default".to_string(),
                     bypass_permissions: false,
                     auto_approve_permissions: false,
                     session_id: "manual-codex-app-server".to_string(),
                     workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
                     inherit_session_grants: false,
-                    policy: serde_json::json!({}),
+                    policy: serde_json::to_value(
+                        bamboo_tools::permission::SerializablePermissionConfig::default(),
+                    )
+                    .unwrap(),
                 }),
                 messages: Vec::new(),
                 activation_run_id: None,
@@ -128,12 +133,17 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
                 reasoning_effort: None,
                 permission_policy: Some(PermissionPolicyContext {
                     revision: 2,
+                    requested_mode: "default".to_string(),
+                    effective_mode: "default".to_string(),
                     bypass_permissions: false,
                     auto_approve_permissions: false,
                     session_id: "manual-codex-app-server".to_string(),
                     workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
                     inherit_session_grants: false,
-                    policy: serde_json::json!({}),
+                    policy: serde_json::to_value(
+                        bamboo_tools::permission::SerializablePermissionConfig::default(),
+                    )
+                    .unwrap(),
                 }),
                 messages: vec![serde_json::json!({"role": "user", "content": "prior turn"})],
                 activation_run_id: None,

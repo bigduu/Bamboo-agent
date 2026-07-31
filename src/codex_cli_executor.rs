@@ -405,8 +405,7 @@ pub struct CodexPermissionConfig {
     network_access: bool,
     allow_danger_bypass: bool,
     permission_profile: Option<String>,
-    provisioned_bypass: bool,
-    provisioned_auto_approve_permissions: bool,
+    provisioned_permission: bamboo_domain::PermissionModeResolution,
     provisioned_session_id: Option<String>,
     workspace_owned: bool,
 }
@@ -490,12 +489,16 @@ impl CodexPermissionConfig {
     /// legacy bypass path that can opt into danger-full-access.
     fn effective_for_session(
         &self,
-        bypass: bool,
-        auto_approve_permissions: bool,
+        permission: bamboo_domain::PermissionModeResolution,
         is_root: bool,
     ) -> EffectiveCodexPolicy {
-        let mut policy = self.effective(bypass, is_root);
-        if auto_approve_permissions {
+        let mut policy = self.effective(permission.bypass_permissions(), is_root);
+        if permission.effective == bamboo_domain::PermissionMode::Plan {
+            policy.sandbox = CodexSandbox::ReadOnly;
+            policy.approval_policy = CodexApprovalPolicy::Never;
+            policy.invocation = CodexPolicyInvocation::Explicit;
+            policy.network_access = false;
+        } else if permission.suppress_approval_prompts() {
             policy.approval_policy = CodexApprovalPolicy::Never;
         }
         policy
@@ -580,8 +583,14 @@ pub fn resolve_codex_permission_config(
         network_access,
         allow_danger_bypass,
         permission_profile,
-        provisioned_bypass,
-        provisioned_auto_approve_permissions: false,
+        provisioned_permission: bamboo_domain::resolve_permission_mode(
+            if provisioned_bypass {
+                bamboo_domain::SessionPermissionMode::Bypass
+            } else {
+                bamboo_domain::SessionPermissionMode::Default
+            },
+            bamboo_domain::PermissionMode::Default,
+        ),
         provisioned_session_id: None,
         workspace_owned,
     })
@@ -624,26 +633,40 @@ pub fn resolve_codex_app_server_permission_config(
         network_access,
         allow_danger_bypass,
         permission_profile,
-        provisioned_bypass,
-        provisioned_auto_approve_permissions: false,
+        provisioned_permission: bamboo_domain::resolve_permission_mode(
+            if provisioned_bypass {
+                bamboo_domain::SessionPermissionMode::Bypass
+            } else {
+                bamboo_domain::SessionPermissionMode::Default
+            },
+            bamboo_domain::PermissionMode::Default,
+        ),
         provisioned_session_id: None,
         workspace_owned,
     })
 }
 
 impl CodexPermissionConfig {
-    pub(crate) fn with_provisioned_permission_context(
+    pub(crate) fn with_provisioned_permission_resolution(
         mut self,
-        auto_approve_permissions: bool,
+        resolution: bamboo_domain::PermissionModeResolution,
         session_id: String,
     ) -> Self {
-        self.provisioned_auto_approve_permissions = auto_approve_permissions;
+        self.provisioned_permission = resolution;
         self.provisioned_session_id = Some(session_id);
         self
     }
 
-    pub(crate) fn app_server_posture(&self, bypass: bool) -> (String, bool, Vec<String>) {
-        let mut policy = self.effective(bypass, running_as_root());
+    pub(crate) fn app_server_posture(
+        &self,
+        permission: bamboo_domain::PermissionModeResolution,
+    ) -> (String, bool, Vec<String>) {
+        let mut policy = self.effective(permission.bypass_permissions(), running_as_root());
+        if permission.effective == bamboo_domain::PermissionMode::Plan {
+            policy.sandbox = CodexSandbox::ReadOnly;
+            policy.network_access = false;
+            policy.invocation = CodexPolicyInvocation::Explicit;
+        }
         policy.approval_policy = CodexApprovalPolicy::OnRequest;
         (
             policy.sandbox.as_str().to_string(),
@@ -660,17 +683,50 @@ impl CodexPermissionConfig {
         self.provisioned_session_id.as_deref()
     }
 
-    pub(crate) fn activation_permission_flags(
+    pub(crate) fn activation_permission_resolution(
         &self,
         context: Option<&bamboo_subagent::proto::PermissionPolicyContext>,
-    ) -> (bool, bool) {
-        context
-            .map(|policy| (policy.bypass_permissions, policy.auto_approve_permissions))
-            .unwrap_or((
-                self.provisioned_bypass,
-                self.provisioned_auto_approve_permissions,
-            ))
+    ) -> Result<bamboo_domain::PermissionModeResolution, String> {
+        let Some(context) = context else {
+            return Ok(self.provisioned_permission);
+        };
+        let (requested, effective) = context.resolved_modes()?;
+        Ok(bamboo_domain::PermissionModeResolution {
+            requested,
+            effective,
+        })
     }
+
+    pub(crate) fn activation_permission(
+        &self,
+        context: Option<&bamboo_subagent::proto::PermissionPolicyContext>,
+    ) -> Result<ResolvedCodexPermission, String> {
+        let resolution = self.activation_permission_resolution(context)?;
+        let Some(context) = context else {
+            return Ok(ResolvedCodexPermission {
+                resolution,
+                policy_revision: 0,
+                explicit_deny_reason: None,
+            });
+        };
+        let policy =
+            serde_json::from_value::<bamboo_tools::permission::SerializablePermissionConfig>(
+                context.policy.clone(),
+            )
+            .map_err(|error| format!("decode Codex permission policy: {error}"))?;
+        Ok(ResolvedCodexPermission {
+            resolution,
+            policy_revision: context.revision,
+            explicit_deny_reason: bamboo_tools::permission::explicit_deny_policy_reason(&policy),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedCodexPermission {
+    pub resolution: bamboo_domain::PermissionModeResolution,
+    pub policy_revision: u64,
+    pub explicit_deny_reason: Option<String>,
 }
 
 #[cfg(unix)]
@@ -1098,17 +1154,14 @@ impl CodexExecutor {
         prompt: &str,
         resume_id: Option<&str>,
         run_provider_token: Option<&str>,
-        parent_bypass: bool,
-        auto_approve_permissions: bool,
+        permission: bamboo_domain::PermissionModeResolution,
         events: &EventSink,
         cancel: &CancellationToken,
     ) -> (ChildOutcome, bool) {
-        let policy = self.permissions.effective_for_session(
-            parent_bypass,
-            auto_approve_permissions,
-            running_as_root(),
-        );
-        self.emit_policy_bootstrap(&policy, parent_bypass, auto_approve_permissions, events);
+        let policy = self
+            .permissions
+            .effective_for_session(permission, running_as_root());
+        self.emit_policy_bootstrap(&policy, permission, events);
         // Warm workers reuse this executor across activations. Reassert the
         // isolated-home invariant at every run boundary so a prior Codex
         // process cannot leave an auth artifact or mutate provider routing for
@@ -1281,17 +1334,9 @@ impl CodexExecutor {
     fn emit_policy_bootstrap(
         &self,
         policy: &EffectiveCodexPolicy,
-        parent_bypass: bool,
-        auto_approve_permissions: bool,
+        permission: bamboo_domain::PermissionModeResolution,
         events: &EventSink,
     ) {
-        let requested_mode = if auto_approve_permissions {
-            "auto"
-        } else if parent_bypass {
-            "bypass"
-        } else {
-            "default"
-        };
         let executor_mapping = format!(
             "codex_exec:approval_policy={}",
             policy.approval_policy.as_str()
@@ -1313,8 +1358,8 @@ impl CodexExecutor {
             "network_access": policy.network_access,
             "policy_invocation": policy.invocation.as_str(),
             "permission_profile": self.permissions.permission_profile.as_deref(),
-            "requested_mode": requested_mode,
-            "effective_mode": requested_mode,
+            "requested_mode": permission.requested.as_str(),
+            "effective_mode": permission.effective.as_str(),
             "executor_mapping": executor_mapping,
         }));
         for warning in &policy.warnings {
@@ -1345,12 +1390,64 @@ impl ChildExecutor for CodexExecutor {
         mut steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
+        let logical_session_id = spec
+            .permission_policy
+            .as_ref()
+            .map(|context| context.session_id.trim())
+            .filter(|session_id| !session_id.is_empty())
+            .or_else(|| {
+                spec.logical_session
+                    .as_ref()
+                    .map(|identity| identity.session_id.trim())
+                    .filter(|session_id| !session_id.is_empty())
+            })
+            .or_else(|| self.permissions.provisioned_session_id())
+            .unwrap_or("codex")
+            .to_string();
+        let activation = match self
+            .permissions
+            .activation_permission(spec.permission_policy.as_ref())
+        {
+            Ok(activation) => activation,
+            Err(error) => {
+                events.emit(event_json(AgentEvent::Error {
+                    message: error.clone(),
+                }));
+                return ChildOutcome::error(error);
+            }
+        };
+        if let Some(reason) = activation.explicit_deny_reason.as_ref() {
+            let message =
+                format!("Codex exec cannot safely enforce Bamboo explicit-deny policy: {reason}");
+            events.emit(event_json(AgentEvent::PermissionPostureActivated {
+                session_id: logical_session_id,
+                policy_revision: activation.policy_revision,
+                requested_mode: activation.resolution.requested.as_str().to_string(),
+                effective_mode: activation.resolution.effective.as_str().to_string(),
+                executor_mapping: "codex_exec:blocked_explicit_deny".to_string(),
+            }));
+            events.emit(event_json(AgentEvent::Error {
+                message: message.clone(),
+            }));
+            return ChildOutcome::error(message);
+        }
+        let bootstrap_policy = self
+            .permissions
+            .effective_for_session(activation.resolution, running_as_root());
+        events.emit(event_json(AgentEvent::PermissionPostureActivated {
+            session_id: logical_session_id,
+            policy_revision: activation.policy_revision,
+            requested_mode: activation.resolution.requested.as_str().to_string(),
+            effective_mode: activation.resolution.effective.as_str().to_string(),
+            executor_mapping: format!(
+                "codex_exec:approval_policy={}",
+                bootstrap_policy.approval_policy.as_str()
+            ),
+        }));
+
         // `codex exec` v1 has no mid-turn steering channel. Drain the inbox so
         // transport senders cannot build an unbounded backlog.
         let steer_drain = tokio::spawn(async move { while steer.recv().await.is_some() {} });
-        let (parent_bypass, auto_approve_permissions) = self
-            .permissions
-            .activation_permission_flags(spec.permission_policy.as_ref());
         if spec.messages.is_empty() {
             self.delete_session_state().await;
         }
@@ -1374,8 +1471,7 @@ impl ChildExecutor for CodexExecutor {
                 &body,
                 resume_id.as_deref(),
                 run_provider_token,
-                parent_bypass,
-                auto_approve_permissions,
+                activation.resolution,
                 &events,
                 &cancel,
             )
@@ -1398,8 +1494,7 @@ impl ChildExecutor for CodexExecutor {
                 &fallback_body,
                 None,
                 run_provider_token,
-                parent_bypass,
-                auto_approve_permissions,
+                activation.resolution,
                 &events,
                 &cancel,
             )
@@ -2103,12 +2198,25 @@ mod tests {
 
     #[test]
     fn run_permission_context_replaces_provisioned_auto_instead_of_sticking() {
-        let permissions = default_permissions()
-            .with_provisioned_permission_context(true, "provisioned-codex".to_string());
-        assert_eq!(permissions.activation_permission_flags(None), (false, true));
+        let permissions = default_permissions().with_provisioned_permission_resolution(
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Auto,
+                bamboo_domain::PermissionMode::Default,
+            ),
+            "provisioned-codex".to_string(),
+        );
+        assert_eq!(
+            permissions.activation_permission_resolution(None).unwrap(),
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Auto,
+                bamboo_domain::PermissionMode::Default,
+            )
+        );
 
         let explicit_default = bamboo_subagent::proto::PermissionPolicyContext {
             revision: 3,
+            requested_mode: "default".to_string(),
+            effective_mode: "default".to_string(),
             bypass_permissions: false,
             auto_approve_permissions: false,
             session_id: "explicit-default".to_string(),
@@ -2117,17 +2225,29 @@ mod tests {
             policy: json!({}),
         };
         assert_eq!(
-            permissions.activation_permission_flags(Some(&explicit_default)),
-            (false, false)
+            permissions
+                .activation_permission_resolution(Some(&explicit_default))
+                .unwrap(),
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Default,
+                bamboo_domain::PermissionMode::Default,
+            )
         );
 
         let explicit_bypass = bamboo_subagent::proto::PermissionPolicyContext {
+            requested_mode: "bypass".to_string(),
+            effective_mode: "bypass".to_string(),
             bypass_permissions: true,
             ..explicit_default
         };
         assert_eq!(
-            permissions.activation_permission_flags(Some(&explicit_bypass)),
-            (true, false)
+            permissions
+                .activation_permission_resolution(Some(&explicit_bypass))
+                .unwrap(),
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Bypass,
+                bamboo_domain::PermissionMode::Default,
+            )
         );
     }
 
@@ -2380,7 +2500,13 @@ mod tests {
         assert_eq!(baseline.sandbox, CodexSandbox::ReadOnly);
         assert_eq!(baseline.approval_policy, CodexApprovalPolicy::OnFailure);
 
-        let auto = permissions.effective_for_session(false, true, false);
+        let auto = permissions.effective_for_session(
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Auto,
+                bamboo_domain::PermissionMode::Default,
+            ),
+            false,
+        );
         assert_eq!(auto.sandbox, CodexSandbox::ReadOnly);
         assert_eq!(auto.approval_policy, CodexApprovalPolicy::Never);
         assert_eq!(auto.invocation, CodexPolicyInvocation::Explicit);
@@ -2458,7 +2584,14 @@ mod tests {
         );
         let policy = executor.permissions.effective(true, false);
         let (sink, mut receiver) = EventSink::channel();
-        executor.emit_policy_bootstrap(&policy, true, false, &sink);
+        executor.emit_policy_bootstrap(
+            &policy,
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Bypass,
+                bamboo_domain::PermissionMode::Default,
+            ),
+            &sink,
+        );
 
         let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| {
@@ -3070,6 +3203,71 @@ exit 7
             let error = outcome.error.unwrap();
             assert!(error.contains("status exit status: 7"), "{error}");
             assert!(error.contains("credential lookup failed"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn explicit_deny_fails_before_codex_exec_spawn_without_leaking_rule_resource() {
+            let workspace = tempfile::tempdir().unwrap();
+            let bin_dir = tempfile::tempdir().unwrap();
+            let marker = bin_dir.path().join("spawned");
+            let bin = write_stub(
+                bin_dir.path(),
+                r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+: > "$DIR/spawned"
+exit 0
+"#,
+            );
+            let secret_resource = "TOP_SECRET_CODEX_EXEC_DENY_RESOURCE";
+            let mut policy = bamboo_tools::permission::SerializablePermissionConfig::default();
+            policy
+                .whitelist
+                .push(bamboo_tools::permission::PermissionRule::new(
+                    bamboo_tools::permission::PermissionType::ExecuteCommand,
+                    secret_resource,
+                    false,
+                ));
+            let mut spec = run_spec("must fail closed");
+            spec.permission_policy = Some(bamboo_subagent::proto::PermissionPolicyContext {
+                revision: 23,
+                requested_mode: "auto".to_string(),
+                effective_mode: "auto".to_string(),
+                bypass_permissions: false,
+                auto_approve_permissions: true,
+                session_id: "codex-exec-explicit-deny".to_string(),
+                workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                inherit_session_grants: false,
+                policy: serde_json::to_value(policy).unwrap(),
+            });
+            let (sink, mut rx) = EventSink::channel();
+
+            let outcome = executor(bin, workspace.path())
+                .run(
+                    spec,
+                    sink,
+                    SteerInbox::disconnected(),
+                    CancellationToken::new(),
+                )
+                .await;
+
+            assert_eq!(outcome.status, TerminalStatus::Error);
+            assert!(outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("explicit-deny")));
+            assert!(!marker.exists(), "Codex exec process must not be spawned");
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.iter().any(|event| {
+                event["type"] == "permission_posture_activated"
+                    && event["executor_mapping"] == "codex_exec:blocked_explicit_deny"
+            }));
+            assert!(events.iter().any(|event| event["type"] == "error"));
+            assert!(
+                !serde_json::to_string(&events)
+                    .unwrap()
+                    .contains(secret_resource),
+                "deny resources must not be emitted in audit/error events"
+            );
         }
 
         #[tokio::test]

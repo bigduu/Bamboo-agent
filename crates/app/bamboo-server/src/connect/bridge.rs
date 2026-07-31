@@ -880,7 +880,12 @@ impl ConnectBridge {
             if let Some(workspace) = session.workspace.as_ref() {
                 config.register_session_workspace(session_id.clone(), workspace.clone());
             }
-            record_bamboo_runtime_permission_metadata(&mut session, config.as_ref());
+            if let Err(error) =
+                record_bamboo_runtime_permission_metadata(&mut session, config.as_ref())
+            {
+                tracing::error!(%error, %session_id, "connect permission audit failed closed");
+                return;
+            }
         }
         self.ctx.session_repo.save_and_cache(&mut session).await;
 

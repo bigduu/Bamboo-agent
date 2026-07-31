@@ -338,6 +338,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn permission_config(mut self, v: Arc<bamboo_tools::permission::PermissionConfig>) -> Self {
+        self.inner = self.inner.permission_config(v);
+        self
+    }
+
+    pub fn permission_mode(mut self, v: bamboo_domain::PermissionMode) -> Self {
+        self.inner = self.inner.permission_mode(v);
+        self
+    }
+
     pub fn provider(mut self, v: Arc<dyn bamboo_llm::LLMProvider>) -> Self {
         self.inner = self.inner.provider(v);
         self

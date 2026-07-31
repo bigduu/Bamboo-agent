@@ -113,6 +113,15 @@ struct ClaudeSessionState {
     updated_at: DateTime<Utc>,
 }
 
+enum ClaudePermissionActivationError {
+    Invalid(String),
+    ExplicitDeny {
+        message: String,
+        resolution: bamboo_domain::PermissionModeResolution,
+        policy_revision: u64,
+    },
+}
+
 /// Drives `claude --output-format stream-json --input-format stream-json ...`
 /// as the engine behind one sub-agent run.
 pub struct ClaudeCodeExecutor {
@@ -124,8 +133,7 @@ pub struct ClaudeCodeExecutor {
     /// Provision-time fallback for compatibility callers that legitimately
     /// omit `RunSpec.permission_policy` (for example `bamboo actor call`). A
     /// present per-run context always overrides these baked worker flags.
-    provisioned_bypass_permissions: bool,
-    provisioned_auto_approve_permissions: bool,
+    provisioned_permission: bamboo_domain::PermissionModeResolution,
     /// Working directory for the spawned CLI's file tools. `None` inherits the
     /// worker process's own cwd (mirrors how [`BambooRuntimeExecutor`](crate::subagent_worker::BambooRuntimeExecutor)
     /// treats an absent `ProvisionSpec.workspace`).
@@ -167,8 +175,10 @@ impl ClaudeCodeExecutor {
             binary: binary.unwrap_or_else(|| "claude".to_string()),
             model,
             permission_mode,
-            provisioned_bypass_permissions: false,
-            provisioned_auto_approve_permissions: false,
+            provisioned_permission: bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Default,
+                bamboo_domain::PermissionMode::Default,
+            ),
             workspace,
             state_dir,
             inherit_user_config,
@@ -182,9 +192,77 @@ impl ClaudeCodeExecutor {
         bypass_permissions: bool,
         auto_approve_permissions: bool,
     ) -> Self {
-        self.provisioned_bypass_permissions = bypass_permissions;
-        self.provisioned_auto_approve_permissions = auto_approve_permissions;
+        // Legacy payload normalization: Auto is a separate no-prompt posture
+        // and must never inherit Bypass authorization semantics.
+        let requested = if auto_approve_permissions {
+            bamboo_domain::SessionPermissionMode::Auto
+        } else if bypass_permissions {
+            bamboo_domain::SessionPermissionMode::Bypass
+        } else {
+            bamboo_domain::SessionPermissionMode::Default
+        };
+        self.provisioned_permission = bamboo_domain::resolve_permission_mode(
+            requested,
+            bamboo_domain::PermissionMode::Default,
+        );
         self
+    }
+
+    pub fn with_provisioned_permission_resolution(
+        mut self,
+        resolution: bamboo_domain::PermissionModeResolution,
+    ) -> Self {
+        self.provisioned_permission = resolution;
+        self
+    }
+
+    fn activation_permission(
+        &self,
+        spec: &RunSpec,
+    ) -> Result<(bamboo_domain::PermissionModeResolution, u64), ClaudePermissionActivationError>
+    {
+        let Some(context) = spec.permission_policy.as_ref() else {
+            return Ok((self.provisioned_permission, 0));
+        };
+        let (requested, effective) = context
+            .resolved_modes()
+            .map_err(ClaudePermissionActivationError::Invalid)?;
+        let resolution = bamboo_domain::PermissionModeResolution {
+            requested,
+            effective,
+        };
+        let policy =
+            serde_json::from_value::<bamboo_tools::permission::SerializablePermissionConfig>(
+                context.policy.clone(),
+            )
+            .map_err(|error| {
+                ClaudePermissionActivationError::Invalid(format!(
+                    "decode Claude permission policy: {error}"
+                ))
+            })?;
+        if let Some(reason) = bamboo_tools::permission::explicit_deny_policy_reason(&policy) {
+            return Err(ClaudePermissionActivationError::ExplicitDeny {
+                message: format!(
+                    "Claude executor cannot safely enforce Bamboo explicit-deny policy: {reason}"
+                ),
+                resolution,
+                policy_revision: context.revision,
+            });
+        }
+        Ok((resolution, context.revision))
+    }
+
+    fn mapped_permission_mode(&self, resolution: bamboo_domain::PermissionModeResolution) -> &str {
+        match resolution.effective {
+            bamboo_domain::PermissionMode::Plan => "plan",
+            bamboo_domain::PermissionMode::Auto => "bypassPermissions",
+            bamboo_domain::PermissionMode::AcceptEdits => "acceptEdits",
+            bamboo_domain::PermissionMode::DontAsk => "dontAsk",
+            bamboo_domain::PermissionMode::Default
+            | bamboo_domain::PermissionMode::BypassPermissions => {
+                self.permission_mode.as_deref().unwrap_or("default")
+            }
+        }
     }
 
     /// Test-only override of [`Self::relay_timeout`] — production callers
@@ -353,7 +431,7 @@ impl ClaudeCodeExecutor {
         write_tx: &mpsc::UnboundedSender<Value>,
         pending: &mut HashMap<String, JoinHandle<()>>,
         last_text: &mut String,
-        auto_approve_permissions: bool,
+        permission: bamboo_domain::PermissionModeResolution,
     ) -> Option<ChildOutcome> {
         let frame_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         match frame_type {
@@ -423,13 +501,7 @@ impl ClaudeCodeExecutor {
                 Some(ChildOutcome::completed(final_text))
             }
             "control_request" => {
-                self.handle_control_request(
-                    value,
-                    events,
-                    write_tx,
-                    pending,
-                    auto_approve_permissions,
-                );
+                self.handle_control_request(value, events, write_tx, pending, permission);
                 None
             }
             "control_cancel_request" => {
@@ -460,7 +532,7 @@ impl ClaudeCodeExecutor {
         events: &EventSink,
         write_tx: &mpsc::UnboundedSender<Value>,
         pending: &mut HashMap<String, JoinHandle<()>>,
-        auto_approve_permissions: bool,
+        permission: bamboo_domain::PermissionModeResolution,
     ) {
         let request_id = value
             .get("request_id")
@@ -488,7 +560,20 @@ impl ClaudeCodeExecutor {
             .unwrap_or("")
             .to_string();
         let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
-        if auto_approve_permissions {
+        if permission.effective == bamboo_domain::PermissionMode::Plan {
+            // Claude's native Plan policy is the authorization boundary. Any
+            // control request that still escapes it is conservatively denied;
+            // requested Auto suppresses prompts but never approves a mutation.
+            send_control_response(
+                write_tx,
+                &request_id,
+                false,
+                None,
+                Some("Bamboo Plan/read-only posture denies tool mutation".to_string()),
+            );
+            return;
+        }
+        if permission.suppress_approval_prompts() {
             send_control_response(write_tx, &request_id, true, Some(input), None);
             return;
         }
@@ -555,9 +640,9 @@ impl ClaudeCodeExecutor {
         resume_id: Option<&str>,
         events: &EventSink,
         cancel: &CancellationToken,
-        auto_approve_permissions: bool,
+        permission: bamboo_domain::PermissionModeResolution,
     ) -> (ChildOutcome, bool) {
-        let permission_mode_override = auto_approve_permissions.then_some("bypassPermissions");
+        let permission_mode_override = Some(self.mapped_permission_mode(permission));
         let mut child = match spawn_with_etxtbsy_retry(|| {
             self.build_command(resume_id, permission_mode_override)
         })
@@ -635,7 +720,7 @@ impl ClaudeCodeExecutor {
                                     &write_tx,
                                     &mut pending,
                                     &mut last_text,
-                                    auto_approve_permissions,
+                                    permission,
                                 )
                                 .await
                             {
@@ -712,6 +797,55 @@ impl ChildExecutor for ClaudeCodeExecutor {
         mut steer: SteerInbox,
         cancel: CancellationToken,
     ) -> ChildOutcome {
+        let logical_session_id = spec
+            .permission_policy
+            .as_ref()
+            .map(|context| context.session_id.trim())
+            .filter(|session_id| !session_id.is_empty())
+            .or_else(|| {
+                spec.logical_session
+                    .as_ref()
+                    .map(|identity| identity.session_id.trim())
+                    .filter(|session_id| !session_id.is_empty())
+            })
+            .unwrap_or("claude_code")
+            .to_string();
+        let (permission, policy_revision) = match self.activation_permission(&spec) {
+            Ok(permission) => permission,
+            Err(ClaudePermissionActivationError::Invalid(message)) => {
+                events.emit(event_json(AgentEvent::Error {
+                    message: message.clone(),
+                }));
+                return ChildOutcome::error(message);
+            }
+            Err(ClaudePermissionActivationError::ExplicitDeny {
+                message,
+                resolution,
+                policy_revision,
+            }) => {
+                events.emit(event_json(AgentEvent::PermissionPostureActivated {
+                    session_id: logical_session_id,
+                    policy_revision,
+                    requested_mode: resolution.requested.as_str().to_string(),
+                    effective_mode: resolution.effective.as_str().to_string(),
+                    executor_mapping: "claude_code:blocked_explicit_deny".to_string(),
+                }));
+                events.emit(event_json(AgentEvent::Error {
+                    message: message.clone(),
+                }));
+                return ChildOutcome::error(message);
+            }
+        };
+        let mapped_permission_mode = self.mapped_permission_mode(permission);
+        let executor_mapping = format!("claude_code:permission_mode={mapped_permission_mode}");
+        events.emit(event_json(AgentEvent::PermissionPostureActivated {
+            session_id: logical_session_id.clone(),
+            policy_revision,
+            requested_mode: permission.requested.as_str().to_string(),
+            effective_mode: permission.effective.as_str().to_string(),
+            executor_mapping: executor_mapping.clone(),
+        }));
+
         // Ignore steer messages (see doc comment on `steer` above) but keep
         // draining so the sender never sees an unbounded backlog. Spans BOTH
         // possible spawn attempts below — the inbox belongs to the whole
@@ -732,47 +866,20 @@ impl ChildExecutor for ClaudeCodeExecutor {
 
         // Step 3: fallback body when there's history but no usable id.
         let body = build_turn_body(&spec, resume_id.as_deref());
-        let (bypass_permissions, auto_approve_permissions) = spec
-            .permission_policy
-            .as_ref()
-            .map(|policy| (policy.bypass_permissions, policy.auto_approve_permissions))
-            .unwrap_or((
-                self.provisioned_bypass_permissions,
-                self.provisioned_auto_approve_permissions,
-            ));
-        let requested_mode = if auto_approve_permissions {
-            "auto"
-        } else if bypass_permissions {
-            "bypass"
-        } else {
-            "default"
-        };
-        let mapped_permission_mode = if auto_approve_permissions {
-            "bypassPermissions"
-        } else {
-            self.permission_mode.as_deref().unwrap_or("default")
-        };
         events.emit(json!({
             "type": "runner_progress",
-            "session_id": "claude_code",
+            "session_id": logical_session_id,
             "round_count": 0,
             "executor": "claude_code",
             "phase": "bootstrap",
-            "requested_mode": requested_mode,
-            "effective_mode": requested_mode,
-            "executor_mapping":
-                format!("claude_code:permission_mode={mapped_permission_mode}"),
+            "requested_mode": permission.requested.as_str(),
+            "effective_mode": permission.effective.as_str(),
+            "executor_mapping": executor_mapping,
         }));
 
         let used_resume = resume_id.is_some();
         let (outcome, exited_without_result) = self
-            .run_once(
-                &body,
-                resume_id.as_deref(),
-                &events,
-                &cancel,
-                auto_approve_permissions,
-            )
+            .run_once(&body, resume_id.as_deref(), &events, &cancel, permission)
             .await;
 
         // Step 4: retry-once, ONLY when the failed attempt itself used
@@ -784,15 +891,9 @@ impl ChildExecutor for ClaudeCodeExecutor {
             );
             self.delete_state_file().await;
             let fallback_body = build_turn_body(&spec, None);
-            self.run_once(
-                &fallback_body,
-                None,
-                &events,
-                &cancel,
-                auto_approve_permissions,
-            )
-            .await
-            .0
+            self.run_once(&fallback_body, None, &events, &cancel, permission)
+                .await
+                .0
         } else {
             outcome
         };
@@ -1324,6 +1425,7 @@ echo '{"type":"result","subtype":"success","result":"done: hi","usage":{"input_t
         assert_eq!(
             types,
             vec![
+                "permission_posture_activated",
                 "runner_progress",
                 "token",
                 "tool_start",
@@ -1331,13 +1433,19 @@ echo '{"type":"result","subtype":"success","result":"done: hi","usage":{"input_t
                 "complete"
             ]
         );
-        assert_eq!(events[0]["phase"], "bootstrap");
         assert_eq!(events[0]["requested_mode"], "default");
-        assert_eq!(events[1]["content"], "Working on it");
-        assert_eq!(events[2]["tool_name"], "Bash");
-        assert_eq!(events[3]["result"]["result"], "hi");
-        assert_eq!(events[4]["usage"]["prompt_tokens"], 10);
-        assert_eq!(events[4]["usage"]["completion_tokens"], 5);
+        assert_eq!(events[0]["effective_mode"], "default");
+        assert_eq!(
+            events[0]["executor_mapping"],
+            "claude_code:permission_mode=default"
+        );
+        assert_eq!(events[1]["phase"], "bootstrap");
+        assert_eq!(events[1]["requested_mode"], "default");
+        assert_eq!(events[2]["content"], "Working on it");
+        assert_eq!(events[3]["tool_name"], "Bash");
+        assert_eq!(events[4]["result"]["result"], "hi");
+        assert_eq!(events[5]["usage"]["prompt_tokens"], 10);
+        assert_eq!(events[5]["usage"]["completion_tokens"], 5);
     }
 
     #[tokio::test]
@@ -1353,12 +1461,17 @@ echo '{"type":"result","subtype":"success","result":"done"}'
         let mut spec = run_spec("say hi");
         spec.permission_policy = Some(bamboo_subagent::proto::PermissionPolicyContext {
             revision: 7,
+            requested_mode: "auto".to_string(),
+            effective_mode: "auto".to_string(),
             bypass_permissions: false,
             auto_approve_permissions: true,
             session_id: "auto-audit".to_string(),
             workspace_path: None,
             inherit_session_grants: false,
-            policy: json!({}),
+            policy: serde_json::to_value(
+                bamboo_tools::permission::SerializablePermissionConfig::default(),
+            )
+            .unwrap(),
         });
         let (sink, mut rx) = EventSink::channel();
 
@@ -1380,6 +1493,70 @@ echo '{"type":"result","subtype":"success","result":"done"}'
                 && event["effective_mode"] == "auto"
                 && event["executor_mapping"] == "claude_code:permission_mode=bypassPermissions"
         }));
+    }
+
+    #[tokio::test]
+    async fn explicit_deny_fails_before_claude_spawn_without_leaking_rule_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let bin = write_stub(
+            dir.path(),
+            r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+: > "$DIR/spawned"
+exit 0
+"#,
+        );
+        let secret_resource = "TOP_SECRET_CLAUDE_DENY_RESOURCE";
+        let mut policy = bamboo_tools::permission::SerializablePermissionConfig::default();
+        policy
+            .whitelist
+            .push(bamboo_tools::permission::PermissionRule::new(
+                bamboo_tools::permission::PermissionType::ExecuteCommand,
+                secret_resource,
+                false,
+            ));
+        let mut spec = run_spec("must fail closed");
+        spec.permission_policy = Some(bamboo_subagent::proto::PermissionPolicyContext {
+            revision: 19,
+            requested_mode: "auto".to_string(),
+            effective_mode: "auto".to_string(),
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            session_id: "claude-explicit-deny".to_string(),
+            workspace_path: None,
+            inherit_session_grants: false,
+            policy: serde_json::to_value(policy).unwrap(),
+        });
+        let (sink, mut rx) = EventSink::channel();
+
+        let outcome = executor(bin)
+            .run(
+                spec,
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(outcome.status, TerminalStatus::Error);
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("explicit-deny")));
+        assert!(!marker.exists(), "Claude process must not be spawned");
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["type"] == "permission_posture_activated"
+                && event["executor_mapping"] == "claude_code:blocked_explicit_deny"
+        }));
+        assert!(events.iter().any(|event| event["type"] == "error"));
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains(secret_resource),
+            "deny resources must not be emitted in audit/error events"
+        );
     }
 
     #[tokio::test]
@@ -1425,12 +1602,17 @@ echo '{"type":"result","subtype":"success","result":"done"}'
         let mut spec = run_spec("say hi");
         spec.permission_policy = Some(bamboo_subagent::proto::PermissionPolicyContext {
             revision: 8,
+            requested_mode: "default".to_string(),
+            effective_mode: "default".to_string(),
             bypass_permissions: false,
             auto_approve_permissions: false,
             session_id: "explicit-default".to_string(),
             workspace_path: None,
             inherit_session_grants: false,
-            policy: json!({}),
+            policy: serde_json::to_value(
+                bamboo_tools::permission::SerializablePermissionConfig::default(),
+            )
+            .unwrap(),
         });
         let (sink, mut rx) = EventSink::channel();
 

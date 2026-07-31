@@ -249,13 +249,40 @@ pub trait ChildSessionPort: Send + Sync {
         child: &mut Session,
         workspace: &str,
         workspace_source: crate::project_context::WorkspaceSource,
+        permission_audit: bamboo_domain::PermissionAuditSeed,
+        no_human_approver: bool,
     ) -> Result<(), ChildSessionError> {
+        let previous_mode = child
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        let previous_resolution =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                .map(|snapshot| snapshot.resolution);
         child.workspace = Some(workspace.to_string());
         child.set_workspace_path_meta(workspace);
         child.metadata.insert(
             crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
             workspace_source.as_str().to_string(),
         );
+        let runtime = child
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.set_permission_mode(permission_audit.resolution.requested);
+        runtime.no_human_approver = no_human_approver;
+        let changed = previous_mode != permission_audit.resolution.requested;
+        let posture_changed = previous_resolution != Some(permission_audit.resolution);
+        let transitioned_at = posture_changed.then(|| chrono::Utc::now().to_rfc3339());
+        bamboo_domain::record_permission_audit(
+            &mut child.metadata,
+            &permission_audit,
+            transitioned_at.as_deref(),
+        )
+        .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
+        if changed {
+            child.metadata_version = child.metadata_version.saturating_add(1);
+        }
         self.save_child_session_authoritative_flags(child).await?;
         self.publish_child_workspace(
             &child.id,

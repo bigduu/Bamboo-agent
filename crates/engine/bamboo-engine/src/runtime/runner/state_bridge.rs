@@ -15,13 +15,6 @@ use bamboo_domain::{
 };
 
 const METADATA_KEY: &str = "agent.runtime.state";
-const PERMISSION_AUDIT_METADATA_KEYS: &[&str] = &[
-    "permission.policy_revision",
-    "permission.requested_mode",
-    "permission.effective_mode",
-    "permission.executor_mapping",
-    "permission.transitioned_at",
-];
 #[cfg(test)]
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
@@ -44,19 +37,6 @@ pub fn read_runtime_state(session: &Session) -> Option<AgentRuntimeState> {
 /// was removed after the migration completed.
 pub fn write_runtime_state(session: &mut Session, state: &AgentRuntimeState) {
     session.agent_runtime_state = Some(state.clone());
-}
-
-fn adopt_permission_audit_metadata(session: &mut Session, latest: &Session) {
-    if latest.agent_runtime_state.is_none() {
-        return;
-    }
-    for key in PERMISSION_AUDIT_METADATA_KEYS {
-        if let Some(value) = latest.metadata.get(*key) {
-            session.metadata.insert((*key).to_string(), value.clone());
-        } else {
-            session.metadata.remove(*key);
-        }
-    }
 }
 
 /// Sync runtime state fields from existing metadata keys.
@@ -557,17 +537,40 @@ pub async fn refresh_turn_boundary_with_inbox(
     // mode — report `None` (unknown) so the caller leaves the live posture
     // untouched rather than force-disabling a legitimately permissive run.
     // #540/#770.
-    let disk_permission_mode = latest
+    let disk_permission_posture = latest
         .as_ref()
-        .and_then(|latest| latest.agent_runtime_state.as_ref())
-        .map(|state| state.effective_permission_mode());
+        .and_then(|latest| {
+            latest
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| (latest, state.effective_permission_mode()))
+        })
+        .and_then(|(latest, disk_mode)| {
+            let current_mode = session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.effective_permission_mode())
+                .unwrap_or_default();
+            bamboo_domain::fresher_disk_permission_audit(
+                current_mode,
+                &session.metadata,
+                disk_mode,
+                &latest.metadata,
+            )
+            .map(|audit| (disk_mode, audit))
+        });
+    let disk_permission_mode = disk_permission_posture
+        .as_ref()
+        .map(|(disk_mode, _)| *disk_mode);
 
     if let Some(latest) = latest.as_ref() {
         // Keep the live snapshot's bounded audit record in the same revision as
         // the typed mode returned below. Runtime persistence also adopts these
         // keys under its session lock, so both the current round and any later
         // checkpoint observe one coherent permission transition.
-        adopt_permission_audit_metadata(session, latest);
+        if let Some((_, audit)) = disk_permission_posture.as_ref() {
+            audit.write_to(&mut session.metadata);
+        }
         // A previous activation may have checkpointed and acked the claim
         // before this live snapshot was loaded/refreshed. Carry its durable
         // cursor forward so finalization never mistakes an admitted duplicate

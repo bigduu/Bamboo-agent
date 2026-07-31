@@ -143,6 +143,14 @@ impl std::fmt::Debug for SecretValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionPolicyContext {
     pub revision: u64,
+    /// Exact typed session request (`default`, `bypass`, or `auto`). Empty is a
+    /// rolling-upgrade legacy payload and is derived from the booleans below.
+    #[serde(default)]
+    pub requested_mode: String,
+    /// Host-resolved effective mode, including Plan/read-only hard overlays.
+    /// Empty is accepted only for legacy payloads.
+    #[serde(default)]
+    pub effective_mode: String,
     pub bypass_permissions: bool,
     #[serde(default)]
     pub auto_approve_permissions: bool,
@@ -154,6 +162,86 @@ pub struct PermissionPolicyContext {
     #[serde(default)]
     pub inherit_session_grants: bool,
     pub policy: serde_json::Value,
+}
+
+impl PermissionPolicyContext {
+    /// Validate a newly-produced wire posture and decode rolling-upgrade
+    /// payloads. Dual permissive flags are always contradictory: Auto never
+    /// borrows Bypass semantics.
+    pub fn resolved_modes(
+        &self,
+    ) -> Result<
+        (
+            bamboo_domain::SessionPermissionMode,
+            bamboo_domain::PermissionMode,
+        ),
+        String,
+    > {
+        if self.auto_approve_permissions && self.bypass_permissions {
+            return Err(
+                "permission_policy auto_approve_permissions and bypass_permissions are mutually exclusive"
+                    .to_string(),
+            );
+        }
+        let has_requested_mode = !self.requested_mode.is_empty();
+        let has_effective_mode = !self.effective_mode.is_empty();
+        if has_requested_mode != has_effective_mode {
+            return Err(
+                "permission_policy requested_mode and effective_mode must be provided together"
+                    .to_string(),
+            );
+        }
+        let requested = if self.requested_mode.is_empty() {
+            if self.auto_approve_permissions {
+                bamboo_domain::SessionPermissionMode::Auto
+            } else if self.bypass_permissions {
+                bamboo_domain::SessionPermissionMode::Bypass
+            } else {
+                bamboo_domain::SessionPermissionMode::Default
+            }
+        } else {
+            match self.requested_mode.as_str() {
+                "default" => bamboo_domain::SessionPermissionMode::Default,
+                "bypass" => bamboo_domain::SessionPermissionMode::Bypass,
+                "auto" => bamboo_domain::SessionPermissionMode::Auto,
+                other => return Err(format!("invalid requested permission mode '{other}'")),
+            }
+        };
+        let effective = if self.effective_mode.is_empty() {
+            bamboo_domain::resolve_permission_mode(
+                requested,
+                bamboo_domain::PermissionMode::Default,
+            )
+            .effective
+        } else {
+            bamboo_domain::PermissionMode::from_audit_str(&self.effective_mode).ok_or_else(
+                || {
+                    format!(
+                        "invalid effective permission mode '{}'",
+                        self.effective_mode
+                    )
+                },
+            )?
+        };
+        let resolution = bamboo_domain::PermissionModeResolution {
+            requested,
+            effective,
+        };
+        if !resolution.is_consistent() {
+            return Err("permission_policy requested/effective modes are inconsistent".into());
+        }
+        if has_requested_mode {
+            if self.bypass_permissions != resolution.bypass_permissions() {
+                return Err("permission_policy bypass flag disagrees with effective mode".into());
+            }
+            if self.auto_approve_permissions != resolution.suppress_approval_prompts() {
+                return Err(
+                    "permission_policy auto flag disagrees with no-prompt resolution".into(),
+                );
+            }
+        }
+        Ok((requested, effective))
+    }
 }
 
 /// Parent → child control/in-band frames.
@@ -358,6 +446,8 @@ mod tests {
     fn permission_policy_context_round_trips_at_run_boundary() {
         let context = PermissionPolicyContext {
             revision: 9,
+            requested_mode: "bypass".into(),
+            effective_mode: "bypass".into(),
             bypass_permissions: true,
             auto_approve_permissions: false,
             session_id: "child-1".into(),
@@ -396,6 +486,42 @@ mod tests {
         let context = run.permission_policy.expect("permission policy");
         assert!(context.bypass_permissions);
         assert!(!context.auto_approve_permissions);
+        assert_eq!(
+            context.resolved_modes().unwrap(),
+            (
+                bamboo_domain::SessionPermissionMode::Bypass,
+                bamboo_domain::PermissionMode::BypassPermissions,
+            )
+        );
+    }
+
+    #[test]
+    fn permission_policy_rejects_partial_typed_mode_pairs() {
+        let context = PermissionPolicyContext {
+            revision: 1,
+            requested_mode: "auto".to_string(),
+            effective_mode: String::new(),
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            session_id: "partial-policy".to_string(),
+            workspace_path: None,
+            inherit_session_grants: false,
+            policy: serde_json::json!({}),
+        };
+        assert!(context
+            .resolved_modes()
+            .unwrap_err()
+            .contains("provided together"));
+
+        let effective_only = PermissionPolicyContext {
+            requested_mode: String::new(),
+            effective_mode: "auto".to_string(),
+            ..context
+        };
+        assert!(effective_only
+            .resolved_modes()
+            .unwrap_err()
+            .contains("provided together"));
     }
 
     #[test]

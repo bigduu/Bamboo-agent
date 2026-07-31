@@ -73,6 +73,7 @@ pub(super) struct ToolExecutionApplyContext<'a> {
     pub round: usize,
     pub session: &'a mut Session,
     pub tools: &'a Arc<dyn ToolExecutor>,
+    pub session_flags: ToolExecutionSessionFlags,
     pub config: &'a AgentLoopConfig,
     pub runtime_state: &'a mut AgentRuntimeState,
     pub task_context: &'a mut Option<TaskLoopContext>,
@@ -386,6 +387,11 @@ async fn hook_ask_outcome(
             )
         };
 
+    let requested_mode = runtime_state.effective_permission_mode();
+    let resolution = bamboo_domain::resolve_permission_mode(
+        requested_mode,
+        config.permission_mode.unwrap_or_default(),
+    );
     let request = bamboo_tools::permission::PermissionRequest {
         request_id: tool_call.id.clone(),
         session_id: session.id.clone(),
@@ -396,10 +402,9 @@ async fn hook_ask_outcome(
         operation_summary,
         risk_level,
         reason_code: bamboo_tools::permission::PermissionReasonCode::ConfiguredAlwaysAsk,
-        effective_mode: config.permission_mode.unwrap_or_default(),
-        bypass_requested: runtime_state.bypass_permissions,
-        auto_approve_requested: runtime_state.effective_permission_mode()
-            == bamboo_domain::SessionPermissionMode::Auto,
+        effective_mode: resolution.effective,
+        bypass_requested: resolution.bypass_permissions(),
+        auto_approve_requested: requested_mode == bamboo_domain::SessionPermissionMode::Auto,
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),
@@ -587,6 +592,7 @@ pub(super) async fn apply_tool_execution_outcome(
                         round: ctx.round,
                         session: ctx.session,
                         tools: ctx.tools,
+                        session_flags: ctx.session_flags,
                         config: ctx.config,
                         task_context: ctx.task_context,
                         state: ctx.state,
@@ -933,6 +939,10 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
         let mut task_context = None;
         let mut state = RoundExecutionState::default();
+        let session_flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            config.permission_mode.unwrap_or_default(),
+        );
         apply_tool_execution_outcome(
             ToolExecutionApplyContext {
                 tool_call,
@@ -943,6 +953,7 @@ mod hook_tests {
                 round: 0,
                 session,
                 tools,
+                session_flags,
                 config,
                 runtime_state: &mut runtime_state,
                 task_context: &mut task_context,

@@ -59,6 +59,35 @@ const POOLED_IDLE_TIMEOUT_SECS: u64 = 300;
 /// a slow-but-healthy cold start.
 const WORKER_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn active_scoped_session_deny_count(
+    config: &bamboo_tools::permission::PermissionConfig,
+    session_id: &str,
+) -> usize {
+    config
+        .temporary_grants()
+        .into_iter()
+        .filter(|grant| {
+            grant.scope == bamboo_tools::permission::TemporaryPermissionGrantScope::Session
+                && grant.effect == bamboo_tools::permission::TemporaryPermissionGrantEffect::Deny
+                && grant.session_id.as_deref() == Some(session_id)
+        })
+        .count()
+}
+
+fn ensure_no_active_scoped_session_denies(
+    config: &bamboo_tools::permission::PermissionConfig,
+    session_id: &str,
+) -> Result<(), AgentError> {
+    let count = active_scoped_session_deny_count(config, session_id);
+    if count == 0 {
+        Ok(())
+    } else {
+        Err(AgentError::LLM(format!(
+            "external executor activation blocked by {count} active session-scoped explicit deny rule(s)"
+        )))
+    }
+}
+
 /// Plaintext token returned once by the server authority for one Codex run.
 /// `token_id` is non-secret and is the handle used for guaranteed revocation.
 pub struct IssuedCodexRunToken {
@@ -99,6 +128,29 @@ fn executor_uses_bamboo_codex(executor: &ExecutorSpec) -> bool {
             ..
         } if !inherit_user_config.unwrap_or(false)
     )
+}
+
+fn executor_has_read_only_permission_profile(executor: &ExecutorSpec) -> bool {
+    match executor {
+        ExecutorSpec::ClaudeCode {
+            permission_mode, ..
+        } => permission_mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("plan")),
+        ExecutorSpec::Codex {
+            permission_profile,
+            sandbox,
+            ..
+        } => {
+            permission_profile
+                .as_deref()
+                .is_some_and(|profile| profile.eq_ignore_ascii_case("read-only"))
+                || sandbox
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("read-only"))
+        }
+        _ => false,
+    }
 }
 
 fn workspace_is_bamboo_owned(raw: &str) -> bool {
@@ -473,7 +525,8 @@ impl ActorChildRunner {
     /// they share role, provider, model, workspace, disabled-tool set, AND every
     /// capability the worker BAKES at provision time (`BambooRuntimeExecutor`
     /// stamps these once and reuses them across runs): nesting depth, nested-spawn
-    /// stack, bypass mode, permission enforcement, and the depth cap. Omitting any
+    /// stack, requested/effective permission modes, legacy bypass/auto flags,
+    /// permission enforcement, and the depth cap. Omitting any
     /// of these lets the pool hand a run a worker baked for a DIFFERENT posture —
     /// e.g. a depth-1 worker (with its own spawn stack) reused for a depth-4
     /// child would re-stamp `spawn_depth=1` and pass the depth-cap check, breaking
@@ -500,10 +553,12 @@ impl ActorChildRunner {
         // Codex exec and app-server workers are not interchangeable.
         let executor = serde_json::to_string(&spec.executor).unwrap_or_default();
         format!(
-            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}\u{1}executor={executor}",
+            "{role}\u{1}{provider}\u{1}{model}\u{1}{workspace}\u{1}{}\u{1}d={}\u{1}ns={}\u{1}pr={}\u{1}pe={}\u{1}by={}\u{1}auto={}\u{1}ep={}\u{1}md={}\u{1}nha={}\u{1}gro={}\u{1}executor={executor}",
             tools.join(","),
             spec.identity.depth,
             caps.nested_spawn,
+            caps.permission_requested_mode,
+            caps.permission_effective_mode,
             caps.bypass,
             caps.auto_approve_permissions,
             caps.enforce_permissions,
@@ -702,14 +757,16 @@ impl ActorChildRunner {
         // is a bypassed parent and installs the off-loop model-reviewer for its
         // children's forced-ask actions (Phase 6, Part B). The child session
         // already carries the inherited flag (create_child_action seeds it).
-        let permission_mode = session
+        let requested_permission_mode = session
             .agent_runtime_state
             .as_ref()
             .map(|state| state.effective_permission_mode())
             .unwrap_or_default();
-        spec.capabilities.bypass = permission_mode == bamboo_domain::SessionPermissionMode::Bypass;
-        spec.capabilities.auto_approve_permissions =
-            permission_mode == bamboo_domain::SessionPermissionMode::Auto;
+        let configured_permission_mode = self
+            .permission_config
+            .as_ref()
+            .map(|config| config.mode())
+            .unwrap_or_default();
         // #73: propagate "no interactive human approver" (headless / scheduled /
         // deployed root, inherited by the child session). When set, the worker's
         // per-run approval proxy model-reviews a gated action locally instead of
@@ -737,6 +794,24 @@ impl ActorChildRunner {
                 *permission_profile = Some("read-only".to_string());
             }
         }
+        let read_only_overlay = session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.plan_mode.is_some())
+            || spec.capabilities.guardian_read_only
+            || executor_has_read_only_permission_profile(&spec.executor);
+        let permission_resolution = bamboo_domain::resolve_permission_mode_with_read_only(
+            requested_permission_mode,
+            configured_permission_mode,
+            read_only_overlay,
+        );
+        spec.capabilities.bypass = permission_resolution.bypass_permissions();
+        spec.capabilities.auto_approve_permissions =
+            permission_resolution.suppress_approval_prompts();
+        spec.capabilities.permission_requested_mode =
+            permission_resolution.requested.as_str().to_string();
+        spec.capabilities.permission_effective_mode =
+            permission_resolution.effective.as_str().to_string();
         // #193: route this role to a REMOTE resident worker when one is pinned.
         // `spec.identity.role` was just computed from `subagent_type` above; a
         // match flips the placement to Remote and rides the worker's bearer on the
@@ -909,7 +984,7 @@ impl ExternalChildRunner for ActorChildRunner {
             ));
         }
         let project_id = project_id_for_actor_run(session)?;
-        let permission_mode = session
+        let requested_permission_mode = session
             .agent_runtime_state
             .as_ref()
             .map(|state| state.effective_permission_mode())
@@ -918,21 +993,66 @@ impl ExternalChildRunner for ActorChildRunner {
         // provisioned), so reused local workers and resident remote/broker
         // workers observe the latest durable revision and bypass flag at the
         // next run boundary. Session grants are intentionally not inherited.
-        let permission_policy = self.permission_config.as_ref().and_then(|config| {
-            serde_json::to_value(config.to_serializable())
-                .ok()
-                .map(|policy| PermissionPolicyContext {
-                    revision: config.policy_revision(),
-                    bypass_permissions: permission_mode
-                        == bamboo_domain::SessionPermissionMode::Bypass,
-                    auto_approve_permissions: permission_mode
-                        == bamboo_domain::SessionPermissionMode::Auto,
-                    session_id: session.id.clone(),
-                    workspace_path: session.workspace.clone(),
-                    inherit_session_grants: false,
-                    policy,
+        let permission_policy = if let Some(config) = self.permission_config.as_ref() {
+            ensure_no_active_scoped_session_denies(config, &session.id)?;
+            let read_only_overlay = session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|state| state.plan_mode.is_some())
+                || spec.capabilities.guardian_read_only
+                || executor_has_read_only_permission_profile(&spec.executor);
+            let resolution = bamboo_domain::resolve_permission_mode_with_read_only(
+                requested_permission_mode,
+                config.mode(),
+                read_only_overlay,
+            );
+            let policy = serde_json::to_value(config.to_serializable()).map_err(|error| {
+                AgentError::LLM(format!(
+                    "failed to serialize permission policy for external executor: {error}"
+                ))
+            })?;
+            Some(PermissionPolicyContext {
+                revision: config.policy_revision(),
+                requested_mode: resolution.requested.as_str().to_string(),
+                effective_mode: resolution.effective.as_str().to_string(),
+                bypass_permissions: resolution.bypass_permissions(),
+                auto_approve_permissions: resolution.suppress_approval_prompts(),
+                session_id: session.id.clone(),
+                workspace_path: session.workspace.clone(),
+                inherit_session_grants: false,
+                policy,
+            })
+        } else {
+            None
+        };
+        let provisioned_permission =
+            spec.capabilities.permission_resolution().map_err(|error| {
+                AgentError::LLM(format!("invalid provisioned permission posture: {error}"))
+            })?;
+        let policy_resolution = permission_policy
+            .as_ref()
+            .map(|context| {
+                context.resolved_modes().map(|(requested, effective)| {
+                    bamboo_domain::PermissionModeResolution {
+                        requested,
+                        effective,
+                    }
                 })
-        });
+            })
+            .transpose()
+            .map_err(|error| {
+                AgentError::LLM(format!("invalid host permission posture: {error}"))
+            })?;
+        let host_audit = bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata);
+        let expected_permission_posture = ExpectedPermissionPosture {
+            policy_revision: permission_policy
+                .as_ref()
+                .map(|context| context.revision)
+                .or_else(|| host_audit.as_ref().map(|audit| audit.policy_revision))
+                .unwrap_or_default(),
+            resolution: policy_resolution.unwrap_or(provisioned_permission),
+            expected_audit_revision: host_audit.map(|audit| audit.audit_revision),
+        };
 
         // Backpressure: hold a concurrency slot for the lifetime of the *run*
         // (cancellation still proceeds — the cancel branch in drive() runs while
@@ -1242,6 +1362,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 live_rx: &mut live_rx,
                 delivery_rx: &mut delivery_rx,
                 logical_session: session,
+                expected_permission_posture: Some(expected_permission_posture),
                 session_inbox_runtime: session_inbox_runtime.as_ref(),
                 activation_run_id: bound_activation_run_id.as_deref(),
                 initial_inflight_claims,
@@ -1744,10 +1865,65 @@ struct ActorDriveContext<'a> {
     live_rx: &'a mut mpsc::UnboundedReceiver<ParentFrame>,
     delivery_rx: &'a mut mpsc::UnboundedReceiver<u64>,
     logical_session: &'a mut Session,
+    expected_permission_posture: Option<ExpectedPermissionPosture>,
     session_inbox_runtime: Option<&'a SessionInboxRuntimeBinding>,
     activation_run_id: Option<&'a str>,
     initial_inflight_claims: VecDeque<SessionInboxClaim>,
     first_frame_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedPermissionPosture {
+    policy_revision: u64,
+    resolution: bamboo_domain::PermissionModeResolution,
+    expected_audit_revision: Option<u64>,
+}
+
+fn permission_posture_seed_from_event(
+    session: &Session,
+    event: &AgentEvent,
+) -> Result<Option<bamboo_domain::PermissionAuditSeed>, String> {
+    let AgentEvent::PermissionPostureActivated {
+        session_id,
+        policy_revision,
+        requested_mode,
+        effective_mode,
+        executor_mapping,
+    } = event
+    else {
+        return Ok(None);
+    };
+    if session_id != &session.id {
+        return Err("permission posture event targets a different logical session".to_string());
+    }
+    let requested = bamboo_domain::SessionPermissionMode::from_audit_str(requested_mode)
+        .ok_or_else(|| "permission posture event has an invalid requested mode".to_string())?;
+    let effective = bamboo_domain::PermissionMode::from_audit_str(effective_mode)
+        .ok_or_else(|| "permission posture event has an invalid effective mode".to_string())?;
+    let resolution = bamboo_domain::PermissionModeResolution {
+        requested,
+        effective,
+    };
+    if !resolution.is_consistent() {
+        return Err("permission posture event has an inconsistent mode pair".to_string());
+    }
+    let current_requested = session
+        .agent_runtime_state
+        .as_ref()
+        .map(|state| state.effective_permission_mode())
+        .unwrap_or_default();
+    if current_requested != requested {
+        return Err("permission posture event is stale for the host typed mode".to_string());
+    }
+    let mapping_chars = executor_mapping.chars().count();
+    if mapping_chars == 0 || mapping_chars > bamboo_domain::MAX_PERMISSION_EXECUTOR_MAPPING_CHARS {
+        return Err("permission posture event has an invalid executor mapping".to_string());
+    }
+    Ok(Some(bamboo_domain::PermissionAuditSeed::new(
+        *policy_revision,
+        resolution,
+        executor_mapping,
+    )))
 }
 
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
@@ -1775,6 +1951,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         live_rx,
         delivery_rx,
         logical_session,
+        expected_permission_posture,
         session_inbox_runtime,
         activation_run_id,
         initial_inflight_claims,
@@ -1834,6 +2011,65 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                     Ok(Some(ChildFrame::Event { event })) => {
                         // AgentEvent is serialized verbatim on the wire (zero mapping).
                         if let Ok(ev) = serde_json::from_value::<AgentEvent>(event) {
+                            if let Some(seed) = permission_posture_seed_from_event(logical_session, &ev)
+                                .map_err(AgentError::LLM)?
+                            {
+                                if let Some(expected) = expected_permission_posture {
+                                    if seed.policy_revision != expected.policy_revision
+                                        || seed.resolution != expected.resolution
+                                    {
+                                        return Err(AgentError::LLM(
+                                            "permission posture event does not match the host-dispatched policy"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                                if let Some(binding) = session_inbox_runtime {
+                                    let saved = binding
+                                        .persistence
+                                        .record_permission_posture_activation(
+                                            &logical_session.id,
+                                            expected_permission_posture
+                                                .and_then(|expected| expected.expected_audit_revision),
+                                            &seed,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            AgentError::LLM(format!(
+                                                "persist child permission posture bootstrap: {error}"
+                                            ))
+                                        })?
+                                        .ok_or_else(|| {
+                                            AgentError::LLM(
+                                                "persist child permission posture bootstrap: session not found"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                    let snapshot = bamboo_domain::PermissionAuditSnapshot::from_metadata(
+                                        &saved.metadata,
+                                    )
+                                    .ok_or_else(|| {
+                                        AgentError::LLM(
+                                            "persisted child permission posture audit is incomplete"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                    snapshot.write_to(&mut logical_session.metadata);
+                                } else {
+                                    // In-memory/custom actor embeddings still use a host-owned
+                                    // clock. Durable server paths always take the atomic branch.
+                                    bamboo_domain::record_permission_audit(
+                                        &mut logical_session.metadata,
+                                        &seed,
+                                        None,
+                                    )
+                                    .map_err(|error| {
+                                        AgentError::LLM(format!(
+                                            "record in-memory child permission posture: {error}"
+                                        ))
+                                    })?;
+                                }
+                            }
                             let _ = event_tx.send(ev).await;
                         }
                     }
@@ -2109,6 +2345,82 @@ mod tests {
     use super::*;
     use crate::SessionActivationRouter;
     use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
+
+    #[test]
+    fn actor_preflight_counts_only_current_session_scoped_denies() {
+        let config = bamboo_tools::permission::PermissionConfig::new();
+        let secret_matcher = "TOP_SECRET_ACTOR_DENY_MATCHER";
+        config.deny_scoped_session_permission(
+            "target-session",
+            bamboo_tools::permission::PermissionType::ExecuteCommand,
+            secret_matcher,
+        );
+        config.deny_scoped_session_permission(
+            "other-session",
+            bamboo_tools::permission::PermissionType::WriteFile,
+            "/other/**",
+        );
+
+        assert_eq!(
+            active_scoped_session_deny_count(&config, "target-session"),
+            1
+        );
+        assert_eq!(
+            active_scoped_session_deny_count(&config, "clean-session"),
+            0
+        );
+        let error = ensure_no_active_scoped_session_denies(&config, "target-session")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret_matcher));
+        ensure_no_active_scoped_session_denies(&config, "clean-session")
+            .expect("another session's deny must not block this activation");
+    }
+
+    #[test]
+    fn permission_posture_event_rejects_oversized_executor_mapping() {
+        let session = Session::new("mapping-bound", "model");
+        let event = AgentEvent::PermissionPostureActivated {
+            session_id: session.id.clone(),
+            policy_revision: 1,
+            requested_mode: "default".to_string(),
+            effective_mode: "default".to_string(),
+            executor_mapping: "x".repeat(bamboo_domain::MAX_PERMISSION_EXECUTOR_MAPPING_CHARS + 1),
+        };
+
+        assert!(permission_posture_seed_from_event(&session, &event)
+            .unwrap_err()
+            .contains("executor mapping"));
+    }
+
+    #[test]
+    fn remote_audit_revision_and_timestamp_fields_cannot_poison_host_audit() {
+        let mut session = Session::new("host-resigns-audit", "model");
+        let hostile_timestamp = "9".repeat(1024);
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "permission_posture_activated",
+            "session_id": session.id.clone(),
+            "policy_revision": 31,
+            "requested_mode": "default",
+            "effective_mode": "default",
+            "executor_mapping": "codex_exec:approval_policy=never",
+            "audit_revision": u64::MAX,
+            "transitioned_at": hostile_timestamp,
+        }))
+        .expect("unknown remote audit fields are ignored by the typed event");
+        let seed = permission_posture_seed_from_event(&session, &event)
+            .unwrap()
+            .expect("permission event");
+
+        let host_revision =
+            bamboo_domain::record_permission_audit(&mut session.metadata, &seed, None).unwrap();
+        let host_audit = bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
+            .expect("host-generated complete audit");
+        assert_eq!(host_audit.audit_revision, host_revision);
+        assert!(host_audit.audit_revision < bamboo_domain::MAX_PERMISSION_AUDIT_REVISION);
+        assert_ne!(host_audit.transitioned_at, hostile_timestamp);
+        assert!(chrono::DateTime::parse_from_rfc3339(&host_audit.transitioned_at).is_ok());
+    }
 
     struct ActorFaultingPersistence {
         inner: Arc<bamboo_storage::LockedSessionStore>,
@@ -2613,6 +2925,7 @@ mod tests {
             live_rx: &mut live_rx,
             delivery_rx: &mut delivery_rx,
             logical_session: &mut session,
+            expected_permission_posture: None,
             session_inbox_runtime: Some(&binding),
             activation_run_id: Some(run_id),
             initial_inflight_claims: claims,
@@ -3121,6 +3434,26 @@ mod tests {
             "auto_approve_permissions must split"
         );
 
+        let mut global_auto = spec_with("explorer", "p", "m", Some("/ws"), None);
+        global_auto.capabilities.permission_requested_mode = "default".to_string();
+        global_auto.capabilities.permission_effective_mode = "auto".to_string();
+        global_auto.capabilities.auto_approve_permissions = true;
+        let mut explicit_auto = global_auto.clone();
+        explicit_auto.capabilities.permission_requested_mode = "auto".to_string();
+        assert_ne!(
+            ActorChildRunner::fingerprint(&global_auto),
+            ActorChildRunner::fingerprint(&explicit_auto),
+            "permission_requested_mode must split global and explicit Auto"
+        );
+
+        let mut plan_overlay = explicit_auto.clone();
+        plan_overlay.capabilities.permission_effective_mode = "plan".to_string();
+        assert_ne!(
+            ActorChildRunner::fingerprint(&explicit_auto),
+            ActorChildRunner::fingerprint(&plan_overlay),
+            "permission_effective_mode must split Plan overlay from Auto"
+        );
+
         let mut enforce = spec_with("explorer", "p", "m", Some("/ws"), None);
         enforce.capabilities.enforce_permissions = true;
         assert_ne!(
@@ -3293,6 +3626,7 @@ mod tests {
                 live_rx: &mut live_rx,
                 delivery_rx: &mut delivery_rx,
                 logical_session: &mut logical_session,
+                expected_permission_posture: None,
                 session_inbox_runtime: None,
                 activation_run_id: None,
                 initial_inflight_claims: VecDeque::new(),
@@ -3354,6 +3688,7 @@ mod tests {
                 live_rx: &mut live_rx,
                 delivery_rx: &mut delivery_rx,
                 logical_session: &mut logical_session,
+                expected_permission_posture: None,
                 session_inbox_runtime: None,
                 activation_run_id: None,
                 initial_inflight_claims: VecDeque::new(),
@@ -3412,6 +3747,7 @@ mod tests {
             live_rx: &mut live_rx,
             delivery_rx: &mut delivery_rx,
             logical_session: &mut logical_session,
+            expected_permission_posture: None,
             session_inbox_runtime: None,
             activation_run_id: None,
             initial_inflight_claims: VecDeque::new(),
@@ -3448,6 +3784,7 @@ mod tests {
             live_rx: &mut live_rx,
             delivery_rx: &mut delivery_rx,
             logical_session: &mut logical_session,
+            expected_permission_posture: None,
             session_inbox_runtime: None,
             activation_run_id: None,
             initial_inflight_claims: VecDeque::new(),

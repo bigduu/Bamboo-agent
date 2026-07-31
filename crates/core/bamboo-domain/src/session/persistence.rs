@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::session::task::TaskList;
 use crate::session::types::Session;
+use crate::session::PermissionAuditSeed;
 
 /// Merge messages from a live runner snapshot into an already-durable
 /// transcript without ever removing or rewriting a durable message.
@@ -118,6 +119,45 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
+    /// Authoritatively seed one validated actor activation.
+    ///
+    /// Unlike an ordinary runtime save, the incoming RunSpec posture and its
+    /// complete audit record must replace any posture left by a previous warm
+    /// activation. Implementations must still preserve durable SessionInbox
+    /// admission/transcript proof and serialize the operation per session.
+    ///
+    /// There is no safe generic implementation through
+    /// [`Self::save_runtime_session`]: that primitive is explicitly allowed to
+    /// adopt a newer disk posture, which would make warm workers sticky across
+    /// runs. Custom persisters therefore fail closed until they implement this
+    /// authority boundary deliberately.
+    async fn seed_runtime_activation(&self, _session: &mut Session) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support authoritative activation seeding",
+        ))
+    }
+
+    /// Atomically persist a worker-declared executor mapping for the current
+    /// host-authoritative permission posture.
+    ///
+    /// The caller supplies the audit revision it observed before dispatch.
+    /// Implementations must load and compare that revision while holding the
+    /// per-session lock, reject a concurrent posture update, and allocate a new
+    /// host revision/timestamp themselves. Remote audit clocks are never an
+    /// authority at this boundary.
+    async fn record_permission_posture_activation(
+        &self,
+        _session_id: &str,
+        _expected_audit_revision: Option<u64>,
+        _seed: &PermissionAuditSeed,
+    ) -> io::Result<Option<Session>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support atomic permission posture activation",
+        ))
+    }
+
     /// Persist only the runtime control-plane for a session.
     ///
     /// Task lists and other runtime metadata belong to the control-plane and do
@@ -228,6 +268,21 @@ pub trait RuntimeSessionPersistence: Send + Sync {
 impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T> {
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_runtime_session(session).await
+    }
+
+    async fn seed_runtime_activation(&self, session: &mut Session) -> io::Result<()> {
+        (**self).seed_runtime_activation(session).await
+    }
+
+    async fn record_permission_posture_activation(
+        &self,
+        session_id: &str,
+        expected_audit_revision: Option<u64>,
+        seed: &PermissionAuditSeed,
+    ) -> io::Result<Option<Session>> {
+        (**self)
+            .record_permission_posture_activation(session_id, expected_audit_revision, seed)
+            .await
     }
 
     async fn save_runtime_control_plane(&self, session: &mut Session) -> io::Result<()> {

@@ -7,7 +7,7 @@ pub use bamboo_domain::{CompiledWorkflow, WorkflowCompileError};
 pub use executor::{
     AgentStepPort, AgentStepResult, NamedAgentSpec, PermissionDecision, WorkflowDefinitionPort,
     WorkflowPolicyPort, WorkflowPolicyTarget, WorkflowRunEngine, WorkflowRunError,
-    WorkflowSecretMaterial, WorkflowSecretResolverPort,
+    WorkflowSecretMaterial, WorkflowSecretResolverPort, WorkflowSessionPermissionPort,
 };
 pub use repository::{FileWorkflowRunRepository, WorkflowRunRepository};
 

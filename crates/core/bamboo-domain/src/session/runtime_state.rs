@@ -311,6 +311,15 @@ impl SessionPermissionMode {
         }
     }
 
+    pub fn from_audit_str(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "bypass" => Some(Self::Bypass),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
     fn is_default(&self) -> bool {
         *self == Self::Default
     }

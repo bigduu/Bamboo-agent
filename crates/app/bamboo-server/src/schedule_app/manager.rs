@@ -409,7 +409,8 @@ async fn run_schedule_job(
         if let Some(workspace) = session.workspace.as_ref() {
             config.register_session_workspace(session_id.clone(), workspace.clone());
         }
-        record_bamboo_runtime_permission_metadata(&mut session, config.as_ref());
+        record_bamboo_runtime_permission_metadata(&mut session, config.as_ref())
+            .map_err(|error| error.to_string())?;
     }
 
     // #73: a scheduled run has no interactive human approver — mark the root so

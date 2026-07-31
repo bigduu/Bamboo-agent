@@ -1398,22 +1398,23 @@ impl PermissionConfig {
     /// always-ask rules.
     pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
         let configured_mode = self.mode();
-        // Per-session posture is more specific than the process default. Keep
-        // explicit Auto strongest, but never let a configured global Auto
-        // reinterpret a legacy/session Bypass request as Auto: Bypass must
-        // retain its forced-confirmation behavior for compatibility.
-        let effective_mode = if input.auto_approve_requested {
-            PermissionMode::Auto
+        // Normalize legacy callers that accidentally supplied both booleans:
+        // Auto is a no-prompt posture, never an alias for Bypass or its wider
+        // sandbox semantics. Plan remains a hard read-only overlay.
+        let requested = if input.auto_approve_requested {
+            bamboo_domain::SessionPermissionMode::Auto
         } else if input.bypass_requested {
-            PermissionMode::BypassPermissions
+            bamboo_domain::SessionPermissionMode::Bypass
         } else {
-            configured_mode
+            bamboo_domain::SessionPermissionMode::Default
         };
+        let resolution = bamboo_domain::resolve_permission_mode(requested, configured_mode);
+        let effective_mode = resolution.effective;
         let effective_policy = EffectivePermissionPolicy {
             revision: self.policy_revision(),
             mode: effective_mode,
-            bypass_requested: input.bypass_requested,
-            auto_approve_requested: input.auto_approve_requested,
+            bypass_requested: resolution.bypass_permissions(),
+            auto_approve_requested: requested == bamboo_domain::SessionPermissionMode::Auto,
         };
 
         let deny = |code, message: String, matched_rule| PermissionOutcome::Deny {
@@ -1452,6 +1453,18 @@ impl PermissionConfig {
             );
         }
 
+        // Plan/read-only is an authorization boundary rather than an approval
+        // preference. It precedes receipts, grants, disabled-checks, Bypass and
+        // Auto so none of those mechanisms can turn a mutating operation into
+        // an allow while the gate is active.
+        if effective_mode == PermissionMode::Plan && input.risk_level != RiskLevel::Low {
+            return deny(
+                PermissionReasonCode::ModeDenied,
+                "operation denied by plan mode".to_string(),
+                None,
+            );
+        }
+
         if input.consume_once
             && self.consume_once(
                 &input.session_id,
@@ -1470,7 +1483,7 @@ impl PermissionConfig {
         // exact one-shot receipt, but before every source of an approval
         // request. It therefore produces zero prompts without weakening
         // platform, durable, session, or legacy deny rules.
-        if effective_mode == PermissionMode::Auto {
+        if resolution.suppress_approval_prompts() {
             return PermissionOutcome::Allow {
                 source: PermissionDecisionSource::Auto,
                 effective_policy,
@@ -1545,14 +1558,7 @@ impl PermissionConfig {
             };
         }
 
-        match configured_mode {
-            PermissionMode::Plan if input.risk_level != RiskLevel::Low => {
-                return deny(
-                    PermissionReasonCode::ModeDenied,
-                    "operation denied by plan mode".to_string(),
-                    None,
-                );
-            }
+        match effective_mode {
             PermissionMode::DontAsk => {
                 return deny(
                     PermissionReasonCode::ModeDenied,
@@ -1861,6 +1867,31 @@ pub struct SerializablePermissionConfig {
     /// and are evaluated without broadening during the migration window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub durable_rules: Vec<DurablePermissionRule>,
+}
+
+/// Conservative external-runner preflight for explicit Bamboo deny policy.
+///
+/// Vendor native no-prompt modes do not expose a reliable per-tool callback.
+/// Any live explicit deny therefore makes such an activation fail closed before
+/// process spawn; workspace/session applicability that cannot be proven at this
+/// boundary is deliberately treated as applicable.
+pub fn explicit_deny_policy_reason(policy: &SerializablePermissionConfig) -> Option<String> {
+    let legacy_denies = policy
+        .whitelist
+        .iter()
+        .filter(|rule| !rule.allowed && !rule.is_expired())
+        .count();
+    let durable_denies = policy
+        .durable_rules
+        .iter()
+        .filter(|rule| rule.effect == PermissionRuleEffect::Deny && !rule.is_expired())
+        .count();
+    let total = legacy_denies.saturating_add(durable_denies);
+    (total > 0).then(|| {
+        format!(
+            "external no-prompt executor cannot safely enforce {total} explicit Bamboo deny rule(s)"
+        )
+    })
 }
 
 impl Default for SerializablePermissionConfig {

@@ -2,6 +2,7 @@ use crate::error::AppError;
 use bamboo_agent_core::tools::ToolResult;
 
 use super::{
+    enforce_plan_tool_gate,
     models::{ToolExecutionRequest, ToolParameter},
     request::{
         build_tool_call, canonical_tool_name_or_error, parse_arguments, trimmed_session_id,
@@ -9,6 +10,28 @@ use super::{
     },
     response::build_execution_response,
 };
+
+#[test]
+fn direct_http_plan_auto_blocks_mutation_and_keeps_reads_available() {
+    let mut session = bamboo_agent_core::Session::new("http-plan-auto", "model");
+    let mut runtime = bamboo_domain::AgentRuntimeState::new("http-plan-auto");
+    runtime.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+    session.agent_runtime_state = Some(runtime);
+    let flags =
+        bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &session,
+            bamboo_domain::PermissionMode::Plan,
+        );
+
+    assert!(flags.plan_read_only);
+    assert!(flags.auto_approve_permissions);
+    assert!(!flags.bypass_permissions);
+    assert!(matches!(
+        enforce_plan_tool_gate(flags, "Write"),
+        Err(AppError::ToolExecutionError(message)) if message.contains("Plan mode")
+    ));
+    enforce_plan_tool_gate(flags, "Read").expect("read-only HTTP tool remains available");
+}
 
 #[test]
 fn canonical_tool_name_or_error_resolves_aliases() {

@@ -37,7 +37,7 @@ mod tests;
 
 use actix_web::{web, HttpResponse};
 
-use bamboo_agent_core::tools::ToolExecutionContext;
+use bamboo_agent_core::tools::{ToolExecutionContext, ToolExecutionSessionFlags};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
@@ -45,6 +45,19 @@ use crate::error::AppError;
 pub use models::{
     ToolExecutionRequest, ToolExecutionResponse, ToolExecutionResultPayload, ToolParameter,
 };
+
+fn enforce_plan_tool_gate(
+    session_flags: ToolExecutionSessionFlags,
+    tool_name: &str,
+) -> Result<(), AppError> {
+    if session_flags.plan_read_only && !bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name)
+    {
+        return Err(AppError::ToolExecutionError(format!(
+            "Plan mode: {tool_name} operation blocked"
+        )));
+    }
+    Ok(())
+}
 
 /// Execute a tool directly without agent loop.
 ///
@@ -111,6 +124,41 @@ pub async fn execute_tool(
     let args = request::parse_arguments(parameters);
     let call = request::build_tool_call(canonical_tool_name, args)?;
 
+    let configured_mode = app_state
+        .permission_checker
+        .permission_config()
+        .map(|config| config.mode())
+        .unwrap_or_default();
+    let session_flags = if let Some(session_id) = session_id {
+        let session = app_state
+            .session_repo
+            .try_load(session_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("session {session_id}")))?;
+        let effective_configured = if session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.plan_mode.is_some())
+        {
+            bamboo_domain::PermissionMode::Plan
+        } else {
+            configured_mode
+        };
+        ToolExecutionSessionFlags::from_session_and_configured_mode(&session, effective_configured)
+    } else {
+        let resolution = bamboo_domain::resolve_permission_mode(
+            bamboo_domain::SessionPermissionMode::Default,
+            configured_mode,
+        );
+        ToolExecutionSessionFlags {
+            bypass_permissions: resolution.bypass_permissions(),
+            auto_approve_permissions: resolution.suppress_approval_prompts(),
+            plan_read_only: resolution.effective == bamboo_domain::PermissionMode::Plan,
+        }
+    };
+
+    enforce_plan_tool_gate(session_flags, &call.function.name)?;
+
     let root_tools = app_state.tools_for(crate::tools::ToolSurface::Root);
     let available_tool_schemas = root_tools.list_tools();
     let result = root_tools
@@ -121,8 +169,9 @@ pub async fn execute_tool(
                 tool_call_id: &call.id,
                 event_tx: None,
                 available_tool_schemas: Some(available_tool_schemas.as_slice()),
-                bypass_permissions: false,
-                auto_approve_permissions: false,
+                bypass_permissions: session_flags.bypass_permissions,
+                auto_approve_permissions: session_flags.auto_approve_permissions,
+                plan_read_only: session_flags.plan_read_only,
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,

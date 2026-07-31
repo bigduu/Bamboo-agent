@@ -183,6 +183,11 @@ pub struct ToolCtx {
     pub available_tool_schemas: Arc<[ToolSchema]>,
     /// Per-session bypass-permissions flag.
     pub bypass_permissions: bool,
+    /// Zero-prompt approval posture. Unlike legacy Bypass, this must survive
+    /// nested tool dispatch while hard authorization gates remain active.
+    pub auto_approve_permissions: bool,
+    /// Hard Plan/read-only authorization overlay for nested dispatch.
+    pub plan_read_only: bool,
     /// Whether the executing loop can suspend and self-resume for detached work.
     pub can_async_resume: bool,
     /// Sink that pushes a detached tool's real result into the owning loop.
@@ -203,6 +208,8 @@ impl ToolCtx {
             event_tx: None,
             available_tool_schemas: Arc::from(Vec::new()),
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             async_completion_sink: None,
             bash_completion_sink: None,

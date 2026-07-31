@@ -55,6 +55,10 @@ pub struct AgentRuntime {
     pub project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     pub metrics_collector: MetricsCollector,
     pub config: Arc<RwLock<Config>>,
+    /// Live process-wide permission policy when the embedding exposes one.
+    pub permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    /// SDK/static fallback used when there is no live policy handle.
+    pub permission_mode: PermissionMode,
 
     /// Reloadable LLM provider handle (delegates to the latest provider).
     pub provider: Arc<dyn LLMProvider>,
@@ -94,6 +98,8 @@ pub struct AgentRuntimeBuilder {
     project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     metrics_collector: Option<MetricsCollector>,
     config: Option<Arc<RwLock<Config>>>,
+    permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
+    permission_mode: PermissionMode,
     provider: Option<Arc<dyn LLMProvider>>,
     default_tools: Option<Arc<dyn ToolExecutor>>,
     hook_runner: Arc<HookRunner>,
@@ -112,6 +118,8 @@ impl AgentRuntimeBuilder {
             project_context_resolver: None,
             metrics_collector: None,
             config: None,
+            permission_config: None,
+            permission_mode: PermissionMode::Default,
             provider: None,
             default_tools: None,
             hook_runner: Arc::new(HookRunner::new()),
@@ -171,6 +179,16 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    pub fn permission_config(mut self, v: Arc<bamboo_tools::permission::PermissionConfig>) -> Self {
+        self.permission_config = Some(v);
+        self
+    }
+
+    pub fn permission_mode(mut self, v: PermissionMode) -> Self {
+        self.permission_mode = v;
+        self
+    }
+
     pub fn provider(mut self, v: Arc<dyn LLMProvider>) -> Self {
         self.provider = Some(v);
         self
@@ -210,6 +228,8 @@ impl AgentRuntimeBuilder {
                 .metrics_collector
                 .ok_or_else(|| format_missing("metrics_collector"))?,
             config: self.config.ok_or_else(|| format_missing("config"))?,
+            permission_config: self.permission_config,
+            permission_mode: self.permission_mode,
             provider: self.provider.ok_or_else(|| format_missing("provider"))?,
             default_tools: self
                 .default_tools
@@ -695,6 +715,15 @@ impl AgentRuntime {
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
+        let configured_permission_mode = self
+            .permission_config
+            .as_ref()
+            .map(|config| config.mode())
+            .unwrap_or(self.permission_mode);
+        let active_plan_gate = session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.plan_mode.is_some());
 
         // Decompose the roster back into the loose locals the resolution logic
         // below expects. This preserves the byte-for-byte `None → Config`
@@ -785,11 +814,11 @@ impl AgentRuntime {
                 .map(PromptMemoryFlags::from)
                 .unwrap_or_default(),
             features_dynamic_model_routing: config.features.dynamic_model_routing,
-            permission_mode: session
-                .agent_runtime_state
-                .as_ref()
-                .and_then(|state| state.plan_mode.as_ref())
-                .map(|_| PermissionMode::Plan),
+            permission_mode: Some(if active_plan_gate {
+                PermissionMode::Plan
+            } else {
+                configured_permission_mode
+            }),
             gold_config,
             guardian_config,
             guardian_spawner,
