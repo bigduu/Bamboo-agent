@@ -85,6 +85,7 @@ pub use bamboo_domain::{
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
 pub use bamboo_engine::{
     Agent as RuntimeAgent, AgentBuilder as RuntimeAgentBuilder, ExecuteRequest, HookRunner,
+    LifecycleHookEvent, LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook,
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationRouter,
     SessionActivationSpawner, SessionMessagingMetrics, SessionMessagingMetricsSnapshot,
     SessionMessenger, SessionMessengerAdmission, SessionMessengerError, SessionMessengerReceipt,

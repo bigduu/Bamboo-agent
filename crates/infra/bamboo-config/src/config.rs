@@ -1527,7 +1527,7 @@ pub struct ConfigValues {
     #[serde(default)]
     pub hooks: HooksConfig,
 
-    /// User-configured agent lifecycle command hooks.
+    /// User-configured agent lifecycle command or external script handlers.
     ///
     /// This is intentionally separate from `hooks`, which is already the
     /// provider HTTP request-hook namespace. Lifecycle hooks are snapshotted
@@ -2295,7 +2295,7 @@ impl LifecycleHooksConfig {
     }
 }
 
-/// A matcher and its ordered command-hook list for one lifecycle event.
+/// A matcher and its ordered handler list for one lifecycle event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleHookGroup {
     /// A disabled group remains persisted and editable but is not registered
@@ -2308,7 +2308,7 @@ pub struct LifecycleHookGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     #[serde(default)]
-    pub hooks: Vec<LifecycleHookCommand>,
+    pub hooks: Vec<LifecycleHookHandler>,
 }
 
 impl Default for LifecycleHookGroup {
@@ -2321,24 +2321,119 @@ impl Default for LifecycleHookGroup {
     }
 }
 
-/// Supported lifecycle hook implementation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LifecycleHookType {
-    Command,
+/// One configured lifecycle hook handler.
+///
+/// The internally tagged representation preserves the existing command JSON
+/// while allowing handler-specific validation for external scripts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LifecycleHookHandler {
+    Command {
+        command: String,
+        #[serde(
+            default = "default_lifecycle_hook_timeout_ms",
+            skip_serializing_if = "lifecycle_hook_timeout_is_default"
+        )]
+        timeout_ms: u64,
+    },
+    Script {
+        path: String,
+        #[serde(default, skip_serializing_if = "LifecycleScriptRunner::is_auto")]
+        runner: LifecycleScriptRunner,
+        #[serde(
+            default = "default_lifecycle_hook_timeout_ms",
+            skip_serializing_if = "lifecycle_hook_timeout_is_default"
+        )]
+        timeout_ms: u64,
+    },
 }
 
-/// One configured lifecycle shell command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LifecycleHookCommand {
-    #[serde(rename = "type")]
-    pub hook_type: LifecycleHookType,
-    pub command: String,
-    #[serde(
-        default = "default_lifecycle_hook_timeout_ms",
-        skip_serializing_if = "lifecycle_hook_timeout_is_default"
-    )]
-    pub timeout_ms: u64,
+/// Runtime used to execute a lifecycle script.
+///
+/// `auto` infers the language from the file extension and tries the system
+/// runtimes in a deterministic order. Explicit runners are useful when both
+/// Node.js and Bun are installed or when a deployment standardizes one binary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LifecycleScriptRunner {
+    #[default]
+    Auto,
+    Node,
+    Bun,
+    Python,
+    Bash,
+    PowerShell,
+    Cmd,
+}
+
+impl LifecycleScriptRunner {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Node => "node",
+            Self::Bun => "bun",
+            Self::Python => "python",
+            Self::Bash => "bash",
+            Self::PowerShell => "powershell",
+            Self::Cmd => "cmd",
+        }
+    }
+
+    /// Whether this runner can execute the supplied supported script path.
+    pub fn supports_path(self, path: &str) -> bool {
+        let extension = lifecycle_script_extension(path);
+        match self {
+            Self::Auto => extension.is_some(),
+            Self::Node | Self::Bun => {
+                matches!(extension.as_deref(), Some("js" | "mjs" | "cjs"))
+            }
+            Self::Python => matches!(extension.as_deref(), Some("py")),
+            Self::Bash => matches!(extension.as_deref(), Some("sh")),
+            Self::PowerShell => matches!(extension.as_deref(), Some("ps1")),
+            Self::Cmd => matches!(extension.as_deref(), Some("bat" | "cmd")),
+        }
+    }
+}
+
+/// Return the normalized extension when the path names a supported lifecycle
+/// script.
+pub fn lifecycle_script_extension(path: &str) -> Option<String> {
+    let extension = std::path::Path::new(path)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "js" | "mjs" | "cjs" | "py" | "sh" | "ps1" | "bat" | "cmd"
+    )
+    .then_some(extension)
+}
+
+impl LifecycleHookHandler {
+    pub fn command(command: impl Into<String>, timeout_ms: u64) -> Self {
+        Self::Command {
+            command: command.into(),
+            timeout_ms,
+        }
+    }
+
+    pub fn script(path: impl Into<String>, runner: LifecycleScriptRunner, timeout_ms: u64) -> Self {
+        Self::Script {
+            path: path.into(),
+            runner,
+            timeout_ms,
+        }
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::Command { timeout_ms, .. } | Self::Script { timeout_ms, .. } => *timeout_ms,
+        }
+    }
 }
 
 /// Request override configuration for provider-specific HTTP behavior.
@@ -5012,11 +5107,11 @@ mod tests {
             "legacy groups without an enabled flag remain active"
         );
         assert_eq!(
-            config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms,
+            config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms(),
             DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
         );
         assert_eq!(
-            config.lifecycle_hooks.session_start[0].hooks[0].timeout_ms,
+            config.lifecycle_hooks.session_start[0].hooks[0].timeout_ms(),
             25
         );
 
@@ -5037,6 +5132,62 @@ mod tests {
             .get("timeout_ms")
             .is_none());
         assert!(json.get("hooks").is_some());
+    }
+
+    #[test]
+    fn script_lifecycle_hook_uses_auto_runner_and_shared_timeout_default() {
+        let handler: LifecycleHookHandler = serde_json::from_value(serde_json::json!({
+            "type": "script",
+            "path": ".bamboo/hooks/check.js"
+        }))
+        .expect("script lifecycle hook should deserialize");
+
+        assert_eq!(handler.timeout_ms(), DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS);
+        assert!(matches!(
+            handler,
+            LifecycleHookHandler::Script {
+                runner: LifecycleScriptRunner::Auto,
+                ..
+            }
+        ));
+        let json = serde_json::to_value(handler).expect("script hook should serialize");
+        assert_eq!(json["type"], "script");
+        assert!(json.get("timeout_ms").is_none());
+        assert!(json.get("runner").is_none());
+    }
+
+    #[test]
+    fn script_runner_support_is_extension_aware() {
+        assert!(LifecycleScriptRunner::Auto.supports_path("guard.PS1"));
+        assert!(LifecycleScriptRunner::Node.supports_path("guard.mjs"));
+        assert!(LifecycleScriptRunner::Bun.supports_path("guard.cjs"));
+        assert!(LifecycleScriptRunner::Python.supports_path("guard.py"));
+        assert!(LifecycleScriptRunner::Bash.supports_path("guard.sh"));
+        assert!(LifecycleScriptRunner::PowerShell.supports_path("guard.ps1"));
+        assert!(LifecycleScriptRunner::Cmd.supports_path("guard.bat"));
+        assert!(LifecycleScriptRunner::Cmd.supports_path("guard.cmd"));
+        assert!(!LifecycleScriptRunner::Node.supports_path("guard.py"));
+        assert!(!LifecycleScriptRunner::Auto.supports_path("guard.rb"));
+    }
+
+    #[test]
+    fn script_runner_names_round_trip_through_config_json() {
+        for (runner, name) in [
+            (LifecycleScriptRunner::Auto, "auto"),
+            (LifecycleScriptRunner::Node, "node"),
+            (LifecycleScriptRunner::Bun, "bun"),
+            (LifecycleScriptRunner::Python, "python"),
+            (LifecycleScriptRunner::Bash, "bash"),
+            (LifecycleScriptRunner::PowerShell, "powershell"),
+            (LifecycleScriptRunner::Cmd, "cmd"),
+        ] {
+            let json = serde_json::to_value(runner).unwrap();
+            assert_eq!(json, name);
+            assert_eq!(
+                serde_json::from_value::<LifecycleScriptRunner>(json).unwrap(),
+                runner
+            );
+        }
     }
 
     #[test]

@@ -3700,7 +3700,7 @@ mod tests {
     #[tokio::test]
     async fn background_completion_fires_configured_post_tool_use_command() {
         use bamboo_config::{
-            LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType, LifecycleHooksConfig,
+            LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig,
             DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
         };
 
@@ -3715,11 +3715,10 @@ mod tests {
             post_tool_use: vec![LifecycleHookGroup {
                 enabled: true,
                 matcher: Some("^Bash$".to_string()),
-                hooks: vec![LifecycleHookCommand {
-                    hook_type: LifecycleHookType::Command,
+                hooks: vec![LifecycleHookHandler::command(
                     command,
-                    timeout_ms: DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-                }],
+                    DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                )],
             }],
             ..Default::default()
         };

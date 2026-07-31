@@ -55,6 +55,19 @@ async fn test_validate_lifecycle_hooks_reports_structured_field_errors() {
                             "command": "echo done",
                             "timeout_ms": bamboo_config::MAX_LIFECYCLE_HOOK_TIMEOUT_MS + 1
                         }]
+                    }],
+                    "SessionStart": [{
+                        "hooks": [{
+                            "type": "script",
+                            "path": "   "
+                        }]
+                    }],
+                    "Stop": [{
+                        "hooks": [{
+                            "type": "script",
+                            "path": "guard.py",
+                            "runner": "node"
+                        }]
                     }]
                 }
             }))
@@ -75,6 +88,8 @@ async fn test_validate_lifecycle_hooks_reports_structured_field_errors() {
     assert!(paths.contains(&"lifecycle_hooks.PreToolUse[0].hooks[0].command"));
     assert!(paths.contains(&"lifecycle_hooks.PreToolUse[0].hooks[0].timeout_ms"));
     assert!(paths.contains(&"lifecycle_hooks.SessionEnd[0].hooks[0].timeout_ms"));
+    assert!(paths.contains(&"lifecycle_hooks.SessionStart[0].hooks[0].path"));
+    assert!(paths.contains(&"lifecycle_hooks.Stop[0].hooks[0].runner"));
 
     let response = test::call_service(
         &app,

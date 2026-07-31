@@ -82,8 +82,7 @@ pub(crate) async fn apply_user_prompt_submit_hooks(
 mod tests {
     use super::*;
     use bamboo_config::{
-        LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType,
-        DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+        LifecycleHookGroup, LifecycleHookHandler, DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
     };
 
     fn config(command: &str) -> LifecycleHooksConfig {
@@ -92,11 +91,10 @@ mod tests {
             user_prompt_submit: vec![LifecycleHookGroup {
                 enabled: true,
                 matcher: None,
-                hooks: vec![LifecycleHookCommand {
-                    hook_type: LifecycleHookType::Command,
-                    command: command.to_string(),
-                    timeout_ms: DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-                }],
+                hooks: vec![LifecycleHookHandler::command(
+                    command,
+                    DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                )],
             }],
             ..Default::default()
         }
