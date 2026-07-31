@@ -2,6 +2,7 @@
 
 use bamboo_agent_core::{PendingQuestion, Session};
 use bamboo_domain::session::runtime_state::{AgentRuntimeState, PlanModeState, PlanModeStatus};
+use bamboo_domain::SessionPermissionMode;
 use bamboo_tools::permission::PermissionType;
 use chrono::Utc;
 
@@ -205,9 +206,8 @@ fn apply_plan_mode_transition(
             let pre_mode = session
                 .agent_runtime_state
                 .as_ref()
-                .and_then(|s| s.plan_mode.as_ref())
-                .map(|p| p.pre_permission_mode.clone())
-                .unwrap_or_else(|| "default".to_string());
+                .map(|state| state.effective_permission_mode().as_str().to_string())
+                .unwrap_or_else(|| SessionPermissionMode::Default.as_str().to_string());
 
             let entered_at = Utc::now();
             let status = PlanModeStatus::Exploring;
@@ -236,10 +236,13 @@ fn apply_plan_mode_transition(
             let restored_mode = session
                 .agent_runtime_state
                 .as_ref()
-                .and_then(|state| state.plan_mode.as_ref())
-                .map(|plan| plan.pre_permission_mode.clone())
+                .map(|state| state.effective_permission_mode().as_str().to_string())
                 .unwrap_or_else(|| "default".to_string());
             if let Some(ref mut runtime_state) = session.agent_runtime_state {
+                // The typed requested mode remains live while Plan is active and
+                // may have been changed by a newer PATCH. Exiting Plan clears
+                // only the overlay; the old pre-mode is event history, never a
+                // write authority that may roll back the newer request.
                 runtime_state.plan_mode = None;
             }
             tracing::info!(
@@ -426,6 +429,99 @@ mod tests {
         apply_plan_mode_transition(&mut session, &pending, "Stay in normal mode", None);
 
         assert!(session.agent_runtime_state.is_none());
+    }
+
+    #[test]
+    fn plan_mode_preserves_and_restores_typed_auto_request() {
+        let mut session = Session::new("sess-auto-plan", "test-model");
+        session
+            .agent_runtime_state
+            .get_or_insert_with(|| AgentRuntimeState::new("run-1"))
+            .set_permission_mode(SessionPermissionMode::Auto);
+        let enter = make_pending("EnterPlanMode");
+        let transition =
+            apply_plan_mode_transition(&mut session, &enter, "Enter plan mode", None).unwrap();
+        assert!(matches!(
+            transition,
+            PlanModeTransition::Entered {
+                ref pre_permission_mode,
+                ..
+            } if pre_permission_mode == "auto"
+        ));
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .plan_mode
+                .as_ref()
+                .unwrap()
+                .pre_permission_mode,
+            "auto"
+        );
+
+        let exit = make_pending("ExitPlanMode");
+        let transition = apply_plan_mode_transition(
+            &mut session,
+            &exit,
+            "Approve (Auto mode)",
+            Some("Reviewed plan".to_string()),
+        )
+        .unwrap();
+        assert!(matches!(
+            transition,
+            PlanModeTransition::Exited {
+                ref restored_mode,
+                ..
+            } if restored_mode == "auto"
+        ));
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_does_not_restore_over_a_newer_typed_mode() {
+        let mut session = Session::new("sess-plan-patch", "test-model");
+        let state = session
+            .agent_runtime_state
+            .get_or_insert_with(|| AgentRuntimeState::new("run-1"));
+        state.set_permission_mode(SessionPermissionMode::Auto);
+        state.plan_mode = Some(PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "auto".to_string(),
+            plan_file_path: None,
+            status: PlanModeStatus::AwaitingApproval,
+        });
+        // Simulate a newer PATCH while the Plan overlay is still active.
+        state.set_permission_mode(SessionPermissionMode::Bypass);
+
+        let transition = apply_plan_mode_transition(
+            &mut session,
+            &make_pending("ExitPlanMode"),
+            "Approve (Default mode)",
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            transition,
+            PlanModeTransition::Exited {
+                ref restored_mode,
+                ..
+            } if restored_mode == "bypass"
+        ));
+        let state = session.agent_runtime_state.unwrap();
+        assert!(state.plan_mode.is_none());
+        assert_eq!(
+            state.effective_permission_mode(),
+            SessionPermissionMode::Bypass
+        );
     }
 
     #[test]

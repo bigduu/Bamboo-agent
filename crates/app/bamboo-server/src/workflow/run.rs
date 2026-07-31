@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_agent_core::tools::{
+    Tool, ToolClass, ToolCtx, ToolError, ToolExecutionSessionFlags, ToolOutcome, ToolResult,
+};
 use bamboo_domain::{
     StartWorkflowRun, WorkflowBudgets, WorkflowDefinitionBundle, WorkflowProgress,
     WorkflowRunDefinition, WorkflowRunSnapshot,
@@ -13,6 +15,7 @@ use bamboo_engine::{
     AgentStepPort, AgentStepResult, FileWorkflowRunRepository, NamedAgentSpec, PermissionDecision,
     WorkflowDefinitionPort, WorkflowPolicyPort, WorkflowPolicyTarget, WorkflowRunEngine,
     WorkflowRunError, WorkflowSecretMaterial, WorkflowSecretResolverPort,
+    WorkflowSessionPermissionPort,
 };
 use bamboo_skills::SkillManager;
 use serde::Deserialize;
@@ -47,12 +50,54 @@ pub struct WorkflowRunAccess {
     sessions: bamboo_engine::SessionRepository,
 }
 
+struct ServerWorkflowSessionPermissions {
+    sessions: bamboo_engine::SessionRepository,
+    permission_config: Arc<bamboo_tools::permission::PermissionConfig>,
+}
+
+#[async_trait]
+impl WorkflowSessionPermissionPort for ServerWorkflowSessionPermissions {
+    async fn flags_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ToolExecutionSessionFlags, String> {
+        let session = self
+            .sessions
+            .try_load(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("workflow session '{session_id}' does not exist"))?;
+        let configured = if session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.plan_mode.is_some())
+        {
+            bamboo_domain::PermissionMode::Plan
+        } else {
+            self.permission_config.mode()
+        };
+        Ok(ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &session, configured,
+        ))
+    }
+}
+
 impl WorkflowRunAccess {
     pub async fn new(
         data_dir: &Path,
         tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
         skills: Arc<SkillManager>,
         sessions: bamboo_engine::SessionRepository,
+    ) -> Result<Self, String> {
+        Self::new_with_permission_config(data_dir, tools, skills, sessions, None).await
+    }
+
+    pub async fn new_with_permission_config(
+        data_dir: &Path,
+        tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+        skills: Arc<SkillManager>,
+        sessions: bamboo_engine::SessionRepository,
+        permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     ) -> Result<Self, String> {
         let repository = Arc::new(
             FileWorkflowRunRepository::new(data_dir.join("workflow-runs"))
@@ -76,6 +121,12 @@ impl WorkflowRunAccess {
                 max_cost_micros: Some(MAX_COST_MICROS),
             },
         );
+        if let Some(permission_config) = permission_config {
+            engine.set_session_permission_port(Arc::new(ServerWorkflowSessionPermissions {
+                sessions: sessions.clone(),
+                permission_config,
+            }));
+        }
         engine
             .recover()
             .await

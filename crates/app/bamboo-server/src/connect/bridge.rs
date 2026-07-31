@@ -24,6 +24,8 @@ use bamboo_engine::execution::{
 use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
 
+use crate::permission_audit::record_bamboo_runtime_permission_metadata;
+
 use super::approvals::{self, ParkedAsk, RespondAndResumeOutcome, Responder};
 use super::platform::{CallbackQuery, InboundMessage, OutboundMessage, Platform, ReplyCtx};
 use super::render;
@@ -878,14 +880,12 @@ impl ConnectBridge {
             if let Some(workspace) = session.workspace.as_ref() {
                 config.register_session_workspace(session_id.clone(), workspace.clone());
             }
-            session.metadata.insert(
-                "permission.policy_revision".to_string(),
-                config.policy_revision().to_string(),
-            );
-            session.metadata.insert(
-                "permission.effective_mode".to_string(),
-                format!("{:?}", config.mode()).to_ascii_lowercase(),
-            );
+            if let Err(error) =
+                record_bamboo_runtime_permission_metadata(&mut session, config.as_ref())
+            {
+                tracing::error!(%error, %session_id, "connect permission audit failed closed");
+                return;
+            }
         }
         self.ctx.session_repo.save_and_cache(&mut session).await;
 

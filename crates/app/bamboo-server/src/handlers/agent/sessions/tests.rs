@@ -9,7 +9,10 @@ use chrono::Utc;
 fn session_summary_from_entry_includes_last_run_fields() {
     let entry = SessionIndexEntry {
         id: "child-1".to_string(),
-        bypass_permissions: false,
+        // Simulate a pre-#770 index row: the compatibility boolean is present
+        // but the newly added typed field deserializes to its default.
+        bypass_permissions: true,
+        permission_mode: bamboo_domain::SessionPermissionMode::Default,
         kind: SessionKind::Child,
         rel_path: "sessions/root/children/child-1".to_string(),
         title: "Child Session".to_string(),
@@ -58,6 +61,11 @@ fn session_summary_from_entry_includes_last_run_fields() {
     assert_eq!(summary.subagent_type, None);
     assert!(summary.has_pending_question);
     assert_eq!(summary.running_child_count, 0);
+    assert!(summary.bypass_permissions);
+    assert_eq!(
+        summary.permission_mode,
+        bamboo_domain::SessionPermissionMode::Bypass
+    );
 }
 
 #[test]
@@ -65,6 +73,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
     let entry = SessionIndexEntry {
         id: "child-2".to_string(),
         bypass_permissions: false,
+        permission_mode: bamboo_domain::SessionPermissionMode::Default,
         kind: SessionKind::Child,
         rel_path: "sessions/root/children/child-2".to_string(),
         title: "Plan Child".to_string(),

@@ -10,6 +10,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::mpsc;
 
 use crate::app_state::AppState;
+use crate::permission_audit::record_bamboo_runtime_permission_metadata;
 use crate::tools::ToolSurface;
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_model};
@@ -155,14 +156,12 @@ pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
         if let Some(workspace) = args.session.workspace.as_deref() {
             config.register_session_workspace(args.session_id.clone(), workspace.to_string());
         }
-        args.session.metadata.insert(
-            "permission.policy_revision".to_string(),
-            config.policy_revision().to_string(),
-        );
-        args.session.metadata.insert(
-            "permission.effective_mode".to_string(),
-            format!("{:?}", config.mode()).to_ascii_lowercase(),
-        );
+        if let Err(error) =
+            record_bamboo_runtime_permission_metadata(&mut args.session, config.as_ref())
+        {
+            tracing::error!(%error, session_id = %args.session_id, "agent permission audit failed closed");
+            return;
+        }
     }
     let tools_override = Some(tools_for_execution(
         args.state.as_ref(),

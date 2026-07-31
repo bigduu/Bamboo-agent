@@ -4,34 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Permission mode controlling how the system handles permission requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PermissionMode {
-    /// Default interactive mode: prompt for all dangerous operations.
-    #[default]
-    Default,
-    /// Plan (read-only) mode: deny all mutating tool calls, allow read-only tools.
-    Plan,
-    /// Accept edits mode: auto-approve file writes, prompt for command execution.
-    AcceptEdits,
-    /// Don't ask mode: auto-deny unless pre-approved by whitelist.
-    DontAsk,
-    /// Bypass all permission checks (dangerous, intended for CI/testing only).
-    BypassPermissions,
-}
-
-impl PermissionMode {
-    pub fn description(&self) -> &'static str {
-        match self {
-            PermissionMode::Default => "Interactive mode: prompt for dangerous operations",
-            PermissionMode::Plan => "Plan mode: read-only, no mutations allowed",
-            PermissionMode::AcceptEdits => "Accept edits: auto-approve file writes",
-            PermissionMode::DontAsk => "Don't ask: auto-deny unless whitelisted",
-            PermissionMode::BypassPermissions => "Bypass: skip all permission checks",
-        }
-    }
-}
+pub use bamboo_domain::PermissionMode;
 
 /// Bamboo settings loaded from settings.json files.
 ///
@@ -235,6 +208,7 @@ mod tests {
             PermissionMode::AcceptEdits,
             PermissionMode::DontAsk,
             PermissionMode::BypassPermissions,
+            PermissionMode::Auto,
         ];
         for mode in modes {
             let json = serde_json::to_string(&mode).unwrap();

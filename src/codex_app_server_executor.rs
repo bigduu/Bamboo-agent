@@ -148,6 +148,19 @@ impl Drop for AppServerConnection {
     }
 }
 
+#[derive(Clone, Copy)]
+struct AppServerRunPolicy<'a> {
+    sandbox: &'a str,
+    approval_policy: &'a str,
+    network_access: bool,
+}
+
+#[derive(Clone, Copy)]
+enum UnexpectedApprovalDisposition {
+    Relay,
+    Deny,
+}
+
 /// `codex app-server` implementation of the Codex executor mode.
 pub struct CodexAppServerExecutor {
     binary: PathBuf,
@@ -494,11 +507,11 @@ impl CodexAppServerExecutor {
         Ok(slot.as_mut().expect("connection installed"))
     }
 
-    fn thread_params(&self, sandbox: &str) -> Value {
+    fn thread_params(&self, policy: AppServerRunPolicy<'_>) -> Value {
         let mut params = json!({
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
-            "sandbox": sandbox,
+            "approvalPolicy": policy.approval_policy,
+            "approvalsReviewer": (policy.approval_policy != "never").then_some("user"),
+            "sandbox": policy.sandbox,
             "cwd": self.workspace,
             "model": self.model,
         });
@@ -509,10 +522,10 @@ impl CodexAppServerExecutor {
     async fn start_thread(
         &self,
         connection: &AppServerConnection,
-        sandbox: &str,
+        policy: AppServerRunPolicy<'_>,
     ) -> Result<String, String> {
         let result = connection
-            .request("thread/start", self.thread_params(sandbox))
+            .request("thread/start", self.thread_params(policy))
             .await?;
         result
             .pointer("/thread/id")
@@ -526,9 +539,9 @@ impl CodexAppServerExecutor {
         &self,
         connection: &AppServerConnection,
         thread_id: &str,
-        sandbox: &str,
+        policy: AppServerRunPolicy<'_>,
     ) -> Result<(), String> {
-        let mut params = self.thread_params(sandbox);
+        let mut params = self.thread_params(policy);
         params["threadId"] = Value::String(thread_id.to_string());
         connection
             .request("thread/resume", params)
@@ -541,19 +554,22 @@ impl CodexAppServerExecutor {
         connection: &AppServerConnection,
         thread_id: &str,
         prompt: &str,
-        sandbox: &str,
-        network_access: bool,
         reasoning_effort: Option<&str>,
+        policy: AppServerRunPolicy<'_>,
     ) -> Result<String, String> {
         let mut params = json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt, "text_elements": []}],
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
+            "approvalPolicy": policy.approval_policy,
+            "approvalsReviewer": (policy.approval_policy != "never").then_some("user"),
             "cwd": self.workspace,
             "model": self.model,
             "effort": reasoning_effort,
-            "sandboxPolicy": sandbox_policy(sandbox, self.workspace.as_deref(), network_access),
+            "sandboxPolicy": sandbox_policy(
+                policy.sandbox,
+                self.workspace.as_deref(),
+                policy.network_access,
+            ),
         });
         remove_null_object_fields(&mut params);
         let result = connection.request("turn/start", params).await?;
@@ -575,6 +591,7 @@ impl CodexAppServerExecutor {
         steer: &mut SteerInbox,
         approval_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
         force_cancelled: bool,
+        approval_disposition: UnexpectedApprovalDisposition,
     ) -> ChildOutcome {
         let mut state = AppRunState::default();
         let mut steer_open = true;
@@ -613,12 +630,28 @@ impl CodexAppServerExecutor {
                                 let _ = connection.send(approval_response(&message, false));
                                 continue;
                             }
-                            approval_tasks.push(spawn_approval_relay(
-                                connection.write_tx.clone(),
-                                message,
-                                events.host().cloned(),
-                                self.approval_timeout,
-                            ));
+                            if method == "item/permissions/requestApproval" {
+                                // Granular filesystem/network escalation cannot be
+                                // represented by Bamboo's boolean relay without
+                                // accidentally granting the full requested set.
+                                // An empty subset is the protocol's deterministic
+                                // deny response in every posture.
+                                let _ = connection.send(approval_response(&message, false));
+                                continue;
+                            }
+                            match approval_disposition {
+                                UnexpectedApprovalDisposition::Deny => {
+                                    let _ = connection.send(approval_response(&message, false));
+                                }
+                                UnexpectedApprovalDisposition::Relay => {
+                                    approval_tasks.push(spawn_approval_relay(
+                                        connection.write_tx.clone(),
+                                        message,
+                                        events.host().cloned(),
+                                        self.approval_timeout,
+                                    ));
+                                }
+                            }
                         } else {
                             let id = message.get("id").cloned().unwrap_or(Value::Null);
                             let _ = connection.send(json!({
@@ -659,19 +692,87 @@ impl CodexAppServerExecutor {
             .as_ref()
             .map(|policy| policy.session_id.trim())
             .filter(|id| !id.is_empty())
-        {
-            Some(id) => id.to_string(),
-            None => return ChildOutcome::error(
-                "Codex app-server mode requires a logical session id in RunSpec.permission_policy",
-            ),
+            .map(str::to_string)
+            .or_else(|| {
+                spec.logical_session
+                    .as_ref()
+                    .map(|identity| identity.session_id.trim())
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                self.permissions
+                    .provisioned_session_id()
+                    .map(str::to_string)
+            }) {
+            Some(id) => id,
+            None => {
+                return ChildOutcome::error(
+                    "Codex app-server mode requires a logical or provisioned session id",
+                )
+            }
         };
-        let parent_bypass = spec
-            .permission_policy
-            .as_ref()
-            .map(|policy| policy.bypass_permissions)
-            .unwrap_or(self.permissions.provisioned_bypass());
+        let activation = match self
+            .permissions
+            .activation_permission(spec.permission_policy.as_ref())
+        {
+            Ok(activation) => activation,
+            Err(error) => {
+                events.emit(event_json(AgentEvent::Error {
+                    message: error.clone(),
+                }));
+                return ChildOutcome::error(error);
+            }
+        };
+        if let Some(reason) = activation.explicit_deny_reason.as_ref() {
+            let message = format!(
+                "Codex app-server cannot safely enforce Bamboo explicit-deny policy: {reason}"
+            );
+            events.emit(event_json(AgentEvent::PermissionPostureActivated {
+                session_id: logical_session.clone(),
+                policy_revision: activation.policy_revision,
+                requested_mode: activation.resolution.requested.as_str().to_string(),
+                effective_mode: activation.resolution.effective.as_str().to_string(),
+                executor_mapping: "codex_app_server:blocked_explicit_deny".to_string(),
+            }));
+            events.emit(event_json(AgentEvent::Error {
+                message: message.clone(),
+            }));
+            return ChildOutcome::error(message);
+        }
+        let approval_policy = if activation.resolution.suppress_approval_prompts()
+            || activation.resolution.effective == bamboo_domain::PermissionMode::Plan
+        {
+            "never"
+        } else {
+            "on-request"
+        };
+        let approval_disposition =
+            if activation.resolution.effective == bamboo_domain::PermissionMode::Plan {
+                UnexpectedApprovalDisposition::Deny
+            } else if activation.resolution.suppress_approval_prompts() {
+                // `approvalPolicy=never` means operate within the already-selected
+                // sandbox. A surprise approval may request additional filesystem or
+                // network access, so no-prompt mode must deny rather than expand it.
+                UnexpectedApprovalDisposition::Deny
+            } else {
+                UnexpectedApprovalDisposition::Relay
+            };
+        let executor_mapping = format!("codex_app_server:approvalPolicy={approval_policy}");
         let (sandbox, network_access, warnings) =
-            self.permissions.app_server_posture(parent_bypass);
+            self.permissions.app_server_posture(activation.resolution);
+        let run_policy = AppServerRunPolicy {
+            sandbox: &sandbox,
+            approval_policy,
+            network_access,
+        };
+        events.emit(event_json(AgentEvent::PermissionPostureActivated {
+            session_id: logical_session.clone(),
+            policy_revision: activation.policy_revision,
+            requested_mode: activation.resolution.requested.as_str().to_string(),
+            effective_mode: activation.resolution.effective.as_str().to_string(),
+            executor_mapping: executor_mapping.clone(),
+        }));
         for warning in warnings {
             events.emit(json!({
                 "type": "runner_progress",
@@ -692,10 +793,15 @@ impl CodexAppServerExecutor {
             "auth_mode": self.auth.mode().as_str(),
             "codex_home_mode": self.codex_home_mode(),
             "sandbox": sandbox,
-            "approval_policy": "on-request",
-            "approvals_reviewer": "user",
+            "approval_policy": approval_policy,
+            "approvals_reviewer": (!activation.resolution.suppress_approval_prompts()
+                && activation.resolution.effective != bamboo_domain::PermissionMode::Plan)
+                .then_some("user"),
             "network_access": network_access,
             "permission_profile": self.permissions.permission_profile(),
+            "requested_mode": activation.resolution.requested.as_str(),
+            "effective_mode": activation.resolution.effective.as_str(),
+            "executor_mapping": executor_mapping,
         }));
 
         if spec.messages.is_empty() {
@@ -714,7 +820,7 @@ impl CodexAppServerExecutor {
             self.stored_thread(&logical_session).await
         };
         let (thread_id, prompt) = if let Some(thread_id) = stored {
-            match self.resume_thread(connection, &thread_id, &sandbox).await {
+            match self.resume_thread(connection, &thread_id, run_policy).await {
                 Ok(()) => (thread_id, spec.assignment.clone()),
                 Err(error) => {
                     tracing::warn!(%error, "codex app-server: resume failed; rehydrating once");
@@ -727,7 +833,7 @@ impl CodexAppServerExecutor {
                         "message": "resume failed; starting a new thread with bounded history rehydration",
                     }));
                     self.forget_thread(&logical_session).await;
-                    let new_id = match self.start_thread(connection, &sandbox).await {
+                    let new_id = match self.start_thread(connection, run_policy).await {
                         Ok(id) => id,
                         Err(error) => return ChildOutcome::error(error),
                     };
@@ -738,7 +844,7 @@ impl CodexAppServerExecutor {
                 }
             }
         } else {
-            let thread_id = match self.start_thread(connection, &sandbox).await {
+            let thread_id = match self.start_thread(connection, run_policy).await {
                 Ok(id) => id,
                 Err(error) => return ChildOutcome::error(error),
             };
@@ -756,9 +862,8 @@ impl CodexAppServerExecutor {
                 connection,
                 &thread_id,
                 &prompt,
-                &sandbox,
-                network_access,
                 spec.reasoning_effort.as_deref(),
+                run_policy,
             )
             .await
         {
@@ -779,6 +884,7 @@ impl CodexAppServerExecutor {
                 steer,
                 &mut approval_tasks,
                 false,
+                approval_disposition,
             ) => outcome,
             _ = cancel.cancelled() => {
                 let interrupt = connection.request_with_timeout(
@@ -799,6 +905,7 @@ impl CodexAppServerExecutor {
                         steer,
                         &mut approval_tasks,
                         true,
+                        approval_disposition,
                     ),
                 ).await {
                     Ok(_) => ChildOutcome::cancelled(),
@@ -1065,6 +1172,7 @@ fn is_approval_method(method: &str) -> bool {
         method,
         "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
             | "execCommandApproval"
             | "applyPatchApproval"
     )
@@ -1149,6 +1257,12 @@ fn approval_response(request: &Value, approved: bool) -> Value {
 }
 
 fn approval_response_parts(id: Value, method: &str, approved: bool) -> Value {
+    if method == "item/permissions/requestApproval" {
+        // Omitted granular permissions are denied by the app-server protocol.
+        // Bamboo deliberately grants an empty subset because its approval bridge
+        // cannot safely express per-item FS/network escalation.
+        return json!({"id": id, "result": {"permissions": {}}});
+    }
     let decision = if matches!(method, "execCommandApproval" | "applyPatchApproval") {
         if approved {
             "approved"
@@ -1381,7 +1495,11 @@ while IFS= read -r ignored; do :; done
     }
 
     #[cfg(unix)]
-    async fn run_stub_with_decision(approved: bool) -> (ChildOutcome, Vec<Value>) {
+    async fn run_stub(
+        approved: Option<bool>,
+        run_auto_approve_permissions: Option<bool>,
+        provisioned_auto_approve_permissions: bool,
+    ) -> (ChildOutcome, Vec<Value>) {
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("codex-stub.sh");
         write_stub_codex(&binary);
@@ -1394,7 +1512,18 @@ while IFS= read -r ignored; do :; done
             false,
             false,
         )
-        .unwrap();
+        .unwrap()
+        .with_provisioned_permission_resolution(
+            bamboo_domain::resolve_permission_mode(
+                if provisioned_auto_approve_permissions {
+                    bamboo_domain::SessionPermissionMode::Auto
+                } else {
+                    bamboo_domain::SessionPermissionMode::Default
+                },
+                bamboo_domain::PermissionMode::Default,
+            ),
+            "provisioned-stub-session".to_string(),
+        );
         let executor = CodexAppServerExecutor::new(
             Some(binary.to_string_lossy().into_owned()),
             None,
@@ -1407,12 +1536,17 @@ while IFS= read -r ignored; do :; done
         .await
         .unwrap();
         let (sink, mut event_rx) = EventSink::channel();
-        let (host, mut host_rx) = HostBridge::channel();
-        let approval_task = tokio::spawn(async move {
-            let request = host_rx.recv().await.expect("approval request");
-            assert_eq!(request.body["tool_name"], "Bash");
-            request.reply.send(json!({"approved": approved})).unwrap();
-        });
+        let (sink, approval_task) = if let Some(approved) = approved {
+            let (host, mut host_rx) = HostBridge::channel();
+            let task = tokio::spawn(async move {
+                let request = host_rx.recv().await.expect("approval request");
+                assert_eq!(request.body["tool_name"], "Bash");
+                request.reply.send(json!({"approved": approved})).unwrap();
+            });
+            (sink.with_host_bridge(host), Some(task))
+        } else {
+            (sink, None)
+        };
         let outcome = executor
             .run(
                 RunSpec {
@@ -1420,25 +1554,43 @@ while IFS= read -r ignored; do :; done
                     logical_session: None,
                     project_id: None,
                     reasoning_effort: None,
-                    permission_policy: Some(PermissionPolicyContext {
-                        revision: 1,
-                        bypass_permissions: false,
-                        session_id: format!("stub-{approved}"),
-                        workspace_path: Some(root.path().to_string_lossy().into_owned()),
-                        inherit_session_grants: false,
-                        policy: json!({}),
-                    }),
+                    permission_policy: run_auto_approve_permissions.map(
+                        |auto_approve_permissions| PermissionPolicyContext {
+                            revision: 1,
+                            requested_mode: if auto_approve_permissions {
+                                "auto".to_string()
+                            } else {
+                                "default".to_string()
+                            },
+                            effective_mode: if auto_approve_permissions {
+                                "auto".to_string()
+                            } else {
+                                "default".to_string()
+                            },
+                            bypass_permissions: false,
+                            auto_approve_permissions,
+                            session_id: format!("stub-{approved:?}-{auto_approve_permissions}"),
+                            workspace_path: Some(root.path().to_string_lossy().into_owned()),
+                            inherit_session_grants: false,
+                            policy: serde_json::to_value(
+                                bamboo_tools::permission::SerializablePermissionConfig::default(),
+                            )
+                            .unwrap(),
+                        },
+                    ),
                     messages: Vec::new(),
                     activation_run_id: None,
                     initial_session_messages: Vec::new(),
                     secrets: RunSecrets::default(),
                 },
-                sink.with_host_bridge(host),
+                sink,
                 SteerInbox::disconnected(),
                 CancellationToken::new(),
             )
             .await;
-        approval_task.await.unwrap();
+        if let Some(task) = approval_task {
+            task.await.unwrap();
+        }
         let mut events = Vec::new();
         while let Ok(event) = event_rx.try_recv() {
             events.push(event);
@@ -1560,7 +1712,7 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn subprocess_stub_completes_full_handshake_and_allow_path() {
-        let (outcome, events) = run_stub_with_decision(true).await;
+        let (outcome, events) = run_stub(Some(true), Some(false), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub approved"));
         assert!(events.iter().any(|event| event["type"] == "complete"));
     }
@@ -1568,11 +1720,199 @@ while IFS= read -r ignored; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn subprocess_stub_returns_denial_to_model_and_completes() {
-        let (outcome, events) = run_stub_with_decision(false).await;
+        let (outcome, events) = run_stub(Some(false), Some(false), false).await;
         assert_eq!(outcome.result.as_deref(), Some("stub denied"));
         assert!(events
             .iter()
             .any(|event| event["type"] == "token" && event["content"] == "stub denied"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_uses_never_policy_and_denies_unexpected_approval_without_host() {
+        let (outcome, events) = run_stub(None, Some(true), false).await;
+        assert_eq!(outcome.result.as_deref(), Some("stub denied"));
+        assert_eq!(
+            events.first().and_then(|event| event["type"].as_str()),
+            Some("permission_posture_activated"),
+            "typed permission posture must precede every warning/progress event"
+        );
+        assert!(events.iter().any(|event| {
+            event["executor"] == "codex_app_server"
+                && event["approval_policy"] == "never"
+                && event["approvals_reviewer"].is_null()
+                && event["requested_mode"] == "auto"
+                && event["effective_mode"] == "auto"
+                && event["executor_mapping"] == "codex_app_server:approvalPolicy=never"
+        }));
+    }
+
+    #[test]
+    fn granular_filesystem_and_network_escalation_is_denied_as_empty_subset() {
+        let request = json!({
+            "id": 77,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thread-stub",
+                "turnId": "turn-stub",
+                "additionalPermissions": {
+                    "fileSystem": {"write": ["/outside-workspace"]},
+                    "network": {"enabled": true}
+                }
+            }
+        });
+        assert!(is_approval_method("item/permissions/requestApproval"));
+        assert_eq!(
+            approval_response(&request, true),
+            json!({"id": 77, "result": {"permissions": {}}})
+        );
+        assert_eq!(
+            approval_response(&request, false),
+            json!({"id": 77, "result": {"permissions": {}}})
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provisioned_auto_supplies_policy_and_session_when_run_context_is_absent() {
+        let (outcome, events) = run_stub(None, None, true).await;
+        assert_eq!(outcome.result.as_deref(), Some("stub denied"));
+        assert!(events.iter().any(|event| {
+            event["session_id"] == "provisioned-stub-session"
+                && event["approval_policy"] == "never"
+                && event["requested_mode"] == "auto"
+                && event["executor_mapping"] == "codex_app_server:approvalPolicy=never"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_run_context_replaces_provisioned_auto_in_app_server() {
+        let (outcome, events) = run_stub(Some(true), Some(false), true).await;
+        assert_eq!(outcome.result.as_deref(), Some("stub approved"));
+        assert!(events.iter().any(|event| {
+            event["approval_policy"] == "on-request"
+                && event["approvals_reviewer"] == "user"
+                && event["requested_mode"] == "default"
+                && event["executor_mapping"] == "codex_app_server:approvalPolicy=on-request"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_deny_fails_before_app_server_connection_without_leaking_rule_resource() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("codex-explicit-deny-stub.sh");
+        let marker = root.path().join("connected");
+        std::fs::write(
+            &binary,
+            r###"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'codex-cli 0.144.5'
+  exit 0
+fi
+if [ "$1" = "exec" ]; then
+  echo '--json --output-last-message --config --sandbox --dangerously-bypass-approvals-and-sandbox stdin'
+  exit 0
+fi
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then
+  echo '--listen stdio:// --stdio'
+  exit 0
+fi
+DIR=$(cd "$(dirname "$0")" && pwd)
+: > "$DIR/connected"
+exit 2
+"###,
+        )
+        .unwrap();
+        let mut binary_permissions = std::fs::metadata(&binary).unwrap().permissions();
+        binary_permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, binary_permissions).unwrap();
+
+        let permissions = resolve_codex_app_server_permission_config(
+            Some("workspace-write"),
+            Some("on-request"),
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let executor = CodexAppServerExecutor::new(
+            Some(binary.to_string_lossy().into_owned()),
+            None,
+            Some(root.path().to_string_lossy().into_owned()),
+            Some(root.path().join("state")),
+            Vec::new(),
+            CodexAuthConfig::inherit(),
+            permissions,
+        )
+        .await
+        .unwrap();
+        let secret_resource = "TOP_SECRET_CODEX_APP_SERVER_DENY_RESOURCE";
+        let mut policy = bamboo_tools::permission::SerializablePermissionConfig::default();
+        policy
+            .whitelist
+            .push(bamboo_tools::permission::PermissionRule::new(
+                bamboo_tools::permission::PermissionType::ExecuteCommand,
+                secret_resource,
+                false,
+            ));
+        let (sink, mut rx) = EventSink::channel();
+
+        let outcome = executor
+            .run(
+                RunSpec {
+                    assignment: "must fail closed".to_string(),
+                    logical_session: None,
+                    project_id: None,
+                    reasoning_effort: None,
+                    permission_policy: Some(PermissionPolicyContext {
+                        revision: 29,
+                        requested_mode: "auto".to_string(),
+                        effective_mode: "auto".to_string(),
+                        bypass_permissions: false,
+                        auto_approve_permissions: true,
+                        session_id: "codex-app-server-explicit-deny".to_string(),
+                        workspace_path: Some(root.path().to_string_lossy().into_owned()),
+                        inherit_session_grants: false,
+                        policy: serde_json::to_value(policy).unwrap(),
+                    }),
+                    messages: Vec::new(),
+                    activation_run_id: None,
+                    initial_session_messages: Vec::new(),
+                    secrets: RunSecrets::default(),
+                },
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(
+            outcome.status,
+            bamboo_subagent::proto::TerminalStatus::Error
+        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("explicit-deny")));
+        assert!(!marker.exists(), "app-server connection must not start");
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event["type"] == "permission_posture_activated"
+                && event["executor_mapping"] == "codex_app_server:blocked_explicit_deny"
+        }));
+        assert!(events.iter().any(|event| event["type"] == "error"));
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains(secret_resource),
+            "deny resources must not be emitted in audit/error events"
+        );
     }
 
     #[cfg(unix)]

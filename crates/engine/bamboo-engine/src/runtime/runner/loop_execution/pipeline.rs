@@ -1654,13 +1654,13 @@ pub(super) async fn run_pipeline(
             })
             .await;
 
-        // --- Turn-boundary refresh from disk: injected messages + live bypass ---
+        // --- Turn-boundary refresh from disk: messages + live permission mode ---
         // A single load also picks up a mid-run `PATCH /sessions
-        // {bypass_permissions}`: the run owns a Session taken at spawn and never
-        // otherwise re-reads storage, so without this a bypass flip would not
-        // take effect until the next run. Adopt the disk value onto BOTH the
-        // live runtime state and the owned session so this round's per-tool-call
-        // `ToolExecutionSessionFlags::from_session` sees it. #540.
+        // {permission_mode|bypass_permissions}`: the run owns a Session taken at
+        // spawn and never otherwise re-reads storage, so without this a mode
+        // transition would not take effect until the next run. Adopt the disk
+        // value onto BOTH the live runtime state and the owned session so this
+        // round's per-tool-call flags see it. #540/#770.
         if let Some(notifications) = config.session_activation_notifications.as_ref() {
             let mut receiver = notifications.lock();
             if receiver.has_changed().unwrap_or(false) {
@@ -1686,12 +1686,12 @@ pub(super) async fn run_pipeline(
                 "turn boundary admitted durable SessionInbox work"
             );
         }
-        if let Some(disk_bypass) = turn_refresh.disk_bypass_permissions {
-            state.runtime_state.bypass_permissions = disk_bypass;
+        if let Some(disk_mode) = turn_refresh.disk_permission_mode {
+            state.runtime_state.set_permission_mode(disk_mode);
             session
                 .agent_runtime_state
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .bypass_permissions = disk_bypass;
+                .set_permission_mode(disk_mode);
         }
 
         // --- Cancellation check ---

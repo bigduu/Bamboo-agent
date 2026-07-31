@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use bamboo_domain::session::types::Session;
 use bamboo_domain::storage::Storage;
-use bamboo_domain::RuntimeSessionPersistence;
+use bamboo_domain::{PermissionAuditSeed, PermissionAuditSnapshot, RuntimeSessionPersistence};
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -176,7 +176,7 @@ impl LockedSessionStore {
             apply_authoritative_metadata(session, &latest);
             // The control-plane sidecar carries `agent_runtime_state`, so a
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
-            adopt_disk_bypass_permissions(session, &latest);
+            adopt_fresher_disk_permission_posture(session, &latest);
         }
         let result = self.storage.save_runtime_state(session).await;
         publish(session);
@@ -234,12 +234,12 @@ impl LockedSessionStore {
     /// This is the locked equivalent of [`merge_save_session`]; prefer it for
     /// server-side paths where an authoritative write may race with this save.
     ///
-    /// Adopts the on-disk `bypass_permissions` so a running loop's save can't
-    /// revert a concurrent `PATCH /sessions` flip (#540). Callers that are
-    /// themselves the authoritative writer of that flag — the parent seeding a
-    /// child's posture (#74) — must use
+    /// Adopts the on-disk typed permission mode so a running loop's save can't
+    /// revert a concurrent `PATCH /sessions` transition (#540/#770). Callers
+    /// that are themselves the authoritative writer of that posture — the
+    /// parent seeding a child's mode (#74) — must use
     /// [`Self::save_runtime_authoritative_flags`] instead, which persists the
-    /// in-memory flag as-is.
+    /// in-memory mode as-is.
     pub async fn merge_save_runtime(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime_and_publish(session, |_, _| {})
             .await
@@ -307,7 +307,7 @@ impl LockedSessionStore {
                 session.messages.len(),
             );
             apply_authoritative_metadata(session, latest);
-            adopt_disk_bypass_permissions(session, latest);
+            adopt_fresher_disk_permission_posture(session, latest);
         }
 
         let result = self.storage.save_session(session).await;
@@ -316,7 +316,7 @@ impl LockedSessionStore {
     }
 
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
-    /// `bypass_permissions` — the caller's in-memory value is authoritative and
+    /// permission mode — the caller's in-memory value is authoritative and
     /// persists as-is.
     ///
     /// For parent-side control writes to a child session (e.g. the #74
@@ -388,15 +388,172 @@ impl LockedSessionStore {
             }
             bamboo_domain::merge_session_inbox_admission(session, latest);
             // Never let a running loop's save revert a concurrent mid-run
-            // `PATCH /sessions {bypass_permissions}` flip. #540. Skipped for
+            // `PATCH /sessions {permission_mode|bypass_permissions}` transition.
+            // #540/#770. Skipped for
             // authoritative flag writers (`save_runtime_authoritative_flags`).
             if adopt_bypass {
-                adopt_disk_bypass_permissions(session, latest);
+                adopt_fresher_disk_permission_posture(session, latest);
             }
         }
         let result = self.storage.save_session(session).await;
         publish(session, result.is_ok());
         result
+    }
+
+    /// Persist one validated RunSpec activation as the exact authority for the
+    /// worker's requested posture and complete audit record.
+    ///
+    /// Warm workers reuse a durable session id. An ordinary runtime save is
+    /// intentionally disk-adopting, so using it here would let the previous
+    /// activation's posture stick. This dedicated transaction preserves only
+    /// durable UI metadata and SessionInbox admission/transcript proof, then
+    /// writes the incoming posture with an audit revision above the durable
+    /// floor while holding the same per-session lock.
+    pub async fn seed_runtime_activation_and_publish<F>(
+        &self,
+        session: &mut Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        let _guard = self.acquire_lock(&session.id).await;
+        let mut incoming_audit = PermissionAuditSnapshot::from_metadata(&session.metadata)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "activation seed requires a complete permission audit record",
+                )
+            })?;
+
+        if let Some(latest) = self.storage.load_session(&session.id).await? {
+            apply_authoritative_metadata(session, &latest);
+            bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
+            bamboo_domain::merge_session_inbox_admission(session, &latest);
+
+            let durable_audit = PermissionAuditSnapshot::from_metadata(&latest.metadata);
+            let durable_floor = durable_audit
+                .as_ref()
+                .map(|snapshot| snapshot.audit_revision)
+                .unwrap_or_default();
+            if let Some(durable_audit) = durable_audit {
+                if durable_audit.resolution == incoming_audit.resolution {
+                    incoming_audit.transitioned_at = durable_audit.transitioned_at;
+                }
+            }
+            incoming_audit.audit_revision = bamboo_domain::next_permission_audit_revision_after(
+                durable_floor.max(incoming_audit.audit_revision),
+            )
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
+        }
+
+        session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .set_permission_mode(incoming_audit.resolution.requested);
+        incoming_audit.write_to(&mut session.metadata);
+
+        let result = self.storage.save_session(session).await;
+        publish(session, result.is_ok());
+        result
+    }
+
+    /// Atomically re-seed a resident child from its parent posture.
+    ///
+    /// The latest session load, typed-mode comparison, complete audit refresh,
+    /// metadata CAS bump (only for a true typed transition), narrow companion
+    /// mutation, save, and cache publication share one session lock.
+    pub async fn update_authoritative_permission_posture_and_publish<M, P>(
+        &self,
+        session_id: &str,
+        seed: &PermissionAuditSeed,
+        mutate: M,
+        publish: P,
+    ) -> std::io::Result<Option<Session>>
+    where
+        M: FnOnce(&mut Session),
+        P: FnOnce(&Session),
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_session(session_id).await? else {
+            return Ok(None);
+        };
+        let previous_mode = latest
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        let previous_resolution = PermissionAuditSnapshot::from_metadata(&latest.metadata)
+            .map(|snapshot| snapshot.resolution);
+        mutate(&mut latest);
+        latest
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .set_permission_mode(seed.resolution.requested);
+        let mode_changed = previous_mode != seed.resolution.requested;
+        let posture_changed = previous_resolution != Some(seed.resolution);
+        let transitioned_at = posture_changed.then(|| chrono::Utc::now().to_rfc3339());
+        bamboo_domain::record_permission_audit(
+            &mut latest.metadata,
+            seed,
+            transitioned_at.as_deref(),
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+        if mode_changed {
+            latest.metadata_version = latest.metadata_version.saturating_add(1);
+        }
+        self.storage.save_session(&latest).await?;
+        publish(&latest);
+        Ok(Some(latest))
+    }
+
+    /// Persist a worker's bounded executor mapping only when the exact host
+    /// posture observed before dispatch is still current. The remote event does
+    /// not contribute an audit revision or transition timestamp: both are
+    /// allocated from the latest durable record while this session lock is held.
+    pub async fn record_permission_posture_activation_and_publish<P>(
+        &self,
+        session_id: &str,
+        expected_audit_revision: Option<u64>,
+        seed: &PermissionAuditSeed,
+        publish: P,
+    ) -> std::io::Result<Option<Session>>
+    where
+        P: FnOnce(&Session),
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_session(session_id).await? else {
+            return Ok(None);
+        };
+        let durable_audit = PermissionAuditSnapshot::from_metadata(&latest.metadata);
+        let durable_revision = durable_audit
+            .as_ref()
+            .map(|snapshot| snapshot.audit_revision);
+        if durable_revision != expected_audit_revision {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stale permission posture activation: durable audit changed after dispatch",
+            ));
+        }
+        let durable_requested = latest
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        if durable_requested != seed.resolution.requested || !seed.resolution.is_consistent() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stale or inconsistent permission posture activation",
+            ));
+        }
+        bamboo_domain::record_permission_audit(&mut latest.metadata, seed, None).map_err(
+            |error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+        )?;
+        self.storage.save_session(&latest).await?;
+        publish(&latest);
+        Ok(Some(latest))
     }
 
     /// Apply a config-only mutation to a session without ever clobbering its
@@ -478,6 +635,26 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         self.merge_save_runtime(session).await
     }
 
+    async fn seed_runtime_activation(&self, session: &mut Session) -> std::io::Result<()> {
+        self.seed_runtime_activation_and_publish(session, |_, _| {})
+            .await
+    }
+
+    async fn record_permission_posture_activation(
+        &self,
+        session_id: &str,
+        expected_audit_revision: Option<u64>,
+        seed: &PermissionAuditSeed,
+    ) -> std::io::Result<Option<Session>> {
+        self.record_permission_posture_activation_and_publish(
+            session_id,
+            expected_audit_revision,
+            seed,
+            |_| {},
+        )
+        .await
+    }
+
     async fn save_runtime_control_plane(&self, session: &mut Session) -> std::io::Result<()> {
         self.save_runtime_only(session).await
     }
@@ -533,43 +710,62 @@ async fn merge_authoritative_metadata_into_stale(
         apply_authoritative_metadata(session, &latest);
         bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
         bamboo_domain::merge_session_inbox_admission(session, &latest);
-        adopt_disk_bypass_permissions(session, &latest);
+        adopt_fresher_disk_permission_posture(session, &latest);
     }
 }
 
-/// Adopt the on-disk `agent_runtime_state.bypass_permissions` into the session
-/// about to be saved.
+/// Adopt the on-disk typed permission posture into the session about to be
+/// saved when the durable posture is semantically fresher.
 ///
-/// `PATCH /sessions {bypass_permissions}` is the SOLE authoritative writer of
-/// this flag (a running loop only carries it forward from run start). Without
-/// this, a runtime save from an in-flight run — which holds the run-start value
-/// — silently reverts a concurrent mid-run flip on disk. Unlike the metadata
-/// group this is NOT version-gated: the PATCH writes via `update_runtime_config`,
-/// which does not bump `metadata_version`. #540.
-fn adopt_disk_bypass_permissions(session: &mut Session, latest: &Session) {
-    // A disk copy with NO runtime state at all carries no authoritative bypass
+/// `PATCH /sessions {permission_mode|bypass_permissions}` is the authoritative
+/// writer of this posture (a running loop only carries it forward from run
+/// start). Without this, a runtime save from an in-flight run — which holds the
+/// run-start value — silently reverts a concurrent mid-run transition on disk.
+/// A true typed-mode difference always represents an authoritative durable
+/// transition. When the modes are equal, the complete audit revision is the
+/// ordering fence: an older/missing disk audit must never delete a newer
+/// run-start policy/mapping refresh. #540/#770.
+fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session) {
+    // A disk copy with NO runtime state at all carries no authoritative mode
     // value — treat it as "unknown" and leave the in-memory flag untouched,
     // rather than forcing it OFF (which would silently disable a legitimately
     // bypassed run on any backend/path that doesn't round-trip the field). #540.
-    let Some(disk_bypass) = latest
+    let Some(disk_mode) = latest
         .agent_runtime_state
         .as_ref()
-        .map(|state| state.bypass_permissions)
+        .map(|state| state.effective_permission_mode())
     else {
         return;
     };
+    let current_mode = session
+        .agent_runtime_state
+        .as_ref()
+        .map(|state| state.effective_permission_mode())
+        .unwrap_or_default();
+    let Some(disk_audit) = bamboo_domain::fresher_disk_permission_audit(
+        current_mode,
+        &session.metadata,
+        disk_mode,
+        &latest.metadata,
+    ) else {
+        return;
+    };
+
     match session.agent_runtime_state.as_mut() {
-        Some(state) => state.bypass_permissions = disk_bypass,
+        Some(state) => state.set_permission_mode(disk_mode),
         // No runtime state in memory and disk says "off" → nothing to adopt;
         // avoid allocating a default state just to store `false`.
-        None if disk_bypass => {
-            session
+        None if disk_mode != bamboo_domain::SessionPermissionMode::Default => {
+            let state = session
                 .agent_runtime_state
-                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .bypass_permissions = true;
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+            state.set_permission_mode(disk_mode);
         }
         None => {}
     }
+
+    // The typed posture and its complete bounded audit record move together.
+    disk_audit.write_to(&mut session.metadata);
 }
 
 /// Pure merge step: given a freshly-loaded on-disk copy, overwrite the
@@ -619,7 +815,7 @@ pub async fn merge_save_session(
 mod tests {
     use super::*;
     use crate::v2::SessionStoreV2;
-    use bamboo_domain::session::types::Session;
+    use bamboo_domain::{session::types::Session, PermissionMode};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingControlPlaneStorage {
@@ -664,6 +860,332 @@ mod tests {
 
     fn fresh(id: &str) -> Session {
         Session::new(id.to_string(), "test-model".to_string())
+    }
+
+    fn set_permission_audit(
+        session: &mut Session,
+        requested: bamboo_domain::SessionPermissionMode,
+        policy_revision: u64,
+        mapping: &str,
+        transitioned_at: &str,
+    ) -> u64 {
+        let resolution = bamboo_domain::resolve_permission_mode(requested, PermissionMode::Default);
+        session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .set_permission_mode(requested);
+        bamboo_domain::record_permission_audit(
+            &mut session.metadata,
+            &PermissionAuditSeed::new(policy_revision, resolution, mapping),
+            Some(transitioned_at),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn same_mode_newer_run_start_audit_survives_every_runtime_save_path() {
+        for path in ["merge", "checkpoint", "control-plane"] {
+            let (_temp, storage) = make_storage().await;
+            let store = LockedSessionStore::new(storage.clone());
+            let session_id = format!("same-mode-newer-{path}");
+            let mut durable = fresh(&session_id);
+            set_permission_audit(
+                &mut durable,
+                bamboo_domain::SessionPermissionMode::Default,
+                1,
+                "bamboo_runtime:old-policy",
+                "2026-07-31T12:00:00Z",
+            );
+            storage.save_session(&durable).await.unwrap();
+
+            let mut run_start = durable.clone();
+            let old_revision = PermissionAuditSnapshot::from_metadata(&durable.metadata)
+                .unwrap()
+                .audit_revision;
+            let new_revision = set_permission_audit(
+                &mut run_start,
+                bamboo_domain::SessionPermissionMode::Default,
+                2,
+                "bamboo_runtime:new-policy",
+                "2026-07-31T12:00:00Z",
+            );
+            assert!(new_revision > old_revision);
+
+            match path {
+                "merge" => store.merge_save_runtime(&mut run_start).await.unwrap(),
+                "checkpoint" => store
+                    .checkpoint_runtime_session(&mut run_start)
+                    .await
+                    .unwrap(),
+                "control-plane" => store.save_runtime_only(&mut run_start).await.unwrap(),
+                _ => unreachable!(),
+            }
+
+            let saved = storage.load_session(&session_id).await.unwrap().unwrap();
+            let audit = PermissionAuditSnapshot::from_metadata(&saved.metadata).unwrap();
+            assert_eq!(audit.audit_revision, new_revision, "path={path}");
+            assert_eq!(audit.policy_revision, 2, "path={path}");
+            assert_eq!(audit.executor_mapping, "bamboo_runtime:new-policy");
+        }
+    }
+
+    #[tokio::test]
+    async fn newer_disk_transition_wins_after_mode_cycles_back() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "permission-cycle-back";
+        let mut baseline = fresh(session_id);
+        let stale_revision = set_permission_audit(
+            &mut baseline,
+            bamboo_domain::SessionPermissionMode::Default,
+            1,
+            "bamboo_runtime:initial",
+            "2026-07-31T12:00:00Z",
+        );
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale_runtime = baseline.clone();
+
+        let mut durable = baseline;
+        set_permission_audit(
+            &mut durable,
+            bamboo_domain::SessionPermissionMode::Auto,
+            2,
+            "bamboo_runtime:auto",
+            "2026-07-31T12:01:00Z",
+        );
+        let durable_revision = set_permission_audit(
+            &mut durable,
+            bamboo_domain::SessionPermissionMode::Default,
+            3,
+            "bamboo_runtime:cycled-default",
+            "2026-07-31T12:02:00Z",
+        );
+        assert!(durable_revision > stale_revision);
+        storage.save_session(&durable).await.unwrap();
+
+        store.merge_save_runtime(&mut stale_runtime).await.unwrap();
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        let audit = PermissionAuditSnapshot::from_metadata(&saved.metadata).unwrap();
+        assert_eq!(audit.audit_revision, durable_revision);
+        assert_eq!(audit.policy_revision, 3);
+        assert_eq!(audit.executor_mapping, "bamboo_runtime:cycled-default");
+    }
+
+    #[tokio::test]
+    async fn authoritative_activation_seed_replaces_every_warm_worker_posture() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "warm-permission-matrix";
+        let cases = [
+            (
+                bamboo_domain::SessionPermissionMode::Auto,
+                PermissionMode::Default,
+                PermissionMode::Auto,
+            ),
+            (
+                bamboo_domain::SessionPermissionMode::Default,
+                PermissionMode::Default,
+                PermissionMode::Default,
+            ),
+            (
+                bamboo_domain::SessionPermissionMode::Auto,
+                PermissionMode::Default,
+                PermissionMode::Auto,
+            ),
+            (
+                bamboo_domain::SessionPermissionMode::Bypass,
+                PermissionMode::Auto,
+                PermissionMode::BypassPermissions,
+            ),
+        ];
+        let mut previous_revision = 0;
+
+        for (index, (requested, configured, expected_effective)) in cases.into_iter().enumerate() {
+            let mut activation = fresh(session_id);
+            activation
+                .agent_runtime_state
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                .set_permission_mode(requested);
+            let resolution = bamboo_domain::resolve_permission_mode(requested, configured);
+            bamboo_domain::record_permission_audit(
+                &mut activation.metadata,
+                &PermissionAuditSeed::new(
+                    index as u64 + 1,
+                    resolution,
+                    format!("bamboo_worker:{}", resolution.effective.as_str()),
+                ),
+                Some("2026-07-31T12:00:00Z"),
+            )
+            .unwrap();
+
+            RuntimeSessionPersistence::seed_runtime_activation(&store, &mut activation)
+                .await
+                .unwrap();
+            let durable = storage.load_session(session_id).await.unwrap().unwrap();
+            assert_eq!(
+                durable
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .effective_permission_mode(),
+                requested,
+                "activation {index}"
+            );
+            let audit = PermissionAuditSnapshot::from_metadata(&durable.metadata).unwrap();
+            assert_eq!(audit.resolution.requested, requested);
+            assert_eq!(audit.resolution.effective, expected_effective);
+            assert!(audit.audit_revision > previous_revision);
+            previous_revision = audit.audit_revision;
+        }
+    }
+
+    #[tokio::test]
+    async fn resident_reseed_bumps_etag_only_for_typed_transition() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "resident-atomic-permission";
+        let mut baseline = fresh(session_id);
+        baseline.metadata_version = 7;
+        set_permission_audit(
+            &mut baseline,
+            bamboo_domain::SessionPermissionMode::Auto,
+            1,
+            "bamboo_runtime:auto",
+            "2026-07-31T12:00:00Z",
+        );
+        storage.save_session(&baseline).await.unwrap();
+        let initial_audit = PermissionAuditSnapshot::from_metadata(&baseline.metadata).unwrap();
+
+        let same_mode_seed = PermissionAuditSeed::bamboo_runtime(
+            2,
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Auto,
+                PermissionMode::Default,
+            ),
+        );
+        let refreshed = store
+            .update_authoritative_permission_posture_and_publish(
+                session_id,
+                &same_mode_seed,
+                |session| {
+                    session
+                        .metadata
+                        .insert("resident.marker".to_string(), "same-mode".to_string());
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let refreshed_audit = PermissionAuditSnapshot::from_metadata(&refreshed.metadata).unwrap();
+        assert_eq!(refreshed.metadata_version, 7);
+        assert!(refreshed_audit.audit_revision > initial_audit.audit_revision);
+        assert_eq!(refreshed_audit.policy_revision, 2);
+
+        let transition_seed = PermissionAuditSeed::bamboo_runtime(
+            3,
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Default,
+                PermissionMode::Default,
+            ),
+        );
+        let transitioned = store
+            .update_authoritative_permission_posture_and_publish(
+                session_id,
+                &transition_seed,
+                |session| {
+                    session
+                        .metadata
+                        .insert("resident.marker".to_string(), "transition".to_string());
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let transitioned_audit =
+            PermissionAuditSnapshot::from_metadata(&transitioned.metadata).unwrap();
+        assert_eq!(transitioned.metadata_version, 8, "old ETag must be invalid");
+        assert_eq!(
+            transitioned
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert_eq!(
+            transitioned_audit.resolution.requested,
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert!(transitioned_audit.audit_revision > refreshed_audit.audit_revision);
+        assert_eq!(
+            transitioned
+                .metadata
+                .get("resident.marker")
+                .map(String::as_str),
+            Some("transition")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_activation_cas_cannot_overwrite_concurrent_permission_patch() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "permission-activation-cas";
+        let mut baseline = fresh(session_id);
+        set_permission_audit(
+            &mut baseline,
+            bamboo_domain::SessionPermissionMode::Default,
+            1,
+            "bamboo_runtime:default",
+            "2026-07-31T12:00:00Z",
+        );
+        storage.save_session(&baseline).await.unwrap();
+        let dispatched_revision = PermissionAuditSnapshot::from_metadata(&baseline.metadata)
+            .unwrap()
+            .audit_revision;
+
+        let patched_resolution = bamboo_domain::resolve_permission_mode(
+            bamboo_domain::SessionPermissionMode::Auto,
+            PermissionMode::Default,
+        );
+        let patched = store
+            .update_authoritative_permission_posture_and_publish(
+                session_id,
+                &PermissionAuditSeed::new(2, patched_resolution, "patch:auto"),
+                |_| {},
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patched_audit = PermissionAuditSnapshot::from_metadata(&patched.metadata).unwrap();
+        assert!(patched_audit.audit_revision > dispatched_revision);
+
+        let stale_worker_seed = PermissionAuditSeed::new(
+            1,
+            bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Default,
+                PermissionMode::Default,
+            ),
+            "worker:stale-default",
+        );
+        let error = store
+            .record_permission_posture_activation_and_publish(
+                session_id,
+                Some(dispatched_revision),
+                &stale_worker_seed,
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("durable audit changed"));
+
+        let durable = storage.load_session(session_id).await.unwrap().unwrap();
+        let durable_audit = PermissionAuditSnapshot::from_metadata(&durable.metadata).unwrap();
+        assert_eq!(durable_audit, patched_audit);
+        assert_eq!(durable_audit.executor_mapping, "patch:auto");
     }
 
     // ── update_runtime_config: config patches must never clobber messages ──
@@ -1084,6 +1606,97 @@ mod tests {
             .is_some_and(|s| s.bypass_permissions));
     }
 
+    // #770: the generalized disk-wins path must preserve Auto as a distinct
+    // typed mode rather than collapsing it into the legacy bypass boolean.
+    #[tokio::test]
+    async fn merge_save_runtime_adopts_disk_auto_permission_mode() {
+        use bamboo_domain::{AgentRuntimeState, SessionPermissionMode};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-auto";
+
+        storage.save_session(&fresh(session_id)).await.unwrap();
+        let mut loop_snapshot = storage.load_session(session_id).await.unwrap().unwrap();
+        loop_snapshot.agent_runtime_state = Some(AgentRuntimeState::default());
+        loop_snapshot.metadata.insert(
+            "permission.requested_mode".to_string(),
+            "default".to_string(),
+        );
+        loop_snapshot.metadata.insert(
+            "permission.effective_mode".to_string(),
+            "default".to_string(),
+        );
+        loop_snapshot.metadata.insert(
+            "permission.executor_mapping".to_string(),
+            "bamboo_runtime:default".to_string(),
+        );
+
+        store
+            .update_runtime_config(session_id, |session| {
+                session
+                    .agent_runtime_state
+                    .get_or_insert_with(AgentRuntimeState::default)
+                    .set_permission_mode(SessionPermissionMode::Auto);
+                session
+                    .metadata
+                    .insert("permission.policy_revision".to_string(), "12".to_string());
+                session
+                    .metadata
+                    .insert("permission.requested_mode".to_string(), "auto".to_string());
+                session
+                    .metadata
+                    .insert("permission.effective_mode".to_string(), "auto".to_string());
+                session.metadata.insert(
+                    "permission.executor_mapping".to_string(),
+                    "bamboo_runtime:auto".to_string(),
+                );
+                session.metadata.insert(
+                    "permission.transitioned_at".to_string(),
+                    "2026-07-31T12:00:00Z".to_string(),
+                );
+                session.metadata_version = session.metadata_version.saturating_add(1);
+            })
+            .await
+            .unwrap()
+            .expect("session exists");
+
+        store.merge_save_runtime(&mut loop_snapshot).await.unwrap();
+
+        let durable = storage.load_session(session_id).await.unwrap().unwrap();
+        for state in [
+            durable.agent_runtime_state.as_ref(),
+            loop_snapshot.agent_runtime_state.as_ref(),
+        ] {
+            assert_eq!(
+                state.map(AgentRuntimeState::effective_permission_mode),
+                Some(SessionPermissionMode::Auto)
+            );
+        }
+        for session in [&durable, &loop_snapshot] {
+            assert_eq!(
+                session.metadata.get("permission.policy_revision"),
+                Some(&"12".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.requested_mode"),
+                Some(&"auto".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.effective_mode"),
+                Some(&"auto".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.executor_mapping"),
+                Some(&"bamboo_runtime:auto".to_string())
+            );
+            assert_eq!(
+                session.metadata.get("permission.transitioned_at"),
+                Some(&"2026-07-31T12:00:00Z".to_string())
+            );
+        }
+    }
+
     // The reverse direction: a PATCH turning bypass OFF must also stick against
     // a stale loop snapshot that still has it ON.
     #[tokio::test]
@@ -1096,8 +1709,10 @@ mod tests {
 
         // Baseline persisted with bypass ON.
         let mut baseline = fresh(session_id);
-        let mut on_state = AgentRuntimeState::default();
-        on_state.bypass_permissions = true;
+        let on_state = AgentRuntimeState {
+            bypass_permissions: true,
+            ..AgentRuntimeState::default()
+        };
         baseline.agent_runtime_state = Some(on_state);
         storage.save_session(&baseline).await.unwrap();
 
@@ -1130,7 +1745,7 @@ mod tests {
     // #540 review: the authoritative flag writer (#74 child-reseed) must NOT be
     // reverted by the disk-wins protection — its in-memory value persists as-is.
     #[tokio::test]
-    async fn save_runtime_authoritative_flags_persists_in_memory_bypass() {
+    async fn save_runtime_authoritative_flags_persists_in_memory_posture_and_audit() {
         use bamboo_domain::AgentRuntimeState;
 
         let (_temp, storage) = make_storage().await;
@@ -1139,9 +1754,20 @@ mod tests {
 
         // Child on disk has bypass ON (created under a bypassed parent).
         let mut baseline = fresh(session_id);
-        let mut on_state = AgentRuntimeState::default();
-        on_state.bypass_permissions = true;
+        let on_state = AgentRuntimeState {
+            bypass_permissions: true,
+            ..AgentRuntimeState::default()
+        };
         baseline.agent_runtime_state = Some(on_state);
+        for (key, value) in [
+            ("permission.policy_revision", "12"),
+            ("permission.requested_mode", "bypass"),
+            ("permission.effective_mode", "bypass"),
+            ("permission.executor_mapping", "bamboo_runtime:bypass"),
+            ("permission.transitioned_at", "2026-07-31T12:00:00Z"),
+        ] {
+            baseline.metadata.insert(key.to_string(), value.to_string());
+        }
         storage.save_session(&baseline).await.unwrap();
 
         // Parent re-seeds the reused child to OFF (parent flipped bypass off),
@@ -1151,6 +1777,15 @@ mod tests {
             .agent_runtime_state
             .get_or_insert_with(AgentRuntimeState::default)
             .bypass_permissions = false;
+        for (key, value) in [
+            ("permission.policy_revision", "13"),
+            ("permission.requested_mode", "default"),
+            ("permission.effective_mode", "default"),
+            ("permission.executor_mapping", "bamboo_runtime:default"),
+            ("permission.transitioned_at", "2026-07-31T12:01:00Z"),
+        ] {
+            child.metadata.insert(key.to_string(), value.to_string());
+        }
 
         // Authoritative write must persist OFF, not adopt the disk's stale ON.
         store
@@ -1166,6 +1801,15 @@ mod tests {
                 .is_some_and(|s| s.bypass_permissions),
             "authoritative re-seed of bypass=OFF must persist, not be reverted (#540/#74)"
         );
+        for (key, value) in [
+            ("permission.policy_revision", "13"),
+            ("permission.requested_mode", "default"),
+            ("permission.effective_mode", "default"),
+            ("permission.executor_mapping", "bamboo_runtime:default"),
+            ("permission.transitioned_at", "2026-07-31T12:01:00Z"),
+        ] {
+            assert_eq!(after.metadata.get(key).map(String::as_str), Some(value));
+        }
     }
 
     // A disk copy lacking runtime state must not force the in-memory bypass OFF.
@@ -1184,8 +1828,10 @@ mod tests {
 
         // A running loop legitimately carries bypass ON in memory.
         let mut running = storage.load_session(session_id).await.unwrap().unwrap();
-        let mut on_state = AgentRuntimeState::default();
-        on_state.bypass_permissions = true;
+        let on_state = AgentRuntimeState {
+            bypass_permissions: true,
+            ..AgentRuntimeState::default()
+        };
         running.agent_runtime_state = Some(on_state);
 
         store.merge_save_runtime(&mut running).await.unwrap();

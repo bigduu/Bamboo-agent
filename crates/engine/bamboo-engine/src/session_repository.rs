@@ -313,6 +313,44 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn seed_runtime_activation(&self, session: &mut Session) -> std::io::Result<()> {
+        self.persistence
+            .seed_runtime_activation_and_publish(session, |saved, committed| {
+                #[cfg(test)]
+                self.run_post_durable_hook("seed_runtime_activation", &saved.id);
+                if committed {
+                    self.cache.insert(
+                        saved.id.clone(),
+                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    );
+                }
+            })
+            .await
+    }
+
+    async fn record_permission_posture_activation(
+        &self,
+        session_id: &str,
+        expected_audit_revision: Option<u64>,
+        seed: &bamboo_domain::PermissionAuditSeed,
+    ) -> std::io::Result<Option<Session>> {
+        self.persistence
+            .record_permission_posture_activation_and_publish(
+                session_id,
+                expected_audit_revision,
+                seed,
+                |saved| {
+                    #[cfg(test)]
+                    self.run_post_durable_hook("permission_posture_activation", &saved.id);
+                    self.cache.insert(
+                        saved.id.clone(),
+                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    );
+                },
+            )
+            .await
+    }
+
     async fn save_runtime_control_plane(&self, session: &mut Session) -> std::io::Result<()> {
         self.persistence
             .save_runtime_only_and_publish(session, |saved| {

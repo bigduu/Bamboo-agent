@@ -29,6 +29,7 @@ pub use workflow_run::{
     AgentStepPort, AgentStepResult, FileWorkflowRunRepository, NamedAgentSpec, PermissionDecision,
     WorkflowDefinitionPort, WorkflowPolicyPort, WorkflowPolicyTarget, WorkflowRunEngine,
     WorkflowRunError, WorkflowRunRepository, WorkflowSecretMaterial, WorkflowSecretResolverPort,
+    WorkflowSessionPermissionPort,
 };
 
 pub use app_context::AgentSessionContext;

@@ -412,11 +412,12 @@ impl AppState {
         // The workflow engine executes against the base tool surface. The
         // caller-facing workflow_run tool is overlaid onto the root surface
         // later, preventing a workflow from recursively dispatching itself.
-        let workflow_runs = crate::workflow::WorkflowRunAccess::new(
+        let workflow_runs = crate::workflow::WorkflowRunAccess::new_with_permission_config(
             &data_dir,
             base_tools.clone(),
             skill_manager.clone(),
             session_repo.clone(),
+            permission_checker.permission_config(),
         )
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
@@ -500,20 +501,24 @@ impl AppState {
                 workspace_resolver.clone(),
             ),
         );
+        let mut agent_builder = bamboo_engine::Agent::builder()
+            .storage(storage.clone())
+            .persistence(Arc::new(session_repo.clone()))
+            .session_inbox(session_inbox.clone())
+            .activation_router(session_activation_router.clone())
+            .session_messenger(session_messenger.clone())
+            .attachment_reader(session_store.clone())
+            .skill_manager(skill_manager.clone())
+            .metrics_collector(metrics_service.collector())
+            .config(config.clone())
+            .provider(provider_handle.clone())
+            .default_tools(base_tools.clone())
+            .project_context_resolver(project_context_resolver.clone());
+        if let Some(permission_config) = permission_checker.permission_config() {
+            agent_builder = agent_builder.permission_config(permission_config);
+        }
         let agent = Arc::new(
-            bamboo_engine::Agent::builder()
-                .storage(storage.clone())
-                .persistence(Arc::new(session_repo.clone()))
-                .session_inbox(session_inbox.clone())
-                .activation_router(session_activation_router.clone())
-                .session_messenger(session_messenger.clone())
-                .attachment_reader(session_store.clone())
-                .skill_manager(skill_manager.clone())
-                .metrics_collector(metrics_service.collector())
-                .config(config.clone())
-                .provider(provider_handle.clone())
-                .default_tools(base_tools.clone())
-                .project_context_resolver(project_context_resolver.clone())
+            agent_builder
                 .build()
                 .expect("agent runtime should be fully configured"),
         );

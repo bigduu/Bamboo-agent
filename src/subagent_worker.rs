@@ -54,6 +54,7 @@ pub async fn run() -> std::result::Result<(), String> {
     let mut spec = ProvisionSpec::read_from_stdin()
         .await
         .map_err(|e| format!("read ProvisionSpec from stdin: {e}"))?;
+    let provisioned_permission = spec.capabilities.permission_resolution()?;
 
     // Preserve an explicit parent-selected storage root. Otherwise bind
     // project workers to `<git-root>/.bamboo/tmp/subagents/<child-id>` and
@@ -103,18 +104,21 @@ pub async fn run() -> std::result::Result<(), String> {
             permission_mode,
             inherit_user_config,
             forward_env,
-        } => Arc::new(ClaudeCodeExecutor::new(
-            binary.clone(),
-            model.clone(),
-            permission_mode.clone(),
-            spec.workspace.clone(),
-            Some(crate::claude_code_executor::resolve_claude_code_state_dir(
-                &spec.storage_dir,
-                &spec.identity.child_id,
-            )),
-            inherit_user_config.unwrap_or(false),
-            forward_env.clone().unwrap_or_default(),
-        )),
+        } => Arc::new(
+            ClaudeCodeExecutor::new(
+                binary.clone(),
+                model.clone(),
+                permission_mode.clone(),
+                spec.workspace.clone(),
+                Some(crate::claude_code_executor::resolve_claude_code_state_dir(
+                    &spec.storage_dir,
+                    &spec.identity.child_id,
+                )),
+                inherit_user_config.unwrap_or(false),
+                forward_env.clone().unwrap_or_default(),
+            )
+            .with_provisioned_permission_resolution(provisioned_permission),
+        ),
         ExecutorSpec::Codex {
             binary,
             model,
@@ -154,9 +158,13 @@ pub async fn run() -> std::result::Result<(), String> {
                         network_access.unwrap_or(false),
                         allow_danger_bypass.unwrap_or(false),
                         permission_profile.clone(),
-                        spec.capabilities.bypass,
+                        provisioned_permission.bypass_permissions(),
                         workspace_owned.unwrap_or(false),
-                    )?;
+                    )?
+                    .with_provisioned_permission_resolution(
+                        provisioned_permission,
+                        spec.identity.child_id.clone(),
+                    );
                     Arc::new(
                         CodexExecutor::new(
                             binary.clone(),
@@ -178,9 +186,13 @@ pub async fn run() -> std::result::Result<(), String> {
                             network_access.unwrap_or(false),
                             allow_danger_bypass.unwrap_or(false),
                             permission_profile.clone(),
-                            spec.capabilities.bypass,
+                            provisioned_permission.bypass_permissions(),
                             workspace_owned.unwrap_or(false),
-                        )?;
+                        )?
+                        .with_provisioned_permission_resolution(
+                            provisioned_permission,
+                            spec.identity.child_id.clone(),
+                        );
                     Arc::new(
                         CodexAppServerExecutor::new(
                             binary.clone(),
@@ -292,11 +304,9 @@ pub struct BambooRuntimeExecutor {
     /// This worker's nesting depth (from the actor spec). Stamped onto each run
     /// session's `spawn_depth` so the depth cap accumulates across the boundary.
     spawn_depth: u32,
-    /// Whether this worker runs in "bypass permissions" mode (from the actor
-    /// spec). Stamped onto each run session so the worker's own tools honor it
-    /// AND it propagates to grandchildren (whose forced-ask actions then get the
-    /// installed model-reviewer). Phase 6, Part B.
-    bypass: bool,
+    /// Exact provision-time requested/effective posture. Per-activation
+    /// RunSpec policy replaces it for warm workers.
+    provisioned_permission: bamboo_domain::PermissionModeResolution,
     /// Live policy updated from the host at every activation boundary. Keeping
     /// the same Arc as the builtin executor lets warm and remote workers adopt
     /// new durable revisions without rebuilding their tool surface.
@@ -315,11 +325,18 @@ pub struct BambooRuntimeExecutor {
     child_runner: Option<Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>>,
 }
 
+fn provisioned_permission_resolution(
+    capabilities: &bamboo_subagent::provision::Capabilities,
+) -> Result<bamboo_domain::PermissionModeResolution, String> {
+    capabilities.permission_resolution()
+}
+
 impl BambooRuntimeExecutor {
     /// Assemble the isolated runtime: in-memory config + scoped credentials, provider,
     /// isolated storage/skills/metrics, builtin tools — never touching the user's
     /// `~/.bamboo` or persisting any secret.
     pub async fn build(spec: &ProvisionSpec) -> std::result::Result<Self, String> {
+        let provisioned_permission = provisioned_permission_resolution(&spec.capabilities)?;
         let storage_dir = spec.storage_dir.clone().map(PathBuf::from).unwrap_or(
             default_worker_storage_dir(spec.workspace.as_deref(), &spec.identity.child_id).await,
         );
@@ -576,22 +593,26 @@ impl BambooRuntimeExecutor {
             worker_provider_registry.clone(),
         ));
 
+        let mut agent_builder = bamboo_engine::Agent::builder()
+            .storage(store.clone())
+            .persistence(persistence.clone())
+            .session_inbox(session_inbox.clone())
+            .activation_router(session_activation_router.clone())
+            .session_messenger(session_messenger.clone())
+            .attachment_reader(store.clone())
+            .skill_manager(skill_manager)
+            .metrics_collector(metrics_collector)
+            .config(config)
+            .provider(provider)
+            // Base tools only; the real SubAgent tool is added per-run via
+            // `ExecuteRequestBuilder.tools()` (see `run_tools` below) to break
+            // the agent→tools→adapter→scheduler→agent construction cycle.
+            .default_tools(default_tools.clone());
+        if let Some(permission_config) = permission_config.as_ref() {
+            agent_builder = agent_builder.permission_config(permission_config.clone());
+        }
         let agent = Arc::new(
-            bamboo_engine::Agent::builder()
-                .storage(store.clone())
-                .persistence(persistence.clone())
-                .session_inbox(session_inbox.clone())
-                .activation_router(session_activation_router.clone())
-                .session_messenger(session_messenger.clone())
-                .attachment_reader(store.clone())
-                .skill_manager(skill_manager)
-                .metrics_collector(metrics_collector)
-                .config(config)
-                .provider(provider)
-                // Base tools only; the real SubAgent tool is added per-run via
-                // `ExecuteRequestBuilder.tools()` (see `run_tools` below) to break
-                // the agent→tools→adapter→scheduler→agent construction cycle.
-                .default_tools(default_tools.clone())
+            agent_builder
                 .build()
                 .map_err(|e| format!("build agent runtime: {e}"))?,
         );
@@ -733,7 +754,7 @@ impl BambooRuntimeExecutor {
             child_id: spec.identity.child_id.clone(),
             run_tools,
             spawn_depth: spec.identity.depth,
-            bypass: spec.capabilities.bypass,
+            provisioned_permission,
             permission_config,
             no_human_review,
             child_runner,
@@ -1064,40 +1085,63 @@ impl ChildExecutor for BambooRuntimeExecutor {
         if let Some(project_id) = run.project_id.as_ref() {
             session.set_project_id_meta(project_id.as_str());
         }
-        let mut effective_bypass = self.bypass;
+        let mut permission_resolution = self.provisioned_permission;
+        let mut policy_revision = self
+            .permission_config
+            .as_ref()
+            .map(|config| config.policy_revision())
+            .unwrap_or_default();
         let mut effective_workspace = self.workspace.clone();
-        if let (Some(context), Some(config)) = (
-            run.permission_policy.as_ref(),
-            self.permission_config.as_ref(),
-        ) {
-            match serde_json::from_value::<bamboo_tools::permission::SerializablePermissionConfig>(
-                context.policy.clone(),
-            ) {
-                Ok(policy) => {
-                    config.publish_persistent_policy(context.revision, &policy);
-                    effective_bypass = context.bypass_permissions;
-                    effective_workspace = context.workspace_path.clone().or(effective_workspace);
-                    session.metadata.insert(
-                        "permission.policy_revision".to_string(),
-                        context.revision.to_string(),
-                    );
-                    session.metadata.insert(
-                        "permission.effective_mode".to_string(),
-                        format!("{:?}", config.mode()).to_ascii_lowercase(),
-                    );
-                    session.metadata.insert(
-                        "permission.session_grants_inherited".to_string(),
-                        context.inherit_session_grants.to_string(),
-                    );
-                }
+        if let Some(context) = run.permission_policy.as_ref() {
+            permission_resolution = match context.resolved_modes() {
+                Ok((requested, effective)) => bamboo_domain::PermissionModeResolution {
+                    requested,
+                    effective,
+                },
                 Err(error) => {
-                    // Retain the last-known-good live policy and disable bypass
-                    // for this activation rather than broadening on corrupt wire
-                    // data.
-                    tracing::warn!(%error, "invalid permission policy update; retaining LKG and disabling bypass");
-                    effective_bypass = false;
+                    return ChildOutcome::error(format!(
+                        "invalid activation permission posture: {error}"
+                    ));
                 }
-            }
+            };
+            let Some(config) = self.permission_config.as_ref() else {
+                return ChildOutcome::error(
+                    "activation carries a permission policy but worker enforcement is disabled",
+                );
+            };
+            let policy = match serde_json::from_value::<
+                bamboo_tools::permission::SerializablePermissionConfig,
+            >(context.policy.clone())
+            {
+                Ok(policy) => policy,
+                Err(error) => {
+                    return ChildOutcome::error(format!(
+                        "invalid activation permission policy: {error}"
+                    ));
+                }
+            };
+            config.publish_persistent_policy(context.revision, &policy);
+            config.set_mode(permission_resolution.effective);
+            policy_revision = context.revision;
+            effective_workspace = context.workspace_path.clone().or(effective_workspace);
+            session.metadata.insert(
+                "permission.session_grants_inherited".to_string(),
+                context.inherit_session_grants.to_string(),
+            );
+        } else if let Some(config) = self.permission_config.as_ref() {
+            config.set_mode(permission_resolution.effective);
+        }
+        if let Err(error) = bamboo_domain::record_permission_audit(
+            &mut session.metadata,
+            &bamboo_domain::PermissionAuditSeed::bamboo_runtime(
+                policy_revision,
+                permission_resolution,
+            ),
+            Some(&chrono::Utc::now().to_rfc3339()),
+        ) {
+            return ChildOutcome::error(format!(
+                "worker permission audit allocation failed closed: {error}"
+            ));
         }
         session.workspace = effective_workspace;
         if let (Some(config), Some(workspace)) =
@@ -1112,12 +1156,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Phase 6, Part B: re-establish bypass on the fresh run session so the
         // worker's own tools honor it AND create_child_action propagates it to
         // grandchildren (whose forced-ask actions then reach the model-reviewer).
-        if effective_bypass {
-            session
-                .agent_runtime_state
-                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .bypass_permissions = true;
-        }
+        session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .set_permission_mode(permission_resolution.requested);
         // #73 review (P1): mirror the bypass re-stamp for "no human approver", so
         // create_child_action propagates it to in-process grandchildren. Without
         // this, a depth-2+ child of an unattended run does NOT inherit the flag,
@@ -1207,21 +1249,22 @@ impl ChildExecutor for BambooRuntimeExecutor {
             }
         };
 
-        // Seed the worker's local store before typed steering can enqueue.
+        // Seed the worker's local store before typed steering can enqueue. This
+        // is an exact activation authority boundary: an ordinary adopting save
+        // would make a warm worker retain the previous RunSpec posture.
         {
             let mut seed = session.clone();
             if let Err(error) = self
                 .agent
                 .persistence()
-                .save_runtime_session(&mut seed)
+                .seed_runtime_activation(&mut seed)
                 .await
             {
-                if !initial_deliveries.is_empty() {
-                    return ChildOutcome::error(format!(
-                        "seed worker session before initial SessionInbox delivery: {error}"
-                    ));
-                }
+                return ChildOutcome::error(format!(
+                    "authoritatively seed worker activation before SessionInbox delivery: {error}"
+                ));
             }
+            session = seed;
         }
 
         if let Some(durable) = durable_before_seed.as_ref() {
@@ -1571,6 +1614,19 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             }
         });
+        if let Some(audit) =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
+        {
+            let _ = event_tx
+                .send(AgentEvent::PermissionPostureActivated {
+                    session_id: session.id.clone(),
+                    policy_revision: audit.policy_revision,
+                    requested_mode: audit.resolution.requested.as_str().to_string(),
+                    effective_mode: audit.resolution.effective.as_str().to_string(),
+                    executor_mapping: audit.executor_mapping,
+                })
+                .await;
+        }
 
         let mut builder = bamboo_engine::ExecuteRequestBuilder::new(
             run.assignment.clone(),
@@ -1787,7 +1843,10 @@ mod tests {
             child_id: "worker-transport".to_string(),
             run_tools: None,
             spawn_depth: 1,
-            bypass: false,
+            provisioned_permission: bamboo_domain::resolve_permission_mode(
+                bamboo_domain::SessionPermissionMode::Default,
+                bamboo_domain::PermissionMode::Default,
+            ),
             permission_config: None,
             no_human_review: None,
             child_runner: None,

@@ -179,6 +179,22 @@ pub fn classify_tool(tool_name: &str) -> ToolMutability {
     }
 }
 
+/// Shared Plan-mode authorization gate used by agent loops and direct tool
+/// dispatch. Unknown tools fail closed as mutating; only read-only tools and
+/// the bounded pause/clarification set are admitted.
+pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
+    classify_tool(tool_name) == ToolMutability::ReadOnly
+        || [
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "request_permissions",
+            "conclusion_with_options",
+            "compact_context",
+        ]
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(tool_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

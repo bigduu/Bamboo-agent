@@ -629,6 +629,57 @@ impl ChildSessionPort for ChildSessionAdapter {
         self.finish_child_save(child, saved)
     }
 
+    async fn save_resident_reuse_state(
+        &self,
+        child: &mut Session,
+        workspace: &str,
+        workspace_source: bamboo_engine::project_context::WorkspaceSource,
+        permission_audit: bamboo_domain::PermissionAuditSeed,
+        no_human_approver: bool,
+    ) -> Result<(), ChildSessionError> {
+        let child_id = child.id.clone();
+        let workspace_value = workspace.to_string();
+        let source_value = workspace_source.as_str().to_string();
+        let saved = self
+            .persistence
+            .update_authoritative_permission_posture_and_publish(
+                &child_id,
+                &permission_audit,
+                |latest| {
+                    latest.workspace = Some(workspace_value.clone());
+                    latest.set_workspace_path_meta(&workspace_value);
+                    latest.metadata.insert(
+                        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+                        source_value,
+                    );
+                    latest
+                        .agent_runtime_state
+                        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                        .no_human_approver = no_human_approver;
+                },
+                |latest| {
+                    self.sessions_cache.insert(
+                        latest.id.clone(),
+                        Arc::new(parking_lot::RwLock::new(latest.clone())),
+                    );
+                },
+            )
+            .await
+            .map_err(|error| {
+                ChildSessionError::Execution(format!(
+                    "failed to atomically re-seed resident child: {error}"
+                ))
+            })?
+            .ok_or_else(|| ChildSessionError::NotFound(child_id.clone()))?;
+        *child = saved;
+        self.publish_child_workspace(
+            &child.id,
+            std::path::PathBuf::from(workspace),
+            workspace_source.as_str(),
+        );
+        Ok(())
+    }
+
     async fn send_session_message(
         &self,
         source_session_id: &str,

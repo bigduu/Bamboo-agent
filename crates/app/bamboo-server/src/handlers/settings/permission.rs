@@ -308,6 +308,8 @@ pub struct DiagnosePermissionRequest {
     #[serde(default)]
     pub bypass_requested: bool,
     #[serde(default)]
+    pub auto_approve_requested: bool,
+    #[serde(default)]
     pub platform_hard_deny: Option<String>,
 }
 
@@ -332,6 +334,7 @@ pub async fn diagnose_permission(
         operation_summary: request.operation_summary,
         risk_level: request.permission_type.risk_level(),
         bypass_requested: request.bypass_requested,
+        auto_approve_requested: request.auto_approve_requested,
         platform_hard_deny: request.platform_hard_deny,
         consume_once: false,
         supported_decisions: PermissionDecisionKind::all_supported(),

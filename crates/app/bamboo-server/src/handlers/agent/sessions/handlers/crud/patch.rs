@@ -10,6 +10,49 @@ use bamboo_engine::session_app::provider_model::{
 use super::super::super::types::PatchSessionRequest;
 use super::query::get_session;
 use super::running::is_session_running;
+use crate::permission_audit::record_bamboo_runtime_permission_transition_metadata;
+
+#[cfg(test)]
+mod patch_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    pub(super) struct PermissionInterleaveHook {
+        pub(super) reached: Notify,
+        pub(super) resume: Notify,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Arc<PermissionInterleaveHook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<PermissionInterleaveHook>>>> =
+            OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(session_id: &str) -> Arc<PermissionInterleaveHook> {
+        let hook = Arc::new(PermissionInterleaveHook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        hooks()
+            .lock()
+            .expect("permission interleave hooks lock")
+            .insert(session_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause_after_authoritative_fields(session_id: &str) {
+        let hook = hooks()
+            .lock()
+            .expect("permission interleave hooks lock")
+            .remove(session_id);
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+}
 
 /// Parse an `If-Match` header value into the expected `metadata_version`.
 /// Accepts a bare integer or a (weak) quoted ETag: `7`, `"7"`, `W/"7"`.
@@ -153,8 +196,39 @@ pub async fn patch_session(
     req: web::Json<PatchSessionRequest>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
-    // Consumed by the first authoritative setter invoked (see `.take()` below).
-    let mut precondition = parse_if_match(&http_req);
+    if req.permission_mode.is_some() && req.bypass_permissions.is_some() {
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value(
+                "permission_mode and bypass_permissions cannot be set together"
+            ),
+            "session_id": session_id,
+        })));
+    }
+    let request_precondition = parse_if_match(&http_req);
+    if req.permission_mode.is_some() && request_precondition.is_none() {
+        return Ok(HttpResponse::build(
+            actix_web::http::StatusCode::PRECONDITION_REQUIRED,
+        )
+        .json(serde_json::json!({
+            "error": crate::error::error_value(
+                "If-Match with the current session metadata_version is required for permission_mode changes"
+            ),
+            "session_id": session_id,
+        })));
+    }
+    let requested_permission_mode = req.permission_mode.or_else(|| {
+        req.bypass_permissions.map(|enabled| {
+            if enabled {
+                bamboo_domain::SessionPermissionMode::Bypass
+            } else {
+                bamboo_domain::SessionPermissionMode::Default
+            }
+        })
+    });
+    // When present, carry the exact version produced by each preceding field
+    // through the whole PATCH. Every authoritative step validates it under the
+    // session lock and advances it only when that step actually changed data.
+    let mut precondition = request_precondition;
 
     // Project reassignment and explicit Workspace switching are one
     // authoritative transaction. The entire validate -> mutate -> persist ->
@@ -454,15 +528,14 @@ pub async fn patch_session(
     }
 
     if let Some(title) = req.title.as_ref() {
-        match SessionMetadataService::set_title(
-            state.get_ref(),
-            &session_id,
-            title,
-            precondition.take(),
-        )
-        .await
+        match SessionMetadataService::set_title(state.get_ref(), &session_id, title, precondition)
+            .await
         {
-            Ok(_) => {}
+            Ok(change) => {
+                if change.is_some() {
+                    precondition = precondition.map(|version| version.saturating_add(1));
+                }
+            }
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": crate::error::error_value("Session not found"),
@@ -479,15 +552,14 @@ pub async fn patch_session(
     }
 
     if let Some(pinned) = req.pinned {
-        match SessionMetadataService::set_pinned(
-            state.get_ref(),
-            &session_id,
-            pinned,
-            precondition.take(),
-        )
-        .await
+        match SessionMetadataService::set_pinned(state.get_ref(), &session_id, pinned, precondition)
+            .await
         {
-            Ok(_) => {}
+            Ok(change) => {
+                if change.is_some() {
+                    precondition = precondition.map(|version| version.saturating_add(1));
+                }
+            }
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": crate::error::error_value("Session not found"),
@@ -522,11 +594,15 @@ pub async fn patch_session(
             state.get_ref(),
             &session_id,
             gold_config_json,
-            precondition.take(),
+            precondition,
         )
         .await
         {
-            Ok(_) => {}
+            Ok(change) => {
+                if change.is_some() {
+                    precondition = precondition.map(|version| version.saturating_add(1));
+                }
+            }
             Err(MetadataError::NotFound(id)) => {
                 return Ok(HttpResponse::NotFound().json(serde_json::json!({
                     "error": crate::error::error_value("Session not found"),
@@ -547,7 +623,7 @@ pub async fn patch_session(
         || req.model.is_some()
         || req.reasoning_effort.is_some()
         || req.clear_reasoning_effort.unwrap_or(false)
-        || req.bypass_permissions.is_some();
+        || requested_permission_mode.is_some();
 
     if touches_non_metadata {
         let request_model_ref = derive_model_ref(
@@ -556,82 +632,154 @@ pub async fn patch_session(
             req.model.as_deref(),
         );
 
-        // Tracks whether the locked mutation actually changed model/reasoning,
-        // so the log below reports real diffs (not merely "a field was present
-        // in the request"). `Cell` is fine: the closure runs synchronously.
-        let model_changed = std::cell::Cell::new(false);
-        let reasoning_changed = std::cell::Cell::new(false);
+        // A typed permission write is authoritative and CAS-guarded. The
+        // expected revision is the exact value produced by the preceding
+        // operations in this request, never a lock-free reload of whatever a
+        // third party may have committed in the gap.
+        #[cfg(test)]
+        let earlier_authoritative_field = req.project_id.is_some()
+            || req.workspace_path.is_some()
+            || req.title.is_some()
+            || req.pinned.is_some()
+            || req.gold_config.is_some();
+        let permission_expected_version = req.permission_mode.and(precondition);
 
-        // Apply ONLY the config fields, loading the freshest session under the
-        // per-session lock. This must never rewrite `messages`: a config patch
-        // (e.g. model/reasoning-effort) can race a concurrent `POST /chat` that
-        // just appended a user message, and a full-session save from a stale
-        // snapshot would silently revert that append (lost-write bug).
-        let updated = state
+        #[cfg(test)]
+        if req.permission_mode.is_some() && earlier_authoritative_field {
+            patch_test_hooks::pause_after_authoritative_fields(&session_id).await;
+        }
+
+        // Apply ONLY the config fields after loading the freshest session under
+        // the per-session lock. This cannot clobber messages appended by a
+        // concurrent chat write, and the permission CAS check happens under the
+        // same lock as its durable commit.
+        let guard = state.persistence.acquire_lock(&session_id).await;
+        let Some(mut session) = state
             .persistence
-            .update_runtime_config(&session_id, |session| {
-                let prev_model = session.model.clone();
-                let prev_model_ref = session.model_ref.clone();
-                let prev_reasoning = session.reasoning_effort;
-
-                if let Some(model_ref) = request_model_ref.as_ref() {
-                    persist_model_ref(session, model_ref);
-                } else {
-                    persist_legacy_model_provider(
-                        session,
-                        req.model.as_deref(),
-                        req.provider.as_deref(),
-                    );
-                }
-                if req.clear_reasoning_effort.unwrap_or(false) {
-                    session.reasoning_effort = None;
-                } else if let Some(reasoning_effort) = req.reasoning_effort {
-                    session.reasoning_effort = Some(reasoning_effort);
-                }
-
-                // Per-session "bypass permissions" toggle. Stored on the session's
-                // runtime state (runtime.json), creating it on demand so the flag
-                // can be set before the session's first run.
-                if let Some(bypass) = req.bypass_permissions {
-                    session
-                        .agent_runtime_state
-                        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                        .bypass_permissions = bypass;
-                }
-
-                model_changed
-                    .set(session.model != prev_model || session.model_ref != prev_model_ref);
-                reasoning_changed.set(session.reasoning_effort != prev_reasoning);
-                session.updated_at = chrono::Utc::now();
-            })
+            .storage()
+            .load_session(&session_id)
             .await
             .map_err(|error| {
-                crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
-            })?;
-
-        let Some(session) = updated else {
+                crate::error::json_internal_server_error(format!(
+                    "Failed to load session for config update: {error}"
+                ))
+            })?
+        else {
             return Ok(HttpResponse::NotFound().json(serde_json::json!({
                 "error": crate::error::error_value("Session not found"),
                 "session_id": session_id
             })));
         };
+        if let Some(expected) = permission_expected_version {
+            if session.metadata_version != expected {
+                return Ok(precondition_failed(&session_id, session.metadata_version));
+            }
+        }
+
+        let prev_model = session.model.clone();
+        let prev_model_ref = session.model_ref.clone();
+        let prev_reasoning = session.reasoning_effort;
+
+        if let Some(model_ref) = request_model_ref.as_ref() {
+            persist_model_ref(&mut session, model_ref);
+        } else {
+            persist_legacy_model_provider(
+                &mut session,
+                req.model.as_deref(),
+                req.provider.as_deref(),
+            );
+        }
+        if req.clear_reasoning_effort.unwrap_or(false) {
+            session.reasoning_effort = None;
+        } else if let Some(reasoning_effort) = req.reasoning_effort {
+            session.reasoning_effort = Some(reasoning_effort);
+        }
+
+        // First-class per-session permission behavior. The typed mode and
+        // legacy mirror are updated together so old clients remain
+        // conservative without gaining a way to select Auto.
+        let permission_transition = requested_permission_mode
+            .and_then(|mode| {
+                let runtime = session
+                    .agent_runtime_state
+                    .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+                let previous = runtime.effective_permission_mode();
+                runtime.set_permission_mode(mode);
+                (previous != mode).then_some((previous, mode))
+            })
+            .map(|(previous, effective)| (previous, effective, chrono::Utc::now().to_rfc3339()));
+        if let Some((_, effective, transitioned_at)) = permission_transition.as_ref() {
+            if let Some(config) = state.permission_checker.permission_config() {
+                record_bamboo_runtime_permission_transition_metadata(
+                    &mut session,
+                    config.as_ref(),
+                    transitioned_at,
+                )
+                .map_err(|error| {
+                    crate::error::json_internal_server_error(format!(
+                        "Failed to record permission transition: {error}"
+                    ))
+                })?;
+            } else {
+                let resolution = bamboo_domain::resolve_permission_mode(
+                    *effective,
+                    bamboo_domain::PermissionMode::Default,
+                );
+                bamboo_domain::record_permission_audit(
+                    &mut session.metadata,
+                    &bamboo_domain::PermissionAuditSeed::bamboo_runtime(0, resolution),
+                    Some(transitioned_at),
+                )
+                .map_err(|error| {
+                    crate::error::json_internal_server_error(format!(
+                        "Failed to record permission transition: {error}"
+                    ))
+                })?;
+            }
+            session.metadata_version = session.metadata_version.saturating_add(1);
+        }
+
+        let model_changed = session.model != prev_model || session.model_ref != prev_model_ref;
+        let reasoning_changed = session.reasoning_effort != prev_reasoning;
+        session.updated_at = chrono::Utc::now();
+        state
+            .persistence
+            .storage()
+            .save_session(&session)
+            .await
+            .map_err(|error| {
+                crate::error::json_internal_server_error(format!("Failed to save session: {error}"))
+            })?;
+        state.sessions.insert(
+            session_id.clone(),
+            std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        );
+        drop(guard);
 
         // Only worth a line when something actually changed; a no-op config
         // patch (the common case for repeated/echoed UI writes) stays quiet.
-        if model_changed.get() || reasoning_changed.get() {
+        if model_changed || reasoning_changed {
             tracing::debug!(
                 "[{}] patch_session config update saved under lock: messages preserved={}, model_changed={}, reasoning_changed={}",
                 session_id,
                 session.messages.len(),
-                model_changed.get(),
-                reasoning_changed.get(),
+                model_changed,
+                reasoning_changed,
             );
         }
-
-        state.sessions.insert(
-            session_id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session)),
-        );
+        if let Some((previous, effective, transitioned_at)) = permission_transition {
+            tracing::info!(
+                telemetry_event = "session.permission_mode.transition",
+                session_id = %session_id,
+                previous_mode = previous.as_str(),
+                requested_mode = requested_permission_mode
+                    .map(bamboo_domain::SessionPermissionMode::as_str)
+                    .unwrap_or("unchanged"),
+                effective_mode = effective.as_str(),
+                transitioned_at = %transitioned_at,
+                "session permission mode changed"
+            );
+        }
     }
 
     // Advertise the new ETag (metadata_version) so clients can send it back as
@@ -703,6 +851,436 @@ mod tests {
             label: None,
             git_common_dir: None,
         }
+    }
+
+    #[actix_web::test]
+    async fn permission_mode_auto_persists_and_is_indexed_distinctly() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial_version = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session")
+            .metadata_version;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
+                .set_json(serde_json::json!({"permission_mode": "auto"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let expected_etag = format!("\"{}\"", initial_version.saturating_add(1));
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_etag.as_str())
+        );
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["session"]["permission_mode"], "auto");
+        assert_eq!(body["session"]["bypass_permissions"], true);
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(
+            persisted.metadata.get("permission.requested_mode"),
+            Some(&"auto".to_string())
+        );
+        assert_eq!(
+            persisted.metadata.get("permission.effective_mode"),
+            Some(&"auto".to_string())
+        );
+        assert!(persisted
+            .metadata
+            .get("permission.policy_revision")
+            .is_some_and(|revision| revision.parse::<u64>().is_ok()));
+        assert_eq!(
+            persisted.metadata.get("permission.executor_mapping"),
+            Some(&"bamboo_runtime:auto".to_string())
+        );
+        assert!(persisted
+            .metadata
+            .get("permission.transitioned_at")
+            .is_some_and(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).is_ok()));
+        let runtime = persisted.agent_runtime_state.expect("runtime state");
+        assert_eq!(
+            runtime.effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+        let indexed = state
+            .session_store
+            .get_index_entry(&id)
+            .await
+            .expect("index entry");
+        assert_eq!(
+            indexed.permission_mode,
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+    }
+
+    #[actix_web::test]
+    async fn typed_permission_mode_requires_cas_and_rejects_stale_reordering() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial_version = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session")
+            .metadata_version;
+        let initial_etag = format!("\"{initial_version}\"");
+
+        let missing = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({"permission_mode": "auto"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let first = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, initial_etag.as_str()))
+                .set_json(serde_json::json!({"permission_mode": "auto"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // A delayed request prepared from the same original snapshot must not
+        // overwrite the newer Auto choice merely because it arrived later.
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, initial_etag.as_str()))
+                .set_json(serde_json::json!({"permission_mode": "default"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        let next_etag = format!("\"{}\"", initial_version.saturating_add(1));
+        assert_eq!(
+            stale
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(next_etag.as_str())
+        );
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(
+            persisted.metadata_version,
+            initial_version.saturating_add(1)
+        );
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode),
+            Some(bamboo_domain::SessionPermissionMode::Auto)
+        );
+    }
+
+    #[actix_web::test]
+    async fn mixed_field_patch_rejects_permission_write_that_loses_an_interleaving_cas() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial_version = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session")
+            .metadata_version;
+        let hook = super::patch_test_hooks::install(&id);
+
+        let mixed_request = test::TestRequest::patch()
+            .uri(&format!("/api/v1/sessions/{id}"))
+            .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
+            .set_json(serde_json::json!({
+                "title": "mixed request title",
+                "permission_mode": "auto"
+            }))
+            .to_request();
+        let mixed = test::call_service(&app, mixed_request);
+        let interleaving = async {
+            hook.reached.notified().await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .insert_header((
+                        header::IF_MATCH,
+                        format!("\"{}\"", initial_version.saturating_add(1)),
+                    ))
+                    .set_json(serde_json::json!({"permission_mode": "bypass"}))
+                    .to_request(),
+            )
+            .await;
+            hook.resume.notify_one();
+            response
+        };
+        let (mixed_response, interleaving_response) = futures::join!(mixed, interleaving);
+
+        assert_eq!(interleaving_response.status(), StatusCode::OK);
+        assert_eq!(mixed_response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            mixed_response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(format!("\"{}\"", initial_version.saturating_add(2)).as_str())
+        );
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(persisted.title, "mixed request title");
+        assert_eq!(
+            persisted.metadata_version,
+            initial_version.saturating_add(2)
+        );
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode),
+            Some(bamboo_domain::SessionPermissionMode::Bypass)
+        );
+        assert_eq!(
+            persisted.metadata.get("permission.requested_mode"),
+            Some(&"bypass".to_string())
+        );
+    }
+
+    #[actix_web::test]
+    async fn no_op_earlier_field_does_not_blindly_advance_permission_cas_token() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial = state.storage.load_session(&id).await.unwrap().unwrap();
+        let initial_version = initial.metadata_version;
+        let initial_audit =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&initial.metadata);
+        let hook = super::patch_test_hooks::install(&id);
+
+        let no_op_then_auto = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
+                .set_json(serde_json::json!({
+                    "title": initial.title,
+                    "permission_mode": "auto"
+                }))
+                .to_request(),
+        );
+        let interleaving = async {
+            hook.reached.notified().await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .insert_header((header::IF_MATCH, format!("\"{initial_version}\"")))
+                    .set_json(serde_json::json!({"pinned": true}))
+                    .to_request(),
+            )
+            .await;
+            hook.resume.notify_one();
+            response
+        };
+        let (stale_auto, third_party) = futures::join!(no_op_then_auto, interleaving);
+
+        assert_eq!(third_party.status(), StatusCode::OK);
+        assert_eq!(stale_auto.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            stale_auto.headers().get(header::ETAG).unwrap(),
+            format!("\"{}\"", initial_version + 1).as_str()
+        );
+        let persisted = state.storage.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(persisted.metadata_version, initial_version + 1);
+        assert!(persisted.pinned);
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode)
+                .unwrap_or_default(),
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert_eq!(
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&persisted.metadata),
+            initial_audit
+        );
+    }
+
+    #[actix_web::test]
+    async fn workspace_then_interleaving_write_makes_mixed_auto_patch_stale() {
+        let state = new_state().await;
+        let first = tempdir().expect("first workspace");
+        let second = tempdir().expect("second workspace");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Mixed CAS Project",
+                None,
+                first.path().to_string_lossy(),
+                vec![binding(second.path())],
+            )
+            .expect("Project");
+        let session_id = "workspace-mixed-permission-cas";
+        seed_session(&state, session_id, Some(&project.id), Some(first.path())).await;
+        let initial = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let initial_audit =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&initial.metadata);
+        let hook = super::patch_test_hooks::install(session_id);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let workspace_then_auto = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "workspace_path": second.path(),
+                    "permission_mode": "auto"
+                }))
+                .to_request(),
+        );
+        let interleaving = async {
+            hook.reached.notified().await;
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{session_id}"))
+                    .insert_header((header::IF_MATCH, "\"1\""))
+                    .set_json(serde_json::json!({"pinned": true}))
+                    .to_request(),
+            )
+            .await;
+            hook.resume.notify_one();
+            response
+        };
+        let (stale_auto, third_party) = futures::join!(workspace_then_auto, interleaving);
+
+        assert_eq!(third_party.status(), StatusCode::OK);
+        assert_eq!(stale_auto.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale_auto.headers().get(header::ETAG).unwrap(), "\"2\"");
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, 2);
+        assert!(persisted.pinned);
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(display(second.path()).as_str())
+        );
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .map(bamboo_domain::AgentRuntimeState::effective_permission_mode)
+                .unwrap_or_default(),
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert_eq!(
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&persisted.metadata),
+            initial_audit
+        );
+    }
+
+    #[actix_web::test]
+    async fn permission_patch_rejects_ambiguous_new_and_legacy_fields() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .set_json(serde_json::json!({
+                    "permission_mode": "auto",
+                    "bypass_permissions": true
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert!(persisted.agent_runtime_state.is_none());
     }
 
     async fn seed_session(

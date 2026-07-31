@@ -143,13 +143,15 @@ pub(super) async fn initialize_loop_state(
         .as_ref()
         .is_some_and(|previous| matches!(previous.status, AgentStatusState::Suspended));
     let mut runtime_state = AgentRuntimeState::new(&session_id);
-    // "Bypass permissions" is a per-session sticky toggle (set via PATCH /sessions
-    // and persisted in runtime.json). Each run rebuilds a fresh runtime state, so
-    // carry the flag forward from the prior state instead of resetting it.
-    runtime_state.bypass_permissions = session
+    // Permission mode is a per-session sticky posture (set via PATCH /sessions
+    // and persisted in runtime.json). Each run rebuilds a fresh runtime state,
+    // so carry the exact typed mode forward instead of resetting it.
+    let permission_mode = session
         .agent_runtime_state
         .as_ref()
-        .is_some_and(|prev| prev.bypass_permissions);
+        .map(|prev| prev.effective_permission_mode())
+        .unwrap_or_default();
+    runtime_state.set_permission_mode(permission_mode);
     // #73: "no interactive human approver" (headless / scheduled / deployed) is
     // likewise a sticky per-session flag; carry it forward so every run — and the
     // sub-agents it spawns (which inherit it) — route gated actions to the

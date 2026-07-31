@@ -199,6 +199,16 @@ pub trait PermissionChecker: Send + Sync {
         None
     }
 
+    /// Return a non-interactive hard-deny reason for this operation.
+    ///
+    /// This is evaluated before permissive modes such as `Auto`. Implementors
+    /// that enforce an authority boundary (for example a read-only reviewer)
+    /// must expose it here so zero-prompt execution can distinguish "allow
+    /// without asking" from "deny without asking".
+    fn hard_deny_reason(&self, _ctx: &PermissionContext) -> Option<String> {
+        None
+    }
+
     /// Whether this tool call matches an "always ask" rule (configured pattern
     /// or built-in dangerous-command detection) and must therefore force a user
     /// confirmation REGARDLESS of the active permission mode — including
@@ -360,6 +370,10 @@ impl<T: PermissionChecker> PermissionChecker for LoggingPermissionChecker<T> {
     fn permission_config(&self) -> Option<Arc<PermissionConfig>> {
         self.inner.permission_config()
     }
+
+    fn hard_deny_reason(&self, ctx: &PermissionContext) -> Option<String> {
+        self.inner.hard_deny_reason(ctx)
+    }
 }
 
 /// A permission checker that always allows all operations
@@ -407,6 +421,20 @@ impl PermissionChecker for DenyDangerousPermissionChecker {
 
     fn grant_session_permission(&self, _perm_type: PermissionType, _resource: String) {
         // No-op since we don't allow grants
+    }
+
+    fn hard_deny_reason(&self, ctx: &PermissionContext) -> Option<String> {
+        matches!(
+            ctx.permission_type.risk_level(),
+            RiskLevel::High | RiskLevel::Medium
+        )
+        .then(|| {
+            format!(
+                "{} operation denied: {}",
+                ctx.permission_type.description(),
+                ctx.resource
+            )
+        })
     }
 }
 
@@ -515,6 +543,19 @@ impl PermissionChecker for GuardianReadOnlyChecker {
 
     fn permission_config(&self) -> Option<Arc<PermissionConfig>> {
         self.inner.permission_config()
+    }
+
+    fn hard_deny_reason(&self, ctx: &PermissionContext) -> Option<String> {
+        if ctx.permission_type == PermissionType::ExecuteCommand
+            && !is_read_only_command(&ctx.resource)
+        {
+            Some(format!(
+                "Guardian reviewer is read-only: command not allowed: {}",
+                ctx.resource
+            ))
+        } else {
+            self.inner.hard_deny_reason(ctx)
+        }
     }
 }
 
@@ -839,7 +880,7 @@ impl ModeAwarePermissionChecker {
 impl PermissionChecker for ModeAwarePermissionChecker {
     async fn needs_confirmation(&self, perm_type: PermissionType, resource: &str) -> bool {
         match self.config.mode() {
-            PermissionMode::BypassPermissions => false,
+            PermissionMode::BypassPermissions | PermissionMode::Auto => false,
             PermissionMode::Plan => {
                 // In plan mode, all non-low-risk operations require confirmation (= are blocked)
                 perm_type.risk_level() != RiskLevel::Low
@@ -868,7 +909,7 @@ impl PermissionChecker for ModeAwarePermissionChecker {
 
     async fn request_confirmation(&self, ctx: PermissionContext) -> Result<bool, PermissionError> {
         match self.config.mode() {
-            PermissionMode::BypassPermissions => Ok(true),
+            PermissionMode::BypassPermissions | PermissionMode::Auto => Ok(true),
             PermissionMode::Plan => Err(PermissionError::Denied(format!(
                 "Plan mode: {} operation blocked for '{}'",
                 ctx.permission_type.description(),
@@ -911,6 +952,9 @@ impl PermissionChecker for ModeAwarePermissionChecker {
         &self,
         ctx: PermissionContext,
     ) -> Result<bool, PermissionError> {
+        if self.config.mode() == PermissionMode::Auto {
+            return Ok(true);
+        }
         // Route through the inner (mode-unaware) checker so the active mode —
         // including BypassPermissions — does NOT suppress the forced prompt.
         // Session grants still short-circuit, so a re-attempt after approval
@@ -920,6 +964,10 @@ impl PermissionChecker for ModeAwarePermissionChecker {
 
     fn permission_config(&self) -> Option<Arc<PermissionConfig>> {
         Some(self.config.clone())
+    }
+
+    fn hard_deny_reason(&self, ctx: &PermissionContext) -> Option<String> {
+        self.inner.hard_deny_reason(ctx)
     }
 }
 
@@ -1315,6 +1363,26 @@ mod tests {
         // request_confirmation should also succeed
         let ctx = PermissionContext::new(PermissionType::ExecuteCommand, "rm -rf /", "dangerous");
         assert!(checker.request_confirmation(ctx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auto_suppresses_forced_confirmation_but_bypass_does_not() {
+        let context = || {
+            PermissionContext::new(
+                PermissionType::ExecuteCommand,
+                "eval 'echo forced'",
+                "forced confirmation",
+            )
+        };
+
+        let bypass = mode_aware_setup(PermissionMode::BypassPermissions);
+        assert!(bypass.check_or_request_forced(context()).await.is_err());
+
+        let auto = mode_aware_setup(PermissionMode::Auto);
+        assert!(matches!(
+            auto.check_or_request_forced(context()).await,
+            Ok(true)
+        ));
     }
 
     #[tokio::test]

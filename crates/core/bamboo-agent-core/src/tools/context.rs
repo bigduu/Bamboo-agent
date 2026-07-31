@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::tools::{BashCompletionSink, ToolSchema};
 use crate::{AgentEvent, Session};
+use bamboo_domain::PermissionMode;
 
 /// Per-session flags that flow into every tool call's [`ToolExecutionContext`].
 ///
@@ -28,17 +29,48 @@ pub struct ToolExecutionSessionFlags {
     /// When `true`, the session is in "bypass permissions" mode and tool
     /// permission checks are skipped. Sourced from the session's runtime state.
     pub bypass_permissions: bool,
+    /// When `true`, approval requests are suppressed even for hard-dangerous
+    /// and always-ask operations. Hard policy denials remain enforced.
+    pub auto_approve_permissions: bool,
+    /// Hard read-only authorization overlay. Independent from approval
+    /// suppression: Plan+Auto is no-prompt but still denies every mutating tool.
+    pub plan_read_only: bool,
 }
 
 impl ToolExecutionSessionFlags {
     /// Derive the per-session tool-execution flags from a session's runtime
     /// state. This is the single source of truth for both agent loops.
     pub fn from_session(session: &Session) -> Self {
+        Self::from_session_and_configured_mode(session, PermissionMode::Default)
+    }
+
+    /// Derive flags from the typed session request and the process-wide mode.
+    /// This is the execution-boundary form: default sessions inherit global
+    /// Auto, explicit Bypass remains Bypass, and Plan produces neither
+    /// permissive flag.
+    pub fn from_session_and_configured_mode(
+        session: &Session,
+        configured_mode: PermissionMode,
+    ) -> Self {
+        let requested = session
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        let configured_mode = if session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.plan_mode.is_some())
+        {
+            PermissionMode::Plan
+        } else {
+            configured_mode
+        };
+        let resolution = bamboo_domain::resolve_permission_mode(requested, configured_mode);
         Self {
-            bypass_permissions: session
-                .agent_runtime_state
-                .as_ref()
-                .is_some_and(|state| state.bypass_permissions),
+            bypass_permissions: resolution.bypass_permissions(),
+            auto_approve_permissions: resolution.auto_approve_permissions(),
+            plan_read_only: resolution.effective == PermissionMode::Plan,
         }
     }
 }
@@ -66,6 +98,11 @@ pub struct ToolExecutionContext<'a> {
     /// tool permission checks are skipped. Sourced per-session from the
     /// session's runtime state (`runtime.json`), not the global checker.
     pub bypass_permissions: bool,
+    /// Stronger, explicitly selected auto mode. This skips every approval
+    /// request but is still evaluated behind platform and explicit deny rules.
+    pub auto_approve_permissions: bool,
+    /// Hard Plan/read-only overlay, evaluated before checker/bypass/Auto paths.
+    pub plan_read_only: bool,
     /// When `true`, the executing agent loop can suspend the current turn for a
     /// backgrounded shell and self-resume once it finishes (i.e. a
     /// `bash_resume_hook` AND persistence are wired). The Bash tool uses this to
@@ -109,6 +146,8 @@ impl std::fmt::Debug for ToolExecutionContext<'_> {
             .field("event_tx", &self.event_tx)
             .field("available_tool_schemas", &self.available_tool_schemas)
             .field("bypass_permissions", &self.bypass_permissions)
+            .field("auto_approve_permissions", &self.auto_approve_permissions)
+            .field("plan_read_only", &self.plan_read_only)
             .field("can_async_resume", &self.can_async_resume)
             .field("bash_completion_sink", &self.bash_completion_sink.is_some())
             .field("pre_parsed_args", &self.pre_parsed_args)
@@ -124,6 +163,8 @@ impl<'a> ToolExecutionContext<'a> {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -167,6 +208,8 @@ impl<'a> ToolExecutionContext<'a> {
             event_tx: Some(event_tx),
             available_tool_schemas: Some(available_tool_schemas),
             bypass_permissions: flags.bypass_permissions,
+            auto_approve_permissions: flags.auto_approve_permissions,
+            plan_read_only: flags.plan_read_only,
             can_async_resume,
             bash_completion_sink,
             pre_parsed_args,
@@ -202,6 +245,8 @@ impl<'a> ToolExecutionContext<'a> {
                 .map(Arc::from)
                 .unwrap_or_else(|| Arc::from(Vec::new())),
             bypass_permissions: self.bypass_permissions,
+            auto_approve_permissions: self.auto_approve_permissions,
+            plan_read_only: self.plan_read_only,
             can_async_resume: self.can_async_resume,
             async_completion_sink: None,
             bash_completion_sink: self.bash_completion_sink.map(Arc::clone),
@@ -238,7 +283,7 @@ impl<'a> ToolExecutionContext<'a> {
 #[cfg(test)]
 mod session_flags_tests {
     use super::*;
-    use bamboo_domain::AgentRuntimeState;
+    use bamboo_domain::{AgentRuntimeState, SessionPermissionMode};
 
     #[test]
     fn from_session_defaults_false_without_runtime_state() {
@@ -246,7 +291,9 @@ mod session_flags_tests {
         assert_eq!(
             ToolExecutionSessionFlags::from_session(&session),
             ToolExecutionSessionFlags {
-                bypass_permissions: false
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
             }
         );
     }
@@ -258,6 +305,82 @@ mod session_flags_tests {
         runtime.bypass_permissions = true;
         session.agent_runtime_state = Some(runtime);
         assert!(ToolExecutionSessionFlags::from_session(&session).bypass_permissions);
+        assert!(!ToolExecutionSessionFlags::from_session(&session).auto_approve_permissions);
+    }
+
+    #[test]
+    fn from_session_distinguishes_auto_from_legacy_bypass() {
+        let mut session = Session::new("s-auto", "test-model");
+        let mut runtime = AgentRuntimeState::new("run-1");
+        runtime.set_permission_mode(SessionPermissionMode::Auto);
+        session.agent_runtime_state = Some(runtime);
+
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        assert!(!flags.bypass_permissions);
+        assert!(flags.auto_approve_permissions);
+    }
+
+    #[test]
+    fn configured_auto_applies_to_default_but_not_explicit_bypass() {
+        let default_session = Session::new("s-global-auto", "test-model");
+        let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &default_session,
+            PermissionMode::Auto,
+        );
+        assert_eq!(
+            flags,
+            ToolExecutionSessionFlags {
+                bypass_permissions: false,
+                auto_approve_permissions: true,
+                plan_read_only: false,
+            }
+        );
+
+        let mut bypass_session = default_session;
+        bypass_session
+            .agent_runtime_state
+            .get_or_insert_default()
+            .set_permission_mode(SessionPermissionMode::Bypass);
+        let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &bypass_session,
+            PermissionMode::Auto,
+        );
+        assert!(flags.bypass_permissions);
+        assert!(!flags.auto_approve_permissions);
+    }
+
+    #[test]
+    fn configured_plan_preserves_no_prompt_but_sets_read_only_gate() {
+        let mut session = Session::new("s-plan-auto", "test-model");
+        session
+            .agent_runtime_state
+            .get_or_insert_default()
+            .set_permission_mode(SessionPermissionMode::Auto);
+        let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &session,
+            PermissionMode::Plan,
+        );
+        assert!(!flags.bypass_permissions);
+        assert!(flags.auto_approve_permissions);
+        assert!(flags.plan_read_only);
+    }
+
+    #[test]
+    fn persisted_plan_overlay_is_honored_without_config_reconstruction() {
+        let mut session = Session::new("s-persisted-plan-auto", "test-model");
+        let runtime = session.agent_runtime_state.get_or_insert_default();
+        runtime.set_permission_mode(SessionPermissionMode::Auto);
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "auto".to_string(),
+            plan_file_path: None,
+            status: bamboo_domain::PlanModeStatus::Designing,
+        });
+
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        assert!(flags.plan_read_only);
+        assert!(flags.auto_approve_permissions);
+        assert!(!flags.bypass_permissions);
     }
 
     #[test]
@@ -270,6 +393,8 @@ mod session_flags_tests {
             &[],
             ToolExecutionSessionFlags {
                 bypass_permissions: true,
+                auto_approve_permissions: false,
+                plan_read_only: false,
             },
             true,
             None,
@@ -277,8 +402,14 @@ mod session_flags_tests {
         );
         assert_eq!(ctx.session_id, Some("s1"));
         assert!(ctx.bypass_permissions);
+        assert!(!ctx.auto_approve_permissions);
         assert!(ctx.can_async_resume);
         assert!(ctx.pre_parsed_args.is_none());
+
+        let owned = ctx.to_tool_ctx();
+        assert!(owned.bypass_permissions);
+        assert!(!owned.auto_approve_permissions);
+        assert!(!owned.plan_read_only);
     }
 
     #[test]
@@ -317,6 +448,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -347,6 +480,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -379,6 +514,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -422,6 +559,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -476,6 +615,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -503,6 +644,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -535,6 +678,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -566,6 +711,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -594,6 +741,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -626,6 +775,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -654,6 +805,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -680,6 +833,8 @@ mod tests {
             event_tx: Some(&tx),
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,

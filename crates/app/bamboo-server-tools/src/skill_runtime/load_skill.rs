@@ -25,6 +25,10 @@ use super::{
     validate_runtime_activation_descriptor, SkillToolAccess,
 };
 
+pub(super) fn plan_allows_dynamic_provider(plan_read_only: bool, tool_name: &str) -> bool {
+    !plan_read_only || bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name)
+}
+
 #[derive(Debug, Deserialize)]
 struct LoadSkillArgs {
     skill_id: String,
@@ -347,13 +351,41 @@ impl LoadSkillTool {
                 &call_id,
                 event_tx,
                 &available,
-                // Dynamic context never inherits bypass. Every provider must
-                // pass the normal permission/workspace gate independently.
-                ToolExecutionSessionFlags::default(),
+                // Dynamic context never inherits legacy Bypass. Every provider
+                // passes the normal permission/workspace gate independently.
+                // Auto's zero-prompt contract and Plan's hard read-only overlay,
+                // however, must survive this nested dispatch.
+                ToolExecutionSessionFlags {
+                    bypass_permissions: false,
+                    auto_approve_permissions: ctx.auto_approve_permissions,
+                    plan_read_only: ctx.plan_read_only,
+                },
                 false,
                 None,
                 Some(&provider_input),
             );
+            if !plan_allows_dynamic_provider(ctx.plan_read_only, &call.function.name) {
+                blocks.push(bamboo_skills::DynamicContextBlock {
+                    provider_id: declaration.id,
+                    tool: declaration.tool,
+                    provenance: "registered_tool_permission_checked".to_string(),
+                    generated_at: now,
+                    expires_at: None,
+                    status: bamboo_skills::WorkflowActivationStatus::Degraded,
+                    stop_on_failure: declaration.stop_on_failure,
+                    content: String::new(),
+                    diagnostic: Some(bamboo_skills::WorkflowActivationDiagnostic {
+                        code: bamboo_skills::WorkflowActivationErrorCode::ProviderFailed,
+                        message: "Plan mode blocked a mutating dynamic context provider"
+                            .to_string(),
+                        recoverable: true,
+                    }),
+                });
+                if declaration.stop_on_failure {
+                    break;
+                }
+                continue;
+            }
             let timeout_ms = declaration.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
             let result = tokio::time::timeout(
                 Duration::from_millis(timeout_ms),

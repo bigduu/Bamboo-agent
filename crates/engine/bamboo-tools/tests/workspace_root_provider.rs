@@ -30,6 +30,8 @@ fn ctx_for(session: &str) -> ToolCtx {
         event_tx: None,
         available_tool_schemas: std::sync::Arc::from(Vec::new()),
         bypass_permissions: false,
+        auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         async_completion_sink: None,
         bash_completion_sink: None,

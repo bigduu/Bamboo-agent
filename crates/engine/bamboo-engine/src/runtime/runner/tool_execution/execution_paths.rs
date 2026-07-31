@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
-use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolResult};
+use bamboo_agent_core::tools::{ToolCall, ToolExecutionSessionFlags, ToolExecutor, ToolResult};
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_metrics::MetricsCollector;
 
@@ -25,6 +25,7 @@ pub(super) struct SuccessPathContext<'a> {
     pub round: usize,
     pub session: &'a mut Session,
     pub tools: &'a Arc<dyn ToolExecutor>,
+    pub session_flags: ToolExecutionSessionFlags,
     pub config: &'a AgentLoopConfig,
     pub task_context: &'a mut Option<TaskLoopContext>,
     pub state: &'a mut RoundExecutionState,

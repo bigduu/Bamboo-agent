@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{
     AsyncWaitKind, RunningCompletion, RunningHandle, ToolCall, ToolError, ToolExecutionContext,
-    ToolExecutor, ToolOutcome, ToolResult,
+    ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult,
 };
 use bamboo_domain::*;
 use chrono::Utc;
@@ -539,6 +539,49 @@ impl ToolExecutor for MockTools {
     }
 }
 
+struct StaticSessionPermissions(ToolExecutionSessionFlags);
+
+#[async_trait]
+impl WorkflowSessionPermissionPort for StaticSessionPermissions {
+    async fn flags_for_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<ToolExecutionSessionFlags, String> {
+        Ok(self.0)
+    }
+}
+
+#[derive(Default)]
+struct ContextRecordingTools {
+    calls: AtomicUsize,
+    flags: std::sync::Mutex<Vec<ToolExecutionSessionFlags>>,
+}
+
+#[async_trait]
+impl ToolExecutor for ContextRecordingTools {
+    async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+        unreachable!("workflow dispatch must use the context-aware path")
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        _call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.flags.lock().unwrap().push(ToolExecutionSessionFlags {
+            bypass_permissions: ctx.bypass_permissions,
+            auto_approve_permissions: ctx.auto_approve_permissions,
+            plan_read_only: ctx.plan_read_only,
+        });
+        Ok(ToolOutcome::Completed(ToolResult::text(true, "{}")))
+    }
+
+    fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+        Vec::new()
+    }
+}
+
 struct CapturingTools(Arc<std::sync::Mutex<Option<Value>>>);
 
 #[async_trait]
@@ -969,6 +1012,62 @@ async fn engine_runs_sequence_parallel_map_and_rebuilds_progress_from_sequence()
         progress.events.last().unwrap().kind,
         WorkflowRunEventKind::RunSucceeded { .. }
     ));
+}
+
+#[tokio::test]
+async fn workflow_plan_auto_blocks_mutation_before_dispatch_and_allows_read_context() {
+    let directory = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ContextRecordingTools::default());
+    let engine = WorkflowRunEngine::new(
+        Arc::new(FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap()),
+        tools.clone(),
+        Arc::new(MockAgents),
+        Arc::new(MockDefinitions::default()),
+        Arc::new(MockPolicy),
+        Arc::new(MockSecrets),
+        budgets(),
+    );
+    let plan_auto = ToolExecutionSessionFlags {
+        bypass_permissions: false,
+        auto_approve_permissions: true,
+        plan_read_only: true,
+    };
+    engine.set_session_permission_port(Arc::new(StaticSessionPermissions(plan_auto)));
+
+    let blocked = engine
+        .run(request(
+            definition(
+                vec![tool_step("write", "Write", json!({"file_path":"blocked"}))],
+                WorkflowPlan::Step {
+                    step: "write".to_string(),
+                },
+            ),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status, WorkflowRunStatus::Failed);
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
+    assert!(blocked
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.message.contains("Plan mode")));
+
+    let allowed = engine
+        .run(request(
+            definition(
+                vec![tool_step("read", "Read", json!({"file_path":"safe"}))],
+                WorkflowPlan::Step {
+                    step: "read".to_string(),
+                },
+            ),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(allowed.status, WorkflowRunStatus::Succeeded);
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tools.flags.lock().unwrap().as_slice(), &[plan_auto]);
 }
 
 #[tokio::test]
