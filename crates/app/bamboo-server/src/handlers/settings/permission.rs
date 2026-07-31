@@ -6,8 +6,8 @@ use std::sync::Arc;
 use actix_web::{web, HttpResponse};
 use bamboo_config::{ConfigStoreError, SectionSnapshot, SectionSourceKind, SectionStatus};
 use bamboo_tools::permission::{
-    DurablePermissionRule, PermissionDecisionKind, PermissionEvaluation, PermissionOutcome,
-    PermissionType, SerializablePermissionConfig,
+    DurablePermissionRule, ParsedRule, PermissionDecisionKind, PermissionEvaluation,
+    PermissionOutcome, PermissionType, SerializablePermissionConfig, TemporaryPermissionGrant,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,11 @@ pub async fn update_permission_ask_rules(
         .collect();
     let mut seen = std::collections::HashSet::new();
     rules.retain(|rule| seen.insert(rule.clone()));
+    for (index, rule) in rules.iter().enumerate() {
+        ParsedRule::try_parse(rule).map_err(|error| {
+            AppError::BadRequest(format!("invalid ask rule at index {index}: {error}"))
+        })?;
+    }
 
     let Some(config) = app_state.permission_checker.permission_config() else {
         return Err(AppError::InternalError(anyhow::anyhow!(
@@ -129,10 +134,14 @@ pub struct PermissionPolicyResponse {
     pub status: SectionStatus,
     pub last_error: Option<String>,
     pub policy: SerializablePermissionConfig,
+    pub temporary_grants: Vec<TemporaryPermissionGrant>,
 }
 
 impl PermissionPolicyResponse {
-    fn from_snapshot(snapshot: &SectionSnapshot<SerializablePermissionConfig>) -> Self {
+    fn from_snapshot(
+        snapshot: &SectionSnapshot<SerializablePermissionConfig>,
+        temporary_grants: Vec<TemporaryPermissionGrant>,
+    ) -> Self {
         Self {
             revision: snapshot.revision,
             loaded_at: snapshot.loaded_at,
@@ -141,15 +150,31 @@ impl PermissionPolicyResponse {
             status: snapshot.status,
             last_error: snapshot.last_error.clone(),
             policy: snapshot.data.as_ref().clone(),
+            temporary_grants,
         }
     }
+}
+
+fn permission_policy_response(
+    app_state: &web::Data<AppState>,
+    snapshot: &SectionSnapshot<SerializablePermissionConfig>,
+) -> Result<PermissionPolicyResponse, AppError> {
+    let Some(config) = app_state.permission_checker.permission_config() else {
+        return Err(AppError::InternalError(anyhow::anyhow!(
+            "permission checker does not expose runtime grants"
+        )));
+    };
+    Ok(PermissionPolicyResponse::from_snapshot(
+        snapshot,
+        config.temporary_grants(),
+    ))
 }
 
 pub async fn get_permission_policy(
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, AppError> {
     let snapshot = app_state.permission_section.snapshot();
-    Ok(HttpResponse::Ok().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+    Ok(HttpResponse::Ok().json(permission_policy_response(&app_state, &snapshot)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,7 +241,7 @@ pub async fn create_permission_rule(
     candidate.durable_rules.push(request.rule);
     let snapshot =
         commit_permission_candidate(&app_state, request.expected_revision, candidate).await?;
-    Ok(HttpResponse::Created().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+    Ok(HttpResponse::Created().json(permission_policy_response(&app_state, &snapshot)?))
 }
 
 pub async fn update_permission_rule(
@@ -244,7 +269,7 @@ pub async fn update_permission_rule(
     *existing = request.rule;
     let snapshot =
         commit_permission_candidate(&app_state, request.expected_revision, candidate).await?;
-    Ok(HttpResponse::Ok().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+    Ok(HttpResponse::Ok().json(permission_policy_response(&app_state, &snapshot)?))
 }
 
 pub async fn delete_permission_rule(
@@ -262,7 +287,7 @@ pub async fn delete_permission_rule(
     }
     let snapshot =
         commit_permission_candidate(&app_state, query.expected_revision, candidate).await?;
-    Ok(HttpResponse::Ok().json(PermissionPolicyResponse::from_snapshot(&snapshot)))
+    Ok(HttpResponse::Ok().json(permission_policy_response(&app_state, &snapshot)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,6 +418,95 @@ mod tests {
         let reopened = bamboo_tools::permission::PermissionSection::open(temp.path()).unwrap();
         assert_eq!(reopened.snapshot().revision, 1);
         assert_eq!(reopened.snapshot().data.ask_rules, vec!["Bash(git push *)"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_ask_rule_is_rejected_before_disk_or_live_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new(temp.path().to_path_buf())
+                .await
+                .expect("app state should initialize"),
+        );
+
+        let error = update_permission_ask_rules(
+            state.clone(),
+            web::Json(UpdateAskRulesRequest {
+                expected_revision: Some(0),
+                rules: vec!["Bash(git push *".to_string()],
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message.contains("invalid ask rule at index 0")
+                    && message.contains("unbalanced parentheses")
+        ));
+        assert_eq!(state.permission_section.snapshot().revision, 0);
+        assert!(state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .ask_rule_patterns()
+            .is_empty());
+        assert!(!temp.path().join("permissions.json").exists());
+    }
+
+    #[tokio::test]
+    async fn policy_response_projects_active_runtime_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new(temp.path().to_path_buf())
+                .await
+                .expect("app state should initialize"),
+        );
+        let config = state.permission_checker.permission_config().unwrap();
+        config.grant_scoped_session_permission(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "cargo test",
+        );
+        config.deny_scoped_session_permission(
+            "session-a",
+            PermissionType::WriteFile,
+            "/private/**",
+        );
+        config.grant_once(
+            "session-a",
+            "request-1",
+            PermissionType::GitWrite,
+            "git push".to_string(),
+        );
+
+        let response = get_permission_policy(state).await.unwrap();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let grants = body["temporary_grants"].as_array().unwrap();
+
+        assert_eq!(grants.len(), 3);
+        assert!(grants.iter().any(|grant| {
+            grant["scope"] == "session"
+                && grant["effect"] == "allow"
+                && grant["session_id"] == "session-a"
+                && grant["matcher"] == "cargo test"
+                && grant["expires_at"].is_string()
+        }));
+        assert!(grants.iter().any(|grant| {
+            grant["scope"] == "session"
+                && grant["effect"] == "deny"
+                && grant["matcher"] == "/private/**"
+        }));
+        assert!(grants.iter().any(|grant| {
+            grant["scope"] == "one_shot"
+                && grant["request_id"] == "request-1"
+                && grant["matcher"] == "git push"
+                && grant.get("expires_at").is_none()
+        }));
     }
 
     #[tokio::test]

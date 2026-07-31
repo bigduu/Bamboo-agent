@@ -101,6 +101,48 @@ pub struct ParsedRule {
 }
 
 impl ParsedRule {
+    /// Strictly parse and validate a permission rule.
+    ///
+    /// Tool-only rules (`Read`) and matcher rules (`Bash(cargo test *)`) are
+    /// accepted. Matcher rules must have one balanced outer parenthesis pair,
+    /// a non-empty matcher, and no trailing content. Parentheses inside quoted
+    /// or escaped matcher content do not affect the outer structure.
+    pub fn try_parse(rule: &str) -> Result<Self, String> {
+        let trimmed = rule.trim();
+        if trimmed.is_empty() {
+            return Err("rule must not be empty".to_string());
+        }
+
+        let Some(open_paren) = trimmed.find('(') else {
+            validate_tool_name(trimmed)?;
+            if trimmed.contains(')') {
+                return Err("unexpected ')' without a matching '('".to_string());
+            }
+            return Ok(Self {
+                tool_name: trimmed.to_string(),
+                pattern: None,
+            });
+        };
+
+        let tool_name = trimmed[..open_paren].trim();
+        validate_tool_name(tool_name)?;
+
+        let close_paren = matching_outer_paren(trimmed, open_paren)?;
+        if close_paren != trimmed.len() - 1 {
+            return Err("unexpected content after the closing ')'".to_string());
+        }
+
+        let pattern = trimmed[open_paren + 1..close_paren].trim();
+        if pattern.is_empty() {
+            return Err("matcher inside parentheses must not be empty".to_string());
+        }
+
+        Ok(Self {
+            tool_name: tool_name.to_string(),
+            pattern: Some(pattern.to_string()),
+        })
+    }
+
     /// Parse a rule string like "Bash(npm run *)" or "Write(/src/**)" or "Read".
     ///
     /// If the string contains '(' and ends with ')', the part before '(' is the tool name
@@ -121,35 +163,24 @@ impl ParsedRule {
     /// assert_eq!(rule.pattern, Some("npm run *".to_string()));
     /// ```
     pub fn parse(rule: &str) -> Self {
-        let trimmed = rule.trim();
-
-        // Find the outermost '(' and matching ')'
-        if let Some(open_paren) = trimmed.find('(') {
-            if trimmed.ends_with(')') {
-                let tool_name = trimmed[..open_paren].trim().to_string();
-                let pattern = trimmed[open_paren + 1..trimmed.len() - 1]
-                    .trim()
-                    .to_string();
-
-                if pattern.is_empty() {
+        Self::try_parse(rule).unwrap_or_else(|_| {
+            // Preserve conservative legacy behavior for already-persisted
+            // malformed rules. New writes use `try_parse` and reject malformed
+            // input before persistence.
+            let trimmed = rule.trim();
+            if let Some(open_paren) = trimmed.find('(') {
+                if trimmed.ends_with(')') {
                     return Self {
-                        tool_name,
+                        tool_name: trimmed[..open_paren].trim().to_string(),
                         pattern: None,
                     };
                 }
-
-                return Self {
-                    tool_name,
-                    pattern: Some(pattern),
-                };
             }
-        }
-
-        // No parentheses - just a tool name
-        Self {
-            tool_name: trimmed.to_string(),
-            pattern: None,
-        }
+            Self {
+                tool_name: trimmed.to_string(),
+                pattern: None,
+            }
+        })
     }
 
     /// Check if a tool call matches this rule.
@@ -230,6 +261,63 @@ impl ParsedRule {
     }
 }
 
+fn validate_tool_name(tool_name: &str) -> Result<(), String> {
+    if tool_name.is_empty() {
+        return Err("tool name must not be empty".to_string());
+    }
+    if tool_name
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '(' | ')'))
+    {
+        return Err("tool name must not contain whitespace or parentheses".to_string());
+    }
+    Ok(())
+}
+
+fn matching_outer_paren(rule: &str, open_paren: usize) -> Result<usize, String> {
+    let mut depth = 1_u32;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (offset, character) in rule[open_paren + 1..].char_indices() {
+        let index = open_paren + 1 + offset;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if quote.is_some() {
+        Err("unterminated quoted matcher content".to_string())
+    } else {
+        Err("unbalanced parentheses".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -277,6 +365,41 @@ mod tests {
         let rule = ParsedRule::parse("  Bash(  npm run *  )  ");
         assert_eq!(rule.tool_name, "Bash");
         assert_eq!(rule.pattern, Some("npm run *".to_string()));
+    }
+
+    #[test]
+    fn strict_parser_accepts_nested_quoted_and_escaped_parentheses() {
+        assert_eq!(
+            ParsedRule::try_parse(r#"Bash(echo "$(foo)" && printf '\)')"#)
+                .unwrap()
+                .pattern,
+            Some(r#"echo "$(foo)" && printf '\)'"#.to_string())
+        );
+        assert_eq!(
+            ParsedRule::try_parse(r#"Bash(echo \(literal\))"#)
+                .unwrap()
+                .pattern,
+            Some(r#"echo \(literal\)"#.to_string())
+        );
+    }
+
+    #[test]
+    fn strict_parser_rejects_malformed_rules_that_would_broaden_to_tool_only() {
+        for invalid in [
+            "",
+            "Bash(",
+            "Bash(git push *",
+            "Bash()",
+            "Bash(git push *))",
+            "Bash(git push *) trailing",
+            "(git push *)",
+            "Bad Tool(git push *)",
+        ] {
+            assert!(
+                ParsedRule::try_parse(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
     }
 
     #[test]
