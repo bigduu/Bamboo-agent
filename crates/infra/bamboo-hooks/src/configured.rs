@@ -190,7 +190,12 @@ impl ShellCommandHook {
         }
 
         match output.exit_code {
-            Some(0) => self.interpret_success(&output.stdout.bytes),
+            Some(0) => {
+                if output.stdout.truncated {
+                    return HookResult::Continue;
+                }
+                self.interpret_success(&output.stdout.bytes)
+            }
             Some(2) => {
                 let reason = String::from_utf8_lossy(&output.stderr.bytes)
                     .trim()
@@ -1053,7 +1058,7 @@ fn script_invocations(
                 ScriptInvocation::with_path("bun", &["run"], resolved_path),
             ],
             "py" => python_invocations(resolved_path),
-            "sh" => bash_invocations(resolved_path),
+            "sh" => system_shell_invocations(resolved_path),
             "ps1" => powershell_invocations(resolved_path),
             "bat" | "cmd" => cmd_invocations(resolved_path)?,
             _ => unreachable!("supported extensions are matched exhaustively"),
@@ -1086,7 +1091,7 @@ fn python_invocations(path: &Path) -> Vec<ScriptInvocation> {
     invocations
 }
 
-fn bash_invocations(path: &Path) -> Vec<ScriptInvocation> {
+fn system_shell_invocations(path: &Path) -> Vec<ScriptInvocation> {
     let shell = preferred_bash_shell();
     #[cfg(windows)]
     let program = if shell.arg == "-lc" {
@@ -1097,6 +1102,17 @@ fn bash_invocations(path: &Path) -> Vec<ScriptInvocation> {
     #[cfg(not(windows))]
     let program = shell.program;
     vec![ScriptInvocation::with_path(program, &[], path)]
+}
+
+fn bash_invocations(path: &Path) -> Vec<ScriptInvocation> {
+    #[cfg(windows)]
+    {
+        return system_shell_invocations(path);
+    }
+    #[cfg(not(windows))]
+    {
+        vec![ScriptInvocation::with_path("bash", &[], path)]
+    }
 }
 
 fn powershell_invocations(path: &Path) -> Vec<ScriptInvocation> {
@@ -1693,6 +1709,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncated_command_response_is_not_interpreted() {
+        let hook = shell_hook(ShellHookEvent::SessionStart, "true", 1_000, None, 0);
+        let output = CommandOutput {
+            exit_code: Some(0),
+            stdout: CapturedOutput {
+                bytes: br#"{"decision":"block","reason":"must not apply"}"#.to_vec(),
+                truncated: true,
+            },
+            stderr: CapturedOutput::default(),
+            timed_out: false,
+        };
+
+        assert_eq!(hook.interpret(output), HookResult::Continue);
+    }
+
     #[tokio::test]
     async fn timeout_kills_hook_and_continues() {
         let dir = tempfile::tempdir().unwrap();
@@ -1762,6 +1794,19 @@ mod tests {
         )
         .unwrap_err()
         .contains("cannot execute"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_bash_runner_does_not_fall_back_to_sh() {
+        let bash = script_invocations(
+            "guard.sh",
+            Path::new("guard.sh"),
+            LifecycleScriptRunner::Bash,
+        )
+        .unwrap();
+
+        assert_eq!(bash[0].program, OsString::from("bash"));
     }
 
     #[cfg(windows)]
