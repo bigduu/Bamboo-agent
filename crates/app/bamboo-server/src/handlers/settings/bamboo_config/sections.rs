@@ -142,6 +142,10 @@ pub struct ProviderInstanceSettingsData {
     pub responses_only_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_overrides: Option<RequestOverridesConfig>,
+    /// OpenAI-only compatibility switch for Bamboo-generated GPT-5.6+
+    /// `prompt_cache_options` and `prompt_cache_breakpoint` fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_prompt_cache: Option<bool>,
     #[serde(default = "provider_instance_enabled_default")]
     pub enabled: bool,
     /// Bodhi-only upstream routing target.
@@ -168,6 +172,14 @@ impl ProviderInstanceSettingsData {
             reasoning_effort: instance.reasoning_effort,
             responses_only_models: instance.responses_only_models.clone(),
             request_overrides: instance.request_overrides.clone(),
+            explicit_prompt_cache: (instance.provider_type == "openai")
+                .then(|| {
+                    instance
+                        .extra
+                        .get(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY)
+                        .and_then(Value::as_bool)
+                })
+                .flatten(),
             enabled: instance.enabled,
             target_provider: (instance.provider_type == "bodhi")
                 .then(|| {
@@ -199,6 +211,12 @@ impl ProviderInstanceSettingsData {
             extra.insert(
                 "thinking_replay_always".to_string(),
                 json!(thinking_replay_always),
+            );
+        }
+        if let Some(explicit_prompt_cache) = self.explicit_prompt_cache {
+            extra.insert(
+                bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
+                json!(explicit_prompt_cache),
             );
         }
         ProviderInstanceConfig {
@@ -871,7 +889,12 @@ fn retain_provider_settings_server_owned_fields(
                 .extra
                 .iter()
                 .filter(|(key, _)| {
-                    !matches!(key.as_str(), "target_provider" | "thinking_replay_always")
+                    !matches!(
+                        key.as_str(),
+                        "target_provider"
+                            | "thinking_replay_always"
+                            | bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
+                    )
                 })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
@@ -1019,6 +1042,12 @@ fn validate_provider_instance_shape(
         if instance.thinking_replay_always.is_some() && instance.provider_type != "anthropic" {
             return Err(format!(
                 "thinking_replay_always is only accepted for anthropic provider instance '{id}'"
+            ));
+        }
+        if instance.explicit_prompt_cache.is_some() && instance.provider_type != "openai" {
+            return Err(format!(
+                "{} is only accepted for OpenAI provider instance '{id}'",
+                bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
             ));
         }
     }
@@ -1364,6 +1393,7 @@ fn provider_diagnostics(config: &bamboo_llm::Config) -> Value {
                 "vision_model": provider.vision_model,
                 "reasoning_effort": provider.reasoning_effort,
                 "responses_only_models": provider.responses_only_models,
+                "explicit_prompt_cache": provider.explicit_prompt_cache_enabled(),
             }),
         );
     }
@@ -2778,6 +2808,12 @@ mod tests {
                     "label": "GLM compatible",
                     "thinking_replay_always": true,
                     "enabled": false
+                },
+                "openai-proxy": {
+                    "provider_type": "openai",
+                    "label": "OpenAI-compatible proxy",
+                    "explicit_prompt_cache": false,
+                    "enabled": false
                 }
             },
             "default_provider_instance_id": null
@@ -2818,6 +2854,10 @@ mod tests {
             created["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"],
             true
         );
+        assert_eq!(
+            created["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"],
+            false
+        );
 
         let hidden_value = "server-owned-provider-instance-metadata";
         state
@@ -2833,6 +2873,7 @@ mod tests {
         let mut updated = created["data"].clone();
         updated["provider_instances"]["bodhi-proxy"]["target_provider"] = json!("anthropic");
         updated["provider_instances"]["glm-compat"]["thinking_replay_always"] = json!(false);
+        updated["provider_instances"]["openai-proxy"]["explicit_prompt_cache"] = json!(true);
         let updated = test::call_service(
             &app,
             test::TestRequest::put()
@@ -2854,6 +2895,10 @@ mod tests {
             updated["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"],
             false
         );
+        assert_eq!(
+            updated["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"],
+            true
+        );
         {
             let config = state.config.read().await;
             assert_eq!(
@@ -2868,6 +2913,11 @@ mod tests {
                 config.provider_instances["glm-compat"].extra["thinking_replay_always"],
                 false
             );
+            assert_eq!(
+                config.provider_instances["openai-proxy"].extra
+                    [bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY],
+                true
+            );
         }
 
         let mut removed = updated["data"].clone();
@@ -2879,6 +2929,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("thinking_replay_always");
+        removed["provider_instances"]["openai-proxy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("explicit_prompt_cache");
         let removed = test::call_service(
             &app,
             test::TestRequest::put()
@@ -2894,6 +2948,10 @@ mod tests {
         assert!(
             removed["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"].is_null()
         );
+        assert!(
+            removed["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"]
+                .is_null()
+        );
         {
             let config = state.config.read().await;
             assert_eq!(
@@ -2906,6 +2964,9 @@ mod tests {
             assert!(!config.provider_instances["glm-compat"]
                 .extra
                 .contains_key("thinking_replay_always"));
+            assert!(!config.provider_instances["openai-proxy"]
+                .extra
+                .contains_key(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY));
         }
 
         for (id, field, value) in [
@@ -2913,6 +2974,7 @@ mod tests {
             ("bodhi-proxy", "thinking_replay_always", json!(true)),
             ("bodhi-proxy", "target_provider", json!("copilot")),
             ("glm-compat", "target_provider", json!("openai")),
+            ("glm-compat", "explicit_prompt_cache", json!(false)),
         ] {
             let mut invalid = removed["data"].clone();
             invalid["provider_instances"][id][field] = value;
