@@ -19,15 +19,15 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 
 use super::common::openai_compat::{
-    messages_to_openai_compat_json, parse_openai_compat_sse_data_lenient,
-    tools_to_openai_compat_json,
+    messages_to_openai_compat_json, openai_compat_chat_stream_from_sse,
+    parse_openai_compat_sse_data_lenient_multi, tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
     build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::llm_stream_from_sse;
+use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 
 const COPILOT_TRANSPORT_MAX_ATTEMPTS: usize = 2;
 const COPILOT_TRANSPORT_RETRY_BASE_DELAY_MS: u64 = 250;
@@ -586,6 +586,13 @@ impl CopilotProvider {
             );
         }
         effective_responses_options.store = Some(false);
+        let retain_protocol_events = effective_responses_options.retain_protocol_events;
+        // OpenAI-specific cache controls are not part of Copilot's documented
+        // Responses request shape. Keep this unrelated provider byte-compatible
+        // with its pre-cache-control behavior.
+        effective_responses_options.prompt_cache_key = None;
+        effective_responses_options.prompt_cache_options = None;
+        effective_responses_options.raw_input_with_cache_breakpoints = None;
         let input_selection =
             select_responses_input_messages(messages, Some(&effective_responses_options));
         let input_source = match input_selection.source {
@@ -600,6 +607,7 @@ impl CopilotProvider {
             reasoning_effort,
             Some(&effective_responses_options),
             parallel_tool_calls,
+            None,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -732,6 +740,7 @@ impl CopilotProvider {
                         None,
                         Some(&fallback_options),
                         parallel_tool_calls,
+                        None,
                     );
                     request_overrides::apply_overrides_to_body(
                         &mut fallback_body,
@@ -798,19 +807,24 @@ impl CopilotProvider {
 
                     if fallback.status().is_success() {
                         let mut parser =
-                            ResponsesSseParser::new_with_context("Copilot", model, None);
+                            ResponsesSseParser::new_with_context("Copilot", model, None)
+                                .with_protocol_events(retain_protocol_events);
                         let model_for_debug = model.to_string();
-                        let stream = llm_stream_from_sse(fallback, move |event, data| {
-                            let parsed = parser.handle_event(event, data);
-                            append_responses_sse_record(
-                                "Copilot",
-                                &model_for_debug,
-                                event,
-                                data,
-                                &parsed,
-                            );
-                            parsed
-                        });
+                        let stream = llm_stream_from_sse_multi_requiring_done(
+                            fallback,
+                            move |event, data| {
+                                let parsed = parser.handle_event_multi(event, data);
+                                append_responses_sse_record(
+                                    "Copilot",
+                                    &model_for_debug,
+                                    event,
+                                    data,
+                                    &parsed,
+                                );
+                                parsed
+                            },
+                            "Copilot Responses",
+                        );
                         return Ok(stream);
                     }
                 }
@@ -860,13 +874,18 @@ impl CopilotProvider {
             }
         }
 
-        let mut parser = ResponsesSseParser::new_with_context("Copilot", model, reasoning_effort);
+        let mut parser = ResponsesSseParser::new_with_context("Copilot", model, reasoning_effort)
+            .with_protocol_events(retain_protocol_events);
         let model_for_debug = model.to_string();
-        let stream = llm_stream_from_sse(response, move |event, data| {
-            let parsed = parser.handle_event(event, data);
-            append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
-            parsed
-        });
+        let stream = llm_stream_from_sse_multi_requiring_done(
+            response,
+            move |event, data| {
+                let parsed = parser.handle_event_multi(event, data);
+                append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
+                parsed
+            },
+            "Copilot Responses",
+        );
         Ok(stream)
     }
 
@@ -918,15 +937,17 @@ impl CopilotProvider {
     }
 
     fn parse_model_info(payload: serde_json::Value) -> Result<Vec<ProviderModelInfo>> {
-        const CONTEXT_KEYS: &[&str] = &[
+        const TOTAL_CONTEXT_KEYS: &[&str] = &[
             "max_context_tokens",
-            "max_input_tokens",
-            "max_prompt_tokens",
             "context_window",
             "context_window_tokens",
+            "context_length",
+        ];
+        const INPUT_KEYS: &[&str] = &[
+            "max_input_tokens",
+            "max_prompt_tokens",
             "input_token_limit",
             "prompt_token_limit",
-            "context_length",
         ];
         const OUTPUT_KEYS: &[&str] = &[
             "max_output_tokens",
@@ -954,8 +975,13 @@ impl CopilotProvider {
                 continue;
             };
 
-            let context_tokens = Self::find_max_token_limit_by_keys(model, CONTEXT_KEYS);
             let output_tokens = Self::find_max_token_limit_by_keys(model, OUTPUT_KEYS);
+            let context_tokens = Self::find_max_token_limit_by_keys(model, TOTAL_CONTEXT_KEYS)
+                .or_else(|| {
+                    Self::find_max_token_limit_by_keys(model, INPUT_KEYS).map(|input_tokens| {
+                        input_tokens.saturating_add(output_tokens.unwrap_or_default())
+                    })
+                });
 
             dedup
                 .entry(id.to_string())
@@ -1398,12 +1424,8 @@ impl LLMProvider for CopilotProvider {
                     }
 
                     if retry.status().is_success() {
-                        let stream = llm_stream_from_sse(retry, |_event, data| {
-                            let chunk = parse_openai_compat_sse_data_lenient(data)?;
-                            match chunk {
-                                LLMChunk::Done => Ok(Some(LLMChunk::Done)),
-                                other => Ok(Some(other)),
-                            }
+                        let stream = openai_compat_chat_stream_from_sse(retry, |_event, data| {
+                            parse_openai_compat_sse_data_lenient_multi(data)
                         });
                         return Ok(stream);
                     }
@@ -1466,7 +1488,7 @@ impl LLMProvider for CopilotProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = llm_stream_from_sse(response, move |_event, data| {
+        let stream = openai_compat_chat_stream_from_sse(response, move |_event, data| {
             let mut reasoning_chunk_to_emit: Option<String> = None;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 if let Some(delta) = v
@@ -1493,32 +1515,29 @@ impl LLMProvider for CopilotProvider {
                 }
             }
 
+            let mut chunks = parse_openai_compat_sse_data_lenient_multi(data)?;
             if let Some(reasoning_chunk) = reasoning_chunk_to_emit {
-                return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk)));
+                chunks.retain(|chunk| !matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
+                chunks.insert(0, LLMChunk::ReasoningToken(reasoning_chunk));
             }
 
-            let chunk = parse_openai_compat_sse_data_lenient(data)?;
-            match chunk {
-                LLMChunk::Done => {
-                    if !logged_summary
-                        && (requested_reasoning.is_some() || observed_reasoning_signal)
-                    {
-                        tracing::info!(
-                            "[{}] Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
-                            session_for_log,
-                            model_for_log,
-                            requested_reasoning
-                                .map(ReasoningEffort::as_str)
-                                .unwrap_or("none"),
-                            observed_reasoning_signal,
-                            reasoning_chars
-                        );
-                        logged_summary = true;
-                    }
-                    Ok(Some(LLMChunk::Done))
-                }
-                other => Ok(Some(other)),
+            if chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done))
+                && !logged_summary
+                && (requested_reasoning.is_some() || observed_reasoning_signal)
+            {
+                tracing::info!(
+                    "[{}] Copilot chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                    session_for_log,
+                    model_for_log,
+                    requested_reasoning
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("none"),
+                    observed_reasoning_signal,
+                    reasoning_chars
+                );
+                logged_summary = true;
             }
+            Ok(chunks)
         });
 
         Ok(stream)
@@ -1542,6 +1561,7 @@ impl LLMProvider for CopilotProvider {
 mod tests {
     use super::*;
     use bamboo_domain::FunctionSchema;
+    use futures::StreamExt;
 
     // Helper to skip tests in CODEX_SANDBOX environment
     fn should_skip() -> bool {
@@ -1560,6 +1580,42 @@ mod tests {
 
         let provider = CopilotProvider::new();
         assert!(!provider.is_authenticated());
+    }
+
+    #[test]
+    fn model_info_adds_output_capacity_to_input_only_limit() {
+        let models = CopilotProvider::parse_model_info(serde_json::json!({
+            "data": [{
+                "id": "dynamic-model",
+                "capabilities": {
+                    "limits": {
+                        "max_input_tokens": 200_000,
+                        "max_output_tokens": 64_000
+                    }
+                }
+            }]
+        }))
+        .expect("parse model metadata");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].max_context_tokens, Some(264_000));
+        assert_eq!(models[0].max_output_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn model_info_does_not_add_output_to_explicit_total_context_window() {
+        let models = CopilotProvider::parse_model_info(serde_json::json!({
+            "data": [{
+                "id": "dynamic-model",
+                "context_window": 200_000,
+                "max_output_tokens": 64_000
+            }]
+        }))
+        .expect("parse model metadata");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].max_context_tokens, Some(200_000));
+        assert_eq!(models[0].max_output_tokens, Some(64_000));
     }
 
     #[tokio::test]
@@ -1586,6 +1642,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("required tool schema 'load_skill' was not offered"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_production_adapter_keeps_usage_before_one_terminal_done() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4}}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                    .to_string(),
+                )
+                .expect("http response"),
+        );
+        let mut stream = openai_compat_chat_stream_from_sse(response, |_event, data| {
+            parse_openai_compat_sse_data_lenient_multi(data)
+        });
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("Copilot chat stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(&chunks[0], LLMChunk::Token(token) if token == "answer"));
+        assert!(matches!(chunks[1], LLMChunk::ProviderUsage { .. }));
+        assert!(matches!(chunks[2], LLMChunk::Done));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1827,27 +1921,45 @@ mod tests {
     }
 
     #[test]
-    fn copilot_responses_forces_store_false_before_building_body() {
+    fn copilot_responses_forces_store_false_and_strips_openai_cache_controls() {
         let mut effective_responses_options = ResponsesRequestOptions {
             store: Some(true),
             instructions: Some("Stable instructions".to_string()),
+            prompt_cache_key: Some("openai-only".to_string()),
+            prompt_cache_options: Some(json!({"mode": "explicit"})),
+            raw_input_with_cache_breakpoints: Some(json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "raw",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }]
+            }])),
             ..Default::default()
         };
         if effective_responses_options.store == Some(true) {
             effective_responses_options.store = Some(false);
         }
+        effective_responses_options.prompt_cache_key = None;
+        effective_responses_options.prompt_cache_options = None;
+        effective_responses_options.raw_input_with_cache_breakpoints = None;
 
         let body = build_responses_body(
-            "gpt-4o",
+            "gpt-5.6",
             &[Message::user("hello")],
             &[],
             None,
             None,
             Some(&effective_responses_options),
             None,
+            None,
         );
 
         assert_eq!(body["store"], false);
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_options").is_none());
+        assert_eq!(body["input"][0]["content"], "hello");
     }
 
     #[test]

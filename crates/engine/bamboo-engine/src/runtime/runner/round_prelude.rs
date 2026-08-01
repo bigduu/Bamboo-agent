@@ -362,6 +362,7 @@ mod project_prompt_tests {
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
             name: "Zenith".to_string(),
+            project_path: Some(first.clone()),
             home: directory.path().join("projects/project-1"),
             workspace_bindings: vec![
                 WorkspaceBinding {
@@ -441,6 +442,7 @@ mod project_prompt_tests {
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
             name: "Round Project".to_string(),
+            project_path: Some(workspace.clone()),
             home: directory.path().join("projects/round-project"),
             workspace_bindings: Vec::new(),
             resources: ProjectResourceSummary {
@@ -506,6 +508,7 @@ mod project_prompt_tests {
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
             name: "Unrelated".to_string(),
+            project_path: None,
             home: directory.path().join("projects/unrelated-project"),
             workspace_bindings: Vec::new(),
             resources: ProjectResourceSummary {

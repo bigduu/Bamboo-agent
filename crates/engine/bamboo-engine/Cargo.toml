@@ -16,6 +16,7 @@ bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-a2a = { path = "../../infra/bamboo-a2a" }
 bamboo-memory = { path = "../../infra/bamboo-memory" }
 bamboo-metrics = { path = "../../infra/bamboo-metrics" }
+bamboo-hooks = { path = "../../infra/bamboo-hooks" }
 bamboo-skills = { path = "../../infra/bamboo-skills" }
 bamboo-mcp = { path = "../../infra/bamboo-mcp" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }
@@ -39,7 +40,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 dashmap = "6"
 parking_lot = "0.12"
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.11"
 hex = "0.4"
 colored = "2"

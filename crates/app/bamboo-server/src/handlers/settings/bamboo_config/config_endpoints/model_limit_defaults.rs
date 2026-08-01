@@ -23,7 +23,7 @@ struct ModelLimitDefaultsResponse {
 }
 
 /// Returns the single global model-limit default from the backend
-/// source-of-truth (`1M` context / `128K` output).
+/// source-of-truth (`1M` total input+output context / `128K` output).
 pub async fn get_model_limit_defaults() -> Result<HttpResponse, AppError> {
     let limit = default_model_limit();
     let default = ModelLimitDefault {

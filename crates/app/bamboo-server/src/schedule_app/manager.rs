@@ -17,6 +17,8 @@ use bamboo_engine::execution::{
 use bamboo_engine::{AuxiliaryModelConfig, ModelRoster};
 use bamboo_storage::LockedSessionStore;
 
+use crate::permission_audit::record_bamboo_runtime_permission_metadata;
+
 use super::store::{ClaimedScheduleRun, ScheduleStore};
 use super::trigger_engine::DynTriggerEngine;
 use bamboo_domain::{ScheduleRunConfig, ScheduleRunStatus};
@@ -66,6 +68,8 @@ pub struct ScheduleContext {
     pub trigger_engine: DynTriggerEngine,
     /// Authoritative Project registry, rechecked when each persisted job fires.
     pub project_store: Arc<bamboo_projects::ProjectStore>,
+    /// AppState-owned workspace policy used by every schedule preflight/fire.
+    pub workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     /// Dependencies to start the always-on notification relay (see
     /// `crate::app_state::session_events::ensure_notification_relay`).
     /// Scheduled runs previously never classified events into notifications
@@ -310,10 +314,24 @@ async fn run_schedule_job(
 ) -> Result<ScheduleRunLifecycleResult, String> {
     validate_schedule_project_at_fire(&ctx.project_store, &job.run_config)?;
     let mut resolved = (ctx.resolve_run_config)(&job);
-    let final_workspace = crate::project_context::validate_workspace_assignment(
+    let explicit_workspace = job
+        .run_config
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty());
+    let requested_workspace = explicit_workspace.or_else(|| {
+        job.run_config
+            .project_id
+            .is_none()
+            .then_some(resolved.workspace_path.as_deref())
+            .flatten()
+    });
+    let final_workspace = crate::project_context::validate_workspace_assignment_with_resolver(
         &ctx.project_store,
         job.run_config.project_id.as_ref(),
-        resolved.workspace_path.as_deref(),
+        requested_workspace,
+        &ctx.workspace_resolver,
     )
     .map_err(|error| format!("validate schedule workspace at execution time: {error}"))?;
     resolved.workspace_path = final_workspace
@@ -338,11 +356,20 @@ async fn run_schedule_job(
         }
         _ => bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered,
     };
-    resolved.system_prompt = bamboo_engine::runtime::context::upsert_workspace_prompt_context(
-        &resolved.system_prompt,
-        resolved.workspace_path.as_deref(),
-        binding_status,
-    );
+    let workspace_source = job.run_config.project_id.as_ref().map(|_| {
+        if explicit_workspace.is_some() {
+            bamboo_engine::project_context::WorkspaceSource::Explicit
+        } else {
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+        }
+    });
+    resolved.system_prompt =
+        bamboo_engine::runtime::context::upsert_workspace_prompt_context_with_source(
+            &resolved.system_prompt,
+            resolved.workspace_path.as_deref(),
+            binding_status,
+            workspace_source,
+        );
     // Primary model is required for a schedule run; the roster stores it as
     // `Option<String>`, so recover the owned String once for the checks/logging
     // below (an absent primary is treated as the old empty-string skip).
@@ -375,20 +402,15 @@ async fn run_schedule_job(
         &resolved.base_system_prompt,
         resolved.workspace_path.as_deref(),
         resolved.reasoning_effort,
+        &ctx.workspace_resolver,
     );
     let session_id = session.id.clone();
     if let Some(config) = ctx.permission_config.as_ref() {
         if let Some(workspace) = session.workspace.as_ref() {
             config.register_session_workspace(session_id.clone(), workspace.clone());
         }
-        session.metadata.insert(
-            "permission.policy_revision".to_string(),
-            config.policy_revision().to_string(),
-        );
-        session.metadata.insert(
-            "permission.effective_mode".to_string(),
-            format!("{:?}", config.mode()).to_ascii_lowercase(),
-        );
+        record_bamboo_runtime_permission_metadata(&mut session, config.as_ref())
+            .map_err(|error| error.to_string())?;
     }
 
     // #73: a scheduled run has no interactive human approver — mark the root so
@@ -735,6 +757,7 @@ pub fn build_schedule_context(
         app_data_dir: base.app_data_dir,
         trigger_engine: base.trigger_engine,
         project_store: base.project_store,
+        workspace_resolver: base.workspace_resolver,
         persistence: base.persistence,
         notification_relay: base.notification_relay,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {
@@ -966,11 +989,10 @@ mod build_context_tests {
             session_start: vec![bamboo_config::LifecycleHookGroup {
                 enabled: true,
                 matcher: None,
-                hooks: vec![bamboo_config::LifecycleHookCommand {
-                    hook_type: bamboo_config::LifecycleHookType::Command,
-                    command: "printf schedule-start".to_string(),
-                    timeout_ms: bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-                }],
+                hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                    "printf schedule-start",
+                    bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                )],
             }],
             ..Default::default()
         };

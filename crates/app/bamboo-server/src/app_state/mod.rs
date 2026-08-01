@@ -242,6 +242,12 @@ pub struct AppState {
     /// resolve one authoritative Project/workspace identity.
     pub project_context_resolver: Arc<bamboo_engine::project_context::ProjectContextResolver>,
 
+    /// Instance-scoped live workspace providers used for preview and
+    /// post-persistence publication. The equivalent process-global providers
+    /// remain first-registration-wins; retaining this pair prevents parallel
+    /// test AppStates from resolving through a sibling state's config/root.
+    pub(crate) workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+
     /// Per-session write serialisation + metadata-merge persistence layer.
     ///
     /// Wraps the same [`Storage`] as `self.storage`, adding per-session
@@ -491,6 +497,7 @@ mod builder;
 mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
 pub(crate) use config_runtime::ConfigSectionMutationError;
+pub(crate) use config_runtime::CredentialBackedResetCommit;
 pub mod init;
 pub mod parent_approval_reviewer;
 mod persistence;

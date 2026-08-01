@@ -4,6 +4,21 @@ use serde_json::Value;
 
 use bamboo_llm::provider::ResponsesRequestOptions;
 
+pub(super) fn has_responses_prompt_cache_breakpoint(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(has_responses_prompt_cache_breakpoint),
+        Value::Object(object) => {
+            let supported_block = matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_text" | "input_image" | "input_file")
+            );
+            supported_block && object.contains_key("prompt_cache_breakpoint")
+                || object.values().any(has_responses_prompt_cache_breakpoint)
+        }
+        _ => false,
+    }
+}
+
 fn parse_reasoning_summary(parameters: &HashMap<String, Value>) -> Option<String> {
     parameters
         .get("reasoning")
@@ -112,12 +127,24 @@ pub(super) fn parse_responses_request_options(
             .map(ToString::to_string),
         truncation: parse_truncation(parameters),
         text_verbosity,
+        prompt_cache_key: parameters
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        prompt_cache_options: parameters
+            .get("prompt_cache_options")
+            .filter(|value| value.is_object())
+            .cloned(),
+        raw_input_with_cache_breakpoints: None,
+        retain_protocol_events: true,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_responses_request_options;
+    use super::{has_responses_prompt_cache_breakpoint, parse_responses_request_options};
     use serde_json::Value;
     use std::collections::HashMap;
 
@@ -129,7 +156,9 @@ mod tests {
             "store": true,
             "previous_response_id": "resp_123",
             "truncation": "auto",
-            "text": { "verbosity": "high" }
+            "text": { "verbosity": "high" },
+            "prompt_cache_key": "tenant:stable",
+            "prompt_cache_options": { "mode": "explicit", "ttl": "30m" }
         }))
         .expect("valid params");
 
@@ -145,6 +174,37 @@ mod tests {
         assert_eq!(parsed.previous_response_id.as_deref(), Some("resp_123"));
         assert_eq!(parsed.truncation.as_deref(), Some("auto"));
         assert_eq!(parsed.text_verbosity.as_deref(), Some("high"));
+        assert_eq!(parsed.prompt_cache_key.as_deref(), Some("tenant:stable"));
+        assert_eq!(
+            parsed.prompt_cache_options,
+            Some(serde_json::json!({"mode": "explicit", "ttl": "30m"}))
+        );
+        assert!(parsed.raw_input_with_cache_breakpoints.is_none());
+        assert!(parsed.retain_protocol_events);
+    }
+
+    #[test]
+    fn detects_supported_content_breakpoints_without_accepting_unrelated_fields() {
+        assert!(has_responses_prompt_cache_breakpoint(&serde_json::json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_id": "file_123",
+                "prompt_cache_breakpoint": {"mode": "explicit"}
+            }]
+        }])));
+        assert!(!has_responses_prompt_cache_breakpoint(
+            &serde_json::json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "output_text",
+                    "text": "not a supported Responses input block",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }]
+            }])
+        ));
     }
 
     #[test]

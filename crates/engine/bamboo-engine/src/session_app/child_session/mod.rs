@@ -114,6 +114,8 @@ pub struct CreateChildInput {
     pub subagent_type: String,
     /// Absolute path to the working directory for the child session.
     pub workspace: String,
+    /// How the child workspace was selected before validation.
+    pub workspace_source: crate::project_context::WorkspaceSource,
     /// Optional model override resolved from subagent_type routing.
     /// When `None`, the child inherits the parent session's model.
     pub model_override: Option<String>,
@@ -187,6 +189,21 @@ pub trait ChildSessionPort: Send + Sync {
         normalize_child_workspace(requested_workspace)
     }
 
+    /// Publish a child workspace that already passed this port's validation.
+    ///
+    /// Server adapters override this so validation and publication use the
+    /// same AppState-scoped confinement resolver. The default preserves the
+    /// process-global behavior for non-server embeddings.
+    fn publish_child_workspace(
+        &self,
+        session_id: &str,
+        workspace: std::path::PathBuf,
+        source: &str,
+    ) -> std::path::PathBuf {
+        let _ = source;
+        bamboo_agent_core::workspace_state::publish_resolved_workspace(session_id, workspace)
+    }
+
     async fn load_root_session(&self, root_id: &str) -> Result<Session, ChildSessionError>;
     async fn load_child_for_parent(
         &self,
@@ -194,8 +211,8 @@ pub trait ChildSessionPort: Send + Sync {
         child_id: &str,
     ) -> Result<Session, ChildSessionError>;
     async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError>;
-    /// Save a child session whose `agent_runtime_state` posture flags
-    /// (`bypass_permissions` / `no_human_approver`) the caller just set
+    /// Save a child session whose `agent_runtime_state` posture
+    /// (`permission_mode` / `no_human_approver`) the caller just set
     /// authoritatively (the #74 resident-reuse re-seed) — persists them as-is
     /// instead of adopting the child's stale on-disk value, unlike
     /// [`Self::save_child_session`], which protects a concurrent `PATCH` to a
@@ -231,13 +248,46 @@ pub trait ChildSessionPort: Send + Sync {
         &self,
         child: &mut Session,
         workspace: &str,
+        workspace_source: crate::project_context::WorkspaceSource,
+        permission_audit: bamboo_domain::PermissionAuditSeed,
+        no_human_approver: bool,
     ) -> Result<(), ChildSessionError> {
+        let previous_mode = child
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        let previous_resolution =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                .map(|snapshot| snapshot.resolution);
         child.workspace = Some(workspace.to_string());
         child.set_workspace_path_meta(workspace);
+        child.metadata.insert(
+            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            workspace_source.as_str().to_string(),
+        );
+        let runtime = child
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.set_permission_mode(permission_audit.resolution.requested);
+        runtime.no_human_approver = no_human_approver;
+        let changed = previous_mode != permission_audit.resolution.requested;
+        let posture_changed = previous_resolution != Some(permission_audit.resolution);
+        let transitioned_at = posture_changed.then(|| chrono::Utc::now().to_rfc3339());
+        bamboo_domain::record_permission_audit(
+            &mut child.metadata,
+            &permission_audit,
+            transitioned_at.as_deref(),
+        )
+        .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
+        if changed {
+            child.metadata_version = child.metadata_version.saturating_add(1);
+        }
         self.save_child_session_authoritative_flags(child).await?;
-        bamboo_agent_core::workspace_state::publish_resolved_workspace(
+        self.publish_child_workspace(
             &child.id,
             std::path::PathBuf::from(workspace),
+            workspace_source.as_str(),
         );
         Ok(())
     }

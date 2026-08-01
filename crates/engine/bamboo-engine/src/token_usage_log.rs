@@ -10,8 +10,8 @@
 //!
 //! The record bridges two sources: the prompt-side budget snapshot
 //! ([`TokenBudgetUsage`], already on the session) and the server-returned stream
-//! stats — notably `cache_creation_input_tokens`, which is NOT part of
-//! `TokenBudgetUsage` and would otherwise only exist in the logs.
+//! stats — notably cache-creation and OpenAI cache-write dimensions, which are
+//! NOT part of `TokenBudgetUsage` and would otherwise only exist transiently.
 
 use bamboo_domain::TokenBudgetUsage;
 use serde::Serialize;
@@ -32,11 +32,17 @@ pub struct TokenUsageRecord {
     // --- server-returned usage (this call) ---
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// OpenAI cache-write volume. This can overlap the fresh-input count and
+    /// therefore must not be added to the disjoint prompt-total equation.
+    pub cache_write_input_tokens: u64,
     /// Non-cached "fresh" input tokens (server-reported), disjoint from the two
     /// cache counts. The precise prompt size is
     /// `input_tokens + cache_read + cache_creation`, and the exact cache-hit
     /// ratio is `cache_read / that_sum`.
     pub input_tokens: u64,
+    /// Total provider output. For reasoning-capable OpenAI-compatible models,
+    /// `thinking_tokens` is a subset breakdown of this value, not an additional
+    /// quantity.
     pub output_tokens: u64,
     pub thinking_tokens: u64,
 
@@ -55,9 +61,9 @@ pub struct TokenUsageRecord {
 
 impl TokenUsageRecord {
     /// Build a record from the prompt-side budget snapshot (`usage`) and the
-    /// server-side stream stats. The cache-creation count lives only on the
-    /// stream output — it is not part of [`TokenBudgetUsage`] — so it is passed
-    /// in explicitly.
+    /// server-side stream stats. Cache creation and cache writes live only on
+    /// the stream output — they are not part of [`TokenBudgetUsage`] — so they
+    /// are passed in explicitly.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ts: String,
@@ -68,6 +74,7 @@ impl TokenUsageRecord {
         usage: Option<&TokenBudgetUsage>,
         cache_creation_input_tokens: u64,
         cache_read_input_tokens: u64,
+        cache_write_input_tokens: u64,
         input_tokens: u64,
         output_tokens: u64,
         thinking_tokens: u64,
@@ -80,6 +87,7 @@ impl TokenUsageRecord {
             message_count,
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            cache_write_input_tokens,
             input_tokens,
             output_tokens,
             thinking_tokens,
@@ -134,6 +142,7 @@ mod tests {
             Some(&usage),
             1500, // cache_creation — only present on the stream output
             12_000,
+            0,
             800, // input_tokens (fresh, non-cached)
             300,
             7,
@@ -142,7 +151,39 @@ mod tests {
         assert!(!line.contains('\n'), "must be a single line");
         assert!(line.contains("\"cache_creation_input_tokens\":1500"));
         assert!(line.contains("\"cache_read_input_tokens\":12000"));
+        assert!(line.contains("\"cache_write_input_tokens\":0"));
         assert!(line.contains("\"input_tokens\":800"));
         assert!(line.contains("\"session_id\":\"sess-1\""));
+    }
+
+    #[test]
+    fn openai_flat_log_contract_keeps_fresh_cache_and_total_disjoint() {
+        let record = TokenUsageRecord::new(
+            "2026-07-29T00:00:00Z".to_string(),
+            "sess-openai",
+            "gpt-5",
+            "openai",
+            4,
+            None,
+            0,
+            768,
+            64,
+            232,
+            120,
+            20,
+        );
+
+        let prompt_total = record
+            .input_tokens
+            .saturating_add(record.cache_read_input_tokens)
+            .saturating_add(record.cache_creation_input_tokens);
+        let cache_hit_ratio = record.cache_read_input_tokens as f64 / prompt_total as f64;
+
+        assert_eq!(record.input_tokens, 232);
+        assert_eq!(prompt_total, 1000);
+        assert_eq!(record.cache_write_input_tokens, 64);
+        assert!((cache_hit_ratio - 0.768).abs() < f64::EPSILON);
+        assert_eq!(record.output_tokens, 120);
+        assert_eq!(record.thinking_tokens, 20);
     }
 }

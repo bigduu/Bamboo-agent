@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 
 use super::hooks::HookRunner;
 
+/// The live disabled tool and skill-id sets resolved at a round boundary.
+pub type DisabledFilterSets = (BTreeSet<String>, BTreeSet<String>);
+
+/// Late-bound resolver for disabled tool and skill-id filters.
+pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct AuxiliaryModelConfig {
     pub fast_model_name: Option<String>,
@@ -392,6 +398,12 @@ pub struct AgentLoopConfig {
     ///
     /// Resolution order: session-level > config-level > built-in defaults.
     pub(crate) compression_instructions: Option<String>,
+    /// Desired final summary size relative to the raw source tokens represented
+    /// by it. Values are normalized at the compression boundary.
+    pub(crate) summary_target_ratio: f64,
+    /// Safe request ceiling as a percentage of the selected summarization
+    /// model's context window.
+    pub(crate) summary_safe_window_percent: u8,
     /// Dedicated model for summarization. Falls back to `background_model_name`.
     pub(crate) summarization_model_name: Option<String>,
     /// Optional provider override for memory/background model LLM calls.
@@ -425,10 +437,10 @@ pub struct AgentLoopConfig {
     /// Token budget for context management (optional, defaults to model's limits)
     pub(crate) token_budget: Option<TokenBudget>,
     /// Legacy `config.json` `model_limits` value, snapshotted from the live
-    /// in-memory Config when this loop config is built. Consulted only by
-    /// `resolve_token_budget` as a last-resort fallback when `model_limits.json`
-    /// fails to load — so the engine never does a fresh disk-reading
-    /// `Config::new()` (which would also clobber the global env-var cache). #38.
+    /// in-memory Config when this loop config is built. Consulted per model when
+    /// the instance-local `model_limits.json` has no matching entry or cannot be
+    /// loaded, so the engine never does a fresh disk-reading `Config::new()`
+    /// (which would also clobber the global env-var cache). #38.
     pub(crate) legacy_model_limits: Option<serde_json::Value>,
     /// Optional image fallback behavior applied to *LLM requests only* (never persisted).
     ///
@@ -501,8 +513,7 @@ pub struct AgentLoopConfig {
     /// `disabled_tools` / `disabled_skill_ids` fields below are used (#44 behavior).
     /// Re-resolved each round at the tool-schema filter, so disabling/re-enabling a
     /// tool mid-run takes effect on the next round. #136.
-    pub(crate) disabled_filter_resolver:
-        Option<Arc<dyn Fn() -> (BTreeSet<String>, BTreeSet<String>) + Send + Sync>>,
+    pub(crate) disabled_filter_resolver: Option<DisabledFilterResolver>,
     /// Server-level usage guidance contributed by the run's tool executor —
     /// chiefly the `instructions` connected MCP servers return from `initialize`.
     /// Captured once at config construction (from `ToolExecutor::tool_guidance`)
@@ -543,6 +554,8 @@ impl Default for AgentLoopConfig {
             planning_model_name: None,
             search_model_name: None,
             compression_instructions: None,
+            summary_target_ratio: 0.20,
+            summary_safe_window_percent: 80,
             summarization_model_name: None,
             background_model_provider: None,
             summarization_model_provider: None,

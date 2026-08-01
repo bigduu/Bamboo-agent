@@ -21,6 +21,8 @@ async fn configure_routes_registers_expected_api_prefixes() {
         ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
         ("GET", "/v1/bamboo/workflows"),
         ("GET", "/v1/bamboo/access/status"),
+        ("PUT", "/v1/bamboo/config/notifications"),
+        ("PUT", "/v1/bamboo/config/connect"),
         ("GET", "/api/v1/plugins"),
         ("GET", "/openai/v1/models"),
         ("GET", "/anthropic/v1/models"),
@@ -30,6 +32,7 @@ async fn configure_routes_registers_expected_api_prefixes() {
     for (method, uri) in requests {
         let req = match method {
             "POST" => test::TestRequest::post().uri(uri).to_request(),
+            "PUT" => test::TestRequest::put().uri(uri).to_request(),
             "DELETE" => test::TestRequest::delete().uri(uri).to_request(),
             _ => test::TestRequest::get().uri(uri).to_request(),
         };
@@ -57,6 +60,8 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
         ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
         ("GET", "/v1/bamboo/workflows"),
         ("GET", "/v1/bamboo/access/status"),
+        ("PUT", "/v1/bamboo/config/notifications"),
+        ("PUT", "/v1/bamboo/config/connect"),
         ("GET", "/api/v1/plugins"),
         ("GET", "/openai/v1/models"),
         ("GET", "/anthropic/v1/models"),
@@ -66,6 +71,7 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
     for (method, uri) in requests {
         let req = match method {
             "POST" => test::TestRequest::post().uri(uri).to_request(),
+            "PUT" => test::TestRequest::put().uri(uri).to_request(),
             "DELETE" => test::TestRequest::delete().uri(uri).to_request(),
             _ => test::TestRequest::get().uri(uri).to_request(),
         };
@@ -97,6 +103,8 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
         "/sessions/session/workflow-runs/example",
         "/bamboo/setup/status",
         "/bamboo/config",
+        "/bamboo/config/notifications",
+        "/bamboo/config/connect",
         "/bamboo/access/status",
         "/bamboo/model-limits/defaults",
         "/bamboo/tools",
@@ -192,6 +200,7 @@ async fn remote_unverified_request_is_blocked_by_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -220,6 +229,7 @@ async fn lifecycle_hook_dry_run_is_blocked_by_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -257,6 +267,7 @@ async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -301,6 +312,7 @@ async fn plugin_routes_are_blocked_by_the_same_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -329,6 +341,7 @@ async fn access_bootstrap_endpoints_remain_public() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -364,6 +377,7 @@ async fn verified_cookie_allows_remote_request_through_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -461,6 +475,7 @@ async fn local_request_bypasses_access_middleware() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -546,6 +561,7 @@ async fn v2_stream_upgrade_is_open_but_siblings_stay_gated() {
         let mut config = app_state.config.write().await;
         config.access_control = Some(AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some(
                 "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
             ),
@@ -611,6 +627,7 @@ const SECRET_SALT: &str = "01010101010101010101010101010101";
 fn password_access_control() -> AccessControlConfig {
     AccessControlConfig {
         password_enabled: true,
+        repair_required: false,
         password_hash: Some(SECRET_HASH.to_string()),
         password_salt: Some(SECRET_SALT.to_string()),
         password_credential_ref: None,
@@ -757,10 +774,22 @@ async fn password_change_preserves_paired_devices() {
     assert_eq!(device_count_before, 1);
 
     // Change the root password (local bypass → current_password not required).
+    let expected_revision = app_state
+        .config_facade
+        .as_ref()
+        .expect("modular config facade")
+        .registry()
+        .access_control
+        .snapshot()
+        .revision;
     let change_req = test::TestRequest::post()
         .uri("/v1/bamboo/access/password")
         .insert_header((header::HOST, "localhost:9562"))
-        .set_json(serde_json::json!({ "new_password": "newsecret" }))
+        .set_json(serde_json::json!({
+            "expected_revision": expected_revision,
+            "action": "replace",
+            "value": "newsecret"
+        }))
         .to_request();
     let change_resp = test::call_service(&app, change_req).await;
     assert_eq!(change_resp.status(), StatusCode::OK);
@@ -1015,10 +1044,13 @@ async fn v2_devices_list_excludes_secret_material() {
 async fn v2_devices_delete_revokes_and_404s_unknown() {
     let data_dir = tempdir().unwrap();
     let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
-    {
-        let mut config = app_state.config.write().await;
-        config.access_control = Some(password_access_control());
-    }
+    app_state
+        .update_access_control_credentials(0, true, Default::default(), |config| {
+            config.access_control = Some(password_access_control());
+            Ok(())
+        })
+        .await
+        .unwrap();
     inject_code(&app_state, "333333", Duration::from_secs(120));
     let app = test::init_service(
         App::new()

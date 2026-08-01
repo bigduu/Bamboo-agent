@@ -52,6 +52,9 @@ pub use builder::AgentBuilder;
 pub use execute_request::ExecuteRequestBuilder;
 use tokio::sync::mpsc;
 
+use bamboo_engine::session_app::approval_replay::{
+    refresh_approval_replay_posture, ApprovalReplayDecision,
+};
 use bamboo_engine::session_app::errors::{SessionLoadError, SessionSaveError};
 use bamboo_engine::session_app::repository::SessionAccess;
 use bamboo_engine::session_app::respond::{
@@ -85,6 +88,7 @@ pub use bamboo_domain::{
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
 pub use bamboo_engine::{
     Agent as RuntimeAgent, AgentBuilder as RuntimeAgentBuilder, ExecuteRequest, HookRunner,
+    LifecycleHookEvent, LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook,
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationRouter,
     SessionActivationSpawner, SessionMessagingMetrics, SessionMessagingMetricsSnapshot,
     SessionMessenger, SessionMessengerAdmission, SessionMessengerError, SessionMessengerReceipt,
@@ -128,6 +132,10 @@ pub struct Agent {
     /// approved permission prompt, mirroring what the HTTP `/respond` handler
     /// does for `state.permission_checker`.
     permission_checker: Option<Arc<dyn bamboo_tools::permission::PermissionChecker>>,
+    /// Configured process posture retained independently from the checker.
+    /// In particular, the SDK's explicit legacy Bypass policy deliberately has
+    /// no checker, while approval replay still needs to derive exact flags.
+    permission_mode: PermissionMode,
 }
 
 impl Agent {
@@ -147,6 +155,7 @@ impl Agent {
             project_id: None,
             session_store: None,
             permission_checker: None,
+            permission_mode: PermissionMode::Default,
         }
     }
 
@@ -160,6 +169,7 @@ impl Agent {
         project_id: Option<bamboo_domain::ProjectId>,
         session_store: Option<Arc<bamboo_storage::SessionStoreV2>>,
         permission_checker: Option<Arc<dyn bamboo_tools::permission::PermissionChecker>>,
+        permission_mode: PermissionMode,
     ) -> Self {
         Self {
             inner,
@@ -169,6 +179,7 @@ impl Agent {
             project_id,
             session_store,
             permission_checker,
+            permission_mode,
         }
     }
 
@@ -376,7 +387,7 @@ impl Agent {
         // entry into the loop, not just `resume`. See
         // `reexecute_approved_tool_if_pending` for the full rationale.
         self.reexecute_approved_tool_if_pending(session, &event_tx)
-            .await;
+            .await?;
 
         // Apply the instruction as the session's leading System message and set
         // the configured model via the single authoritative pre-execution
@@ -438,22 +449,59 @@ impl Agent {
         &self,
         session: &mut Session,
         event_tx: &mpsc::Sender<AgentEvent>,
-    ) {
-        let Some(tool_call_id) = session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY) else {
-            return;
+    ) -> Result<(), AgentError> {
+        let Some(tool_call_id) = session
+            .metadata
+            .get(PERMISSION_REEXECUTE_METADATA_KEY)
+            .cloned()
+        else {
+            return Ok(());
         };
 
         let Some(tool_call) = find_pending_tool_call(session, &tool_call_id) else {
+            session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
             tracing::warn!(
                 session_id = %session.id,
                 tool_call_id = %tool_call_id,
                 "Permission re-exec marker set but tool call not found in history"
             );
-            return;
+            return Ok(());
         };
 
-        let executor = self.inner.default_tools();
         let tool_name = tool_call.function.name.clone();
+        let decision = refresh_approval_replay_posture(
+            self.storage().as_ref(),
+            session,
+            self.permission_mode,
+            &tool_name,
+        )
+        .await?;
+
+        let flags = match decision {
+            ApprovalReplayDecision::Execute(flags) => flags,
+            ApprovalReplayDecision::BlockedByPlan(_) => {
+                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
+                apply_tool_result(
+                    session,
+                    &tool_call_id,
+                    format!(
+                        "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"
+                    ),
+                    false,
+                );
+                if let Err(error) = self.persistence().save_runtime_session(session).await {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        %error,
+                        "Failed to persist Plan-blocked approval replay (loop's own save will retry)"
+                    );
+                }
+                return Ok(());
+            }
+        };
+        session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
+
+        let executor = self.inner.default_tools();
         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
             == bamboo_tools::orchestrator::ToolMutability::Mutating;
 
@@ -473,7 +521,9 @@ impl Agent {
                 tool_call_id: tool_call_id.as_str(),
                 event_tx: Some(event_tx),
                 available_tool_schemas: None,
-                bypass_permissions: false,
+                bypass_permissions: flags.bypass_permissions,
+                auto_approve_permissions: flags.auto_approve_permissions,
+                plan_read_only: flags.plan_read_only,
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
@@ -524,6 +574,7 @@ impl Agent {
                 "Failed to persist session after tool re-execution (loop's own save will retry)"
             );
         }
+        Ok(())
     }
 
     /// Access the shared storage backend.
@@ -1239,6 +1290,7 @@ mod approval_and_session_tests {
             None,
             None,
             None,
+            PermissionMode::Default,
         );
         let result = bare.list_sessions().await;
         assert!(matches!(result, Err(SdkError::Unsupported(_))));
@@ -1252,8 +1304,11 @@ mod approval_and_session_tests {
 #[cfg(test)]
 mod reexecute_and_child_approval_tests {
     use super::*;
-    use bamboo_agent_core::tools::{FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome};
+    use bamboo_agent_core::tools::{
+        FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutionSessionFlags, ToolOutcome,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
 
     /// A tool whose real output is trivially distinguishable from the
@@ -1262,12 +1317,14 @@ mod reexecute_and_child_approval_tests {
     /// (not merely that the metadata marker was consumed).
     struct RealOutputTool {
         calls: AtomicUsize,
+        flags: StdMutex<Vec<ToolExecutionSessionFlags>>,
     }
 
     impl RealOutputTool {
         fn new() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                flags: StdMutex::new(Vec::new()),
             }
         }
     }
@@ -1341,9 +1398,14 @@ mod reexecute_and_child_approval_tests {
         async fn invoke(
             &self,
             _args: serde_json::Value,
-            _ctx: ToolCtx,
+            ctx: ToolCtx,
         ) -> Result<ToolOutcome, ToolError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.flags.lock().unwrap().push(ToolExecutionSessionFlags {
+                bypass_permissions: ctx.bypass_permissions,
+                auto_approve_permissions: ctx.auto_approve_permissions,
+                plan_read_only: ctx.plan_read_only,
+            });
             Ok(ToolOutcome::Completed(
                 bamboo_agent_core::tools::ToolResult::text(true, format!("REAL TOOL OUTPUT #{n}")),
             ))
@@ -1354,6 +1416,14 @@ mod reexecute_and_child_approval_tests {
         data_dir: std::path::PathBuf,
         tool: Arc<RealOutputTool>,
     ) -> Agent {
+        build_test_agent_with_tool_and_mode(data_dir, tool, None).await
+    }
+
+    async fn build_test_agent_with_tool_and_mode(
+        data_dir: std::path::PathBuf,
+        tool: Arc<RealOutputTool>,
+        mode: Option<PermissionMode>,
+    ) -> Agent {
         let config_json = r#"{
             "provider": "anthropic",
             "providers": {
@@ -1362,10 +1432,16 @@ mod reexecute_and_child_approval_tests {
         }"#;
         std::fs::write(data_dir.join("config.json"), config_json).expect("write config");
 
-        AgentBuilder::new()
+        let builder = AgentBuilder::new()
             .model("claude-test")
             .instruction("test agent")
-            .tool_shared(tool)
+            .tool_shared(tool);
+        let builder = match mode {
+            Some(PermissionMode::BypassPermissions) => builder.bypass_permissions(),
+            Some(mode) => builder.permission_mode(mode),
+            None => builder,
+        };
+        builder
             .with_defaults_for_data_dir(data_dir)
             .await
             .expect("defaults should assemble")
@@ -1379,6 +1455,7 @@ mod reexecute_and_child_approval_tests {
     /// the synthesized `awaiting_permission_approval` tool-result payload.
     fn seed_gated_tool_session(session_id: &str, tool_call_id: &str) -> Session {
         let mut session = Session::new(session_id.to_string(), "claude-test".to_string());
+        session.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("test-run"));
         session.add_message(Message::assistant(
             "",
             Some(vec![ToolCall {
@@ -1509,7 +1586,8 @@ mod reexecute_and_child_approval_tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
         agent
             .reexecute_approved_tool_if_pending(&mut session, &event_tx)
-            .await;
+            .await
+            .expect("authoritative posture is available");
         drop(event_tx);
 
         // The gated tool ran exactly once, and the placeholder is replaced with
@@ -1553,6 +1631,138 @@ mod reexecute_and_child_approval_tests {
             .find(|m| m.tool_call_id.as_deref() == Some("call-reexec-1"))
             .expect("tool result message present");
         assert_eq!(reloaded_result.content, "REAL TOOL OUTPUT #0");
+    }
+
+    #[tokio::test]
+    async fn latest_plan_consumes_stale_marker_without_tool_start_or_invocation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool.clone()).await;
+        let mut session = seed_gated_tool_session("sdk-plan-replay", "plan-call");
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "plan-call".to_string(),
+        );
+
+        let mut latest = session.clone();
+        let plan_state: bamboo_domain::PlanModeState = serde_json::from_value(serde_json::json!({
+            "entered_at": "2026-07-31T00:00:00Z",
+            "pre_permission_mode": "default",
+            "status": "exploring"
+        }))
+        .expect("valid plan state");
+        latest.agent_runtime_state.as_mut().unwrap().plan_mode = Some(plan_state);
+        agent
+            .storage()
+            .save_session(&latest)
+            .await
+            .expect("persist latest Plan posture");
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+        agent
+            .reexecute_approved_tool_if_pending(&mut session, &event_tx)
+            .await
+            .expect("latest Plan is a handled replay denial");
+        drop(event_tx);
+
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "Plan denial emits no ToolStart"
+        );
+        assert!(!session
+            .metadata
+            .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+        let blocked = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("plan-call"))
+            .expect("blocked result remains in history");
+        assert_eq!(blocked.tool_success, Some(false));
+        assert!(blocked.content.contains("Plan mode blocked"));
+        assert!(session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|runtime| runtime.plan_mode.is_some()));
+    }
+
+    #[tokio::test]
+    async fn missing_authoritative_posture_retains_marker_and_aborts_replay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = build_test_agent_with_tool(tmp.path().to_path_buf(), tool.clone()).await;
+        let mut session = seed_gated_tool_session("sdk-missing-replay", "missing-call");
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "missing-call".to_string(),
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+        let error = agent
+            .reexecute_approved_tool_if_pending(&mut session, &event_tx)
+            .await
+            .expect_err("missing durable posture must abort resume");
+        drop(event_tx);
+
+        assert!(error.to_string().contains("session missing"));
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "failed refresh emits no events"
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("missing-call"),
+            "storage failure keeps the approval marker retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_auto_and_explicit_bypass_reach_real_replay_context() {
+        for (mode, expected) in [
+            (
+                PermissionMode::Auto,
+                ToolExecutionSessionFlags {
+                    bypass_permissions: false,
+                    auto_approve_permissions: true,
+                    plan_read_only: false,
+                },
+            ),
+            (
+                PermissionMode::BypassPermissions,
+                ToolExecutionSessionFlags {
+                    bypass_permissions: true,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                },
+            ),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let tool = Arc::new(RealOutputTool::new());
+            let agent = build_test_agent_with_tool_and_mode(
+                tmp.path().to_path_buf(),
+                tool.clone(),
+                Some(mode),
+            )
+            .await;
+            let mut session = seed_gated_tool_session("sdk-flags-replay", "flags-call");
+            session.metadata.insert(
+                PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+                "flags-call".to_string(),
+            );
+            agent.storage().save_session(&session).await.unwrap();
+
+            let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+            agent
+                .reexecute_approved_tool_if_pending(&mut session, &event_tx)
+                .await
+                .expect("configured replay should execute");
+
+            assert_eq!(*tool.flags.lock().unwrap(), vec![expected]);
+        }
     }
 
     #[tokio::test]
@@ -1645,7 +1855,8 @@ mod reexecute_and_child_approval_tests {
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
         agent
             .reexecute_approved_tool_if_pending(&mut session, &event_tx)
-            .await;
+            .await
+            .expect("missing marker is a no-op");
 
         assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
         assert_eq!(session.messages.len(), 1);
@@ -1667,7 +1878,8 @@ mod reexecute_and_child_approval_tests {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
         agent
             .reexecute_approved_tool_if_pending(&mut session, &event_tx)
-            .await;
+            .await
+            .expect("missing tool call clears the marker without replay");
         drop(event_tx);
 
         assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
@@ -1698,16 +1910,18 @@ mod reexecute_and_child_approval_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _live_guard = bamboo_engine::external_agents::live::register("child-x", tx, 0, None);
         let (approval_event_tx, _approval_event_rx) = tokio::sync::mpsc::channel(4);
-        bamboo_engine::external_agents::live::register_pending_approval_observed(
-            None,
-            "parent-x",
-            "child-x",
-            0,
-            "req-1",
-            "shell",
-            "execute",
-            "cargo test",
-            approval_event_tx,
+        bamboo_engine::external_agents::live::observe_pending_approval(
+            bamboo_engine::external_agents::live::PendingApprovalObservation {
+                registry: None,
+                parent_session_id: "parent-x",
+                child_id: "child-x",
+                child_attempt: 0,
+                request_id: "req-1",
+                tool_name: "shell",
+                permission: "execute",
+                resource: "cargo test",
+                event_tx: approval_event_tx,
+            },
         );
 
         assert!(agent.answer_child_approval("child-x", "req-1", true));

@@ -22,12 +22,11 @@ pub async fn list_skills(
         let config = state.config.read().await;
         config.disabled_skill_ids()
     };
-    let skills = state
-        .skill_manager
-        .as_ref()
-        .store()
-        .list_skills(Some(filter), refresh)
-        .await
+    let store = state.skill_manager.as_ref().store();
+    let (skills, _skill_catalog) = store
+        .skills_and_catalog_snapshot(Some(filter), refresh)
+        .await;
+    let skills = skills
         .into_iter()
         .filter(|skill| include_disabled || !disabled_skill_ids.contains(&skill.id))
         .collect::<Vec<_>>();
@@ -44,10 +43,8 @@ pub async fn get_skill(
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
     let id = path.into_inner();
-    let skill = state
-        .skill_manager
-        .as_ref()
-        .store()
+    let store = state.skill_manager.as_ref().store();
+    let skill = store
         .get_skill(&id)
         .await
         .map_err(|_| AppError::NotFound(format!("Skill {} not found", id)))?;

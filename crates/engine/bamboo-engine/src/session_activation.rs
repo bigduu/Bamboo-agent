@@ -16,6 +16,9 @@ use bamboo_domain::{
 };
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
+type AsyncRollback =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
+
 /// A reservation whose runner slot already exists but whose task has not yet
 /// been launched. The router publishes the logical owner before calling
 /// `launch`, so even an immediately-completing task participates in the
@@ -23,9 +26,7 @@ use tokio::sync::{mpsc, watch, Mutex, RwLock};
 pub struct SessionActivationLaunch {
     pub run_id: String,
     launch: Option<Box<dyn FnOnce() + Send + 'static>>,
-    rollback: Option<
-        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>,
-    >,
+    rollback: Option<AsyncRollback>,
     rollback_completion: Option<Arc<RollbackCompletion>>,
 }
 

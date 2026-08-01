@@ -1,0 +1,8 @@
+#!/bin/sh
+case "$*" in
+  "--version") echo 'codex-cli 0.144.5' ;;
+  "exec --help") echo '--json --output-last-message --config --sandbox --dangerously-bypass-approvals-and-sandbox prompt from stdin' ;;
+  "exec resume --help") echo '--json' ;;
+  "app-server --help") echo '--listen stdio:// --stdio' ;;
+  *) exit 2 ;;
+esac

@@ -1,7 +1,9 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::session::task::TaskList;
 use crate::session::types::Session;
+use crate::session::PermissionAuditSeed;
 
 /// Merge messages from a live runner snapshot into an already-durable
 /// transcript without ever removing or rewriting a durable message.
@@ -117,6 +119,96 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
+    /// Authoritatively seed one validated actor activation.
+    ///
+    /// Unlike an ordinary runtime save, the incoming RunSpec posture and its
+    /// complete audit record must replace any posture left by a previous warm
+    /// activation. Implementations must still preserve durable SessionInbox
+    /// admission/transcript proof and serialize the operation per session.
+    ///
+    /// There is no safe generic implementation through
+    /// [`Self::save_runtime_session`]: that primitive is explicitly allowed to
+    /// adopt a newer disk posture, which would make warm workers sticky across
+    /// runs. Custom persisters therefore fail closed until they implement this
+    /// authority boundary deliberately.
+    async fn seed_runtime_activation(&self, _session: &mut Session) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support authoritative activation seeding",
+        ))
+    }
+
+    /// Atomically persist a worker-declared executor mapping for the current
+    /// host-authoritative permission posture.
+    ///
+    /// The caller supplies the audit revision it observed before dispatch.
+    /// Implementations must load and compare that revision while holding the
+    /// per-session lock, reject a concurrent posture update, and allocate a new
+    /// host revision/timestamp themselves. Remote audit clocks are never an
+    /// authority at this boundary.
+    async fn record_permission_posture_activation(
+        &self,
+        _session_id: &str,
+        _expected_audit_revision: Option<u64>,
+        _seed: &PermissionAuditSeed,
+    ) -> io::Result<Option<Session>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support atomic permission posture activation",
+        ))
+    }
+
+    /// Persist only the runtime control-plane for a session.
+    ///
+    /// Task lists and other runtime metadata belong to the control-plane and do
+    /// not require rewriting the potentially large message transcript. Built-in
+    /// persistence implementations with a runtime sidecar should override this
+    /// operation with their sidecar-only path. Custom/legacy implementations
+    /// remain source-compatible and safely fall back to the full runtime save.
+    ///
+    /// Callers must not rely on this operation to persist message changes.
+    async fn save_runtime_control_plane(&self, session: &mut Session) -> io::Result<()> {
+        self.save_runtime_session(session).await
+    }
+
+    /// Load the representation paired with
+    /// [`save_runtime_control_plane`](Self::save_runtime_control_plane).
+    ///
+    /// Sidecar-capable implementations should return their message-free
+    /// control-plane snapshot. The default deliberately returns the full
+    /// runtime session: when the paired save also falls back to a full save,
+    /// retaining the transcript makes that fallback safe rather than replacing
+    /// durable messages with an empty sidecar-shaped snapshot.
+    async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {
+        self.load_runtime_session(session_id).await
+    }
+
+    /// Atomically update only the shared Task list and its version.
+    ///
+    /// The default is safe for custom/legacy persistence: it loads the full
+    /// runtime session, changes only Task-owned fields, then uses the paired
+    /// control-plane save (which itself defaults to a full save). Returning
+    /// `false` means the implementation could not load the target; callers that
+    /// also hold a [`Storage`](crate::storage::Storage) may retain legacy
+    /// behavior with an explicit full-load/full-save fallback.
+    ///
+    /// Implementations with per-session transactions should override this so
+    /// the load, narrow mutation and save share one critical section.
+    async fn update_task_list_control_plane(
+        &self,
+        session_id: &str,
+        task_list: &TaskList,
+        version: &str,
+    ) -> io::Result<bool> {
+        let Some(mut session) = self.load_runtime_session(session_id).await? else {
+            return Ok(false);
+        };
+        session.set_task_list(task_list.clone());
+        session.set_task_list_version_meta(version.to_string());
+        self.save_runtime_control_plane(&mut session).await?;
+        Ok(true)
+    }
+
     /// Append-safe checkpoint used at the shared engine execute boundary.
     ///
     /// Unlike [`save_runtime_session`](Self::save_runtime_session), this must
@@ -176,6 +268,40 @@ pub trait RuntimeSessionPersistence: Send + Sync {
 impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T> {
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_runtime_session(session).await
+    }
+
+    async fn seed_runtime_activation(&self, session: &mut Session) -> io::Result<()> {
+        (**self).seed_runtime_activation(session).await
+    }
+
+    async fn record_permission_posture_activation(
+        &self,
+        session_id: &str,
+        expected_audit_revision: Option<u64>,
+        seed: &PermissionAuditSeed,
+    ) -> io::Result<Option<Session>> {
+        (**self)
+            .record_permission_posture_activation(session_id, expected_audit_revision, seed)
+            .await
+    }
+
+    async fn save_runtime_control_plane(&self, session: &mut Session) -> io::Result<()> {
+        (**self).save_runtime_control_plane(session).await
+    }
+
+    async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {
+        (**self).load_runtime_control_plane(session_id).await
+    }
+
+    async fn update_task_list_control_plane(
+        &self,
+        session_id: &str,
+        task_list: &TaskList,
+        version: &str,
+    ) -> io::Result<bool> {
+        (**self)
+            .update_task_list_control_plane(session_id, task_list, version)
+            .await
     }
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {

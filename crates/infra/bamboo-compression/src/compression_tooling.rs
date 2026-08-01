@@ -81,6 +81,20 @@ pub enum CompressionPlanError {
         anchor_index: usize,
         non_system_count: usize,
     },
+    /// Eligible history was exhausted while protected/recent content still kept
+    /// the active prompt above the configured post-compression target.
+    ProtectedContentExceedsTarget {
+        projected_tokens: u32,
+        target_tokens: u32,
+    },
+    /// The session changed after candidate selection and before finalization.
+    CandidateSetChanged,
+    /// The real generated summary was larger than the source-derived reserve,
+    /// so applying the candidate set would miss the post-compression target.
+    SummaryExceedsTarget {
+        projected_tokens: u32,
+        target_tokens: u32,
+    },
 }
 
 impl std::fmt::Display for CompressionPlanError {
@@ -108,6 +122,25 @@ impl std::fmt::Display for CompressionPlanError {
                 "nothing to compress after anchor/keep splitting (anchor_index={}, non_system={})",
                 anchor_index, non_system_count
             ),
+            Self::ProtectedContentExceedsTarget {
+                projected_tokens,
+                target_tokens,
+            } => write!(
+                f,
+                "protected active content prevents compression target (projected={}, target={})",
+                projected_tokens, target_tokens
+            ),
+            Self::CandidateSetChanged => {
+                write!(f, "compression candidate set changed before finalization")
+            }
+            Self::SummaryExceedsTarget {
+                projected_tokens,
+                target_tokens,
+            } => write!(
+                f,
+                "actual summary misses compression target (projected={}, target={})",
+                projected_tokens, target_tokens
+            ),
         }
     }
 }
@@ -127,6 +160,11 @@ pub struct ContextCompressionExposure {
 /// archived and summarized.
 #[derive(Debug, Clone)]
 pub struct CompressionPlan {
+    /// Stable identifier for all requests and the persisted event belonging to
+    /// one logical compression pass.
+    pub logical_pass_id: Option<String>,
+    /// Tokens from active prompt blocks rendered outside `Session.messages`.
+    pub fixed_prompt_tokens: u32,
     pub compressed_message_ids: Vec<String>,
     pub messages_to_summarize: Vec<Message>,
     pub summary_tokens: u32,
@@ -140,6 +178,367 @@ pub struct CompressionPlan {
     pub compression_ratio: f64,
     pub model_used: Option<String>,
     pub latency_ms: u64,
+    pub source_tokens: u32,
+    pub represented_source_tokens: u32,
+    pub target_summary_tokens: u32,
+    pub actual_summary_content_tokens: u32,
+    pub summary_target_ratio: f64,
+    pub summary_budget_clamped: bool,
+    pub summary_budget_clamp_reason: Option<String>,
+    pub summarization_map_calls: u32,
+    pub summarization_reduce_calls: u32,
+    pub summarization_fallback_used: bool,
+}
+
+/// Immutable archive selection produced before any summarization request is
+/// sent. The final summary must represent exactly this set.
+#[derive(Debug, Clone)]
+pub struct CompressionCandidatePlan {
+    pub compressed_message_ids: Vec<String>,
+    pub messages_to_summarize: Vec<Message>,
+    pub source_tokens: u32,
+    pub previous_represented_source_tokens: u32,
+    pub represented_source_tokens: u32,
+    pub target_summary_tokens: u32,
+    pub summary_target_ratio: f64,
+    pub active_usage_before_percent: f64,
+    pub projected_usage_after_percent: f64,
+    pub trigger_percent: u8,
+    pub target_percent: u8,
+    pub segments_removed: usize,
+    pub trigger_type: CompressionTriggerType,
+    additional_fixed_tokens: u32,
+    context_window: u32,
+    target_limit: u32,
+}
+
+pub const DEFAULT_SUMMARY_TARGET_RATIO: f64 = 0.20;
+
+pub fn normalized_summary_target_ratio(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value.clamp(0.01, 0.50)
+    } else {
+        DEFAULT_SUMMARY_TARGET_RATIO
+    }
+}
+
+fn target_summary_content_tokens(
+    session: &Session,
+    counter: &impl TokenCounter,
+    newly_represented_tokens: u32,
+    target_ratio: f64,
+) -> (u32, u32) {
+    let target_ratio = normalized_summary_target_ratio(target_ratio);
+    match session.conversation_summary.as_ref() {
+        Some(summary) if summary.represented_source_tokens > 0 => {
+            let represented = summary
+                .represented_source_tokens
+                .saturating_add(newly_represented_tokens);
+            (
+                ((represented as f64) * target_ratio).ceil() as u32,
+                summary.represented_source_tokens,
+            )
+        }
+        Some(summary) => {
+            let existing_tokens = counter.count_text(&summary.content);
+            let inferred_previous_source = ((existing_tokens as f64) / target_ratio).ceil() as u32;
+            (
+                existing_tokens.saturating_add(
+                    ((newly_represented_tokens as f64) * target_ratio).ceil() as u32,
+                ),
+                inferred_previous_source,
+            )
+        }
+        None => (
+            ((newly_represented_tokens as f64) * target_ratio).ceil() as u32,
+            0,
+        ),
+    }
+}
+
+fn protected_compression_message_ids(non_system: &[Message]) -> HashSet<String> {
+    let user_indexes = non_system
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            matches!(message.role, bamboo_domain::Role::User).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let keep_user_count = user_indexes.len().min(3);
+    let mut protected = user_indexes[user_indexes.len().saturating_sub(keep_user_count)..]
+        .iter()
+        .filter_map(|index| non_system.get(*index))
+        .map(|message| message.id.clone())
+        .collect::<HashSet<_>>();
+
+    let skill_call_ids = non_system
+        .iter()
+        .filter(|message| is_skill_tool_chain_message(message))
+        .flat_map(|message| {
+            message
+                .tool_calls
+                .iter()
+                .flatten()
+                .map(|call| call.id.clone())
+        })
+        .collect::<HashSet<_>>();
+
+    for message in non_system {
+        if message.never_compress
+            || is_skill_tool_chain_message(message)
+            || message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| skill_call_ids.contains(id))
+        {
+            protected.insert(message.id.clone());
+        }
+    }
+    protected
+}
+
+fn post_compaction_recovery_tokens(
+    compressed_messages: &[Message],
+    session: &Session,
+    counter: &impl TokenCounter,
+) -> u32 {
+    build_post_compaction_recovery_message(compressed_messages, session)
+        .as_ref()
+        .map(|message| counter.count_message(message))
+        .unwrap_or(0)
+}
+
+/// Select the exact archive candidates before invoking the summarization model.
+///
+/// Candidate segments are considered oldest-first. Generic tool chains remain
+/// atomic because selection operates on [`crate::MessageSegmenter`] output;
+/// newest user turns, `never_compress`, and skill chains remain active.
+pub fn build_forced_compression_candidate_plan(
+    session: &Session,
+    model_name: &str,
+    configured_budget: Option<&TokenBudget>,
+    summary_target_ratio: f64,
+    trigger_type: CompressionTriggerType,
+) -> Result<CompressionCandidatePlan, CompressionPlanError> {
+    build_forced_compression_candidate_plan_with_fixed_tokens(
+        session,
+        model_name,
+        configured_budget,
+        summary_target_ratio,
+        trigger_type,
+        0,
+    )
+}
+
+/// Variant of [`build_forced_compression_candidate_plan`] that accounts for
+/// fixed prompt blocks rendered outside `Session.messages` (for example task,
+/// plan, workflow, project-resource, and external-memory context blocks).
+pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
+    session: &Session,
+    model_name: &str,
+    configured_budget: Option<&TokenBudget>,
+    summary_target_ratio: f64,
+    trigger_type: CompressionTriggerType,
+    additional_fixed_tokens: u32,
+) -> Result<CompressionCandidatePlan, CompressionPlanError> {
+    let exposure = estimate_context_compression_exposure(session, model_name, configured_budget);
+    let budget = &exposure.budget;
+    let counter = TiktokenTokenCounter::default();
+    let active_messages = active_messages_for_budget(session);
+    if active_messages.is_empty() {
+        return Err(CompressionPlanError::NoActiveMessages);
+    }
+
+    let system_messages = active_messages
+        .iter()
+        .filter(|message| matches!(message.role, bamboo_domain::Role::System))
+        .cloned()
+        .collect::<Vec<_>>();
+    let non_system = active_messages
+        .into_iter()
+        .filter(|message| !matches!(message.role, bamboo_domain::Role::System))
+        .collect::<Vec<_>>();
+    if non_system.len() < 3 {
+        return Err(CompressionPlanError::NotEnoughMessages {
+            non_system_count: non_system.len(),
+        });
+    }
+
+    let context_window = budget.max_context_tokens;
+    let target_limit = budget.compression_target_context_tokens();
+    let system_tokens = counter.count_messages(&system_messages);
+    let protected_ids = protected_compression_message_ids(&non_system);
+    let segments = crate::segmenter::MessageSegmenter::new().segment(non_system.clone());
+    let mut remaining_tokens = counter.count_messages(&non_system);
+    let mut source_tokens = 0u32;
+    let mut selected_messages = Vec::new();
+    let mut selected_segment_count = 0usize;
+    let ratio = normalized_summary_target_ratio(summary_target_ratio);
+    let summary_envelope_tokens = counter.count_messages(&[compression_summary_message("")]);
+    let mut projected_tokens = system_tokens
+        .saturating_add(remaining_tokens)
+        .saturating_add(additional_fixed_tokens);
+    let mut target_summary_tokens = 0u32;
+    let mut previous_represented_source_tokens = session
+        .conversation_summary
+        .as_ref()
+        .map(|summary| summary.represented_source_tokens)
+        .unwrap_or(0);
+
+    for segment in segments {
+        if segment
+            .messages
+            .iter()
+            .any(|message| protected_ids.contains(&message.id))
+        {
+            continue;
+        }
+
+        let segment_tokens = counter.count_messages(&segment.messages);
+        source_tokens = source_tokens.saturating_add(segment_tokens);
+        remaining_tokens = remaining_tokens.saturating_sub(segment_tokens);
+        selected_messages.extend(segment.messages);
+        selected_segment_count += 1;
+
+        let (desired, previous_represented) =
+            target_summary_content_tokens(session, &counter, source_tokens, ratio);
+        target_summary_tokens = desired;
+        previous_represented_source_tokens = previous_represented;
+        let recovery_tokens =
+            post_compaction_recovery_tokens(&selected_messages, session, &counter);
+        projected_tokens = system_tokens
+            .saturating_add(remaining_tokens)
+            .saturating_add(additional_fixed_tokens)
+            .saturating_add(summary_envelope_tokens)
+            .saturating_add(target_summary_tokens)
+            .saturating_add(recovery_tokens);
+        if projected_tokens <= target_limit {
+            break;
+        }
+    }
+
+    if selected_messages.is_empty() {
+        return Err(CompressionPlanError::NothingToCompress {
+            anchor_index: 0,
+            non_system_count: non_system.len(),
+        });
+    }
+    if projected_tokens > target_limit {
+        return Err(CompressionPlanError::ProtectedContentExceedsTarget {
+            projected_tokens,
+            target_tokens: target_limit,
+        });
+    }
+
+    let represented_source_tokens =
+        previous_represented_source_tokens.saturating_add(source_tokens);
+    let projected_usage_after_percent =
+        context_window_usage_percent(projected_tokens, context_window);
+    let compressed_message_ids = selected_messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect();
+
+    Ok(CompressionCandidatePlan {
+        compressed_message_ids,
+        messages_to_summarize: selected_messages,
+        source_tokens,
+        previous_represented_source_tokens,
+        represented_source_tokens,
+        target_summary_tokens,
+        summary_target_ratio: ratio,
+        active_usage_before_percent: exposure.active_usage_percent,
+        projected_usage_after_percent,
+        trigger_percent: budget.compression_trigger_percent,
+        target_percent: budget.compression_target_percent,
+        segments_removed: selected_segment_count,
+        trigger_type,
+        additional_fixed_tokens,
+        context_window,
+        target_limit,
+    })
+}
+
+/// Bind a completed summary to a previously selected candidate set and verify
+/// the real post-compression prompt before any session mutation occurs.
+pub fn finalize_compression_candidate_plan(
+    session: &Session,
+    candidate: CompressionCandidatePlan,
+    summary_content: String,
+) -> Result<CompressionPlan, CompressionPlanError> {
+    let active_ids = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .map(|message| message.id.as_str())
+        .collect::<HashSet<_>>();
+    if candidate
+        .compressed_message_ids
+        .iter()
+        .any(|id| !active_ids.contains(id.as_str()))
+    {
+        return Err(CompressionPlanError::CandidateSetChanged);
+    }
+
+    let candidate_ids = candidate
+        .compressed_message_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let counter = TiktokenTokenCounter::default();
+    let summary_tokens = counter.count_messages(&[compression_summary_message(&summary_content)]);
+    let actual_summary_content_tokens = counter.count_text(&summary_content);
+    let recovery_tokens =
+        post_compaction_recovery_tokens(&candidate.messages_to_summarize, session, &counter);
+    let remaining_tokens = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .filter(|message| !candidate_ids.contains(message.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let projected_tokens = counter
+        .count_messages(&remaining_tokens)
+        .saturating_add(candidate.additional_fixed_tokens)
+        .saturating_add(summary_tokens)
+        .saturating_add(recovery_tokens);
+    if projected_tokens > candidate.target_limit {
+        return Err(CompressionPlanError::SummaryExceedsTarget {
+            projected_tokens,
+            target_tokens: candidate.target_limit,
+        });
+    }
+
+    Ok(CompressionPlan {
+        logical_pass_id: None,
+        fixed_prompt_tokens: candidate.additional_fixed_tokens,
+        compressed_message_ids: candidate.compressed_message_ids,
+        messages_to_summarize: candidate.messages_to_summarize,
+        summary_tokens,
+        summary_content,
+        active_usage_before_percent: candidate.active_usage_before_percent,
+        active_usage_after_percent: context_window_usage_percent(
+            projected_tokens,
+            candidate.context_window,
+        ),
+        trigger_percent: candidate.trigger_percent,
+        target_percent: candidate.target_percent,
+        segments_removed: candidate.segments_removed,
+        trigger_type: candidate.trigger_type,
+        compression_ratio: 0.0,
+        model_used: None,
+        latency_ms: 0,
+        source_tokens: candidate.source_tokens,
+        represented_source_tokens: candidate.represented_source_tokens,
+        target_summary_tokens: candidate.target_summary_tokens,
+        actual_summary_content_tokens,
+        summary_target_ratio: candidate.summary_target_ratio,
+        summary_budget_clamped: false,
+        summary_budget_clamp_reason: None,
+        summarization_map_calls: 0,
+        summarization_reduce_calls: 0,
+        summarization_fallback_used: false,
+    })
 }
 
 pub fn context_window_usage_percent(total_tokens: u32, context_window_tokens: u32) -> f64 {
@@ -165,7 +564,8 @@ pub fn estimate_context_compression_exposure(
     configured_budget: Option<&TokenBudget>,
 ) -> ContextCompressionExposure {
     // When a budget was already resolved upstream (the production path — see
-    // `resolve_token_budget`, which caches it in `session.resolved_token_budget` (#180),
+    // `resolve_token_budget`, which publishes the current-round snapshot in
+    // `session.resolved_token_budget` (#180),
     // issue #20 bug 1), use it directly. Only when none is available do we fall
     // back to a model-derived budget. No `model_limits.json` registry is in
     // scope synchronously here, so this fallback resolves to the global default
@@ -472,8 +872,17 @@ fn build_compression_plan_with_summary_internal(
     // prepare_hybrid_context uses, so the segment count is accurate.
     let segmenter = crate::segmenter::MessageSegmenter::new();
     let segments_removed = segmenter.segment(messages_to_summarize.clone()).len();
+    let source_tokens = counter.count_messages(&messages_to_summarize);
+    let actual_summary_content_tokens = counter.count_text(&summary_content);
+    let previous_represented_source_tokens = session
+        .conversation_summary
+        .as_ref()
+        .map(|summary| summary.represented_source_tokens)
+        .unwrap_or(0);
 
     Ok(CompressionPlan {
+        logical_pass_id: None,
+        fixed_prompt_tokens: 0,
         compressed_message_ids,
         messages_to_summarize,
         summary_tokens,
@@ -487,6 +896,16 @@ fn build_compression_plan_with_summary_internal(
         compression_ratio: 0.0,
         model_used: None,
         latency_ms: 0,
+        source_tokens,
+        represented_source_tokens: previous_represented_source_tokens.saturating_add(source_tokens),
+        target_summary_tokens: actual_summary_content_tokens,
+        actual_summary_content_tokens,
+        summary_target_ratio: 0.0,
+        summary_budget_clamped: false,
+        summary_budget_clamp_reason: None,
+        summarization_map_calls: 0,
+        summarization_reduce_calls: 0,
+        summarization_fallback_used: false,
     })
 }
 
@@ -684,7 +1103,7 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         return 0;
     }
 
-    let event = CompressionEvent::new(
+    let mut event = CompressionEvent::new(
         changed_indexes.len(),
         plan.segments_removed,
         plan.active_usage_before_percent,
@@ -695,16 +1114,43 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         plan.model_used.clone(),
         plan.latency_ms,
     );
+    if let Some(logical_pass_id) = plan.logical_pass_id.as_ref() {
+        event.id.clone_from(logical_pass_id);
+    }
+    event.source_tokens = plan.source_tokens;
+    event.fixed_prompt_tokens = plan.fixed_prompt_tokens;
+    event.actual_summary_tokens = plan.actual_summary_content_tokens;
+    event.target_summary_tokens = plan.target_summary_tokens;
+    event.summary_target_ratio = plan.summary_target_ratio;
+    event.actual_summary_ratio = if plan.represented_source_tokens == 0 {
+        0.0
+    } else {
+        plan.actual_summary_content_tokens as f64 / plan.represented_source_tokens as f64
+    };
+    event.summary_budget_clamped = plan.summary_budget_clamped;
+    event.summary_budget_clamp_reason = plan.summary_budget_clamp_reason.clone();
+    event.summarization_map_calls = plan.summarization_map_calls;
+    event.summarization_reduce_calls = plan.summarization_reduce_calls;
+    event.summarization_fallback_used = plan.summarization_fallback_used;
     let event_id = event.id.clone();
     for index in changed_indexes {
         session.messages[index].compressed_by_event_id = Some(event_id.clone());
     }
     session.compression_events.push(event);
-    session.conversation_summary = Some(ConversationSummary::new(
-        &plan.summary_content,
-        plan.compressed_message_ids.len(),
-        plan.summary_tokens,
-    ));
+    session.conversation_summary = Some(
+        ConversationSummary::new(
+            &plan.summary_content,
+            plan.compressed_message_ids.len(),
+            plan.summary_tokens,
+        )
+        .with_compression_metrics(
+            plan.represented_source_tokens,
+            plan.target_summary_tokens,
+            plan.summary_target_ratio,
+            plan.summary_budget_clamped,
+            plan.summary_budget_clamp_reason.clone(),
+        ),
+    );
 
     // Inject a post-compaction recovery message to preserve critical context
     // from the compressed messages (files, tasks, decisions).
@@ -738,8 +1184,9 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
     // Instead of clearing token_usage entirely (which forces the next round
     // to rely on heuristic estimates that don't account for tool schema
     // tokens), recompute an approximate post-compression snapshot.  We
-    // preserve the context-window denominator from the previous usage snapshot
-    // so percentages stay consistent across rounds.
+    // preserve both the total context-window denominator and the request input
+    // limit from the previous usage snapshot so their meanings stay distinct
+    // across rounds.
     let counter = TiktokenTokenCounter::default();
     let remaining_active: Vec<_> = session
         .messages
@@ -757,7 +1204,9 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         .filter(|m| !matches!(m.role, bamboo_domain::Role::System))
         .cloned()
         .collect();
-    let system_tokens = counter.count_messages(&system_msgs);
+    let system_tokens = counter
+        .count_messages(&system_msgs)
+        .saturating_add(plan.fixed_prompt_tokens);
     let new_summary_tokens = plan.summary_tokens;
     let window_tokens = counter.count_messages(&window_msgs);
     let total_tokens = system_tokens
@@ -767,10 +1216,12 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
     let budget_limit = previous_usage
         .as_ref()
         .map(|u| {
-            if u.max_context_tokens > 0 {
-                u.max_context_tokens
-            } else {
+            if u.budget_limit > 0 {
                 u.budget_limit
+            } else {
+                // Legacy snapshots used the total context window as the only
+                // denominator.
+                u.max_context_tokens
             }
         })
         .unwrap_or(0);
@@ -891,8 +1342,10 @@ pub fn build_summary_prompt(
             content.push_str(tool_call_id);
             content.push('\n');
         }
-        let snippet = truncate_chars(&message.content, 2000);
-        content.push_str(&snippet);
+        // Keep this compatibility renderer lossless. Production callers bound
+        // the fully rendered request through the hierarchical summarizer;
+        // clipping each message would discard tails without bounding the total.
+        content.push_str(&message.content);
         content.push_str("\n\n");
     }
 
@@ -900,13 +1353,6 @@ pub fn build_summary_prompt(
         "Return only the summary text. Be explicit about what is active now versus what is already done or no longer relevant.",
     );
     content
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    value.chars().take(max_chars).collect::<String>() + "..."
 }
 
 #[cfg(test)]
@@ -1732,5 +2178,353 @@ mod tests {
         let quality = validate_summary_quality("some summary", &[]);
         assert_eq!(quality.file_coverage, 1.0);
         assert_eq!(quality.decision_coverage, 1.0);
+    }
+
+    fn candidate_budget(max_context_tokens: u32, target_percent: u8) -> TokenBudget {
+        TokenBudget {
+            max_context_tokens,
+            max_output_tokens: max_context_tokens / 4,
+            strategy: BudgetStrategy::Hybrid {
+                window_size: 20,
+                enable_summarization: true,
+            },
+            safety_margin: 0,
+            compression_trigger_percent: 80,
+            compression_target_percent: target_percent,
+            working_reserve_tokens: 0,
+            fallback_trigger_percent: 75,
+            prompt_cache_min_tool_output_chars: 1_200,
+            prompt_cache_head_chars: 280,
+            prompt_cache_tail_chars: 180,
+            prompt_cache_recent_user_turns: 2,
+            prompt_cache_recent_tool_chains: 2,
+            max_tool_output_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn candidate_plan_is_selected_before_summary_and_reserves_twenty_percent_of_source() {
+        let budget = candidate_budget(6_000, 40);
+        let mut session = Session::new("candidate-first", "main-model");
+        session.add_message(Message::system("system"));
+
+        let mut tool_call = Message::assistant("searching", None);
+        tool_call.tool_calls = Some(vec![ToolCall {
+            id: "candidate-chain".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"compression"}"#.to_string(),
+            },
+        }]);
+        let tool_call_id = tool_call.id.clone();
+        session.add_message(tool_call);
+        let tool_result = Message::tool_result(
+            "candidate-chain",
+            "result payload with decisions and paths ".repeat(80),
+        );
+        let tool_result_id = tool_result.id.clone();
+        session.add_message(tool_result);
+
+        let mut never = Message::assistant("protected runtime state ".repeat(80), None);
+        never.never_compress = true;
+        let never_id = never.id.clone();
+        session.add_message(never);
+
+        for index in 0..12 {
+            session.add_message(Message::user(format!(
+                "U{index}: {}",
+                "requirement context decision ".repeat(40)
+            )));
+            session.add_message(Message::assistant(
+                format!("A{index}: {}", "implementation evidence result ".repeat(40)),
+                None,
+            ));
+        }
+        let newest_user_ids = session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, bamboo_domain::Role::User))
+            .rev()
+            .take(3)
+            .map(|message| message.id.clone())
+            .collect::<HashSet<_>>();
+
+        let candidate = build_forced_compression_candidate_plan(
+            &session,
+            "main-model",
+            Some(&budget),
+            0.20,
+            CompressionTriggerType::Auto,
+        )
+        .expect("candidate plan should reach target");
+        let selected = candidate
+            .compressed_message_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            selected,
+            candidate
+                .messages_to_summarize
+                .iter()
+                .map(|message| message.id.clone())
+                .collect()
+        );
+        assert_eq!(
+            candidate.target_summary_tokens,
+            ((candidate.source_tokens as f64) * 0.20).ceil() as u32
+        );
+        assert!(!selected.contains(&never_id));
+        assert!(newest_user_ids.is_disjoint(&selected));
+        assert_eq!(
+            selected.contains(&tool_call_id),
+            selected.contains(&tool_result_id),
+            "generic tool chain must be selected atomically"
+        );
+        assert!(
+            candidate.projected_usage_after_percent <= budget.compression_target_percent as f64
+        );
+    }
+
+    #[test]
+    fn cumulative_twenty_percent_uses_represented_raw_tokens_not_previous_summary_length() {
+        let budget = candidate_budget(30_000, 50);
+        let mut session = Session::new("cumulative-ratio", "main-model");
+        session.add_message(Message::system("system"));
+        session.conversation_summary = Some(
+            ConversationSummary::new("existing detailed summary ".repeat(200), 40, 2_000)
+                .with_compression_metrics(10_000, 2_000, 0.20, false, None),
+        );
+        for index in 0..80 {
+            session.add_message(Message::user(format!(
+                "U{index}: {}",
+                "raw source requirement and evidence ".repeat(30)
+            )));
+            session.add_message(Message::assistant(
+                format!(
+                    "A{index}: {}",
+                    "implementation result and next step ".repeat(30)
+                ),
+                None,
+            ));
+        }
+
+        let candidate = build_forced_compression_candidate_plan(
+            &session,
+            "main-model",
+            Some(&budget),
+            0.20,
+            CompressionTriggerType::Auto,
+        )
+        .expect("cumulative candidate plan");
+        assert_eq!(
+            candidate.target_summary_tokens,
+            ((10_000u32.saturating_add(candidate.source_tokens) as f64) * 0.20).ceil() as u32
+        );
+        assert_eq!(
+            candidate.represented_source_tokens,
+            10_000u32.saturating_add(candidate.source_tokens)
+        );
+    }
+
+    #[test]
+    fn legacy_summary_uses_conservative_growth_and_migrates_represented_source_metadata() {
+        let budget = candidate_budget(20_000, 50);
+        let counter = TiktokenTokenCounter::default();
+        let existing_content = "legacy summary fact and decision ".repeat(180);
+        let existing_tokens = counter.count_text(&existing_content);
+        let mut session = Session::new("legacy-summary-ratio", "main-model");
+        session.add_message(Message::system("system"));
+        session.conversation_summary = Some(ConversationSummary::new(
+            existing_content,
+            40,
+            existing_tokens,
+        ));
+        for index in 0..40 {
+            session.add_message(Message::user(format!(
+                "U{index}: {}",
+                "raw requirement evidence ".repeat(40)
+            )));
+            session.add_message(Message::assistant(
+                format!("A{index}: {}", "result next step ".repeat(40)),
+                None,
+            ));
+        }
+
+        let candidate = build_forced_compression_candidate_plan(
+            &session,
+            "main-model",
+            Some(&budget),
+            0.20,
+            CompressionTriggerType::Auto,
+        )
+        .expect("legacy candidate plan");
+        assert_eq!(
+            candidate.target_summary_tokens,
+            existing_tokens.saturating_add(((candidate.source_tokens as f64) * 0.20).ceil() as u32)
+        );
+        assert_eq!(
+            candidate.previous_represented_source_tokens,
+            ((existing_tokens as f64) / 0.20).ceil() as u32
+        );
+        let expected_represented = candidate.represented_source_tokens;
+        let expected_target = candidate.target_summary_tokens;
+        let plan = finalize_compression_candidate_plan(
+            &session,
+            candidate,
+            "migrated legacy summary with new evidence".to_string(),
+        )
+        .expect("short real summary should satisfy target");
+        assert!(apply_compression_plan(&mut session, plan) > 0);
+        let migrated = session
+            .conversation_summary
+            .as_ref()
+            .expect("migrated summary");
+        assert_eq!(migrated.represented_source_tokens, expected_represented);
+        assert_eq!(migrated.target_token_count, expected_target);
+        assert_eq!(migrated.target_ratio, 0.20);
+    }
+
+    #[test]
+    fn final_postcondition_counts_the_recovery_message_inserted_during_apply() {
+        let budget = candidate_budget(8_000, 40);
+        let mut session = Session::new("recovery-postcondition", "main-model");
+        session.add_message(Message::system("system"));
+        for index in 0..20 {
+            session.add_message(Message::user(format!(
+                "U{index}: {}",
+                "requirement source content ".repeat(45)
+            )));
+            let mut assistant = Message::assistant(
+                format!("A{index}: {}", "implementation evidence ".repeat(45)),
+                None,
+            );
+            if index == 0 {
+                assistant.tool_calls = Some(vec![ToolCall {
+                    id: "write-recovery-763".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "Write".to_string(),
+                        arguments:
+                            r#"{"file_path":"/workspace/src/recovery_763.rs","content":"fixed"}"#
+                                .to_string(),
+                    },
+                }]);
+            }
+            session.add_message(assistant);
+            if index == 0 {
+                session.add_message(Message::tool_result(
+                    "write-recovery-763",
+                    "write completed",
+                ));
+            }
+        }
+
+        let candidate = build_forced_compression_candidate_plan(
+            &session,
+            "main-model",
+            Some(&budget),
+            0.20,
+            CompressionTriggerType::CriticalOverflow,
+        )
+        .expect("candidate should reserve recovery-message tokens");
+        let plan = finalize_compression_candidate_plan(
+            &session,
+            candidate,
+            "summary with /workspace/src/recovery_763.rs".to_string(),
+        )
+        .expect("final plan");
+        assert!(apply_compression_plan(&mut session, plan) > 0);
+        assert!(session
+            .messages
+            .iter()
+            .any(|message| message.content.contains("[post-compaction-recovery]")));
+        assert!(
+            session.token_usage.as_ref().is_some_and(
+                |usage| usage.total_tokens <= budget.compression_target_context_tokens()
+            ),
+            "the real active context, including recovery, must remain at or below target"
+        );
+    }
+
+    #[test]
+    fn finalization_revalidates_actual_summary_without_mutating_session() {
+        let budget = candidate_budget(6_000, 40);
+        let mut session = Session::new("atomic-finalize", "main-model");
+        session.add_message(Message::system("system"));
+        for index in 0..20 {
+            session.add_message(Message::user(format!(
+                "U{index}: {}",
+                "source content ".repeat(50)
+            )));
+            session.add_message(Message::assistant(
+                format!("A{index}: {}", "response content ".repeat(50)),
+                None,
+            ));
+        }
+        let candidate = build_forced_compression_candidate_plan(
+            &session,
+            "main-model",
+            Some(&budget),
+            0.20,
+            CompressionTriggerType::CriticalOverflow,
+        )
+        .expect("candidate plan");
+        let before_flags = session
+            .messages
+            .iter()
+            .map(|message| (message.id.clone(), message.compressed))
+            .collect::<Vec<_>>();
+
+        let result = finalize_compression_candidate_plan(
+            &session,
+            candidate,
+            "oversized summary ".repeat(20_000),
+        );
+        assert!(matches!(
+            result,
+            Err(CompressionPlanError::SummaryExceedsTarget { .. })
+        ));
+        assert_eq!(
+            before_flags,
+            session
+                .messages
+                .iter()
+                .map(|message| (message.id.clone(), message.compressed))
+                .collect::<Vec<_>>()
+        );
+        assert!(session.conversation_summary.is_none());
+        assert!(session.compression_events.is_empty());
+    }
+
+    #[test]
+    fn candidate_plan_reports_when_protected_content_makes_target_impossible() {
+        let budget = candidate_budget(2_000, 20);
+        let mut session = Session::new("protected-capacity", "main-model");
+        session.add_message(Message::system("system"));
+        session.add_message(Message::assistant(
+            "one eligible old message ".repeat(200),
+            None,
+        ));
+        for index in 0..3 {
+            session.add_message(Message::user(format!(
+                "protected recent user {index} {}",
+                "large active content ".repeat(300)
+            )));
+        }
+
+        let result = build_forced_compression_candidate_plan(
+            &session,
+            "main-model",
+            Some(&budget),
+            0.20,
+            CompressionTriggerType::CriticalOverflow,
+        );
+        assert!(matches!(
+            result,
+            Err(CompressionPlanError::ProtectedContentExceedsTarget { .. })
+        ));
     }
 }

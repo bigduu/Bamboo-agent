@@ -228,6 +228,46 @@ mod tests {
         assert!(!names(ToolSurface::Child).contains("workflow_run"));
     }
 
+    #[tokio::test]
+    async fn workflow_run_root_overlay_advertises_provider_safe_parameters() {
+        let (_temp, state) = make_state().await;
+        let workflow_run = state
+            .tools_for(ToolSurface::Root)
+            .list_tools()
+            .into_iter()
+            .find(|schema| schema.function.name == "workflow_run")
+            .expect("root workflow_run overlay");
+        let parameters = &workflow_run.function.parameters;
+
+        for combinator in ["oneOf", "anyOf", "allOf"] {
+            assert!(
+                parameters.get(combinator).is_none(),
+                "root workflow_run overlay must not advertise {combinator}"
+            );
+        }
+        let properties = parameters["properties"]
+            .as_object()
+            .expect("root workflow_run properties");
+        assert!(
+            !properties.is_empty(),
+            "root workflow_run overlay must not advertise empty properties"
+        );
+        for field in [
+            "action",
+            "workflow_id",
+            "revision",
+            "args",
+            "budget",
+            "run_id",
+            "since",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "root workflow_run overlay is missing {field}"
+            );
+        }
+    }
+
     // ---- get_all_tool_schemas ----
 
     #[tokio::test]

@@ -90,9 +90,9 @@ use thiserror::Error;
 
 use crate::metrics::types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
-    ForwardRequestMetrics, ForwardStatus, MetricsDateFilter, MetricsSummary, ModelMetrics,
-    RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter, SessionStatus,
-    TokenUsage, ToolCallMetrics,
+    ForwardRequestMetrics, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, MetricsSummary,
+    ModelMetrics, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter,
+    SessionStatus, TokenUsage, ToolCallMetrics,
 };
 
 /// Result type for metrics storage operations.
@@ -416,7 +416,9 @@ pub trait MetricsStorage: Send + Sync {
     /// * `status_code` - HTTP status code from the upstream API
     /// * `status` - Classified status (success, error, or timeout)
     /// * `usage` - Token usage if provided in the response
+    /// * `token_details` - Provider-specific cache/reasoning dimensions
     /// * `error` - Error message if the request failed
+    #[allow(clippy::too_many_arguments)]
     async fn complete_forward(
         &self,
         forward_id: &str,
@@ -424,6 +426,7 @@ pub trait MetricsStorage: Send + Sync {
         status_code: Option<u16>,
         status: ForwardStatus,
         usage: Option<TokenUsage>,
+        token_details: Option<ForwardTokenDetails>,
         error: Option<String>,
     ) -> MetricsResult<()>;
 
@@ -935,6 +938,10 @@ impl MetricsStorage for SqliteMetricsStorage {
                     prompt_tokens INTEGER,
                     completion_tokens INTEGER,
                     total_tokens INTEGER,
+                    cache_creation_input_tokens INTEGER,
+                    cache_read_input_tokens INTEGER,
+                    cache_write_input_tokens INTEGER,
+                    reasoning_output_tokens INTEGER,
                     error TEXT,
                     updated_at TEXT NOT NULL
                 );
@@ -967,6 +974,26 @@ impl MetricsStorage for SqliteMetricsStorage {
             ensure_integer_column(connection, "round_metrics", "prompt_cached_tool_tokens_saved", 0)?;
             ensure_integer_column(connection, "round_metrics", "compression_count", 0)?;
             ensure_integer_column(connection, "round_metrics", "tokens_saved", 0)?;
+            ensure_nullable_integer_column(
+                connection,
+                "forward_request_metrics",
+                "cache_creation_input_tokens",
+            )?;
+            ensure_nullable_integer_column(
+                connection,
+                "forward_request_metrics",
+                "cache_read_input_tokens",
+            )?;
+            ensure_nullable_integer_column(
+                connection,
+                "forward_request_metrics",
+                "cache_write_input_tokens",
+            )?;
+            ensure_nullable_integer_column(
+                connection,
+                "forward_request_metrics",
+                "reasoning_output_tokens",
+            )?;
             connection.execute(
                 "UPDATE forward_request_metrics SET status = 'pending' WHERE status IS NULL OR trim(status) = ''",
                 [],
@@ -1259,6 +1286,10 @@ impl MetricsStorage for SqliteMetricsStorage {
                     prompt_tokens = NULL,
                     completion_tokens = NULL,
                     total_tokens = NULL,
+                    cache_creation_input_tokens = NULL,
+                    cache_read_input_tokens = NULL,
+                    cache_write_input_tokens = NULL,
+                    reasoning_output_tokens = NULL,
                     error = NULL,
                     updated_at = excluded.updated_at
                 "#,
@@ -1276,6 +1307,7 @@ impl MetricsStorage for SqliteMetricsStorage {
         status_code: Option<u16>,
         status: ForwardStatus,
         usage: Option<TokenUsage>,
+        token_details: Option<ForwardTokenDetails>,
         error: Option<String>,
     ) -> MetricsResult<()> {
         let forward_id = forward_id.to_string();
@@ -1289,6 +1321,19 @@ impl MetricsStorage for SqliteMetricsStorage {
             ),
             None => (None, None, None),
         };
+        let token_details = token_details.unwrap_or_default();
+        let cache_creation = token_details
+            .cache_creation_input_tokens
+            .map(|value| value as i64);
+        let cache_read = token_details
+            .cache_read_input_tokens
+            .map(|value| value as i64);
+        let cache_write = token_details
+            .cache_write_input_tokens
+            .map(|value| value as i64);
+        let reasoning_output = token_details
+            .reasoning_output_tokens
+            .map(|value| value as i64);
 
         self.with_connection(move |connection| {
             connection.execute(
@@ -1300,9 +1345,13 @@ impl MetricsStorage for SqliteMetricsStorage {
                     prompt_tokens = ?4,
                     completion_tokens = ?5,
                     total_tokens = ?6,
-                    error = ?7,
+                    cache_creation_input_tokens = ?7,
+                    cache_read_input_tokens = ?8,
+                    cache_write_input_tokens = ?9,
+                    reasoning_output_tokens = ?10,
+                    error = ?11,
                     updated_at = ?1
-                WHERE forward_id = ?8
+                WHERE forward_id = ?12
                 "#,
                 params![
                     completed_at_str,
@@ -1311,6 +1360,10 @@ impl MetricsStorage for SqliteMetricsStorage {
                     prompt,
                     completion,
                     total,
+                    cache_creation,
+                    cache_read,
+                    cache_write,
+                    reasoning_output,
                     error,
                     forward_id,
                 ],
@@ -1341,6 +1394,10 @@ impl MetricsStorage for SqliteMetricsStorage {
                  COALESCE(SUM(prompt_tokens), 0), \
                  COALESCE(SUM(completion_tokens), 0), \
                  COALESCE(SUM(total_tokens), 0), \
+                 SUM(cache_creation_input_tokens), \
+                 SUM(cache_read_input_tokens), \
+                 SUM(cache_write_input_tokens), \
+                 SUM(reasoning_output_tokens), \
                  AVG(CASE WHEN completed_at IS NOT NULL THEN \
                      (julianday(completed_at) - julianday(started_at)) * 86400000 END) \
                  FROM forward_request_metrics {}",
@@ -1349,7 +1406,7 @@ impl MetricsStorage for SqliteMetricsStorage {
 
             let mut stmt = connection.prepare(&sql)?;
             let summary = stmt.query_row(params_from_iter(params_vec.iter()), |row| {
-                let avg_duration: Option<f64> = row.get(6)?;
+                let avg_duration: Option<f64> = row.get(10)?;
                 Ok(ForwardMetricsSummary {
                     total_requests: row.get::<_, i64>(0)? as u64,
                     successful_requests: row.get::<_, i64>(1)? as u64,
@@ -1358,6 +1415,20 @@ impl MetricsStorage for SqliteMetricsStorage {
                         prompt_tokens: row.get::<_, i64>(3)? as u64,
                         completion_tokens: row.get::<_, i64>(4)? as u64,
                         total_tokens: row.get::<_, i64>(5)? as u64,
+                    },
+                    token_details: ForwardTokenDetails {
+                        cache_creation_input_tokens: row
+                            .get::<_, Option<i64>>(6)?
+                            .map(|value| value as u64),
+                        cache_read_input_tokens: row
+                            .get::<_, Option<i64>>(7)?
+                            .map(|value| value as u64),
+                        cache_write_input_tokens: row
+                            .get::<_, Option<i64>>(8)?
+                            .map(|value| value as u64),
+                        reasoning_output_tokens: row
+                            .get::<_, Option<i64>>(9)?
+                            .map(|value| value as u64),
                     },
                     avg_duration_ms: avg_duration.map(|d| d as u64),
                 })
@@ -1389,6 +1460,10 @@ impl MetricsStorage for SqliteMetricsStorage {
                  COALESCE(SUM(prompt_tokens), 0), \
                  COALESCE(SUM(completion_tokens), 0), \
                  COALESCE(SUM(total_tokens), 0), \
+                 SUM(cache_creation_input_tokens), \
+                 SUM(cache_read_input_tokens), \
+                 SUM(cache_write_input_tokens), \
+                 SUM(reasoning_output_tokens), \
                  AVG(CASE WHEN completed_at IS NOT NULL THEN \
                      (julianday(completed_at) - julianday(started_at)) * 86400000 END) \
                  FROM forward_request_metrics {} \
@@ -1401,7 +1476,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             let mut endpoints = Vec::new();
 
             while let Some(row) = rows.next()? {
-                let avg_duration: Option<f64> = row.get(7)?;
+                let avg_duration: Option<f64> = row.get(11)?;
                 endpoints.push(ForwardEndpointMetrics {
                     endpoint: row.get(0)?,
                     requests: row.get::<_, i64>(1)? as u64,
@@ -1411,6 +1486,20 @@ impl MetricsStorage for SqliteMetricsStorage {
                         prompt_tokens: row.get::<_, i64>(4)? as u64,
                         completion_tokens: row.get::<_, i64>(5)? as u64,
                         total_tokens: row.get::<_, i64>(6)? as u64,
+                    },
+                    token_details: ForwardTokenDetails {
+                        cache_creation_input_tokens: row
+                            .get::<_, Option<i64>>(7)?
+                            .map(|value| value as u64),
+                        cache_read_input_tokens: row
+                            .get::<_, Option<i64>>(8)?
+                            .map(|value| value as u64),
+                        cache_write_input_tokens: row
+                            .get::<_, Option<i64>>(9)?
+                            .map(|value| value as u64),
+                        reasoning_output_tokens: row
+                            .get::<_, Option<i64>>(10)?
+                            .map(|value| value as u64),
                     },
                     avg_duration_ms: avg_duration.map(|d| d as u64),
                 });
@@ -1438,7 +1527,9 @@ impl MetricsStorage for SqliteMetricsStorage {
             let limit = i64::from(filter.limit.unwrap_or(100).min(1_000));
             let sql = format!(
                 "SELECT forward_id, endpoint, model, is_stream, started_at, completed_at, \
-                 status_code, status, prompt_tokens, completion_tokens, total_tokens, error \
+                 status_code, status, prompt_tokens, completion_tokens, total_tokens, \
+                 cache_creation_input_tokens, cache_read_input_tokens, \
+                 cache_write_input_tokens, reasoning_output_tokens, error \
                  FROM forward_request_metrics {} \
                  ORDER BY started_at DESC LIMIT {}",
                 where_clause, limit
@@ -1476,7 +1567,21 @@ impl MetricsStorage for SqliteMetricsStorage {
                     status_code: row.get::<_, Option<i64>>(6)?.map(|s| s as u16),
                     status,
                     token_usage,
-                    error: row.get(11)?,
+                    token_details: ForwardTokenDetails {
+                        cache_creation_input_tokens: row
+                            .get::<_, Option<i64>>(11)?
+                            .map(|value| value as u64),
+                        cache_read_input_tokens: row
+                            .get::<_, Option<i64>>(12)?
+                            .map(|value| value as u64),
+                        cache_write_input_tokens: row
+                            .get::<_, Option<i64>>(13)?
+                            .map(|value| value as u64),
+                        reasoning_output_tokens: row
+                            .get::<_, Option<i64>>(14)?
+                            .map(|value| value as u64),
+                    },
+                    error: row.get(15)?,
                     duration_ms: compute_duration_ms(started_at, completed_at),
                 });
             }
@@ -2278,6 +2383,26 @@ fn ensure_integer_column(
     Ok(())
 }
 
+fn ensure_nullable_integer_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> MetricsResult<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = connection.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER");
+    connection.execute(&alter, [])?;
+    Ok(())
+}
+
 /// Refreshes aggregated metrics for a session by recalculating from child entities.
 ///
 /// This function updates the session's aggregate columns by summing values
@@ -2592,8 +2717,8 @@ mod tests {
 
     use super::{MetricsStorage, SqliteMetricsStorage, ToolCallCompletion};
     use crate::metrics::types::{
-        ForwardMetricsFilter, ForwardStatus, MetricsDateFilter, RoundStatus, SessionMetricsFilter,
-        SessionStatus, TokenUsage,
+        ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, RoundStatus,
+        SessionMetricsFilter, SessionStatus, TokenUsage,
     };
 
     #[test]
@@ -2939,6 +3064,97 @@ mod tests {
         assert_eq!(
             daily[0].total_sessions, 1,
             "the 23:59:59 session is in range; the next-day 00:00 session is not"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_metrics_preserve_provider_cache_dimensions_separately() {
+        let dir = tempdir().expect("temp dir");
+        let database_path = dir.path().join("metrics.db");
+        let legacy = rusqlite::Connection::open(&database_path).expect("legacy database");
+        legacy
+            .execute_batch(
+                r#"
+                CREATE TABLE forward_request_metrics (
+                    forward_id TEXT PRIMARY KEY,
+                    endpoint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    is_stream INTEGER NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status_code INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens INTEGER,
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .expect("legacy forward schema");
+        drop(legacy);
+
+        let storage = SqliteMetricsStorage::new(database_path);
+        storage.init().await.expect("init storage");
+        let now = Utc
+            .with_ymd_and_hms(2026, 2, 11, 9, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        storage
+            .insert_forward_start("forward-cache", "openai.responses", "gpt-5.6", true, now)
+            .await
+            .expect("forward start");
+        storage
+            .complete_forward(
+                "forward-cache",
+                now + chrono::Duration::milliseconds(25),
+                Some(200),
+                ForwardStatus::Success,
+                Some(TokenUsage {
+                    prompt_tokens: 80,
+                    completion_tokens: 20,
+                    total_tokens: 100,
+                }),
+                Some(ForwardTokenDetails {
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: Some(32),
+                    cache_write_input_tokens: Some(48),
+                    reasoning_output_tokens: Some(5),
+                }),
+                None,
+            )
+            .await
+            .expect("forward completion");
+
+        let requests = storage
+            .forward_requests(ForwardMetricsFilter::default())
+            .await
+            .expect("forward requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].token_details.cache_read_input_tokens, Some(32));
+        assert_eq!(requests[0].token_details.cache_write_input_tokens, Some(48));
+        assert_eq!(requests[0].token_details.cache_creation_input_tokens, None);
+        assert_eq!(requests[0].token_details.reasoning_output_tokens, Some(5));
+
+        let summary = storage
+            .forward_summary(ForwardMetricsFilter::default())
+            .await
+            .expect("forward summary");
+        assert_eq!(summary.token_details.cache_read_input_tokens, Some(32));
+        assert_eq!(summary.token_details.cache_write_input_tokens, Some(48));
+        assert_eq!(summary.token_details.cache_creation_input_tokens, None);
+        assert_eq!(summary.token_details.reasoning_output_tokens, Some(5));
+
+        let endpoints = storage
+            .forward_by_endpoint(ForwardMetricsFilter::default())
+            .await
+            .expect("forward endpoints");
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(
+            endpoints[0].token_details.cache_write_input_tokens,
+            Some(48)
         );
     }
 

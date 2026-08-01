@@ -1531,6 +1531,7 @@ async fn runtime_skill_context_rejects_another_projects_workspace_overlay() {
     let descriptor = crate::project_context::ProjectDescriptor {
         id: session_project.clone(),
         name: "Session Project".to_string(),
+        project_path: Some(workspace.clone()),
         home: project_home.clone(),
         workspace_bindings: Vec::new(),
         resources: bamboo_domain::ProjectResourceSummary {

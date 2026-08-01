@@ -6,6 +6,7 @@
 //! before the commit point, and every reader recovers a committed transaction
 //! before reading any credential transaction member.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -15,6 +16,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
+use base64::Engine as _;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -30,6 +32,7 @@ const MIGRATION_VERSION: u32 = 1;
 const SECTION_LAYOUT_COMPLETION_LEDGER_VERSION: u32 = 1;
 const MANIFEST_FILE: &str = "config-credential-migration.json";
 const JOURNAL_FILE: &str = "config-credential-migration.journal.json";
+const CLUSTER_ABORT_FILE: &str = "config-credential-migration.cluster-abort.json";
 pub(crate) const SECTION_LAYOUT_COMPLETION_FILE: &str = "config-section-layout-completion.json";
 const LOCK_FILE: &str = ".config-credential-migration.lock";
 const STAGE_PREFIX: &str = ".config-credential-stage-v1-";
@@ -90,6 +93,19 @@ struct MigrationManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ClusterAbortRecord {
+    version: u32,
+    transaction_id: String,
+    stage_dir: String,
+    state: MigrationState,
+    exact_scope: ExactTransactionScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration_scope: Option<MigrationScope>,
+    rollback_journal_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum FacadeSourceBase {
     Missing,
@@ -100,6 +116,7 @@ enum FacadeSourceBase {
 #[serde(rename_all = "snake_case")]
 enum MigrationState {
     Pending,
+    Aborting,
     Complete,
 }
 
@@ -129,6 +146,171 @@ enum ExactTransactionScope {
     Connect,
     AccessControl,
     ClusterFabric,
+}
+
+impl ExactTransactionScope {
+    fn section_id(self) -> crate::SectionId {
+        match self {
+            Self::Providers => crate::SectionId::Providers,
+            Self::Mcp => crate::SectionId::Mcp,
+            Self::ProxyAuth => crate::SectionId::Core,
+            Self::EnvVars => crate::SectionId::Env,
+            Self::Notifications => crate::SectionId::Notifications,
+            Self::Connect => crate::SectionId::Connect,
+            Self::AccessControl => crate::SectionId::AccessControl,
+            Self::ClusterFabric => crate::SectionId::ClusterFabric,
+        }
+    }
+}
+
+fn non_cluster_credential_scope(
+    section: crate::SectionId,
+) -> ConfigStoreResult<ExactTransactionScope> {
+    match section {
+        crate::SectionId::Core => Ok(ExactTransactionScope::ProxyAuth),
+        crate::SectionId::Env => Ok(ExactTransactionScope::EnvVars),
+        crate::SectionId::Notifications => Ok(ExactTransactionScope::Notifications),
+        crate::SectionId::Connect => Ok(ExactTransactionScope::Connect),
+        crate::SectionId::AccessControl => Ok(ExactTransactionScope::AccessControl),
+        _ => Err(ConfigStoreError::Validation(
+            "section is not a non-cluster credential-backed domain".to_string(),
+        )),
+    }
+}
+
+fn credential_refs_for_scope(
+    config: &crate::Config,
+    scope: ExactTransactionScope,
+) -> BTreeSet<crate::CredentialRef> {
+    match scope {
+        ExactTransactionScope::ProxyAuth => {
+            config.proxy_auth_credential_ref.iter().cloned().collect()
+        }
+        ExactTransactionScope::EnvVars => config
+            .env_vars
+            .iter()
+            .filter(|entry| entry.secret && entry.configured)
+            .filter_map(|entry| entry.credential_ref.clone())
+            .collect(),
+        ExactTransactionScope::Notifications => [
+            config
+                .notifications
+                .ntfy
+                .configured
+                .then(|| config.notifications.ntfy.credential_ref.clone())
+                .flatten(),
+            config
+                .notifications
+                .bark
+                .configured
+                .then(|| config.notifications.bark.credential_ref.clone())
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        ExactTransactionScope::Connect => config
+            .connect
+            .platforms
+            .iter()
+            .flat_map(|platform| {
+                [
+                    platform
+                        .token_configured
+                        .then(|| platform.token_credential_ref.clone())
+                        .flatten(),
+                    platform
+                        .app_secret_configured
+                        .then(|| platform.app_secret_credential_ref.clone())
+                        .flatten(),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect(),
+        ExactTransactionScope::AccessControl => config
+            .access_control
+            .iter()
+            .flat_map(|access| {
+                access
+                    .password_configured
+                    .then(|| access.password_credential_ref.clone())
+                    .flatten()
+                    .into_iter()
+                    .chain(access.devices.iter().filter_map(|device| {
+                        device
+                            .token_configured
+                            .then(|| device.token_credential_ref.clone())
+                            .flatten()
+                    }))
+            })
+            .collect(),
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
+        | ExactTransactionScope::ClusterFabric => BTreeSet::new(),
+    }
+}
+
+fn credential_value_is_valid_for_scope(scope: ExactTransactionScope, value: &str) -> bool {
+    match scope {
+        ExactTransactionScope::ProxyAuth => serde_json::from_str::<crate::ProxyAuth>(value)
+            .is_ok_and(|auth| {
+                !auth.username.trim().is_empty()
+                    && !crate::patch::is_masked_api_key(&auth.username)
+                    && !crate::patch::is_masked_api_key(&auth.password)
+            }),
+        ExactTransactionScope::AccessControl => {
+            crate::config_crypto::decode_access_verifier(value).is_ok()
+        }
+        ExactTransactionScope::EnvVars
+        | ExactTransactionScope::Notifications
+        | ExactTransactionScope::Connect => {
+            !value.trim().is_empty() && !crate::patch::is_masked_api_key(value)
+        }
+        ExactTransactionScope::Providers
+        | ExactTransactionScope::Mcp
+        | ExactTransactionScope::ClusterFabric => true,
+    }
+}
+
+fn semantic_credential_statuses_for_scope(
+    config: &crate::Config,
+    scope: ExactTransactionScope,
+    credential_lkg: &crate::credential_store::CredentialDocumentLkg,
+) -> (BTreeSet<crate::CredentialRef>, Vec<crate::CredentialStatus>) {
+    let active_refs = credential_refs_for_scope(config, scope);
+    let statuses = credential_lkg.statuses_with_validation(&active_refs, |_, value| {
+        credential_value_is_valid_for_scope(scope, value)
+    });
+    (active_refs, statuses)
+}
+
+fn ensure_active_credential_statuses(
+    active_refs: &BTreeSet<crate::CredentialRef>,
+    statuses: &[crate::CredentialStatus],
+) -> ConfigStoreResult<()> {
+    if let Some(reference) = active_refs.iter().find(|reference| {
+        !statuses
+            .iter()
+            .any(|status| &status.credential_ref == *reference && status.configured)
+    }) {
+        return Err(ConfigStoreError::Validation(format!(
+            "active credential '{}' is invalid; explicitly replace or clear it",
+            reference.as_str()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_active_section_credential_values(
+    config: &crate::Config,
+    section: crate::SectionId,
+    credential_lkg: &crate::credential_store::CredentialDocumentLkg,
+) -> ConfigStoreResult<()> {
+    let scope = non_cluster_credential_scope(section)?;
+    let (active_refs, statuses) =
+        semantic_credential_statuses_for_scope(config, scope, credential_lkg);
+    ensure_active_credential_statuses(&active_refs, &statuses)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -534,14 +716,16 @@ pub(crate) fn plan_facade_compound_credentials(
         .map(ToOwned::to_owned)
     {
         primary_authority.access_control = true;
-        if let Some(section) = plan_access_control_document(original, &mut primary_extracted, 1)? {
+        if let Some(section) =
+            plan_access_control_document(original, &mut primary_extracted, 1, "section")?
+        {
             source_overrides.insert(ACCESS_CONTROL_FILE.to_string(), section.bytes);
         }
     }
 
     if let Some(original) = source_snapshot.bytes(CONFIG_FILE)?.map(ToOwned::to_owned) {
         let mut root_extracted = Vec::new();
-        let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1)?;
+        let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1, "root")?;
         let mut candidate = planned
             .as_ref()
             .map(|section| section.bytes.clone())
@@ -678,8 +862,12 @@ pub(crate) fn plan_facade_compound_credentials(
         if let Some(original) = source_snapshot.bytes(&access_name)?.map(ToOwned::to_owned) {
             if serde_json::from_slice::<Value>(&original).is_ok() {
                 let mut access_extracted = Vec::new();
-                let planned =
-                    plan_access_control_document(original.clone(), &mut access_extracted, 1)?;
+                let planned = plan_access_control_document(
+                    original.clone(),
+                    &mut access_extracted,
+                    1,
+                    &format!("section.{suffix}"),
+                )?;
                 discard_shadowed_sidecar_backup_secrets(&mut access_extracted, &primary_authority);
                 if let Some(section) = planned {
                     generation_extracted.extend(access_extracted);
@@ -697,7 +885,12 @@ pub(crate) fn plan_facade_compound_credentials(
         if let Some(original) = source_snapshot.bytes(&config_name)?.map(ToOwned::to_owned) {
             if serde_json::from_slice::<Value>(&original).is_ok() {
                 let mut root_extracted = Vec::new();
-                let planned = plan_facade_root_document(original.clone(), &mut root_extracted, 1)?;
+                let planned = plan_facade_root_document(
+                    original.clone(),
+                    &mut root_extracted,
+                    1,
+                    &format!("root.{suffix}"),
+                )?;
                 let mut candidate = planned
                     .as_ref()
                     .map(|section| section.bytes.clone())
@@ -794,6 +987,9 @@ enum ExtractedSecretKind {
     ExternalBroker,
     Connect,
     AccessControl,
+    /// Server-owned encrypted recovery payload for malformed legacy access
+    /// data. It is never referenced by the public runtime projection.
+    AccessControlRepair,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -814,12 +1010,16 @@ enum MigrationFault {
     AfterRebaseStageWrite,
     AfterRebaseManifest,
     BeforeExactCommitCredentialRace,
+    BeforeExactStagingUnrelatedCredentialRace,
+    BeforeExactCommitUnrelatedCredentialRace,
     AfterExactCommitCredentialRace,
     AfterExactCommitUnrelatedCredentialRace,
     AfterExactCommitCredentialClearRace,
     AfterExactCredentialRebaseStage,
     AfterExactCredentialRebaseManifest,
     AfterExactProxyConfigRebaseManifestExternalWrite,
+    AfterExactClusterConsumerConflict,
+    AfterExactClusterSectionRebase,
 }
 
 fn authoritative_section_file(scope: ExactTransactionScope) -> &'static str {
@@ -859,6 +1059,37 @@ type EnvTransactionTestHook = Box<dyn FnOnce(&Path) + Send + 'static>;
 static ENV_TRANSACTION_TEST_HOOK: std::sync::Mutex<Option<EnvTransactionTestHook>> =
     std::sync::Mutex::new(None);
 
+/// One-shot crash boundary for an adopted cluster-fabric exact transaction.
+///
+/// Test-only: production builds have neither this type nor the corresponding
+/// timing branches.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterExactCommitTestFault {
+    AfterManifest,
+    AfterManifestRecoveryFailure,
+    AfterCredentialInstall,
+    BeforeFinish,
+    AbortMarkerRecoveryFailure,
+    AbortJournalMarkerAndCleanupRecoveryFailure,
+    AbortBothMarkersRecoveryFailure,
+    AfterManifestAbortBothMarkersRecoveryFailure,
+    AbortAllMarkersRecoveryFailure,
+    AbortCleanupRecoveryFailure,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy)]
+struct ClusterExactCommitTestFaultState {
+    fault: ClusterExactCommitTestFault,
+    cleanup_failure_observed: bool,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+static CLUSTER_EXACT_COMMIT_TEST_FAULTS: LazyLock<
+    Mutex<BTreeMap<PathBuf, ClusterExactCommitTestFaultState>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
 /// Install a one-shot hook immediately after an env exact manifest commits.
 /// Test-only: production builds have no hook or timing branch.
 #[cfg(feature = "test-utils")]
@@ -866,6 +1097,137 @@ pub fn set_env_transaction_test_hook(hook: impl FnOnce(&Path) + Send + 'static) 
     *ENV_TRANSACTION_TEST_HOOK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+}
+
+/// Inject one recoverable failure into the next adopted cluster exact
+/// transaction for `data_dir`.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn set_cluster_exact_commit_test_fault(
+    data_dir: impl Into<PathBuf>,
+    fault: ClusterExactCommitTestFault,
+) {
+    CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            data_dir.into(),
+            ClusterExactCommitTestFaultState {
+                fault,
+                cleanup_failure_observed: false,
+            },
+        );
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn clear_cluster_exact_commit_test_fault(data_dir: impl AsRef<Path>) {
+    CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(data_dir.as_ref());
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn take_cluster_exact_commit_test_fault(
+    data_dir: &Path,
+    fault: ClusterExactCommitTestFault,
+) -> bool {
+    let mut faults = CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if faults
+        .get(data_dir)
+        .is_some_and(|state| state.fault == fault)
+    {
+        faults.remove(data_dir);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn take_cluster_exact_after_manifest_test_fault(data_dir: &Path) -> bool {
+    let mut faults = CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match faults.get(data_dir).map(|state| state.fault) {
+        Some(ClusterExactCommitTestFault::AfterManifest) => {
+            faults.remove(data_dir);
+            true
+        }
+        // Retain this variant until the recovery attempt consumes its second
+        // deterministic failure below.
+        Some(ClusterExactCommitTestFault::AfterManifestRecoveryFailure) => true,
+        Some(ClusterExactCommitTestFault::AfterManifestAbortBothMarkersRecoveryFailure) => true,
+        _ => false,
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn cluster_abort_cleanup_test_fault(data_dir: &Path) -> bool {
+    let mut faults = CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(state) = faults.get_mut(data_dir) else {
+        return false;
+    };
+    match state.fault {
+        ClusterExactCommitTestFault::AbortCleanupRecoveryFailure => true,
+        ClusterExactCommitTestFault::AbortJournalMarkerAndCleanupRecoveryFailure
+        | ClusterExactCommitTestFault::AbortBothMarkersRecoveryFailure
+        | ClusterExactCommitTestFault::AfterManifestAbortBothMarkersRecoveryFailure
+            if !state.cleanup_failure_observed =>
+        {
+            state.cleanup_failure_observed = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn cluster_abort_marker_test_fault(data_dir: &Path) -> bool {
+    CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(data_dir)
+        .is_some_and(|state| {
+            matches!(
+                state.fault,
+                ClusterExactCommitTestFault::AbortMarkerRecoveryFailure
+                    | ClusterExactCommitTestFault::AbortBothMarkersRecoveryFailure
+                    | ClusterExactCommitTestFault::AfterManifestAbortBothMarkersRecoveryFailure
+                    | ClusterExactCommitTestFault::AbortAllMarkersRecoveryFailure
+            )
+        })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn cluster_abort_journal_marker_test_fault(data_dir: &Path) -> bool {
+    CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(data_dir)
+        .is_some_and(|state| {
+            matches!(
+                state.fault,
+                ClusterExactCommitTestFault::AbortJournalMarkerAndCleanupRecoveryFailure
+                    | ClusterExactCommitTestFault::AbortBothMarkersRecoveryFailure
+                    | ClusterExactCommitTestFault::AfterManifestAbortBothMarkersRecoveryFailure
+                    | ClusterExactCommitTestFault::AbortAllMarkersRecoveryFailure
+            )
+        })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn cluster_abort_record_test_fault(data_dir: &Path) -> bool {
+    CLUSTER_EXACT_COMMIT_TEST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(data_dir)
+        .is_some_and(|state| {
+            state.fault == ClusterExactCommitTestFault::AbortAllMarkersRecoveryFailure
+        })
 }
 
 /// Extract provider/MCP/root secrets into the isolated credential store.
@@ -905,6 +1267,22 @@ pub(crate) fn migrate_cluster_credentials_locked(
     migrate_cluster_locked(data_dir, None)
 }
 
+pub(crate) fn migrate_access_control_credentials_for_facade_locked(
+    data_dir: &Path,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    migrate_access_control_locked(data_dir, None)
+}
+
+pub(crate) fn access_control_requires_opaque_repair(data_dir: &Path) -> ConfigStoreResult<bool> {
+    let Some(bytes) = read_optional_target(&data_dir.join(ACCESS_CONTROL_FILE))? else {
+        return Ok(false);
+    };
+    let Ok(mut document) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(true);
+    };
+    Ok(section_data_mut(&mut document).is_err())
+}
+
 /// Run the provider/MCP/root planner and every ownership/decryption check
 /// without creating the migration lock or staging any bytes. This is the
 /// facade's zero-write gate before independently-scoped migrations begin.
@@ -932,7 +1310,7 @@ pub(crate) fn preflight_provider_mcp_credential_migration(
     };
     let mut root_extracted = Vec::new();
     let root = match read_optional_target(&data_dir.join(CONFIG_FILE))? {
-        Some(original) => plan_facade_root_document(original, &mut root_extracted, 1)?,
+        Some(original) => plan_facade_root_document(original, &mut root_extracted, 1, "root")?,
         None => None,
     };
     discard_shadowed_root_secrets(&mut root_extracted, &authority);
@@ -1232,6 +1610,7 @@ fn install_section_split_migration_locked_inner(
                     name.as_str(),
                     MANIFEST_FILE
                         | JOURNAL_FILE
+                        | CLUSTER_ABORT_FILE
                         | SECTION_LAYOUT_COMPLETION_FILE
                         | crate::SECTION_LAYOUT_FILE
                 )
@@ -1314,6 +1693,7 @@ fn install_section_split_migration_locked_inner(
     install_pending(
         data_dir,
         &mut manifest,
+        None,
         #[cfg(test)]
         Some(fault),
     )?;
@@ -1407,6 +1787,11 @@ fn validate_section_split_plan(
 pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> ConfigStoreResult<()> {
     let path = data_dir.as_ref().join(MANIFEST_FILE);
     let Some(bytes) = read_optional_migration_file(&path)? else {
+        if read_optional_migration_file(&data_dir.as_ref().join(CLUSTER_ABORT_FILE))?.is_some() {
+            return Err(ConfigStoreError::Validation(
+                "provider/MCP/broker credential migration is pending".to_string(),
+            ));
+        }
         return Ok(());
     };
     let manifest: MigrationManifest = serde_json::from_slice(&bytes).map_err(|_| {
@@ -1419,8 +1804,16 @@ pub fn ensure_provider_mcp_migration_ready(data_dir: impl AsRef<Path>) -> Config
             "provider/MCP/broker credential migration is pending".to_string(),
         )
     })?;
-    if manifest.state == MigrationState::Pending {
+    let aborting = manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric)
+        && matching_cluster_abort_evidence(data_dir.as_ref(), &manifest)?;
+    if aborting {
+        return Err(ConfigStoreError::Validation(
+            "provider/MCP/broker credential migration is pending".to_string(),
+        ));
+    }
+    if manifest.state != MigrationState::Complete {
         if manifest.migration_scope == Some(MigrationScope::ClusterFabric)
+            && manifest.state == MigrationState::Pending
             && provider_mcp_documents_are_migration_free(data_dir.as_ref())?
             && pending_cluster_refs_are_exclusive(data_dir.as_ref())?
         {
@@ -1449,6 +1842,11 @@ pub(crate) fn recover_pending_config_transaction(
         data_dir
     };
     if read_optional_migration_file(&data_dir.join(MANIFEST_FILE))?.is_none() {
+        if read_optional_migration_file(&data_dir.join(CLUSTER_ABORT_FILE))?.is_some() {
+            return Err(ConfigStoreError::Validation(
+                "cluster abort recovery metadata has no committed manifest".to_string(),
+            ));
+        }
         return Ok(false);
     }
     with_provider_mcp_migration_lock(data_dir, || {
@@ -1528,9 +1926,10 @@ fn persist_proxy_auth_credential_transaction(
     persist_proxy_auth_credential_transaction_at_revision(data_dir, config, expected_revision)
 }
 
-/// Persist proxy authentication with an explicit credential-store revision
-/// precondition. The returned revision is the durable credential revision
-/// committed by the exact transaction.
+/// Persist proxy authentication with an explicit revision precondition. In the
+/// modular layout the core section is the public CAS authority and the returned
+/// revision is its exact committed revision. The legacy layout retains the
+/// credential-document revision contract for bounded compatibility.
 pub fn persist_proxy_auth_credential_transaction_at_revision(
     data_dir: impl AsRef<Path>,
     config: &mut crate::Config,
@@ -1567,8 +1966,9 @@ pub fn persist_proxy_auth_credential_transaction_at_revision(
     )
 }
 
-/// Persist secret env values and their root metadata as one recoverable exact
-/// transaction guarded by the credential document revision.
+/// Persist secret env values and their metadata as one recoverable exact
+/// transaction. In the modular layout the env section is the sole public CAS
+/// authority; the credential revision remains an internal transaction member.
 pub fn persist_env_var_credential_transaction_at_revision(
     data_dir: impl AsRef<Path>,
     config: &mut crate::Config,
@@ -1697,6 +2097,8 @@ pub fn persist_connect_credential_transaction_at_revision(
         None,
         None,
         None,
+        None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1735,9 +2137,792 @@ pub fn persist_access_control_credential_transaction_at_revision(
         None,
         None,
         None,
+        None,
+        None,
         #[cfg(test)]
         None,
     )
+}
+
+/// Result of a cluster-fabric compound commit whose process-local facade
+/// adoption was attempted before the cross-process transaction lock was
+/// released.
+pub struct ClusterFabricTransactionCommit {
+    pub revision: u64,
+    pub adoption: Option<ConfigStoreResult<crate::ConfigSectionEvent>>,
+    pub credential_adoption: Option<ConfigStoreResult<()>>,
+    /// A durable manifest crossed the commit point, but completing/recovering
+    /// its members failed. Callers must publish the captured secret-free
+    /// candidate and classify this as committed, never as a pre-commit error.
+    pub committed_recovery: ConfigStoreResult<()>,
+    /// Exact runtime and public credential metadata captured from one
+    /// immutable credential document before the transaction lock admitted
+    /// another writer. Present for changed and semantic no-op transactions.
+    pub runtime: ConfigStoreResult<ClusterFabricRuntimeSnapshot>,
+}
+
+pub struct ClusterFabricRuntimeSnapshot {
+    pub cluster_fabric: crate::ClusterFabricConfig,
+    pub credential_statuses: Vec<crate::CredentialStatus>,
+    pub credential_health: crate::CredentialStoreHealth,
+}
+
+/// Secret-free metadata returned after installing an exact owned-section
+/// runtime snapshot. The secret-bearing runtime and credential document LKG
+/// remain opaque and have no `Debug` or serialization implementation.
+pub struct CredentialSectionRuntimeMetadata {
+    pub credential_statuses: Vec<crate::CredentialStatus>,
+    pub credential_health: crate::CredentialStoreHealth,
+}
+
+impl CredentialSectionRuntimeMetadata {
+    pub fn status(&self, reference: &crate::CredentialRef) -> crate::CredentialStatus {
+        self.credential_statuses
+            .iter()
+            .find(|status| &status.credential_ref == reference)
+            .cloned()
+            .unwrap_or_else(|| crate::CredentialStatus {
+                credential_ref: reference.clone(),
+                configured: false,
+                source: crate::CredentialSource::User,
+                updated_at: None,
+            })
+    }
+}
+
+/// One coherent durable generation of a non-cluster credential-backed
+/// section and the credential document observed under the same migration
+/// lock.
+///
+/// With an expected revision this contains a hydrated, mutation-safe runtime
+/// section and requires healthy primary authorities. Without one it contains
+/// the secret-free durable projection, including degraded last-known-good
+/// metadata suitable for GET/status responses.
+pub struct ExactCredentialSectionReadSnapshot {
+    pub section: crate::SectionEnvelope<Value>,
+    pub credential_statuses: Vec<crate::CredentialStatus>,
+    pub credential_health: crate::CredentialStoreHealth,
+    section_id: crate::SectionId,
+    runtime: crate::Config,
+}
+
+impl ExactCredentialSectionReadSnapshot {
+    /// Install only this snapshot's owned section into an existing runtime.
+    /// Unrelated process-local sections are preserved.
+    pub fn install_into(self, target: &mut crate::Config) -> CredentialSectionRuntimeMetadata {
+        crate::section_facade::apply_runtime_section(self.section_id, &self.runtime, target);
+        CredentialSectionRuntimeMetadata {
+            credential_statuses: self.credential_statuses,
+            credential_health: self.credential_health,
+        }
+    }
+}
+
+/// Exact runtime projection for one non-cluster credential-backed section.
+///
+/// Callers can install only the owned section into an existing process
+/// [`crate::Config`]; unrelated sections cannot be observed or replaced from
+/// this value.
+pub struct CredentialSectionRuntimeSnapshot {
+    section: crate::SectionId,
+    runtime: crate::Config,
+    credential_statuses: Vec<crate::CredentialStatus>,
+    credential_health: crate::CredentialStoreHealth,
+}
+
+impl CredentialSectionRuntimeSnapshot {
+    pub fn install_into(self, target: &mut crate::Config) -> CredentialSectionRuntimeMetadata {
+        crate::section_facade::apply_runtime_section(self.section, &self.runtime, target);
+        CredentialSectionRuntimeMetadata {
+            credential_statuses: self.credential_statuses,
+            credential_health: self.credential_health,
+        }
+    }
+}
+
+/// Result of a non-cluster exact credential transaction whose owned section
+/// was adopted while the shared migration lock still excluded later writers.
+pub struct CredentialSectionTransactionCommit {
+    pub revision: u64,
+    pub section_adoption: Option<ConfigStoreResult<crate::ConfigSectionEvent>>,
+    pub credential_adoption: Option<ConfigStoreResult<Option<crate::ConfigSectionEvent>>>,
+    pub section: ConfigStoreResult<crate::SectionEnvelope<Value>>,
+    pub runtime: ConfigStoreResult<CredentialSectionRuntimeSnapshot>,
+}
+
+struct ExactSectionRuntimeSnapshot {
+    runtime: CredentialSectionRuntimeSnapshot,
+    credential_lkg: crate::credential_store::CredentialDocumentLkg,
+}
+
+/// Recover readiness and read one durable credential-backed section together
+/// with one immutable credential generation while the shared migration lock
+/// excludes compound writers.
+///
+/// Revision-bound reads are mutation preflights: the section itself is the
+/// CAS authority and both primary documents must be healthy. Unbound reads
+/// are secret-free response snapshots and may report degraded LKG health.
+pub fn read_exact_credential_section_snapshot(
+    data_dir: impl AsRef<Path>,
+    section: crate::SectionId,
+    expected_revision: Option<u64>,
+) -> ConfigStoreResult<ExactCredentialSectionReadSnapshot> {
+    let data_dir = data_dir.as_ref();
+    let scope = non_cluster_credential_scope(section)?;
+    with_migration_lock(data_dir, || {
+        recover_committed(
+            data_dir,
+            #[cfg(test)]
+            None,
+        )?;
+        ensure_provider_mcp_migration_ready(data_dir)?;
+
+        let (config, mut envelope) = if expected_revision.is_some() {
+            crate::section_facade::load_durable_effective_section_under_migration_lock(
+                data_dir, section,
+            )?
+        } else {
+            crate::section_facade::load_durable_effective_section_snapshot_under_migration_lock(
+                data_dir, section,
+            )?
+        };
+        if let Some(expected) = expected_revision {
+            if expected != envelope.revision {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: envelope.revision,
+                });
+            }
+        }
+
+        let store = CredentialStore::open(data_dir);
+        let (runtime, credential_statuses, credential_health) = if expected_revision.is_some() {
+            let exact =
+                materialize_section_runtime_under_migration_lock(config, scope, &store, false)?;
+            if exact.runtime.credential_health.status == crate::SectionStatus::Degraded {
+                return Err(ConfigStoreError::Validation(format!(
+                    "revision-bound {} mutations require a healthy primary credential section",
+                    section.descriptor().name
+                )));
+            }
+            let credential_statuses = exact.runtime.credential_statuses.clone();
+            let credential_health = exact.runtime.credential_health.clone();
+            (
+                exact.runtime.runtime,
+                credential_statuses,
+                credential_health,
+            )
+        } else {
+            let (credential_lkg, _, credential_health) = store.snapshot_with_health_unchecked()?;
+            let active_refs = credential_refs_for_scope(&config, scope);
+            let credential_statuses = credential_lkg
+                .statuses_with_validation(&active_refs, |_, value| {
+                    credential_value_is_valid_for_scope(scope, value)
+                });
+            (config, credential_statuses, credential_health)
+        };
+        if section == crate::SectionId::AccessControl
+            && runtime.access_control.as_ref().is_some_and(|access| {
+                let password_invalid = access.password_enabled
+                    && (!access.password_configured
+                        || access
+                            .password_credential_ref
+                            .as_ref()
+                            .is_none_or(|reference| {
+                                !credential_statuses.iter().any(|status| {
+                                    &status.credential_ref == reference && status.configured
+                                })
+                            }));
+                let device_invalid = access.devices.iter().any(|device| {
+                    !device.token_configured
+                        || device
+                            .token_credential_ref
+                            .as_ref()
+                            .is_none_or(|reference| {
+                                !credential_statuses.iter().any(|status| {
+                                    &status.credential_ref == reference && status.configured
+                                })
+                            })
+                });
+                access.repair_required
+                    || password_invalid
+                    || device_invalid
+                    || credential_health.status == crate::SectionStatus::Degraded
+            })
+        {
+            envelope.status = crate::SectionStatus::Degraded;
+            envelope.last_error = Some("access-control credential repair is required".to_string());
+        }
+
+        Ok(ExactCredentialSectionReadSnapshot {
+            section: envelope,
+            credential_statuses,
+            credential_health,
+            section_id: section,
+            runtime,
+        })
+    })
+}
+
+type SectionPostCommit<'a> = &'a mut dyn FnMut(
+    ExactTransactionScope,
+    u64,
+    u64,
+    bool,
+    Option<&crate::Config>,
+    ConfigStoreResult<ExactSectionRuntimeSnapshot>,
+);
+
+fn materialize_section_runtime_under_migration_lock(
+    mut runtime: crate::Config,
+    scope: ExactTransactionScope,
+    store: &CredentialStore,
+    reject_invalid_active: bool,
+) -> ConfigStoreResult<ExactSectionRuntimeSnapshot> {
+    let (credential_lkg, _, credential_health) = store.snapshot_with_health_unchecked()?;
+    let (active_refs, credential_statuses) =
+        semantic_credential_statuses_for_scope(&runtime, scope, &credential_lkg);
+    let active_values_valid =
+        ensure_active_credential_statuses(&active_refs, &credential_statuses).is_ok();
+    if reject_invalid_active {
+        ensure_active_credential_statuses(&active_refs, &credential_statuses)?;
+    }
+    // A mutation base must remain repairable. If an active value decrypts but
+    // fails its domain semantics, retain only the secret-free durable
+    // metadata. Explicit replace/clear can repair it; keep/metadata is rejected
+    // against the prepared credential candidate before staging.
+    if active_values_valid {
+        match scope {
+            ExactTransactionScope::Providers => {
+                runtime.hydrate_provider_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::Mcp => {
+                runtime.hydrate_mcp_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::ProxyAuth => {
+                runtime.hydrate_proxy_auth_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::EnvVars => {
+                runtime.hydrate_env_var_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::Notifications => {
+                runtime.hydrate_notification_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::Connect => {
+                runtime.hydrate_connect_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::AccessControl => {
+                runtime.hydrate_access_control_credentials_from_snapshot(&credential_lkg)?;
+            }
+            ExactTransactionScope::ClusterFabric => {
+                return Err(ConfigStoreError::Validation(
+                    "cluster runtime uses its dedicated transaction snapshot".to_string(),
+                ));
+            }
+        }
+    }
+    runtime.apply_runtime_env_overrides();
+    Ok(ExactSectionRuntimeSnapshot {
+        runtime: CredentialSectionRuntimeSnapshot {
+            section: scope.section_id(),
+            runtime,
+            credential_statuses,
+            credential_health,
+        },
+        credential_lkg,
+    })
+}
+
+fn capture_section_post_commit(
+    data_dir: &Path,
+    scope: ExactTransactionScope,
+    request_expected_revision: u64,
+    staged_committed_revision: u64,
+    changed: bool,
+    store: &CredentialStore,
+    callback: &mut SectionPostCommit<'_>,
+) -> u64 {
+    match crate::section_facade::load_durable_effective_section_under_migration_lock(
+        data_dir,
+        scope.section_id(),
+    ) {
+        Ok((candidate, envelope)) => {
+            let actual_revision = envelope.revision;
+            let adoption_expected_revision = if changed {
+                actual_revision.saturating_sub(1)
+            } else {
+                request_expected_revision
+            };
+            let runtime = if changed && actual_revision < staged_committed_revision {
+                Err(ConfigStoreError::Validation(format!(
+                    "committed {} section revision {actual_revision} precedes staged revision \
+                     {staged_committed_revision}",
+                    scope.section_id().descriptor().name
+                )))
+            } else {
+                materialize_section_runtime_under_migration_lock(
+                    candidate.clone(),
+                    scope,
+                    store,
+                    true,
+                )
+            };
+            callback(
+                scope,
+                adoption_expected_revision,
+                actual_revision,
+                changed,
+                Some(&candidate),
+                runtime,
+            );
+            actual_revision
+        }
+        Err(error) => {
+            callback(
+                scope,
+                request_expected_revision,
+                staged_committed_revision,
+                changed,
+                None,
+                Err(error),
+            );
+            staged_committed_revision
+        }
+    }
+}
+
+fn persist_section_transaction_with_adoption<F>(
+    facade: &crate::ConfigFacade,
+    operation: F,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit>
+where
+    F: FnOnce(SectionPostCommit<'_>) -> ConfigStoreResult<u64>,
+{
+    let mut section_adoption = None;
+    let mut exact_section = None;
+    let mut exact_runtime = None;
+    let mut callback =
+        |scope: ExactTransactionScope,
+         expected_revision: u64,
+         committed_revision: u64,
+         changed: bool,
+         candidate: Option<&crate::Config>,
+         runtime: ConfigStoreResult<ExactSectionRuntimeSnapshot>| {
+            // Do not advance the process facade unless the exact runtime can
+            // also be installed. Otherwise the watcher would observe the
+            // already-adopted revision as unchanged and could never converge
+            // the live AppState after this post-commit failure.
+            if runtime.is_ok() {
+                section_adoption = if changed {
+                    Some(match candidate {
+                        Some(candidate) => facade.adopt_committed_section(
+                            scope.section_id(),
+                            expected_revision,
+                            committed_revision,
+                            candidate,
+                        ),
+                        None => Err(ConfigStoreError::Validation(
+                            "committed section candidate is unavailable for process adoption"
+                                .to_string(),
+                        )),
+                    })
+                } else {
+                    facade
+                        .catch_up_committed_section(scope.section_id())
+                        .map(Ok)
+                };
+                exact_section = Some(
+                    if section_adoption
+                        .as_ref()
+                        .is_none_or(|adoption| adoption.is_ok())
+                    {
+                        facade.registry().envelope_value(scope.section_id())
+                    } else {
+                        Err(ConfigStoreError::Validation(
+                            "committed section could not be adopted for exact response capture"
+                                .to_string(),
+                        ))
+                    },
+                );
+            }
+            exact_runtime = Some(runtime);
+        };
+    let revision = operation(&mut callback)?;
+    let exact_runtime = exact_runtime.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "exact section transaction omitted runtime materialization".to_string(),
+        ))
+    });
+    let section = exact_section.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "exact section transaction omitted its committed envelope".to_string(),
+        ))
+    });
+    let (runtime, credential_adoption) = match exact_runtime {
+        Ok(exact) => {
+            let statuses = exact.runtime.credential_statuses.clone();
+            let health = exact.runtime.credential_health.clone();
+            let adoption = Some(facade.adopt_captured_credentials_with_event(
+                exact.credential_lkg,
+                statuses,
+                health,
+            ));
+            (Ok(exact.runtime), adoption)
+        }
+        Err(error) => (Err(error), None),
+    };
+    Ok(CredentialSectionTransactionCommit {
+        revision,
+        section_adoption,
+        credential_adoption,
+        section,
+        runtime,
+    })
+}
+
+struct ExactClusterRuntimeSnapshot {
+    runtime: ClusterFabricRuntimeSnapshot,
+    credential_lkg: crate::credential_store::CredentialDocumentLkg,
+}
+
+type ClusterPostCommit<'a> = &'a mut dyn FnMut(
+    u64,
+    bool,
+    &crate::ClusterFabricConfig,
+    ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+    ConfigStoreResult<()>,
+);
+
+fn materialize_cluster_runtime_under_migration_lock(
+    config: &crate::Config,
+    store: &CredentialStore,
+) -> ConfigStoreResult<ExactClusterRuntimeSnapshot> {
+    let (credential_lkg, credential_statuses, credential_health) =
+        store.snapshot_with_health_unchecked()?;
+    let mut runtime = config.clone();
+    runtime.hydrate_cluster_credentials_from_snapshot(&credential_lkg)?;
+    Ok(ExactClusterRuntimeSnapshot {
+        runtime: ClusterFabricRuntimeSnapshot {
+            cluster_fabric: runtime.cluster_fabric.clone(),
+            credential_statuses,
+            credential_health,
+        },
+        credential_lkg,
+    })
+}
+
+fn cluster_candidate_from_section_bytes(
+    bytes: &[u8],
+) -> ConfigStoreResult<(u64, crate::ClusterFabricConfig)> {
+    let (_, revision, data) = parse_exact_section_document(CLUSTER_FABRIC_FILE, bytes)?;
+    let section: crate::ClusterFabricSection = serde_json::from_value(data)?;
+    Ok((revision, section.0))
+}
+
+fn load_durable_cluster_candidate_under_migration_lock(
+    data_dir: &Path,
+) -> ConfigStoreResult<(u64, crate::ClusterFabricConfig)> {
+    let bytes = read_file_reject_symlink(&data_dir.join(CLUSTER_FABRIC_FILE))?;
+    cluster_candidate_from_section_bytes(&bytes)
+}
+
+enum LiveClusterTransaction {
+    NotCommitted,
+    Aborting,
+    Committed(MigrationManifest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterInstallOutcome {
+    CommitIntent,
+    AbortAttempt,
+    Aborting,
+}
+
+struct ClusterInstallTracker(Cell<ClusterInstallOutcome>);
+
+impl ClusterInstallTracker {
+    fn new() -> Self {
+        Self(Cell::new(ClusterInstallOutcome::CommitIntent))
+    }
+
+    fn mark_abort_attempt(&self) {
+        self.0.set(ClusterInstallOutcome::AbortAttempt);
+    }
+
+    fn mark_aborting(&self) {
+        self.0.set(ClusterInstallOutcome::Aborting);
+    }
+
+    fn outcome(&self) -> ClusterInstallOutcome {
+        self.0.get()
+    }
+}
+
+/// Classify the still-live manifest for this exact cluster transaction.
+///
+/// `Aborting` is a durable non-commit outcome written before rollback starts.
+/// It can therefore never enter committed-candidate adoption, even if rollback
+/// or cleanup repeatedly fails. A Complete manifest is different: only an
+/// authority that still equals its candidate proves the transaction committed;
+/// Complete plus a missing/nonmatching authority is an intentional abort tail.
+fn load_live_cluster_transaction_manifest(
+    data_dir: &Path,
+    expected: &MigrationManifest,
+) -> ConfigStoreResult<LiveClusterTransaction> {
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(MANIFEST_FILE))? else {
+        return Ok(LiveClusterTransaction::NotCommitted);
+    };
+    let manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&manifest)?;
+    if manifest.transaction_id != expected.transaction_id
+        || manifest.stage_dir != expected.stage_dir
+        || manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster transaction manifest no longer matches its commit".to_string(),
+        ));
+    }
+    if matching_cluster_abort_evidence(data_dir, &manifest)? {
+        return Ok(LiveClusterTransaction::Aborting);
+    }
+    if manifest.state == MigrationState::Aborting {
+        return Ok(LiveClusterTransaction::Aborting);
+    }
+    if manifest.state == MigrationState::Complete {
+        let authority = manifest
+            .files
+            .iter()
+            .find(|file| file.name == CLUSTER_FABRIC_FILE)
+            .ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "cluster transaction authority is missing from its manifest".to_string(),
+                )
+            })?;
+        let current = read_target_or_empty(&data_dir.join(CLUSTER_FABRIC_FILE))?;
+        if sha256(&current) != authority.sha256 {
+            return Ok(LiveClusterTransaction::NotCommitted);
+        }
+    }
+    Ok(LiveClusterTransaction::Committed(manifest))
+}
+
+fn load_installed_cluster_candidate_for_manifest(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<Option<(u64, crate::ClusterFabricConfig)>> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric) {
+        return Ok(None);
+    }
+    let authority_name = exact_authority_file(manifest).ok_or_else(|| {
+        ConfigStoreError::Validation(
+            "cluster transaction authority is missing from its manifest".to_string(),
+        )
+    })?;
+    let authority = manifest
+        .files
+        .iter()
+        .find(|file| file.name == authority_name)
+        .ok_or_else(|| {
+            ConfigStoreError::Validation(
+                "cluster transaction authority is missing from its manifest".to_string(),
+            )
+        })?;
+    let current = read_target_or_empty(&data_dir.join(authority_name))?;
+    if sha256(&current) != authority.sha256 {
+        return Ok(None);
+    }
+    load_durable_cluster_candidate_under_migration_lock(data_dir).map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_cluster_committed_recovery_failure(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    local_manifest: &MigrationManifest,
+    live_manifest: Option<&MigrationManifest>,
+    installed_candidate: Option<&(u64, crate::ClusterFabricConfig)>,
+    initial_error: &ConfigStoreError,
+    recovery_error: &ConfigStoreError,
+    cluster_post_commit: &mut Option<ClusterPostCommit<'_>>,
+) -> Option<u64> {
+    let actual = installed_candidate
+        .cloned()
+        .or_else(|| {
+            live_manifest.and_then(|manifest| {
+                load_installed_cluster_candidate_for_manifest(data_dir, manifest)
+                    .ok()
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            load_installed_cluster_candidate_for_manifest(data_dir, local_manifest)
+                .ok()
+                .flatten()
+        })?;
+    let (revision, candidate) = actual;
+    config.cluster_fabric = candidate;
+    let message = format!(
+        "cluster transaction committed at revision {revision}, completion failed \
+         ({initial_error}), and recovery failed ({recovery_error})"
+    );
+    if let Some(callback) = cluster_post_commit.as_mut() {
+        callback(
+            revision,
+            true,
+            &config.cluster_fabric,
+            Err(ConfigStoreError::Validation(message.clone())),
+            Err(ConfigStoreError::Validation(message)),
+        );
+    }
+    Some(revision)
+}
+
+fn cluster_commit_indeterminate_error(
+    initial_error: &ConfigStoreError,
+    terminal_error: &ConfigStoreError,
+) -> ConfigStoreError {
+    ConfigStoreError::CommitIndeterminate(format!(
+        "cluster transaction has durable commit intent, but installed authority could not be \
+         proven; completion failed ({initial_error}), and recovery/inspection failed \
+         ({terminal_error})"
+    ))
+}
+
+/// One coherent durable cluster generation captured under the shared
+/// migration lock. The runtime fabric may contain hydrated SSH credentials,
+/// so this type deliberately does not implement `Debug` or `Serialize`.
+pub struct ExactClusterFabricReadSnapshot {
+    pub cluster_fabric: crate::ClusterFabricConfig,
+    pub section: crate::SectionEnvelope<Value>,
+    pub credential_statuses: Vec<crate::CredentialStatus>,
+    pub credential_health: crate::CredentialStoreHealth,
+}
+
+/// Recover readiness and read the durable cluster section plus one immutable
+/// credential generation while one migration lock excludes compound writers.
+///
+/// When `expected_revision` is present, the durable section itself is the CAS
+/// authority. A stale process facade therefore cannot authorize preflight or
+/// another external lifecycle action.
+pub fn read_exact_cluster_fabric_snapshot(
+    data_dir: impl AsRef<Path>,
+    expected_revision: Option<u64>,
+) -> ConfigStoreResult<ExactClusterFabricReadSnapshot> {
+    let data_dir = data_dir.as_ref();
+    with_migration_lock(data_dir, || {
+        recover_committed(
+            data_dir,
+            #[cfg(test)]
+            None,
+        )?;
+        ensure_provider_mcp_migration_ready(data_dir)?;
+
+        let primary_path = data_dir.join(CLUSTER_FABRIC_FILE);
+        let store = crate::AtomicJsonStore::<crate::ClusterFabricSection>::new(
+            &primary_path,
+            crate::section_facade::SECTION_SCHEMA_VERSION,
+        )
+        .with_raw_validator(crate::section_facade::validate_ordinary_section_raw);
+        let stored = store
+            .load_validated(crate::section_facade::validate_cluster_fabric)?
+            .ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "cluster section revision envelope is missing".to_string(),
+                )
+            })?;
+        let revision = stored.revision;
+        if let Some(expected) = expected_revision {
+            if stored.recovered_from_backup {
+                return Err(ConfigStoreError::Validation(
+                    "revision-bound cluster actions require a healthy primary section".to_string(),
+                ));
+            }
+            if expected != revision {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: revision,
+                });
+            }
+        }
+        let source_kind = if stored.recovered_from_backup {
+            crate::SectionSourceKind::Backup
+        } else {
+            crate::SectionSourceKind::File
+        };
+        let status = if stored.recovered_from_backup {
+            crate::SectionStatus::Degraded
+        } else {
+            crate::SectionStatus::Healthy
+        };
+        let last_error = stored
+            .recovered_from_backup
+            .then(|| "primary document invalid; using last-known-good backup".to_string());
+        let data = serde_json::to_value(&stored.data)?;
+
+        let credential_store = CredentialStore::open(data_dir);
+        let (credential_lkg, mut credential_statuses, credential_health) =
+            match credential_store.snapshot_with_health_unchecked() {
+                Ok((lkg, statuses, health)) => (Some(lkg), statuses, health),
+                Err(error) if expected_revision.is_some() => return Err(error),
+                Err(_) => (
+                    None,
+                    Vec::new(),
+                    crate::CredentialStoreHealth {
+                        revision: 0,
+                        status: crate::SectionStatus::Degraded,
+                        source: crate::SectionSourceKind::Default,
+                        last_error: Some("credential status is unavailable".to_string()),
+                    },
+                ),
+            };
+        if expected_revision.is_none() {
+            if let Some(credential_lkg) = credential_lkg.as_ref() {
+                let active_refs = stored
+                    .data
+                    .0
+                    .credential_refs
+                    .values()
+                    .flat_map(|metadata| metadata.references().cloned())
+                    .collect::<BTreeSet<_>>();
+                credential_statuses = credential_lkg.statuses_with_crypto_validation(&active_refs);
+            }
+        }
+        let credential_degraded = credential_health.status == crate::SectionStatus::Degraded;
+        if expected_revision.is_some() && credential_degraded {
+            return Err(ConfigStoreError::Validation(
+                "revision-bound cluster actions require a healthy primary credential section"
+                    .to_string(),
+            ));
+        }
+        let mut config = crate::Config::default();
+        config.cluster_fabric = stored.data.0;
+        // GET needs only secret-free metadata and statuses, so it never
+        // materializes plaintext. Revision-bound actions hydrate only after
+        // both primary authorities have passed the coherence checks above.
+        if expected_revision.is_some() && !stored.recovered_from_backup && !credential_degraded {
+            config.hydrate_cluster_credentials_from_snapshot(
+                credential_lkg
+                    .as_ref()
+                    .expect("revision-bound credential snapshot checked above"),
+            )?;
+        }
+
+        Ok(ExactClusterFabricReadSnapshot {
+            cluster_fabric: config.cluster_fabric.clone(),
+            section: crate::SectionEnvelope {
+                data,
+                revision,
+                loaded_at: chrono::Utc::now(),
+                source_path: stored.source_path,
+                source_kind,
+                status,
+                last_error,
+            },
+            credential_statuses,
+            credential_health,
+        })
+    })
 }
 
 /// Persist node metadata and every explicitly touched SSH credential through
@@ -1746,11 +2931,112 @@ pub fn persist_access_control_credential_transaction_at_revision(
 pub fn persist_cluster_fabric_credential_transaction_at_revision(
     data_dir: impl AsRef<Path>,
     config: &mut crate::Config,
-    node_intents: &BTreeSet<String>,
+    node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
     expected_revision: u64,
 ) -> ConfigStoreResult<u64> {
-    persist_exact_credential_transaction_inner(
+    persist_cluster_fabric_credential_transaction_inner(
         data_dir.as_ref(),
+        config,
+        node_intents,
+        expected_revision,
+        None,
+        None,
+    )
+}
+
+/// Persist a cluster-fabric compound transaction and adopt its exact immutable
+/// candidate into the supplied process facade while the migration lock still
+/// excludes later cross-process commits. An adoption failure is returned as a
+/// post-commit outcome rather than being confused with a failed durable CAS.
+pub fn persist_cluster_fabric_credential_transaction_with_adoption<F>(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+    mut before_adoption: F,
+) -> ConfigStoreResult<ClusterFabricTransactionCommit>
+where
+    F: FnMut(u64, &crate::ClusterFabricConfig),
+{
+    let mut adoption = None;
+    let mut exact_runtime = None;
+    let mut committed_recovery = None;
+    let mut callback = |revision: u64,
+                        changed: bool,
+                        candidate: &crate::ClusterFabricConfig,
+                        runtime: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                        recovery: ConfigStoreResult<()>| {
+        let runtime_ready = runtime.is_ok();
+        exact_runtime = Some(runtime);
+        committed_recovery = Some(recovery);
+        if revision == expected_revision {
+            if runtime_ready {
+                adoption = facade
+                    .catch_up_committed_section(crate::SectionId::ClusterFabric)
+                    .map(Ok);
+            }
+        } else if changed {
+            before_adoption(revision, candidate);
+            adoption = Some(facade.adopt_committed_cluster_fabric(
+                expected_revision,
+                revision,
+                candidate.clone(),
+            ));
+        }
+    };
+    let revision = persist_cluster_fabric_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        node_intents,
+        expected_revision,
+        Some(&mut callback),
+        None,
+    )?;
+    let (runtime, credential_adoption) = match exact_runtime.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "cluster transaction omitted exact runtime materialization".to_string(),
+        ))
+    }) {
+        Ok(exact) => {
+            let runtime = exact.runtime;
+            let credential_adoption = Some(facade.adopt_captured_cluster_credentials(
+                exact.credential_lkg,
+                runtime.credential_statuses.clone(),
+                runtime.credential_health.clone(),
+            ));
+            (Ok(runtime), credential_adoption)
+        }
+        Err(error) => (Err(error), None),
+    };
+    Ok(ClusterFabricTransactionCommit {
+        revision,
+        adoption,
+        credential_adoption,
+        committed_recovery: committed_recovery.unwrap_or_else(|| {
+            Err(ConfigStoreError::Validation(
+                "cluster transaction omitted its committed recovery outcome".to_string(),
+            ))
+        }),
+        runtime,
+    })
+}
+
+fn persist_cluster_fabric_credential_transaction_inner(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
+    expected_revision: u64,
+    cluster_post_commit: Option<ClusterPostCommit<'_>>,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<u64> {
+    if !crate::section_layout_is_active(data_dir)? {
+        return Err(ConfigStoreError::Validation(
+            "cluster credential updates require the modular configuration layout".to_string(),
+        ));
+    }
+    persist_exact_credential_transaction_inner(
+        data_dir,
         config,
         &BTreeSet::new(),
         &BTreeSet::new(),
@@ -1767,8 +3053,10 @@ pub fn persist_cluster_fabric_credential_transaction_at_revision(
         None,
         None,
         None,
-        #[cfg(test)]
         None,
+        cluster_post_commit,
+        #[cfg(test)]
+        fault,
     )
 }
 
@@ -1903,6 +3191,8 @@ pub fn persist_mcp_reset_credential_transaction_at_revision(
         None,
         Some((&intents, expected_revision)),
         None,
+        None,
+        None,
         #[cfg(test)]
         None,
     )
@@ -1956,6 +3246,8 @@ fn persist_mcp_credential_transaction_inner(
         None,
         Some((intents, expected_revision)),
         None,
+        None,
+        None,
         #[cfg(test)]
         fault,
     )
@@ -2002,9 +3294,461 @@ pub fn persist_credential_backed_section_reset_at_revision(
         None,
         None,
         Some((scope, expected_revision)),
+        None,
+        None,
         #[cfg(test)]
         None,
     )
+}
+
+fn require_modular_exact_adoption(data_dir: &Path) -> ConfigStoreResult<()> {
+    if crate::section_layout_is_active(data_dir)? {
+        Ok(())
+    } else {
+        Err(ConfigStoreError::Validation(
+            "exact process adoption requires the modular configuration layout".to_string(),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_provider_family_with_adoption(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    proxy_expected_revision: Option<u64>,
+    env_intents: &BTreeSet<String>,
+    env_expected_revision: Option<u64>,
+    notification_transaction: bool,
+    notification_intents: &BTreeSet<String>,
+    notification_reset: bool,
+    notification_expected_revision: Option<u64>,
+    provider_expected_revision: Option<u64>,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    require_modular_exact_adoption(data_dir)?;
+    persist_section_transaction_with_adoption(facade, |post_commit| {
+        persist_exact_credential_transaction_inner(
+            data_dir,
+            config,
+            provider_intents,
+            provider_instance_intents,
+            proxy_expected_revision,
+            env_intents,
+            env_expected_revision,
+            notification_transaction,
+            notification_intents,
+            notification_reset,
+            notification_expected_revision,
+            None,
+            None,
+            None,
+            provider_expected_revision,
+            None,
+            None,
+            Some(post_commit),
+            None,
+            #[cfg(test)]
+            None,
+        )
+    })
+}
+
+pub fn persist_provider_instance_credential_transaction_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    if provider_intents.contains("__proxy_auth") {
+        return Err(ConfigStoreError::Validation(
+            "proxy auth requires the dedicated revisioned credential transaction".to_string(),
+        ));
+    }
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        facade,
+    )
+}
+
+pub fn persist_provider_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        provider_intents,
+        provider_instance_intents,
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        Some(expected_revision),
+        facade,
+    )
+}
+
+pub fn persist_provider_reset_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    provider_intents: &BTreeSet<String>,
+    provider_instance_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_credential_transaction_at_revision_with_adoption(
+        data_dir,
+        config,
+        provider_intents,
+        provider_instance_intents,
+        expected_revision,
+        facade,
+    )
+}
+
+pub fn persist_proxy_auth_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::from(["__proxy_auth".to_string()]),
+        &BTreeSet::new(),
+        Some(expected_revision),
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        facade,
+    )
+}
+
+pub fn persist_env_var_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    env_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        env_intents,
+        Some(expected_revision),
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        facade,
+    )
+}
+
+pub fn persist_notification_credential_transaction_at_revision_with_reset_and_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    secret_intents: &BTreeSet<String>,
+    reset_domain: bool,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_provider_family_with_adoption(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        true,
+        secret_intents,
+        reset_domain,
+        Some(expected_revision),
+        None,
+        facade,
+    )
+}
+
+enum ScopedSectionMutation<'a> {
+    Mcp(&'a BTreeSet<CredentialRef>),
+    Connect(&'a crate::patch::ConnectSecretIntents),
+    AccessControl {
+        password: bool,
+        devices: &'a BTreeSet<String>,
+    },
+    Reset,
+}
+
+fn persist_scoped_section_with_adoption(
+    data_dir: &Path,
+    config: &mut crate::Config,
+    scope: ExactTransactionScope,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+    mutation: ScopedSectionMutation<'_>,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    require_modular_exact_adoption(data_dir)?;
+    let (connect_transaction, access_transaction, mcp_transaction, reset) = match mutation {
+        ScopedSectionMutation::Mcp(intents) => (None, None, Some(intents), false),
+        ScopedSectionMutation::Connect(intents) => (Some(intents), None, None, false),
+        ScopedSectionMutation::AccessControl { password, devices } => {
+            (None, Some((password, devices)), None, false)
+        }
+        ScopedSectionMutation::Reset => (None, None, None, true),
+    };
+    persist_section_transaction_with_adoption(facade, |post_commit| {
+        persist_exact_credential_transaction_inner(
+            data_dir,
+            config,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            &BTreeSet::new(),
+            None,
+            false,
+            &BTreeSet::new(),
+            false,
+            None,
+            None,
+            connect_transaction.map(|intents| (intents, expected_revision)),
+            access_transaction
+                .as_ref()
+                .map(|(password, devices)| (*password, *devices, expected_revision)),
+            None,
+            mcp_transaction.map(|intents| (intents, expected_revision)),
+            reset.then_some((scope, expected_revision)),
+            Some(post_commit),
+            None,
+            #[cfg(test)]
+            None,
+        )
+    })
+}
+
+pub fn persist_mcp_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    intents: &BTreeSet<CredentialRef>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::Mcp,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Mcp(intents),
+    )
+}
+
+pub fn persist_mcp_reset_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    let intents = BTreeSet::new();
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::Mcp,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Mcp(&intents),
+    )
+}
+
+pub fn persist_connect_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    intents: &crate::patch::ConnectSecretIntents,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::Connect,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Connect(intents),
+    )
+}
+
+pub fn persist_access_control_credential_transaction_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    password_intent: bool,
+    device_intents: &BTreeSet<String>,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        ExactTransactionScope::AccessControl,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::AccessControl {
+            password: password_intent,
+            devices: device_intents,
+        },
+    )
+}
+
+pub fn persist_credential_backed_section_reset_at_revision_with_adoption(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    section: crate::SectionId,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+) -> ConfigStoreResult<CredentialSectionTransactionCommit> {
+    let scope = match section {
+        crate::SectionId::Core => ExactTransactionScope::ProxyAuth,
+        crate::SectionId::Notifications => ExactTransactionScope::Notifications,
+        crate::SectionId::Connect => ExactTransactionScope::Connect,
+        crate::SectionId::Env => ExactTransactionScope::EnvVars,
+        crate::SectionId::AccessControl => ExactTransactionScope::AccessControl,
+        _ => {
+            return Err(ConfigStoreError::Validation(
+                "section is not a non-cluster credential-backed reset domain".to_string(),
+            ))
+        }
+    };
+    persist_scoped_section_with_adoption(
+        data_dir.as_ref(),
+        config,
+        scope,
+        expected_revision,
+        facade,
+        ScopedSectionMutation::Reset,
+    )
+}
+
+/// Reset cluster-fabric and adopt its exact committed snapshot into one
+/// process facade before the cross-process transaction lock is released.
+pub fn persist_cluster_fabric_reset_at_revision_with_adoption<F>(
+    data_dir: impl AsRef<Path>,
+    config: &mut crate::Config,
+    expected_revision: u64,
+    facade: &crate::ConfigFacade,
+    mut before_adoption: F,
+) -> ConfigStoreResult<ClusterFabricTransactionCommit>
+where
+    F: FnMut(u64, &crate::ClusterFabricConfig),
+{
+    if !crate::section_layout_is_active(data_dir.as_ref())? {
+        return Err(ConfigStoreError::Validation(
+            "cluster reset requires the modular configuration layout".to_string(),
+        ));
+    }
+    let mut adoption = None;
+    let mut exact_runtime = None;
+    let mut committed_recovery = None;
+    let mut callback = |revision: u64,
+                        changed: bool,
+                        candidate: &crate::ClusterFabricConfig,
+                        runtime: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                        recovery: ConfigStoreResult<()>| {
+        let runtime_ready = runtime.is_ok();
+        exact_runtime = Some(runtime);
+        committed_recovery = Some(recovery);
+        if revision == expected_revision {
+            if runtime_ready {
+                adoption = facade
+                    .catch_up_committed_section(crate::SectionId::ClusterFabric)
+                    .map(Ok);
+            }
+        } else if changed {
+            before_adoption(revision, candidate);
+            adoption = Some(facade.adopt_committed_cluster_fabric(
+                expected_revision,
+                revision,
+                candidate.clone(),
+            ));
+        }
+    };
+    let revision = persist_exact_credential_transaction_inner(
+        data_dir.as_ref(),
+        config,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        None,
+        &BTreeSet::new(),
+        None,
+        false,
+        &BTreeSet::new(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((ExactTransactionScope::ClusterFabric, expected_revision)),
+        None,
+        Some(&mut callback),
+        #[cfg(test)]
+        None,
+    )?;
+    let (runtime, credential_adoption) = match exact_runtime.unwrap_or_else(|| {
+        Err(ConfigStoreError::Validation(
+            "cluster reset omitted exact runtime materialization".to_string(),
+        ))
+    }) {
+        Ok(exact) => {
+            let runtime = exact.runtime;
+            let credential_adoption = Some(facade.adopt_captured_cluster_credentials(
+                exact.credential_lkg,
+                runtime.credential_statuses.clone(),
+                runtime.credential_health.clone(),
+            ));
+            (Ok(runtime), credential_adoption)
+        }
+        Err(error) => (Err(error), None),
+    };
+    Ok(ClusterFabricTransactionCommit {
+        revision,
+        adoption,
+        credential_adoption,
+        committed_recovery: committed_recovery.unwrap_or_else(|| {
+            Err(ConfigStoreError::Validation(
+                "cluster reset omitted its committed recovery outcome".to_string(),
+            ))
+        }),
+        runtime,
+    })
 }
 
 #[cfg(test)]
@@ -2101,6 +3845,8 @@ fn persist_provider_credential_transaction_with_instances_at_revision_inner(
         provider_expected_revision,
         None,
         None,
+        None,
+        None,
         #[cfg(test)]
         fault,
     )
@@ -2119,12 +3865,14 @@ fn persist_exact_credential_transaction_inner(
     notification_intents: &BTreeSet<String>,
     notification_reset: bool,
     notification_expected_revision: Option<u64>,
-    cluster_transaction: Option<(&BTreeSet<String>, u64)>,
+    cluster_transaction: Option<(&BTreeMap<String, crate::ClusterNodeCredentialIntents>, u64)>,
     connect_transaction: Option<(&crate::patch::ConnectSecretIntents, u64)>,
     access_transaction: Option<(bool, &BTreeSet<String>, u64)>,
     provider_expected_revision: Option<u64>,
     mcp_transaction: Option<(&BTreeSet<CredentialRef>, u64)>,
     reset_scope: Option<(ExactTransactionScope, u64)>,
+    mut section_post_commit: Option<SectionPostCommit<'_>>,
+    mut cluster_post_commit: Option<ClusterPostCommit<'_>>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<u64> {
     let reset_is = |scope| reset_scope.is_some_and(|(reset, _)| reset == scope);
@@ -2237,36 +3985,38 @@ fn persist_exact_credential_transaction_inner(
     } else {
         None
     };
-    if let (Some(expected), Some(section), Some(ExactTransactionScope::Providers)) = (
-        provider_expected_revision,
-        active_section.as_ref(),
-        exact_scope,
-    ) {
-        if section.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: section.expected_revision,
-            });
+    let client_section_revision = match exact_scope {
+        Some(ExactTransactionScope::Providers) => provider_expected_revision,
+        Some(ExactTransactionScope::Mcp) => {
+            mcp_transaction.map(|(_, expected_revision)| expected_revision)
         }
-    }
-    if let (Some(expected), Some(section), Some(ExactTransactionScope::Mcp)) = (
-        mcp_transaction.map(|(_, revision)| revision),
-        active_section.as_ref(),
-        exact_scope,
-    ) {
-        if section.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: section.expected_revision,
-            });
+        Some(ExactTransactionScope::ProxyAuth) => proxy_expected_revision,
+        Some(ExactTransactionScope::EnvVars) => env_expected_revision,
+        Some(ExactTransactionScope::Notifications) => notification_expected_revision,
+        Some(ExactTransactionScope::Connect) => {
+            connect_transaction.map(|(_, expected_revision)| expected_revision)
         }
+        Some(ExactTransactionScope::AccessControl) => {
+            access_transaction.map(|(_, _, expected_revision)| expected_revision)
+        }
+        Some(ExactTransactionScope::ClusterFabric) => {
+            cluster_transaction.map(|(_, expected_revision)| expected_revision)
+        }
+        None => None,
     }
-    if let (Some((_, expected)), Some(section)) = (reset_scope, active_section.as_ref()) {
-        if section.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: section.expected_revision,
-            });
+    .or_else(|| reset_scope.map(|(_, expected_revision)| expected_revision));
+    if let Some(section) = active_section.as_ref() {
+        if let Some(expected) = client_section_revision {
+            if section.expected_revision != expected {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: section.expected_revision,
+                });
+            }
+        } else if !matches!(exact_scope, Some(ExactTransactionScope::Providers)) {
+            return Err(ConfigStoreError::Validation(
+                "owned section revision precondition is required".to_string(),
+            ));
         }
     }
 
@@ -2277,6 +4027,19 @@ fn persist_exact_credential_transaction_inner(
         .as_ref()
         .map(|section| section.legacy_root.as_slice())
         .unwrap_or(config_original.as_slice());
+    if access_only
+        && !reset_is(ExactTransactionScope::AccessControl)
+        && access_repair_required_from_document(domain_original)?
+        && !config
+            .access_control
+            .as_ref()
+            .is_some_and(|access| access.repair_required)
+    {
+        return Err(ConfigStoreError::Validation(
+            "access-control repair state is server-owned and requires an explicit reset"
+                .to_string(),
+        ));
+    }
     let persisted_instance_refs = provider_instance_refs_from_document(
         if exact_scope == Some(ExactTransactionScope::Providers) {
             domain_original
@@ -2339,6 +4102,7 @@ fn persist_exact_credential_transaction_inner(
             ExactTransactionScope::AccessControl => {
                 references.extend(persisted_access_refs.password.iter().cloned());
                 references.extend(persisted_access_refs.devices.values().cloned());
+                references.extend(access_repair_credential_refs()?);
             }
             ExactTransactionScope::ClusterFabric => {
                 for metadata in persisted_cluster_refs.values() {
@@ -2391,7 +4155,7 @@ fn persist_exact_credential_transaction_inner(
     }
     if let Some((node_intents, _)) = cluster_transaction {
         let mut refs = BTreeSet::new();
-        for node_id in node_intents {
+        for node_id in node_intents.keys() {
             refs.insert(crate::cluster_password_credential_ref(node_id)?);
             refs.insert(crate::cluster_private_key_credential_ref(node_id)?);
             refs.insert(crate::cluster_passphrase_credential_ref(node_id)?);
@@ -2468,10 +4232,30 @@ fn persist_exact_credential_transaction_inner(
     };
     let mut prepared = match prepared {
         Some(prepared) => prepared,
-        None if provider_expected_revision.is_some() => store.prepare_provider_metadata_update()?,
+        None if provider_expected_revision.is_some() || cluster_transaction.is_some() => {
+            store.prepare_provider_metadata_update()?
+        }
+        None if section_post_commit.is_some() && active_section.is_some() => {
+            let scope = exact_scope.expect("active exact section has a scope");
+            let section = active_section
+                .as_ref()
+                .expect("guarded by active-section presence");
+            let actual_revision = capture_section_post_commit(
+                data_dir,
+                scope,
+                section.expected_revision,
+                section.expected_revision,
+                false,
+                &store,
+                section_post_commit
+                    .as_mut()
+                    .expect("guarded by post-commit callback presence"),
+            );
+            return Ok(actual_revision);
+        }
         None => return store.revision_unchecked(),
     };
-    if proxy_only && reset_scope.is_none() {
+    if active_section.is_none() && proxy_only && reset_scope.is_none() {
         let expected = proxy_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "proxy auth credential revision precondition is required".to_string(),
@@ -2484,7 +4268,7 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if env_only && reset_scope.is_none() {
+    if active_section.is_none() && env_only && reset_scope.is_none() {
         let expected = env_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "env credential revision precondition is required".to_string(),
@@ -2497,7 +4281,7 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if notification_only && reset_scope.is_none() {
+    if active_section.is_none() && notification_only && reset_scope.is_none() {
         let expected = notification_expected_revision.ok_or_else(|| {
             ConfigStoreError::Validation(
                 "notification credential revision precondition is required".to_string(),
@@ -2510,32 +4294,44 @@ fn persist_exact_credential_transaction_inner(
             });
         }
     }
-    if let Some((_, expected)) = cluster_transaction {
-        if prepared.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: prepared.expected_revision,
-            });
+    if active_section.is_none() {
+        if let Some((_, expected)) = connect_transaction {
+            if prepared.expected_revision != expected {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: prepared.expected_revision,
+                });
+            }
         }
-    }
-    if let Some((_, expected)) = connect_transaction {
-        if prepared.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: prepared.expected_revision,
-            });
-        }
-    }
-    if let Some((_, _, expected)) = access_transaction {
-        if prepared.expected_revision != expected {
-            return Err(ConfigStoreError::Conflict {
-                expected,
-                actual: prepared.expected_revision,
-            });
+        if let Some((_, _, expected)) = access_transaction {
+            if prepared.expected_revision != expected {
+                return Err(ConfigStoreError::Conflict {
+                    expected,
+                    actual: prepared.expected_revision,
+                });
+            }
         }
     }
     if proxy_only && active_section.is_some() && prepared.required_refs.is_empty() {
         config.proxy_auth_credential_ref = None;
+    }
+    if active_section.is_some()
+        && matches!(
+            exact_scope,
+            Some(
+                ExactTransactionScope::ProxyAuth
+                    | ExactTransactionScope::EnvVars
+                    | ExactTransactionScope::Notifications
+                    | ExactTransactionScope::Connect
+                    | ExactTransactionScope::AccessControl
+            )
+        )
+    {
+        let scope = exact_scope.expect("matched an active non-cluster credential scope");
+        let active_refs = credential_refs_for_scope(config, scope);
+        prepared.validate_active_values(&active_refs, |_, value| {
+            credential_value_is_valid_for_scope(scope, value)
+        })?;
     }
     let (config_bytes, provider_bytes) = if proxy_only {
         (
@@ -2568,7 +4364,11 @@ fn persist_exact_credential_transaction_inner(
         )
     } else if access_only {
         (
-            prepare_access_control_config_document(domain_original, config)?,
+            prepare_access_control_config_document(
+                domain_original,
+                config,
+                reset_is(ExactTransactionScope::AccessControl),
+            )?,
             providers_original.clone(),
         )
     } else if mcp_only {
@@ -2615,7 +4415,10 @@ fn persist_exact_credential_transaction_inner(
             original_data != candidate_data,
         )
     } else if let (Some(section), Some(scope)) = (active_section.as_ref(), exact_scope) {
-        let credential_changed = mcp_only && prepared.revision != prepared.expected_revision;
+        // A secret-only replacement/clear is still an owned-section mutation:
+        // clients observing only the typed section revision must be able to
+        // detect it even when the persisted metadata is otherwise unchanged.
+        let credential_changed = prepared.revision != prepared.expected_revision;
         let (bytes, changed) = prepare_active_exact_section_document(
             section,
             scope,
@@ -2653,15 +4456,48 @@ fn persist_exact_credential_transaction_inner(
         || cluster_domain_changed
         || connect_domain_changed
         || access_domain_changed;
-    if exact_domain_changed {
+    if exact_domain_changed && !cluster_only {
         prepared.advance_revision_for_domain_change()?;
     }
-    if store.revision_unchecked()? != prepared.expected_revision {
+    let committed_authority_revision = if active_section.is_some() {
+        crate::section_facade::validate_section_envelope(authority_name, &authority_bytes, 0)?
+    } else {
+        prepared.revision
+    };
+    #[cfg(test)]
+    if fault == Some(MigrationFault::BeforeExactStagingUnrelatedCredentialRace) {
+        store.replace_unchecked(
+            credential_ref("provider", "anthropic", "api_key")?,
+            "concurrent-pre-staging-winner",
+            crate::CredentialSource::User,
+            prepared.expected_revision,
+        )?;
+    }
+    let current_credential_revision = store.revision_unchecked()?;
+    let owned_section_is_public_authority = active_section.is_some()
+        && matches!(
+            exact_scope,
+            Some(
+                ExactTransactionScope::ProxyAuth
+                    | ExactTransactionScope::EnvVars
+                    | ExactTransactionScope::Notifications
+                    | ExactTransactionScope::Connect
+                    | ExactTransactionScope::AccessControl
+                    | ExactTransactionScope::ClusterFabric
+            )
+        );
+    if current_credential_revision != prepared.expected_revision
+        && !owned_section_is_public_authority
+    {
         return Err(ConfigStoreError::Conflict {
             expected: prepared.expected_revision,
-            actual: store.revision_unchecked()?,
+            actual: current_credential_revision,
         });
     }
+    // Cluster-fabric's section revision is the public CAS authority. If an
+    // unrelated credential writer advances this internal member after
+    // preparation, stage the immutable base/candidate pair and let the exact
+    // installer perform its touched-ref three-way merge.
     // A true env-domain no-op keeps the CAS revision and avoids publishing an
     // event or rewriting either durable member. Any credential or config
     // semantic change advances the one shared revision exactly once.
@@ -2674,7 +4510,38 @@ fn persist_exact_credential_transaction_inner(
         && !exact_domain_changed
         && prepared.revision == prepared.expected_revision
     {
-        return Ok(prepared.revision);
+        if cluster_only && active_section.is_some() {
+            if let Some(callback) = cluster_post_commit.as_mut() {
+                let runtime = materialize_cluster_runtime_under_migration_lock(config, &store);
+                callback(
+                    committed_authority_revision,
+                    false,
+                    &config.cluster_fabric,
+                    runtime,
+                    Ok(()),
+                );
+            }
+        } else if let (Some(scope), Some(section), Some(callback)) = (
+            exact_scope,
+            active_section.as_ref(),
+            section_post_commit.as_mut(),
+        ) {
+            let actual_revision = capture_section_post_commit(
+                data_dir,
+                scope,
+                section.expected_revision,
+                committed_authority_revision,
+                false,
+                &store,
+                callback,
+            );
+            return Ok(actual_revision);
+        }
+        return if active_section.is_some() {
+            Ok(committed_authority_revision)
+        } else {
+            store.revision_unchecked()
+        };
     }
 
     let transaction_id = Uuid::new_v4().to_string();
@@ -2765,10 +4632,20 @@ fn persist_exact_credential_transaction_inner(
     write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
 
     #[cfg(test)]
-    if fault == Some(MigrationFault::BeforeExactCommitCredentialRace) {
-        let reference = prepared.touched_refs.first().cloned().ok_or_else(|| {
-            ConfigStoreError::Validation("credential intent is empty".to_string())
-        })?;
+    if matches!(
+        fault,
+        Some(
+            MigrationFault::BeforeExactCommitCredentialRace
+                | MigrationFault::BeforeExactCommitUnrelatedCredentialRace
+        )
+    ) {
+        let reference = if fault == Some(MigrationFault::BeforeExactCommitCredentialRace) {
+            prepared.touched_refs.first().cloned().ok_or_else(|| {
+                ConfigStoreError::Validation("credential intent is empty".to_string())
+            })?
+        } else {
+            credential_ref("provider", "anthropic", "api_key")?
+        };
         store.replace_unchecked(
             reference,
             "concurrent-winner",
@@ -2784,6 +4661,13 @@ fn persist_exact_credential_transaction_inner(
         let current_sha256 = sha256(&current);
         if file.original_sha256.as_deref() != Some(current_sha256.as_str()) {
             if file.name == CREDENTIALS_FILE {
+                if owned_section_is_public_authority {
+                    // The owned section is the external CAS authority. Commit
+                    // the manifest against its still-current revision and let
+                    // `install_exact_credential_member` three-way rebase this
+                    // internal member over unrelated credential winners.
+                    continue;
+                }
                 return Err(ConfigStoreError::Conflict {
                     expected: file.expected_revision.unwrap_or(0),
                     actual: store.revision_unchecked()?,
@@ -2807,6 +4691,17 @@ fn persist_exact_credential_transaction_inner(
         }
     }
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+    #[cfg(any(test, feature = "test-utils"))]
+    let cluster_fault_after_manifest = cluster_only
+        && active_section.is_some()
+        && take_cluster_exact_after_manifest_test_fault(data_dir);
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let cluster_fault_after_manifest = false;
+    if cluster_fault_after_manifest && cluster_post_commit.is_none() {
+        return Err(ConfigStoreError::Validation(
+            "injected cluster exact transaction fault after manifest".to_string(),
+        ));
+    }
     #[cfg(feature = "test-utils")]
     if env_only {
         if let Some(hook) = ENV_TRANSACTION_TEST_HOOK
@@ -2854,18 +4749,312 @@ fn persist_exact_credential_transaction_inner(
         }
     }
     #[cfg(test)]
+    if fault == Some(MigrationFault::AfterExactClusterConsumerConflict) {
+        let reference = prepared.touched_refs.first().ok_or_else(|| {
+            ConfigStoreError::Validation("cluster credential intent is empty".to_string())
+        })?;
+        AtomicFileStore::new(data_dir.join(PROVIDERS_FILE)).write_bytes_without_backup(
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "test_external_consumer": {
+                    "credential_ref": reference.as_str()
+                }
+            }))?,
+        )?;
+    }
+    #[cfg(test)]
+    if fault == Some(MigrationFault::AfterExactClusterSectionRebase) {
+        let target = data_dir.join(CLUSTER_FABRIC_FILE);
+        let current = read_file_reject_symlink(&target)?;
+        let current_hash = sha256(&current);
+        let (mut envelope, revision, mut data) =
+            parse_exact_section_document(CLUSTER_FABRIC_FILE, &current)?;
+        let external = crate::Node {
+            id: "external-rebase-node".to_string(),
+            label: "external-rebase-node".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        };
+        data.as_object_mut()
+            .ok_or_else(|| {
+                ConfigStoreError::Validation("cluster section data is invalid".to_string())
+            })?
+            .entry("nodes".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                ConfigStoreError::Validation("cluster node collection is invalid".to_string())
+            })?
+            .push(serde_json::to_value(external)?);
+        let next_revision = revision.checked_add(1).ok_or_else(|| {
+            ConfigStoreError::Validation("cluster section revision counter exhausted".to_string())
+        })?;
+        let object = envelope.as_object_mut().ok_or_else(|| {
+            ConfigStoreError::Validation("cluster section envelope is invalid".to_string())
+        })?;
+        object.insert("revision".to_string(), Value::from(next_revision));
+        object.insert("data".to_string(), data);
+        let bytes = serde_json::to_vec_pretty(&envelope)?;
+        crate::section_facade::validate_section_envelope(
+            CLUSTER_FABRIC_FILE,
+            &bytes,
+            next_revision,
+        )?;
+        if !AtomicFileStore::new(&target).write_bytes_if_hash(&current_hash, &bytes)? {
+            return Err(ConfigStoreError::Validation(
+                "cluster section changed during test race injection".to_string(),
+            ));
+        }
+    }
+    #[cfg(test)]
     if fault == Some(MigrationFault::AfterManifest) {
         return Err(injected_fault());
     }
     let mut manifest = manifest;
-    install_pending(
-        data_dir,
-        &mut manifest,
-        #[cfg(test)]
-        fault,
-    )?;
-    finish_transaction(data_dir, manifest)?;
-    store.revision_unchecked()
+    let adopted_cluster_transaction =
+        cluster_only && active_section.is_some() && cluster_post_commit.is_some();
+    let cluster_install_tracker = adopted_cluster_transaction.then(ClusterInstallTracker::new);
+    let mut installed_cluster_candidate = None;
+    let completion = if cluster_fault_after_manifest {
+        Err(ConfigStoreError::Validation(
+            "injected cluster exact transaction fault after manifest".to_string(),
+        ))
+    } else {
+        match install_pending(
+            data_dir,
+            &mut manifest,
+            cluster_install_tracker.as_ref(),
+            #[cfg(test)]
+            fault,
+        ) {
+            Err(error) => Err(error),
+            Ok(()) => {
+                let capture = adopted_cluster_transaction
+                    .then(|| load_durable_cluster_candidate_under_migration_lock(data_dir))
+                    .transpose();
+                if let Err(error) = capture {
+                    Err(error)
+                } else {
+                    installed_cluster_candidate = capture.expect("checked above");
+                    #[cfg(any(test, feature = "test-utils"))]
+                    let before_finish_fault = cluster_only
+                        && active_section.is_some()
+                        && take_cluster_exact_commit_test_fault(
+                            data_dir,
+                            ClusterExactCommitTestFault::BeforeFinish,
+                        );
+                    #[cfg(not(any(test, feature = "test-utils")))]
+                    let before_finish_fault = false;
+                    if before_finish_fault {
+                        Err(ConfigStoreError::Validation(
+                            "injected cluster exact transaction fault before finish".to_string(),
+                        ))
+                    } else {
+                        finish_transaction(data_dir, manifest.clone())
+                    }
+                }
+            }
+        }
+    };
+    if let Err(initial_error) = completion {
+        if cluster_install_tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.outcome() != ClusterInstallOutcome::CommitIntent)
+        {
+            // Once an intentional abort has started, never infer commit or
+            // publish the staged candidate in this process. `AbortAttempt`
+            // covers the indeterminate case where none of the independent
+            // durable markers could be confirmed; `Aborting` covers any marker
+            // succeeding before rollback or cleanup failed.
+            return Err(initial_error);
+        }
+        if !adopted_cluster_transaction {
+            return Err(initial_error);
+        }
+        let live_before_recovery = match load_live_cluster_transaction_manifest(data_dir, &manifest)
+        {
+            Ok(LiveClusterTransaction::NotCommitted | LiveClusterTransaction::Aborting) => {
+                return Err(initial_error);
+            }
+            Ok(LiveClusterTransaction::Committed(live)) => live,
+            Err(inspection_error) => {
+                if let Some(revision) = report_cluster_committed_recovery_failure(
+                    data_dir,
+                    config,
+                    &manifest,
+                    None,
+                    installed_cluster_candidate.as_ref(),
+                    &initial_error,
+                    &inspection_error,
+                    &mut cluster_post_commit,
+                ) {
+                    return Ok(revision);
+                }
+                return Err(cluster_commit_indeterminate_error(
+                    &initial_error,
+                    &inspection_error,
+                ));
+            }
+        };
+        let recovery = {
+            #[cfg(any(test, feature = "test-utils"))]
+            if take_cluster_exact_commit_test_fault(
+                data_dir,
+                ClusterExactCommitTestFault::AfterManifestRecoveryFailure,
+            ) {
+                Err(ConfigStoreError::Validation(
+                    "injected cluster exact transaction recovery failure".to_string(),
+                ))
+            } else {
+                recover_committed_with_cluster_tracker(
+                    data_dir,
+                    cluster_install_tracker.as_ref(),
+                    #[cfg(test)]
+                    None,
+                )
+            }
+            #[cfg(not(any(test, feature = "test-utils")))]
+            recover_committed_with_cluster_tracker(
+                data_dir,
+                cluster_install_tracker.as_ref(),
+                #[cfg(test)]
+                None,
+            )
+        };
+        if cluster_install_tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.outcome() != ClusterInstallOutcome::CommitIntent)
+        {
+            return match recovery {
+                Ok(_) => Err(initial_error),
+                Err(recovery_error) => Err(recovery_error),
+            };
+        }
+        match recovery {
+            Ok(_) => match load_durable_cluster_candidate_under_migration_lock(data_dir) {
+                Ok(actual) => installed_cluster_candidate = Some(actual),
+                Err(load_error) => {
+                    if let Some(revision) = report_cluster_committed_recovery_failure(
+                        data_dir,
+                        config,
+                        &manifest,
+                        Some(&live_before_recovery),
+                        installed_cluster_candidate.as_ref(),
+                        &initial_error,
+                        &load_error,
+                        &mut cluster_post_commit,
+                    ) {
+                        return Ok(revision);
+                    }
+                    return Err(cluster_commit_indeterminate_error(
+                        &initial_error,
+                        &load_error,
+                    ));
+                }
+            },
+            Err(recovery_error) => {
+                let live_after_recovery =
+                    match load_live_cluster_transaction_manifest(data_dir, &manifest) {
+                        Ok(
+                            LiveClusterTransaction::NotCommitted | LiveClusterTransaction::Aborting,
+                        ) => return Err(recovery_error),
+                        Ok(LiveClusterTransaction::Committed(live)) => Some(live),
+                        Err(inspection_error) => {
+                            let combined = ConfigStoreError::Validation(format!(
+                                "{recovery_error}; cluster transaction state inspection failed \
+                                 ({inspection_error})"
+                            ));
+                            if let Some(revision) = report_cluster_committed_recovery_failure(
+                                data_dir,
+                                config,
+                                &manifest,
+                                None,
+                                installed_cluster_candidate.as_ref(),
+                                &initial_error,
+                                &combined,
+                                &mut cluster_post_commit,
+                            ) {
+                                return Ok(revision);
+                            }
+                            return Err(cluster_commit_indeterminate_error(
+                                &initial_error,
+                                &combined,
+                            ));
+                        }
+                    };
+                if let Some(revision) = report_cluster_committed_recovery_failure(
+                    data_dir,
+                    config,
+                    &manifest,
+                    live_after_recovery.as_ref(),
+                    installed_cluster_candidate.as_ref(),
+                    &initial_error,
+                    &recovery_error,
+                    &mut cluster_post_commit,
+                ) {
+                    return Ok(revision);
+                }
+                return Err(cluster_commit_indeterminate_error(
+                    &initial_error,
+                    &recovery_error,
+                ));
+            }
+        }
+    }
+    if cluster_only && active_section.is_some() {
+        let (actual_revision, actual_candidate) = installed_cluster_candidate
+            .or_else(|| load_durable_cluster_candidate_under_migration_lock(data_dir).ok())
+            .ok_or_else(|| {
+                ConfigStoreError::Validation(
+                    "committed cluster transaction authority is unavailable".to_string(),
+                )
+            })?;
+        config.cluster_fabric = actual_candidate;
+        if let Some(callback) = cluster_post_commit.as_mut() {
+            let runtime = materialize_cluster_runtime_under_migration_lock(config, &store);
+            callback(
+                actual_revision,
+                true,
+                &config.cluster_fabric,
+                runtime,
+                Ok(()),
+            );
+        }
+        Ok(actual_revision)
+    } else if let (Some(scope), Some(section), Some(callback)) = (
+        exact_scope,
+        active_section.as_ref(),
+        section_post_commit.as_mut(),
+    ) {
+        let actual_revision = capture_section_post_commit(
+            data_dir,
+            scope,
+            section.expected_revision,
+            committed_authority_revision,
+            committed_authority_revision != section.expected_revision,
+            &store,
+            callback,
+        );
+        // Credential-member rebases can advance beyond the initially staged
+        // revision. The owned section remains the sole public CAS authority.
+        Ok(actual_revision)
+    } else if let (Some(scope), Some(_)) = (exact_scope, active_section.as_ref()) {
+        // Non-adopting callers use the same public contract: the returned
+        // revision is the owned section generation, never the internal
+        // credential-document generation.
+        crate::section_facade::load_durable_effective_section_under_migration_lock(
+            data_dir,
+            scope.section_id(),
+        )
+        .map(|(_, envelope)| envelope.revision)
+    } else {
+        // Credential-member rebases can advance beyond the initially staged
+        // revision. Preserve the existing exact-transaction return contract
+        // for every non-cluster domain.
+        store.revision_unchecked()
+    }
 }
 
 #[cfg(test)]
@@ -2988,6 +5177,98 @@ fn migrate_broker_locked(
     install_pending(
         data_dir,
         &mut manifest,
+        None,
+        #[cfg(test)]
+        fault,
+    )?;
+    finish_transaction(data_dir, manifest)?;
+    Ok(CredentialMigrationOutcome {
+        migrated_credentials: prepared_credentials.added,
+        resumed: false,
+    })
+}
+
+fn migrate_access_control_locked(
+    data_dir: &Path,
+    #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    cleanup_orphan_transaction_dirs(data_dir)?;
+    if let Some(outcome) = recover_committed(
+        data_dir,
+        #[cfg(test)]
+        fault,
+    )? {
+        return Ok(outcome);
+    }
+    discard_uncommitted(data_dir)?;
+
+    let mut extracted = Vec::new();
+    let Some(section) = plan_access_control_section(data_dir, &mut extracted, 1)? else {
+        return Ok(CredentialMigrationOutcome {
+            migrated_credentials: 0,
+            resumed: false,
+        });
+    };
+    let credential_original = read_optional_target(&data_dir.join(CREDENTIALS_FILE))?;
+    let store = CredentialStore::open(data_dir);
+    let resolved = resolve_extracted_secrets(&store, extracted)?;
+    let prepared_credentials = store.prepare_migration(resolved)?;
+
+    let transaction_id = Uuid::new_v4().to_string();
+    let stage_dir_name = format!("{STAGE_PREFIX}{transaction_id}");
+    let stage_dir = data_dir.join(&stage_dir_name);
+    let backup_dir = data_dir.join(format!("{BACKUP_PREFIX}{transaction_id}"));
+    create_private_dir(&stage_dir)?;
+    create_private_dir(&backup_dir)?;
+    sync_dir(data_dir)?;
+
+    let mut staged = Vec::new();
+    stage_file(
+        &stage_dir,
+        &backup_dir,
+        CREDENTIALS_FILE,
+        &prepared_credentials.bytes,
+        credential_original.as_deref(),
+        true,
+        None,
+        InstallMode::Migration,
+        None,
+        &mut staged,
+    )?;
+    stage_file(
+        &stage_dir,
+        &backup_dir,
+        ACCESS_CONTROL_FILE,
+        &section.bytes,
+        Some(&section.original),
+        false,
+        Some(section.migration_generation),
+        InstallMode::Migration,
+        None,
+        &mut staged,
+    )?;
+    restrict_directory_files_to_owner(&stage_dir)?;
+    restrict_directory_files_to_owner(&backup_dir)?;
+    sync_dir(&stage_dir)?;
+    sync_dir(&backup_dir)?;
+
+    let manifest = MigrationManifest {
+        version: MIGRATION_VERSION,
+        transaction_id,
+        stage_dir: stage_dir_name,
+        state: MigrationState::Pending,
+        exact_scope: None,
+        migration_scope: None,
+        source_attestation: BTreeMap::new(),
+        files: staged,
+    };
+    write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
+    write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
+    let mut manifest = manifest;
+    install_pending(
+        data_dir,
+        &mut manifest,
+        None,
         #[cfg(test)]
         fault,
     )?;
@@ -3096,6 +5377,7 @@ fn migrate_cluster_locked(
         install_pending(
             data_dir,
             &mut manifest,
+            None,
             #[cfg(test)]
             fault,
         )?;
@@ -3120,8 +5402,12 @@ fn pending_cluster_migration(data_dir: &Path) -> ConfigStoreResult<bool> {
     };
     let manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&manifest)?;
-    Ok(manifest.state == MigrationState::Pending
-        && manifest.migration_scope == Some(MigrationScope::ClusterFabric))
+    let pending = manifest.state == MigrationState::Pending
+        && manifest.migration_scope == Some(MigrationScope::ClusterFabric);
+    if pending && matching_cluster_abort_journal(data_dir, &manifest)? {
+        return Ok(false);
+    }
+    Ok(pending)
 }
 
 fn pending_cluster_refs_are_exclusive(data_dir: &Path) -> ConfigStoreResult<bool> {
@@ -3366,6 +5652,7 @@ fn migrate_inner_with_root_builtins_locked(
     install_pending(
         data_dir,
         &mut manifest,
+        None,
         #[cfg(test)]
         fault,
     )?;
@@ -3386,10 +5673,18 @@ fn resolve_extracted_secrets(
         // also makes a fresh plan after an uncommitted crash idempotent.
         let status = store.status_unchecked(&secret.credential_ref)?;
         if status.configured && status.source != crate::CredentialSource::Migrated {
-            if secret.kind == ExtractedSecretKind::EnvVar {
-                return Err(ConfigStoreError::Validation(
-                    "legacy env credential target is already user-managed".to_string(),
-                ));
+            match secret.kind {
+                ExtractedSecretKind::EnvVar => {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy env credential target is already user-managed".to_string(),
+                    ));
+                }
+                ExtractedSecretKind::AccessControlRepair => {
+                    return Err(ConfigStoreError::Validation(
+                        "access recovery target credential is already user-managed".to_string(),
+                    ));
+                }
+                _ => {}
             }
             continue;
         }
@@ -3418,10 +5713,18 @@ fn resolve_extracted_secrets_from_sources(
             .get(&secret.credential_ref)
             .is_some_and(|source| *source != crate::CredentialSource::Migrated)
         {
-            if secret.kind == ExtractedSecretKind::EnvVar {
-                return Err(ConfigStoreError::Validation(
-                    "legacy env credential target is already user-managed".to_string(),
-                ));
+            match secret.kind {
+                ExtractedSecretKind::EnvVar => {
+                    return Err(ConfigStoreError::Validation(
+                        "legacy env credential target is already user-managed".to_string(),
+                    ));
+                }
+                ExtractedSecretKind::AccessControlRepair => {
+                    return Err(ConfigStoreError::Validation(
+                        "access recovery target credential is already user-managed".to_string(),
+                    ));
+                }
+                _ => {}
             }
             continue;
         }
@@ -3453,10 +5756,18 @@ fn resolve_compound_extracted_secrets_from_sources(
     for secret in primary {
         if let Some(source) = sources.get(&secret.credential_ref) {
             if *source != crate::CredentialSource::Migrated {
-                if secret.kind == ExtractedSecretKind::EnvVar {
-                    return Err(ConfigStoreError::Validation(
-                        "legacy env credential target is already user-managed".to_string(),
-                    ));
+                match secret.kind {
+                    ExtractedSecretKind::EnvVar => {
+                        return Err(ConfigStoreError::Validation(
+                            "legacy env credential target is already user-managed".to_string(),
+                        ));
+                    }
+                    ExtractedSecretKind::AccessControlRepair => {
+                        return Err(ConfigStoreError::Validation(
+                            "access recovery target credential is already user-managed".to_string(),
+                        ));
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -3473,12 +5784,21 @@ fn resolve_compound_extracted_secrets_from_sources(
         let mut generation_selected = BTreeMap::<CredentialRef, (String, u64)>::new();
         for secret in generation {
             if let Some(source) = sources.get(&secret.credential_ref) {
-                if secret.kind == ExtractedSecretKind::EnvVar
-                    && *source != crate::CredentialSource::Migrated
-                {
-                    return Err(ConfigStoreError::Validation(
-                        "legacy env credential target is already user-managed".to_string(),
-                    ));
+                if *source != crate::CredentialSource::Migrated {
+                    match secret.kind {
+                        ExtractedSecretKind::EnvVar => {
+                            return Err(ConfigStoreError::Validation(
+                                "legacy env credential target is already user-managed".to_string(),
+                            ));
+                        }
+                        ExtractedSecretKind::AccessControlRepair => {
+                            return Err(ConfigStoreError::Validation(
+                                "access recovery target credential is already user-managed"
+                                    .to_string(),
+                            ));
+                        }
+                        _ => {}
+                    }
                 }
                 continue;
             }
@@ -5153,6 +7473,7 @@ fn plan_facade_root_document(
     original: Vec<u8>,
     extracted: &mut Vec<ExtractedSecret>,
     migration_generation: u64,
+    access_repair_slot: &str,
 ) -> ConfigStoreResult<Option<PlannedSection>> {
     let provider =
         plan_provider_instance_document(original.clone(), extracted, migration_generation, true)?;
@@ -5199,7 +7520,14 @@ fn plan_facade_root_document(
     let access_changed = root_after_cluster
         .as_object_mut()
         .and_then(|root| root.get_mut("access_control"))
-        .map(|access| migrate_access_control_credentials(access, extracted, migration_generation))
+        .map(|access| {
+            migrate_access_control_credentials(
+                access,
+                extracted,
+                migration_generation,
+                access_repair_slot,
+            )
+        })
         .transpose()?
         .unwrap_or(false);
     if !provider_changed && !root_mcp && !cluster_changed && !connect_changed && !access_changed {
@@ -5217,24 +7545,44 @@ fn plan_facade_root_document(
     }))
 }
 
+fn plan_access_control_section(
+    data_dir: &Path,
+    extracted: &mut Vec<ExtractedSecret>,
+    minimum_generation: u64,
+) -> ConfigStoreResult<Option<PlannedSection>> {
+    let path = data_dir.join(ACCESS_CONTROL_FILE);
+    let original = match read_file_reject_symlink(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let structurally_parseable = serde_json::from_slice::<Value>(&original)
+        .ok()
+        .is_some_and(|mut document| section_data_mut(&mut document).is_ok());
+    if structurally_parseable {
+        plan_access_control_document(original, extracted, minimum_generation, "section")
+    } else {
+        let migration_generation =
+            opaque_access_control_repair_generation(data_dir, minimum_generation)?;
+        plan_opaque_access_control_document(original, extracted, migration_generation, "section")
+            .map(Some)
+    }
+}
+
 fn plan_access_control_document(
     original: Vec<u8>,
     extracted: &mut Vec<ExtractedSecret>,
     minimum_generation: u64,
+    repair_slot: &str,
 ) -> ConfigStoreResult<Option<PlannedSection>> {
     let mut root: Value = serde_json::from_slice(&original)?;
     let (data, revision) = section_data_mut(&mut root)?;
     let migration_generation = next_revision(revision.unwrap_or(0))?.max(minimum_generation);
-    if !migrate_access_control_credentials(data, extracted, migration_generation)? {
+    if !migrate_access_control_credentials(data, extracted, migration_generation, repair_slot)? {
         return Ok(None);
     }
     let access: Option<crate::AccessControlConfig> = serde_json::from_value(data.clone())?;
     if let Some(access) = access.as_ref() {
-        if access.password_enabled && !access.password_configured {
-            return Err(ConfigStoreError::Validation(
-                "enabled access-control password has no verifier".to_string(),
-            ));
-        }
         if access.devices.iter().any(|device| !device.token_configured) {
             return Err(ConfigStoreError::Validation(
                 "access-control device has no token verifier".to_string(),
@@ -5250,85 +7598,328 @@ fn plan_access_control_document(
     }))
 }
 
+fn opaque_access_control_repair_generation(
+    data_dir: &Path,
+    minimum_generation: u64,
+) -> ConfigStoreResult<u64> {
+    let mut revision_floor = minimum_generation.saturating_sub(1);
+    if let Some(marker) = read_optional_target(&data_dir.join(crate::SECTION_LAYOUT_FILE))? {
+        if let Ok(completion) =
+            crate::section_facade::validate_completed_section_layout_marker(&marker)
+        {
+            if let Some(access) = completion.members.get(ACCESS_CONTROL_FILE) {
+                revision_floor = revision_floor.max(access.revision);
+            }
+        }
+    }
+    for suffix in ["", ".bak", ".bak.1", ".bak.2"] {
+        let Some(bytes) =
+            read_optional_target(&data_dir.join(format!("{ACCESS_CONTROL_FILE}{suffix}")))?
+        else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(object) = document.as_object() else {
+            continue;
+        };
+        if object.get("schema_version").and_then(Value::as_u64) == Some(1)
+            && object.contains_key("data")
+        {
+            if let Some(revision) = object.get("revision").and_then(Value::as_u64) {
+                revision_floor = revision_floor.max(revision);
+            }
+        }
+    }
+    next_revision(revision_floor)
+}
+
+fn plan_opaque_access_control_document(
+    original: Vec<u8>,
+    extracted: &mut Vec<ExtractedSecret>,
+    migration_generation: u64,
+    repair_slot: &str,
+) -> ConfigStoreResult<PlannedSection> {
+    let reference = CredentialRef::parse(format!("access_repair.{repair_slot}.payload"))?;
+    let payload = serde_json::to_string(&serde_json::json!({
+        "schema_version": 1,
+        "source_slot": repair_slot,
+        "encoding": "base64",
+        "access_control_bytes": base64::engine::general_purpose::STANDARD.encode(&original),
+    }))?;
+    extracted.push(ExtractedSecret {
+        credential_ref: reference,
+        value: LegacySecret::Plaintext(payload),
+        migration_generation,
+        kind: ExtractedSecretKind::AccessControlRepair,
+        env_owner: None,
+        provider_owner: None,
+        mcp_owner: None,
+        connect_owner: None,
+    });
+    let repaired = serde_json::json!({
+        "schema_version": 1,
+        "revision": migration_generation,
+        "data": {
+            "password_enabled": true,
+            "repair_required": true,
+            "password_configured": false
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&repaired)?;
+    crate::section_facade::validate_section_envelope(
+        ACCESS_CONTROL_FILE,
+        &bytes,
+        migration_generation,
+    )?;
+    Ok(PlannedSection {
+        name: ACCESS_CONTROL_FILE,
+        bytes,
+        original,
+        migration_generation,
+    })
+}
+
+/// Apply the migration projection without publishing any extracted values.
+/// Section-facade preflight uses this exact code path so malformed legacy
+/// AccessControl data cannot pass one parser and fail a later planner.
+pub(crate) fn sanitize_access_control_for_preflight(value: &mut Value) -> ConfigStoreResult<()> {
+    let mut extracted = Vec::new();
+    migrate_access_control_credentials(value, &mut extracted, 1, "preflight")?;
+    Ok(())
+}
+
 fn migrate_access_control_credentials(
     value: &mut Value,
     extracted: &mut Vec<ExtractedSecret>,
     migration_generation: u64,
+    repair_slot: &str,
 ) -> ConfigStoreResult<bool> {
     if value.is_null() {
         return Ok(false);
     }
-    let access = value.as_object_mut().ok_or_else(|| {
-        ConfigStoreError::Validation("access_control must be an object or null".to_string())
-    })?;
-    let mut changed = false;
-    let password_hash = take_nonempty_string(access, "password_hash")?;
-    let password_salt = take_nonempty_string(access, "password_salt")?;
-    match (password_hash, password_salt) {
-        (Some(hash), Some(salt)) => {
-            let reference = existing_or_generated_ref(
-                access.get("password_credential_ref"),
-                "access",
-                "root",
-                "password_verifier",
-            )?;
-            let value = crate::config_crypto::encode_access_verifier(&hash, &salt)?;
-            access.insert(
-                "password_credential_ref".to_string(),
-                Value::String(reference.as_str().to_string()),
-            );
-            access.insert("password_configured".to_string(), Value::Bool(true));
-            extracted.push(ExtractedSecret {
-                credential_ref: reference,
-                value: LegacySecret::Plaintext(value),
-                migration_generation,
-                kind: ExtractedSecretKind::AccessControl,
-                env_owner: None,
-                provider_owner: None,
-                mcp_owner: None,
-                connect_owner: None,
-            });
-            changed = true;
+    let original = value.clone();
+    let mut repair_required = false;
+    let mut access = match value.as_object() {
+        Some(access) => access.clone(),
+        None => {
+            repair_required = true;
+            Map::from_iter([
+                ("password_enabled".to_string(), Value::Bool(true)),
+                ("password_configured".to_string(), Value::Bool(false)),
+            ])
         }
-        (None, None) => {}
-        _ => {
-            return Err(ConfigStoreError::Validation(
-                "legacy access-control password verifier is incomplete".to_string(),
-            ));
+    };
+    let known_access_fields = [
+        "password_enabled",
+        "password_hash",
+        "password_salt",
+        "password_credential_ref",
+        "password_configured",
+        "updated_at",
+        "devices",
+        "repair_required",
+    ];
+    if access
+        .keys()
+        .any(|key| !known_access_fields.contains(&key.as_str()))
+    {
+        repair_required = true;
+        access.retain(|key, _| known_access_fields.contains(&key.as_str()));
+    }
+
+    match access.get("password_enabled") {
+        Some(Value::Bool(_)) | None => {}
+        Some(_) => {
+            // A malformed enablement value must not turn remote authentication
+            // off. Preserve the conservative intent until an explicit repair.
+            access.insert("password_enabled".to_string(), Value::Bool(true));
+            repair_required = true;
         }
     }
-    if let Some(devices) = access.get_mut("devices").and_then(Value::as_array_mut) {
-        for device in devices {
-            let device = device.as_object_mut().ok_or_else(|| {
-                ConfigStoreError::Validation("access-control device must be an object".to_string())
-            })?;
-            let device_id = device
-                .get("device_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| {
-                    ConfigStoreError::Validation("access-control device id is missing".to_string())
-                })?
-                .to_string();
-            let token_hash = take_nonempty_string(device, "token_hash")?;
-            let token_salt = take_nonempty_string(device, "token_salt")?;
-            match (token_hash, token_salt) {
-                (Some(hash), Some(salt)) => {
-                    let reference = existing_or_generated_ref(
-                        device.get("token_credential_ref"),
-                        "access",
-                        &device_id,
-                        "device_token_verifier",
-                    )?;
-                    let value = crate::config_crypto::encode_access_verifier(&hash, &salt)?;
+    let durable_repair = match access.get("repair_required") {
+        Some(Value::Bool(value)) => *value,
+        None => false,
+        Some(_) => {
+            repair_required = true;
+            true
+        }
+    };
+    if access
+        .get("updated_at")
+        .is_some_and(|updated| !updated.is_null() && !updated.is_string())
+    {
+        access.remove("updated_at");
+        repair_required = true;
+    }
+
+    let password_hash = access.remove("password_hash");
+    let password_salt = access.remove("password_salt");
+    let previous_password_ref = access.remove("password_credential_ref");
+    let previous_password_configured = access.remove("password_configured");
+    let canonical_password = crate::config_crypto::access_password_credential_ref()?;
+    let raw_password_present = password_hash.is_some() || password_salt.is_some();
+    let migrated_password = match (password_hash.as_ref(), password_salt.as_ref()) {
+        (Some(Value::String(hash)), Some(Value::String(salt)))
+            if !hash.is_empty() && !salt.is_empty() =>
+        {
+            match crate::config_crypto::encode_access_verifier(hash, salt) {
+                Ok(verifier) => Some(verifier),
+                Err(_) => {
+                    repair_required = true;
+                    None
+                }
+            }
+        }
+        (None, None) => None,
+        _ => {
+            repair_required = true;
+            None
+        }
+    };
+    if let Some(verifier) = migrated_password {
+        let metadata_valid = previous_password_configured
+            .as_ref()
+            .is_none_or(|value| value.as_bool() == Some(true))
+            && previous_password_ref
+                .as_ref()
+                .is_none_or(|value| value.as_str() == Some(canonical_password.as_str()));
+        repair_required |= !metadata_valid;
+        access.insert(
+            "password_credential_ref".to_string(),
+            Value::String(canonical_password.as_str().to_string()),
+        );
+        access.insert("password_configured".to_string(), Value::Bool(true));
+        extracted.push(ExtractedSecret {
+            credential_ref: canonical_password,
+            value: LegacySecret::Plaintext(verifier),
+            migration_generation,
+            kind: ExtractedSecretKind::AccessControl,
+            env_owner: None,
+            provider_owner: None,
+            mcp_owner: None,
+            connect_owner: None,
+        });
+    } else if !raw_password_present {
+        let configured = previous_password_configured
+            .as_ref()
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let reference = previous_password_ref.as_ref().and_then(Value::as_str);
+        let binding_valid = (configured && reference == Some(canonical_password.as_str()))
+            || (!configured && reference.is_none());
+        let metadata_typed = previous_password_configured
+            .as_ref()
+            .is_none_or(Value::is_boolean)
+            && previous_password_ref.as_ref().is_none_or(Value::is_string);
+        if binding_valid && metadata_typed {
+            if configured {
+                access.insert(
+                    "password_credential_ref".to_string(),
+                    Value::String(canonical_password.as_str().to_string()),
+                );
+                access.insert("password_configured".to_string(), Value::Bool(true));
+            } else if previous_password_configured.is_some() {
+                access.insert("password_configured".to_string(), Value::Bool(false));
+            }
+        } else {
+            repair_required = true;
+            access.insert("password_configured".to_string(), Value::Bool(false));
+        }
+    } else {
+        access.insert("password_configured".to_string(), Value::Bool(false));
+    }
+
+    let original_had_devices = access.contains_key("devices");
+    let original_devices = access.remove("devices");
+    let mut sanitized_devices = Vec::new();
+    let mut seen_device_ids = BTreeSet::new();
+    match original_devices {
+        None => {}
+        Some(Value::Array(devices)) => {
+            for raw_device in devices {
+                let Some(mut device) = raw_device.as_object().cloned() else {
+                    repair_required = true;
+                    continue;
+                };
+                let known_device_fields = [
+                    "device_id",
+                    "label",
+                    "token_hash",
+                    "token_salt",
+                    "token_credential_ref",
+                    "token_configured",
+                    "created_at",
+                    "last_used_at",
+                    "revoked",
+                ];
+                if device
+                    .keys()
+                    .any(|key| !known_device_fields.contains(&key.as_str()))
+                {
+                    repair_required = true;
+                    device.retain(|key, _| known_device_fields.contains(&key.as_str()));
+                }
+                let Some(device_id) = device
+                    .get("device_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+                else {
+                    repair_required = true;
+                    continue;
+                };
+                if !seen_device_ids.insert(device_id.clone())
+                    || !device.get("label").is_some_and(Value::is_string)
+                    || !device.get("created_at").is_some_and(Value::is_string)
+                    || device
+                        .get("last_used_at")
+                        .is_some_and(|item| !item.is_null() && !item.is_string())
+                    || device.get("revoked").is_some_and(|item| !item.is_boolean())
+                {
+                    repair_required = true;
+                    continue;
+                }
+
+                let token_hash = device.remove("token_hash");
+                let token_salt = device.remove("token_salt");
+                let previous_ref = device.remove("token_credential_ref");
+                let previous_configured = device.remove("token_configured");
+                let Ok(canonical) = crate::config_crypto::access_device_credential_ref(&device_id)
+                else {
+                    repair_required = true;
+                    continue;
+                };
+                let raw_token_present = token_hash.is_some() || token_salt.is_some();
+                let migrated_token = match (token_hash.as_ref(), token_salt.as_ref()) {
+                    (Some(Value::String(hash)), Some(Value::String(salt)))
+                        if !hash.is_empty() && !salt.is_empty() =>
+                    {
+                        crate::config_crypto::encode_access_verifier(hash, salt).ok()
+                    }
+                    _ => None,
+                };
+                if raw_token_present && migrated_token.is_none() {
+                    repair_required = true;
+                    continue;
+                }
+                if let Some(verifier) = migrated_token {
+                    let metadata_valid = previous_configured
+                        .as_ref()
+                        .is_none_or(|item| item.as_bool() == Some(true))
+                        && previous_ref
+                            .as_ref()
+                            .is_none_or(|item| item.as_str() == Some(canonical.as_str()));
+                    repair_required |= !metadata_valid;
                     device.insert(
                         "token_credential_ref".to_string(),
-                        Value::String(reference.as_str().to_string()),
+                        Value::String(canonical.as_str().to_string()),
                     );
                     device.insert("token_configured".to_string(), Value::Bool(true));
                     extracted.push(ExtractedSecret {
-                        credential_ref: reference,
-                        value: LegacySecret::Plaintext(value),
+                        credential_ref: canonical,
+                        value: LegacySecret::Plaintext(verifier),
                         migration_generation,
                         kind: ExtractedSecretKind::AccessControl,
                         env_owner: None,
@@ -5336,16 +7927,66 @@ fn migrate_access_control_credentials(
                         mcp_owner: None,
                         connect_owner: None,
                     });
-                    changed = true;
+                } else {
+                    let configured = previous_configured
+                        .as_ref()
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let metadata_valid = configured
+                        && previous_ref.as_ref().and_then(Value::as_str)
+                            == Some(canonical.as_str())
+                        && previous_configured.as_ref().is_some_and(Value::is_boolean)
+                        && previous_ref.as_ref().is_some_and(Value::is_string);
+                    if !metadata_valid {
+                        repair_required = true;
+                        continue;
+                    }
+                    device.insert(
+                        "token_credential_ref".to_string(),
+                        Value::String(canonical.as_str().to_string()),
+                    );
+                    device.insert("token_configured".to_string(), Value::Bool(true));
                 }
-                (None, None) => {}
-                _ => {
-                    return Err(ConfigStoreError::Validation(format!(
-                        "legacy access-control device '{device_id}' verifier is incomplete"
-                    )));
+                if serde_json::from_value::<crate::DeviceCredential>(Value::Object(device.clone()))
+                    .is_err()
+                {
+                    repair_required = true;
+                    continue;
                 }
+                sanitized_devices.push(Value::Object(device));
             }
         }
+        Some(_) => {
+            repair_required = true;
+        }
+    }
+    if original_had_devices || !sanitized_devices.is_empty() {
+        access.insert("devices".to_string(), Value::Array(sanitized_devices));
+    }
+
+    access.insert(
+        "repair_required".to_string(),
+        Value::Bool(durable_repair || repair_required),
+    );
+    *value = Value::Object(access);
+    let changed = *value != original;
+    if repair_required {
+        let reference = CredentialRef::parse(format!("access_repair.{repair_slot}.payload"))?;
+        let payload = serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "source_slot": repair_slot,
+            "access_control": original.clone(),
+        }))?;
+        extracted.push(ExtractedSecret {
+            credential_ref: reference,
+            value: LegacySecret::Plaintext(payload),
+            migration_generation,
+            kind: ExtractedSecretKind::AccessControlRepair,
+            env_owner: None,
+            provider_owner: None,
+            mcp_owner: None,
+            connect_owner: None,
+        });
     }
     Ok(changed)
 }
@@ -6791,6 +9432,35 @@ fn connect_domain_changed(current: &[u8], candidate: &[u8]) -> ConfigStoreResult
     Ok(current.get("connect") != candidate.get("connect"))
 }
 
+fn access_repair_required_from_document(bytes: &[u8]) -> ConfigStoreResult<bool> {
+    let root = parse_config_root_object(
+        bytes,
+        "config.json is invalid during access-control credential transaction",
+    )?;
+    Ok(root
+        .get("access_control")
+        .and_then(Value::as_object)
+        .and_then(|access| access.get("repair_required"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
+fn access_repair_credential_refs() -> ConfigStoreResult<Vec<CredentialRef>> {
+    [
+        "section",
+        "section.bak",
+        "section.bak.1",
+        "section.bak.2",
+        "root",
+        "root.bak",
+        "root.bak.1",
+        "root.bak.2",
+    ]
+    .into_iter()
+    .map(|slot| CredentialRef::parse(format!("access_repair.{slot}.payload")))
+    .collect()
+}
+
 fn access_refs_from_document(
     bytes: &[u8],
 ) -> ConfigStoreResult<crate::credential_store::PersistedAccessCredentialRefs> {
@@ -6853,7 +9523,20 @@ fn access_refs_from_document(
 fn prepare_access_control_config_document(
     current: &[u8],
     candidate: &crate::Config,
+    allow_repair_clear: bool,
 ) -> ConfigStoreResult<Vec<u8>> {
+    if !allow_repair_clear
+        && access_repair_required_from_document(current)?
+        && !candidate
+            .access_control
+            .as_ref()
+            .is_some_and(|access| access.repair_required)
+    {
+        return Err(ConfigStoreError::Validation(
+            "access-control repair state is server-owned and requires an explicit reset"
+                .to_string(),
+        ));
+    }
     let mut root = parse_config_root_object(
         current,
         "config.json is invalid during access-control credential transaction",
@@ -7078,12 +9761,240 @@ fn write_manifest(path: PathBuf, manifest: &MigrationManifest) -> ConfigStoreRes
     AtomicFileStore::new(path).write_bytes_without_backup(&serde_json::to_vec_pretty(manifest)?)
 }
 
+fn validate_matching_cluster_journal(
+    manifest: &MigrationManifest,
+    journal: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+        || journal.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+        || journal.transaction_id != manifest.transaction_id
+        || journal.stage_dir != manifest.stage_dir
+        || journal.migration_scope != manifest.migration_scope
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster abort journal does not match its committed manifest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn cluster_rollback_journal_sha256(journal: &MigrationManifest) -> ConfigStoreResult<String> {
+    validate_manifest(journal)?;
+    if journal.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+        || journal.state == MigrationState::Complete
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster abort rollback journal is invalid".to_string(),
+        ));
+    }
+    let mut rollback_authority = journal.clone();
+    rollback_authority.state = MigrationState::Pending;
+    Ok(sha256(&serde_json::to_vec(&rollback_authority)?))
+}
+
+fn validate_cluster_abort_record(record: &ClusterAbortRecord) -> ConfigStoreResult<()> {
+    let canonical_transaction_id = Uuid::parse_str(&record.transaction_id)
+        .ok()
+        .map(|uuid| uuid.to_string());
+    if record.version != MIGRATION_VERSION
+        || canonical_transaction_id.as_deref() != Some(record.transaction_id.as_str())
+        || record.stage_dir != format!("{STAGE_PREFIX}{}", record.transaction_id)
+        || record.state != MigrationState::Aborting
+        || record.exact_scope != ExactTransactionScope::ClusterFabric
+        || record.migration_scope.is_some()
+        || !is_sha256_hex(&record.rollback_journal_sha256)
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster abort record is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_matching_cluster_abort_record(
+    manifest: &MigrationManifest,
+    record: &ClusterAbortRecord,
+) -> ConfigStoreResult<()> {
+    validate_cluster_abort_record(record)?;
+    if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+        || record.transaction_id != manifest.transaction_id
+        || record.stage_dir != manifest.stage_dir
+        || Some(record.exact_scope) != manifest.exact_scope
+        || record.migration_scope != manifest.migration_scope
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster abort record does not match its committed manifest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_cluster_abort_record(data_dir: &Path) -> ConfigStoreResult<Option<ClusterAbortRecord>> {
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(CLUSTER_ABORT_FILE))? else {
+        return Ok(None);
+    };
+    let record: ClusterAbortRecord = serde_json::from_slice(&bytes)?;
+    validate_cluster_abort_record(&record)?;
+    Ok(Some(record))
+}
+
+fn matching_cluster_abort_record(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<bool> {
+    let Some(record) = read_cluster_abort_record(data_dir)? else {
+        return Ok(false);
+    };
+    validate_matching_cluster_abort_record(manifest, &record)?;
+    let journal_bytes =
+        read_optional_migration_file(&data_dir.join(JOURNAL_FILE))?.ok_or_else(|| {
+            ConfigStoreError::Validation("cluster abort rollback journal is missing".to_string())
+        })?;
+    let journal: MigrationManifest = serde_json::from_slice(&journal_bytes)?;
+    validate_matching_cluster_journal(manifest, &journal)?;
+    if cluster_rollback_journal_sha256(&journal)? != record.rollback_journal_sha256 {
+        return Err(ConfigStoreError::Validation(
+            "cluster abort record does not match its rollback journal".to_string(),
+        ));
+    }
+    Ok(true)
+}
+
+fn persist_cluster_abort_record(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let journal_bytes =
+        read_optional_migration_file(&data_dir.join(JOURNAL_FILE))?.ok_or_else(|| {
+            ConfigStoreError::Validation("cluster abort rollback journal is missing".to_string())
+        })?;
+    let journal: MigrationManifest = serde_json::from_slice(&journal_bytes)?;
+    validate_matching_cluster_journal(manifest, &journal)?;
+    let record = ClusterAbortRecord {
+        version: MIGRATION_VERSION,
+        transaction_id: manifest.transaction_id.clone(),
+        stage_dir: manifest.stage_dir.clone(),
+        state: MigrationState::Aborting,
+        exact_scope: ExactTransactionScope::ClusterFabric,
+        migration_scope: manifest.migration_scope,
+        rollback_journal_sha256: cluster_rollback_journal_sha256(&journal)?,
+    };
+    let path = data_dir.join(CLUSTER_ABORT_FILE);
+    if let Some(existing) = read_cluster_abort_record(data_dir)? {
+        validate_matching_cluster_abort_record(manifest, &existing)?;
+        if existing != record {
+            return Err(ConfigStoreError::Validation(
+                "cluster abort record changed during rollback".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    if cluster_abort_record_test_fault(data_dir) {
+        return Err(ConfigStoreError::Validation(
+            "injected persistent cluster abort record failure".to_string(),
+        ));
+    }
+    AtomicFileStore::new(path).write_bytes_without_backup(&serde_json::to_vec_pretty(&record)?)
+}
+
+fn matching_cluster_abort_evidence(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<bool> {
+    let journal_aborting = matching_cluster_abort_journal(data_dir, manifest)?;
+    let abort_record = matching_cluster_abort_record(data_dir, manifest)?;
+    Ok(journal_aborting || abort_record)
+}
+
+fn remove_matching_cluster_abort_record(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    if !matching_cluster_abort_record(data_dir, manifest)? {
+        return Ok(());
+    }
+    remove_file_if_exists(&data_dir.join(CLUSTER_ABORT_FILE))
+}
+
+/// Return whether the immutable transaction journal carries durable non-commit
+/// intent for this exact cluster transaction.
+///
+/// The journal's original file members are the rollback authority and may
+/// differ from a rebased main manifest. Matching therefore compares identity
+/// and scope only, never candidate member metadata.
+fn matching_cluster_abort_journal(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<bool> {
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(JOURNAL_FILE))? else {
+        return Ok(false);
+    };
+    let journal: MigrationManifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&journal)?;
+    if journal.state != MigrationState::Aborting {
+        return Ok(false);
+    }
+    validate_matching_cluster_journal(manifest, &journal)?;
+    Ok(true)
+}
+
+/// Persist durable abort intent into the immutable journal before the mutable
+/// main manifest is transitioned. Only `state` changes; original staged-member
+/// metadata remains available for exact rollback after rebases or restart.
+fn persist_cluster_abort_journal(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+) -> ConfigStoreResult<()> {
+    let path = data_dir.join(JOURNAL_FILE);
+    let bytes = read_optional_migration_file(&path)?.ok_or_else(|| {
+        ConfigStoreError::Validation("cluster abort journal is missing".to_string())
+    })?;
+    let mut journal: MigrationManifest = serde_json::from_slice(&bytes)?;
+    validate_manifest(&journal)?;
+    validate_matching_cluster_journal(manifest, &journal)?;
+    if journal.state == MigrationState::Complete {
+        return Err(ConfigStoreError::Validation(
+            "a complete cluster journal cannot enter abort rollback".to_string(),
+        ));
+    }
+    if journal.state != MigrationState::Aborting {
+        #[cfg(any(test, feature = "test-utils"))]
+        if cluster_abort_journal_marker_test_fault(data_dir) {
+            return Err(ConfigStoreError::Validation(
+                "injected persistent cluster abort journal marker failure".to_string(),
+            ));
+        }
+        journal.state = MigrationState::Aborting;
+        write_manifest(path, &journal)?;
+    }
+    Ok(())
+}
+
 fn recover_committed(
     data_dir: &Path,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<Option<CredentialMigrationOutcome>> {
+    recover_committed_with_cluster_tracker(
+        data_dir,
+        None,
+        #[cfg(test)]
+        fault,
+    )
+}
+
+fn recover_committed_with_cluster_tracker(
+    data_dir: &Path,
+    install_tracker: Option<&ClusterInstallTracker>,
+    #[cfg(test)] fault: Option<MigrationFault>,
+) -> ConfigStoreResult<Option<CredentialMigrationOutcome>> {
     let path = data_dir.join(MANIFEST_FILE);
     let Some(bytes) = read_optional_migration_file(&path)? else {
+        if read_optional_migration_file(&data_dir.join(CLUSTER_ABORT_FILE))?.is_some() {
+            return Err(ConfigStoreError::Validation(
+                "cluster abort recovery metadata has no committed manifest".to_string(),
+            ));
+        }
         return Ok(None);
     };
     let mut manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
@@ -7093,13 +10004,33 @@ fn recover_committed(
             verify_section_split_completion(data_dir, &manifest)?;
             persist_section_layout_completion_ledger(data_dir, &manifest)?;
         }
+        remove_matching_cluster_abort_record(data_dir, &manifest)?;
         cleanup_transaction_dirs(data_dir, &manifest)?;
         remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
+        return Ok(None);
+    }
+    if manifest.state == MigrationState::Pending
+        && matching_cluster_abort_evidence(data_dir, &manifest)?
+    {
+        // The journal was durably marked before a failed main-manifest abort
+        // transition. Resume rollback before any install validation; the
+        // original conflict may no longer exist after restart.
+        abort_cluster_exact_transaction(data_dir, &manifest, install_tracker)?;
+        return Ok(None);
+    }
+    if manifest.state == MigrationState::Aborting {
+        if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric) {
+            return Err(ConfigStoreError::Validation(
+                "only cluster exact transactions may resume abort rollback".to_string(),
+            ));
+        }
+        abort_cluster_exact_transaction(data_dir, &manifest, install_tracker)?;
         return Ok(None);
     }
     install_pending(
         data_dir,
         &mut manifest,
+        install_tracker,
         #[cfg(test)]
         fault,
     )?;
@@ -7614,22 +10545,96 @@ fn rollback_cluster_config_member(
 fn abort_cluster_exact_transaction(
     data_dir: &Path,
     manifest: &MigrationManifest,
+    install_tracker: Option<&ClusterInstallTracker>,
 ) -> ConfigStoreResult<()> {
     if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric) {
         return Ok(());
     }
-    rollback_exact_authority_member(data_dir, manifest)?;
-    rollback_exact_credential_member(data_dir, manifest)?;
-    let mut complete = manifest.clone();
+    if manifest.state == MigrationState::Complete {
+        return Err(ConfigStoreError::Validation(
+            "a complete cluster transaction cannot enter abort rollback".to_string(),
+        ));
+    }
+    let mut aborting = manifest.clone();
+    aborting.state = MigrationState::Aborting;
+
+    if manifest.state == MigrationState::Aborting {
+        // A restart may arrive here after the main manifest was the successful
+        // fallback marker while the immutable journal remained Pending. The
+        // durable main state is already sufficient non-commit evidence; leave
+        // the journal's original rollback members untouched.
+        if let Some(tracker) = install_tracker {
+            tracker.mark_aborting();
+        }
+    } else {
+        if let Some(tracker) = install_tracker {
+            // This process has chosen abort, even though no durable marker is
+            // confirmed yet. Marker write failures must not fall back into
+            // committed-candidate adoption in the caller.
+            tracker.mark_abort_attempt();
+        }
+
+        // The dedicated abort record binds this decision to the immutable
+        // rollback journal without changing its original members. Journal and
+        // main markers remain independent fallbacks, so any one confirmed
+        // durable write is sufficient non-commit evidence after restart.
+        let abort_record_durable = persist_cluster_abort_record(data_dir, manifest).is_ok();
+        let journal_durable = persist_cluster_abort_journal(data_dir, manifest).is_ok();
+        if abort_record_durable || journal_durable {
+            if let Some(tracker) = install_tracker {
+                tracker.mark_aborting();
+            }
+        }
+
+        #[cfg(any(test, feature = "test-utils"))]
+        let main_marker = if cluster_abort_marker_test_fault(data_dir) {
+            Err(ConfigStoreError::Validation(
+                "injected persistent cluster abort marker failure".to_string(),
+            ))
+        } else {
+            write_manifest(data_dir.join(MANIFEST_FILE), &aborting)
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let main_marker = write_manifest(data_dir.join(MANIFEST_FILE), &aborting);
+
+        match main_marker {
+            Ok(()) => {
+                if let Some(tracker) = install_tracker {
+                    tracker.mark_aborting();
+                }
+            }
+            Err(error) if abort_record_durable || journal_durable => return Err(error),
+            Err(_) => {
+                return Err(ConfigStoreError::CommitIndeterminate(
+                    "cluster transaction has no durable abort marker; recovery may still commit"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    if cluster_abort_cleanup_test_fault(data_dir) {
+        return Err(ConfigStoreError::Validation(
+            "injected persistent cluster abort cleanup failure".to_string(),
+        ));
+    }
+    rollback_exact_authority_member(data_dir, &aborting)?;
+    rollback_exact_credential_member(data_dir, &aborting)?;
+    let mut complete = aborting;
     complete.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &complete)?;
+    remove_matching_cluster_abort_record(data_dir, &complete)?;
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
     cleanup_transaction_dirs(data_dir, &complete)?;
     remove_file_if_exists(&data_dir.join(MANIFEST_FILE))?;
     sync_dir(data_dir)
 }
 
-fn abort_exact_transaction(data_dir: &Path, manifest: &MigrationManifest) -> ConfigStoreResult<()> {
+fn abort_exact_transaction(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+    install_tracker: Option<&ClusterInstallTracker>,
+) -> ConfigStoreResult<()> {
     match manifest.exact_scope {
         Some(ExactTransactionScope::Providers) => {
             abort_active_exact_transaction(data_dir, manifest, ExactTransactionScope::Providers)
@@ -7647,7 +10652,7 @@ fn abort_exact_transaction(data_dir: &Path, manifest: &MigrationManifest) -> Con
             abort_access_control_exact_transaction(data_dir, manifest)
         }
         Some(ExactTransactionScope::ClusterFabric) => {
-            abort_cluster_exact_transaction(data_dir, manifest)
+            abort_cluster_exact_transaction(data_dir, manifest, install_tracker)
         }
         None => Ok(()),
     }
@@ -7785,6 +10790,7 @@ fn ensure_notification_consumers_or_abort(
 fn ensure_cluster_consumers_or_abort(
     data_dir: &Path,
     manifest: &MigrationManifest,
+    install_tracker: Option<&ClusterInstallTracker>,
 ) -> ConfigStoreResult<()> {
     if manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric) {
         return Ok(());
@@ -7805,7 +10811,7 @@ fn ensure_cluster_consumers_or_abort(
         .map(|reference| CredentialRef::parse(reference.clone()))
         .collect::<ConfigStoreResult<BTreeSet<_>>>()?;
     if let Err(error) = ensure_cluster_refs_are_safe(data_dir, &refs, &[]) {
-        abort_cluster_exact_transaction(data_dir, manifest)?;
+        abort_cluster_exact_transaction(data_dir, manifest, install_tracker)?;
         return Err(error);
     }
     Ok(())
@@ -7915,6 +10921,11 @@ fn ensure_access_consumers_or_abort(
     let staged_refs = access_refs_from_document(&staged)?;
     let original_refs = access_refs_from_document(&original)?;
     for raw in &credential_file.touched_credential_refs {
+        if raw.starts_with("access_repair.") {
+            // Internal quarantine records intentionally have no public config
+            // consumer. An explicit AccessControl reset owns and clears them.
+            continue;
+        }
         let owner = if staged_refs
             .password
             .as_ref()
@@ -8090,7 +11101,7 @@ pub(crate) fn section_layout_completion_evidence_matches(
             Ok(manifest) => manifest,
             Err(_) => return Ok(false),
         };
-        if validate_manifest(&manifest).is_err() || manifest.state == MigrationState::Pending {
+        if validate_manifest(&manifest).is_err() || manifest.state != MigrationState::Complete {
             return Ok(false);
         }
         if is_section_layout_scope(manifest.migration_scope)
@@ -8388,9 +11399,23 @@ fn verify_section_split_completion(
 fn install_pending(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
+    install_tracker: Option<&ClusterInstallTracker>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
     validate_manifest(manifest)?;
+    if manifest.state != MigrationState::Pending {
+        return Err(ConfigStoreError::Validation(
+            "only a pending transaction may install staged members".to_string(),
+        ));
+    }
+    if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric)
+        && matching_cluster_abort_evidence(data_dir, manifest)?
+    {
+        abort_cluster_exact_transaction(data_dir, manifest, install_tracker)?;
+        return Err(ConfigStoreError::Validation(
+            "cluster transaction carries durable abort intent".to_string(),
+        ));
+    }
     if manifest.migration_scope == Some(MigrationScope::ClusterFabric) {
         pending_cluster_refs_are_exclusive(data_dir)?;
     }
@@ -8398,7 +11423,7 @@ fn install_pending(
     ensure_notification_consumers_or_abort(data_dir, manifest)?;
     ensure_connect_consumers_or_abort(data_dir, manifest)?;
     ensure_access_consumers_or_abort(data_dir, manifest)?;
-    ensure_cluster_consumers_or_abort(data_dir, manifest)?;
+    ensure_cluster_consumers_or_abort(data_dir, manifest, install_tracker)?;
     let _stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     let names = manifest
         .files
@@ -8436,6 +11461,17 @@ fn install_pending(
             if fault == Some(MigrationFault::AfterCredentials) {
                 return Err(injected_fault());
             }
+            #[cfg(any(test, feature = "test-utils"))]
+            if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric)
+                && take_cluster_exact_commit_test_fault(
+                    data_dir,
+                    ClusterExactCommitTestFault::AfterCredentialInstall,
+                )
+            {
+                return Err(ConfigStoreError::Validation(
+                    "injected cluster exact transaction fault after credential install".to_string(),
+                ));
+            }
             continue;
         }
         let staged = read_managed_file(data_dir, &manifest.stage_dir, &file.staged_name)?;
@@ -8462,6 +11498,7 @@ fn install_pending(
                             data_dir,
                             manifest,
                             file_index,
+                            install_tracker,
                             #[cfg(test)]
                             fault,
                         )?
@@ -8812,6 +11849,7 @@ fn install_rebased_active_section_member(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
     file_index: usize,
+    install_tracker: Option<&ClusterInstallTracker>,
 ) -> ConfigStoreResult<bool> {
     let scope = manifest.exact_scope.ok_or_else(|| {
         ConfigStoreError::Validation("exact transaction scope is missing".to_string())
@@ -8839,13 +11877,13 @@ fn install_rebased_active_section_member(
     let (mut current_envelope, current_revision, current_data) =
         parse_exact_section_document(name, &current)?;
     if current_revision < original_revision {
-        abort_exact_transaction(data_dir, manifest)?;
+        abort_exact_transaction(data_dir, manifest, install_tracker)?;
         return Err(ConfigStoreError::Validation(
             "authoritative section revision moved backwards".to_string(),
         ));
     }
     if current_revision == original_revision && current_hash != sha256(&original) {
-        abort_exact_transaction(data_dir, manifest)?;
+        abort_exact_transaction(data_dir, manifest, install_tracker)?;
         return Err(ConfigStoreError::Validation(
             "authoritative section reused a revision with different content".to_string(),
         ));
@@ -8859,7 +11897,7 @@ fn install_rebased_active_section_member(
     ) {
         Ok(merged) => merged,
         Err(error) => {
-            abort_exact_transaction(data_dir, manifest)?;
+            abort_exact_transaction(data_dir, manifest, install_tracker)?;
             return Err(error);
         }
     };
@@ -8905,10 +11943,16 @@ fn install_rebased_exact_config_member(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
     file_index: usize,
+    install_tracker: Option<&ClusterInstallTracker>,
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<bool> {
     if manifest.files[file_index].name != CONFIG_FILE {
-        return install_rebased_active_section_member(data_dir, manifest, file_index);
+        return install_rebased_active_section_member(
+            data_dir,
+            manifest,
+            file_index,
+            install_tracker,
+        );
     }
     if manifest.exact_scope == Some(ExactTransactionScope::EnvVars) {
         return install_rebased_env_config_member(data_dir, manifest, file_index);
@@ -8922,7 +11966,12 @@ fn install_rebased_exact_config_member(
         ));
     }
     if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric) {
-        return install_rebased_cluster_config_member(data_dir, manifest, file_index);
+        return install_rebased_cluster_config_member(
+            data_dir,
+            manifest,
+            file_index,
+            install_tracker,
+        );
     }
     install_rebased_proxy_config_member(
         data_dir,
@@ -8937,6 +11986,7 @@ fn install_rebased_cluster_config_member(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
     file_index: usize,
+    install_tracker: Option<&ClusterInstallTracker>,
 ) -> ConfigStoreResult<bool> {
     let stage_dir = validated_stage_dir(data_dir, &manifest.stage_dir)?;
     let file = manifest.files[file_index].clone();
@@ -8961,7 +12011,7 @@ fn install_rebased_cluster_config_member(
     if current_object.get("cluster_fabric") != original_object.get("cluster_fabric")
         && current_object.get("cluster_fabric") != staged.get("cluster_fabric")
     {
-        abort_cluster_exact_transaction(data_dir, manifest)?;
+        abort_cluster_exact_transaction(data_dir, manifest, install_tracker)?;
         return Err(ConfigStoreError::Validation(
             "cluster metadata changed during committed transaction".to_string(),
         ));
@@ -9581,9 +12631,17 @@ fn install_exact_credential_member(
             continue;
         }
         if file.touched_credential_refs.is_empty()
-            && manifest.exact_scope != Some(ExactTransactionScope::Notifications)
-            && manifest.exact_scope != Some(ExactTransactionScope::Connect)
-            && manifest.exact_scope != Some(ExactTransactionScope::ClusterFabric)
+            && !matches!(
+                manifest.exact_scope,
+                Some(
+                    ExactTransactionScope::ProxyAuth
+                        | ExactTransactionScope::EnvVars
+                        | ExactTransactionScope::Notifications
+                        | ExactTransactionScope::Connect
+                        | ExactTransactionScope::AccessControl
+                        | ExactTransactionScope::ClusterFabric
+                )
+            )
         {
             return Err(ConfigStoreError::Validation(
                 "committed credential transaction cannot be safely rebased".to_string(),
@@ -9865,6 +12923,9 @@ fn rebase_changed_section(
         PROVIDERS_FILE => plan_provider_section(data_dir, &mut extracted, minimum_generation)?,
         MCP_FILE => plan_mcp_section(data_dir, &mut extracted, minimum_generation)?,
         BROKER_FILE => plan_broker_section(data_dir, &mut extracted, minimum_generation)?,
+        ACCESS_CONTROL_FILE => {
+            plan_access_control_section(data_dir, &mut extracted, minimum_generation)?
+        }
         CONFIG_FILE if manifest.migration_scope == Some(MigrationScope::ClusterFabric) => {
             plan_cluster_section(data_dir, &mut extracted, minimum_generation, false)?
         }
@@ -10095,6 +13156,13 @@ fn rollback_section_split_credentials(
 }
 
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
+    if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric)
+        && matching_cluster_abort_evidence(data_dir, &manifest)?
+    {
+        return Err(ConfigStoreError::Validation(
+            "cluster transaction carries durable abort intent".to_string(),
+        ));
+    }
     let section_split = is_section_layout_scope(manifest.migration_scope);
     if section_split {
         verify_section_split_completion(data_dir, &manifest)?;
@@ -10557,6 +13625,11 @@ fn cleanup_transaction_dirs(
 }
 
 pub(crate) fn discard_uncommitted(data_dir: &Path) -> ConfigStoreResult<()> {
+    if read_optional_migration_file(&data_dir.join(CLUSTER_ABORT_FILE))?.is_some() {
+        return Err(ConfigStoreError::Validation(
+            "cluster abort recovery is still pending".to_string(),
+        ));
+    }
     let journal_path = data_dir.join(JOURNAL_FILE);
     let Some(bytes) = read_optional_migration_file(&journal_path)? else {
         return Ok(());
@@ -10585,6 +13658,10 @@ fn cleanup_orphan_transaction_dirs(data_dir: &Path) -> ConfigStoreResult<()> {
         })?;
         referenced.insert(manifest.stage_dir.clone());
         referenced.insert(format!("{BACKUP_PREFIX}{}", manifest.transaction_id));
+    }
+    if let Some(record) = read_cluster_abort_record(data_dir)? {
+        referenced.insert(record.stage_dir);
+        referenced.insert(format!("{BACKUP_PREFIX}{}", record.transaction_id));
     }
 
     let mut removed = false;
@@ -11015,7 +14092,7 @@ fn facade_source_attestation_is_valid(manifest: &MigrationManifest) -> bool {
         }
         if matches!(
             name.as_str(),
-            MANIFEST_FILE | JOURNAL_FILE | SECTION_LAYOUT_COMPLETION_FILE
+            MANIFEST_FILE | JOURNAL_FILE | CLUSTER_ABORT_FILE | SECTION_LAYOUT_COMPLETION_FILE
         ) || is_compound_internal_derivative_source(name)
         {
             if manifest.files.iter().any(|file| file.name == *name) {
@@ -11283,6 +14360,7 @@ fn valid_source_guard_name(name: &str) -> bool {
             name,
             MANIFEST_FILE
                 | JOURNAL_FILE
+                | CLUSTER_ABORT_FILE
                 | SECTION_LAYOUT_COMPLETION_FILE
                 | crate::SECTION_LAYOUT_FILE
         )
@@ -11625,7 +14703,7 @@ mod tests {
     fn migration_metadata_reads_reject_symlinks_without_following_targets() {
         use std::os::unix::fs::symlink;
 
-        for metadata_name in [MANIFEST_FILE, JOURNAL_FILE] {
+        for metadata_name in [MANIFEST_FILE, JOURNAL_FILE, CLUSTER_ABORT_FILE] {
             let dir = tempfile::tempdir().unwrap();
             let external = dir.path().join("external-metadata.json");
             let external_bytes = br#"{"external":"must-survive"}"#;
@@ -13864,6 +16942,286 @@ mod tests {
         (facade.effective_config(), revision)
     }
 
+    fn active_facade_config_and_section_revision(
+        data_dir: &Path,
+        section: crate::SectionId,
+    ) -> (crate::Config, u64) {
+        let facade = crate::ConfigFacade::open(data_dir).unwrap();
+        let revision = facade.registry().envelope_value(section).unwrap().revision;
+        (facade.effective_config(), revision)
+    }
+
+    fn install_unrelated_credential(data_dir: &Path, value: &str) -> CredentialRef {
+        let reference = credential_ref("provider", "unrelated", "api_key").unwrap();
+        CredentialStore::open(data_dir)
+            .replace(reference.clone(), value, crate::CredentialSource::User, 0)
+            .unwrap();
+        reference
+    }
+
+    fn assert_unrelated_credential(data_dir: &Path, reference: &CredentialRef, value: &str) {
+        assert_eq!(
+            CredentialStore::open(data_dir)
+                .resolve(reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            value
+        );
+    }
+
+    fn persist_owned_domain_with_fault(
+        data_dir: &Path,
+        config: &mut crate::Config,
+        scope: ExactTransactionScope,
+        expected_revision: u64,
+        fault: MigrationFault,
+    ) -> ConfigStoreResult<u64> {
+        let empty = BTreeSet::new();
+        match scope {
+            ExactTransactionScope::ProxyAuth => {
+                let providers = BTreeSet::from(["__proxy_auth".to_string()]);
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &providers,
+                    &empty,
+                    Some(expected_revision),
+                    &empty,
+                    None,
+                    false,
+                    &empty,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::EnvVars => {
+                let intents = config
+                    .env_vars
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect::<BTreeSet<_>>();
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &empty,
+                    &empty,
+                    None,
+                    &intents,
+                    Some(expected_revision),
+                    false,
+                    &empty,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::Notifications => {
+                let intents = BTreeSet::from(["ntfy".to_string()]);
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &empty,
+                    &empty,
+                    None,
+                    &empty,
+                    None,
+                    true,
+                    &intents,
+                    false,
+                    Some(expected_revision),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::Connect => {
+                let mut intents = crate::patch::ConnectSecretIntents::default();
+                intents.token.insert(0);
+                persist_exact_credential_transaction_inner(
+                    data_dir,
+                    config,
+                    &empty,
+                    &empty,
+                    None,
+                    &empty,
+                    None,
+                    false,
+                    &empty,
+                    false,
+                    None,
+                    None,
+                    Some((&intents, expected_revision)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(fault),
+                )
+            }
+            ExactTransactionScope::AccessControl => persist_exact_credential_transaction_inner(
+                data_dir,
+                config,
+                &empty,
+                &empty,
+                None,
+                &empty,
+                None,
+                false,
+                &empty,
+                false,
+                None,
+                None,
+                None,
+                Some((true, &empty, expected_revision)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(fault),
+            ),
+            ExactTransactionScope::Providers
+            | ExactTransactionScope::Mcp
+            | ExactTransactionScope::ClusterFabric => unreachable!("test helper scope"),
+        }
+    }
+
+    fn populate_owned_domain_candidate(
+        config: &mut crate::Config,
+        scope: ExactTransactionScope,
+        suffix: usize,
+    ) -> (CredentialRef, String) {
+        match scope {
+            ExactTransactionScope::ProxyAuth => {
+                let secret = format!("fault-proxy-secret-{suffix}");
+                config.proxy_auth = Some(crate::ProxyAuth {
+                    username: "fault-user".to_string(),
+                    password: secret.clone(),
+                });
+                (credential_ref("proxy", "default", "auth").unwrap(), secret)
+            }
+            ExactTransactionScope::EnvVars => {
+                let name = format!("FAULT_TOKEN_{suffix}");
+                let secret = format!("fault-env-secret-{suffix}");
+                config.env_vars.push(crate::EnvVarEntry {
+                    name: name.clone(),
+                    value: secret.clone(),
+                    secret: true,
+                    value_encrypted: None,
+                    credential_ref: None,
+                    configured: true,
+                    description: None,
+                });
+                (credential_ref("env", &name, "value").unwrap(), secret)
+            }
+            ExactTransactionScope::Notifications => {
+                let secret = format!("fault-notification-secret-{suffix}");
+                config.notifications.ntfy.enabled = true;
+                config.notifications.ntfy.topic = format!("fault-topic-{suffix}");
+                config.notifications.ntfy.token = Some(secret.clone());
+                config.notifications.ntfy.configured = true;
+                (
+                    credential_ref("notification", "ntfy", "token").unwrap(),
+                    secret,
+                )
+            }
+            ExactTransactionScope::Connect => {
+                let id = format!("fault-connect-{suffix}");
+                let secret = format!("fault-connect-secret-{suffix}");
+                config.connect.platforms.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": id.clone(),
+                        "type": "telegram",
+                        "token": secret.clone(),
+                        "allow_from": ["owner"]
+                    }))
+                    .unwrap(),
+                );
+                (credential_ref("connect", &id, "token").unwrap(), secret)
+            }
+            ExactTransactionScope::AccessControl => {
+                let marker = format!("{:064x}", suffix + 1);
+                config.access_control = Some(crate::AccessControlConfig {
+                    password_enabled: true,
+                    repair_required: false,
+                    password_hash: Some(marker.clone()),
+                    password_salt: Some("03".repeat(16)),
+                    password_credential_ref: None,
+                    password_configured: false,
+                    updated_at: None,
+                    devices: Vec::new(),
+                });
+                (
+                    crate::config_crypto::access_password_credential_ref().unwrap(),
+                    marker,
+                )
+            }
+            ExactTransactionScope::Providers
+            | ExactTransactionScope::Mcp
+            | ExactTransactionScope::ClusterFabric => unreachable!("test helper scope"),
+        }
+    }
+
+    fn active_facade_config_and_cluster_revision(data_dir: &Path) -> (crate::Config, u64) {
+        let facade = crate::ConfigFacade::open(data_dir).unwrap();
+        let revision = facade.registry().cluster_fabric.snapshot().revision;
+        (facade.effective_config(), revision)
+    }
+
+    fn cluster_test_node(id: &str, auth: crate::SshAuth) -> crate::Node {
+        crate::Node {
+            id: id.to_string(),
+            label: id.to_string(),
+            placement: crate::NodePlacement::Ssh(crate::SshTarget {
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                auth,
+                host_key_fingerprint: None,
+            }),
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        }
+    }
+
+    fn password_intents(
+        action: crate::ClusterCredentialAction,
+    ) -> crate::ClusterNodeCredentialIntents {
+        crate::ClusterNodeCredentialIntents {
+            password: action,
+            private_key: crate::ClusterCredentialAction::Clear,
+            passphrase: crate::ClusterCredentialAction::Clear,
+        }
+    }
+
     fn assert_active_exact_manifest(data_dir: &Path, expected: ExactTransactionScope) {
         let manifest: MigrationManifest =
             serde_json::from_slice(&std::fs::read(data_dir.join(MANIFEST_FILE)).unwrap()).unwrap();
@@ -14071,6 +17429,650 @@ mod tests {
     }
 
     #[test]
+    fn active_credential_domains_use_owned_section_cas_and_rebase_unrelated_credentials() {
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc1; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), crate::SectionId::Core);
+            let unrelated = install_unrelated_credential(dir.path(), "proxy-unrelated-winner");
+            candidate.proxy_auth = Some(crate::ProxyAuth {
+                username: "proxy-user".to_string(),
+                password: "proxy-secret".to_string(),
+            });
+
+            let committed = persist_proxy_auth_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .core
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "proxy-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc2; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), crate::SectionId::Env);
+            let unrelated = install_unrelated_credential(dir.path(), "env-unrelated-winner");
+            candidate.env_vars.push(crate::EnvVarEntry {
+                name: "OWNED_TOKEN".to_string(),
+                value: "owned-env-secret".to_string(),
+                secret: true,
+                value_encrypted: None,
+                credential_ref: None,
+                configured: true,
+                description: Some("owned metadata".to_string()),
+            });
+
+            let committed = persist_env_var_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeSet::from(["OWNED_TOKEN".to_string()]),
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .env
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "env-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc3; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) = active_facade_config_and_section_revision(
+                dir.path(),
+                crate::SectionId::Notifications,
+            );
+            let unrelated =
+                install_unrelated_credential(dir.path(), "notification-unrelated-winner");
+            candidate.notifications.ntfy.enabled = true;
+            candidate.notifications.ntfy.topic = "owned-topic".to_string();
+            candidate.notifications.ntfy.token = Some("owned-notification-secret".to_string());
+            candidate.notifications.ntfy.configured = true;
+
+            let committed = persist_notification_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeSet::from(["ntfy".to_string()]),
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .notifications
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "notification-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc4; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), crate::SectionId::Connect);
+            let unrelated = install_unrelated_credential(dir.path(), "connect-unrelated-winner");
+            candidate.connect.platforms.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "telegram-owned",
+                    "type": "telegram",
+                    "token": "owned-connect-secret",
+                    "allow_from": ["owner"]
+                }))
+                .unwrap(),
+            );
+            let mut intents = crate::patch::ConnectSecretIntents::default();
+            intents.token.insert(0);
+
+            let committed = persist_connect_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .connect
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "connect-unrelated-winner");
+        }
+
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xc5; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) = active_facade_config_and_section_revision(
+                dir.path(),
+                crate::SectionId::AccessControl,
+            );
+            let unrelated = install_unrelated_credential(dir.path(), "access-unrelated-winner");
+            candidate.access_control = Some(crate::AccessControlConfig {
+                password_enabled: true,
+                repair_required: false,
+                password_hash: Some("a".repeat(64)),
+                password_salt: Some("01".repeat(16)),
+                password_credential_ref: None,
+                password_configured: false,
+                updated_at: None,
+                devices: Vec::new(),
+            });
+
+            let committed = persist_access_control_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                true,
+                &BTreeSet::new(),
+                revision,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1);
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .access_control
+                    .snapshot()
+                    .revision,
+                revision + 1
+            );
+            assert_unrelated_credential(dir.path(), &unrelated, "access-unrelated-winner");
+        }
+    }
+
+    #[test]
+    fn owned_section_transactions_rebase_unrelated_credentials_changed_after_preparation() {
+        for (scope, key) in [
+            (ExactTransactionScope::ProxyAuth, 0xd0),
+            (ExactTransactionScope::EnvVars, 0xd1),
+            (ExactTransactionScope::Notifications, 0xd2),
+            (ExactTransactionScope::Connect, 0xd3),
+            (ExactTransactionScope::AccessControl, 0xd4),
+        ] {
+            let _key = crate::encryption::set_test_encryption_key([key; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) =
+                active_facade_config_and_section_revision(dir.path(), scope.section_id());
+            match scope {
+                ExactTransactionScope::ProxyAuth => {
+                    candidate.proxy_auth = Some(crate::ProxyAuth {
+                        username: "race-proxy-user".to_string(),
+                        password: "race-proxy-secret".to_string(),
+                    });
+                }
+                ExactTransactionScope::EnvVars => {
+                    candidate.env_vars.push(crate::EnvVarEntry {
+                        name: "RACE_TOKEN".to_string(),
+                        value: "race-env-secret".to_string(),
+                        secret: true,
+                        value_encrypted: None,
+                        credential_ref: None,
+                        configured: true,
+                        description: None,
+                    });
+                }
+                ExactTransactionScope::Notifications => {
+                    candidate.notifications.ntfy.enabled = true;
+                    candidate.notifications.ntfy.topic = "race-topic".to_string();
+                    candidate.notifications.ntfy.token =
+                        Some("race-notification-secret".to_string());
+                    candidate.notifications.ntfy.configured = true;
+                }
+                ExactTransactionScope::Connect => {
+                    candidate.connect.platforms.push(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "race-telegram",
+                            "type": "telegram",
+                            "token": "race-connect-secret",
+                            "allow_from": ["owner"]
+                        }))
+                        .unwrap(),
+                    );
+                }
+                ExactTransactionScope::AccessControl => {
+                    candidate.access_control = Some(crate::AccessControlConfig {
+                        password_enabled: true,
+                        repair_required: false,
+                        password_hash: Some("b".repeat(64)),
+                        password_salt: Some("02".repeat(16)),
+                        password_credential_ref: None,
+                        password_configured: false,
+                        updated_at: None,
+                        devices: Vec::new(),
+                    });
+                }
+                ExactTransactionScope::Providers
+                | ExactTransactionScope::Mcp
+                | ExactTransactionScope::ClusterFabric => unreachable!(),
+            }
+
+            let committed = persist_owned_domain_with_fault(
+                dir.path(),
+                &mut candidate,
+                scope,
+                revision,
+                MigrationFault::BeforeExactStagingUnrelatedCredentialRace,
+            )
+            .unwrap();
+
+            assert_eq!(committed, revision + 1, "{scope:?}");
+            assert_eq!(
+                crate::ConfigFacade::open(dir.path())
+                    .unwrap()
+                    .registry()
+                    .envelope_value(scope.section_id())
+                    .unwrap()
+                    .revision,
+                committed,
+                "{scope:?}"
+            );
+            let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+            assert_eq!(
+                CredentialStore::open(dir.path())
+                    .resolve(&unrelated)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                "concurrent-pre-staging-winner",
+                "{scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_credential_sections_recover_every_durable_boundary_atomically() {
+        let scopes = [
+            ExactTransactionScope::ProxyAuth,
+            ExactTransactionScope::EnvVars,
+            ExactTransactionScope::Notifications,
+            ExactTransactionScope::Connect,
+            ExactTransactionScope::AccessControl,
+        ];
+        let faults = [
+            MigrationFault::AfterManifest,
+            MigrationFault::AfterCredentials,
+            MigrationFault::AfterAuthoritativeSection,
+        ];
+        for (scope_index, scope) in scopes.into_iter().enumerate() {
+            for (fault_index, fault) in faults.into_iter().enumerate() {
+                let case = scope_index * faults.len() + fault_index;
+                let _key = crate::encryption::set_test_encryption_key([0xe0 + case as u8; 32]);
+                let dir = tempfile::tempdir().unwrap();
+                crate::migrate_config_facade_layout(dir.path()).unwrap();
+                let (mut candidate, revision) =
+                    active_facade_config_and_section_revision(dir.path(), scope.section_id());
+                let (reference, secret_marker) =
+                    populate_owned_domain_candidate(&mut candidate, scope, case);
+
+                let error = persist_owned_domain_with_fault(
+                    dir.path(),
+                    &mut candidate,
+                    scope,
+                    revision,
+                    fault,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(error, ConfigStoreError::Io(_)),
+                    "{scope:?} {fault:?}"
+                );
+                assert!(
+                    crate::ConfigFacade::open(dir.path()).is_err(),
+                    "{scope:?} {fault:?} must not expose a partial generation"
+                );
+                assert!(
+                    recover_pending_config_transaction(dir.path()).unwrap(),
+                    "{scope:?} {fault:?}"
+                );
+                let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+                assert_eq!(
+                    fresh
+                        .registry()
+                        .envelope_value(scope.section_id())
+                        .unwrap()
+                        .revision,
+                    revision + 1,
+                    "{scope:?} {fault:?}"
+                );
+                assert!(
+                    CredentialStore::open(dir.path())
+                        .status(&reference)
+                        .unwrap()
+                        .configured,
+                    "{scope:?} {fault:?}"
+                );
+                for file in [scope.section_id().descriptor().file_name, CREDENTIALS_FILE] {
+                    let bytes = std::fs::read_to_string(dir.path().join(file)).unwrap();
+                    assert!(
+                        !bytes.contains(&secret_marker),
+                        "{scope:?} {fault:?} leaked into {file}"
+                    );
+                }
+                assert_active_exact_manifest(dir.path(), scope);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_env_section_revision_conflicts_without_touching_credentials() {
+        let _key = crate::encryption::set_test_encryption_key([0xc6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, stale_revision) =
+            active_facade_config_and_section_revision(dir.path(), crate::SectionId::Env);
+        candidate.env_vars.push(crate::EnvVarEntry {
+            name: "STALE_TOKEN".to_string(),
+            value: "must-not-commit".to_string(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let path = dir.path().join(ENV_FILE);
+        let mut envelope: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["revision"] = Value::from(stale_revision + 1);
+        let bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+        crate::section_facade::validate_section_envelope(ENV_FILE, &bytes, stale_revision + 1)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+
+        let error = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &BTreeSet::from(["STALE_TOKEN".to_string()]),
+            stale_revision,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict {
+                expected,
+                actual
+            } if expected == stale_revision && actual == stale_revision + 1
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+    }
+
+    #[test]
+    fn env_keep_rejects_a_semantically_invalid_active_credential_without_writes() {
+        let _key = crate::encryption::set_test_encryption_key([0x4d; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut seed, initial_revision) =
+            active_facade_config_and_section_revision(dir.path(), crate::SectionId::Env);
+        seed.env_vars.push(crate::EnvVarEntry {
+            name: "MASKED_TOKEN".to_string(),
+            value: "initial-secret".to_string(),
+            secret: true,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        });
+        let intents = BTreeSet::from(["MASKED_TOKEN".to_string()]);
+        let section_revision = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut seed,
+            &intents,
+            initial_revision,
+        )
+        .unwrap();
+        let reference = seed.env_vars[0].credential_ref.clone().unwrap();
+        let credential_path = dir.path().join(CREDENTIALS_FILE);
+        let mut credential_document: Value =
+            serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
+        credential_document["data"]["entries"][reference.as_str()]["ciphertext"] =
+            Value::String(crate::encryption::encrypt("********").unwrap());
+        std::fs::write(
+            &credential_path,
+            serde_json::to_vec_pretty(&credential_document).unwrap(),
+        )
+        .unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+
+        let exact = read_exact_credential_section_snapshot(
+            dir.path(),
+            crate::SectionId::Env,
+            Some(section_revision),
+        )
+        .unwrap();
+        let mut keep = crate::Config::default();
+        let metadata = exact.install_into(&mut keep);
+        assert!(!metadata.status(&reference).configured);
+        let entry = keep
+            .env_vars
+            .iter_mut()
+            .find(|entry| entry.name == "MASKED_TOKEN")
+            .unwrap();
+        entry.value.clear();
+        entry.description = Some("metadata-only edit".to_string());
+
+        let env_before = std::fs::read(dir.path().join(ENV_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let directory_before = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        let error = persist_env_var_credential_transaction_at_revision_with_adoption(
+            dir.path(),
+            &mut keep,
+            &intents,
+            section_revision,
+            &process_facade,
+        )
+        .err()
+        .expect("retaining a semantic mask must fail");
+        assert!(matches!(
+            error,
+            ConfigStoreError::Validation(message)
+                if message.contains("explicitly replace or clear")
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(ENV_FILE)).unwrap(),
+            env_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>(),
+            directory_before
+        );
+        assert!(!dir.path().join(JOURNAL_FILE).exists());
+        assert_active_exact_manifest(dir.path(), ExactTransactionScope::EnvVars);
+
+        let get = read_exact_credential_section_snapshot(dir.path(), crate::SectionId::Env, None)
+            .unwrap();
+        assert!(
+            !get.credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == reference)
+                .unwrap()
+                .configured,
+            "GET/status must report the invalid active record truthfully"
+        );
+
+        let entry = keep
+            .env_vars
+            .iter_mut()
+            .find(|entry| entry.name == "MASKED_TOKEN")
+            .unwrap();
+        entry.value = "replacement-secret".to_string();
+        entry.configured = true;
+        let repaired = persist_env_var_credential_transaction_at_revision_with_adoption(
+            dir.path(),
+            &mut keep,
+            &intents,
+            section_revision,
+            &process_facade,
+        )
+        .unwrap();
+        assert_eq!(repaired.revision, section_revision + 1);
+        assert!(
+            repaired
+                .runtime
+                .unwrap()
+                .credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == reference)
+                .unwrap()
+                .configured
+        );
+    }
+
+    #[test]
+    fn adopted_env_semantic_noop_catches_up_only_the_stale_owned_generation() {
+        let _key = crate::encryption::set_test_encryption_key([0x5a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(process_facade.registry().env.snapshot().revision, 0);
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 0);
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut external = external_facade.effective_config();
+        external.env_vars.push(crate::EnvVarEntry {
+            name: "PUBLIC_VALUE".to_string(),
+            value: "durable-value".to_string(),
+            secret: false,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: Some("external generation".to_string()),
+        });
+        let intents = BTreeSet::from(["PUBLIC_VALUE".to_string()]);
+        let revision = persist_env_var_credential_transaction_at_revision(
+            dir.path(),
+            &mut external,
+            &intents,
+            0,
+        )
+        .unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(
+            process_facade.registry().env.snapshot().revision,
+            0,
+            "the process facade is intentionally stale before its no-op write"
+        );
+
+        let env_before = std::fs::read(dir.path().join(ENV_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut retry = fresh.effective_config();
+        let commit = persist_env_var_credential_transaction_at_revision_with_adoption(
+            dir.path(),
+            &mut retry,
+            &intents,
+            revision,
+            &process_facade,
+        )
+        .unwrap();
+        let CredentialSectionTransactionCommit {
+            revision: committed_revision,
+            section_adoption,
+            credential_adoption,
+            section,
+            runtime,
+        } = commit;
+        assert_eq!(committed_revision, revision);
+        assert_eq!(section.unwrap().revision, committed_revision);
+        assert!(matches!(
+            section_adoption.unwrap().unwrap(),
+            crate::ConfigSectionEvent::Changed {
+                ref section,
+                revision: 1
+            } if section == "env"
+        ));
+        assert!(matches!(
+            credential_adoption.unwrap().unwrap().unwrap(),
+            crate::ConfigSectionEvent::Changed {
+                ref section,
+                revision: 1
+            } if section == "credentials"
+        ));
+
+        let mut live = crate::Config::default();
+        live.server.port = 42_424;
+        live.cluster_fabric.nodes.push(crate::Node {
+            id: "process-only-node".to_string(),
+            label: "process-only-node".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        runtime.unwrap().install_into(&mut live);
+        assert_eq!(live.server.port, 42_424);
+        assert_eq!(live.cluster_fabric.nodes[0].id, "process-only-node");
+        assert!(live.env_vars.iter().any(|entry| {
+            entry.name == "PUBLIC_VALUE"
+                && entry.value == "durable-value"
+                && entry.description.as_deref() == Some("external generation")
+        }));
+        assert_eq!(process_facade.registry().env.snapshot().revision, 1);
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 1);
+        assert_eq!(
+            std::fs::read(dir.path().join(ENV_FILE)).unwrap(),
+            env_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+    }
+
+    #[test]
     fn active_notification_exact_transaction_is_visible_to_fresh_facades_after_set_and_clear() {
         let _key = crate::encryption::set_test_encryption_key([0x53; 32]);
         let dir = tempfile::tempdir().unwrap();
@@ -14206,6 +18208,7 @@ mod tests {
         let (mut candidate, revision) = active_facade_config_and_credential_revision(dir.path());
         candidate.access_control = Some(crate::AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some("a".repeat(64)),
             password_salt: Some("01".repeat(16)),
             password_credential_ref: None,
@@ -14267,9 +18270,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::migrate_config_facade_layout(dir.path()).unwrap();
         let root_before = read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap();
-        let intents = BTreeSet::from(["active-node".to_string()]);
 
-        let (mut set, revision) = active_facade_config_and_credential_revision(dir.path());
+        let (mut set, revision) = active_facade_config_and_cluster_revision(dir.path());
         set.cluster_fabric = serde_json::from_value(serde_json::json!({
             "nodes": [{
                 "id": "active-node",
@@ -14278,11 +18280,19 @@ mod tests {
                     "type": "ssh",
                     "host": "127.0.0.1",
                     "username": "deploy",
-                    "auth": {"method": "password", "password": "active-ssh-secret"}
+                    "auth": {"method": "password"}
                 }
             }]
         }))
         .unwrap();
+        let intents = BTreeMap::from([(
+            "active-node".to_string(),
+            crate::ClusterNodeCredentialIntents {
+                password: crate::ClusterCredentialAction::Replace("active-ssh-secret".to_string()),
+                private_key: crate::ClusterCredentialAction::Clear,
+                passphrase: crate::ClusterCredentialAction::Clear,
+            },
+        )]);
         persist_cluster_fabric_credential_transaction_at_revision(
             dir.path(),
             &mut set,
@@ -14292,9 +18302,13 @@ mod tests {
         .unwrap();
         assert_active_exact_manifest(dir.path(), ExactTransactionScope::ClusterFabric);
         let reference = crate::cluster_password_credential_ref("active-node").unwrap();
-        let (mut clear, revision) = active_facade_config_and_credential_revision(dir.path());
+        let (mut clear, revision) = active_facade_config_and_cluster_revision(dir.path());
         assert!(clear.cluster_fabric.credential_refs["active-node"].password_configured);
         clear.cluster_fabric.nodes.clear();
+        let intents = BTreeMap::from([(
+            "active-node".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
         persist_cluster_fabric_credential_transaction_at_revision(
             dir.path(),
             &mut clear,
@@ -14302,7 +18316,7 @@ mod tests {
             revision,
         )
         .unwrap();
-        let (fresh, _) = active_facade_config_and_credential_revision(dir.path());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
         assert!(fresh.cluster_fabric.nodes.is_empty());
         assert!(!fresh
             .cluster_fabric
@@ -14316,6 +18330,2088 @@ mod tests {
             read_target_or_empty(&dir.path().join(CONFIG_FILE)).unwrap(),
             root_before
         );
+    }
+
+    #[test]
+    fn cluster_section_revision_is_authoritative_and_rebases_unrelated_credentials() {
+        let _key = crate::encryption::set_test_encryption_key([0xb1; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        let store = CredentialStore::open(dir.path());
+        store
+            .replace(
+                unrelated.clone(),
+                "unrelated-secret",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+
+        let (mut candidate, section_revision) =
+            active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(section_revision, 0);
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "local-1".to_string(),
+            label: "local-1".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "local-1".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        let committed = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            section_revision,
+        )
+        .unwrap();
+        assert_eq!(committed, 1, "the returned revision is the cluster section");
+        assert_eq!(
+            store.revision().unwrap(),
+            1,
+            "metadata-only cluster edits do not manufacture credential revisions"
+        );
+        assert_eq!(
+            store.resolve(&unrelated).unwrap().unwrap().expose(),
+            "unrelated-secret"
+        );
+
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        candidate.cluster_fabric.nodes[0].label = "stale-loser".to_string();
+        let error = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            section_revision,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+    }
+
+    #[test]
+    fn cluster_transaction_merges_unrelated_post_commit_credential_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0xb2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "race-local".to_string(),
+            label: "race-local".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "race-local".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+
+        let committed = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            None,
+            Some(MigrationFault::AfterExactCommitUnrelatedCredentialRace),
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&unrelated)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-unrelated-winner"
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("race-local").is_some());
+    }
+
+    #[test]
+    fn adopted_cluster_transaction_does_not_publish_an_intentional_abort() {
+        let _key = crate::encryption::set_test_encryption_key([0xba; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "aborted-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let intents = BTreeMap::from([(
+            "aborted-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "must-roll-back".to_string(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("shared by another consumer"));
+        assert_eq!(callbacks, 0, "a rolled-back intent must not be adopted");
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        assert!(!dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn aborting_cluster_manifest_never_adopts_when_cleanup_recovery_keeps_failing() {
+        let _key = crate::encryption::set_test_encryption_key([0xbd; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "phantom-abort-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let abort_secret = Uuid::new_v4().to_string();
+        let intents = BTreeMap::from([(
+            "phantom-abort-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(abort_secret)),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AbortCleanupRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persistent cluster abort cleanup failure"));
+        assert_eq!(callbacks, 0, "an aborting candidate must never be adopted");
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.state, MigrationState::Aborting);
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Aborting
+        ));
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(
+            recover_committed(
+                dir.path(),
+                #[cfg(test)]
+                None,
+            )
+            .is_err(),
+            "recovery must resume abort and retain its fail-closed marker"
+        );
+        let persisted: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(persisted.state, MigrationState::Aborting);
+        assert_eq!(callbacks, 0);
+
+        clear_cluster_exact_commit_test_fault(dir.path());
+        assert!(recover_committed(
+            dir.path(),
+            #[cfg(test)]
+            None,
+        )
+        .unwrap()
+        .is_none());
+        assert!(!manifest_path.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn abort_marker_failure_is_still_a_typed_noncommit_outcome() {
+        let _key = crate::encryption::set_test_encryption_key([0xbe; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let providers_path = dir.path().join(PROVIDERS_FILE);
+        let providers_before = std::fs::read(&providers_path).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "marker-failure-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let abort_secret = Uuid::new_v4().to_string();
+        let intents = BTreeMap::from([(
+            "marker-failure-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                abort_secret.clone(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AbortMarkerRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persistent cluster abort marker failure"));
+        assert_eq!(
+            callbacks, 0,
+            "an in-memory abort outcome must bypass committed reporting"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.state,
+            MigrationState::Pending,
+            "the injected marker failure must exercise the typed fallback"
+        );
+        let journal_path = dir.path().join(JOURNAL_FILE);
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(
+            journal.state,
+            MigrationState::Aborting,
+            "the immutable journal must retain durable non-commit intent"
+        );
+        let stage_dir = dir.path().join(&journal.stage_dir);
+        let backup_dir = dir
+            .path()
+            .join(format!("{BACKUP_PREFIX}{}", journal.transaction_id));
+        assert!(stage_dir.exists());
+        assert!(backup_dir.exists());
+        assert_ne!(
+            std::fs::read(&providers_path).unwrap(),
+            providers_before,
+            "the conflict must still be present before restart"
+        );
+
+        // Simulate a restart after the external conflict has disappeared. The
+        // Pending main manifest alone would now be installable, so recovery
+        // must honor the durable Aborting journal instead.
+        std::fs::write(&providers_path, &providers_before).unwrap();
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Aborting
+        ));
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+
+        clear_cluster_exact_commit_test_fault(dir.path());
+        assert!(
+            !recover_pending_config_transaction(dir.path()).unwrap(),
+            "restart recovery must roll back rather than report a committed candidate"
+        );
+        assert!(
+            !recover_pending_config_transaction(dir.path()).unwrap(),
+            "completed abort recovery must be idempotent"
+        );
+        assert!(!manifest_path.exists());
+        assert!(!journal_path.exists());
+        assert!(!stage_dir.exists());
+        assert!(!backup_dir.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        let password_ref = crate::cluster_password_credential_ref("marker-failure-node").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&password_ref)
+            .unwrap()
+            .is_none());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh.cluster_fabric.node("marker-failure-node").is_none());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap())
+                        .contains(&abort_secret),
+                    "aborted cluster plaintext remained in {}",
+                    entry.path().display()
+                );
+            }
+        }
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn abort_journal_marker_failure_falls_back_to_main_abort_across_restart() {
+        let _key = crate::encryption::set_test_encryption_key([0xc5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let providers_path = dir.path().join(PROVIDERS_FILE);
+        let providers_before = std::fs::read(&providers_path).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "journal-marker-failure-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let abort_secret = Uuid::new_v4().to_string();
+        let intents = BTreeMap::from([(
+            "journal-marker-failure-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                abort_secret.clone(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AbortJournalMarkerAndCleanupRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persistent cluster abort cleanup failure"));
+        assert_eq!(callbacks, 0);
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.state,
+            MigrationState::Aborting,
+            "the main manifest must be the redundant durable abort marker"
+        );
+        let journal_path = dir.path().join(JOURNAL_FILE);
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(
+            journal.state,
+            MigrationState::Pending,
+            "journal marker failure must preserve the original rollback journal"
+        );
+        let stage_dir = dir.path().join(&journal.stage_dir);
+        let backup_dir = dir
+            .path()
+            .join(format!("{BACKUP_PREFIX}{}", journal.transaction_id));
+        assert!(stage_dir.exists());
+        assert!(backup_dir.exists());
+        assert_ne!(std::fs::read(&providers_path).unwrap(), providers_before);
+
+        // The original conflict disappears before restart. Keep the injected
+        // journal failure active: recovery can succeed only if the durable main
+        // Aborting marker skips any attempt to mutate the Pending journal.
+        std::fs::write(&providers_path, &providers_before).unwrap();
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Aborting
+        ));
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(
+            !recover_pending_config_transaction(dir.path()).unwrap(),
+            "restart recovery must roll back from the main abort marker"
+        );
+        clear_cluster_exact_commit_test_fault(dir.path());
+        assert!(!recover_pending_config_transaction(dir.path()).unwrap());
+
+        assert!(!manifest_path.exists());
+        assert!(!journal_path.exists());
+        assert!(!stage_dir.exists());
+        assert!(!backup_dir.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        let password_ref =
+            crate::cluster_password_credential_ref("journal-marker-failure-node").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&password_ref)
+            .unwrap()
+            .is_none());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh
+            .cluster_fabric
+            .node("journal-marker-failure-node")
+            .is_none());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap())
+                        .contains(&abort_secret),
+                    "aborted cluster plaintext remained in {}",
+                    entry.path().display()
+                );
+            }
+        }
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn abort_double_marker_failure_recovers_durable_abort_after_restart() {
+        let _key = crate::encryption::set_test_encryption_key([0xc6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let providers_path = dir.path().join(PROVIDERS_FILE);
+        let providers_before = std::fs::read(&providers_path).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "double-marker-failure-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let abort_secret = Uuid::new_v4().to_string();
+        let intents = BTreeMap::from([(
+            "double-marker-failure-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                abort_secret.clone(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AbortBothMarkersRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persistent cluster abort marker failure"));
+        assert_eq!(
+            callbacks, 0,
+            "durable abort proof must bypass committed reporting"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let journal_path = dir.path().join(JOURNAL_FILE);
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(manifest.state, MigrationState::Pending);
+        assert_eq!(journal.state, MigrationState::Pending);
+        let abort_path = dir.path().join(CLUSTER_ABORT_FILE);
+        let abort_record: ClusterAbortRecord =
+            serde_json::from_slice(&std::fs::read(&abort_path).unwrap()).unwrap();
+        validate_matching_cluster_abort_record(&manifest, &abort_record).unwrap();
+        assert_eq!(
+            abort_record.rollback_journal_sha256,
+            cluster_rollback_journal_sha256(&journal).unwrap()
+        );
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Aborting
+        ));
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+
+        // Once the rejected external consumer disappears, only the dedicated
+        // abort proof distinguishes this tail from an ordinary Pending commit.
+        std::fs::write(&providers_path, &providers_before).unwrap();
+        clear_cluster_exact_commit_test_fault(dir.path());
+        assert!(!recover_pending_config_transaction(dir.path()).unwrap());
+        assert!(!recover_pending_config_transaction(dir.path()).unwrap());
+        assert!(!manifest_path.exists());
+        assert!(!journal_path.exists());
+        assert!(!abort_path.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        let password_ref =
+            crate::cluster_password_credential_ref("double-marker-failure-node").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&password_ref)
+            .unwrap()
+            .is_none());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh
+            .cluster_fabric
+            .node("double-marker-failure-node")
+            .is_none());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap())
+                        .contains(&abort_secret),
+                    "aborted cluster plaintext remained in {}",
+                    entry.path().display()
+                );
+            }
+        }
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn all_abort_marker_write_failures_return_indeterminate_without_publication() {
+        let _key = crate::encryption::set_test_encryption_key([0xc7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "indeterminate-marker-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let intents = BTreeMap::from([(
+            "indeterminate-marker-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "indeterminate-marker-secret".to_string(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AbortAllMarkersRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ConfigStoreError::CommitIndeterminate(_)));
+        assert!(error.to_string().contains("outcome is indeterminate"));
+        assert_eq!(callbacks, 0);
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        assert!(!dir.path().join(CLUSTER_ABORT_FILE).exists());
+
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap()).unwrap();
+        assert_eq!(manifest.state, MigrationState::Pending);
+        assert_eq!(journal.state, MigrationState::Pending);
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Committed(_)
+        ));
+        clear_cluster_exact_commit_test_fault(dir.path());
+    }
+
+    #[test]
+    fn unproven_commit_recovery_failure_is_typed_without_callback_and_startup_recovers() {
+        let _key = crate::encryption::set_test_encryption_key([0xcc; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "startup-recovery-node".to_string(),
+            label: "startup-recovery-node".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "startup-recovery-node".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AfterManifestRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ConfigStoreError::CommitIndeterminate(_)));
+        assert_eq!(
+            callbacks, 0,
+            "an unproven candidate must not invoke the post-commit callback"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before,
+            "the durable authority must remain at the pre-final-persist generation"
+        );
+        assert!(dir.path().join(MANIFEST_FILE).exists());
+
+        let reopened = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            reopened.registry().cluster_fabric.snapshot().revision,
+            revision + 1
+        );
+        assert!(reopened
+            .effective_config()
+            .cluster_fabric
+            .node("startup-recovery-node")
+            .is_some());
+        assert_active_exact_manifest(dir.path(), ExactTransactionScope::ClusterFabric);
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn post_manifest_recovery_double_marker_failure_never_publishes_and_restarts_as_abort() {
+        let _key = crate::encryption::set_test_encryption_key([0xc8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let providers_path = dir.path().join(PROVIDERS_FILE);
+        let providers_before = std::fs::read(&providers_path).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "post-manifest-abort-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let abort_secret = Uuid::new_v4().to_string();
+        let intents = BTreeMap::from([(
+            "post-manifest-abort-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                abort_secret.clone(),
+            )),
+        )]);
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let mut callbacks = 0;
+        let mut callback = |_: u64,
+                            _: bool,
+                            _: &crate::ClusterFabricConfig,
+                            _: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            _: ConfigStoreResult<()>| {
+            callbacks += 1;
+        };
+        set_cluster_exact_commit_test_fault(
+            dir.path().to_path_buf(),
+            ClusterExactCommitTestFault::AfterManifestAbortBothMarkersRecoveryFailure,
+        );
+
+        let error = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterConsumerConflict),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("persistent cluster abort marker failure"));
+        assert_eq!(
+            callbacks, 0,
+            "fallback recovery must propagate abort outcome instead of reporting a commit"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let journal_path = dir.path().join(JOURNAL_FILE);
+        let journal: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        let abort_path = dir.path().join(CLUSTER_ABORT_FILE);
+        let abort_record: ClusterAbortRecord =
+            serde_json::from_slice(&std::fs::read(&abort_path).unwrap()).unwrap();
+        assert_eq!(manifest.state, MigrationState::Pending);
+        assert_eq!(journal.state, MigrationState::Pending);
+        validate_matching_cluster_abort_record(&manifest, &abort_record).unwrap();
+        assert_eq!(
+            abort_record.rollback_journal_sha256,
+            cluster_rollback_journal_sha256(&journal).unwrap()
+        );
+        assert!(matches!(
+            load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+            LiveClusterTransaction::Aborting
+        ));
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+
+        std::fs::write(&providers_path, &providers_before).unwrap();
+        clear_cluster_exact_commit_test_fault(dir.path());
+        assert!(
+            !recover_pending_config_transaction(dir.path()).unwrap(),
+            "restart must roll back a durably classified post-manifest abort"
+        );
+        assert!(!recover_pending_config_transaction(dir.path()).unwrap());
+        assert!(!manifest_path.exists());
+        assert!(!journal_path.exists());
+        assert!(!abort_path.exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        let password_ref =
+            crate::cluster_password_credential_ref("post-manifest-abort-node").unwrap();
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&password_ref)
+            .unwrap()
+            .is_none());
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh
+            .cluster_fabric
+            .node("post-manifest-abort-node")
+            .is_none());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap())
+                        .contains(&abort_secret),
+                    "aborted cluster plaintext remained in {}",
+                    entry.path().display()
+                );
+            }
+        }
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn main_aborting_with_missing_or_corrupt_journal_fails_closed() {
+        for (index, corrupt) in [false, true].into_iter().enumerate() {
+            let _key = crate::encryption::set_test_encryption_key([0xc9 + index as u8; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+            let node_id = format!("broken-abort-journal-node-{index}");
+            candidate.cluster_fabric.nodes.push(cluster_test_node(
+                &node_id,
+                crate::SshAuth::Password {
+                    password: String::new(),
+                    password_encrypted: None,
+                },
+            ));
+            let intents = BTreeMap::from([(
+                node_id.clone(),
+                password_intents(crate::ClusterCredentialAction::Replace(format!(
+                    "broken-abort-journal-secret-{index}"
+                ))),
+            )]);
+            let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+            let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+
+            assert!(persist_cluster_fabric_credential_transaction_inner(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                revision,
+                None,
+                Some(MigrationFault::AfterManifest),
+            )
+            .is_err());
+            let manifest_path = dir.path().join(MANIFEST_FILE);
+            let mut manifest: MigrationManifest =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            assert_eq!(manifest.state, MigrationState::Pending);
+            manifest.state = MigrationState::Aborting;
+            write_manifest(manifest_path.clone(), &manifest).unwrap();
+
+            let journal_path = dir.path().join(JOURNAL_FILE);
+            if corrupt {
+                std::fs::write(&journal_path, b"{corrupt").unwrap();
+            } else {
+                std::fs::remove_file(&journal_path).unwrap();
+            }
+
+            assert!(
+                recover_pending_config_transaction(dir.path()).is_err(),
+                "an Aborting main manifest must not guess without its rollback journal"
+            );
+            assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+            assert!(
+                crate::ConfigFacade::open(dir.path()).is_err(),
+                "facade open must retain the prior live generation"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+                cluster_before
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+                credentials_before
+            );
+            let password_ref = crate::cluster_password_credential_ref(&node_id).unwrap();
+            assert!(CredentialStore::open(dir.path())
+                .resolve_unchecked(&password_ref)
+                .unwrap()
+                .is_none());
+            assert!(manifest_path.exists());
+            assert_eq!(
+                serde_json::from_slice::<MigrationManifest>(
+                    &std::fs::read(&manifest_path).unwrap()
+                )
+                .unwrap()
+                .state,
+                MigrationState::Aborting
+            );
+        }
+    }
+
+    #[test]
+    fn complete_cluster_abort_manifest_is_not_a_live_commit() {
+        let _key = crate::encryption::set_test_encryption_key([0xbc; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "never-installed".to_string(),
+            label: "never-installed".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "never-installed".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        assert!(persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            None,
+            Some(MigrationFault::AfterManifest),
+        )
+        .is_err());
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let mut manifest: MigrationManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.state, MigrationState::Pending);
+        manifest.state = MigrationState::Complete;
+        write_manifest(manifest_path, &manifest).unwrap();
+
+        assert!(
+            matches!(
+                load_live_cluster_transaction_manifest(dir.path(), &manifest).unwrap(),
+                LiveClusterTransaction::NotCommitted
+            ),
+            "Complete plus rolled-back/nonmatching authority is an abort tail"
+        );
+    }
+
+    #[test]
+    fn adopted_cluster_transaction_reports_the_actual_rebased_candidate() {
+        let _key = crate::encryption::set_test_encryption_key([0xbb; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut baseline, revision) = active_facade_config_and_cluster_revision(dir.path());
+        baseline.cluster_fabric.nodes.push(crate::Node {
+            id: "baseline-node".to_string(),
+            label: "baseline-node".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut baseline,
+            &BTreeMap::from([(
+                "baseline-node".to_string(),
+                crate::ClusterNodeCredentialIntents::clear_all(),
+            )]),
+            revision,
+        )
+        .unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "planned-node".to_string(),
+            label: "planned-node".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "planned-node".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        let mut observed = None;
+        let mut callback = |committed_revision: u64,
+                            changed: bool,
+                            committed: &crate::ClusterFabricConfig,
+                            runtime: ConfigStoreResult<ExactClusterRuntimeSnapshot>,
+                            recovery: ConfigStoreResult<()>| {
+            observed = Some((
+                committed_revision,
+                changed,
+                committed.clone(),
+                runtime.is_ok(),
+                recovery.is_ok(),
+            ));
+        };
+
+        let committed = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            Some(&mut callback),
+            Some(MigrationFault::AfterExactClusterSectionRebase),
+        )
+        .unwrap();
+
+        assert_eq!(committed, 3);
+        let (callback_revision, changed, callback_candidate, runtime_ok, recovery_ok) =
+            observed.expect("post-commit callback");
+        assert_eq!(callback_revision, committed);
+        assert!(changed);
+        assert!(runtime_ok);
+        assert!(recovery_ok);
+        for node_id in ["external-rebase-node", "planned-node"] {
+            assert!(callback_candidate.node(node_id).is_some());
+            assert!(candidate.cluster_fabric.node(node_id).is_some());
+        }
+        let (fresh, fresh_revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(fresh_revision, committed);
+        assert_eq!(fresh.cluster_fabric, callback_candidate);
+    }
+
+    #[test]
+    fn adopted_cluster_semantic_noop_catches_up_exact_credential_generation() {
+        let _key = crate::encryption::set_test_encryption_key([0x7e; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            0
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 0);
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut external = external_facade.effective_config();
+        external.cluster_fabric.nodes.push(cluster_test_node(
+            "credential-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                &BTreeMap::from([(
+                    "credential-node".to_string(),
+                    password_intents(crate::ClusterCredentialAction::Replace(
+                        "captured-password".to_string(),
+                    )),
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut retry = fresh.effective_config();
+        let commit = persist_cluster_fabric_credential_transaction_with_adoption(
+            dir.path(),
+            &mut retry,
+            &BTreeMap::from([(
+                "credential-node".to_string(),
+                password_intents(crate::ClusterCredentialAction::Keep),
+            )]),
+            1,
+            &process_facade,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(commit.revision, 1);
+        assert!(matches!(
+            commit.adoption.unwrap().unwrap(),
+            crate::ConfigSectionEvent::Changed {
+                ref section,
+                revision: 1
+            } if section == "cluster-fabric"
+        ));
+        commit.credential_adoption.unwrap().unwrap();
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            1
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 1);
+        let runtime = commit.runtime.unwrap();
+        let crate::NodePlacement::Ssh(target) = &runtime
+            .cluster_fabric
+            .node("credential-node")
+            .unwrap()
+            .placement
+        else {
+            panic!("credential node must remain SSH-placed")
+        };
+        let crate::SshAuth::Password { password, .. } = &target.auth else {
+            panic!("credential node must remain password-authenticated")
+        };
+        assert_eq!(password, "captured-password");
+    }
+
+    #[test]
+    fn adopted_cluster_reset_noop_catches_up_exact_credential_generation() {
+        let _key = crate::encryption::set_test_encryption_key([0x7f; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let process_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut external = external_facade.effective_config();
+        external.cluster_fabric.nodes.push(cluster_test_node(
+            "reset-credential-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                &BTreeMap::from([(
+                    "reset-credential-node".to_string(),
+                    password_intents(crate::ClusterCredentialAction::Replace(
+                        "reset-password".to_string(),
+                    )),
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let reset_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut reset = reset_facade.effective_config();
+        reset.cluster_fabric = crate::ClusterFabricConfig::default();
+        assert_eq!(
+            persist_cluster_fabric_reset_at_revision_with_adoption(
+                dir.path(),
+                &mut reset,
+                1,
+                &reset_facade,
+                |_, _| {},
+            )
+            .unwrap()
+            .revision,
+            2
+        );
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            0
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 0);
+
+        let fresh = crate::ConfigFacade::open(dir.path()).unwrap();
+        let mut retry = fresh.effective_config();
+        let commit = persist_cluster_fabric_reset_at_revision_with_adoption(
+            dir.path(),
+            &mut retry,
+            2,
+            &process_facade,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(commit.revision, 2);
+        commit.adoption.unwrap().unwrap();
+        commit.credential_adoption.unwrap().unwrap();
+        assert_eq!(
+            process_facade.registry().cluster_fabric.snapshot().revision,
+            2
+        );
+        assert_eq!(process_facade.registry().credentials.snapshot().revision, 2);
+        assert!(commit.runtime.unwrap().cluster_fabric.nodes.is_empty());
+    }
+
+    #[test]
+    fn cluster_transaction_rebases_unrelated_pre_manifest_credential_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0xb6; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "pre-manifest-local".to_string(),
+            label: "pre-manifest-local".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "pre-manifest-local".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+
+        let committed = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            None,
+            Some(MigrationFault::BeforeExactCommitUnrelatedCredentialRace),
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&unrelated)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-winner"
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("pre-manifest-local").is_some());
+    }
+
+    #[test]
+    fn cluster_transaction_rebases_unrelated_pre_staging_credential_winner() {
+        let _key = crate::encryption::set_test_encryption_key([0xb7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "pre-staging-local".to_string(),
+            label: "pre-staging-local".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let intents = BTreeMap::from([(
+            "pre-staging-local".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+
+        let committed = persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut candidate,
+            &intents,
+            revision,
+            None,
+            Some(MigrationFault::BeforeExactStagingUnrelatedCredentialRace),
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        let unrelated = credential_ref("provider", "anthropic", "api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&unrelated)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-pre-staging-winner"
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("pre-staging-local").is_some());
+    }
+
+    #[test]
+    fn cluster_password_key_and_passphrase_actions_are_explicit_and_secret_free() {
+        let _key = crate::encryption::set_test_encryption_key([0xb3; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut create, revision) = active_facade_config_and_cluster_revision(dir.path());
+        create.cluster_fabric.nodes.push(cluster_test_node(
+            "ssh-1",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let mut intents = BTreeMap::from([(
+            "ssh-1".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "password-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut create,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+        let store = CredentialStore::open(dir.path());
+        let password_ref = crate::cluster_password_credential_ref("ssh-1").unwrap();
+        let key_ref = crate::cluster_private_key_credential_ref("ssh-1").unwrap();
+        let passphrase_ref = crate::cluster_passphrase_credential_ref("ssh-1").unwrap();
+        assert_eq!(
+            store.resolve(&password_ref).unwrap().unwrap().expose(),
+            "password-secret"
+        );
+
+        let (mut keep, revision) = active_facade_config_and_cluster_revision(dir.path());
+        keep.cluster_fabric.node_mut("ssh-1").unwrap().label = "kept".to_string();
+        intents.insert(
+            "ssh-1".to_string(),
+            password_intents(crate::ClusterCredentialAction::Keep),
+        );
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut keep,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            store.resolve(&password_ref).unwrap().unwrap().expose(),
+            "password-secret"
+        );
+
+        let (mut switch, revision) = active_facade_config_and_cluster_revision(dir.path());
+        switch.cluster_fabric.node_mut("ssh-1").unwrap().placement =
+            crate::NodePlacement::Ssh(crate::SshTarget {
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                auth: crate::SshAuth::PrivateKey {
+                    private_key: String::new(),
+                    private_key_encrypted: None,
+                    private_key_path: None,
+                    passphrase: String::new(),
+                    passphrase_encrypted: None,
+                },
+                host_key_fingerprint: None,
+            });
+        intents.insert(
+            "ssh-1".to_string(),
+            crate::ClusterNodeCredentialIntents {
+                password: crate::ClusterCredentialAction::Clear,
+                private_key: crate::ClusterCredentialAction::Replace(
+                    "private-key-secret".to_string(),
+                ),
+                passphrase: crate::ClusterCredentialAction::Replace(
+                    "passphrase-secret".to_string(),
+                ),
+            },
+        );
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut switch,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            3
+        );
+        assert!(store.resolve(&password_ref).unwrap().is_none());
+        assert_eq!(
+            store.resolve(&key_ref).unwrap().unwrap().expose(),
+            "private-key-secret"
+        );
+        assert_eq!(
+            store.resolve(&passphrase_ref).unwrap().unwrap().expose(),
+            "passphrase-secret"
+        );
+
+        let (mut clear_passphrase, revision) =
+            active_facade_config_and_cluster_revision(dir.path());
+        clear_passphrase
+            .cluster_fabric
+            .node_mut("ssh-1")
+            .unwrap()
+            .label = "clear-passphrase".to_string();
+        intents.insert(
+            "ssh-1".to_string(),
+            crate::ClusterNodeCredentialIntents {
+                password: crate::ClusterCredentialAction::Clear,
+                private_key: crate::ClusterCredentialAction::Keep,
+                passphrase: crate::ClusterCredentialAction::Clear,
+            },
+        );
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut clear_passphrase,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            store.resolve(&key_ref).unwrap().unwrap().expose(),
+            "private-key-secret"
+        );
+        assert!(store.resolve(&passphrase_ref).unwrap().is_none());
+
+        let ordinary = std::fs::read_to_string(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        for forbidden in [
+            "password-secret",
+            "private-key-secret",
+            "passphrase-secret",
+            "****",
+            "password_encrypted",
+            "private_key_encrypted",
+            "passphrase_encrypted",
+        ] {
+            assert!(
+                !ordinary.contains(forbidden),
+                "ordinary cluster section leaked {forbidden}"
+            );
+        }
+        let section: Value = serde_json::from_str(&ordinary).unwrap();
+        let auth = &section["data"]["nodes"][0]["placement"]["auth"];
+        assert!(auth.get("password").is_none());
+        assert!(auth.get("private_key").is_none());
+        assert!(auth.get("passphrase").is_none());
+    }
+
+    #[test]
+    fn exact_cluster_get_status_marks_corrupt_and_wrong_key_ciphertext_as_error_metadata() {
+        let key = crate::encryption::set_test_encryption_key([0xbe; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "status-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let password_ref = crate::cluster_password_credential_ref("status-node").unwrap();
+        let status_secret = Uuid::new_v4().to_string();
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeMap::from([(
+                    "status-node".to_string(),
+                    password_intents(crate::ClusterCredentialAction::Replace(
+                        status_secret.clone(),
+                    )),
+                )]),
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+
+        let healthy = read_exact_cluster_fabric_snapshot(dir.path(), None).unwrap();
+        assert!(
+            healthy
+                .credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == password_ref)
+                .unwrap()
+                .configured
+        );
+        let crate::NodePlacement::Ssh(target) = &healthy
+            .cluster_fabric
+            .node("status-node")
+            .unwrap()
+            .placement
+        else {
+            panic!("expected SSH placement")
+        };
+        let crate::SshAuth::Password { password, .. } = &target.auth else {
+            panic!("expected password authentication")
+        };
+        assert!(
+            password.is_empty(),
+            "GET status must not hydrate plaintext into Config"
+        );
+
+        let credentials_path = dir.path().join(CREDENTIALS_FILE);
+        let credentials = std::fs::read(&credentials_path).unwrap();
+        let mut corrupt: Value = serde_json::from_slice(&credentials).unwrap();
+        corrupt["data"]["entries"][password_ref.as_str()]["ciphertext"] =
+            Value::String("nonempty-but-not-ciphertext".to_string());
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_vec_pretty(&corrupt).unwrap(),
+        )
+        .unwrap();
+        let corrupt = read_exact_cluster_fabric_snapshot(dir.path(), None).unwrap();
+        assert!(
+            !corrupt
+                .credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == password_ref)
+                .unwrap()
+                .configured
+        );
+
+        std::fs::write(&credentials_path, credentials).unwrap();
+        drop(key);
+        let _wrong_key = crate::encryption::set_test_encryption_key([0xbf; 32]);
+        let wrong_key = read_exact_cluster_fabric_snapshot(dir.path(), None).unwrap();
+        assert!(
+            !wrong_key
+                .credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == password_ref)
+                .unwrap()
+                .configured
+        );
+        let encoded = serde_json::to_string(&wrong_key.cluster_fabric).unwrap();
+        assert!(!encoded.contains(&status_secret));
+    }
+
+    #[test]
+    fn secret_free_cluster_snapshot_supports_explicit_corrupt_credential_repair() {
+        let _key = crate::encryption::set_test_encryption_key([0xc0; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "repair-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let password_ref = crate::cluster_password_credential_ref("repair-node").unwrap();
+        let initial_secret = Uuid::new_v4().to_string();
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeMap::from([(
+                    "repair-node".to_string(),
+                    password_intents(crate::ClusterCredentialAction::Replace(initial_secret,)),
+                )]),
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+
+        let credentials_path = dir.path().join(CREDENTIALS_FILE);
+        let corrupt_active_password = || {
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&credentials_path).unwrap()).unwrap();
+            document["data"]["entries"][password_ref.as_str()]["ciphertext"] =
+                Value::String("corrupt-active-ciphertext".to_string());
+            std::fs::write(
+                &credentials_path,
+                serde_json::to_vec_pretty(&document).unwrap(),
+            )
+            .unwrap();
+        };
+        corrupt_active_password();
+        let exact = read_exact_cluster_fabric_snapshot(dir.path(), None).unwrap();
+        assert!(
+            !exact
+                .credential_statuses
+                .iter()
+                .find(|status| status.credential_ref == password_ref)
+                .unwrap()
+                .configured
+        );
+        let mut replacement = crate::Config::default();
+        replacement.cluster_fabric = exact.cluster_fabric;
+        let repaired_secret = Uuid::new_v4().to_string();
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut replacement,
+                &BTreeMap::from([(
+                    "repair-node".to_string(),
+                    password_intents(crate::ClusterCredentialAction::Replace(
+                        repaired_secret.clone(),
+                    )),
+                )]),
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        let replaced = read_exact_cluster_fabric_snapshot(dir.path(), Some(2)).unwrap();
+        let crate::NodePlacement::Ssh(target) = &replaced
+            .cluster_fabric
+            .node("repair-node")
+            .unwrap()
+            .placement
+        else {
+            panic!("expected SSH placement")
+        };
+        let crate::SshAuth::Password { password, .. } = &target.auth else {
+            panic!("expected password authentication")
+        };
+        assert_eq!(password, &repaired_secret);
+
+        corrupt_active_password();
+        let exact = read_exact_cluster_fabric_snapshot(dir.path(), None).unwrap();
+        let mut clearing = crate::Config::default();
+        clearing.cluster_fabric = exact.cluster_fabric;
+        clearing
+            .cluster_fabric
+            .node_mut("repair-node")
+            .unwrap()
+            .placement = crate::NodePlacement::Ssh(crate::SshTarget {
+            host: "repair.example.test".to_string(),
+            port: 22,
+            username: "operator".to_string(),
+            auth: crate::SshAuth::SystemSshConfig,
+            host_key_fingerprint: None,
+        });
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut clearing,
+                &BTreeMap::from([(
+                    "repair-node".to_string(),
+                    crate::ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                2,
+            )
+            .unwrap(),
+            3
+        );
+        let cleared = read_exact_cluster_fabric_snapshot(dir.path(), Some(3)).unwrap();
+        assert!(!cleared
+            .cluster_fabric
+            .credential_refs
+            .contains_key("repair-node"));
+        assert!(CredentialStore::open(dir.path())
+            .resolve(&password_ref)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn secret_only_cluster_replace_advances_section_revision_and_rejects_stale_writer() {
+        let _key = crate::encryption::set_test_encryption_key([0xb8; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+
+        let (mut create, revision) = active_facade_config_and_cluster_revision(dir.path());
+        create.cluster_fabric.nodes.push(cluster_test_node(
+            "secret-cas",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        let initial_intents = BTreeMap::from([(
+            "secret-cas".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "initial-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut create,
+                &initial_intents,
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+
+        let (first_base, shared_revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(shared_revision, 1);
+        let mut first = first_base.clone();
+        let mut stale = first_base;
+        let winner_intents = BTreeMap::from([(
+            "secret-cas".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "winner-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut first,
+                &winner_intents,
+                shared_revision,
+            )
+            .unwrap(),
+            2,
+            "a secret-only write must advance the public cluster revision"
+        );
+
+        let stale_intents = BTreeMap::from([(
+            "secret-cas".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "stale-loser-secret".to_string(),
+            )),
+        )]);
+        let error = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut stale,
+            &stale_intents,
+            shared_revision,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict {
+                expected: 1,
+                actual: 2
+            }
+        ));
+        let reference = crate::cluster_password_credential_ref("secret-cas").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "winner-secret"
+        );
+    }
+
+    #[test]
+    fn node_and_new_cluster_membership_commit_together_or_not_at_all() {
+        let _key = crate::encryption::set_test_encryption_key([0xb4; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+        candidate.cluster_fabric.nodes.push(cluster_test_node(
+            "atomic-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        candidate.cluster_fabric.clusters.push(crate::Cluster {
+            name: "new-cluster".to_string(),
+            description: None,
+            node_ids: vec!["atomic-node".to_string()],
+        });
+        let intents = BTreeMap::from([(
+            "atomic-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "atomic-secret".to_string(),
+            )),
+        )]);
+        assert_eq!(
+            persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                revision,
+            )
+            .unwrap(),
+            1
+        );
+        let (fresh, revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(revision, 1);
+        assert!(fresh.cluster_fabric.node("atomic-node").is_some());
+        assert_eq!(
+            fresh
+                .cluster_fabric
+                .cluster("new-cluster")
+                .unwrap()
+                .node_ids,
+            ["atomic-node"]
+        );
+
+        let cluster_before = std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap();
+        let credentials_before = std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap();
+        let (mut failed, revision) = active_facade_config_and_cluster_revision(dir.path());
+        failed.cluster_fabric.nodes.push(cluster_test_node(
+            "failed-node",
+            crate::SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        failed.cluster_fabric.clusters.push(crate::Cluster {
+            name: "failed-cluster".to_string(),
+            description: None,
+            node_ids: vec!["failed-node".to_string()],
+        });
+        let failed_intents = BTreeMap::from([(
+            "failed-node".to_string(),
+            password_intents(crate::ClusterCredentialAction::Replace(
+                "failed-secret".to_string(),
+            )),
+        )]);
+        assert!(persist_cluster_fabric_credential_transaction_inner(
+            dir.path(),
+            &mut failed,
+            &failed_intents,
+            revision,
+            None,
+            Some(MigrationFault::AfterStaging),
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(CLUSTER_FABRIC_FILE)).unwrap(),
+            cluster_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(CREDENTIALS_FILE)).unwrap(),
+            credentials_before
+        );
+        let (fresh, fresh_revision) = active_facade_config_and_cluster_revision(dir.path());
+        assert_eq!(fresh_revision, revision);
+        assert!(fresh.cluster_fabric.node("failed-node").is_none());
+        assert!(fresh.cluster_fabric.cluster("failed-cluster").is_none());
+    }
+
+    #[test]
+    fn stale_node_delete_cannot_overwrite_concurrent_membership_edit() {
+        let _key = crate::encryption::set_test_encryption_key([0xb5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        crate::migrate_config_facade_layout(dir.path()).unwrap();
+        let (mut initial, revision) = active_facade_config_and_cluster_revision(dir.path());
+        initial.cluster_fabric.nodes.push(crate::Node {
+            id: "member".to_string(),
+            label: "member".to_string(),
+            placement: crate::NodePlacement::Local,
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        initial.cluster_fabric.clusters.push(crate::Cluster {
+            name: "first".to_string(),
+            description: None,
+            node_ids: vec!["member".to_string()],
+        });
+        let node_intents = BTreeMap::from([(
+            "member".to_string(),
+            crate::ClusterNodeCredentialIntents::clear_all(),
+        )]);
+        persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut initial,
+            &node_intents,
+            revision,
+        )
+        .unwrap();
+
+        let (base, revision) = active_facade_config_and_cluster_revision(dir.path());
+        let mut membership_winner = base.clone();
+        membership_winner
+            .cluster_fabric
+            .clusters
+            .push(crate::Cluster {
+                name: "second".to_string(),
+                description: None,
+                node_ids: vec!["member".to_string()],
+            });
+        persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut membership_winner,
+            &BTreeMap::new(),
+            revision,
+        )
+        .unwrap();
+
+        let mut stale_delete = base;
+        stale_delete.cluster_fabric.nodes.clear();
+        stale_delete.cluster_fabric.clusters.clear();
+        let error = persist_cluster_fabric_credential_transaction_at_revision(
+            dir.path(),
+            &mut stale_delete,
+            &node_intents,
+            revision,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigStoreError::Conflict { actual: 2, .. }
+        ));
+        let (fresh, _) = active_facade_config_and_cluster_revision(dir.path());
+        assert!(fresh.cluster_fabric.node("member").is_some());
+        assert_eq!(
+            fresh.cluster_fabric.cluster("second").unwrap().node_ids,
+            ["member"]
+        );
+    }
+
+    #[test]
+    fn active_cluster_exact_transaction_recovers_every_durable_boundary_atomically() {
+        for (index, fault) in [
+            MigrationFault::AfterManifest,
+            MigrationFault::AfterCredentials,
+            MigrationFault::AfterAuthoritativeSection,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _key = crate::encryption::set_test_encryption_key([0xb7 + index as u8; 32]);
+            let dir = tempfile::tempdir().unwrap();
+            crate::migrate_config_facade_layout(dir.path()).unwrap();
+            let (mut candidate, revision) = active_facade_config_and_cluster_revision(dir.path());
+            let node_id = format!("recover-node-{index}");
+            let cluster_name = format!("recover-cluster-{index}");
+            let secret = format!("recover-cluster-secret-{index}");
+            candidate.cluster_fabric.nodes.push(cluster_test_node(
+                &node_id,
+                crate::SshAuth::Password {
+                    password: String::new(),
+                    password_encrypted: None,
+                },
+            ));
+            candidate.cluster_fabric.clusters.push(crate::Cluster {
+                name: cluster_name.clone(),
+                description: None,
+                node_ids: vec![node_id.clone()],
+            });
+            let intents = BTreeMap::from([(
+                node_id.clone(),
+                password_intents(crate::ClusterCredentialAction::Replace(secret.clone())),
+            )]);
+
+            let error = persist_cluster_fabric_credential_transaction_inner(
+                dir.path(),
+                &mut candidate,
+                &intents,
+                revision,
+                None,
+                Some(fault),
+            )
+            .unwrap_err();
+            assert!(matches!(error, ConfigStoreError::Io(_)));
+            assert!(
+                crate::ConfigFacade::open(dir.path()).is_err(),
+                "a partial durable boundary must not open as a fresh facade"
+            );
+            assert!(recover_pending_config_transaction(dir.path()).unwrap());
+            let (fresh, committed_revision) = active_facade_config_and_cluster_revision(dir.path());
+            assert_eq!(committed_revision, revision + 1);
+            assert!(fresh.cluster_fabric.node(&node_id).is_some());
+            assert_eq!(
+                fresh
+                    .cluster_fabric
+                    .cluster(&cluster_name)
+                    .unwrap()
+                    .node_ids
+                    .as_slice(),
+                std::slice::from_ref(&node_id)
+            );
+            let reference = crate::cluster_password_credential_ref(&node_id).unwrap();
+            assert_eq!(
+                CredentialStore::open(dir.path())
+                    .resolve(&reference)
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                secret
+            );
+            assert_active_exact_manifest(dir.path(), ExactTransactionScope::ClusterFabric);
+        }
     }
 
     #[test]

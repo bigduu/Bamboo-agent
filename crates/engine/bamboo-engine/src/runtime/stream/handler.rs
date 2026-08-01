@@ -62,6 +62,24 @@ fn sanitize_identifier(value: &str) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
+/// Raw authoritative usage fields preserved from provider terminal events.
+///
+/// Each field remains optional so callers can distinguish an explicit
+/// provider-reported zero from an omitted value. Flat counters on
+/// [`StreamHandlingOutput`] remain the normalized compatibility view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderUsageSnapshot {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    /// OpenAI Responses cache-write volume. This is raw provider metadata and
+    /// is not folded into the disjoint legacy prompt-cache counters.
+    pub cache_write_input_tokens: Option<u64>,
+}
+
 pub struct StreamHandlingOutput {
     pub response_id: Option<String>,
     pub content: String,
@@ -76,7 +94,37 @@ pub struct StreamHandlingOutput {
     pub thinking_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Merged authoritative provider snapshot, when at least one provider-usage
+    /// chunk was observed. Repeated cumulative snapshots are idempotent, absent
+    /// fields do not erase known values, and explicit zeros remain `Some(0)`.
+    pub provider_usage: Option<ProviderUsageSnapshot>,
+    /// Normalized non-cached ("fresh") input, disjoint from the adjacent cache
+    /// counters. When a provider total is available this is derived from that
+    /// total with a saturating, cache-subset policy; the raw total remains in
+    /// [`Self::provider_usage`].
     pub input_tokens: u64,
+}
+
+impl StreamHandlingOutput {
+    /// Prompt usage for runtime budget enforcement.
+    ///
+    /// Provider-reported totals are authoritative when present. Legacy streams
+    /// retain their historical fallback to the flat fresh-input counter.
+    pub(crate) fn prompt_tokens_for_runtime_budget(&self) -> u64 {
+        self.provider_usage
+            .and_then(|usage| usage.input_tokens)
+            .unwrap_or(self.input_tokens)
+    }
+
+    /// Completion usage for runtime budget enforcement.
+    ///
+    /// A provider-reported output total (including explicit zero) wins over
+    /// legacy summaries. Reasoning is a subset breakdown and is never added.
+    pub(crate) fn completion_tokens_for_runtime_budget(&self) -> u64 {
+        self.provider_usage
+            .and_then(|usage| usage.output_tokens)
+            .unwrap_or(self.output_tokens)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

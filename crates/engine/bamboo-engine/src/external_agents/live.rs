@@ -68,20 +68,34 @@ pub fn initialize_durable_approvals(
     Ok((std::sync::Arc::new(Mutex::new(registry)), events))
 }
 
+/// Named identity, audit, and delivery inputs for one observed approval.
+pub struct PendingApprovalObservation<'a> {
+    pub registry: Option<&'a SharedApprovalRegistry>,
+    pub parent_session_id: &'a str,
+    pub child_id: &'a str,
+    pub child_attempt: u32,
+    pub request_id: &'a str,
+    pub tool_name: &'a str,
+    pub permission: &'a str,
+    pub resource: &'a str,
+    pub event_tx: mpsc::Sender<AgentEvent>,
+}
+
 /// Record a `(child_id, request_id)` as a pending human-loop approval. Called
 /// just before surfacing `ChildApprovalRequested` so an external POST can be
 /// correlated against a genuinely-pending request.
-pub fn register_pending_approval_observed(
-    registry: Option<&SharedApprovalRegistry>,
-    parent_session_id: &str,
-    child_id: &str,
-    child_attempt: u32,
-    request_id: &str,
-    tool_name: &str,
-    permission: &str,
-    resource: &str,
-    event_tx: mpsc::Sender<AgentEvent>,
-) -> (u64, String) {
+pub fn observe_pending_approval(observation: PendingApprovalObservation<'_>) -> (u64, String) {
+    let PendingApprovalObservation {
+        registry,
+        parent_session_id,
+        child_id,
+        child_attempt,
+        request_id,
+        tool_name,
+        permission,
+        resource,
+        event_tx,
+    } = observation;
     let now = chrono::Utc::now();
     let version = now.timestamp_micros().max(0) as u64;
     let created_at = now.to_rfc3339();
@@ -128,20 +142,52 @@ pub fn register_pending_approval_observed(
     (version, created_at)
 }
 
+/// Backward-compatible positional wrapper for existing engine consumers.
+///
+/// New call sites should use [`observe_pending_approval`] so each approval
+/// identity and audit field is named at the call site.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "public compatibility wrapper; the typed observation is the canonical API"
+)]
+pub fn register_pending_approval_observed(
+    registry: Option<&SharedApprovalRegistry>,
+    parent_session_id: &str,
+    child_id: &str,
+    child_attempt: u32,
+    request_id: &str,
+    tool_name: &str,
+    permission: &str,
+    resource: &str,
+    event_tx: mpsc::Sender<AgentEvent>,
+) -> (u64, String) {
+    observe_pending_approval(PendingApprovalObservation {
+        registry,
+        parent_session_id,
+        child_id,
+        child_attempt,
+        request_id,
+        tool_name,
+        permission,
+        resource,
+        event_tx,
+    })
+}
+
 #[cfg(test)]
 fn register_pending_approval(child_id: &str, request_id: &str) {
     let (event_tx, _rx) = mpsc::channel(1);
-    let _ = register_pending_approval_observed(
-        None,
-        "test-parent",
+    let _ = observe_pending_approval(PendingApprovalObservation {
+        registry: None,
+        parent_session_id: "test-parent",
         child_id,
-        0,
+        child_attempt: 0,
         request_id,
-        "test-tool",
-        "test-permission",
-        "test-resource",
+        tool_name: "test-tool",
+        permission: "test-permission",
+        resource: "test-resource",
         event_tx,
-    );
+    });
 }
 
 /// One-shot consume of a `(child_id, request_id)` pending pair: remove it and
@@ -699,17 +745,17 @@ mod tests {
         let (wire_tx, _wire_rx) = mpsc::unbounded_channel();
         let _guard = register("c-audit", wire_tx, 0, None);
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        register_pending_approval_observed(
-            None,
-            "parent-audit",
-            "c-audit",
-            0,
-            "req-audit",
-            "Bash",
-            "execute",
-            "/tmp/x",
+        observe_pending_approval(PendingApprovalObservation {
+            registry: None,
+            parent_session_id: "parent-audit",
+            child_id: "c-audit",
+            child_attempt: 0,
+            request_id: "req-audit",
+            tool_name: "Bash",
+            permission: "execute",
+            resource: "/tmp/x",
             event_tx,
-        );
+        });
 
         assert!(deliver_approval_checked(
             None,
@@ -736,17 +782,17 @@ mod tests {
         let (wire_tx, _wire_rx) = mpsc::unbounded_channel();
         let _guard = register("c-versioned", wire_tx, 7, Some(registry.clone()));
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let (pending_version, _) = register_pending_approval_observed(
-            Some(&registry),
-            "parent-versioned",
-            "c-versioned",
-            7,
-            "req-versioned",
-            "Bash",
-            "execute",
-            "/tmp/versioned",
+        let (pending_version, _) = observe_pending_approval(PendingApprovalObservation {
+            registry: Some(&registry),
+            parent_session_id: "parent-versioned",
+            child_id: "c-versioned",
+            child_attempt: 7,
+            request_id: "req-versioned",
+            tool_name: "Bash",
+            permission: "execute",
+            resource: "/tmp/versioned",
             event_tx,
-        );
+        });
 
         assert!(deliver_approval_checked(
             Some(&registry),
@@ -768,17 +814,17 @@ mod tests {
     #[tokio::test]
     async fn timeout_and_disconnect_emit_terminal_outcomes() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        register_pending_approval_observed(
-            None,
-            "parent-audit",
-            "c-expire",
-            0,
-            "req-expire",
-            "Bash",
-            "execute",
-            "/tmp/x",
-            event_tx.clone(),
-        );
+        observe_pending_approval(PendingApprovalObservation {
+            registry: None,
+            parent_session_id: "parent-audit",
+            child_id: "c-expire",
+            child_attempt: 0,
+            request_id: "req-expire",
+            tool_name: "Bash",
+            permission: "execute",
+            resource: "/tmp/x",
+            event_tx: event_tx.clone(),
+        });
         assert!(expire_pending_approval(None, "c-expire", "req-expire"));
         assert!(!expire_pending_approval(None, "c-expire", "req-expire"));
         assert!(matches!(
@@ -786,17 +832,17 @@ mod tests {
             Some(AgentEvent::ChildApprovalChanged { status, .. }) if status == "expired"
         ));
 
-        register_pending_approval_observed(
-            None,
-            "parent-audit",
-            "c-disconnect",
-            0,
-            "req-disconnect",
-            "Write",
-            "write",
-            "/tmp/y",
+        observe_pending_approval(PendingApprovalObservation {
+            registry: None,
+            parent_session_id: "parent-audit",
+            child_id: "c-disconnect",
+            child_attempt: 0,
+            request_id: "req-disconnect",
+            tool_name: "Write",
+            permission: "write",
+            resource: "/tmp/y",
             event_tx,
-        );
+        });
         clear_pending_approvals_for(None, "c-disconnect", 0);
         assert!(matches!(
             event_rx.recv().await,

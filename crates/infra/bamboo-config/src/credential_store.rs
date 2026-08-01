@@ -161,6 +161,41 @@ impl PreparedProviderCredentialUpdate {
         self.bytes = serde_json::to_vec_pretty(&envelope)?;
         Ok(())
     }
+
+    /// Validate the active owned references against the exact credential
+    /// candidate that would be staged. This keeps metadata/keep mutations
+    /// from retaining a decryptable-but-semantic mask or empty value, while
+    /// still allowing an explicit replace or clear to repair that record.
+    pub(crate) fn validate_active_values(
+        &self,
+        active_refs: &BTreeSet<CredentialRef>,
+        validate: impl Fn(&CredentialRef, &str) -> bool,
+    ) -> ConfigStoreResult<()> {
+        let envelope: PreparedCredentialEnvelope = serde_json::from_slice(&self.bytes)?;
+        if envelope.schema_version != CREDENTIAL_SCHEMA_VERSION
+            || envelope.revision != self.revision
+        {
+            return Err(ConfigStoreError::Validation(
+                "prepared credential envelope metadata is invalid".to_string(),
+            ));
+        }
+        let lkg = CredentialDocumentLkg {
+            revision: envelope.revision,
+            document: envelope.data,
+        };
+        let statuses = lkg.statuses_with_validation(active_refs, validate);
+        if let Some(reference) = active_refs.iter().find(|reference| {
+            !statuses
+                .iter()
+                .any(|status| &status.credential_ref == *reference && status.configured)
+        }) {
+            return Err(ConfigStoreError::Validation(format!(
+                "active credential '{}' is invalid; explicitly replace or clear it",
+                reference.as_str()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +223,69 @@ pub(crate) struct CredentialDocumentLkg {
 impl CredentialDocumentLkg {
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<Option<SecretValue>> {
+        self.document
+            .entries
+            .get(credential_ref)
+            .map(|entry| {
+                crate::encryption::decrypt(&entry.ciphertext)
+                    .map(SecretValue)
+                    .map_err(|_| {
+                        ConfigStoreError::Validation("credential decryption failed".to_string())
+                    })
+            })
+            .transpose()
+    }
+
+    /// Project secret-free status metadata while cryptographically validating
+    /// only the references owned by the requested active section generation.
+    ///
+    /// Decrypted values are dropped inside this authority and never returned
+    /// to GET/status callers. A present but undecryptable entry is represented
+    /// as `configured = false`, which the cluster projection renders as
+    /// `error` when durable metadata still says the field is configured.
+    pub(crate) fn statuses_with_crypto_validation(
+        &self,
+        active_refs: &BTreeSet<CredentialRef>,
+    ) -> Vec<CredentialStatus> {
+        self.statuses_with_validation(active_refs, |_, _| true)
+    }
+
+    /// Project statuses while decrypting and semantically validating only the
+    /// references owned by one active section generation.
+    pub(crate) fn statuses_with_validation(
+        &self,
+        active_refs: &BTreeSet<CredentialRef>,
+        validate: impl Fn(&CredentialRef, &str) -> bool,
+    ) -> Vec<CredentialStatus> {
+        self.document
+            .entries
+            .iter()
+            // Recovery payloads are server-owned quarantine records, not
+            // runtime credentials. Do not disclose their fixed slots through
+            // status/list APIs; AccessControl exposes only repair_required.
+            .filter(|(credential_ref, _)| !credential_ref.as_str().starts_with("access_repair."))
+            .map(|(credential_ref, entry)| {
+                let configured = if active_refs.contains(credential_ref) {
+                    crate::encryption::decrypt(&entry.ciphertext)
+                        .map(|value| validate(credential_ref, &value))
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                CredentialStatus {
+                    credential_ref: credential_ref.clone(),
+                    configured,
+                    source: entry.source,
+                    updated_at: Some(entry.updated_at),
+                }
+            })
+            .collect()
     }
 }
 
@@ -288,6 +386,7 @@ impl CredentialStore {
         &self,
         credential_ref: &CredentialRef,
     ) -> ConfigStoreResult<(CredentialStatus, CredentialStoreHealth)> {
+        reject_internal_recovery_ref(credential_ref)?;
         self.with_transaction_lock(|| self.status_with_health_unchecked(credential_ref))
     }
 
@@ -382,6 +481,25 @@ impl CredentialStore {
         })
     }
 
+    /// Replace an orphan credential through the standalone credential API.
+    ///
+    /// The durable config ownership check and credential CAS execute under the
+    /// same cross-process migration lock. A stale process-local config snapshot
+    /// can therefore never mutate a reference that a newer owned section has
+    /// already claimed.
+    pub fn replace_unreferenced(
+        &self,
+        credential_ref: CredentialRef,
+        secret: &str,
+        source: CredentialSource,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.with_transaction_lock(|| {
+            self.ensure_unreferenced_under_lock(&credential_ref)?;
+            self.replace_unchecked(credential_ref, secret, source, expected_revision)
+        })
+    }
+
     /// Replace an internally managed rotating credential at the latest durable
     /// revision. This is not an HTTP/client mutation primitive: external
     /// callers must continue to use [`Self::replace`] with explicit CAS. The
@@ -458,6 +576,7 @@ impl CredentialStore {
         expected_revision: u64,
         authority: CredentialCommitAuthority<'_>,
     ) -> ConfigStoreResult<CredentialMutation> {
+        reject_internal_recovery_ref(&credential_ref)?;
         if secret.trim().is_empty() || crate::patch::is_masked_api_key(secret) {
             return Err(ConfigStoreError::Validation(
                 "credential value must not be empty or a mask; use clear instead".to_string(),
@@ -523,26 +642,70 @@ impl CredentialStore {
         self.with_transaction_lock(|| self.clear_unchecked(credential_ref, expected_revision))
     }
 
+    /// Clear an orphan credential through the standalone credential API.
+    ///
+    /// See [`Self::replace_unreferenced`]: durable ownership and the credential
+    /// CAS share one cross-process critical section.
+    pub fn clear_unreferenced(
+        &self,
+        credential_ref: &CredentialRef,
+        expected_revision: u64,
+    ) -> ConfigStoreResult<(u64, CredentialStatus)> {
+        self.with_transaction_lock(|| {
+            self.ensure_unreferenced_under_lock(credential_ref)?;
+            self.clear_unchecked(credential_ref, expected_revision)
+        })
+    }
+
+    fn ensure_unreferenced_under_lock(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<()> {
+        let durable = crate::section_facade::load_durable_effective_config_under_migration_lock(
+            self.data_dir(),
+        )?;
+        if config_credential_ref_counts(&durable)?.contains_key(credential_ref) {
+            return Err(ConfigStoreError::Validation(
+                "credential reference is managed by configuration and must be changed through its \
+                 owning section"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Clear the standalone credential document in one CAS commit, but only
     /// after every config-owned reference has been removed through its owning
     /// domain transaction. This is the final step of a section-by-section
     /// reset; it must never detach a live config reference from its secret.
+    ///
+    /// `config` is retained for API compatibility only. It is deliberately not
+    /// an ownership authority: another process may have committed a newer
+    /// section generation than this process-local runtime has observed.
     pub fn clear_all_unreferenced(
         &self,
-        config: &crate::Config,
+        _config: &crate::Config,
         expected_revision: u64,
     ) -> ConfigStoreResult<(u64, Vec<CredentialStatus>)> {
         self.with_transaction_lock(|| {
-            let referenced = config_credential_ref_counts(config)?;
+            let durable =
+                crate::section_facade::load_durable_effective_config_under_migration_lock(
+                    self.data_dir(),
+                )?;
+            let referenced = config_credential_ref_counts(&durable)?;
             if !referenced.is_empty() {
                 return Err(ConfigStoreError::Validation(
                     "credentials still referenced by configuration must be reset through their owning sections"
                         .to_string(),
                 ));
             }
+            let (mut document, _) = self.load_document_with_health()?;
+            document
+                .entries
+                .retain(|reference, _| is_internal_recovery_ref(reference));
             let revision = self.store.commit(
                 expected_revision,
-                CredentialDocument::default(),
+                document,
                 validate_document,
             )?;
             Ok((revision, Vec::new()))
@@ -649,6 +812,7 @@ impl CredentialStore {
         expected_revision: u64,
         authority: CredentialCommitAuthority<'_>,
     ) -> ConfigStoreResult<CredentialMutation> {
+        reject_internal_recovery_ref(credential_ref)?;
         let mut document = match authority.document(expected_revision)? {
             Some(document) => document,
             None => self.load_document()?,
@@ -1910,13 +2074,13 @@ impl CredentialStore {
 
     /// Prepare one or more node credential mutations without publishing them.
     /// The caller commits the returned credential envelope together with the
-    /// narrowed `cluster_fabric` root domain through the exact transaction
-    /// manifest. Empty/masked required secrets keep an existing value;
-    /// an empty private-key passphrase is an explicit clear.
+    /// narrowed `cluster_fabric` section through the exact transaction
+    /// manifest. Secret values arrive only through explicit request-only
+    /// actions; ordinary node placement metadata must remain secret-free.
     pub(crate) fn prepare_cluster_node_intents(
         &self,
         config: &mut crate::Config,
-        node_intents: &BTreeSet<String>,
+        node_intents: &BTreeMap<String, crate::ClusterNodeCredentialIntents>,
         persisted_refs: &BTreeMap<String, crate::ClusterNodeCredentialRefs>,
     ) -> ConfigStoreResult<Option<PreparedProviderCredentialUpdate>> {
         if node_intents.is_empty() {
@@ -1943,7 +2107,7 @@ impl CredentialStore {
         let mut required_refs = BTreeSet::new();
         let mut changed = false;
 
-        for node_id in node_intents {
+        for (node_id, intents) in node_intents {
             let password_ref = crate::cluster_password_credential_ref(node_id)?;
             let private_key_ref = crate::cluster_private_key_credential_ref(node_id)?;
             let passphrase_ref = crate::cluster_passphrase_credential_ref(node_id)?;
@@ -1973,87 +2137,140 @@ impl CredentialStore {
                 }
             }
 
-            enum Action {
-                Keep,
-                Replace(String),
-                Clear,
-            }
             let (password, private_key, passphrase) = match config
                 .cluster_fabric
                 .node(node_id)
                 .map(|node| &node.placement)
             {
                 Some(crate::NodePlacement::Ssh(target)) => match &target.auth {
-                    crate::SshAuth::SystemSshConfig => {
-                        (Action::Clear, Action::Clear, Action::Clear)
-                    }
-                    crate::SshAuth::Password { password, .. } => {
-                        let password =
-                            if password.is_empty() || crate::patch::is_masked_api_key(password) {
-                                if persisted.password_configured {
-                                    Action::Keep
-                                } else {
-                                    return Err(ConfigStoreError::Validation(
-                                        "SSH password is required".to_string(),
-                                    ));
-                                }
-                            } else {
-                                Action::Replace(password.clone())
-                            };
-                        (password, Action::Clear, Action::Clear)
+                    crate::SshAuth::SystemSshConfig => (
+                        intents.password.clone(),
+                        intents.private_key.clone(),
+                        intents.passphrase.clone(),
+                    ),
+                    crate::SshAuth::Password {
+                        password,
+                        password_encrypted,
+                    } => {
+                        if !password.is_empty() || password_encrypted.is_some() {
+                            return Err(ConfigStoreError::Validation(
+                                "SSH placement metadata must not contain credentials".to_string(),
+                            ));
+                        }
+                        if matches!(intents.password, crate::ClusterCredentialAction::Clear) {
+                            return Err(ConfigStoreError::Validation(
+                                "password authentication requires keep or replace".to_string(),
+                            ));
+                        }
+                        (
+                            intents.password.clone(),
+                            intents.private_key.clone(),
+                            intents.passphrase.clone(),
+                        )
                     }
                     crate::SshAuth::PrivateKey {
                         private_key,
+                        private_key_encrypted,
                         private_key_path,
                         passphrase,
+                        passphrase_encrypted,
                         ..
                     } => {
-                        let private_key = if private_key.is_empty()
-                            || crate::patch::is_masked_api_key(private_key)
+                        if !private_key.is_empty()
+                            || private_key_encrypted.is_some()
+                            || !passphrase.is_empty()
+                            || passphrase_encrypted.is_some()
                         {
-                            if persisted.private_key_configured {
-                                Action::Keep
-                            } else if private_key_path
-                                .as_deref()
-                                .is_some_and(|path| !path.trim().is_empty())
-                            {
-                                Action::Clear
-                            } else {
-                                return Err(ConfigStoreError::Validation(
-                                    "an inline private key or private key path is required"
-                                        .to_string(),
-                                ));
-                            }
-                        } else {
-                            Action::Replace(private_key.clone())
-                        };
-                        let passphrase = if crate::patch::is_masked_api_key(passphrase) {
-                            if persisted.passphrase_configured {
-                                Action::Keep
-                            } else {
-                                return Err(ConfigStoreError::Validation(
-                                    "SSH passphrase mask has no stored value".to_string(),
-                                ));
-                            }
-                        } else if passphrase.is_empty() {
-                            Action::Clear
-                        } else {
-                            Action::Replace(passphrase.clone())
-                        };
-                        (Action::Clear, private_key, passphrase)
+                            return Err(ConfigStoreError::Validation(
+                                "SSH placement metadata must not contain credentials".to_string(),
+                            ));
+                        }
+                        let uses_key_path = private_key_path
+                            .as_deref()
+                            .is_some_and(|path| !path.trim().is_empty());
+                        if uses_key_path
+                            && !matches!(intents.private_key, crate::ClusterCredentialAction::Clear)
+                        {
+                            return Err(ConfigStoreError::Validation(
+                                "private-key-path authentication requires clearing the inline private key"
+                                    .to_string(),
+                            ));
+                        }
+                        if !uses_key_path
+                            && matches!(intents.private_key, crate::ClusterCredentialAction::Clear)
+                        {
+                            return Err(ConfigStoreError::Validation(
+                                "private-key authentication requires an inline key or key path"
+                                    .to_string(),
+                            ));
+                        }
+                        (
+                            intents.password.clone(),
+                            intents.private_key.clone(),
+                            intents.passphrase.clone(),
+                        )
                     }
                 },
-                Some(crate::NodePlacement::Local) | None => {
-                    (Action::Clear, Action::Clear, Action::Clear)
-                }
+                Some(crate::NodePlacement::Local) | None => (
+                    intents.password.clone(),
+                    intents.private_key.clone(),
+                    intents.passphrase.clone(),
+                ),
             };
 
+            let no_password = !matches!(
+                config
+                    .cluster_fabric
+                    .node(node_id)
+                    .map(|node| &node.placement),
+                Some(crate::NodePlacement::Ssh(crate::SshTarget {
+                    auth: crate::SshAuth::Password { .. },
+                    ..
+                }))
+            );
+            let no_private_key = !matches!(
+                config
+                    .cluster_fabric
+                    .node(node_id)
+                    .map(|node| &node.placement),
+                Some(crate::NodePlacement::Ssh(crate::SshTarget {
+                    auth: crate::SshAuth::PrivateKey { .. },
+                    ..
+                }))
+            );
+            if no_password && !matches!(password, crate::ClusterCredentialAction::Clear) {
+                return Err(ConfigStoreError::Validation(
+                    "password credential must be cleared for this authentication method"
+                        .to_string(),
+                ));
+            }
+            if no_private_key
+                && (!matches!(private_key, crate::ClusterCredentialAction::Clear)
+                    || !matches!(passphrase, crate::ClusterCredentialAction::Clear))
+            {
+                return Err(ConfigStoreError::Validation(
+                    "private-key credentials must be cleared for this authentication method"
+                        .to_string(),
+                ));
+            }
+            for action in [&password, &private_key, &passphrase] {
+                if let crate::ClusterCredentialAction::Replace(value) = action {
+                    if value.is_empty() || crate::patch::is_masked_api_key(value) {
+                        return Err(ConfigStoreError::Validation(
+                            "credential replacement must be nonempty and must not use a mask sentinel"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
             let mut metadata = crate::ClusterNodeCredentialRefs::default();
-            for (action, canonical, existing, reference_slot, configured_slot) in [
+            for (action, canonical, existing, was_configured, reference_slot, configured_slot) in [
                 (
                     password,
                     password_ref,
                     persisted.password_credential_ref,
+                    persisted.password_configured,
                     &mut metadata.password_credential_ref,
                     &mut metadata.password_configured,
                 ),
@@ -2061,6 +2278,7 @@ impl CredentialStore {
                     private_key,
                     private_key_ref,
                     persisted.private_key_credential_ref,
+                    persisted.private_key_configured,
                     &mut metadata.private_key_credential_ref,
                     &mut metadata.private_key_configured,
                 ),
@@ -2068,14 +2286,15 @@ impl CredentialStore {
                     passphrase,
                     passphrase_ref,
                     persisted.passphrase_credential_ref,
+                    persisted.passphrase_configured,
                     &mut metadata.passphrase_credential_ref,
                     &mut metadata.passphrase_configured,
                 ),
             ] {
                 let reference = existing.clone().unwrap_or(canonical);
                 match action {
-                    Action::Keep => {
-                        if !document.entries.contains_key(&reference) {
+                    crate::ClusterCredentialAction::Keep => {
+                        if !was_configured || !document.entries.contains_key(&reference) {
                             return Err(ConfigStoreError::Validation(
                                 "configured cluster credential is unavailable".to_string(),
                             ));
@@ -2085,7 +2304,7 @@ impl CredentialStore {
                         *reference_slot = Some(reference);
                         *configured_slot = true;
                     }
-                    Action::Replace(value) => {
+                    crate::ClusterCredentialAction::Replace(value) => {
                         if existing.is_none() && document.entries.contains_key(&reference) {
                             return Err(ConfigStoreError::Validation(
                                 "canonical cluster credential reference is already in use"
@@ -2119,7 +2338,7 @@ impl CredentialStore {
                         *reference_slot = Some(reference);
                         *configured_slot = true;
                     }
-                    Action::Clear => {
+                    crate::ClusterCredentialAction::Clear => {
                         if let Some(reference) = existing {
                             touched_refs.insert(reference.clone());
                             changed |= document.entries.remove(&reference).is_some();
@@ -2707,10 +2926,24 @@ impl CredentialStore {
     }
 }
 
+fn is_internal_recovery_ref(credential_ref: &CredentialRef) -> bool {
+    credential_ref.as_str().starts_with("access_repair.")
+}
+
+fn reject_internal_recovery_ref(credential_ref: &CredentialRef) -> ConfigStoreResult<()> {
+    if is_internal_recovery_ref(credential_ref) {
+        return Err(ConfigStoreError::Validation(
+            "credential reference is reserved for internal recovery".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn credential_statuses(document: &CredentialDocument) -> Vec<CredentialStatus> {
     document
         .entries
         .iter()
+        .filter(|(credential_ref, _)| !is_internal_recovery_ref(credential_ref))
         .map(|(credential_ref, entry)| CredentialStatus {
             credential_ref: credential_ref.clone(),
             configured: true,
@@ -2779,6 +3012,19 @@ pub(crate) fn config_credential_ref_counts(
                 add(reference);
             }
         }
+    }
+    for metadata in config.cluster_fabric.credential_refs.values() {
+        for reference in metadata.references() {
+            add(reference);
+        }
+    }
+    if let Some(reference) = config
+        .subagents()
+        .broker
+        .as_ref()
+        .and_then(|broker| broker.credential_ref.as_ref())
+    {
+        add(reference);
     }
     for server in &config.mcp.servers {
         match &server.transport {
@@ -2990,6 +3236,191 @@ mod tests {
         assert_eq!(revision, 2);
         assert!(!status.configured);
         assert!(store.resolve(&reference).unwrap().is_none());
+    }
+
+    #[test]
+    fn generic_reset_uses_durable_cluster_owners_not_stale_runtime() {
+        let _key = crate::encryption::set_test_encryption_key([0x32; 32]);
+        let dir = TempDir::new().unwrap();
+        let facade = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = facade.effective_config();
+        candidate.cluster_fabric.nodes.push(crate::Node {
+            id: "durable-owner".to_string(),
+            label: "durable-owner".to_string(),
+            placement: crate::NodePlacement::Ssh(crate::SshTarget {
+                host: "durable.example.test".to_string(),
+                port: 22,
+                username: "operator".to_string(),
+                auth: crate::SshAuth::Password {
+                    password: String::new(),
+                    password_encrypted: None,
+                },
+                host_key_fingerprint: None,
+            }),
+            trust_level: crate::TrustLevel::Trusted,
+            deploy: crate::DeployProfile::default(),
+            state: None,
+            enabled: true,
+        });
+        let password_ref = crate::cluster_password_credential_ref("durable-owner").unwrap();
+        let durable_secret = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            crate::persist_cluster_fabric_credential_transaction_at_revision(
+                dir.path(),
+                &mut candidate,
+                &BTreeMap::from([(
+                    "durable-owner".to_string(),
+                    crate::ClusterNodeCredentialIntents {
+                        password: crate::ClusterCredentialAction::Replace(durable_secret.clone(),),
+                        private_key: crate::ClusterCredentialAction::Clear,
+                        passphrase: crate::ClusterCredentialAction::Clear,
+                    },
+                )]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let store = CredentialStore::open(dir.path());
+        let stale_runtime = crate::Config::default();
+        let error = store.clear_all_unreferenced(&stale_runtime, 1).unwrap_err();
+        assert!(
+            matches!(error, ConfigStoreError::Validation(_)),
+            "a durable owner must reject generic reset"
+        );
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.resolve(&password_ref).unwrap().unwrap().expose(),
+            durable_secret.as_str()
+        );
+    }
+
+    #[test]
+    fn standalone_mutations_use_durable_owner_not_stale_facade() {
+        let _key = crate::encryption::set_test_encryption_key([0x35; 32]);
+        let dir = TempDir::new().unwrap();
+        let stale_facade = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        let reference = CredentialRef::parse("custom.managed.token").unwrap();
+        let original_secret = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            store
+                .replace(
+                    reference.clone(),
+                    &original_secret,
+                    CredentialSource::User,
+                    0,
+                )
+                .unwrap()
+                .0,
+            1
+        );
+
+        let external_facade = crate::ConfigFacade::open(dir.path()).unwrap();
+        external_facade
+            .registry()
+            .env
+            .commit(
+                0,
+                crate::EnvSection(vec![crate::EnvVarEntry {
+                    name: "CUSTOM_TOKEN".to_string(),
+                    value: String::new(),
+                    secret: true,
+                    value_encrypted: None,
+                    credential_ref: Some(reference.clone()),
+                    configured: true,
+                    description: Some("claimed by a newer process".to_string()),
+                }]),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_facade.registry().env.snapshot().revision,
+            0,
+            "the first process must remain stale for this regression"
+        );
+        assert_eq!(
+            crate::ConfigFacade::open(dir.path())
+                .unwrap()
+                .registry()
+                .env
+                .snapshot()
+                .revision,
+            1
+        );
+        let before = std::fs::read(store.path()).unwrap();
+
+        for error in [
+            store
+                .replace_unreferenced(
+                    reference.clone(),
+                    "stale-process-replacement",
+                    CredentialSource::User,
+                    1,
+                )
+                .unwrap_err(),
+            store.clear_unreferenced(&reference, 1).unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    error,
+                    ConfigStoreError::Validation(ref message)
+                        if message.starts_with(
+                            "credential reference is managed by configuration"
+                        )
+                ),
+                "{error}"
+            );
+        }
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.resolve(&reference).unwrap().unwrap().expose(),
+            original_secret
+        );
+    }
+
+    #[test]
+    fn generic_reset_uses_durable_broker_owner_not_stale_runtime() {
+        let _key = crate::encryption::set_test_encryption_key([0x34; 32]);
+        let dir = TempDir::new().unwrap();
+        let broker_secret = uuid::Uuid::new_v4().to_string();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            dir.path().join("broker.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "endpoint": "wss://broker.example.test/ws",
+                "token": broker_secret.clone()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let facade = crate::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let reference = facade
+            .registry()
+            .subagents
+            .snapshot()
+            .data
+            .external_broker
+            .as_ref()
+            .and_then(|broker| broker.credential_ref.clone())
+            .expect("durable broker must own its migrated credential");
+
+        let store = CredentialStore::open(dir.path());
+        let revision = store.revision().unwrap();
+        let stale_runtime = crate::Config::default();
+        let error = store
+            .clear_all_unreferenced(&stale_runtime, revision)
+            .unwrap_err();
+        assert!(
+            matches!(error, ConfigStoreError::Validation(_)),
+            "a durable broker owner must reject generic reset"
+        );
+        assert_eq!(store.revision().unwrap(), revision);
+        assert_eq!(
+            store.resolve(&reference).unwrap().unwrap().expose(),
+            broker_secret.as_str()
+        );
     }
 
     #[test]

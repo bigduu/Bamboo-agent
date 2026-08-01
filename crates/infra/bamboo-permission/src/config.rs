@@ -27,7 +27,7 @@ use crate::policy::{
 use crate::rule_parser::ParsedRule;
 
 /// Types of permissions that can be granted
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionType {
     /// Permission to write files
@@ -245,6 +245,45 @@ impl SessionGrant {
             .as_deref()
             .is_some_and(|pattern| match_glob_pattern(pattern, &normalized_resource))
     }
+}
+
+/// Runtime lifetime of a temporary permission grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporaryPermissionGrantScope {
+    /// Legacy process-wide session grant without a stable session id.
+    UnscopedSession,
+    /// Grant or deny remembered for one stable session until expiry.
+    Session,
+    /// Allow receipt bound to one request and consumed exactly once.
+    OneShot,
+}
+
+/// Effective decision carried by a temporary permission grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporaryPermissionGrantEffect {
+    Allow,
+    Deny,
+}
+
+/// Read-only, non-durable projection of one active runtime permission grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporaryPermissionGrant {
+    pub scope: TemporaryPermissionGrantScope,
+    pub effect: TemporaryPermissionGrantEffect,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub permission_type: PermissionType,
+    /// The matcher used by runtime enforcement. No tool arguments or credential
+    /// payloads are added to this projection.
+    pub matcher: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Canonicalize the static prefix of a file matcher without changing its glob
@@ -1226,6 +1265,99 @@ impl PermissionConfig {
         self.one_shot_grants.clear();
     }
 
+    /// Return a deterministic read-only snapshot of active runtime grants.
+    ///
+    /// Expired entries are omitted. One-shot receipts intentionally have no
+    /// timestamp because their lifetime is consumption-bound rather than
+    /// duration-bound.
+    pub fn temporary_grants(&self) -> Vec<TemporaryPermissionGrant> {
+        let now_instant = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let mut result = Vec::new();
+
+        for permission_entry in self.session_grants.iter() {
+            for grant in permission_entry.value().values() {
+                if grant.expires_at < now_instant {
+                    continue;
+                }
+                result.push(temporary_session_grant(
+                    TemporaryPermissionGrantScope::UnscopedSession,
+                    TemporaryPermissionGrantEffect::Allow,
+                    None,
+                    *permission_entry.key(),
+                    grant,
+                    now_instant,
+                    now_utc,
+                ));
+            }
+        }
+
+        for session_entry in self.scoped_session_grants.iter() {
+            for permission_entry in session_entry.value().iter() {
+                for grant in permission_entry.value().values() {
+                    if grant.expires_at < now_instant {
+                        continue;
+                    }
+                    result.push(temporary_session_grant(
+                        TemporaryPermissionGrantScope::Session,
+                        TemporaryPermissionGrantEffect::Allow,
+                        Some(session_entry.key().clone()),
+                        *permission_entry.key(),
+                        grant,
+                        now_instant,
+                        now_utc,
+                    ));
+                }
+            }
+        }
+
+        for session_entry in self.scoped_session_denies.iter() {
+            for permission_entry in session_entry.value().iter() {
+                for grant in permission_entry.value().values() {
+                    if grant.expires_at < now_instant {
+                        continue;
+                    }
+                    result.push(temporary_session_grant(
+                        TemporaryPermissionGrantScope::Session,
+                        TemporaryPermissionGrantEffect::Deny,
+                        Some(session_entry.key().clone()),
+                        *permission_entry.key(),
+                        grant,
+                        now_instant,
+                        now_utc,
+                    ));
+                }
+            }
+        }
+
+        for receipt_entry in self.one_shot_grants.iter() {
+            let (session_id, request_id) = receipt_entry.key();
+            for (permission_type, matcher) in receipt_entry.value() {
+                result.push(TemporaryPermissionGrant {
+                    scope: TemporaryPermissionGrantScope::OneShot,
+                    effect: TemporaryPermissionGrantEffect::Allow,
+                    session_id: Some(session_id.clone()),
+                    request_id: Some(request_id.clone()),
+                    permission_type: *permission_type,
+                    matcher: matcher.clone(),
+                    granted_at: None,
+                    expires_at: None,
+                });
+            }
+        }
+
+        result.sort_by(|left, right| {
+            left.session_id
+                .cmp(&right.session_id)
+                .then_with(|| left.request_id.cmp(&right.request_id))
+                .then_with(|| left.scope.cmp(&right.scope))
+                .then_with(|| left.effect.cmp(&right.effect))
+                .then_with(|| left.permission_type.cmp(&right.permission_type))
+                .then_with(|| left.matcher.cmp(&right.matcher))
+        });
+        result
+    }
+
     /// Clean up expired session grants.
     ///
     /// Note that expired grants are *also* removed opportunistically by
@@ -1266,15 +1398,23 @@ impl PermissionConfig {
     /// always-ask rules.
     pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
         let configured_mode = self.mode();
-        let effective_mode = if input.bypass_requested {
-            PermissionMode::BypassPermissions
+        // Normalize legacy callers that accidentally supplied both booleans:
+        // Auto is a no-prompt posture, never an alias for Bypass or its wider
+        // sandbox semantics. Plan remains a hard read-only overlay.
+        let requested = if input.auto_approve_requested {
+            bamboo_domain::SessionPermissionMode::Auto
+        } else if input.bypass_requested {
+            bamboo_domain::SessionPermissionMode::Bypass
         } else {
-            configured_mode
+            bamboo_domain::SessionPermissionMode::Default
         };
+        let resolution = bamboo_domain::resolve_permission_mode(requested, configured_mode);
+        let effective_mode = resolution.effective;
         let effective_policy = EffectivePermissionPolicy {
             revision: self.policy_revision(),
             mode: effective_mode,
-            bypass_requested: input.bypass_requested,
+            bypass_requested: resolution.bypass_permissions(),
+            auto_approve_requested: requested == bamboo_domain::SessionPermissionMode::Auto,
         };
 
         let deny = |code, message: String, matched_rule| PermissionOutcome::Deny {
@@ -1313,6 +1453,18 @@ impl PermissionConfig {
             );
         }
 
+        // Plan/read-only is an authorization boundary rather than an approval
+        // preference. It precedes receipts, grants, disabled-checks, Bypass and
+        // Auto so none of those mechanisms can turn a mutating operation into
+        // an allow while the gate is active.
+        if effective_mode == PermissionMode::Plan && input.risk_level != RiskLevel::Low {
+            return deny(
+                PermissionReasonCode::ModeDenied,
+                "operation denied by plan mode".to_string(),
+                None,
+            );
+        }
+
         if input.consume_once
             && self.consume_once(
                 &input.session_id,
@@ -1323,6 +1475,17 @@ impl PermissionConfig {
         {
             return PermissionOutcome::Allow {
                 source: PermissionDecisionSource::OneShot,
+                effective_policy,
+            };
+        }
+
+        // Auto is deliberately ordered after all hard/explicit denials and the
+        // exact one-shot receipt, but before every source of an approval
+        // request. It therefore produces zero prompts without weakening
+        // platform, durable, session, or legacy deny rules.
+        if resolution.suppress_approval_prompts() {
+            return PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
                 effective_policy,
             };
         }
@@ -1388,21 +1551,14 @@ impl PermissionConfig {
             };
         }
 
-        if input.bypass_requested || configured_mode == PermissionMode::BypassPermissions {
+        if effective_mode == PermissionMode::BypassPermissions {
             return PermissionOutcome::Allow {
                 source: PermissionDecisionSource::Bypass,
                 effective_policy,
             };
         }
 
-        match configured_mode {
-            PermissionMode::Plan if input.risk_level != RiskLevel::Low => {
-                return deny(
-                    PermissionReasonCode::ModeDenied,
-                    "operation denied by plan mode".to_string(),
-                    None,
-                );
-            }
+        match effective_mode {
             PermissionMode::DontAsk => {
                 return deny(
                     PermissionReasonCode::ModeDenied,
@@ -1420,6 +1576,7 @@ impl PermissionConfig {
                     effective_policy,
                 };
             }
+            PermissionMode::Auto | PermissionMode::BypassPermissions => {}
             _ => {}
         }
 
@@ -1500,6 +1657,7 @@ impl PermissionConfig {
             reason_code,
             effective_mode,
             bypass_requested: input.bypass_requested,
+            auto_approve_requested: input.auto_approve_requested,
             policy_revision: self.policy_revision(),
             matched_rule,
             allowed_decisions,
@@ -1645,6 +1803,44 @@ impl PermissionConfig {
     }
 }
 
+fn temporary_session_grant(
+    scope: TemporaryPermissionGrantScope,
+    effect: TemporaryPermissionGrantEffect,
+    session_id: Option<String>,
+    permission_type: PermissionType,
+    grant: &SessionGrant,
+    now_instant: Instant,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> TemporaryPermissionGrant {
+    TemporaryPermissionGrant {
+        scope,
+        effect,
+        session_id,
+        request_id: None,
+        permission_type,
+        matcher: grant.resource_pattern.clone(),
+        granted_at: instant_to_utc(grant.granted_at, now_instant, now_utc),
+        expires_at: instant_to_utc(grant.expires_at, now_instant, now_utc),
+    }
+}
+
+fn instant_to_utc(
+    instant: Instant,
+    anchor_instant: Instant,
+    anchor_utc: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(duration) = instant.checked_duration_since(anchor_instant) {
+        chrono::Duration::from_std(duration)
+            .ok()
+            .and_then(|duration| anchor_utc.checked_add_signed(duration))
+    } else {
+        let duration = anchor_instant.checked_duration_since(instant)?;
+        chrono::Duration::from_std(duration)
+            .ok()
+            .and_then(|duration| anchor_utc.checked_sub_signed(duration))
+    }
+}
+
 fn legacy_rule_ref(id: &str, effect: PermissionRuleEffect) -> PermissionRuleRef {
     PermissionRuleRef {
         id: id.to_string(),
@@ -1671,6 +1867,31 @@ pub struct SerializablePermissionConfig {
     /// and are evaluated without broadening during the migration window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub durable_rules: Vec<DurablePermissionRule>,
+}
+
+/// Conservative external-runner preflight for explicit Bamboo deny policy.
+///
+/// Vendor native no-prompt modes do not expose a reliable per-tool callback.
+/// Any live explicit deny therefore makes such an activation fail closed before
+/// process spawn; workspace/session applicability that cannot be proven at this
+/// boundary is deliberately treated as applicable.
+pub fn explicit_deny_policy_reason(policy: &SerializablePermissionConfig) -> Option<String> {
+    let legacy_denies = policy
+        .whitelist
+        .iter()
+        .filter(|rule| !rule.allowed && !rule.is_expired())
+        .count();
+    let durable_denies = policy
+        .durable_rules
+        .iter()
+        .filter(|rule| rule.effect == PermissionRuleEffect::Deny && !rule.is_expired())
+        .count();
+    let total = legacy_denies.saturating_add(durable_denies);
+    (total > 0).then(|| {
+        format!(
+            "external no-prompt executor cannot safely enforce {total} explicit Bamboo deny rule(s)"
+        )
+    })
 }
 
 impl Default for SerializablePermissionConfig {
@@ -2453,6 +2674,7 @@ mod integration_tests {
         assert!(!PermissionMode::AcceptEdits.description().is_empty());
         assert!(!PermissionMode::DontAsk.description().is_empty());
         assert!(!PermissionMode::BypassPermissions.description().is_empty());
+        assert!(!PermissionMode::Auto.description().is_empty());
     }
 
     #[test]
@@ -2579,6 +2801,91 @@ mod integration_tests {
             restored.ask_rule_patterns(),
             vec!["Bash(rm -rf *)".to_string(), "Read".to_string()]
         );
+    }
+
+    #[test]
+    fn temporary_grant_snapshot_is_complete_deterministic_and_omits_expired_entries() {
+        let config = PermissionConfig::new();
+        config.grant_session_permission(PermissionType::HttpRequest, "api.example.com");
+        config.grant_scoped_session_permission(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "cargo test",
+        );
+        config.deny_scoped_session_permission(
+            "session-a",
+            PermissionType::WriteFile,
+            "/private/**",
+        );
+        config.grant_once(
+            "session-a",
+            "request-1",
+            PermissionType::GitWrite,
+            "git push".to_string(),
+        );
+
+        let session = config
+            .scoped_session_grants
+            .entry("session-expired".to_string())
+            .or_default();
+        session
+            .entry(PermissionType::ExecuteCommand)
+            .or_default()
+            .insert(
+                "expired".to_string(),
+                SessionGrant {
+                    granted_at: Instant::now(),
+                    expires_at: Instant::now(),
+                    resource_pattern: "expired".to_string(),
+                },
+            );
+        drop(session);
+
+        let snapshot = config.temporary_grants();
+        assert_eq!(snapshot.len(), 4);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|grant| grant.matcher.as_str())
+                .collect::<Vec<_>>(),
+            vec!["api.example.com", "cargo test", "/private/**", "git push"]
+        );
+        assert!(!snapshot.iter().any(|grant| grant.matcher == "expired"));
+
+        let session_allow = snapshot
+            .iter()
+            .find(|grant| grant.matcher == "cargo test")
+            .unwrap();
+        assert_eq!(session_allow.scope, TemporaryPermissionGrantScope::Session);
+        assert_eq!(session_allow.effect, TemporaryPermissionGrantEffect::Allow);
+        assert_eq!(session_allow.session_id.as_deref(), Some("session-a"));
+        assert!(session_allow.granted_at.is_some());
+        assert!(session_allow.expires_at.is_some());
+
+        let session_deny = snapshot
+            .iter()
+            .find(|grant| grant.matcher == "/private/**")
+            .unwrap();
+        assert_eq!(session_deny.effect, TemporaryPermissionGrantEffect::Deny);
+
+        let one_shot = snapshot
+            .iter()
+            .find(|grant| grant.scope == TemporaryPermissionGrantScope::OneShot)
+            .unwrap();
+        assert_eq!(one_shot.request_id.as_deref(), Some("request-1"));
+        assert!(one_shot.granted_at.is_none());
+        assert!(one_shot.expires_at.is_none());
+
+        assert!(config.consume_once(
+            "session-a",
+            "request-1",
+            PermissionType::GitWrite,
+            "git push"
+        ));
+        assert!(!config
+            .temporary_grants()
+            .iter()
+            .any(|grant| grant.scope == TemporaryPermissionGrantScope::OneShot));
     }
 
     #[test]
@@ -2781,6 +3088,7 @@ mod integration_tests {
             operation_summary: format!("execute {resource}"),
             risk_level: RiskLevel::High,
             bypass_requested,
+            auto_approve_requested: false,
             platform_hard_deny: None,
             consume_once: true,
             supported_decisions: crate::policy::PermissionDecisionKind::all_supported(),
@@ -2818,6 +3126,99 @@ mod integration_tests {
                 },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn auto_skips_forced_asks_but_never_overrides_hard_denials() {
+        let config = PermissionConfig::new();
+        config.set_ask_rules(["Bash(eval *)".to_string()]);
+
+        let mut auto = evaluation("auto", "hard", "eval 'echo allowed'", false);
+        auto.auto_approve_requested = true;
+        assert!(matches!(
+            config.evaluate(auto.clone()),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
+                effective_policy: EffectivePermissionPolicy {
+                    mode: PermissionMode::Auto,
+                    auto_approve_requested: true,
+                    ..
+                }
+            }
+        ));
+
+        auto.platform_hard_deny = Some("sandbox policy rejected operation".to_string());
+        assert!(matches!(
+            config.evaluate(auto.clone()),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::PlatformHardDeny,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        auto.platform_hard_deny = None;
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "eval 'echo allowed'",
+            false,
+        ));
+        assert!(matches!(
+            config.evaluate(auto),
+            PermissionOutcome::Deny {
+                reason: PermissionDenyReason {
+                    code: PermissionReasonCode::ExplicitDeny,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn configured_auto_mode_uses_the_same_zero_prompt_precedence() {
+        let config = PermissionConfig::new();
+        config.set_mode(PermissionMode::Auto);
+
+        assert!(matches!(
+            config.evaluate(evaluation(
+                "auto",
+                "configured",
+                "eval 'echo configured'",
+                false
+            )),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
+                effective_policy: EffectivePermissionPolicy {
+                    mode: PermissionMode::Auto,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_bypass_overrides_global_auto_without_skipping_forced_confirmation() {
+        let config = PermissionConfig::new();
+        config.set_mode(PermissionMode::Auto);
+
+        assert!(matches!(
+            config.evaluate(evaluation(
+                "legacy-bypass",
+                "configured-auto",
+                "sudo rm -rf /tmp/still-confirmed",
+                true
+            )),
+            PermissionOutcome::Ask(PermissionRequest {
+                reason_code: PermissionReasonCode::HardDangerous,
+                effective_mode: PermissionMode::BypassPermissions,
+                bypass_requested: true,
+                auto_approve_requested: false,
+                ..
+            })
         ));
     }
 

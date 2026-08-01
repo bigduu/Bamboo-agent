@@ -123,6 +123,7 @@ async fn need_clarification_sends_event() {
         &event_tx,
         &mut session,
         tools.as_ref(),
+        bamboo_agent_core::tools::ToolExecutionSessionFlags::default(),
         None,
     )
     .await;
@@ -203,6 +204,7 @@ async fn need_more_actions_executes_sub_actions() {
         &event_tx,
         &mut session,
         tools.as_ref(),
+        bamboo_agent_core::tools::ToolExecutionSessionFlags::default(),
         None,
     )
     .await;
@@ -343,6 +345,49 @@ struct MidLoopThenPartialErrorProvider {
 
 struct RetryBeforeStreamThenSuccessProvider {
     calls: AtomicUsize,
+}
+
+struct EmptyAssistantResponseProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for EmptyAssistantResponseProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(call, 0, "an empty assistant response must not be retried");
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::ResponseId("resp_empty_740".to_string())),
+            Ok(LLMChunk::Token(" \n ".to_string())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+struct AlwaysTransientProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for AlwaysTransientProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(LLMError::Api(
+            "temporary provider dispatch failure".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -566,6 +611,98 @@ async fn retryable_pre_stream_error_does_not_delete_existing_interrupted_tail() 
         .messages
         .iter()
         .any(|message| message.content == "retry recovered"));
+}
+
+#[tokio::test]
+async fn direct_execute_surfaces_and_checkpoints_empty_response_without_retry() {
+    let provider = Arc::new(EmptyAssistantResponseProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let (_temp, agent, storage) = build_direct_execute_agent(provider.clone(), None, None).await;
+    let mut session = Session::new("direct-empty-response", "test-model");
+    session.add_message(Message::user("durable base"));
+    storage.save_session(&session).await.unwrap();
+    session.add_message(Message::user("checkpoint this turn"));
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let result = agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await;
+
+    assert!(matches!(
+        &result,
+        Err(bamboo_agent_core::AgentError::EmptyAssistantResponse {
+            response_id: Some(response_id)
+        }) if response_id == "resp_empty_740"
+    ));
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "the real provider pipeline must make exactly one billable call"
+    );
+
+    let terminal_event =
+        crate::runtime::execution::agent_spawn::terminal_error_event_for_result(&result)
+            .expect("terminal empty response must remain visible to event consumers");
+    match terminal_event {
+        AgentEvent::Error { message } => {
+            assert!(message.contains("Empty assistant response from LLM"));
+            assert!(message.contains("resp_empty_740"));
+        }
+        other => panic!("unexpected terminal event: {other:?}"),
+    }
+
+    let saved = storage
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .expect("saved session");
+    assert!(
+        saved
+            .messages
+            .iter()
+            .any(|message| message.content == "checkpoint this turn"),
+        "the shared execute boundary must checkpoint the terminal turn"
+    );
+    assert!(!saved.agent_runtime_state.as_ref().is_some_and(|state| {
+        matches!(state.status, bamboo_domain::AgentStatusState::Completed)
+    }));
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(!matches!(event, AgentEvent::Complete { .. }));
+    }
+}
+
+#[tokio::test]
+async fn direct_execute_retries_transient_llm_errors_to_existing_limit() {
+    let provider = Arc::new(AlwaysTransientProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let (_temp, agent, _storage) = build_direct_execute_agent(provider.clone(), None, None).await;
+    let mut session = Session::new("direct-transient-retry-limit", "test-model");
+    session.add_message(Message::user("retry transient failures"));
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    let error = agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect_err("an always-transient provider must exhaust the retry limit");
+
+    assert!(matches!(
+        error,
+        bamboo_agent_core::AgentError::LLM(message)
+            if message.contains("temporary provider dispatch failure")
+    ));
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        3,
+        "genuine transient LLM failures keep the existing three-attempt limit"
+    );
 }
 
 #[tokio::test]

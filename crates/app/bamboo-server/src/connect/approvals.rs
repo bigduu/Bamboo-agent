@@ -30,6 +30,9 @@ use bamboo_engine::execution::{
 use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
 };
+use bamboo_engine::session_app::approval_replay::{
+    refresh_approval_replay_posture, ApprovalReplayDecision,
+};
 use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
 use bamboo_engine::session_app::respond::{
     submit_pending_response, PERMISSION_REEXECUTE_METADATA_KEY,
@@ -588,64 +591,109 @@ impl ResumeExecutionPort for ConnectResumePort {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
             let mut session = session;
-            session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
 
             if let Some(tool_call) = find_pending_tool_call(&session, &reexecute_tool_call_id) {
-                let executor = ctx.tools.clone();
                 let tool_name = tool_call.function.name.clone();
-                let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
-                    == bamboo_tools::orchestrator::ToolMutability::Mutating;
-
-                let mut emitter =
-                    bamboo_tools::ToolEmitter::new(&tool_call.id, &tool_name, is_mutating);
-                emitter.set_auto_approved(true);
-                let _ = mpsc_tx
-                    .send(emitter.begin().clone().into_agent_event())
-                    .await;
-
-                let exec_result = {
-                    let exec_ctx = ToolExecutionContext {
-                        session_id: Some(session.id.as_str()),
-                        tool_call_id: reexecute_tool_call_id.as_str(),
-                        event_tx: Some(&mpsc_tx),
-                        available_tool_schemas: None,
-                        bypass_permissions: false,
-                        can_async_resume: false,
-                        bash_completion_sink: None,
-                        pre_parsed_args: None,
-                    };
-                    executor.execute_with_context(&tool_call, exec_ctx).await
+                let configured_mode = ctx
+                    .permission_checker
+                    .permission_config()
+                    .map(|config| config.mode())
+                    .unwrap_or_default();
+                let decision = match refresh_approval_replay_posture(
+                    ctx.session_repo.storage().as_ref(),
+                    &mut session,
+                    configured_mode,
+                    &tool_name,
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        tracing::error!(
+                            %session_id,
+                            tool_call_id = %reexecute_tool_call_id,
+                            %error,
+                            "connect approval replay posture refresh failed closed"
+                        );
+                        return;
+                    }
                 };
+                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
 
-                let (content, success) = match exec_result {
-                    Ok(tool_result) => {
+                let (content, success) = match decision {
+                    ApprovalReplayDecision::BlockedByPlan(_) => (
+                        format!(
+                            "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::Execute(flags) => {
+                        let executor = ctx.tools.clone();
+                        let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
+                            == bamboo_tools::orchestrator::ToolMutability::Mutating;
+                        let mut emitter = bamboo_tools::ToolEmitter::new(
+                            &tool_call.id,
+                            &tool_name,
+                            is_mutating,
+                        );
+                        emitter.set_auto_approved(true);
                         let _ = mpsc_tx
-                            .send(
-                                emitter
-                                    .finish(Some("Re-executed after approval".to_string()))
-                                    .clone()
-                                    .into_agent_event(),
+                            .send(emitter.begin().clone().into_agent_event())
+                            .await;
+                        let exec_result = executor
+                            .execute_with_context(
+                                &tool_call,
+                                ToolExecutionContext {
+                                    session_id: Some(session.id.as_str()),
+                                    tool_call_id: reexecute_tool_call_id.as_str(),
+                                    event_tx: Some(&mpsc_tx),
+                                    available_tool_schemas: None,
+                                    bypass_permissions: flags.bypass_permissions,
+                                    auto_approve_permissions: flags.auto_approve_permissions,
+                                    plan_read_only: flags.plan_read_only,
+                                    can_async_resume: false,
+                                    bash_completion_sink: None,
+                                    pre_parsed_args: None,
+                                },
                             )
                             .await;
-                        let _ = mpsc_tx
-                            .send(AgentEvent::ToolComplete {
-                                tool_call_id: tool_call.id.clone(),
-                                result: tool_result.clone(),
-                            })
-                            .await;
-                        (tool_result.result, tool_result.success)
-                    }
-                    Err(error) => {
-                        let message = format!("Tool re-execution after approval failed: {error}");
-                        let _ = mpsc_tx
-                            .send(emitter.error(message.clone()).clone().into_agent_event())
-                            .await;
-                        (message, false)
+
+                        match exec_result {
+                            Ok(tool_result) => {
+                                let _ = mpsc_tx
+                                    .send(
+                                        emitter
+                                            .finish(Some(
+                                                "Re-executed after approval".to_string(),
+                                            ))
+                                            .clone()
+                                            .into_agent_event(),
+                                    )
+                                    .await;
+                                let _ = mpsc_tx
+                                    .send(AgentEvent::ToolComplete {
+                                        tool_call_id: tool_call.id.clone(),
+                                        result: tool_result.clone(),
+                                    })
+                                    .await;
+                                (tool_result.result, tool_result.success)
+                            }
+                            Err(error) => {
+                                let message =
+                                    format!("Tool re-execution after approval failed: {error}");
+                                let _ = mpsc_tx
+                                    .send(
+                                        emitter.error(message.clone()).clone().into_agent_event(),
+                                    )
+                                    .await;
+                                (message, false)
+                            }
+                        }
                     }
                 };
 
                 tracing::info!(
-                    "[{}] connect: re-executed approved tool '{}' ({}) -> success={}",
+                    "[{}] connect: resolved approved tool replay '{}' ({}) -> success={}",
                     session_id,
                     tool_name,
                     reexecute_tool_call_id,
@@ -654,6 +702,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 apply_tool_result(&mut session, &reexecute_tool_call_id, content, success);
                 ctx.session_repo.save_and_cache(&mut session).await;
             } else {
+                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 tracing::warn!(
                     "[{}] connect: permission re-exec marker set but tool call '{}' not found in history",
                     session_id,

@@ -69,6 +69,97 @@ fn redact_config_masks_configured_provider_and_removes_proxy_encrypted_keys() {
 }
 
 #[test]
+fn redact_config_removes_all_cluster_fabric_secret_representations() {
+    let config = Config::default();
+    let input = json!({
+        "cluster_fabric": {
+            "credential_refs": {
+                "password-node": {
+                    "password_credential_ref": "cluster.password-node.password",
+                    "password_configured": true
+                },
+                "key-node": {
+                    "private_key_credential_ref": "cluster.key-node.private_key",
+                    "private_key_configured": true,
+                    "passphrase_credential_ref": "cluster.key-node.passphrase",
+                    "passphrase_configured": true
+                }
+            },
+            "nodes": [
+                {
+                    "id": "password-node",
+                    "placement": {
+                        "type": "ssh",
+                        "auth": {
+                            "type": "password",
+                            "password": "plain-password",
+                            "password_encrypted": "encrypted-password"
+                        }
+                    }
+                },
+                {
+                    "id": "key-node",
+                    "placement": {
+                        "type": "ssh",
+                        "auth": {
+                            "type": "private_key",
+                            "private_key": "plain-private-key",
+                            "private_key_encrypted": "encrypted-private-key",
+                            "passphrase": "plain-passphrase",
+                            "passphrase_encrypted": "encrypted-passphrase"
+                        }
+                    }
+                }
+            ]
+        }
+    });
+
+    let redacted = redact_config_for_api(input, &config);
+    assert!(
+        redacted["cluster_fabric"].get("credential_refs").is_none(),
+        "legacy root responses must not expose cluster credential references"
+    );
+    let nodes = redacted["cluster_fabric"]["nodes"]
+        .as_array()
+        .expect("cluster nodes should remain visible");
+
+    for node in nodes {
+        let auth = node["placement"]["auth"]
+            .as_object()
+            .expect("safe auth metadata should remain visible");
+        for field in [
+            "password",
+            "password_encrypted",
+            "private_key",
+            "private_key_encrypted",
+            "passphrase",
+            "passphrase_encrypted",
+        ] {
+            assert!(!auth.contains_key(field), "{field} must not be returned");
+        }
+    }
+
+    let serialized = serde_json::to_string(&redacted).expect("redacted config should serialize");
+    for forbidden in [
+        "plain-password",
+        "encrypted-password",
+        "plain-private-key",
+        "encrypted-private-key",
+        "plain-passphrase",
+        "encrypted-passphrase",
+        "cluster.password-node.password",
+        "cluster.key-node.private_key",
+        "cluster.key-node.passphrase",
+        "****...****",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "redacted config leaked {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn redact_config_removes_all_access_control_verifiers_but_keeps_safe_device_metadata() {
     let config = Config::default();
     let input = json!({

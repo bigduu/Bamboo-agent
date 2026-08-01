@@ -21,13 +21,16 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 
 use super::common::model_fetcher;
-use super::common::openai_compat::{build_openai_compat_body, parse_openai_compat_sse_data_strict};
+use super::common::openai_compat::{
+    build_openai_compat_body, openai_compat_chat_stream_from_sse,
+    parse_openai_compat_sse_data_strict_multi,
+};
 use super::common::openai_responses::{
     build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
-use super::common::sse::llm_stream_from_sse;
+use super::common::sse::llm_stream_from_sse_multi_requiring_done;
 
 /// OpenAI API provider for chat completions.
 pub struct OpenAIProvider {
@@ -36,6 +39,7 @@ pub struct OpenAIProvider {
     base_url: String,
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
+    explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
 }
@@ -49,6 +53,7 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
+            explicit_prompt_cache: true,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
         }
@@ -82,6 +87,16 @@ impl OpenAIProvider {
     /// Configure default reasoning effort for requests sent through this provider.
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.default_reasoning_effort = effort;
+        self
+    }
+
+    /// Enable or disable Bamboo-generated GPT-5.6+ explicit prompt-cache
+    /// controls for this provider instance.
+    ///
+    /// Disabling this does not remove a caller-supplied `prompt_cache_key`, so
+    /// compatible upstreams can continue using their implicit prompt cache.
+    pub fn with_explicit_prompt_cache(mut self, enabled: bool) -> Self {
+        self.explicit_prompt_cache = enabled;
         self
     }
 
@@ -159,16 +174,20 @@ impl OpenAIProvider {
         reasoning_effort: Option<ReasoningEffort>,
         responses_options: Option<&ResponsesRequestOptions>,
         parallel_tool_calls: Option<bool>,
+        cache_plan: Option<&crate::cache::PromptCachePlan>,
         required_tool: Option<&str>,
         reasoning_source: &str,
         request_purpose: &str,
         session_log_id: &str,
     ) -> Result<LLMStream> {
+        let retain_protocol_events =
+            responses_options.is_some_and(|options| options.retain_protocol_events);
         let input_selection = select_responses_input_messages(messages, responses_options);
         let input_source = match input_selection.source {
             ResponsesInputSource::Explicit => "explicit",
             ResponsesInputSource::Generic => "generic",
         };
+        let generated_cache_plan = self.explicit_prompt_cache.then_some(cache_plan).flatten();
         let mut body = build_responses_body(
             model,
             messages,
@@ -177,6 +196,7 @@ impl OpenAIProvider {
             reasoning_effort,
             responses_options,
             parallel_tool_calls,
+            generated_cache_plan,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -190,7 +210,7 @@ impl OpenAIProvider {
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
-            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} [{}]",
+            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} [{}]",
             session_log_id,
             model,
             reasoning_effort
@@ -205,6 +225,7 @@ impl OpenAIProvider {
             input_selection.original_len,
             input_selection.effective_len,
             input_selection.fallback_removed_duplicate_system,
+            self.explicit_prompt_cache,
             request_purpose
         );
 
@@ -254,6 +275,7 @@ impl OpenAIProvider {
                     reasoning_effort,
                     Some(&fallback_options),
                     parallel_tool_calls,
+                    generated_cache_plan,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -286,13 +308,24 @@ impl OpenAIProvider {
                 }
 
                 let mut parser =
-                    ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
+                    ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
+                        .with_protocol_events(retain_protocol_events);
                 let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse(fallback, move |event, data| {
-                    let parsed = parser.handle_event(event, data);
-                    append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
-                    parsed
-                });
+                let stream = llm_stream_from_sse_multi_requiring_done(
+                    fallback,
+                    move |event, data| {
+                        let parsed = parser.handle_event_multi(event, data);
+                        append_responses_sse_record(
+                            "OpenAI",
+                            &model_for_debug,
+                            event,
+                            data,
+                            &parsed,
+                        );
+                        parsed
+                    },
+                    "OpenAI Responses",
+                );
                 return Ok(stream);
             }
 
@@ -314,6 +347,7 @@ impl OpenAIProvider {
                     None,
                     Some(&fallback_options),
                     parallel_tool_calls,
+                    generated_cache_plan,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -345,26 +379,42 @@ impl OpenAIProvider {
                     )));
                 }
 
-                let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None);
+                let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None)
+                    .with_protocol_events(retain_protocol_events);
                 let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse(fallback, move |event, data| {
-                    let parsed = parser.handle_event(event, data);
-                    append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
-                    parsed
-                });
+                let stream = llm_stream_from_sse_multi_requiring_done(
+                    fallback,
+                    move |event, data| {
+                        let parsed = parser.handle_event_multi(event, data);
+                        append_responses_sse_record(
+                            "OpenAI",
+                            &model_for_debug,
+                            event,
+                            data,
+                            &parsed,
+                        );
+                        parsed
+                    },
+                    "OpenAI Responses",
+                );
                 return Ok(stream);
             }
 
             return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
         }
 
-        let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort);
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
+            .with_protocol_events(retain_protocol_events);
         let model_for_debug = model.to_string();
-        let stream = llm_stream_from_sse(response, move |event, data| {
-            let parsed = parser.handle_event(event, data);
-            append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
-            parsed
-        });
+        let stream = llm_stream_from_sse_multi_requiring_done(
+            response,
+            move |event, data| {
+                let parsed = parser.handle_event_multi(event, data);
+                append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
+                parsed
+            },
+            "OpenAI Responses",
+        );
         Ok(stream)
     }
 }
@@ -404,6 +454,7 @@ impl LLMProvider for OpenAIProvider {
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
         let responses_options = options.and_then(|o| o.responses.as_ref());
+        let cache_plan = options.and_then(|o| o.cache.as_ref());
         let request_purpose = options
             .and_then(|o| o.request_purpose.as_deref())
             .unwrap_or("unknown");
@@ -428,6 +479,7 @@ impl LLMProvider for OpenAIProvider {
                     reasoning_effort,
                     responses_options,
                     parallel_tool_calls,
+                    cache_plan,
                     required_tool,
                     reasoning_source,
                     request_purpose,
@@ -527,16 +579,12 @@ impl LLMProvider for OpenAIProvider {
                     .await?;
 
                 if fallback.status().is_success() {
-                    let stream = llm_stream_from_sse(fallback, |_event, data| {
+                    let stream = openai_compat_chat_stream_from_sse(fallback, |_event, data| {
                         if data.trim().is_empty() {
-                            return Ok(None);
+                            return Ok(Vec::new());
                         }
 
-                        let chunk = parse_openai_compat_sse_data_strict(data)?;
-                        match chunk {
-                            LLMChunk::Done => Ok(Some(LLMChunk::Done)),
-                            other => Ok(Some(other)),
-                        }
+                        parse_openai_compat_sse_data_strict_multi(data)
                     });
 
                     return Ok(stream);
@@ -566,6 +614,7 @@ impl LLMProvider for OpenAIProvider {
                         reasoning_effort,
                         responses_options,
                         parallel_tool_calls,
+                        cache_plan,
                         required_tool,
                         reasoning_source,
                         request_purpose,
@@ -582,9 +631,9 @@ impl LLMProvider for OpenAIProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = llm_stream_from_sse(response, move |_event, data| {
+        let stream = openai_compat_chat_stream_from_sse(response, move |_event, data| {
             if data.trim().is_empty() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
 
             let mut reasoning_chunk_to_emit: Option<String> = None;
@@ -613,31 +662,28 @@ impl LLMProvider for OpenAIProvider {
                 }
             }
 
+            let mut chunks = parse_openai_compat_sse_data_strict_multi(data)?;
             if let Some(reasoning_chunk) = reasoning_chunk_to_emit {
-                return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk)));
+                chunks.retain(|chunk| !matches!(chunk, LLMChunk::Token(token) if token.is_empty()));
+                chunks.insert(0, LLMChunk::ReasoningToken(reasoning_chunk));
             }
 
-            let chunk = parse_openai_compat_sse_data_strict(data)?;
-            match chunk {
-                LLMChunk::Done => {
-                    if !logged_summary
-                        && (requested_reasoning.is_some() || observed_reasoning_signal)
-                    {
-                        tracing::info!(
-                            "OpenAI chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
-                            model_for_log,
-                            requested_reasoning
-                                .map(ReasoningEffort::as_str)
-                                .unwrap_or("none"),
-                            observed_reasoning_signal,
-                            reasoning_chars
-                        );
-                        logged_summary = true;
-                    }
-                    Ok(Some(LLMChunk::Done))
-                }
-                other => Ok(Some(other)),
+            if chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done))
+                && !logged_summary
+                && (requested_reasoning.is_some() || observed_reasoning_signal)
+            {
+                tracing::info!(
+                    "OpenAI chat_completions reasoning summary: model='{}' requested_effort={} observed_reasoning_signal={} reasoning_text_chars={}",
+                    model_for_log,
+                    requested_reasoning
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("none"),
+                    observed_reasoning_signal,
+                    reasoning_chars
+                );
+                logged_summary = true;
             }
+            Ok(chunks)
         });
 
         Ok(stream)
@@ -653,6 +699,7 @@ impl LLMProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionSchema, ToolSchema};
 
@@ -663,6 +710,7 @@ mod tests {
         let provider = OpenAIProvider::new("test_key");
         assert_eq!(provider.api_key, "test_key");
         assert_eq!(provider.base_url, "https://api.openai.com/v1");
+        assert!(provider.explicit_prompt_cache);
     }
 
     #[test]
@@ -680,11 +728,13 @@ mod tests {
 
     #[test]
     fn test_chained_builders() {
-        let provider =
-            OpenAIProvider::new("test_key").with_base_url("https://custom.openai.com/v1");
+        let provider = OpenAIProvider::new("test_key")
+            .with_base_url("https://custom.openai.com/v1")
+            .with_explicit_prompt_cache(false);
 
         assert_eq!(provider.api_key, "test_key");
         assert_eq!(provider.base_url, "https://custom.openai.com/v1");
+        assert!(!provider.explicit_prompt_cache);
     }
 
     #[test]
@@ -1024,6 +1074,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_can_disable_generated_explicit_cache_without_dropping_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = responses_provider(&server).with_explicit_prompt_cache(false);
+        let mut stable = Message::user("stable prefix");
+        stable.id = "stable-message".to_string();
+        let options = LLMRequestOptions {
+            responses: Some(ResponsesRequestOptions {
+                prompt_cache_key: Some("session-cache-key".to_string()),
+                ..Default::default()
+            }),
+            cache: Some(crate::cache::PromptCachePlan {
+                breakpoint_message_ids: vec!["stable-message".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream_with_options(&[stable], &[], None, "gpt-5.6-sol", Some(&options))
+            .await
+            .expect("Responses request without generated explicit cache fields");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["prompt_cache_key"], "session-cache-key");
+        assert!(body.get("prompt_cache_options").is_none());
+        assert!(!body.to_string().contains("prompt_cache_breakpoint"));
+    }
+
+    #[tokio::test]
     async fn chat_completions_forces_named_required_tool_on_wire() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1062,6 +1153,63 @@ mod tests {
         );
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_production_stream_defers_done_until_usage_trailer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n",
+                            "\n",
+                            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n",
+                            "\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":768},\"completion_tokens_details\":{\"reasoning_tokens\":20}}}\n",
+                            "\n",
+                            "data: [DONE]\n",
+                            "\n",
+                        ),
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAIProvider::new("test-key").with_base_url(server.uri());
+
+        let mut stream = provider
+            .chat_stream(&[Message::user("hello")], &[], None, "gpt-4o")
+            .await
+            .expect("chat stream");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.expect("stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "answer"));
+        assert!(matches!(
+            chunks[1],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                reasoning_tokens: Some(20),
+                cache_read_input_tokens: Some(768),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[2], LLMChunk::Done));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

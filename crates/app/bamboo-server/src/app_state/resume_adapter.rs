@@ -13,6 +13,9 @@ use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
     resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
 };
+use bamboo_engine::session_app::approval_replay::{
+    refresh_approval_replay_posture, ApprovalReplayDecision,
+};
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 use bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY;
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
@@ -200,68 +203,113 @@ impl ResumeExecutionPort for AppStateResumeRef {
 
         tokio::spawn(async move {
             let mut session = session;
-            session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
 
             if let Some(tool_call) = find_pending_tool_call(&session, &reexecute_tool_call_id) {
-                let executor = state.tools_for(crate::tools::ToolSurface::Root);
                 let tool_name = tool_call.function.name.clone();
-                let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
-                    == bamboo_tools::orchestrator::ToolMutability::Mutating;
-
-                // Frame the re-run with the same lifecycle events the normal loop
-                // emits (via ToolEmitter) so the frontend updates the tool card
-                // (running → finished) and ToolComplete carries the REAL output —
-                // raw execute_with_context only streams tool tokens, not lifecycle.
-                let mut emitter =
-                    bamboo_tools::ToolEmitter::new(&tool_call.id, &tool_name, is_mutating);
-                emitter.set_auto_approved(true);
-                let _ = mpsc_tx
-                    .send(emitter.begin().clone().into_agent_event())
-                    .await;
-
-                let exec_result = {
-                    let ctx = bamboo_agent_core::tools::ToolExecutionContext {
-                        session_id: Some(session.id.as_str()),
-                        tool_call_id: reexecute_tool_call_id.as_str(),
-                        event_tx: Some(&mpsc_tx),
-                        available_tool_schemas: None,
-                        bypass_permissions: false,
-                        can_async_resume: false,
-                        bash_completion_sink: None,
-                        pre_parsed_args: None,
-                    };
-                    executor.execute_with_context(&tool_call, ctx).await
+                let configured_mode = state
+                    .permission_checker
+                    .permission_config()
+                    .map(|config| config.mode())
+                    .unwrap_or_default();
+                let decision = match refresh_approval_replay_posture(
+                    state.storage.as_ref(),
+                    &mut session,
+                    configured_mode,
+                    &tool_name,
+                )
+                .await
+                {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        // The durable marker remains intact so a later retry can
+                        // re-check policy; no ToolStart or executor entry occurs.
+                        tracing::error!(
+                            %session_id,
+                            tool_call_id = %reexecute_tool_call_id,
+                            %error,
+                            "approval replay posture refresh failed closed"
+                        );
+                        return;
+                    }
                 };
+                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
 
-                let (content, success) = match exec_result {
-                    Ok(tool_result) => {
+                let (content, success) = match decision {
+                    ApprovalReplayDecision::BlockedByPlan(_) => (
+                        format!(
+                            "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"
+                        ),
+                        false,
+                    ),
+                    ApprovalReplayDecision::Execute(flags) => {
+                        let executor = state.tools_for(crate::tools::ToolSurface::Root);
+                        let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
+                            == bamboo_tools::orchestrator::ToolMutability::Mutating;
+
+                        // Only an admitted replay emits lifecycle start.
+                        let mut emitter = bamboo_tools::ToolEmitter::new(
+                            &tool_call.id,
+                            &tool_name,
+                            is_mutating,
+                        );
+                        emitter.set_auto_approved(true);
                         let _ = mpsc_tx
-                            .send(
-                                emitter
-                                    .finish(Some("Re-executed after approval".to_string()))
-                                    .clone()
-                                    .into_agent_event(),
+                            .send(emitter.begin().clone().into_agent_event())
+                            .await;
+                        let exec_result = executor
+                            .execute_with_context(
+                                &tool_call,
+                                bamboo_agent_core::tools::ToolExecutionContext {
+                                    session_id: Some(session.id.as_str()),
+                                    tool_call_id: reexecute_tool_call_id.as_str(),
+                                    event_tx: Some(&mpsc_tx),
+                                    available_tool_schemas: None,
+                                    bypass_permissions: flags.bypass_permissions,
+                                    auto_approve_permissions: flags.auto_approve_permissions,
+                                    plan_read_only: flags.plan_read_only,
+                                    can_async_resume: false,
+                                    bash_completion_sink: None,
+                                    pre_parsed_args: None,
+                                },
                             )
                             .await;
-                        let _ = mpsc_tx
-                            .send(bamboo_agent_core::AgentEvent::ToolComplete {
-                                tool_call_id: tool_call.id.clone(),
-                                result: tool_result.clone(),
-                            })
-                            .await;
-                        (tool_result.result, tool_result.success)
-                    }
-                    Err(error) => {
-                        let message = format!("Tool re-execution after approval failed: {error}");
-                        let _ = mpsc_tx
-                            .send(emitter.error(message.clone()).clone().into_agent_event())
-                            .await;
-                        (message, false)
+
+                        match exec_result {
+                            Ok(tool_result) => {
+                                let _ = mpsc_tx
+                                    .send(
+                                        emitter
+                                            .finish(Some(
+                                                "Re-executed after approval".to_string(),
+                                            ))
+                                            .clone()
+                                            .into_agent_event(),
+                                    )
+                                    .await;
+                                let _ = mpsc_tx
+                                    .send(bamboo_agent_core::AgentEvent::ToolComplete {
+                                        tool_call_id: tool_call.id.clone(),
+                                        result: tool_result.clone(),
+                                    })
+                                    .await;
+                                (tool_result.result, tool_result.success)
+                            }
+                            Err(error) => {
+                                let message =
+                                    format!("Tool re-execution after approval failed: {error}");
+                                let _ = mpsc_tx
+                                    .send(
+                                        emitter.error(message.clone()).clone().into_agent_event(),
+                                    )
+                                    .await;
+                                (message, false)
+                            }
+                        }
                     }
                 };
 
                 tracing::info!(
-                    "[{}] Re-executed approved tool '{}' ({}) -> success={}",
+                    "[{}] Resolved approved tool replay '{}' ({}) -> success={}",
                     session_id,
                     tool_name,
                     reexecute_tool_call_id,
@@ -270,6 +318,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 apply_tool_result(&mut session, &reexecute_tool_call_id, content, success);
                 state.save_and_cache_session(&mut session).await;
             } else {
+                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 tracing::warn!(
                     "[{}] Permission re-exec marker set but tool call '{}' not found in history",
                     session_id,

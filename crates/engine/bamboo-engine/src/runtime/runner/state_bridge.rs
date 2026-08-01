@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use bamboo_agent_core::Session;
+use bamboo_agent_core::{AgentError, Session};
 use bamboo_domain::{
     AgentRuntimeState, SessionInboxPort, SessionMessageBody, SessionMessageContent,
     SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
@@ -86,13 +86,94 @@ pub fn sync_from_metadata(session: &Session, state: &mut AgentRuntimeState) {
 }
 
 /// Result of a turn-boundary disk refresh: how many injected messages were
-/// merged, and the live per-session `bypass_permissions` flag as it stands on
+/// merged, and the live per-session permission mode as it stands on
 /// disk (the authoritative writer is `PATCH /sessions`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TurnBoundaryRefresh {
     pub merged: usize,
     /// `None` when there was no storage / no on-disk session to read.
-    pub disk_bypass_permissions: Option<bool>,
+    pub disk_permission_mode: Option<bamboo_domain::SessionPermissionMode>,
+}
+
+/// Refresh only the authoritative permission posture at a tool-dispatch safe
+/// boundary.
+///
+/// Unlike [`refresh_turn_boundary_with_inbox`], this deliberately never merges
+/// messages, SessionInbox claims, or any other control-plane field. Sequential
+/// tool calls may have externally visible side effects, so a configured durable
+/// store must be readable before the next call is admitted: keeping an old Auto
+/// posture after an Auto -> Default transition would execute without the newly
+/// required approval. SDK/in-memory runtimes with no store retain their current
+/// posture.
+pub async fn refresh_tool_boundary_permission_posture(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+) -> Result<(), AgentError> {
+    let Some(storage) = storage else {
+        return Ok(());
+    };
+    let latest = storage
+        .load_runtime_control_plane(&session.id)
+        .await
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "authoritative permission posture refresh failed closed: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            AgentError::Tool(
+                "authoritative permission posture refresh failed closed: session missing"
+                    .to_string(),
+            )
+        })?;
+    let disk_mode = latest
+        .agent_runtime_state
+        .as_ref()
+        .map(AgentRuntimeState::effective_permission_mode)
+        .ok_or_else(|| {
+            AgentError::Tool(
+                "authoritative permission posture refresh failed closed: typed mode missing"
+                    .to_string(),
+            )
+        })?;
+    let current_mode = session
+        .agent_runtime_state
+        .as_ref()
+        .map(AgentRuntimeState::effective_permission_mode)
+        .unwrap_or_else(|| runtime_state.effective_permission_mode());
+
+    let should_adopt_audit = bamboo_domain::disk_permission_posture_is_fresher(
+        current_mode,
+        &session.metadata,
+        disk_mode,
+        &latest.metadata,
+    );
+    let fresher_audit = bamboo_domain::fresher_disk_permission_audit(
+        current_mode,
+        &session.metadata,
+        disk_mode,
+        &latest.metadata,
+    );
+    if should_adopt_audit && fresher_audit.is_none() {
+        return Err(AgentError::Tool(
+            "authoritative permission posture refresh failed closed: complete audit unavailable"
+                .to_string(),
+        ));
+    }
+
+    // Commit the coherent pair only after every fallible validation above. A
+    // failed refresh leaves the owned snapshot untouched and dispatch never
+    // enters the executor.
+    if let Some(audit) = fresher_audit {
+        audit.write_to(&mut session.metadata);
+    }
+    runtime_state.set_permission_mode(disk_mode);
+    session
+        .agent_runtime_state
+        .get_or_insert_with(AgentRuntimeState::default)
+        .set_permission_mode(disk_mode);
+    Ok(())
 }
 
 /// Result of migrating only the rolling-upgrade legacy ingress queue.
@@ -492,14 +573,15 @@ async fn admit_session_inbox(
 }
 
 /// Turn-boundary refresh from the on-disk session: a SINGLE load that both
-/// merges queued `send_message` injections AND reads the live
-/// `bypass_permissions` flag.
+/// merges queued `send_message` injections AND reads the live typed permission
+/// mode.
 ///
-/// The bypass read is what makes a mid-run `PATCH /sessions {bypass_permissions}`
-/// take effect on the CURRENT run: the run owns a `Session` value taken at spawn
-/// and never otherwise re-reads storage, so the caller applies the returned
-/// `disk_bypass_permissions` to the live runtime state at each round boundary.
-/// The flag is folded into the existing per-round load so large parent sessions
+/// The mode read is what makes a mid-run
+/// `PATCH /sessions {permission_mode|bypass_permissions}` take effect on the
+/// CURRENT run: the run owns a `Session` value taken at spawn and never
+/// otherwise re-reads storage, so the caller applies the returned
+/// `disk_permission_mode` to the live runtime state at each round boundary. The
+/// posture is folded into the existing per-round load so large parent sessions
 /// aren't deserialized twice.
 #[cfg(test)]
 pub async fn refresh_turn_boundary_from_disk(
@@ -532,15 +614,44 @@ pub async fn refresh_turn_boundary_with_inbox(
         None => None,
     };
 
-    // A disk copy with no runtime state carries no authoritative bypass value —
-    // report `None` (unknown) so the caller leaves the live flag untouched
-    // rather than force-disabling a legitimately bypassed run. #540.
-    let disk_bypass_permissions = latest
+    // A disk copy with no runtime state carries no authoritative permission
+    // mode — report `None` (unknown) so the caller leaves the live posture
+    // untouched rather than force-disabling a legitimately permissive run.
+    // #540/#770.
+    let disk_permission_posture = latest
         .as_ref()
-        .and_then(|latest| latest.agent_runtime_state.as_ref())
-        .map(|state| state.bypass_permissions);
+        .and_then(|latest| {
+            latest
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| (latest, state.effective_permission_mode()))
+        })
+        .and_then(|(latest, disk_mode)| {
+            let current_mode = session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.effective_permission_mode())
+                .unwrap_or_default();
+            bamboo_domain::fresher_disk_permission_audit(
+                current_mode,
+                &session.metadata,
+                disk_mode,
+                &latest.metadata,
+            )
+            .map(|audit| (disk_mode, audit))
+        });
+    let disk_permission_mode = disk_permission_posture
+        .as_ref()
+        .map(|(disk_mode, _)| *disk_mode);
 
     if let Some(latest) = latest.as_ref() {
+        // Keep the live snapshot's bounded audit record in the same revision as
+        // the typed mode returned below. Runtime persistence also adopts these
+        // keys under its session lock, so both the current round and any later
+        // checkpoint observe one coherent permission transition.
+        if let Some((_, audit)) = disk_permission_posture.as_ref() {
+            audit.write_to(&mut session.metadata);
+        }
         // A previous activation may have checkpointed and acked the claim
         // before this live snapshot was loaded/refreshed. Carry its durable
         // cursor forward so finalization never mistakes an admitted duplicate
@@ -578,14 +689,14 @@ pub async fn refresh_turn_boundary_with_inbox(
         let merged = admit_session_inbox(session, inbox, persistence).await;
         return TurnBoundaryRefresh {
             merged,
-            disk_bypass_permissions,
+            disk_permission_mode,
         };
     }
 
     let Some(latest) = latest else {
         return TurnBoundaryRefresh {
             merged: 0,
-            disk_bypass_permissions,
+            disk_permission_mode,
         };
     };
 
@@ -594,7 +705,7 @@ pub async fn refresh_turn_boundary_with_inbox(
     let Some(messages) = latest.pending_injected_messages() else {
         return TurnBoundaryRefresh {
             merged: 0,
-            disk_bypass_permissions,
+            disk_permission_mode,
         };
     };
 
@@ -635,24 +746,24 @@ pub async fn refresh_turn_boundary_with_inbox(
         // it back from memory instead of a third full-session deserialization on
         // this steering hot path. Without a save, `session` holds no disk-fresh
         // value, so keep the pre-merge snapshot. #540.
-        let disk_bypass_permissions = if saved {
+        let disk_permission_mode = if saved {
             session
                 .agent_runtime_state
                 .as_ref()
-                .map(|rs| rs.bypass_permissions)
-                .or(disk_bypass_permissions)
+                .map(|rs| rs.effective_permission_mode())
+                .or(disk_permission_mode)
         } else {
-            disk_bypass_permissions
+            disk_permission_mode
         };
         return TurnBoundaryRefresh {
             merged,
-            disk_bypass_permissions,
+            disk_permission_mode,
         };
     }
 
     TurnBoundaryRefresh {
         merged,
-        disk_bypass_permissions,
+        disk_permission_mode,
     }
 }
 
@@ -781,6 +892,34 @@ mod tests {
         async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
             Ok(self.sessions.write().await.remove(session_id).is_some())
         }
+    }
+
+    #[tokio::test]
+    async fn tool_boundary_permission_refresh_preserves_legacy_same_mode_without_audit() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut persisted = Session::new("legacy-same-mode", "model");
+        persisted.agent_runtime_state = Some(AgentRuntimeState::new("run"));
+        persisted.add_message(bamboo_agent_core::Message::user(
+            "must stay on disk until the next turn boundary",
+        ));
+        storage.save_session(&persisted).await.unwrap();
+
+        let mut running = Session::new("legacy-same-mode", "model");
+        running.agent_runtime_state = Some(AgentRuntimeState::new("run"));
+        let mut runtime_state = AgentRuntimeState::new("run");
+        refresh_tool_boundary_permission_posture(&mut running, &mut runtime_state, Some(&storage))
+            .await
+            .expect("same-mode legacy posture is not a transition to adopt");
+
+        assert_eq!(
+            runtime_state.effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Default
+        );
+        assert!(
+            running.messages.is_empty(),
+            "tool-boundary refresh must not merge durable messages mid-round"
+        );
+        assert!(bamboo_domain::PermissionAuditSnapshot::from_metadata(&running.metadata).is_none());
     }
 
     struct TestPersistence(Arc<dyn Storage>);
@@ -1260,33 +1399,60 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    // #540: the turn-boundary refresh reports the live on-disk bypass flag so
-    // the pipeline can adopt a mid-run PATCH into the running loop's state.
+    // #540/#770: the turn-boundary refresh reports the live on-disk permission
+    // mode so the pipeline can adopt a mid-run PATCH into the running loop.
     #[tokio::test]
-    async fn refresh_turn_boundary_reports_disk_bypass_permissions() {
+    async fn refresh_turn_boundary_reports_disk_permission_mode() {
         let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
 
         // Persist a session with bypass ON.
         let mut persisted = Session::new("bypass-live", "model");
         let mut state = AgentRuntimeState::new("run-x");
-        state.bypass_permissions = true;
+        state.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
         persisted.agent_runtime_state = Some(state);
+        for (key, value) in [
+            ("permission.policy_revision", "17"),
+            ("permission.requested_mode", "auto"),
+            ("permission.effective_mode", "auto"),
+            ("permission.executor_mapping", "bamboo_runtime:auto"),
+            ("permission.transitioned_at", "2026-07-31T12:00:00Z"),
+        ] {
+            persisted
+                .metadata
+                .insert(key.to_string(), value.to_string());
+        }
         storage.save_session(&persisted).await.unwrap();
 
         // A running loop holds a stale copy with bypass OFF.
         let mut running = Session::new("bypass-live", "model");
         running.agent_runtime_state = Some(AgentRuntimeState::new("run-x"));
+        running.metadata.insert(
+            "permission.executor_mapping".to_string(),
+            "bamboo_runtime:default".to_string(),
+        );
 
         let refresh = refresh_turn_boundary_from_disk(&mut running, Some(&storage), None).await;
-        assert_eq!(refresh.disk_bypass_permissions, Some(true));
+        assert_eq!(
+            refresh.disk_permission_mode,
+            Some(bamboo_domain::SessionPermissionMode::Auto)
+        );
         assert_eq!(refresh.merged, 0);
+        for (key, value) in [
+            ("permission.policy_revision", "17"),
+            ("permission.requested_mode", "auto"),
+            ("permission.effective_mode", "auto"),
+            ("permission.executor_mapping", "bamboo_runtime:auto"),
+            ("permission.transitioned_at", "2026-07-31T12:00:00Z"),
+        ] {
+            assert_eq!(running.metadata.get(key).map(String::as_str), Some(value));
+        }
     }
 
     #[tokio::test]
     async fn refresh_turn_boundary_reports_none_without_storage() {
         let mut session = test_session();
         let refresh = refresh_turn_boundary_from_disk(&mut session, None, None).await;
-        assert_eq!(refresh.disk_bypass_permissions, None);
+        assert_eq!(refresh.disk_permission_mode, None);
         assert_eq!(refresh.merged, 0);
     }
 
@@ -1302,7 +1468,7 @@ mod tests {
 
         let mut running = Session::new("no-rs", "model");
         let refresh = refresh_turn_boundary_from_disk(&mut running, Some(&storage), None).await;
-        assert_eq!(refresh.disk_bypass_permissions, None);
+        assert_eq!(refresh.disk_permission_mode, None);
     }
 
     #[tokio::test]

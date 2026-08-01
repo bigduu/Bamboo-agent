@@ -97,6 +97,8 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
         event_tx: None,
         available_tool_schemas: None,
         bypass_permissions: false,
+        auto_approve_permissions: false,
+        plan_read_only: false,
         can_async_resume: false,
         bash_completion_sink: None,
         pre_parsed_args: None,
@@ -105,6 +107,19 @@ fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
 
 fn clean_config(data_dir: &std::path::Path) -> Config {
     Config::from_data_dir(Some(data_dir.to_path_buf()))
+}
+
+fn workspace_resolver(
+    data_dir: &std::path::Path,
+) -> bamboo_agent_core::workspace_state::WorkspaceResolver {
+    let root = data_dir.to_path_buf();
+    bamboo_agent_core::workspace_state::WorkspaceResolver::new(
+        || None,
+        move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+            root: root.clone(),
+            confine: false,
+        },
+    )
 }
 
 fn new_schedule_tasks_tool(
@@ -121,6 +136,7 @@ fn new_schedule_tasks_tool(
         store,
         Arc::new(RwLock::new(config)),
         Arc::new(bamboo_projects::ProjectStore::open(data_dir).expect("Project store")),
+        workspace_resolver(data_dir),
     )
 }
 
@@ -192,6 +208,7 @@ fn build_manager(
         app_data_dir: None,
         trigger_engine: bamboo_agent::server::schedule_app::default_trigger_engine(),
         project_store: Arc::new(bamboo_projects::ProjectStore::open(dir).expect("Project store")),
+        workspace_resolver: workspace_resolver(dir),
         notification_relay:
             bamboo_agent::server::app_state::session_events::NotificationRelayDeps {
                 notification_service: Arc::new(bamboo_notification::NotificationService::new(

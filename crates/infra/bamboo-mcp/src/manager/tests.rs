@@ -545,6 +545,7 @@ fn marker_tool(name: &str) -> McpTool {
         name: name.to_string(),
         description: format!("{name} marker"),
         parameters: serde_json::json!({"type": "object"}),
+        output_schema: None,
     }
 }
 
@@ -559,6 +560,7 @@ async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_in
         name: "still_available".to_string(),
         description: "old runtime marker".to_string(),
         parameters: serde_json::json!({"type": "object"}),
+        output_schema: None,
     };
     manager
         .index

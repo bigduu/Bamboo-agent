@@ -10,19 +10,142 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bamboo_agent_core::{Session, Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::{ProjectId, ProjectManifest, ProjectStatus, WorkspaceBinding};
-use bamboo_engine::project_context::{ProjectContextResolver, SessionProjectIdentity};
+use bamboo_engine::project_context::{
+    ProjectContextResolver, SessionProjectIdentity, WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY,
+};
 use bamboo_engine::SessionRepository;
 use bamboo_projects::{ProjectStore, ProjectStoreError};
 use serde_json::{json, Value};
 
+#[derive(Debug)]
+enum EffectiveProjectWorkspaceError {
+    Missing,
+    Unavailable(String),
+    WorkspaceInvalid { workspace: String, message: String },
+}
+
+fn canonical_project_path(
+    project: &ProjectManifest,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<std::path::PathBuf, EffectiveProjectWorkspaceError> {
+    let Some(configured) = project.project_path.as_deref() else {
+        return Err(EffectiveProjectWorkspaceError::Missing);
+    };
+    let configured = std::path::PathBuf::from(configured);
+    if !configured.is_dir() {
+        return Err(EffectiveProjectWorkspaceError::Unavailable(
+            bamboo_config::paths::path_to_display_string(&configured),
+        ));
+    }
+    let canonical = configured.canonicalize().map_err(|_| {
+        EffectiveProjectWorkspaceError::Unavailable(bamboo_config::paths::path_to_display_string(
+            &configured,
+        ))
+    })?;
+    let confined = workspace_resolver.preview_workspace_path(canonical.clone());
+    let confined = confined.canonicalize().map_err(|_| {
+        EffectiveProjectWorkspaceError::Unavailable(bamboo_config::paths::path_to_display_string(
+            &configured,
+        ))
+    })?;
+    if canonical != configured || confined != canonical {
+        return Err(EffectiveProjectWorkspaceError::Unavailable(
+            bamboo_config::paths::path_to_display_string(&configured),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn effective_project_workspace(
+    session: &Session,
+    project: &ProjectManifest,
+    workspace_resolver: &bamboo_agent_core::workspace_state::WorkspaceResolver,
+) -> Result<(std::path::PathBuf, WorkspaceSource), EffectiveProjectWorkspaceError> {
+    let persisted_source = session
+        .metadata
+        .get(WORKSPACE_SOURCE_METADATA_KEY)
+        .map(String::as_str);
+    if persisted_source == Some(WorkspaceSource::ProjectDefault.as_str()) {
+        return canonical_project_path(project, workspace_resolver)
+            .map(|workspace| (workspace, WorkspaceSource::ProjectDefault));
+    }
+    if let Some(workspace) = session.workspace_path_meta() {
+        let workspace = std::path::PathBuf::from(workspace);
+        let workspace = bamboo_engine::project_context::resolve_existing_workspace_with_resolver(
+            &workspace,
+            workspace_resolver,
+        )
+        .map_err(|error| match error {
+            bamboo_engine::project_context::ProjectContextError::WorkspaceInvalid {
+                workspace,
+                message,
+            } => EffectiveProjectWorkspaceError::WorkspaceInvalid { workspace, message },
+            error => EffectiveProjectWorkspaceError::WorkspaceInvalid {
+                workspace: bamboo_config::paths::path_to_display_string(&workspace),
+                message: error.to_string(),
+            },
+        })?;
+        let source = match persisted_source {
+            Some("explicit") => WorkspaceSource::Explicit,
+            Some("session") => WorkspaceSource::Session,
+            _ => WorkspaceSource::Session,
+        };
+        return Ok((workspace, source));
+    }
+    canonical_project_path(project, workspace_resolver)
+        .map(|workspace| (workspace, WorkspaceSource::ProjectDefault))
+}
+
+fn project_workspace_error(
+    project: &ProjectManifest,
+    error: EffectiveProjectWorkspaceError,
+) -> Value {
+    match error {
+        EffectiveProjectWorkspaceError::Missing => json!({
+            "code": "project_path_missing",
+            "message": "Assigned Project has no configured project_path",
+            "project_id": project.id,
+        }),
+        EffectiveProjectWorkspaceError::Unavailable(project_path) => json!({
+            "code": "project_path_unavailable",
+            "message": "Assigned Project path is unavailable",
+            "project_id": project.id,
+            "project_path": project_path,
+        }),
+        EffectiveProjectWorkspaceError::WorkspaceInvalid { workspace, message } => json!({
+            "code": "workspace_invalid",
+            "message": message,
+            "project_id": project.id,
+            "workspace": workspace,
+        }),
+    }
+}
+
 pub struct ProjectWorkspaceTool {
     sessions: SessionRepository,
     projects: Arc<ProjectStore>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 }
 
 impl ProjectWorkspaceTool {
     pub fn new(sessions: SessionRepository, projects: Arc<ProjectStore>) -> Self {
-        Self { sessions, projects }
+        Self::new_with_workspace_resolver(
+            sessions,
+            projects,
+            bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
+        )
+    }
+
+    pub fn new_with_workspace_resolver(
+        sessions: SessionRepository,
+        projects: Arc<ProjectStore>,
+        workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    ) -> Self {
+        Self {
+            sessions,
+            projects,
+            workspace_resolver,
+        }
     }
 
     async fn session_project(
@@ -60,18 +183,21 @@ impl ProjectWorkspaceTool {
         workspace: &Path,
         project: Option<&ProjectManifest>,
         binding_status: &str,
+        workspace_source: &str,
         relocated_from: Option<&Path>,
     ) -> Value {
         json!({
             "session_id": session_id,
             "project_id": project.map(|value| value.id.to_string()),
             "project_name": project.map(|value| value.name.clone()),
+            "project_path": project.and_then(|value| value.project_path.clone()),
             "project_home": project.map(|value| {
                 bamboo_config::paths::path_to_display_string(
                     &self.projects.paths().project_home(&value.id)
                 )
             }),
             "workspace": bamboo_config::paths::path_to_display_string(workspace),
+            "workspace_source": workspace_source,
             "binding_status": binding_status,
             "relocated_from": relocated_from.map(
                 bamboo_config::paths::path_to_display_string
@@ -127,7 +253,9 @@ impl Tool for ProjectWorkspaceTool {
             .map(str::trim)
             .filter(|path| !path.is_empty());
 
-        let (workspace, relocated_from, binding_status) = if let Some(requested) = requested {
+        let (workspace, relocated_from, binding_status, workspace_source) = if let Some(requested) =
+            requested
+        {
             let session_id = session_id.ok_or_else(|| {
                 ToolError::Execution(
                     "Workspace(set) requires a session_id in tool context".to_string(),
@@ -137,16 +265,35 @@ impl Tool for ProjectWorkspaceTool {
             let requested_path = if requested_path.is_absolute() {
                 requested_path.to_path_buf()
             } else {
-                let preferred = session
-                    .as_ref()
-                    .and_then(Session::workspace_path_meta)
-                    .map(std::path::PathBuf::from);
-                let base = bamboo_agent_core::workspace_state::resolve_session_workspace_candidate(
-                    session_id, preferred,
-                )
-                .unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                });
+                let preferred = match (session.as_ref(), project.as_ref()) {
+                    (Some(session), Some(project)) => Some(
+                        effective_project_workspace(session, project, &self.workspace_resolver)
+                            .map_err(|error| {
+                                ToolError::Execution(
+                                    project_workspace_error(project, error).to_string(),
+                                )
+                            })?
+                            .0,
+                    ),
+                    _ => session
+                        .as_ref()
+                        .and_then(Session::workspace_path_meta)
+                        .map(std::path::PathBuf::from),
+                };
+                let base = if project.is_some() {
+                    preferred.ok_or_else(|| {
+                        ToolError::Execution(
+                            "assigned Project has no configured project_path".to_string(),
+                        )
+                    })?
+                } else {
+                    self.workspace_resolver
+                        .resolve_session_workspace_candidate(session_id, preferred)
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        })
+                };
                 base.join(requested_path)
             };
             if !requested_path.exists() {
@@ -172,8 +319,9 @@ impl Tool for ProjectWorkspaceTool {
             })?;
             // Resolve confinement before checking the authoritative global
             // registry. No session state changes until this check passes.
-            let final_path =
-                bamboo_agent_core::workspace_state::preview_workspace_path(canonical.clone());
+            let final_path = self
+                .workspace_resolver
+                .preview_workspace_path(canonical.clone());
             let final_display = bamboo_config::paths::path_to_display_string(&final_path);
             let owner = self
                 .projects
@@ -258,6 +406,12 @@ impl Tool for ProjectWorkspaceTool {
                 None => "unregistered",
             };
             authoritative.set_workspace_path_meta(final_display);
+            authoritative.metadata.insert(
+                bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+                bamboo_engine::project_context::WorkspaceSource::Explicit
+                    .as_str()
+                    .to_string(),
+            );
             self.sessions
                 .storage()
                 .save_session(&authoritative)
@@ -273,26 +427,49 @@ impl Tool for ProjectWorkspaceTool {
             );
             drop(persistence_guard);
             project = authoritative_project;
-            let stored = bamboo_agent_core::workspace_state::publish_resolved_workspace(
+            let stored = self.workspace_resolver.publish_resolved_workspace(
                 session_id,
                 final_path.clone(),
+                bamboo_engine::project_context::WorkspaceSource::Explicit.as_str(),
             );
             let relocated = (stored != canonical).then_some(canonical);
-            (stored, relocated, authoritative_binding_status)
+            (
+                stored,
+                relocated,
+                authoritative_binding_status,
+                bamboo_engine::project_context::WorkspaceSource::Explicit.as_str(),
+            )
         } else {
-            let preferred = session
-                .as_ref()
-                .and_then(Session::workspace_path_meta)
-                .map(std::path::PathBuf::from);
-            let workspace = session_id
-                .and_then(|session_id| {
-                    bamboo_agent_core::workspace_state::resolve_session_workspace_candidate(
-                        session_id, preferred,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                });
+            let (workspace, workspace_source) = if let Some(project) = project.as_ref() {
+                let Some(session) = session.as_ref() else {
+                    return Err(ToolError::Execution(
+                        "assigned Project has no session context".to_string(),
+                    ));
+                };
+                match effective_project_workspace(session, project, &self.workspace_resolver) {
+                    Ok((workspace, source)) => (workspace, source.as_str()),
+                    Err(error) => {
+                        return Ok(completed(false, project_workspace_error(project, error)));
+                    }
+                }
+            } else {
+                let preferred = session
+                    .as_ref()
+                    .and_then(Session::workspace_path_meta)
+                    .map(std::path::PathBuf::from);
+                (
+                    session_id
+                        .and_then(|session_id| {
+                            self.workspace_resolver
+                                .resolve_session_workspace_candidate(session_id, preferred)
+                        })
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        }),
+                    "session",
+                )
+            };
             let workspace_display = bamboo_config::paths::path_to_display_string(&workspace);
             let owner = self
                 .projects
@@ -316,7 +493,7 @@ impl Tool for ProjectWorkspaceTool {
                 }
                 None => "unregistered",
             };
-            (workspace, None, binding_status)
+            (workspace, None, binding_status, workspace_source)
         };
         Ok(completed(
             true,
@@ -325,6 +502,7 @@ impl Tool for ProjectWorkspaceTool {
                 &workspace,
                 project.as_ref(),
                 binding_status,
+                workspace_source,
                 relocated_from.as_deref(),
             ),
         ))
@@ -334,14 +512,28 @@ impl Tool for ProjectWorkspaceTool {
 pub struct ProjectTool {
     sessions: SessionRepository,
     projects: Arc<ProjectStore>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     account_sink: Option<Arc<bamboo_engine::events::AccountEventSink>>,
 }
 
 impl ProjectTool {
     pub fn new(sessions: SessionRepository, projects: Arc<ProjectStore>) -> Self {
+        Self::new_with_workspace_resolver(
+            sessions,
+            projects,
+            bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
+        )
+    }
+
+    pub fn new_with_workspace_resolver(
+        sessions: SessionRepository,
+        projects: Arc<ProjectStore>,
+        workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    ) -> Self {
         Self {
             sessions,
             projects,
+            workspace_resolver,
             account_sink: None,
         }
     }
@@ -433,8 +625,14 @@ impl Tool for ProjectTool {
                     .resource_summary(&project.id)
                     .map_err(project_tool_error)?;
                 let resource_revision = summary.resource_revision;
-                let workspace = ProjectContextResolver::resolve_workspace_candidate(&session, None)
-                    .map_err(|error| ToolError::Execution(error.to_string()))?;
+                let (workspace, workspace_source) =
+                    match effective_project_workspace(&session, &project, &self.workspace_resolver)
+                    {
+                        Ok((workspace, source)) => (Some(workspace), source.as_str()),
+                        Err(error) => {
+                            return Ok(completed(false, project_workspace_error(&project, error)));
+                        }
+                    };
                 let (binding_status, owner_project_id) = match workspace.as_deref() {
                     Some(workspace) => {
                         let display = bamboo_config::paths::path_to_display_string(workspace);
@@ -455,6 +653,7 @@ impl Tool for ProjectTool {
                     json!({
                         "session_id": session_id,
                         "project": project,
+                        "project_path": project.project_path,
                         "project_home": bamboo_config::paths::path_to_display_string(
                             &self.projects.paths().project_home(&project.id)
                         ),
@@ -463,6 +662,7 @@ impl Tool for ProjectTool {
                         "workspace": workspace.as_deref().map(
                             bamboo_config::paths::path_to_display_string
                         ),
+                        "workspace_source": workspace_source,
                         "binding_status": binding_status,
                         "workspace_owner_project_id": owner_project_id,
                     }),
@@ -555,6 +755,18 @@ impl Tool for ProjectTool {
                             "actual_revision": actual,
                         }),
                     )),
+                    Err(ProjectStoreError::ProjectPathUnbindConflict {
+                        project_id,
+                        project_path,
+                    }) => Ok(completed(
+                        false,
+                        json!({
+                            "code": "project_path_unbind_conflict",
+                            "message": "Select another Project path before unbinding the current primary folder",
+                            "project_id": project_id,
+                            "project_path": project_path,
+                        }),
+                    )),
                     Err(error) => Ok(completed(
                         false,
                         json!({
@@ -627,6 +839,8 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -660,15 +874,7 @@ mod tests {
         std::fs::create_dir_all(&nested_workspace).unwrap();
         let store = Arc::new(ProjectStore::open(dir.path()).unwrap());
         let project = store
-            .create_with_bindings(
-                "Zenith",
-                None,
-                vec![WorkspaceBinding {
-                    path: workspace.to_string_lossy().into_owned(),
-                    label: None,
-                    git_common_dir: None,
-                }],
-            )
+            .create_with_project_path("Zenith", None, workspace.to_string_lossy(), Vec::new())
             .unwrap();
         let mut session = Session::new("session-1", "model");
         session.set_project_id_meta(project.id.to_string());
@@ -686,11 +892,265 @@ mod tests {
         let value: Value = serde_json::from_str(&output.result).unwrap();
         assert_eq!(value["project_id"], project.id.to_string());
         assert_eq!(value["project_name"], "Zenith");
+        assert_eq!(
+            value["project_path"],
+            workspace.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(value["workspace_source"], "explicit");
         assert_eq!(value["binding_status"], "registered");
         assert!(value["project_home"]
             .as_str()
             .is_some_and(|path| path.ends_with(project.id.as_str())));
         assert!(value.get("relocated_from").is_some());
+    }
+
+    #[tokio::test]
+    async fn workspace_get_tracks_project_default_after_project_path_cas_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("project");
+        let moved_project_path = dir.path().join("project-moved");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&moved_project_path).unwrap();
+        let store = Arc::new(ProjectStore::open(dir.path()).unwrap());
+        let project = store
+            .create_with_project_path(
+                "Project default",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let mut session = Session::new("workspace-project-default", "model");
+        session.set_project_id_meta(project.id.to_string());
+        session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+            &project_path.canonicalize().unwrap(),
+        ));
+        session.metadata.insert(
+            WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            WorkspaceSource::ProjectDefault.as_str().to_string(),
+        );
+        let sessions = repository(session).await;
+        let updated = store
+            .update_with_project_path(
+                &project.id,
+                project.revision,
+                moved_project_path.to_string_lossy().as_ref(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let tool = ProjectWorkspaceTool::new(sessions, store);
+
+        let output = result(
+            tool.invoke(json!({}), context("workspace-project-default", "Workspace"))
+                .await
+                .unwrap(),
+        );
+        assert!(output.success);
+        let value: Value = serde_json::from_str(&output.result).unwrap();
+        assert_eq!(
+            value["workspace"],
+            moved_project_path
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(value["workspace_source"], "project_default");
+        assert_eq!(value["binding_status"], "registered");
+        assert_eq!(value["project_path"], value["workspace"]);
+        assert_eq!(value["project_path"], updated.project_path.unwrap());
+    }
+
+    #[tokio::test]
+    async fn workspace_get_preserves_legacy_persisted_workspace_after_project_path_cas_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("project");
+        let moved_project_path = dir.path().join("project-moved");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&moved_project_path).unwrap();
+        let store = Arc::new(ProjectStore::open(dir.path()).unwrap());
+        let project = store
+            .create_with_project_path(
+                "Legacy persisted workspace",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let persisted_workspace =
+            bamboo_config::paths::path_to_display_string(&project_path.canonicalize().unwrap());
+        let mut session = Session::new("workspace-legacy-persisted", "model");
+        session.set_project_id_meta(project.id.to_string());
+        session.set_workspace_path_meta(persisted_workspace.clone());
+        let sessions = repository(session).await;
+        store
+            .update_with_project_path(
+                &project.id,
+                project.revision,
+                moved_project_path.to_string_lossy().as_ref(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let tool = ProjectWorkspaceTool::new(sessions, store);
+
+        let output = result(
+            tool.invoke(
+                json!({}),
+                context("workspace-legacy-persisted", "Workspace"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.success);
+        let value: Value = serde_json::from_str(&output.result).unwrap();
+        assert_eq!(value["workspace"], persisted_workspace);
+        assert_eq!(value["workspace_source"], "session");
+        assert_eq!(value["binding_status"], "unregistered");
+        assert_ne!(value["project_path"], value["workspace"]);
+    }
+
+    #[tokio::test]
+    async fn workspace_get_rejects_deleted_persisted_workspace_like_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("project");
+        let persisted_workspace = dir.path().join("persisted-workspace");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&persisted_workspace).unwrap();
+        let store = Arc::new(ProjectStore::open(dir.path()).unwrap());
+        let project = store
+            .create_with_project_path(
+                "Deleted persisted workspace",
+                None,
+                project_path.to_string_lossy(),
+                vec![WorkspaceBinding {
+                    path: persisted_workspace.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        let mut session = Session::new("workspace-deleted-persisted", "model");
+        session.set_project_id_meta(project.id.to_string());
+        let persisted_display = bamboo_config::paths::path_to_display_string(
+            &persisted_workspace.canonicalize().unwrap(),
+        );
+        session.set_workspace_path_meta(persisted_display.clone());
+        session.metadata.insert(
+            WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            WorkspaceSource::Session.as_str().to_string(),
+        );
+        std::fs::remove_dir(&persisted_workspace).unwrap();
+        let tool = ProjectWorkspaceTool::new(repository(session).await, store);
+
+        let output = result(
+            tool.invoke(
+                json!({}),
+                context("workspace-deleted-persisted", "Workspace"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!output.success);
+        let value: Value = serde_json::from_str(&output.result).unwrap();
+        assert_eq!(value["code"], "workspace_invalid");
+        assert_eq!(value["workspace"], persisted_display);
+    }
+
+    #[tokio::test]
+    async fn workspace_get_applies_the_instance_scoped_confinement_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_data = dir.path().join("project-data");
+        let project_path = dir.path().join("project");
+        let root = dir.path().join("instance-root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let store = Arc::new(ProjectStore::open(&project_data).unwrap());
+        let project = store
+            .create_with_project_path(
+                "Confined persisted workspace",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let mut session = Session::new("workspace-get-confined", "model");
+        session.set_project_id_meta(project.id.to_string());
+        session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+            &outside.canonicalize().unwrap(),
+        ));
+        session.metadata.insert(
+            WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            WorkspaceSource::Session.as_str().to_string(),
+        );
+        let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+            let root = root.clone();
+            move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                root: root.clone(),
+                confine: true,
+            }
+        });
+        let tool = ProjectWorkspaceTool::new_with_workspace_resolver(
+            repository(session).await,
+            store,
+            resolver,
+        );
+
+        let output = result(
+            tool.invoke(json!({}), context("workspace-get-confined", "Workspace"))
+                .await
+                .unwrap(),
+        );
+        assert!(output.success);
+        let value: Value = serde_json::from_str(&output.result).unwrap();
+        let workspace = std::path::PathBuf::from(value["workspace"].as_str().unwrap());
+        assert!(workspace.starts_with(root.canonicalize().unwrap()));
+        assert_eq!(value["workspace_source"], "session");
+    }
+
+    #[tokio::test]
+    async fn workspace_set_uses_the_instance_scoped_confinement_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_data = dir.path().join("project-data");
+        let root = dir.path().join("instance-root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&project_data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let store = Arc::new(ProjectStore::open(&project_data).unwrap());
+        let session = Session::new("instance-confined-workspace", "model");
+        let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+            let root = root.clone();
+            move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                root: root.clone(),
+                confine: true,
+            }
+        });
+        let tool = ProjectWorkspaceTool::new_with_workspace_resolver(
+            repository(session).await,
+            store,
+            resolver,
+        );
+
+        let output = result(
+            tool.invoke(
+                json!({"path": outside}),
+                context("instance-confined-workspace", "Workspace"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.success);
+        let value: Value = serde_json::from_str(&output.result).unwrap();
+        let workspace = std::path::PathBuf::from(value["workspace"].as_str().unwrap());
+        assert!(workspace.starts_with(root.canonicalize().unwrap()));
+        assert_eq!(
+            value["relocated_from"],
+            outside.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+        assert_eq!(value["workspace_source"], "explicit");
+        assert!(workspace.is_dir());
     }
 
     #[tokio::test]
@@ -954,8 +1414,17 @@ mod tests {
     #[tokio::test]
     async fn project_tool_uses_normalized_three_state_project_identity() {
         let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("normalized");
+        std::fs::create_dir_all(&project_path).unwrap();
         let store = Arc::new(ProjectStore::open(dir.path()).unwrap());
-        let project = store.create("Normalized", None).unwrap();
+        let project = store
+            .create_with_project_path(
+                "Normalized",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
 
         let mut assigned = Session::new("project-tool-trimmed", "model");
         assigned
@@ -973,6 +1442,15 @@ mod tests {
         assert!(output.success);
         let value: Value = serde_json::from_str(&output.result).unwrap();
         assert_eq!(value["project"]["id"], project.id.to_string());
+        assert_eq!(
+            value["project_path"],
+            project_path
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(value["workspace_source"], "project_default");
 
         let mut invalid = Session::new("project-tool-invalid", "model");
         invalid

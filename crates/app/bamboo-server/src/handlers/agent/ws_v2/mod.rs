@@ -463,20 +463,30 @@ async fn drive(
                 match msg {
                     // The inbound frame type that matches the active encoding.
                     Some(Ok(Message::Text(text))) if encoding == Encoding::Json => {
-                        let keep_open = handle_client_bytes(
-                            &state, &mut forwarders, &mut queues,
-                            &sys_tx, batch_ms, encoding, text.as_bytes(), &mut authorized,
-                        )
+                        let keep_open = handle_client_bytes(ClientDispatchContext {
+                            state: &state,
+                            forwarders: &mut forwarders,
+                            queues: &mut queues,
+                            sys_tx: &sys_tx,
+                            batch_ms,
+                            encoding,
+                            authorized: &mut authorized,
+                        }, text.as_bytes())
                         .await;
                         if !keep_open {
                             break;
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) if encoding == Encoding::Msgpack => {
-                        let keep_open = handle_client_bytes(
-                            &state, &mut forwarders, &mut queues,
-                            &sys_tx, batch_ms, encoding, &bytes, &mut authorized,
-                        )
+                        let keep_open = handle_client_bytes(ClientDispatchContext {
+                            state: &state,
+                            forwarders: &mut forwarders,
+                            queues: &mut queues,
+                            sys_tx: &sys_tx,
+                            batch_ms,
+                            encoding,
+                            authorized: &mut authorized,
+                        }, &bytes)
                         .await;
                         if !keep_open {
                             break;
@@ -516,6 +526,17 @@ async fn drive(
     let _ = session.close(None).await;
 }
 
+/// Mutable connection state shared by the decode and dispatch steps.
+struct ClientDispatchContext<'a> {
+    state: &'a web::Data<AppState>,
+    forwarders: &'a mut HashMap<String, tokio::task::JoinHandle<()>>,
+    queues: &'a mut StreamMap<String, ReceiverStream<OutFrame>>,
+    sys_tx: &'a mpsc::Sender<OutFrame>,
+    batch_ms: u64,
+    encoding: Encoding,
+    authorized: &'a mut bool,
+}
+
 /// Decode one inbound frame's bytes per the connection's [`Encoding`] (serde_json
 /// for `Json`, rmp-serde for `Msgpack`) and dispatch the resulting [`ClientFrame`].
 /// A malformed body logs and is ignored — it NEVER tears down the connection, in
@@ -528,27 +549,15 @@ async fn drive(
 ///
 /// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
 /// presents an INVALID device credential); `true` to keep it open.
-async fn handle_client_bytes(
-    state: &web::Data<AppState>,
-    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
-    sys_tx: &mpsc::Sender<OutFrame>,
-    batch_ms: u64,
-    encoding: Encoding,
-    bytes: &[u8],
-    authorized: &mut bool,
-) -> bool {
-    let frame: ClientFrame = match decode_client_frame(encoding, bytes) {
+async fn handle_client_bytes(context: ClientDispatchContext<'_>, bytes: &[u8]) -> bool {
+    let frame: ClientFrame = match decode_client_frame(context.encoding, bytes) {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!("ws_v2: ignoring malformed client frame: {e}");
             return true;
         }
     };
-    handle_client_frame(
-        state, forwarders, queues, sys_tx, batch_ms, encoding, frame, authorized,
-    )
-    .await
+    handle_client_frame(context, frame).await
 }
 
 /// Dispatch one decoded client frame. A malformed/unknown frame logs and is
@@ -563,16 +572,17 @@ async fn handle_client_bytes(
 ///
 /// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
 /// presents an INVALID device credential); `true` to keep it open.
-async fn handle_client_frame(
-    state: &web::Data<AppState>,
-    forwarders: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-    queues: &mut StreamMap<String, ReceiverStream<OutFrame>>,
-    sys_tx: &mpsc::Sender<OutFrame>,
-    batch_ms: u64,
-    encoding: Encoding,
-    frame: ClientFrame,
-    authorized: &mut bool,
-) -> bool {
+async fn handle_client_frame(context: ClientDispatchContext<'_>, frame: ClientFrame) -> bool {
+    let ClientDispatchContext {
+        state,
+        forwarders,
+        queues,
+        sys_tx,
+        batch_ms,
+        encoding,
+        authorized,
+    } = context;
+
     // Auth gate (#189). Until the connection is authorized, no frame may serve a
     // channel or cancel a session — the only frame that can change anything is a
     // `hello` that carries a verifiable device credential.
@@ -947,6 +957,7 @@ mod tests {
             let mut config = state.config.write().await;
             config.access_control = Some(AccessControlConfig {
                 password_enabled: false,
+                repair_required: false,
                 password_hash: None,
                 password_salt: None,
                 password_credential_ref: None,
@@ -1042,14 +1053,16 @@ mod tests {
         let mut authorized = false;
         assert!(
             handle_client_frame(
-                &state,
-                &mut forwarders,
-                &mut queues,
-                &sys_tx,
-                0,
-                Encoding::Json,
+                ClientDispatchContext {
+                    state: &state,
+                    forwarders: &mut forwarders,
+                    queues: &mut queues,
+                    sys_tx: &sys_tx,
+                    batch_ms: 0,
+                    encoding: Encoding::Json,
+                    authorized: &mut authorized,
+                },
                 ClientFrame::Ping,
-                &mut authorized,
             )
             .await
         );
@@ -1061,14 +1074,16 @@ mod tests {
         authorized = true;
         assert!(
             handle_client_frame(
-                &state,
-                &mut forwarders,
-                &mut queues,
-                &sys_tx,
-                0,
-                Encoding::Json,
+                ClientDispatchContext {
+                    state: &state,
+                    forwarders: &mut forwarders,
+                    queues: &mut queues,
+                    sys_tx: &sys_tx,
+                    batch_ms: 0,
+                    encoding: Encoding::Json,
+                    authorized: &mut authorized,
+                },
                 ClientFrame::Ping,
-                &mut authorized,
             )
             .await
         );
@@ -1098,14 +1113,16 @@ mod tests {
         ] {
             assert!(
                 handle_client_frame(
-                    &state,
-                    &mut forwarders,
-                    &mut queues,
-                    &sys_tx,
-                    0,
-                    Encoding::Json,
+                    ClientDispatchContext {
+                        state: &state,
+                        forwarders: &mut forwarders,
+                        queues: &mut queues,
+                        sys_tx: &sys_tx,
+                        batch_ms: 0,
+                        encoding: Encoding::Json,
+                        authorized: &mut authorized,
+                    },
                     frame,
-                    &mut authorized,
                 )
                 .await
             );

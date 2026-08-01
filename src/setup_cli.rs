@@ -247,12 +247,17 @@ pub fn run_config_set(
     dry_run: bool,
 ) -> Result<()> {
     let data_dir = data_dir.unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
+    let parts: Vec<&str> = key.split('.').collect();
+    if matches!(parts.as_slice(), ["cluster_fabric", ..]) {
+        bail!(
+            "cluster_fabric is managed by the dedicated revisioned cluster API and cannot be changed with `bamboo config set`"
+        );
+    }
     let mut config = Config::from_data_dir_without_env(Some(data_dir.clone()));
     let mut provider_credential_intents = BTreeSet::new();
     let mut provider_instance_credential_intents = BTreeSet::new();
     let mut notification_credential_intents = BTreeSet::new();
 
-    let parts: Vec<&str> = key.split('.').collect();
     // `Some(outcome)` = generic dot-path set (validated new config inside);
     // `None` = a dedicated arm mutated `config` in place.
     let outcome = match parts.as_slice() {
@@ -312,6 +317,9 @@ pub fn run_config_set(
             if v.is_empty() {
                 bail!("token must not be empty");
             }
+            if bamboo_config::patch::is_masked_api_key(v) {
+                bail!("token must not be a mask");
+            }
             config.notifications.ntfy.token = Some(v.to_string());
             config.notifications.ntfy.configured = true;
             notification_credential_intents.insert("ntfy".to_string());
@@ -321,6 +329,9 @@ pub fn run_config_set(
             let v = value.trim();
             if v.is_empty() {
                 bail!("device_key must not be empty");
+            }
+            if bamboo_config::patch::is_masked_api_key(v) {
+                bail!("device_key must not be a mask");
             }
             config.notifications.bark.device_key = Some(v.to_string());
             config.notifications.bark.configured = true;
@@ -346,6 +357,27 @@ pub fn run_config_set(
         value.to_string()
     };
 
+    if let Some(outcome) = outcome.as_ref() {
+        if bamboo_config::section_layout_is_active(&data_dir)? {
+            let changed = bamboo_config::changed_facade_sections(&config, &outcome.config)?;
+            if changed.iter().any(|section| {
+                matches!(
+                    section,
+                    bamboo_config::SectionId::Core
+                        | bamboo_config::SectionId::Env
+                        | bamboo_config::SectionId::Notifications
+                        | bamboo_config::SectionId::Connect
+                        | bamboo_config::SectionId::AccessControl
+                )
+            }) {
+                bail!(
+                    "{key} belongs to a revisioned credential-backed section in the modular layout; \
+                     use its dedicated API"
+                );
+            }
+        }
+    }
+
     if dry_run {
         match &outcome {
             Some(out) => print_dry_run_diff(&config, &out.config),
@@ -362,7 +394,40 @@ pub fn run_config_set(
         None => config,
     };
     if !notification_credential_intents.is_empty() {
-        let revision = bamboo_config::CredentialStore::open(&data_dir).revision()?;
+        let revision = if bamboo_config::section_layout_is_active(&data_dir)? {
+            // The Notifications section is the sole CAS authority in the
+            // modular layout. Read it and its credential document coherently,
+            // then bind a second strict read to that observed generation so a
+            // cross-process winner between reads becomes a conflict.
+            let observed = bamboo_config::read_exact_credential_section_snapshot(
+                &data_dir,
+                bamboo_config::SectionId::Notifications,
+                None,
+            )
+            .context("failed to inspect the Notifications section")?;
+            let revision = observed.section.revision;
+            let exact = bamboo_config::read_exact_credential_section_snapshot(
+                &data_dir,
+                bamboo_config::SectionId::Notifications,
+                Some(revision),
+            )
+            .context("failed to establish an exact Notifications mutation base")?;
+            exact.install_into(&mut to_save);
+            match parts.as_slice() {
+                ["notifications", "ntfy", "token"] => {
+                    to_save.notifications.ntfy.token = Some(value.trim().to_string());
+                    to_save.notifications.ntfy.configured = true;
+                }
+                ["notifications", "bark", "device_key"] => {
+                    to_save.notifications.bark.device_key = Some(value.trim().to_string());
+                    to_save.notifications.bark.configured = true;
+                }
+                _ => unreachable!("notification intent is created only by dedicated CLI keys"),
+            }
+            revision
+        } else {
+            bamboo_config::CredentialStore::open(&data_dir).revision()?
+        };
         bamboo_config::persist_notification_credential_transaction_at_revision(
             &data_dir,
             &mut to_save,
@@ -687,6 +752,7 @@ fn info(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// A default in-memory config that never touches a real data dir: loading
     /// from a non-existent directory returns defaults without reading or writing
@@ -885,6 +951,175 @@ mod tests {
     }
 
     #[test]
+    fn modular_notification_secret_uses_section_cas_and_preserves_external_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+        let facade = bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let mut external = facade.effective_config();
+        external.notifications.ntfy.enabled = true;
+        external.notifications.ntfy.topic = "external-winner".to_string();
+        external.notifications.bark.enabled = true;
+        external.notifications.bark.device_key = Some("external-bark-secret".to_string());
+        external.notifications.bark.configured = true;
+        assert_eq!(
+            bamboo_config::persist_notification_credential_transaction_at_revision(
+                &data_dir,
+                &mut external,
+                &BTreeSet::from(["bark".to_string()]),
+                0,
+            )
+            .unwrap(),
+            1
+        );
+
+        let store = bamboo_config::CredentialStore::open(&data_dir);
+        store
+            .replace(
+                bamboo_config::CredentialRef::parse("custom.cli.first").unwrap(),
+                "unrelated-one",
+                bamboo_config::CredentialSource::User,
+                1,
+            )
+            .unwrap();
+        store
+            .replace(
+                bamboo_config::CredentialRef::parse("custom.cli.second").unwrap(),
+                "unrelated-two",
+                bamboo_config::CredentialSource::User,
+                2,
+            )
+            .unwrap();
+        assert_eq!(store.revision().unwrap(), 3);
+
+        run_config_set(
+            "notifications.ntfy.token",
+            "cli-section-cas-secret",
+            Some(data_dir.clone()),
+            false,
+        )
+        .unwrap();
+
+        let exact = bamboo_config::read_exact_credential_section_snapshot(
+            &data_dir,
+            bamboo_config::SectionId::Notifications,
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(exact.credential_health.revision, 4);
+        let committed_section = exact.section.clone();
+        let mut committed = Config::default();
+        exact.install_into(&mut committed);
+        assert_eq!(committed.notifications.ntfy.topic, "external-winner");
+        assert_eq!(
+            committed.notifications.ntfy.token.as_deref(),
+            Some("cli-section-cas-secret")
+        );
+        assert_eq!(
+            committed.notifications.bark.device_key.as_deref(),
+            Some("external-bark-secret")
+        );
+        for (reference, secret) in [
+            ("custom.cli.first", "unrelated-one"),
+            ("custom.cli.second", "unrelated-two"),
+        ] {
+            assert_eq!(
+                store
+                    .resolve(&bamboo_config::CredentialRef::parse(reference).unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                secret
+            );
+        }
+        for path in [
+            data_dir.join("notifications.json"),
+            data_dir.join("credentials.json"),
+            data_dir.join("config.json"),
+        ] {
+            if path.exists() {
+                let raw = std::fs::read_to_string(path).unwrap();
+                assert!(!raw.contains("cli-section-cas-secret"));
+                assert!(!raw.contains("external-bark-secret"));
+            }
+        }
+
+        let rejected = run_config_set(
+            "notifications.ntfy.topic",
+            "stale-cli-overwrite",
+            Some(data_dir.clone()),
+            false,
+        );
+        assert!(rejected.is_err());
+        assert!(rejected.unwrap_err().to_string().contains("dedicated API"));
+        let after = bamboo_config::read_exact_credential_section_snapshot(
+            &data_dir,
+            bamboo_config::SectionId::Notifications,
+            None,
+        )
+        .unwrap();
+        assert_eq!(after.section.revision, committed_section.revision);
+        assert_eq!(after.section.data, committed_section.data);
+    }
+
+    #[test]
+    fn modular_generic_cli_rejects_every_exact_credential_section_and_flattened_core_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+        let mut seed = Config::default();
+        seed.extra
+            .insert("setup".to_string(), serde_json::json!({"completed": false}));
+        seed.save_to_dir(data_dir.clone()).unwrap();
+        bamboo_config::ConfigFacade::open_or_migrate(&data_dir).unwrap();
+        let paths = [
+            "core.json",
+            "env.json",
+            "notifications.json",
+            "connect.json",
+            "access-control.json",
+            "credentials.json",
+        ];
+        let before = paths
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    std::fs::read(data_dir.join(name)).expect("section exists"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for (key, value) in [
+            ("setup.completed", "true"),
+            ("http_proxy", "http://cli-bypass.test:8080"),
+            ("env_vars", "[]"),
+            ("notifications.ntfy.topic", "cli-bypass"),
+            (
+                "connect",
+                r#"{"platforms":[{"id":"cli-platform","type":"telegram","token_credential_ref":"connect.cli-platform.token","token_configured":true,"app_secret_configured":false,"allow_from":[],"admin_from":[]}]}"#,
+            ),
+            (
+                "access_control",
+                r#"{"password_enabled":true,"repair_required":false,"password_credential_ref":"access.root.password_verifier","password_configured":true}"#,
+            ),
+        ] {
+            let error = run_config_set(key, value, Some(data_dir.clone()), false).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("dedicated") || message.contains("revisioned env API"),
+                "{key}: {message}"
+            );
+        }
+        assert!(run_config_set("setup.completed", "true", Some(data_dir.clone()), true,).is_err());
+        for (name, expected) in before {
+            assert_eq!(
+                std::fs::read(data_dir.join(name)).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn config_set_rejects_secret_paths_it_cannot_protect() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path().to_path_buf();
@@ -892,6 +1127,10 @@ mod tests {
             ("proxy_auth.username", "alice"),
             ("providers.anthropic.api_key_encrypted", "cipher"),
             ("provider_instances.nope.api_key", "sk-x"),
+            (
+                "cluster_fabric.nodes",
+                r#"[{"id":"cli-bypass","label":"cli-bypass","placement":{"type":"local"}}]"#,
+            ),
         ] {
             assert!(
                 run_config_set(key, value, Some(data_dir.clone()), false).is_err(),
@@ -899,5 +1138,12 @@ mod tests {
             );
         }
         assert!(!data_dir.join("config.json").exists());
+
+        for key in ["notifications.ntfy.token", "notifications.bark.device_key"] {
+            assert!(
+                run_config_set(key, "****...****", Some(data_dir.clone()), false).is_err(),
+                "{key} must reject masks"
+            );
+        }
     }
 }

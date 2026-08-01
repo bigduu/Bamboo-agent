@@ -37,7 +37,7 @@ mod tests;
 
 use actix_web::{web, HttpResponse};
 
-use bamboo_agent_core::tools::ToolExecutionContext;
+use bamboo_agent_core::tools::{ToolExecutionContext, ToolExecutionSessionFlags};
 
 use crate::app_state::AppState;
 use crate::error::AppError;
@@ -45,6 +45,45 @@ use crate::error::AppError;
 pub use models::{
     ToolExecutionRequest, ToolExecutionResponse, ToolExecutionResultPayload, ToolParameter,
 };
+
+fn enforce_plan_tool_gate(
+    session_flags: ToolExecutionSessionFlags,
+    tool_name: &str,
+) -> Result<(), AppError> {
+    if session_flags.plan_read_only && !bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name)
+    {
+        return Err(AppError::ToolExecutionError(format!(
+            "Plan mode: {tool_name} operation blocked"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve direct-dispatch flags without changing the historical meaning of
+/// `session_id`: Read/Edit callers may use an opaque id solely as their safety
+/// ledger correlation key. A persisted session contributes its typed posture;
+/// an unknown id inherits only the configured process posture.
+fn direct_tool_session_flags(
+    configured_mode: bamboo_domain::PermissionMode,
+    session: Option<&bamboo_agent_core::Session>,
+) -> ToolExecutionSessionFlags {
+    if let Some(session) = session {
+        return ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            configured_mode,
+        );
+    }
+
+    let resolution = bamboo_domain::resolve_permission_mode(
+        bamboo_domain::SessionPermissionMode::Default,
+        configured_mode,
+    );
+    ToolExecutionSessionFlags {
+        bypass_permissions: resolution.bypass_permissions(),
+        auto_approve_permissions: resolution.suppress_approval_prompts(),
+        plan_read_only: resolution.effective == bamboo_domain::PermissionMode::Plan,
+    }
+}
 
 /// Execute a tool directly without agent loop.
 ///
@@ -111,6 +150,22 @@ pub async fn execute_tool(
     let args = request::parse_arguments(parameters);
     let call = request::build_tool_call(canonical_tool_name, args)?;
 
+    let configured_mode = app_state
+        .permission_checker
+        .permission_config()
+        .map(|config| config.mode())
+        .unwrap_or_default();
+    let persisted_session = if let Some(session_id) = session_id {
+        // A genuine storage failure is still an API error. `Ok(None)` is not:
+        // this endpoint has always accepted opaque ids for the Read/Edit ledger.
+        app_state.session_repo.try_load(session_id).await?
+    } else {
+        None
+    };
+    let session_flags = direct_tool_session_flags(configured_mode, persisted_session.as_ref());
+
+    enforce_plan_tool_gate(session_flags, &call.function.name)?;
+
     let root_tools = app_state.tools_for(crate::tools::ToolSurface::Root);
     let available_tool_schemas = root_tools.list_tools();
     let result = root_tools
@@ -121,7 +176,9 @@ pub async fn execute_tool(
                 tool_call_id: &call.id,
                 event_tx: None,
                 available_tool_schemas: Some(available_tool_schemas.as_slice()),
-                bypass_permissions: false,
+                bypass_permissions: session_flags.bypass_permissions,
+                auto_approve_permissions: session_flags.auto_approve_permissions,
+                plan_read_only: session_flags.plan_read_only,
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,

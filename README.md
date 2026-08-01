@@ -57,7 +57,9 @@ graph TD
   ENG --> SKILLS[bamboo-skills<br/>selection, access control, runtime metadata]
   ENG --> MCP[bamboo-mcp<br/>MCP client: manager, protocol, transports, tool_index]
   ENG --> TOOLS[bamboo-tools<br/>22 built-in tools, registry, guides, permissions]
+  ENG --> HOOKS[bamboo-hooks<br/>lifecycle dispatch, command + external scripts]
   ENG --> INFRA[bamboo-infrastructure<br/>config, LLM providers, session store]
+  HOOKS --> CORE
   SRV --> INFRA
   TOOLS --> INFRA
   MEM --> INFRA
@@ -67,7 +69,7 @@ graph TD
 **Workspace members** (from `Cargo.toml`), organized by tier:
 
 - **`crates/core/`** — `bamboo-domain` (pure domain types), `bamboo-agent-core` (core abstractions)
-- **`crates/infra/`** — `bamboo-config`, `bamboo-llm`, `bamboo-storage`, `bamboo-a2a`, `bamboo-infrastructure`, `bamboo-memory`, `bamboo-metrics`, `bamboo-notification`, `bamboo-skills`, `bamboo-mcp`, `bamboo-permission`, `bamboo-compression`, `bamboo-subagent`, `bamboo-analytics` (dev-only)
+- **`crates/infra/`** — `bamboo-config`, `bamboo-llm`, `bamboo-storage`, `bamboo-a2a`, `bamboo-infrastructure`, `bamboo-memory`, `bamboo-metrics`, `bamboo-notification`, `bamboo-skills`, `bamboo-mcp`, `bamboo-permission`, `bamboo-compression`, `bamboo-subagent`, `bamboo-hooks`, `bamboo-analytics` (dev-only)
 - **`crates/engine/`** — `bamboo-engine`, `bamboo-tools`
 - **`crates/app/`** — `bamboo-server`, `bamboo-server-tools`, `bamboo-sdk`, `bamboo-tui`, `bamboo-client-core`, `bamboo-broker`
 
@@ -99,7 +101,7 @@ Long conversations don't grow without bound. Bamboo uses a **hybrid strategy**: 
 
 - `counter` — counts tokens via tiktoken BPE or heuristic estimation (`TiktokenTokenCounter` / `HeuristicTokenCounter`).
 - `segmenter` — preserves the atomicity of tool calls when segmenting (it won't split a single tool call apart).
-- `limits` — **deliberately ships no per-model table**. Real context/output limits come from (1) provider runtime metadata, (2) user overrides in `model_limits.json`; with neither, it falls back to a global default of **200K context / 64K output**. This way the table never goes stale as models are updated.
+- `limits` — **deliberately ships no per-model table**. Explicit user overrides in `model_limits.json` take precedence over provider runtime metadata; with neither, Bamboo falls back to **1M total input+output context / 128K output**. Prompt fitting reserves the output allowance and tokenizer safety margin from that total window, and root sessions re-read the instance-local override file each round.
 - `summarizer` / `preparation` — builds the compression plan, generates the summary message, prepares context against the budget (`prepare_hybrid_context`), and can estimate prompt-cache savings.
 - **Oversized output** — oversized output produced by tools is trimmed/managed at `bamboo-tools/output_manager.rs`, avoiding stuffing the context all at once.
 
@@ -121,6 +123,8 @@ Built-in skills live in `builtin_skills/`: `docx`, `pdf`, `pptx`, `xlsx`, `skill
 ---
 
 ## Quick Start & Development
+
+Building Bamboo from source requires **Rust 1.95 or newer**.
 
 ### First-run setup
 
@@ -186,7 +190,7 @@ Arguments supported by `bamboo serve` (all override the config file):
 
 The admin commands (`health` / `status` / `sessions` / `stop` / `history` / `respond` / `session` / `schedules`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`); the other `mcp` verbs are server-backed and take the same connection flags. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
-A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present).
+A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present). `bamboo serve` defaults to `info` in every build profile; use `--log-level debug`, `-v`, or `RUST_LOG` to opt into more verbose server logs.
 
 **Defaults** (verified against code):
 
@@ -265,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
 >
 > A separate mechanism, `AgentEvent::ChildApprovalRequested`, covers an out-of-process CHILD sub-agent's gated tool (only reachable if you've also wired the engine's actor/broker transport — `with_defaults_for_data_dir` does not). Answer those with `agent.answer_child_approval(child_session_id, request_id, approved)` instead of `agent.answer`.
 
-**Permission and tool policy.** `.permission_mode(PermissionMode::Plan | AcceptEdits | DontAsk | Default | BypassPermissions)` installs Bamboo's standard permission stack; `.permission_checker(custom)` supplies a custom implementation and `.bypass_permissions()` is the explicit ungated policy. These three setters are last-call-wins even across `with_defaults_for_data_dir(...).await?`. Leaving `.tools(...)` unset exposes the assembled built-in (+ MCP) surface, while `.tools([])` or `.no_tools()` intentionally creates a zero-tool agent; any explicit tool selection has final precedence over assembled or injected default executors. A fully injected `.default_tools(...)` executor owns its own permission behavior and is not wrapped by the SDK policy setters.
+**Permission and tool policy.** `.permission_mode(PermissionMode::Plan | AcceptEdits | DontAsk | Default | BypassPermissions | Auto)` installs Bamboo's standard permission stack. `Auto` emits no approval prompts while retaining explicit policy and platform denials; the typed `BypassPermissions` mode still honors forced confirmations. `.permission_checker(custom)` supplies a custom implementation. In contrast, the SDK-specific `.bypass_permissions()` shortcut explicitly selects its historical no-checker, fully ungated behavior; it is not equivalent to `.permission_mode(PermissionMode::BypassPermissions)`. These three setters are last-call-wins even across `with_defaults_for_data_dir(...).await?`. Leaving `.tools(...)` unset exposes the assembled built-in (+ MCP) surface, while `.tools([])` or `.no_tools()` intentionally creates a zero-tool agent; any explicit tool selection has final precedence over assembled or injected default executors. A fully injected `.default_tools(...)` executor owns its own permission behavior and is not wrapped by the SDK policy setters.
 
 **Session ergonomics.** `agent.new_session(id)` creates a session from the explicit builder model or effective provider-config model, while `agent.load_session(id)`, `agent.list_sessions()` (most-recently-updated first), `agent.session_history(id)`, and `agent.delete_session(id)` cover the common persistence operations. `agent.get_session(id)` remains a compatibility alias for `load_session`. `list_sessions` needs the concrete session-index handle `with_defaults_for_data_dir` assembles.
 
@@ -351,7 +355,7 @@ Zenith is a monorepo, and bamboo is the execution-engine submodule within it.
 **In-module docs:** start at [`docs/README.md`](./docs/README.md) for the full index. Highlights:
 - Getting started: [`docs/guides/GETTING_STARTED.md`](./docs/guides/GETTING_STARTED.md)
 - Configuration reference (every `config.json` key + env vars): [`docs/config-reference.md`](./docs/config-reference.md)
-- Lifecycle command hooks (events, payloads, decisions, examples): [`docs/lifecycle-hooks.md`](./docs/lifecycle-hooks.md)
+- Lifecycle hooks (command + external scripts, events, payloads, decisions): [`docs/lifecycle-hooks.md`](./docs/lifecycle-hooks.md)
 - How-to guides: [Connect/IM bridge](./docs/guides/CONNECT.md) · [Plugins](./docs/guides/PLUGINS.md) · [Deploy](./docs/guides/DEPLOY.md)
 - API reference: [`docs/guides/API.md`](./docs/guides/API.md)
 - Migration: [`docs/guides/MIGRATION_GUIDE.md`](./docs/guides/MIGRATION_GUIDE.md)

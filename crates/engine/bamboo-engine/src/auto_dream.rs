@@ -1343,6 +1343,7 @@ mod tests {
             crate::project_context::ProjectDescriptor {
                 id: project_id.clone(),
                 name: "Unused".to_string(),
+                project_path: Some(workspace.clone()),
                 home: project_home.clone(),
                 workspace_bindings: Vec::new(),
                 resources: ProjectResourceSummary {
@@ -1446,6 +1447,7 @@ mod tests {
             crate::project_context::ProjectDescriptor {
                 id: project_id.clone(),
                 name: "Auto Dream".to_string(),
+                project_path: Some(workspace_one.clone()),
                 home: project_home.clone(),
                 workspace_bindings: vec![
                     WorkspaceBinding {

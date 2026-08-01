@@ -100,7 +100,7 @@ impl ClusterFabricConfig {
 }
 
 /// Metadata for one node's isolated SSH credentials.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterNodeCredentialRefs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_credential_ref: Option<CredentialRef>,
@@ -114,6 +114,29 @@ pub struct ClusterNodeCredentialRefs {
     pub passphrase_credential_ref: Option<CredentialRef>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub passphrase_configured: bool,
+}
+
+impl std::fmt::Debug for ClusterNodeCredentialRefs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClusterNodeCredentialRefs")
+            .field(
+                "password_reference_present",
+                &self.password_credential_ref.is_some(),
+            )
+            .field("password_configured", &self.password_configured)
+            .field(
+                "private_key_reference_present",
+                &self.private_key_credential_ref.is_some(),
+            )
+            .field("private_key_configured", &self.private_key_configured)
+            .field(
+                "passphrase_reference_present",
+                &self.passphrase_credential_ref.is_some(),
+            )
+            .field("passphrase_configured", &self.passphrase_configured)
+            .finish()
+    }
 }
 
 impl ClusterNodeCredentialRefs {
@@ -132,6 +155,39 @@ impl ClusterNodeCredentialRefs {
             && !self.password_configured
             && !self.private_key_configured
             && !self.passphrase_configured
+    }
+}
+
+/// Explicit operator intent for one isolated cluster credential.
+///
+/// Deliberately does not implement `Debug` or serialization: replacement
+/// values are request-only secret material and must never enter ordinary
+/// configuration documents, logs, events, or diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ClusterCredentialAction {
+    Keep,
+    Replace(String),
+    Clear,
+}
+
+/// Explicit password/private-key/passphrase actions for one node mutation.
+///
+/// Every HTTP mutation supplies all three actions, so an omitted field can
+/// never ambiguously mean both "keep" and "clear".
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClusterNodeCredentialIntents {
+    pub password: ClusterCredentialAction,
+    pub private_key: ClusterCredentialAction,
+    pub passphrase: ClusterCredentialAction,
+}
+
+impl ClusterNodeCredentialIntents {
+    pub fn clear_all() -> Self {
+        Self {
+            password: ClusterCredentialAction::Clear,
+            private_key: ClusterCredentialAction::Clear,
+            passphrase: ClusterCredentialAction::Clear,
+        }
     }
 }
 
@@ -228,7 +284,7 @@ fn default_ssh_port() -> u16 {
 /// How to authenticate the SSH connection. Secret material is encrypted at rest
 /// (the `*_encrypted` fields); plaintext is hydrated in memory and cleared
 /// before disk, exactly like [`crate::config::EnvVarEntry`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum SshAuth {
     /// Use the bamboo host's own ssh agent/config (→ system-ssh deployer). No
@@ -238,7 +294,7 @@ pub enum SshAuth {
     /// Stored password.
     Password {
         /// Plaintext — hydrated in memory, empty on disk.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         password: String,
         /// Ciphertext on disk.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,7 +304,7 @@ pub enum SshAuth {
     /// (not a secret). An optional passphrase is always a secret.
     PrivateKey {
         /// Inline PEM plaintext — hydrated in memory, empty on disk.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         private_key: String,
         /// Ciphertext of the inline PEM on disk.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,12 +313,51 @@ pub enum SshAuth {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         private_key_path: Option<String>,
         /// Optional key passphrase plaintext — hydrated in memory, empty on disk.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         passphrase: String,
         /// Ciphertext of the passphrase on disk.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         passphrase_encrypted: Option<String>,
     },
+}
+
+impl std::fmt::Debug for SshAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SystemSshConfig => formatter.write_str("SystemSshConfig"),
+            Self::Password {
+                password,
+                password_encrypted,
+            } => formatter
+                .debug_struct("Password")
+                .field("password_configured", &!password.is_empty())
+                .field(
+                    "legacy_password_ciphertext_present",
+                    &password_encrypted.is_some(),
+                )
+                .finish(),
+            Self::PrivateKey {
+                private_key,
+                private_key_encrypted,
+                private_key_path,
+                passphrase,
+                passphrase_encrypted,
+            } => formatter
+                .debug_struct("PrivateKey")
+                .field("inline_private_key_configured", &!private_key.is_empty())
+                .field(
+                    "legacy_private_key_ciphertext_present",
+                    &private_key_encrypted.is_some(),
+                )
+                .field("private_key_path", private_key_path)
+                .field("passphrase_configured", &!passphrase.is_empty())
+                .field(
+                    "legacy_passphrase_ciphertext_present",
+                    &passphrase_encrypted.is_some(),
+                )
+                .finish(),
+        }
+    }
 }
 
 /// What to launch on the node + which artifact to upload (RFC v2 §6).
@@ -340,6 +435,39 @@ impl Config {
     pub fn hydrate_cluster_credentials_from_store(
         &mut self,
         data_dir: &std::path::Path,
+    ) -> ConfigStoreResult<()> {
+        // Preserve the historical no-store-read path for clusters without
+        // credential references. The validator still runs so inconsistent
+        // configured flags, orphaned metadata, or stray plaintext fail closed.
+        if !self
+            .cluster_fabric
+            .credential_refs
+            .values()
+            .any(|metadata| metadata.references().next().is_some())
+        {
+            return self.hydrate_cluster_credentials(None);
+        }
+
+        let store = crate::CredentialStore::open(data_dir);
+        // One transaction lock performs readiness/recovery once and captures
+        // one immutable document for every cluster reference.
+        let (snapshot, _, _) = store.snapshot_with_health()?;
+        self.hydrate_cluster_credentials(Some(&snapshot))
+    }
+
+    /// Resolve one cluster runtime from an immutable credential document
+    /// captured under the credential migration lock. Compound transactions use
+    /// this exact snapshot before admitting a later cross-process writer.
+    pub(crate) fn hydrate_cluster_credentials_from_snapshot(
+        &mut self,
+        credentials: &crate::credential_store::CredentialDocumentLkg,
+    ) -> ConfigStoreResult<()> {
+        self.hydrate_cluster_credentials(Some(credentials))
+    }
+
+    fn hydrate_cluster_credentials(
+        &mut self,
+        credentials: Option<&crate::credential_store::CredentialDocumentLkg>,
     ) -> ConfigStoreResult<()> {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum Field {
@@ -424,7 +552,7 @@ impl Config {
 
         let mut requested = Vec::<(usize, Field, CredentialRef)>::new();
         let mut seen_refs = BTreeSet::new();
-        let other_counts = crate::credential_store::config_credential_ref_counts(self)?;
+        let consumer_counts = crate::credential_store::config_credential_ref_counts(self)?;
         for (index, node) in self.cluster_fabric.nodes.iter().enumerate() {
             let metadata = self.cluster_fabric.credential_refs.get(&node.id);
             let empty = ClusterNodeCredentialRefs::default();
@@ -447,7 +575,10 @@ impl Config {
                         "cluster credential reference is not canonical".to_string(),
                     ));
                 }
-                if other_counts.get(reference).copied().unwrap_or(0) != 0
+                // The shared inventory includes this cluster metadata slot.
+                // Exactly one consumer is therefore the expected exclusive
+                // state; any additional consumer remains fail-closed.
+                if consumer_counts.get(reference).copied().unwrap_or(0) != 1
                     || !seen_refs.insert(reference.clone())
                 {
                     return Err(crate::ConfigStoreError::Validation(
@@ -519,10 +650,14 @@ impl Config {
             }
         }
 
-        let store = crate::CredentialStore::open(data_dir);
         let mut resolved = Vec::with_capacity(requested.len());
         for (index, field, reference) in requested {
-            let secret = store.resolve(&reference)?.ok_or_else(|| {
+            let credentials = credentials.ok_or_else(|| {
+                crate::ConfigStoreError::Validation(
+                    "referenced cluster credential is unavailable".to_string(),
+                )
+            })?;
+            let secret = credentials.resolve(&reference)?.ok_or_else(|| {
                 crate::ConfigStoreError::Validation(
                     "referenced cluster credential is unavailable".to_string(),
                 )
@@ -560,7 +695,7 @@ impl Config {
 
     /// Remove legacy/cached cluster secrets from a runtime snapshot. Used both
     /// before store hydration and when migration readiness is unavailable.
-    pub(crate) fn clear_cluster_runtime_credentials(&mut self) {
+    pub fn clear_cluster_runtime_credentials(&mut self) {
         for node in &mut self.cluster_fabric.nodes {
             let NodePlacement::Ssh(target) = &mut node.placement else {
                 continue;
@@ -1082,6 +1217,175 @@ mod tests {
         ] {
             assert!(!durable.contains(forbidden), "persisted {forbidden}");
         }
+    }
+
+    #[test]
+    fn recursive_config_debug_redacts_all_cluster_credential_forms() {
+        let _key = crate::encryption::set_test_encryption_key([0xc7; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let password_ref = cluster_password_credential_ref("password-debug").unwrap();
+        let key_ref = cluster_private_key_credential_ref("key-debug").unwrap();
+        let passphrase_ref = cluster_passphrase_credential_ref("key-debug").unwrap();
+        let store = crate::CredentialStore::open(dir.path());
+        for (revision, (reference, value)) in [
+            (&password_ref, "debug-password-plaintext"),
+            (&key_ref, "debug-private-key-plaintext"),
+            (&passphrase_ref, "debug-passphrase-plaintext"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .replace(
+                    reference.clone(),
+                    value,
+                    crate::CredentialSource::User,
+                    revision as u64,
+                )
+                .unwrap();
+        }
+
+        let mut config = Config::default();
+        config.cluster_fabric.nodes.push(ssh_node(
+            "password-debug",
+            SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        config.cluster_fabric.nodes.push(ssh_node(
+            "key-debug",
+            SshAuth::PrivateKey {
+                private_key: String::new(),
+                private_key_encrypted: None,
+                private_key_path: Some("/safe/on-host/key".to_string()),
+                passphrase: String::new(),
+                passphrase_encrypted: None,
+            },
+        ));
+        config.cluster_fabric.credential_refs.insert(
+            "password-debug".to_string(),
+            ClusterNodeCredentialRefs {
+                password_credential_ref: Some(password_ref.clone()),
+                password_configured: true,
+                ..ClusterNodeCredentialRefs::default()
+            },
+        );
+        config.cluster_fabric.credential_refs.insert(
+            "key-debug".to_string(),
+            ClusterNodeCredentialRefs {
+                private_key_credential_ref: Some(key_ref.clone()),
+                private_key_configured: true,
+                passphrase_credential_ref: Some(passphrase_ref.clone()),
+                passphrase_configured: true,
+                ..ClusterNodeCredentialRefs::default()
+            },
+        );
+        config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap();
+
+        let NodePlacement::Ssh(password_target) = &mut config.cluster_fabric.nodes[0].placement
+        else {
+            panic!("expected password SSH node")
+        };
+        let SshAuth::Password {
+            password_encrypted, ..
+        } = &mut password_target.auth
+        else {
+            panic!("expected password auth")
+        };
+        *password_encrypted = Some("debug-password-ciphertext".to_string());
+
+        let NodePlacement::Ssh(key_target) = &mut config.cluster_fabric.nodes[1].placement else {
+            panic!("expected private-key SSH node")
+        };
+        let SshAuth::PrivateKey {
+            private_key_encrypted,
+            passphrase_encrypted,
+            ..
+        } = &mut key_target.auth
+        else {
+            panic!("expected private-key auth")
+        };
+        *private_key_encrypted = Some("debug-private-key-ciphertext".to_string());
+        *passphrase_encrypted = Some("********debug-mask-sentinel".to_string());
+
+        let recursive_debug = format!("{config:?}");
+        let values_debug = format!("{:?}", config.section_values());
+        for forbidden in [
+            "debug-password-plaintext",
+            "debug-private-key-plaintext",
+            "debug-passphrase-plaintext",
+            "debug-password-ciphertext",
+            "debug-private-key-ciphertext",
+            "********debug-mask-sentinel",
+            password_ref.as_str(),
+            key_ref.as_str(),
+            passphrase_ref.as_str(),
+        ] {
+            assert!(
+                !recursive_debug.contains(forbidden),
+                "Config Debug leaked {forbidden}"
+            );
+            assert!(
+                !values_debug.contains(forbidden),
+                "ConfigValues Debug leaked {forbidden}"
+            );
+        }
+        assert!(recursive_debug.contains("password_configured: true"));
+        assert!(recursive_debug.contains("inline_private_key_configured: true"));
+        assert!(recursive_debug.contains("passphrase_configured: true"));
+        assert!(recursive_debug.contains("legacy_password_ciphertext_present: true"));
+        assert!(recursive_debug.contains("legacy_private_key_ciphertext_present: true"));
+        assert!(recursive_debug.contains("legacy_passphrase_ciphertext_present: true"));
+    }
+
+    #[test]
+    fn cluster_without_credential_refs_does_not_read_the_credential_document() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("credentials.json"), b"{invalid").unwrap();
+        let mut config = Config::default();
+        config
+            .cluster_fabric
+            .nodes
+            .push(ssh_node("system-node", SshAuth::SystemSshConfig));
+
+        config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap();
+    }
+
+    #[test]
+    fn cluster_credential_snapshot_preserves_transaction_readiness_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config-credential-migration.json"),
+            b"{invalid",
+        )
+        .unwrap();
+        let reference = cluster_password_credential_ref("node").unwrap();
+        let mut config = Config::default();
+        config.cluster_fabric.nodes.push(ssh_node(
+            "node",
+            SshAuth::Password {
+                password: String::new(),
+                password_encrypted: None,
+            },
+        ));
+        config.cluster_fabric.credential_refs.insert(
+            "node".to_string(),
+            ClusterNodeCredentialRefs {
+                password_credential_ref: Some(reference),
+                password_configured: true,
+                ..ClusterNodeCredentialRefs::default()
+            },
+        );
+
+        let error = config
+            .hydrate_cluster_credentials_from_store(dir.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("migration is pending"));
     }
 
     #[test]

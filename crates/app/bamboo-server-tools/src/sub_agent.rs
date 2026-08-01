@@ -604,16 +604,24 @@ impl Tool for SubAgentTool {
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "worker".to_string());
                 // workspace is optional: default to the parent's workspace.
-                let requested_workspace = workspace
+                let explicit_workspace = workspace
                     .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| parent.workspace.clone())
-                    .ok_or_else(|| {
-                        ToolError::InvalidArguments(
-                            "workspace must be non-empty (parent has no workspace to inherit)"
-                                .to_string(),
-                        )
-                    })?;
+                    .filter(|value| !value.is_empty());
+                let workspace_was_explicit = explicit_workspace.is_some();
+                let parent_workspace_is_project_default = parent
+                    .metadata
+                    .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                    .map(String::as_str)
+                    == Some(
+                        bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str(),
+                    );
+                let requested_workspace = explicit_workspace
+                    .or_else(|| {
+                        (!parent_workspace_is_project_default)
+                            .then(|| parent.workspace.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
                 let parent_project_id =
                     match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&parent) {
                         bamboo_engine::project_context::SessionProjectIdentity::Assigned(
@@ -629,6 +637,24 @@ impl Tool for SubAgentTool {
                             )));
                         }
                     };
+                let workspace_source = if workspace_was_explicit {
+                    bamboo_engine::project_context::WorkspaceSource::Explicit
+                } else if parent_workspace_is_project_default
+                    || (requested_workspace.is_empty() && parent_project_id.is_some())
+                {
+                    bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                } else {
+                    match parent
+                        .metadata
+                        .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                        .map(String::as_str)
+                    {
+                        Some("project_default") => {
+                            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                        }
+                        _ => bamboo_engine::project_context::WorkspaceSource::Session,
+                    }
+                };
                 // This must precede resident lookup/cancellation and every
                 // child/session mutation. Reused residents bypass
                 // `create_child_action`, while new children and guardians use
@@ -724,21 +750,60 @@ impl Tool for SubAgentTool {
                         // flag when reused under another (e.g. parent flipped from
                         // headless to interactive, or toggled bypass). Mirror BOTH
                         // flags so the reused resident matches the current parent.
-                        let (parent_bypass, parent_no_human) = parent
+                        let (parent_permission_mode, parent_no_human, parent_plan_active) = parent
                             .agent_runtime_state
                             .as_ref()
-                            .map(|s| (s.bypass_permissions, s.no_human_approver))
-                            .unwrap_or((false, false));
-                        let rs = child
-                            .agent_runtime_state
-                            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
-                        rs.bypass_permissions = parent_bypass;
-                        rs.no_human_approver = parent_no_human;
+                            .map(|s| {
+                                (
+                                    s.effective_permission_mode(),
+                                    s.no_human_approver,
+                                    s.plan_mode.is_some(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        let inherited_audit =
+                            bamboo_domain::PermissionAuditSnapshot::from_metadata(&parent.metadata);
+                        let policy_revision = inherited_audit
+                            .as_ref()
+                            .map(|audit| audit.policy_revision)
+                            .unwrap_or_default();
+                        let inherited_effective = if parent_plan_active {
+                            bamboo_domain::PermissionMode::Plan
+                        } else {
+                            inherited_audit
+                                .as_ref()
+                                .filter(|audit| {
+                                    audit.resolution.requested == parent_permission_mode
+                                        && audit.resolution.is_consistent()
+                                })
+                                .map(|audit| audit.resolution.effective)
+                                .unwrap_or_else(|| {
+                                    bamboo_domain::resolve_permission_mode(
+                                        parent_permission_mode,
+                                        bamboo_domain::PermissionMode::Default,
+                                    )
+                                    .effective
+                                })
+                        };
+                        let resolution = bamboo_domain::PermissionModeResolution {
+                            requested: parent_permission_mode,
+                            effective: inherited_effective,
+                        };
+                        let permission_audit = bamboo_domain::PermissionAuditSeed::bamboo_runtime(
+                            policy_revision,
+                            resolution,
+                        );
                         // Commit posture + the newly requested, already
                         // authorized workspace before publishing runtime state
                         // or enqueueing the next resident task.
                         self.sessions
-                            .save_resident_reuse_state(&mut child, &workspace)
+                            .save_resident_reuse_state(
+                                &mut child,
+                                &workspace,
+                                workspace_source,
+                                permission_audit,
+                                parent_no_human,
+                            )
                             .await
                             .map_err(tool_error_from_child_session)?;
                         // Reuse: reset => update (truncate + new task) then rerun;
@@ -816,6 +881,7 @@ impl Tool for SubAgentTool {
                                 assignment_prompt: prompt.clone(),
                                 subagent_type: subagent_type.clone(),
                                 workspace: workspace.clone(),
+                                workspace_source,
                                 model_override,
                                 model_ref_override,
                                 runtime_metadata,

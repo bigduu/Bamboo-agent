@@ -115,6 +115,7 @@ pub mod handlers;
 mod lifecycle_hooks;
 pub mod logging;
 pub mod notify_sinks;
+mod permission_audit;
 pub mod plugin_installer;
 pub mod plugin_source;
 pub mod project_context;

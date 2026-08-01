@@ -85,6 +85,7 @@ impl bamboo_engine::project_context::ProjectContextSource for SdkProjectContextS
         Ok(Some(bamboo_engine::project_context::ProjectDescriptor {
             id: manifest.id.clone(),
             name: manifest.name,
+            project_path: manifest.project_path.map(std::path::PathBuf::from),
             home: self.store.paths().project_home(project_id),
             workspace_bindings: manifest.workspace_bindings,
             resources,
@@ -181,6 +182,10 @@ pub struct AgentBuilder {
     /// gating at all — every tool call runs unprompted. See
     /// [`permission_checker`](Self::permission_checker).
     permission_checker: Option<Arc<dyn PermissionChecker>>,
+    /// Typed configured posture retained even when no checker is installed.
+    /// This distinguishes explicit legacy Bypass from the historical ungated
+    /// default at approval replay boundaries.
+    permission_mode: PermissionMode,
     /// Explicit dependency overrides are retained outside the wrapped engine
     /// builder so defaults can never overwrite them based on call order.
     provider_override: Option<Arc<dyn LLMProvider>>,
@@ -223,6 +228,7 @@ impl AgentBuilder {
             api_key: None,
             mcp_servers: Vec::new(),
             permission_checker: None,
+            permission_mode: PermissionMode::Default,
             provider_override: None,
             default_tools_override: None,
             config_override: None,
@@ -412,15 +418,17 @@ impl AgentBuilder {
     /// clarification — resolve it with [`Agent::answer`](super::Agent::answer).
     pub fn permission_checker(mut self, checker: Arc<dyn PermissionChecker>) -> Self {
         self.permission_checker = Some(checker);
+        self.permission_mode = PermissionMode::Default;
+        self.inner = self.inner.permission_mode(PermissionMode::Default);
         self
     }
 
     /// Configure the standard Bamboo permission policy for the default
     /// built-in tool executor.
     ///
-    /// [`PermissionMode::BypassPermissions`] is exactly equivalent to
-    /// [`bypass_permissions`](Self::bypass_permissions). Every other mode
-    /// installs Bamboo's canonical `PermissionConfig` +
+    /// Every typed mode, including legacy
+    /// [`PermissionMode::BypassPermissions`] and zero-prompt
+    /// [`PermissionMode::Auto`], installs Bamboo's canonical `PermissionConfig` +
     /// `ConfigPermissionChecker` + `ModeAwarePermissionChecker` stack. Calls to
     /// this method, [`permission_checker`](Self::permission_checker), and
     /// [`bypass_permissions`](Self::bypass_permissions) are last-call-wins,
@@ -428,6 +436,8 @@ impl AgentBuilder {
     /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir).
     pub fn permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission_checker = permission_checker_for_mode(mode);
+        self.permission_mode = mode;
+        self.inner = self.inner.permission_mode(mode);
         self
     }
 
@@ -437,6 +447,10 @@ impl AgentBuilder {
     /// can say what they mean instead of relying on silent default behavior.
     pub fn bypass_permissions(mut self) -> Self {
         self.permission_checker = None;
+        self.permission_mode = PermissionMode::BypassPermissions;
+        self.inner = self
+            .inner
+            .permission_mode(PermissionMode::BypassPermissions);
         self
     }
 
@@ -810,6 +824,7 @@ impl AgentBuilder {
             project_id,
             self.session_store,
             self.permission_checker,
+            self.permission_mode,
         ))
     }
 }
@@ -885,10 +900,6 @@ fn apply_api_key(config: &mut Config, api_key: &str) -> Result<(), SdkError> {
 }
 
 fn permission_checker_for_mode(mode: PermissionMode) -> Option<Arc<dyn PermissionChecker>> {
-    if mode == PermissionMode::BypassPermissions {
-        return None;
-    }
-
     let config = Arc::new(PermissionConfig::new());
     config.set_mode(mode);
     let base: Arc<dyn PermissionChecker> = Arc::new(ConfigPermissionChecker::new(config.clone()));
@@ -922,6 +933,8 @@ mod tests {
             event_tx: None,
             available_tool_schemas: None,
             bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
             can_async_resume: false,
             bash_completion_sink: None,
             pre_parsed_args: None,
@@ -1438,24 +1451,25 @@ mod tests {
 
     #[test]
     fn permission_configuration_is_last_call_wins() {
-        assert!(AgentBuilder::new()
+        let bypass = AgentBuilder::new()
             .permission_mode(PermissionMode::Default)
+            .bypass_permissions();
+        assert!(bypass.permission_checker.is_none());
+        assert_eq!(bypass.permission_mode, PermissionMode::BypassPermissions);
+
+        let plan = AgentBuilder::new()
             .bypass_permissions()
-            .permission_checker
-            .is_none());
-        assert!(AgentBuilder::new()
-            .bypass_permissions()
-            .permission_mode(PermissionMode::Plan)
-            .permission_checker
-            .is_some());
+            .permission_mode(PermissionMode::Plan);
+        assert!(plan.permission_checker.is_some());
+        assert_eq!(plan.permission_mode, PermissionMode::Plan);
 
         let custom = permission_checker_for_mode(PermissionMode::Default).unwrap();
-        assert!(AgentBuilder::new()
+        let custom = AgentBuilder::new()
             .permission_mode(PermissionMode::Plan)
-            .permission_checker(custom)
-            .permission_checker
-            .is_some());
-        assert!(permission_checker_for_mode(PermissionMode::BypassPermissions).is_none());
+            .permission_checker(custom);
+        assert!(custom.permission_checker.is_some());
+        assert_eq!(custom.permission_mode, PermissionMode::Default);
+        assert!(permission_checker_for_mode(PermissionMode::BypassPermissions).is_some());
     }
 
     #[tokio::test]
@@ -1463,6 +1477,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let blocked_path = tmp.path().join("plan-blocked.txt");
         let allowed_path = tmp.path().join("accept-edits.txt");
+        let bypass_path = tmp.path().join("bypass-forced.txt");
+        let auto_path = tmp.path().join("auto-forced.txt");
         let config = Arc::new(RwLock::new(Config::default()));
 
         let plan = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
@@ -1485,7 +1501,7 @@ mod tests {
         assert!(!blocked_path.exists());
 
         let accept_edits = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
-            config,
+            config.clone(),
             permission_checker_for_mode(PermissionMode::AcceptEdits).unwrap(),
         );
         let allowed = ToolCall {
@@ -1505,6 +1521,47 @@ mod tests {
             .await
             .expect("AcceptEdits should allow Write through the executor");
         assert_eq!(std::fs::read_to_string(allowed_path).unwrap(), "written");
+
+        let bypass = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+            config.clone(),
+            permission_checker_for_mode(PermissionMode::BypassPermissions).unwrap(),
+        );
+        let bypass_forced = ToolCall {
+            id: "bypass-forced".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("eval 'printf bypass > {}'", bypass_path.display())
+                })
+                .to_string(),
+            },
+        };
+        bypass
+            .execute(&bypass_forced)
+            .await
+            .expect_err("Bypass must retain forced confirmations");
+        assert!(!bypass_path.exists());
+
+        let auto = bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+            config,
+            permission_checker_for_mode(PermissionMode::Auto).unwrap(),
+        );
+        let forced = ToolCall {
+            id: "auto-forced".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({
+                    "command": format!("eval 'printf auto > {}'", auto_path.display())
+                })
+                .to_string(),
+            },
+        };
+        auto.execute(&forced)
+            .await
+            .expect("Auto should suppress forced confirmation");
+        assert_eq!(std::fs::read_to_string(auto_path).unwrap(), "auto");
 
         let assembled_dir = tempfile::tempdir().unwrap();
         write_test_config(assembled_dir.path());
@@ -1761,8 +1818,16 @@ mod tests {
     #[tokio::test]
     async fn defaults_backed_sdk_validates_and_propagates_project_identity() {
         let dir = tempfile::tempdir().unwrap();
+        let project_path = tempfile::tempdir().unwrap();
         let store = bamboo_projects::ProjectStore::open(dir.path()).unwrap();
-        let project = store.create("SDK Project", None).unwrap();
+        let project = store
+            .create_with_project_path(
+                "SDK Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
         let empty_executor: Arc<dyn ToolExecutor> = Arc::new(
             bamboo_tools::BuiltinToolExecutor::with_registry(ToolRegistry::new()),
         );
@@ -1777,8 +1842,41 @@ mod tests {
             .build()
             .unwrap();
 
-        let session = agent.new_session("sdk-project-session").unwrap();
+        let mut session = agent.new_session("sdk-project-session").unwrap();
         assert_eq!(session.project_id_meta(), Some(project.id.to_string()));
+        let error = agent
+            .run(&mut session, "verify SDK Project fallback")
+            .await
+            .expect_err("test provider terminates after runtime setup");
+        assert!(error
+            .to_string()
+            .contains("test provider must not be called"));
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(
+                bamboo_config::paths::path_to_display_string(
+                    &project_path.path().canonicalize().unwrap()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("project_default")
+        );
+        let prompt = session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("runtime system prompt")
+            .content
+            .as_str();
+        assert!(prompt.contains("Project path:"));
+        assert!(prompt.contains("Project home (Bamboo data):"));
+        assert!(prompt.contains("Workspace source: project_default"));
     }
 
     #[test]

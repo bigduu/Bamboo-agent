@@ -298,16 +298,16 @@ pub(crate) fn spawn_agent_forwarder(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        match handle_agent_lag(
-                            &state,
-                            &session_id,
-                            &out,
+                        match handle_agent_lag(AgentLagContext {
+                            state: &state,
+                            session_id: &session_id,
+                            out: &out,
                             encoding,
-                            &ch,
-                            &seq,
+                            channel: &ch,
+                            seq: &seq,
                             skipped,
-                            awaiting_children,
-                        )
+                            own_terminal_already_emitted: awaiting_children,
+                        })
                         .await
                         {
                             LagOutcome::Continue => continue,
@@ -418,16 +418,16 @@ pub(crate) fn spawn_agent_forwarder(
                                 }
                                 flush_deadline = None;
                             }
-                            match handle_agent_lag(
-                                &state,
-                                &session_id,
-                                &out,
+                            match handle_agent_lag(AgentLagContext {
+                                state: &state,
+                                session_id: &session_id,
+                                out: &out,
                                 encoding,
-                                &ch,
-                                &seq,
+                                channel: &ch,
+                                seq: &seq,
                                 skipped,
-                                awaiting_children,
-                            )
+                                own_terminal_already_emitted: awaiting_children,
+                            })
                             .await
                             {
                                 LagOutcome::Continue => {}
@@ -496,6 +496,18 @@ enum LagOutcome {
     Disconnected,
 }
 
+/// Named state for one broadcast-lag recovery decision.
+struct AgentLagContext<'a> {
+    state: &'a web::Data<AppState>,
+    session_id: &'a str,
+    out: &'a OutboundTx,
+    encoding: Encoding,
+    channel: &'a str,
+    seq: &'a AgentSeq,
+    skipped: u64,
+    own_terminal_already_emitted: bool,
+}
+
 /// Recover from a broadcast-ring overrun on an `agent.{sid}` channel (#543).
 ///
 /// Agent events have NO durable journal (unlike the feed), so a lag gap is
@@ -520,16 +532,17 @@ enum LagOutcome {
 /// mirroring the normal `is_child_completed && !has_running_child` close — and
 /// never a second, synthesized terminal event for a session whose completion
 /// the client already saw.
-async fn handle_agent_lag(
-    state: &web::Data<AppState>,
-    session_id: &str,
-    out: &OutboundTx,
-    encoding: Encoding,
-    ch: &str,
-    seq: &AgentSeq,
-    skipped: u64,
-    own_terminal_already_emitted: bool,
-) -> LagOutcome {
+async fn handle_agent_lag(context: AgentLagContext<'_>) -> LagOutcome {
+    let AgentLagContext {
+        state,
+        session_id,
+        out,
+        encoding,
+        channel,
+        seq,
+        skipped,
+        own_terminal_already_emitted,
+    } = context;
     tracing::warn!(
         "[{}] ws_v2 agent channel lagged: {} events lost to broadcast-ring overrun; \
          emitting gap control (client must reconcile via REST)",
@@ -539,7 +552,7 @@ async fn handle_agent_lag(
     if !send_env(
         out,
         encoding,
-        ServerEnvelope::control(ch, seq.next(), gap_control(skipped)),
+        ServerEnvelope::control(channel, seq.next(), gap_control(skipped)),
     )
     .await
     {
@@ -568,14 +581,14 @@ async fn handle_agent_lag(
     // In the awaiting-children window the parent's terminal was already
     // delivered — a second one would be a spurious duplicate completion.
     if !own_terminal_already_emitted
-        && !emit_agent_event(out, encoding, ch, seq, terminal_event).await
+        && !emit_agent_event(out, encoding, channel, seq, terminal_event).await
     {
         return LagOutcome::Disconnected;
     }
     let _ = send_env(
         out,
         encoding,
-        ServerEnvelope::control(ch, seq.next(), terminal_control("complete")),
+        ServerEnvelope::control(channel, seq.next(), terminal_control("complete")),
     )
     .await;
     LagOutcome::Stop

@@ -185,6 +185,24 @@ fn validate_provider_type(provider_type: &str) -> Result<(), AppError> {
 fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), AppError> {
     validate_provider_type(&instance.provider_type)?;
 
+    if let Some(value) = instance
+        .extra
+        .get(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY)
+    {
+        if instance.provider_type != "openai" {
+            return Err(AppError::BadRequest(format!(
+                "{} is only accepted for OpenAI provider instances",
+                bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
+            )));
+        }
+        if !value.is_boolean() {
+            return Err(AppError::BadRequest(format!(
+                "{} must be a boolean",
+                bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
+            )));
+        }
+    }
+
     if instance.provider_type != "copilot" && instance.api_key.trim().is_empty() {
         return Err(AppError::BadRequest(
             "api_key is required for non-copilot providers".to_string(),
@@ -565,6 +583,43 @@ mod tests {
     }
 
     #[test]
+    fn openai_instance_accepts_explicit_prompt_cache_switch() {
+        let mut request = create_request("sk-real");
+        request.config["explicit_prompt_cache"] = Value::Bool(false);
+
+        let instance = build_instance_from_create(&request).expect("valid OpenAI switch");
+        assert_eq!(
+            instance
+                .extra
+                .get(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            instance_config_to_api(&instance)
+                .get(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_cache_switch_rejects_wrong_type_or_provider() {
+        let mut wrong_type = create_request("sk-real");
+        wrong_type.config["explicit_prompt_cache"] = Value::String("false".to_string());
+        assert!(matches!(
+            build_instance_from_create(&wrong_type),
+            Err(AppError::BadRequest(_))
+        ));
+
+        let mut wrong_provider = create_request("sk-real");
+        wrong_provider.provider_type = "anthropic".to_string();
+        wrong_provider.config["explicit_prompt_cache"] = Value::Bool(false);
+        assert!(matches!(
+            build_instance_from_create(&wrong_provider),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
     fn create_and_update_ignore_client_owned_credential_metadata() {
         let mut request = create_request("sk-real");
         request.config["api_key_encrypted"] = Value::String("client-cipher".to_string());
@@ -623,8 +678,7 @@ mod tests {
         assert_eq!(create_resp.status(), actix_web::http::StatusCode::CREATED);
 
         // A settings save that does not mention `provider_instances` at all.
-        let save_payload: Value =
-            serde_json::json!({ "http_proxy": "http://example.invalid:8080" });
+        let save_payload: Value = serde_json::json!({ "headless_auth": true });
         crate::handlers::settings::set_bamboo_config(app_state.clone(), web::Json(save_payload))
             .await
             .expect("unrelated settings save should succeed");
@@ -697,8 +751,7 @@ mod tests {
         .await
         .expect("update should succeed");
 
-        let save_payload: Value =
-            serde_json::json!({ "http_proxy": "http://example.invalid:9090" });
+        let save_payload: Value = serde_json::json!({ "headless_auth": true });
         crate::handlers::settings::set_bamboo_config(app_state.clone(), web::Json(save_payload))
             .await
             .expect("unrelated settings save should succeed");

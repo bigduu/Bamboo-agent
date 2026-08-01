@@ -10,6 +10,31 @@ use serde::{Deserialize, Serialize};
 use super::{Config, ProxyAuth};
 use crate::patch::ProviderApiKeyIntents;
 
+trait CredentialResolver {
+    fn resolve(
+        &self,
+        credential_ref: &crate::CredentialRef,
+    ) -> crate::ConfigStoreResult<Option<crate::SecretValue>>;
+}
+
+impl CredentialResolver for crate::CredentialStore {
+    fn resolve(
+        &self,
+        credential_ref: &crate::CredentialRef,
+    ) -> crate::ConfigStoreResult<Option<crate::SecretValue>> {
+        crate::CredentialStore::resolve(self, credential_ref)
+    }
+}
+
+impl CredentialResolver for crate::credential_store::CredentialDocumentLkg {
+    fn resolve(
+        &self,
+        credential_ref: &crate::CredentialRef,
+    ) -> crate::ConfigStoreResult<Option<crate::SecretValue>> {
+        self.resolve(credential_ref)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AccessVerifierRecord {
     pub hash: String,
@@ -39,7 +64,7 @@ fn validate_access_verifier(hash: &str, salt: &str) -> crate::ConfigStoreResult<
     if hash.len() != 64
         || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
         || salt.is_empty()
-        || salt.len() % 2 != 0
+        || !salt.len().is_multiple_of(2)
         || !salt.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(crate::ConfigStoreError::Validation(
@@ -49,7 +74,9 @@ fn validate_access_verifier(hash: &str, salt: &str) -> crate::ConfigStoreResult<
     Ok(())
 }
 
-fn decode_access_verifier(secret: &str) -> crate::ConfigStoreResult<AccessVerifierRecord> {
+pub(crate) fn decode_access_verifier(
+    secret: &str,
+) -> crate::ConfigStoreResult<AccessVerifierRecord> {
     let record: AccessVerifierRecord = serde_json::from_str(secret).map_err(|_| {
         crate::ConfigStoreError::Validation(
             "access-control verifier credential is invalid".to_string(),
@@ -60,7 +87,7 @@ fn decode_access_verifier(secret: &str) -> crate::ConfigStoreResult<AccessVerifi
 }
 
 fn hydrate_header_credentials(
-    store: &crate::CredentialStore,
+    resolver: &impl CredentialResolver,
     headers: &mut [bamboo_domain::mcp_config::HeaderConfig],
 ) -> crate::ConfigStoreResult<()> {
     for header in headers {
@@ -71,7 +98,7 @@ fn hydrate_header_credentials(
             continue;
         };
         let reference = crate::CredentialRef::parse(raw_reference.clone())?;
-        header.value = store
+        header.value = resolver
             .resolve(&reference)?
             .ok_or_else(|| {
                 crate::ConfigStoreError::Validation(
@@ -208,20 +235,33 @@ impl Config {
     /// Hydrate proxy authentication from its isolated credential-store entry.
     /// The stored secret is the JSON representation of [`crate::ProxyAuth`].
     pub fn hydrate_proxy_auth_from_store(&mut self, data_dir: &std::path::Path) -> Result<()> {
+        let store = crate::CredentialStore::open(data_dir);
+        self.hydrate_proxy_auth_from_resolver(&store)
+            .map_err(anyhow::Error::from)
+    }
+
+    pub(crate) fn hydrate_proxy_auth_from_snapshot(
+        &mut self,
+        snapshot: &crate::credential_store::CredentialDocumentLkg,
+    ) -> crate::ConfigStoreResult<()> {
+        self.hydrate_proxy_auth_from_resolver(snapshot)
+    }
+
+    fn hydrate_proxy_auth_from_resolver(
+        &mut self,
+        resolver: &impl CredentialResolver,
+    ) -> crate::ConfigStoreResult<()> {
         let Some(reference) = self.proxy_auth_credential_ref.as_ref() else {
             return Ok(());
         };
-        let value = crate::CredentialStore::open(data_dir)
-            .resolve(reference)
-            .map_err(anyhow::Error::from)?;
+        let value = resolver.resolve(reference)?;
         let Some(value) = value else {
             self.proxy_auth = None;
             return Ok(());
         };
-        self.proxy_auth = Some(
-            serde_json::from_str(value.expose())
-                .context("Failed to parse proxy auth credential")?,
-        );
+        self.proxy_auth = Some(serde_json::from_str(value.expose()).map_err(|_| {
+            crate::ConfigStoreError::Validation("proxy auth credential is invalid".to_string())
+        })?);
         self.proxy_auth_encrypted = None;
         Ok(())
     }
@@ -282,12 +322,26 @@ impl Config {
         data_dir: &std::path::Path,
     ) -> crate::ConfigStoreResult<()> {
         let store = crate::CredentialStore::open(data_dir);
+        self.hydrate_provider_credentials_from_resolver(&store)
+    }
+
+    pub(crate) fn hydrate_provider_credentials_from_snapshot(
+        &mut self,
+        snapshot: &crate::credential_store::CredentialDocumentLkg,
+    ) -> crate::ConfigStoreResult<()> {
+        self.hydrate_provider_credentials_from_resolver(snapshot)
+    }
+
+    fn hydrate_provider_credentials_from_resolver(
+        &mut self,
+        resolver: &impl CredentialResolver,
+    ) -> crate::ConfigStoreResult<()> {
         macro_rules! hydrate {
             ($provider:expr) => {
                 if let Some(provider) = $provider {
                     if provider.api_key.trim().is_empty() {
                         if let Some(reference) = provider.credential_ref.as_ref() {
-                            provider.api_key = store
+                            provider.api_key = resolver
                                 .resolve(reference)?
                                 .ok_or_else(|| {
                                     crate::ConfigStoreError::Validation(
@@ -308,7 +362,7 @@ impl Config {
         for instance in self.provider_instances.values_mut() {
             if instance.api_key.trim().is_empty() {
                 if let Some(reference) = instance.credential_ref.as_ref() {
-                    instance.api_key = store
+                    instance.api_key = resolver
                         .resolve(reference)?
                         .ok_or_else(|| {
                             crate::ConfigStoreError::Validation(
@@ -528,6 +582,20 @@ impl Config {
         data_dir: &std::path::Path,
     ) -> crate::ConfigStoreResult<()> {
         let store = crate::CredentialStore::open(data_dir);
+        self.hydrate_mcp_credentials_from_resolver(&store)
+    }
+
+    pub(crate) fn hydrate_mcp_credentials_from_snapshot(
+        &mut self,
+        snapshot: &crate::credential_store::CredentialDocumentLkg,
+    ) -> crate::ConfigStoreResult<()> {
+        self.hydrate_mcp_credentials_from_resolver(snapshot)
+    }
+
+    fn hydrate_mcp_credentials_from_resolver(
+        &mut self,
+        resolver: &impl CredentialResolver,
+    ) -> crate::ConfigStoreResult<()> {
         for server in &mut self.mcp.servers {
             match &mut server.transport {
                 bamboo_domain::mcp_config::TransportConfig::Stdio(stdio) => {
@@ -536,7 +604,7 @@ impl Config {
                             continue;
                         }
                         let reference = crate::CredentialRef::parse(raw_reference.clone())?;
-                        let secret = store.resolve(&reference)?.ok_or_else(|| {
+                        let secret = resolver.resolve(&reference)?.ok_or_else(|| {
                             crate::ConfigStoreError::Validation(
                                 "referenced MCP credential is unavailable".to_string(),
                             )
@@ -545,10 +613,10 @@ impl Config {
                     }
                 }
                 bamboo_domain::mcp_config::TransportConfig::Sse(config) => {
-                    hydrate_header_credentials(&store, &mut config.headers)?;
+                    hydrate_header_credentials(resolver, &mut config.headers)?;
                 }
                 bamboo_domain::mcp_config::TransportConfig::StreamableHttp(config) => {
-                    hydrate_header_credentials(&store, &mut config.headers)?;
+                    hydrate_header_credentials(resolver, &mut config.headers)?;
                 }
             }
         }
@@ -668,6 +736,20 @@ impl Config {
         data_dir: &std::path::Path,
     ) -> crate::ConfigStoreResult<()> {
         let store = crate::CredentialStore::open(data_dir);
+        self.hydrate_env_var_credentials_from_resolver(&store)
+    }
+
+    pub(crate) fn hydrate_env_var_credentials_from_snapshot(
+        &mut self,
+        snapshot: &crate::credential_store::CredentialDocumentLkg,
+    ) -> crate::ConfigStoreResult<()> {
+        self.hydrate_env_var_credentials_from_resolver(snapshot)
+    }
+
+    fn hydrate_env_var_credentials_from_resolver(
+        &mut self,
+        resolver: &impl CredentialResolver,
+    ) -> crate::ConfigStoreResult<()> {
         for entry in &mut self.env_vars {
             if !entry.secret {
                 entry.credential_ref = None;
@@ -678,7 +760,7 @@ impl Config {
                 entry.configured = false;
                 continue;
             };
-            match store.resolve(reference)? {
+            match resolver.resolve(reference)? {
                 Some(secret) => {
                     entry.value = secret.expose().to_string();
                     entry.configured = true;
@@ -813,6 +895,21 @@ impl Config {
         &mut self,
         data_dir: &std::path::Path,
     ) -> crate::ConfigStoreResult<()> {
+        let store = crate::CredentialStore::open(data_dir);
+        self.hydrate_notification_credentials_from_resolver(&store)
+    }
+
+    pub(crate) fn hydrate_notification_credentials_from_snapshot(
+        &mut self,
+        snapshot: &crate::credential_store::CredentialDocumentLkg,
+    ) -> crate::ConfigStoreResult<()> {
+        self.hydrate_notification_credentials_from_resolver(snapshot)
+    }
+
+    fn hydrate_notification_credentials_from_resolver(
+        &mut self,
+        resolver: &impl CredentialResolver,
+    ) -> crate::ConfigStoreResult<()> {
         let reference_counts = crate::credential_store::config_credential_ref_counts(self)?;
         for reference in [
             self.notifications.ntfy.credential_ref.as_ref(),
@@ -828,10 +925,9 @@ impl Config {
                 ));
             }
         }
-        let store = crate::CredentialStore::open(data_dir);
         let ntfy = &mut self.notifications.ntfy;
         if let Some(reference) = ntfy.credential_ref.as_ref() {
-            match store.resolve(reference)? {
+            match resolver.resolve(reference)? {
                 Some(secret) => {
                     ntfy.token = Some(secret.expose().to_string());
                     ntfy.configured = true;
@@ -851,7 +947,7 @@ impl Config {
 
         let bark = &mut self.notifications.bark;
         if let Some(reference) = bark.credential_ref.as_ref() {
-            match store.resolve(reference)? {
+            match resolver.resolve(reference)? {
                 Some(secret) => {
                     bark.device_key = Some(secret.expose().to_string());
                     bark.configured = true;
@@ -982,16 +1078,31 @@ impl Config {
     ) -> crate::ConfigStoreResult<()> {
         let store = crate::CredentialStore::open(data_dir);
         let allow_legacy_runtime_value = !crate::section_layout_is_active(data_dir)?;
+        self.hydrate_connect_credentials_from_resolver(&store, allow_legacy_runtime_value)
+    }
+
+    pub(crate) fn hydrate_connect_credentials_from_snapshot(
+        &mut self,
+        snapshot: &crate::credential_store::CredentialDocumentLkg,
+    ) -> crate::ConfigStoreResult<()> {
+        self.hydrate_connect_credentials_from_resolver(snapshot, false)
+    }
+
+    fn hydrate_connect_credentials_from_resolver(
+        &mut self,
+        resolver: &impl CredentialResolver,
+        allow_legacy_runtime_value: bool,
+    ) -> crate::ConfigStoreResult<()> {
         for platform in &mut self.connect.platforms {
             hydrate_optional_connect_secret(
-                &store,
+                resolver,
                 platform.token_credential_ref.as_ref(),
                 platform.token_configured,
                 &mut platform.token,
                 allow_legacy_runtime_value,
             )?;
             hydrate_optional_connect_secret(
-                &store,
+                resolver,
                 platform.app_secret_credential_ref.as_ref(),
                 platform.app_secret_configured,
                 &mut platform.app_secret,
@@ -1010,10 +1121,24 @@ impl Config {
         &mut self,
         data_dir: &std::path::Path,
     ) -> crate::ConfigStoreResult<()> {
+        let store = crate::CredentialStore::open(data_dir);
+        self.hydrate_access_control_credentials_from_resolver(&store)
+    }
+
+    pub(crate) fn hydrate_access_control_credentials_from_snapshot(
+        &mut self,
+        snapshot: &crate::credential_store::CredentialDocumentLkg,
+    ) -> crate::ConfigStoreResult<()> {
+        self.hydrate_access_control_credentials_from_resolver(snapshot)
+    }
+
+    fn hydrate_access_control_credentials_from_resolver(
+        &mut self,
+        resolver: &impl CredentialResolver,
+    ) -> crate::ConfigStoreResult<()> {
         let Some(access) = self.access_control.as_mut() else {
             return Ok(());
         };
-        let store = crate::CredentialStore::open(data_dir);
         match access.password_credential_ref.as_ref() {
             Some(reference) => {
                 if reference != &access_password_credential_ref()? || !access.password_configured {
@@ -1021,7 +1146,7 @@ impl Config {
                         "access-control password credential metadata is invalid".to_string(),
                     ));
                 }
-                let secret = store.resolve(reference)?.ok_or_else(|| {
+                let secret = resolver.resolve(reference)?.ok_or_else(|| {
                     crate::ConfigStoreError::Validation(
                         "access-control password verifier is unavailable".to_string(),
                     )
@@ -1053,7 +1178,7 @@ impl Config {
                     "access-control device credential metadata is invalid".to_string(),
                 ));
             }
-            let secret = store.resolve(reference)?.ok_or_else(|| {
+            let secret = resolver.resolve(reference)?.ok_or_else(|| {
                 crate::ConfigStoreError::Validation(
                     "access-control device verifier is unavailable".to_string(),
                 )
@@ -1219,14 +1344,14 @@ impl Config {
 }
 
 fn hydrate_optional_connect_secret(
-    store: &crate::CredentialStore,
+    resolver: &impl CredentialResolver,
     reference: Option<&crate::CredentialRef>,
     configured: bool,
     target: &mut Option<String>,
     allow_legacy_runtime_value: bool,
 ) -> crate::ConfigStoreResult<()> {
     match reference {
-        Some(reference) => match store.resolve(reference)? {
+        Some(reference) => match resolver.resolve(reference)? {
             Some(secret) => *target = Some(secret.expose().to_string()),
             None if configured => {
                 return Err(crate::ConfigStoreError::Validation(

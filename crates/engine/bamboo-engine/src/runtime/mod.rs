@@ -22,8 +22,9 @@ pub use agent::{Agent, AgentBuilder};
 pub use bamboo_domain::RuntimeSessionPersistence;
 pub use complexity_classifier::{ComplexityClassifier, TaskComplexity};
 pub use config::{
-    ApprovalDelegate, ChildApprovalOutcome, ChildApprovalRequest, GoldConfig, GuardianConfig,
-    GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
+    ApprovalDelegate, ChildApprovalOutcome, ChildApprovalRequest, DisabledFilterResolver,
+    DisabledFilterSets, GoldConfig, GuardianConfig, GuardianSpawner, ImageFallbackConfig,
+    ImageFallbackMode,
 };
 // `AgentLoopConfig` is intentionally NOT re-exported: its fields are `pub(crate)`,
 // so it is unconstructible outside the engine. Internal call sites reach it via
@@ -31,7 +32,9 @@ pub use config::{
 // through `AgentRuntime::execute`.
 pub use execution::runner_state::{AgentRunner, AgentStatus};
 pub use hooks::{
-    test_lifecycle_shell_command, HookRunner, ShellCommandHook, ShellHookEvent, ShellHookTestOutput,
+    test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, LifecycleHookEvent,
+    LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
+    ShellHookTestOutput,
 };
 pub use managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,

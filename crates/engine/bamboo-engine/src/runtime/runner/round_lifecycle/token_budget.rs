@@ -3,6 +3,88 @@ use bamboo_agent_core::Session;
 use bamboo_compression::limits::{load_model_limits_from_unified_config, ModelLimit};
 use bamboo_compression::{ModelLimitsRegistry, TokenBudget};
 use bamboo_llm::provider::LLMProvider;
+use std::path::{Path, PathBuf};
+
+const CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS: u32 = 32_000;
+const CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS: u32 = 8_000;
+const CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN: u32 = 1_000;
+
+fn model_limits_path(config: &AgentLoopConfig) -> PathBuf {
+    let data_dir = config
+        .app_data_dir
+        .clone()
+        .unwrap_or_else(bamboo_config::paths::bamboo_dir);
+    bamboo_compression::limits::get_default_config_path(&data_dir)
+}
+
+/// Resolve the budget for an auxiliary model/provider pair without touching the
+/// chat model's session cache. Compression can route to a completely different
+/// provider and must therefore never inherit the triggering model's limits.
+pub(super) async fn resolve_auxiliary_token_budget(
+    config: &AgentLoopConfig,
+    model_name: &str,
+    llm: &dyn LLMProvider,
+) -> TokenBudget {
+    let model_limits_path = model_limits_path(config);
+
+    let configured_limit =
+        resolve_configured_model_limit(config, model_name, &model_limits_path, "summarization")
+            .await;
+    let provider_limit = if configured_limit.is_some() {
+        None
+    } else {
+        match llm.list_model_info().await {
+            Ok(models) => models
+                .into_iter()
+                .find(|entry| entry.id == model_name)
+                .and_then(|model_info| {
+                    model_info.max_context_tokens.map(|max_context_tokens| {
+                        let mut limit = ModelLimit::new(model_name.to_string(), max_context_tokens);
+                        limit.max_output_tokens = model_info.max_output_tokens;
+                        limit
+                    })
+                }),
+            Err(error) => {
+                tracing::warn!(
+                    model = model_name,
+                    error = %error,
+                    "Failed to resolve summarization-model runtime limits"
+                );
+                None
+            }
+        }
+    };
+
+    // Explicit user overrides (including partial patterns) outrank exact
+    // provider metadata. Keeping every source in its own registry avoids an
+    // exact provider or legacy entry accidentally shadowing a higher-priority
+    // user pattern.
+    let model_limit = match configured_limit.or(provider_limit) {
+        Some(limit) => limit,
+        None => {
+            tracing::warn!(
+                model = model_name,
+                context_tokens = CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
+                output_tokens = CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
+                "No summarization-model limit is known; using conservative bounded fallback"
+            );
+            let mut fallback = ModelLimit::new(
+                model_name.to_string(),
+                CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
+            );
+            fallback.max_output_tokens = Some(CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS);
+            fallback.safety_margin = Some(CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN);
+            fallback
+        }
+    };
+
+    TokenBudget::with_safety_margin(
+        model_limit.max_context_tokens,
+        model_limit.get_max_output_tokens(),
+        bamboo_compression::BudgetStrategy::default(),
+        model_limit.get_safety_margin(),
+    )
+}
 
 pub(super) async fn resolve_token_budget(
     session: &mut Session,
@@ -10,8 +92,26 @@ pub(super) async fn resolve_token_budget(
     model_name: &str,
     llm: &dyn LLMProvider,
 ) -> TokenBudget {
-    // Priority: session/child override > config override > per-process cache >
-    // freshly-resolved model defaults.
+    let model_limits_path = model_limits_path(config);
+    resolve_token_budget_with_model_limits_path(
+        session,
+        config,
+        model_name,
+        llm,
+        &model_limits_path,
+    )
+    .await
+}
+
+async fn resolve_token_budget_with_model_limits_path(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    llm: &dyn LLMProvider,
+    model_limits_path: &Path,
+) -> TokenBudget {
+    // Priority: session/child override > config override > freshly-resolved
+    // model defaults.
     if let Some(ref budget) = session.token_budget {
         tracing::debug!("Using session-specific token budget");
         return budget.clone();
@@ -22,56 +122,19 @@ pub(super) async fn resolve_token_budget(
         return budget.clone();
     }
 
-    // Per-process cache of a previous resolution, reused only when it was
-    // resolved for the SAME model. It is never persisted (`#[serde(skip)]`), so a
-    // reloaded session falls through and re-resolves from the current
-    // `model_limits.json`; a mid-session model switch also falls through because
-    // the cached model key no longer matches. (#180)
-    if let Some((cached_model, budget)) = session.resolved_token_budget.as_ref() {
-        if cached_model.as_str() == model_name {
-            tracing::debug!("Using cached resolved token budget for '{model_name}'");
-            return budget.clone();
-        }
-    }
-
-    // Default to model limits:
-    // 1. built-in defaults
-    // 2. provider runtime metadata (copilot only)
-    // 3. dedicated config file: model_limits.json
-    // 4. legacy fallback: config.json -> model_limits
-    let mut registry = ModelLimitsRegistry::with_config_path(
-        bamboo_compression::limits::get_default_config_path(&bamboo_config::paths::bamboo_dir()),
-    );
-
-    if let Some(provider_limit) = resolve_provider_runtime_limit(config, llm, model_name).await {
-        registry.add_limit(provider_limit);
-    }
-
-    let loaded_from_file = match registry.load_user_config().await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to load model limits from {:?}: {}. Falling back to legacy config.json key.",
-                bamboo_compression::limits::get_default_config_path(&bamboo_config::paths::bamboo_dir()),
-                error
-            );
-            false
-        }
-    };
-
-    if !loaded_from_file {
-        // Legacy fallback: parse the config.json `model_limits` key. The value is
-        // snapshotted from the live in-memory config at loop-config build time
-        // (config.legacy_model_limits) — NOT re-read from disk via Config::new(),
-        // which would diverge from the server's live config and clobber the global
-        // env-var cache (#38). Pure JSON parse, so no spawn_blocking needed.
-        apply_legacy_model_limits(&mut registry, config.legacy_model_limits.as_ref());
-    }
-
-    let matched_limit = registry.get(model_name);
+    // Resolve each source independently so an exact lower-priority provider
+    // record cannot shadow a higher-priority partial user pattern:
+    // 1. dedicated model_limits.json
+    // 2. legacy config.json -> model_limits
+    // 3. provider runtime metadata (Copilot)
+    // 4. global fallback
+    let configured_limit =
+        resolve_configured_model_limit(config, model_name, model_limits_path, "chat").await;
+    let provider_limit = resolve_provider_runtime_limit(config, llm, model_name).await;
+    let matched_limit = configured_limit.or(provider_limit);
     let model_limit = matched_limit
         .clone()
-        .unwrap_or_else(|| registry.get_or_default(model_name));
+        .unwrap_or_else(|| ModelLimitsRegistry::new().get_or_default(model_name));
 
     if matched_limit.is_some() {
         tracing::debug!(
@@ -87,7 +150,7 @@ pub(super) async fn resolve_token_budget(
             model_name,
             model_limit.model_pattern,
             model_limit.max_context_tokens,
-            bamboo_compression::limits::get_default_config_path(&bamboo_config::paths::bamboo_dir())
+            model_limits_path
         );
     }
 
@@ -98,17 +161,51 @@ pub(super) async fn resolve_token_budget(
         model_limit.get_safety_margin(),
     );
 
-    // Cache the resolved budget on the session (keyed by model) so every
-    // downstream reader — `build_context_pressure` (tool-output truncation), the
-    // server context bar, `estimate_context_compression_exposure` — sees the
-    // real, model-limit-derived budget via `Session::effective_token_budget`
-    // instead of `None` (issue #20 bug 1). Unlike the persisted `token_budget`
-    // override, this cache is `#[serde(skip)]`: a reloaded session re-resolves
-    // (picking up a `model_limits.json` edit) and a mid-session model switch
-    // invalidates it. (#180)
+    // Publish the freshly resolved budget on the session so every downstream
+    // reader in this round — `build_context_pressure` (tool-output truncation),
+    // the server context bar, `estimate_context_compression_exposure` — sees the
+    // same limits via `Session::effective_token_budget` instead of `None`
+    // (issue #20 bug 1). This runtime snapshot is never used to skip resolution:
+    // every new round re-reads `model_limits.json` and refreshes provider
+    // metadata, so an edit takes effect in an already-running session.
     session.resolved_token_budget = Some((model_name.to_string(), resolved.clone()));
 
     resolved
+}
+
+/// Resolve user-configured limits without mixing source precedence into a
+/// single registry.
+///
+/// The dedicated revisioned sidecar is the authoritative first layer. A
+/// legacy flattened config entry is still checked per model when the sidecar
+/// has no matching pattern, which supports gradual migration without allowing
+/// an exact provider metadata record to shadow a user family pattern.
+async fn resolve_configured_model_limit(
+    config: &AgentLoopConfig,
+    model_name: &str,
+    model_limits_path: &Path,
+    purpose: &str,
+) -> Option<ModelLimit> {
+    let mut dedicated_registry = ModelLimitsRegistry::with_config_path(model_limits_path);
+    if let Err(error) = dedicated_registry.load_user_config().await {
+        tracing::warn!(
+            model = model_name,
+            purpose,
+            error = %error,
+            path = ?model_limits_path,
+            "Failed to load model_limits.json; checking legacy configured limits"
+        );
+    } else if let Some(limit) = dedicated_registry.get(model_name) {
+        return Some(limit);
+    }
+
+    // The legacy value is snapshotted from the live in-memory config at
+    // loop-config build time. Do not re-read Config::new() here: that would
+    // diverge from the server's live config and clobber the global env cache
+    // (#38).
+    let mut legacy_registry = ModelLimitsRegistry::new();
+    apply_legacy_model_limits(&mut legacy_registry, config.legacy_model_limits.as_ref());
+    legacy_registry.get(model_name)
 }
 
 /// Apply the legacy `config.json` `model_limits` value (snapshotted from the
@@ -175,6 +272,7 @@ async fn resolve_provider_runtime_limit(
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use async_trait::async_trait;
     use futures::{stream, Stream};
@@ -211,14 +309,14 @@ mod tests {
         assert!(registry.get("legacy-model").is_none());
     }
 
-    // Issue #20 bug 1: `resolve_token_budget` must cache the resolved budget so
+    // Issue #20 bug 1: `resolve_token_budget` must publish the resolved budget so
     // every downstream reader (build_context_pressure, the server context bar,
     // estimate_context_compression_exposure) observes it via
-    // `effective_token_budget` instead of `None`. Per #180 the cache lives in the
+    // `effective_token_budget` instead of `None`. Per #180 the snapshot lives in the
     // non-persisted `resolved_token_budget` slot (keyed by model), NOT the
     // persisted `token_budget` override slot.
     #[tokio::test]
-    async fn resolve_token_budget_caches_resolved_budget_on_session() {
+    async fn resolve_token_budget_publishes_resolved_budget_on_session() {
         let mut session = bamboo_agent_core::Session::new("budget-cache", "some-model");
         assert!(
             session.effective_token_budget().is_none(),
@@ -230,16 +328,16 @@ mod tests {
 
         let resolved = resolve_token_budget(&mut session, &config, "some-model", &provider).await;
 
-        // The persisted override slot stays empty; the cache holds the resolved
+        // The persisted override slot stays empty; the snapshot holds the resolved
         // budget keyed by model, and effective_token_budget surfaces it.
         assert!(
             session.token_budget.is_none(),
-            "the resolved cache must NOT populate the persisted override slot (#180)"
+            "the resolved snapshot must NOT populate the persisted override slot (#180)"
         );
         let (cached_model, cached) = session
             .resolved_token_budget
             .clone()
-            .expect("resolved budget must be cached on the session (#20 bug 1)");
+            .expect("resolved budget must be published on the session (#20 bug 1)");
         assert_eq!(cached_model, "some-model");
         assert_eq!(cached.max_context_tokens, resolved.max_context_tokens);
         assert_eq!(cached.max_output_tokens, resolved.max_output_tokens);
@@ -250,8 +348,8 @@ mod tests {
         );
     }
 
-    // #180: the resolved cache is `#[serde(skip)]`, so it never persists. A
-    // reloaded long-lived session therefore starts with no cache and re-resolves
+    // #180: the resolved snapshot is `#[serde(skip)]`, so it never persists. A
+    // reloaded long-lived session therefore starts with no snapshot and re-resolves
     // from the current `model_limits.json` — the exact staleness #180 fixes.
     #[tokio::test]
     async fn resolved_token_budget_is_not_persisted() {
@@ -259,24 +357,25 @@ mod tests {
         let config = AgentLoopConfig::default();
         let provider = MetadataProvider::default();
         let _ = resolve_token_budget(&mut session, &config, "some-model", &provider).await;
-        assert!(session.resolved_token_budget.is_some(), "cache populated");
+        assert!(
+            session.resolved_token_budget.is_some(),
+            "runtime snapshot populated"
+        );
 
         let json = serde_json::to_string(&session).expect("serialize");
         assert!(
             !json.contains("resolved_token_budget"),
-            "the resolved cache must not be serialized (#180)"
+            "the resolved snapshot must not be serialized (#180)"
         );
         let reloaded: bamboo_agent_core::Session =
             serde_json::from_str(&json).expect("deserialize");
         assert!(
             reloaded.resolved_token_budget.is_none(),
-            "a reloaded session must have no cached budget, so it re-resolves (#180)"
+            "a reloaded session must have no resolved snapshot, so it re-resolves (#180)"
         );
     }
 
-    // #180: a mid-session model switch invalidates the cache (keyed by model), so
-    // the budget is re-resolved for the new model instead of reusing the first
-    // model's cached budget.
+    // #180: a mid-session model switch updates the keyed runtime snapshot.
     #[tokio::test]
     async fn resolve_token_budget_reresolves_on_model_switch() {
         let mut session = bamboo_agent_core::Session::new("budget-switch", "model-a");
@@ -286,8 +385,7 @@ mod tests {
         let _ = resolve_token_budget(&mut session, &config, "model-a", &provider).await;
         assert_eq!(session.resolved_token_budget.as_ref().unwrap().0, "model-a");
 
-        // Switch the model: the cache key no longer matches, so it re-resolves and
-        // re-keys instead of short-circuiting on "model-a".
+        // Switch the model: resolution refreshes and re-keys the snapshot.
         let _ = resolve_token_budget(&mut session, &config, "model-b", &provider).await;
         assert_eq!(
             session.resolved_token_budget.as_ref().unwrap().0,
@@ -343,6 +441,254 @@ mod tests {
         async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
             Ok(self.models.clone())
         }
+    }
+
+    struct MutableMetadataProvider {
+        max_context_tokens: AtomicU32,
+        max_output_tokens: AtomicU32,
+    }
+
+    #[async_trait]
+    impl LLMProvider for MutableMetadataProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(vec![ProviderModelInfo {
+                id: "dynamic-model-limit-763".to_string(),
+                max_context_tokens: Some(self.max_context_tokens.load(Ordering::SeqCst)),
+                max_output_tokens: Some(self.max_output_tokens.load(Ordering::SeqCst)),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn same_model_limit_is_refreshed_each_round_without_session_reload() {
+        let mut session =
+            bamboo_agent_core::Session::new("dynamic-limit", "dynamic-model-limit-763");
+        let config = AgentLoopConfig {
+            provider_type: Some("copilot".to_string()),
+            ..Default::default()
+        };
+        let provider = MutableMetadataProvider {
+            max_context_tokens: AtomicU32::new(64_000),
+            max_output_tokens: AtomicU32::new(8_000),
+        };
+
+        let first =
+            resolve_token_budget(&mut session, &config, "dynamic-model-limit-763", &provider).await;
+        assert_eq!(first.max_context_tokens, 64_000);
+        assert_eq!(first.max_output_tokens, 8_000);
+
+        provider.max_context_tokens.store(96_000, Ordering::SeqCst);
+        provider.max_output_tokens.store(12_000, Ordering::SeqCst);
+        let refreshed =
+            resolve_token_budget(&mut session, &config, "dynamic-model-limit-763", &provider).await;
+
+        assert_eq!(refreshed.max_context_tokens, 96_000);
+        assert_eq!(refreshed.max_output_tokens, 12_000);
+        assert_eq!(
+            session
+                .resolved_token_budget
+                .as_ref()
+                .expect("latest runtime snapshot")
+                .1
+                .max_context_tokens,
+            96_000
+        );
+    }
+
+    #[tokio::test]
+    async fn revisioned_model_limit_edit_refreshes_same_running_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        let write_limit = |revision: u64, context: u32, output: u32| {
+            let path = path.clone();
+            async move {
+                tokio::fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "revision": revision,
+                        "data": [{
+                            "model_pattern": "live-sidecar-model-763",
+                            "max_context_tokens": context,
+                            "max_output_tokens": output,
+                            "safety_margin": 500
+                        }]
+                    }))
+                    .expect("serialize model-limit envelope"),
+                )
+                .await
+                .expect("write model-limit envelope");
+            }
+        };
+        write_limit(1, 64_000, 8_000).await;
+
+        let mut session = bamboo_agent_core::Session::new("live-sidecar", "live-sidecar-model-763");
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider::default();
+        let first = resolve_token_budget_with_model_limits_path(
+            &mut session,
+            &config,
+            "live-sidecar-model-763",
+            &provider,
+            &path,
+        )
+        .await;
+        assert_eq!(first.max_context_tokens, 64_000);
+        assert_eq!(first.max_output_tokens, 8_000);
+
+        write_limit(2, 96_000, 12_000).await;
+        let refreshed = resolve_token_budget_with_model_limits_path(
+            &mut session,
+            &config,
+            "live-sidecar-model-763",
+            &provider,
+            &path,
+        )
+        .await;
+
+        assert_eq!(refreshed.max_context_tokens, 96_000);
+        assert_eq!(refreshed.max_output_tokens, 12_000);
+        assert_eq!(
+            session
+                .resolved_token_budget
+                .as_ref()
+                .expect("latest runtime snapshot")
+                .1
+                .max_context_tokens,
+            96_000
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reads_model_limits_from_the_instance_app_data_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        tokio::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 1,
+                "data": [{
+                    "model_pattern": "instance-data-dir-model-763",
+                    "max_context_tokens": 72_000,
+                    "max_output_tokens": 9_000,
+                    "safety_margin": 600
+                }]
+            }))
+            .expect("serialize instance model limits"),
+        )
+        .await
+        .expect("write instance model limits");
+
+        let config = AgentLoopConfig {
+            app_data_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let provider = MetadataProvider::default();
+        let mut session =
+            bamboo_agent_core::Session::new("instance-data-dir", "instance-data-dir-model-763");
+
+        let budget = resolve_token_budget(
+            &mut session,
+            &config,
+            "instance-data-dir-model-763",
+            &provider,
+        )
+        .await;
+
+        assert_eq!(budget.max_context_tokens, 72_000);
+        assert_eq!(budget.max_output_tokens, 9_000);
+        assert_eq!(budget.safety_margin, 600);
+    }
+
+    #[tokio::test]
+    async fn dedicated_partial_pattern_outranks_exact_provider_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        tokio::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 7,
+                "data": [{
+                    "model_pattern": "configured-family-763",
+                    "max_context_tokens": 48_000,
+                    "max_output_tokens": 6_000,
+                    "safety_margin": 500
+                }]
+            }))
+            .expect("serialize model-limit envelope"),
+        )
+        .await
+        .expect("write model-limit envelope");
+
+        let mut session =
+            bamboo_agent_core::Session::new("configured-over-provider", "configured-family-763-v2");
+        let config = AgentLoopConfig {
+            provider_type: Some("copilot".to_string()),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo {
+                id: "configured-family-763-v2".to_string(),
+                max_context_tokens: Some(128_000),
+                max_output_tokens: Some(16_000),
+            }],
+        };
+
+        let budget = resolve_token_budget_with_model_limits_path(
+            &mut session,
+            &config,
+            "configured-family-763-v2",
+            &provider,
+            &path,
+        )
+        .await;
+
+        assert_eq!(budget.max_context_tokens, 48_000);
+        assert_eq!(budget.max_output_tokens, 6_000);
+        assert_eq!(budget.safety_margin, 500);
+    }
+
+    #[tokio::test]
+    async fn legacy_limit_is_used_when_dedicated_sidecar_has_no_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_path = dir.path().join("model_limits.json");
+        let model = "legacy-chat-model-763";
+        let config = AgentLoopConfig {
+            legacy_model_limits: Some(serde_json::json!([{
+                "model_pattern": model,
+                "max_context_tokens": 24_000,
+                "max_output_tokens": 4_000,
+                "safety_margin": 400
+            }])),
+            ..Default::default()
+        };
+        let provider = MetadataProvider::default();
+        let mut session = bamboo_agent_core::Session::new("legacy-chat-limit", model);
+
+        let budget = resolve_token_budget_with_model_limits_path(
+            &mut session,
+            &config,
+            model,
+            &provider,
+            &missing_path,
+        )
+        .await;
+
+        assert_eq!(budget.max_context_tokens, 24_000);
+        assert_eq!(budget.max_output_tokens, 4_000);
+        assert_eq!(budget.safety_margin, 400);
     }
 
     #[tokio::test]
@@ -434,5 +780,97 @@ mod tests {
         let limit =
             resolve_provider_runtime_limit(&config, &FailingProvider, "gpt-5.3-codex").await;
         assert!(limit.is_none());
+    }
+
+    #[tokio::test]
+    async fn auxiliary_budget_uses_exact_selected_provider_model_metadata() {
+        let config = AgentLoopConfig {
+            provider_type: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo {
+                id: "summary-model-763".to_string(),
+                max_context_tokens: Some(32_000),
+                max_output_tokens: Some(6_000),
+            }],
+        };
+
+        let budget = resolve_auxiliary_token_budget(&config, "summary-model-763", &provider).await;
+        assert_eq!(budget.max_context_tokens, 32_000);
+        assert_eq!(budget.max_output_tokens, 6_000);
+        assert_eq!(budget.safety_margin, 1_000);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_budget_honors_legacy_model_limit_when_dedicated_file_is_absent() {
+        let model = "legacy-summary-model-763-no-user-file-collision";
+        let config = AgentLoopConfig {
+            legacy_model_limits: Some(serde_json::json!([
+                {
+                    "model_pattern": model,
+                    "max_context_tokens": 12_345,
+                    "max_output_tokens": 2_345,
+                    "safety_margin": 345
+                }
+            ])),
+            ..Default::default()
+        };
+        let provider = MetadataProvider::default();
+
+        let budget = resolve_auxiliary_token_budget(&config, model, &provider).await;
+        assert_eq!(budget.max_context_tokens, 12_345);
+        assert_eq!(budget.max_output_tokens, 2_345);
+        assert_eq!(budget.safety_margin, 345);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_user_pattern_override_outranks_exact_provider_metadata() {
+        let config = AgentLoopConfig {
+            legacy_model_limits: Some(serde_json::json!([
+                {
+                    "model_pattern": "summary-family-763",
+                    "max_context_tokens": 16_000,
+                    "max_output_tokens": 3_000,
+                    "safety_margin": 500
+                }
+            ])),
+            ..Default::default()
+        };
+        let provider = MetadataProvider {
+            models: vec![ProviderModelInfo {
+                id: "summary-family-763-latest".to_string(),
+                max_context_tokens: Some(64_000),
+                max_output_tokens: Some(8_000),
+            }],
+        };
+
+        let budget =
+            resolve_auxiliary_token_budget(&config, "summary-family-763-latest", &provider).await;
+        assert_eq!(budget.max_context_tokens, 16_000);
+        assert_eq!(budget.max_output_tokens, 3_000);
+        assert_eq!(budget.safety_margin, 500);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_budget_uses_conservative_fallback_when_limit_is_unknown() {
+        let config = AgentLoopConfig::default();
+        let provider = MetadataProvider::default();
+
+        let budget = resolve_auxiliary_token_budget(
+            &config,
+            "definitely-unknown-summary-model-763",
+            &provider,
+        )
+        .await;
+        assert_eq!(
+            budget.max_context_tokens,
+            CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            budget.max_output_tokens,
+            CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS
+        );
+        assert_eq!(budget.safety_margin, CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN);
     }
 }

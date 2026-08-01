@@ -24,6 +24,7 @@ pub async fn set_bamboo_config(
             "env_vars must be changed through the dedicated revisioned env-vars API".to_string(),
         ));
     }
+    remove_unchanged_cluster_fabric_echo(&app_state, &mut patch_obj).await?;
     if patch_obj.contains_key("notifications") {
         let has_other_domain = patch_obj
             .keys()
@@ -51,6 +52,8 @@ pub async fn set_bamboo_config(
             "expected_revision is only valid for a dedicated revisioned config domain".to_string(),
         ));
     }
+    let current = app_state.config.read().await.clone();
+    config_manager::remove_unchanged_core_proxy_echo(&current, &mut patch_obj)?;
     let mut model_limits_patch = take_model_limits_patch(&mut patch_obj);
     config_manager::sanitize_root_patch(&mut patch_obj);
     if model_limits_patch.is_some() && !patch_obj.is_empty() {
@@ -72,14 +75,6 @@ pub async fn set_bamboo_config(
     let new_config = app_state
         .update_config_with_provider_credentials(
             move |config| {
-                if patch_obj.contains_key("cluster_fabric")
-                    && !config.cluster_fabric.credential_refs.is_empty()
-                {
-                    return Err(AppError::BadRequest(
-                        "cluster_fabric with isolated credentials must be changed through the dedicated node API"
-                            .to_string(),
-                    ));
-                }
                 let current = config.clone();
                 let mut patch_obj = patch_obj;
                 remove_unchanged_access_control_echo(&current, &mut patch_obj)?;
@@ -131,7 +126,18 @@ pub async fn set_bamboo_config(
         }
     }
 
-    Ok(HttpResponse::Ok().json(redacted_config_json(&new_config, &app_state.app_data_dir).await?))
+    // The live config deliberately retains the current node heartbeat/runtime
+    // state while this unrelated compatibility write installs only its owned
+    // section. Preserve the established POST contract by returning the
+    // operator-owned cluster projection, not a transient runtime heartbeat
+    // that was ignored rather than committed by this request.
+    let mut response_config = new_config;
+    for node in &mut response_config.cluster_fabric.nodes {
+        node.state = None;
+    }
+    response_config.sanitize_cluster_fabric_for_disk();
+    Ok(HttpResponse::Ok()
+        .json(redacted_config_json(&response_config, &app_state.app_data_dir).await?))
 }
 
 pub(super) fn remove_unchanged_access_control_echo(
@@ -168,12 +174,83 @@ fn access_control_patch_error() -> AppError {
     )
 }
 
+async fn remove_unchanged_cluster_fabric_echo(
+    app_state: &AppState,
+    patch_obj: &mut Map<String, Value>,
+) -> Result<(), AppError> {
+    let Some(incoming) = patch_obj.get("cluster_fabric") else {
+        return Ok(());
+    };
+    if incoming.is_null() {
+        return Err(cluster_fabric_patch_error());
+    }
+
+    let current = app_state.config.read().await.clone();
+    let current_value = current.to_compatibility_value()?;
+    let redacted_current = redact_config_for_api(current_value, &current);
+    let Some(current_cluster) = redacted_current.get("cluster_fabric") else {
+        return Err(cluster_fabric_patch_error());
+    };
+    if cluster_fabric_without_runtime_state(current_cluster)
+        != cluster_fabric_without_runtime_state(incoming)
+    {
+        return Err(cluster_fabric_patch_error());
+    }
+
+    // Compatibility clients POST the complete redacted GET payload. Ignore a
+    // semantically unchanged operator-owned cluster echo before routing any
+    // other domain. Runtime node state may advance between GET and POST, and is
+    // ignored here as well as on persistence; all other cluster fields must
+    // still match exactly.
+    patch_obj.remove("cluster_fabric");
+    Ok(())
+}
+
+fn cluster_fabric_without_runtime_state(cluster: &Value) -> Value {
+    let mut cluster = cluster.clone();
+    let Some(nodes) = cluster
+        .as_object_mut()
+        .and_then(|object| object.get_mut("nodes"))
+        .and_then(Value::as_array_mut)
+    else {
+        return cluster;
+    };
+    for node in nodes {
+        if let Some(node) = node.as_object_mut() {
+            node.remove("state");
+        }
+    }
+    cluster
+}
+
+fn cluster_fabric_patch_error() -> AppError {
+    AppError::BadRequest(
+        "cluster_fabric must be changed through the dedicated revisioned cluster API".to_string(),
+    )
+}
+
 async fn notification_payload_is_unchanged(
     app_state: &AppState,
     patch_obj: &serde_json::Map<String, Value>,
 ) -> Result<bool, AppError> {
     if patch_obj.get("notifications").is_some_and(Value::is_null) {
         return Ok(false);
+    }
+    for (channel, field) in [("ntfy", "token"), ("bark", "device_key")] {
+        if patch_obj
+            .get("notifications")
+            .and_then(Value::as_object)
+            .and_then(|notifications| notifications.get(channel))
+            .and_then(Value::as_object)
+            .and_then(|channel| channel.get(field))
+            .and_then(Value::as_str)
+            .is_some_and(bamboo_config::patch::is_masked_api_key)
+        {
+            return Err(AppError::BadRequest(
+                "notification credential value must not be a mask; omit it to keep the existing value"
+                    .to_string(),
+            ));
+        }
     }
     let current = app_state.config.read().await.clone();
     let mut notification_patch = serde_json::Map::new();
@@ -193,17 +270,17 @@ async fn set_notification_config(
     app_state: web::Data<AppState>,
     mut patch_obj: serde_json::Map<String, Value>,
 ) -> Result<HttpResponse, AppError> {
-    let explicit_revision = patch_obj.contains_key("expected_revision");
     let expected_revision = match patch_obj.remove("expected_revision") {
         Some(value) => value.as_u64().ok_or_else(|| {
             AppError::BadRequest(
                 "notification expected_revision must be an unsigned integer".to_string(),
             )
         })?,
-        None => app_state
-            .credential_store
-            .revision()
-            .map_err(super::super::credentials::map_store_read_error)?,
+        None => {
+            return Err(AppError::BadRequest(
+                "notification expected_revision is required".to_string(),
+            ))
+        }
     };
     if patch_obj.len() != 1 {
         return Err(AppError::BadRequest(
@@ -244,13 +321,10 @@ async fn set_notification_config(
                     Value::Null => {}
                     Value::String(value) => {
                         if bamboo_config::patch::is_masked_api_key(value) {
-                            if explicit_revision {
-                                return Err(AppError::BadRequest(
-                                    "notification credential value must not be a mask; omit it to keep the existing value"
-                                        .to_string(),
-                                ));
-                            }
-                            secret_intents.remove(channel);
+                            return Err(AppError::BadRequest(
+                                "notification credential value must not be a mask; omit it to keep the existing value"
+                                    .to_string(),
+                            ));
                         }
                     }
                     _ => {
@@ -264,7 +338,7 @@ async fn set_notification_config(
     }
     let patch_for_update = patch_obj;
     let intents_for_update = secret_intents.clone();
-    let (new_config, _) = app_state
+    let (new_config, _, _, _) = app_state
         .update_notification_credentials(
             expected_revision,
             secret_intents,
@@ -322,6 +396,28 @@ async fn connect_payload_is_unchanged(
     if patch_obj.get("connect").is_some_and(Value::is_null) {
         return Ok(false);
     }
+    if patch_obj
+        .get("connect")
+        .and_then(|connect| connect.get("platforms"))
+        .and_then(Value::as_array)
+        .is_some_and(|platforms| {
+            platforms.iter().any(|platform| {
+                platform.as_object().is_some_and(|platform| {
+                    ["token", "app_secret"].iter().any(|field| {
+                        platform
+                            .get(*field)
+                            .and_then(Value::as_str)
+                            .is_some_and(bamboo_config::patch::is_masked_api_key)
+                    })
+                })
+            })
+        })
+    {
+        return Err(AppError::BadRequest(
+            "connect credential value must not be a mask; omit it to keep the existing value"
+                .to_string(),
+        ));
+    }
     let current = app_state.config.read().await.clone();
     let mut connect_patch = serde_json::Map::new();
     connect_patch.insert(
@@ -340,17 +436,17 @@ async fn set_connect_config(
     app_state: web::Data<AppState>,
     mut patch_obj: serde_json::Map<String, Value>,
 ) -> Result<HttpResponse, AppError> {
-    let explicit_revision = patch_obj.contains_key("expected_revision");
     let expected_revision = match patch_obj.remove("expected_revision") {
         Some(value) => value.as_u64().ok_or_else(|| {
             AppError::BadRequest(
                 "connect expected_revision must be an unsigned integer".to_string(),
             )
         })?,
-        None => app_state
-            .credential_store
-            .revision()
-            .map_err(super::super::credentials::map_store_read_error)?,
+        None => {
+            return Err(AppError::BadRequest(
+                "connect expected_revision is required".to_string(),
+            ))
+        }
     };
     if patch_obj.len() != 1 {
         return Err(AppError::BadRequest(
@@ -402,15 +498,12 @@ async fn set_connect_config(
                     }
                     Value::String(value) => {
                         if bamboo_config::patch::is_masked_api_key(value) {
-                            if explicit_revision {
-                                return Err(AppError::BadRequest(
-                                    "connect credential value must not be a mask; omit it to keep the existing value"
-                                        .to_string(),
-                                ));
-                            }
-                        } else {
-                            intents.insert(index);
+                            return Err(AppError::BadRequest(
+                                "connect credential value must not be a mask; omit it to keep the existing value"
+                                    .to_string(),
+                            ));
                         }
+                        intents.insert(index);
                     }
                     _ => {
                         return Err(AppError::BadRequest(
@@ -425,7 +518,7 @@ async fn set_connect_config(
     config_manager::sanitize_root_patch(&mut patch_obj);
     let patch_for_update = patch_obj;
     let intents_for_update = secret_intents.clone();
-    let (new_config, _) = app_state
+    let (new_config, _, _, _) = app_state
         .update_connect_credentials(expected_revision, secret_intents, move |config| {
             let current = config.clone();
             let mut patch = patch_for_update;
@@ -527,6 +620,334 @@ mod tests {
             let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
             assert!(body.contains("revisioned env-vars API"));
         }
+    }
+
+    #[actix_web::test]
+    async fn root_patch_and_validation_reject_core_proxy_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let core_before = std::fs::read(dir.path().join("core.json")).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/config", web::post().to(set_bamboo_config))
+                .route(
+                    "/config/validate",
+                    web::post().to(crate::handlers::settings::validate_bamboo_config_patch),
+                ),
+        )
+        .await;
+        for uri in ["/config", "/config/validate"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(uri)
+                    .set_json(serde_json::json!({
+                        "http_proxy": "http://unrevisioned-proxy.test:8080"
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(body.contains("revisioned Core"), "{body}");
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("core.json")).unwrap(),
+            core_before
+        );
+    }
+
+    #[actix_web::test]
+    async fn stale_root_proxy_echo_cannot_rebase_an_unrelated_core_edit_over_exact_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state.stop_config_watcher_for_test();
+        let state = web::Data::new(state);
+
+        let external_facade = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let mut external_core = external_facade
+            .registry()
+            .envelope_value(bamboo_config::SectionId::Core)
+            .unwrap()
+            .data;
+        external_core["http_proxy"] = serde_json::json!("http://external-winner.test:8080");
+        external_facade
+            .registry()
+            .commit_value(bamboo_config::SectionId::Core, 0, external_core)
+            .unwrap();
+        let mut external = bamboo_config::ConfigFacade::open(dir.path())
+            .unwrap()
+            .effective_config();
+        external.proxy_auth = Some(bamboo_config::ProxyAuth {
+            username: "external-user".to_string(),
+            password: "external-password".to_string(),
+        });
+        assert_eq!(
+            bamboo_config::persist_proxy_auth_credential_transaction_at_revision(
+                dir.path(),
+                &mut external,
+                1,
+            )
+            .unwrap(),
+            2
+        );
+        let core_before = std::fs::read(dir.path().join("core.json")).unwrap();
+        let credentials_before = std::fs::read(dir.path().join("credentials.json")).unwrap();
+        assert_eq!(state.config.read().await.http_proxy, "");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/config", web::post().to(set_bamboo_config)),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config")
+                .set_json(serde_json::json!({
+                    "http_proxy": "",
+                    "server": {"port": 22_226}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(dir.path().join("core.json")).unwrap(),
+            core_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.json")).unwrap(),
+            credentials_before
+        );
+        let exact = bamboo_config::read_exact_credential_section_snapshot(
+            dir.path(),
+            bamboo_config::SectionId::Core,
+            Some(2),
+        )
+        .unwrap();
+        let mut committed = bamboo_llm::Config::default();
+        exact.install_into(&mut committed);
+        assert_eq!(committed.http_proxy, "http://external-winner.test:8080");
+        assert_eq!(
+            committed.proxy_auth.as_ref().unwrap().username,
+            "external-user"
+        );
+        assert_ne!(committed.server.port, 22_226);
+    }
+
+    #[actix_web::test]
+    async fn root_patch_and_validation_reject_cluster_fabric_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let before = std::fs::read(&cluster_path).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route("/config", web::post().to(set_bamboo_config))
+                .route(
+                    "/config/validate",
+                    web::post().to(crate::handlers::settings::validate_bamboo_config_patch),
+                ),
+        )
+        .await;
+        for uri in ["/config", "/config/validate"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(uri)
+                    .set_json(serde_json::json!({
+                        "cluster_fabric": {
+                            "nodes": [{
+                                "id": "bypass",
+                                "label": "bypass",
+                                "placement": {"type": "local"}
+                            }]
+                        }
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+            assert!(body.contains("revisioned cluster API"));
+        }
+        assert_eq!(std::fs::read(cluster_path).unwrap(), before);
+        assert!(state.config.read().await.cluster_fabric.nodes.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_root_get_post_accepts_only_an_unchanged_redacted_cluster_echo() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let reference = bamboo_config::cluster_password_credential_ref("echo-node").unwrap();
+        state
+            .update_cluster_fabric_credentials(
+                0,
+                std::collections::BTreeMap::from([(
+                    "echo-node".to_string(),
+                    bamboo_config::ClusterNodeCredentialIntents {
+                        password: bamboo_config::ClusterCredentialAction::Replace(
+                            "echo-secret".to_string(),
+                        ),
+                        private_key: bamboo_config::ClusterCredentialAction::Clear,
+                        passphrase: bamboo_config::ClusterCredentialAction::Clear,
+                    },
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(bamboo_config::Node {
+                        id: "echo-node".to_string(),
+                        label: "echo-node".to_string(),
+                        placement: bamboo_config::NodePlacement::Ssh(bamboo_config::SshTarget {
+                            host: "echo.example".to_string(),
+                            port: 22,
+                            username: "deploy".to_string(),
+                            auth: bamboo_config::SshAuth::Password {
+                                password: String::new(),
+                                password_encrypted: None,
+                            },
+                            host_key_fingerprint: None,
+                        }),
+                        trust_level: bamboo_config::TrustLevel::Trusted,
+                        deploy: bamboo_config::DeployProfile::default(),
+                        state: None,
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        let cluster_revision = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .revision;
+        let cluster_path = dir.path().join("cluster-fabric.json");
+        let cluster_before = std::fs::read(&cluster_path).unwrap();
+        let credentials_before = std::fs::read(state.credential_store.path()).unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .route(
+                    "/config",
+                    web::get().to(crate::handlers::settings::get_bamboo_config),
+                )
+                .route("/config", web::post().to(set_bamboo_config)),
+        )
+        .await;
+
+        let mut full_config: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/config").to_request(),
+        )
+        .await;
+        let cluster_echo = full_config["cluster_fabric"].clone();
+        assert!(cluster_echo.get("credential_refs").is_none());
+        assert!(!cluster_echo.to_string().contains(reference.as_str()));
+        assert!(!cluster_echo.to_string().contains("echo-secret"));
+
+        full_config["server"]["port"] = serde_json::json!(19_999);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config")
+                .set_json(&full_config)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["cluster_fabric"], cluster_echo);
+        assert_eq!(response["server"]["port"], 19_999);
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_before);
+        assert_eq!(
+            std::fs::read(state.credential_store.path()).unwrap(),
+            credentials_before
+        );
+
+        {
+            let mut config = state.config.write().await;
+            config.cluster_fabric.node_mut("echo-node").unwrap().state =
+                Some(bamboo_config::NodeState {
+                    status: bamboo_config::NodeStatus::Running,
+                    worker_id: Some("heartbeat-worker".to_string()),
+                    last_health: Some("runtime-only-heartbeat".to_string()),
+                    ..Default::default()
+                });
+        }
+        let mut heartbeat_echo: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/config").to_request(),
+        )
+        .await;
+        assert_eq!(
+            heartbeat_echo["cluster_fabric"]["nodes"][0]["state"]["last_health"],
+            "runtime-only-heartbeat"
+        );
+        state
+            .config
+            .write()
+            .await
+            .cluster_fabric
+            .node_mut("echo-node")
+            .unwrap()
+            .state
+            .as_mut()
+            .unwrap()
+            .last_health = Some("newer-runtime-only-heartbeat".to_string());
+        heartbeat_echo["server"]["port"] = serde_json::json!(20_000);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config")
+                .set_json(&heartbeat_echo)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["server"]["port"], 20_000);
+        assert!(!response.to_string().contains("runtime-only-heartbeat"));
+        assert!(!response
+            .to_string()
+            .contains("newer-runtime-only-heartbeat"));
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            cluster_revision
+        );
+        assert_eq!(std::fs::read(&cluster_path).unwrap(), cluster_before);
+        assert_eq!(
+            std::fs::read(state.credential_store.path()).unwrap(),
+            credentials_before
+        );
+        assert!(state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot()
+            .data
+            .0
+            .node("echo-node")
+            .unwrap()
+            .state
+            .is_none());
     }
 
     #[actix_web::test]

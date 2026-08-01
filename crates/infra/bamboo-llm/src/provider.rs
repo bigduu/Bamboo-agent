@@ -52,7 +52,9 @@ pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
 pub struct ProviderModelInfo {
     /// Model identifier.
     pub id: String,
-    /// Maximum context window (input + output) in tokens when known.
+    /// Maximum total context window (input + output) in tokens when known.
+    /// Provider adapters that receive an input-only limit must add the model's
+    /// output capacity before populating this field.
     pub max_context_tokens: Option<u32>,
     /// Maximum output/completion tokens when known.
     pub max_output_tokens: Option<u32>,
@@ -97,6 +99,27 @@ pub struct ResponsesRequestOptions {
     /// Optional text verbosity for Responses API requests
     /// (e.g. "low", "medium", "high").
     pub text_verbosity: Option<String>,
+    /// Stable affinity key for OpenAI prompt caching. Callers should provide a
+    /// privacy-preserving value; Bamboo never derives one from raw session
+    /// identity in this generic request DTO.
+    pub prompt_cache_key: Option<String>,
+    /// OpenAI request-wide cache policy (currently `mode` and optional `ttl`).
+    /// Kept as JSON so newly added official policy keys survive proxying.
+    pub prompt_cache_options: Option<serde_json::Value>,
+    /// Original Responses `input` retained by the compatibility endpoint when
+    /// it contains caller-authored explicit cache breakpoints.
+    ///
+    /// The OpenAI Responses adapter may use this instead of the provider-neutral
+    /// message rendering so supported `input_text`, `input_image`, and
+    /// `input_file` markers survive byte-for-byte. Agent/runtime calls leave it
+    /// unset.
+    pub raw_input_with_cache_breakpoints: Option<serde_json::Value>,
+    /// Retain raw Responses protocol events alongside provider-neutral chunks.
+    ///
+    /// This is an internal compatibility-endpoint control, not an upstream
+    /// request field. Agent/runtime calls leave it disabled to avoid cloning
+    /// every SSE payload when only normalized chunks are needed.
+    pub retain_protocol_events: bool,
 }
 
 /// Optional request-time controls for provider calls.
@@ -121,8 +144,9 @@ pub struct LLMRequestOptions {
     pub request_purpose: Option<String>,
     /// Provider-agnostic prompt-cache plan describing the stable, cacheable
     /// prefix of this request. Providers render it in their own dialect
-    /// (Anthropic `cache_control` breakpoints; OpenAI/Gemini rely on the stable
-    /// prefix automatically). `None` means "no explicit cache hints".
+    /// (Anthropic `cache_control`; GPT-5.6+ OpenAI Responses explicit content
+    /// breakpoints; automatic caching for providers without explicit support).
+    /// `None` means "no explicit cache hints".
     pub cache: Option<crate::cache::PromptCachePlan>,
 }
 

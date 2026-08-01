@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::events::ToolEmitter;
-pub use bamboo_agent_core::{classify_tool, ToolMutability};
+pub use bamboo_agent_core::{classify_tool, plan_mode_allows_tool, ToolMutability};
 use bamboo_agent_core::{ToolCall, ToolError, ToolExecutionContext, ToolExecutor, ToolResult};
 
 /// Configuration for the orchestrator.

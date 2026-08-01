@@ -31,7 +31,7 @@ dashmap = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 globset = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 parking_lot = "0.12"
 url = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }

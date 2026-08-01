@@ -16,7 +16,7 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 chrono = { workspace = true }
 uuid = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 dashmap = "6"
 fs2 = "0.4"
 sha2 = { workspace = true }

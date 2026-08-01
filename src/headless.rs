@@ -27,8 +27,9 @@ fn parse_permission_mode(s: &str) -> Result<PermissionMode, String> {
         "accept-edits" | "edits" => Ok(PermissionMode::AcceptEdits),
         "dont-ask" | "deny" => Ok(PermissionMode::DontAsk),
         "bypass" | "bypass-permissions" | "yolo" => Ok(PermissionMode::BypassPermissions),
+        "auto" => Ok(PermissionMode::Auto),
         other => Err(format!(
-            "unknown --permission-mode '{other}' (expected: default | plan | accept-edits | dont-ask | bypass)"
+            "unknown --permission-mode '{other}' (expected: default | plan | accept-edits | dont-ask | bypass | auto)"
         )),
     }
 }
@@ -266,10 +267,17 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     // `--permission-mode` lets `bamboo -p` proceed (e.g. `bypass`). The mode rides
     // on the shared PermissionConfig and is read per check, so it applies to the
     // whole run (and any child actors built from the same checker).
-    if let Some(raw) = args.permission_mode.as_deref() {
-        let mode = parse_permission_mode(raw)?;
+    let requested_permission_mode = args
+        .permission_mode
+        .as_deref()
+        .map(parse_permission_mode)
+        .transpose()?;
+    if let Some(mode) = requested_permission_mode {
         state.permission_checker.set_permission_mode(mode);
-        eprintln!("• permission mode: {raw}");
+        eprintln!(
+            "• permission mode: {}",
+            args.permission_mode.as_deref().unwrap_or_default()
+        );
     }
 
     // ---- session: continue or create ----
@@ -392,6 +400,17 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             .map_err(|e| format!("load session: {e}"))?
             .ok_or_else(|| "session vanished".to_string())?;
         session.add_message(Message::user(args.prompt.clone()));
+        if let Some(mode) = requested_permission_mode {
+            let session_mode = match mode {
+                PermissionMode::Auto => bamboo_domain::SessionPermissionMode::Auto,
+                PermissionMode::BypassPermissions => bamboo_domain::SessionPermissionMode::Bypass,
+                _ => bamboo_domain::SessionPermissionMode::Default,
+            };
+            session
+                .agent_runtime_state
+                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+                .set_permission_mode(session_mode);
+        }
         // Pin the chosen model onto the SESSION, not just the request. The server
         // has two model cascades gated on `features.provider_model_ref`; the
         // legacy one (the default) ranks the request's model BELOW the provider's
@@ -847,6 +866,11 @@ fn print_server_event(value: &serde_json::Value, streamed_tokens: &mut bool) {
 mod tests {
     use super::*;
     use bamboo_agent_core::PendingQuestion;
+
+    #[test]
+    fn auto_permission_mode_is_accepted_explicitly() {
+        assert_eq!(parse_permission_mode("auto"), Ok(PermissionMode::Auto));
+    }
 
     fn permission_gate() -> PendingQuestion {
         PendingQuestion {

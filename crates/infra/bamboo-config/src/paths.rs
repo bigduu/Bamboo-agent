@@ -237,9 +237,20 @@ pub fn subagents_dir() -> PathBuf {
 /// global — it re-reads the environment every call, matching the pattern of
 /// [`resolve_bamboo_dir`] vs [`bamboo_dir`].
 pub fn resolve_workspace_root() -> PathBuf {
+    resolve_workspace_root_in(&bamboo_dir())
+}
+
+/// Resolve the workspace root for one explicit Bamboo data directory.
+///
+/// This is the instance-scoped counterpart to [`resolve_workspace_root`].
+/// Server tests may construct more than one `AppState` in a process even
+/// though [`bamboo_dir`] is intentionally first-registration-wins. Passing the
+/// owning state's data directory keeps its fallback workspaces isolated while
+/// preserving the operator's `BAMBOO_WORKSPACE_ROOT` override.
+pub fn resolve_workspace_root_in(bamboo_data_dir: &Path) -> PathBuf {
     std::env::var("BAMBOO_WORKSPACE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| bamboo_dir().join("workspaces"))
+        .unwrap_or_else(|_| bamboo_data_dir.join("workspaces"))
 }
 
 /// Whether explicit workspace paths must be canonicalized and confined to
@@ -456,6 +467,11 @@ mod tests {
         std::env::remove_var("BAMBOO_WORKSPACE_ROOT");
 
         assert_eq!(resolve_workspace_root(), bamboo_dir().join("workspaces"));
+        let explicit_data_dir = PathBuf::from("/instance/data");
+        assert_eq!(
+            resolve_workspace_root_in(&explicit_data_dir),
+            explicit_data_dir.join("workspaces")
+        );
 
         if let Some(val) = original {
             std::env::set_var("BAMBOO_WORKSPACE_ROOT", val);
@@ -470,6 +486,10 @@ mod tests {
         std::env::set_var("BAMBOO_WORKSPACE_ROOT", "/mnt/tenant-workspaces");
         assert_eq!(
             resolve_workspace_root(),
+            PathBuf::from("/mnt/tenant-workspaces")
+        );
+        assert_eq!(
+            resolve_workspace_root_in(Path::new("/ignored/instance/data")),
             PathBuf::from("/mnt/tenant-workspaces")
         );
 

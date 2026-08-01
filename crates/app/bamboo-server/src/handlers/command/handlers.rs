@@ -7,8 +7,8 @@ use crate::error::AppError;
 use crate::handlers::settings::is_safe_workflow_name;
 
 use super::sources::{
-    catalog_entry_to_command, list_markdown_commands, list_mcp_tools_as_commands,
-    list_prompt_presets_as_commands, safe_project_commands_dir,
+    legacy_workflow_catalog_entry_to_command, list_markdown_commands, list_mcp_tools_as_commands,
+    list_prompt_presets_as_commands, safe_project_commands_dir, skill_catalog_entry_to_command,
 };
 use super::types::{CommandItem, CommandListResponse, GetCommandQuery, ListCommandsQuery};
 
@@ -20,11 +20,11 @@ struct SessionResourceContext {
 
 pub(super) fn append_unique(
     commands: &mut Vec<CommandItem>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<(String, String)>,
     items: Vec<CommandItem>,
 ) {
     for item in items {
-        if seen.insert(item.name.clone()) {
+        if seen.insert((item.command_type.clone(), item.name.clone())) {
             commands.push(item);
         }
     }
@@ -70,10 +70,18 @@ async fn session_resource_context(
                 )));
             }
         };
-    let workspace = crate::project_context::validate_workspace_assignment(
+    let persisted_workspace = (session
+        .metadata
+        .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+        .map(String::as_str)
+        != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str()))
+    .then(|| session.workspace_path_meta())
+    .flatten();
+    let workspace = crate::project_context::validate_workspace_assignment_with_resolver(
         &app_state.project_store,
         project_id.as_ref(),
-        session.workspace_path_meta().as_deref(),
+        persisted_workspace.as_deref(),
+        &app_state.workspace_resolver,
     )
     .map_err(|error| match error {
         crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }
@@ -97,6 +105,26 @@ async fn session_resource_context(
         project_id,
         project_home,
     })
+}
+
+async fn scoped_skill_store(
+    app_state: &AppState,
+    context: &SessionResourceContext,
+) -> Result<std::sync::Arc<bamboo_skills::SkillStore>, AppError> {
+    if let (Some(project_id), Some(project_home)) =
+        (context.project_id.as_ref(), context.project_home.as_ref())
+    {
+        app_state
+            .skill_manager
+            .store_for_project_workspace(project_id, project_home, context.workspace.as_deref())
+            .await
+    } else {
+        app_state
+            .skill_manager
+            .store_for_workspace(context.workspace.as_deref())
+            .await
+    }
+    .map_err(|error| AppError::BadRequest(format!("Invalid session resource scope: {error}")))
 }
 
 /// Lists all available commands from workflows, skills, and MCP tools.
@@ -152,38 +180,20 @@ pub async fn list_commands(
         list_prompt_presets_as_commands(&app_state.app_data_dir).await,
     );
 
-    let catalog = if let (Some(project_id), Some(project_home)) =
-        (context.project_id.as_ref(), context.project_home.as_ref())
-    {
-        app_state
-            .skill_manager
-            .workflow_catalog_for_project_workspace(
-                project_id,
-                project_home,
-                context.workspace.as_deref(),
-            )
-            .await
-            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
-    } else if let Some(workspace) = context.workspace.as_ref() {
-        app_state
-            .skill_manager
-            .store()
-            .workflow_catalog_for_workspace(workspace)
-            .await
-            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
-    } else {
-        app_state
-            .skill_manager
-            .store()
-            .workflow_catalog_snapshot()
-            .await
-    };
-    let skill_commands = catalog
+    let store = scoped_skill_store(app_state.get_ref(), &context).await?;
+    let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+    let skill_commands = skill_catalog
         .entries
         .into_iter()
-        .map(|entry| catalog_entry_to_command(&entry))
+        .filter_map(|entry| skill_catalog_entry_to_command(&entry))
         .collect();
     append_unique(&mut commands, &mut seen, skill_commands);
+    let workflow_commands = workflow_catalog
+        .entries
+        .into_iter()
+        .filter_map(|entry| legacy_workflow_catalog_entry_to_command(&entry))
+        .collect();
+    append_unique(&mut commands, &mut seen, workflow_commands);
 
     match list_mcp_tools_as_commands(app_state.get_ref()).await {
         Ok(mcp_tools) => append_unique(&mut commands, &mut seen, mcp_tools),
@@ -192,7 +202,11 @@ pub async fn list_commands(
         }
     }
 
-    commands.sort_by(|left, right| left.name.cmp(&right.name));
+    commands.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.command_type.cmp(&right.command_type))
+    });
     Ok(HttpResponse::Ok().json(CommandListResponse {
         total: commands.len(),
         commands,
@@ -273,19 +287,14 @@ pub async fn get_command(
                 return Err(AppError::BadRequest("Invalid workflow name".to_string()));
             }
 
-            let workflows_dir = app_state.app_data_dir.join("workflows");
-            let filename = format!("{id}.md");
-            let filepath = workflows_dir.join(&filename);
-
-            if !filepath.exists() {
-                return Err(AppError::NotFound(format!("Workflow {id} not found")));
-            }
-
-            let content = tokio::fs::read_to_string(&filepath)
+            let store = scoped_skill_store(app_state.get_ref(), &context).await?;
+            let filepath = store
+                .get_legacy_workflow_source(&id)
                 .await
-                .map_err(|error| {
-                    AppError::InternalError(anyhow::anyhow!("Failed to read workflow: {error}"))
-                })?;
+                .map_err(|_| AppError::NotFound(format!("Workflow {id} not found")))?;
+            let content = bamboo_skills::legacy::read_legacy_markdown_workflow(&filepath)
+                .await
+                .map_err(|_| AppError::NotFound(format!("Workflow {id} not found")))?;
 
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "id": format!("workflow-{id}"),
@@ -295,26 +304,7 @@ pub async fn get_command(
             })))
         }
         "skill" => {
-            let store = if let (Some(project_id), Some(project_home)) =
-                (context.project_id.as_ref(), context.project_home.as_ref())
-            {
-                app_state
-                    .skill_manager
-                    .store_for_project_workspace(
-                        project_id,
-                        project_home,
-                        context.workspace.as_deref(),
-                    )
-                    .await
-            } else {
-                app_state
-                    .skill_manager
-                    .store_for_workspace(context.workspace.as_deref())
-                    .await
-            }
-            .map_err(|error| {
-                AppError::BadRequest(format!("Invalid session resource scope: {error}"))
-            })?;
+            let store = scoped_skill_store(app_state.get_ref(), &context).await?;
             match store.get_skill(&id).await {
                 Ok(skill) => Ok(HttpResponse::Ok().json(skill)),
                 Err(error) => Err(AppError::NotFound(format!("Skill {id} not found: {error}"))),

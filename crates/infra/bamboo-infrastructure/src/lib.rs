@@ -22,6 +22,8 @@ pub use process::{
     ProcessHandle, ProcessInfo, ProcessRegistrationConfig, ProcessRegistry, ProcessType,
 };
 
+// Legacy test-utils exports retained for downstream source compatibility.
+// New tests should use `test_support::override_command_environment`.
 #[cfg(any(test, feature = "test-utils"))]
 pub use process::process_utils::{
     clear_command_environment_cache_for_tests, prime_command_environment_cache_for_tests,
@@ -37,7 +39,36 @@ pub mod registry {
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support {
+    use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use crate::process::process_utils;
+    use crate::CommandEnvironmentDiagnostics;
+
+    /// Same-thread scope for a deterministic command environment in tests.
+    ///
+    /// This wrapper is deliberately non-`Send`: keep it alive while polling the
+    /// code under test on the same thread. The default `#[tokio::test]` runtime
+    /// is current-thread and satisfies that contract. The override never clears
+    /// or primes the process-global login-shell cache, so other parallel tests
+    /// and in-flight production-cache refreshes remain isolated.
+    #[must_use = "keep the guard alive for the full command-environment test scope"]
+    pub struct CommandEnvironmentOverrideGuard {
+        _inner: process_utils::CommandEnvironmentOverrideGuard,
+    }
+
+    /// Install a deterministic command environment for the current test thread.
+    ///
+    /// Dropping the returned guard restores the previous override, including
+    /// when scopes are nested.
+    pub fn override_command_environment(
+        env: HashMap<String, String>,
+        diagnostics: CommandEnvironmentDiagnostics,
+    ) -> CommandEnvironmentOverrideGuard {
+        CommandEnvironmentOverrideGuard {
+            _inner: process_utils::override_command_environment_for_tests(env, diagnostics),
+        }
+    }
 
     /// The single crate-wide lock guarding all tests that mutate process-global
     /// state — environment variables (`BAMBOO_DATA_DIR`, `HOME`, `BAMBOO_*`, the

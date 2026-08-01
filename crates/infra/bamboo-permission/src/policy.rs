@@ -322,6 +322,8 @@ pub struct EffectivePermissionPolicy {
     pub revision: u64,
     pub mode: PermissionMode,
     pub bypass_requested: bool,
+    #[serde(default)]
+    pub auto_approve_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +334,7 @@ pub enum PermissionDecisionSource {
     RememberedSession,
     RememberedRule { rule: PermissionRuleRef },
     Bypass,
+    Auto,
     Mode,
     BelowRiskThreshold,
 }
@@ -370,6 +373,7 @@ pub struct PermissionEvaluation {
     pub operation_summary: String,
     pub risk_level: RiskLevel,
     pub bypass_requested: bool,
+    pub auto_approve_requested: bool,
     /// A caller-owned sandbox/platform deny which policy must never override.
     pub platform_hard_deny: Option<String>,
     /// Tool execution consumes an exact one-shot receipt; diagnostics never do.
@@ -393,6 +397,8 @@ pub struct PermissionRequest {
     pub reason_code: PermissionReasonCode,
     pub effective_mode: PermissionMode,
     pub bypass_requested: bool,
+    #[serde(default)]
+    pub auto_approve_requested: bool,
     pub policy_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<PermissionRuleRef>,

@@ -204,47 +204,66 @@ impl AppState {
 
         let config = Arc::new(RwLock::new(config));
 
-        // Wire the configured-default-workspace resolver into agent-core. This keeps
-        // the dependency arrow pointing down (agent-core owns only the slot; the
-        // server fills it). The closure reads the server's LIVE in-memory config —
-        // not a fresh disk-reading Config::new(), which would diverge from the live
-        // config and clobber the global env-var cache (#38). `try_read` never blocks
-        // (the resolver is called from sync code, so a blocking read could deadlock);
-        // on the rare write-lock contention it returns the last successfully-resolved
-        // path so a session never transiently falls back to the process cwd.
-        {
+        // Build one coherent configured-default/root provider pair. The process
+        // globals below intentionally remain first-registration-wins, while
+        // this AppState retains the same pair for instance-scoped Project
+        // preview and post-persistence publication (#717).
+        //
+        // The default closure reads the LIVE in-memory config, not a fresh
+        // disk-reading Config::new() (#38). `try_read` never blocks (the
+        // resolver is called from sync code); on write-lock contention it
+        // returns the last successful value rather than transiently falling
+        // back to another source.
+        let live_default_workspace: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync> = {
             let config_for_workspace = config.clone();
             let last_known: Arc<std::sync::Mutex<Option<PathBuf>>> =
                 Arc::new(std::sync::Mutex::new(None));
-            bamboo_agent_core::workspace_state::set_default_workspace_provider(Box::new(
-                move || match config_for_workspace.try_read() {
-                    Ok(cfg) => {
-                        let path = cfg.get_default_work_area_path();
-                        if let Ok(mut cache) = last_known.lock() {
-                            *cache = path.clone();
-                        }
-                        path
+            Arc::new(move || match config_for_workspace.try_read() {
+                Ok(cfg) => {
+                    let path = cfg.get_default_work_area_path();
+                    if let Ok(mut cache) = last_known.lock() {
+                        *cache = path.clone();
                     }
-                    Err(_) => last_known.lock().ok().and_then(|c| c.clone()),
-                },
-            ));
-        }
+                    path
+                }
+                Err(_) => last_known.lock().ok().and_then(|cache| cache.clone()),
+            })
+        };
 
-        // Issue #217: wire the workspace-root + confinement policy into
-        // agent-core, mirroring the default-workspace provider just above.
-        // This is what lets `workspace_or_process_cwd` default a session with
-        // NO configured/explicit workspace to `data_dir/workspaces/{session}`
-        // instead of falling through to the server process's cwd, and lets
-        // `set_workspace` pin/relocate an explicit path when confinement is
-        // enabled (`BAMBOO_WORKSPACE_CONFINE` / `BAMBOO_WORKSPACE_ROOT`).
-        // Read fresh from the environment on every call (not captured here)
-        // so an operator-set env var is honored the same way `bamboo_dir()`
-        // itself is — no config-file knob needed.
-        bamboo_agent_core::workspace_state::set_workspace_root_provider(Box::new(|| {
-            bamboo_agent_core::workspace_state::WorkspaceRootConfig {
-                root: bamboo_config::paths::resolve_workspace_root(),
-                confine: bamboo_config::paths::workspace_confinement_enforced(),
-            }
+        // Issue #217: the root provider re-reads operator env policy on every
+        // call. Its no-override fallback is this AppState's own data directory,
+        // not the unrelated process-global bamboo_dir that another test state
+        // may have registered first.
+        let live_workspace_root: Arc<
+            dyn Fn() -> bamboo_agent_core::workspace_state::WorkspaceRootConfig + Send + Sync,
+        > = {
+            let app_data_dir = data_dir.clone();
+            Arc::new(
+                move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+                    root: bamboo_config::paths::resolve_workspace_root_in(&app_data_dir),
+                    confine: bamboo_config::paths::workspace_confinement_enforced(),
+                },
+            )
+        };
+
+        let workspace_resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(
+            {
+                let provider = live_default_workspace.clone();
+                move || provider()
+            },
+            {
+                let provider = live_workspace_root.clone();
+                move || provider()
+            },
+        );
+
+        bamboo_agent_core::workspace_state::set_default_workspace_provider(Box::new({
+            let provider = live_default_workspace;
+            move || provider()
+        }));
+        bamboo_agent_core::workspace_state::set_workspace_root_provider(Box::new({
+            let provider = live_workspace_root;
+            move || provider()
         }));
 
         let (permission_checker, permission_section) =
@@ -387,16 +406,18 @@ impl AppState {
             ledger_schedule_bridge.clone(),
             project_store.clone(),
             account_sink.clone(),
+            workspace_resolver.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
         // caller-facing workflow_run tool is overlaid onto the root surface
         // later, preventing a workflow from recursively dispatching itself.
-        let workflow_runs = crate::workflow::WorkflowRunAccess::new(
+        let workflow_runs = crate::workflow::WorkflowRunAccess::new_with_permission_config(
             &data_dir,
             base_tools.clone(),
             skill_manager.clone(),
             session_repo.clone(),
+            permission_checker.permission_config(),
         )
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
@@ -421,6 +442,9 @@ impl AppState {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
+                    if !event.public_workflow {
+                        continue;
+                    }
                     let event = match event.kind {
                         bamboo_skills::WorkflowCatalogEventKind::Changed => {
                             AgentEvent::WorkflowChanged {
@@ -470,24 +494,31 @@ impl AppState {
         // Interactive execution paths pass an explicit tool surface override:
         // root sessions use ToolSurface::Root; child sessions use ToolSurface::Child.
         let project_context_resolver = Arc::new(
-            bamboo_engine::project_context::ProjectContextResolver::new(Arc::new(
-                crate::project_context::ProjectStoreContextSource::new(project_store.clone()),
-            )),
+            bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(
+                Arc::new(crate::project_context::ProjectStoreContextSource::new(
+                    project_store.clone(),
+                )),
+                workspace_resolver.clone(),
+            ),
         );
+        let mut agent_builder = bamboo_engine::Agent::builder()
+            .storage(storage.clone())
+            .persistence(Arc::new(session_repo.clone()))
+            .session_inbox(session_inbox.clone())
+            .activation_router(session_activation_router.clone())
+            .session_messenger(session_messenger.clone())
+            .attachment_reader(session_store.clone())
+            .skill_manager(skill_manager.clone())
+            .metrics_collector(metrics_service.collector())
+            .config(config.clone())
+            .provider(provider_handle.clone())
+            .default_tools(base_tools.clone())
+            .project_context_resolver(project_context_resolver.clone());
+        if let Some(permission_config) = permission_checker.permission_config() {
+            agent_builder = agent_builder.permission_config(permission_config);
+        }
         let agent = Arc::new(
-            bamboo_engine::Agent::builder()
-                .storage(storage.clone())
-                .persistence(Arc::new(session_repo.clone()))
-                .session_inbox(session_inbox.clone())
-                .activation_router(session_activation_router.clone())
-                .session_messenger(session_messenger.clone())
-                .attachment_reader(session_store.clone())
-                .skill_manager(skill_manager.clone())
-                .metrics_collector(metrics_service.collector())
-                .config(config.clone())
-                .provider(provider_handle.clone())
-                .default_tools(base_tools.clone())
-                .project_context_resolver(project_context_resolver.clone())
+            agent_builder
                 .build()
                 .expect("agent runtime should be fully configured"),
         );
@@ -665,6 +696,7 @@ impl AppState {
             Some(account_sink.inbox()),
             notification_relay_deps.clone(),
             project_store.clone(),
+            workspace_resolver.clone(),
         );
 
         bamboo_engine::auto_dream::spawn_auto_dream_task_with_project_resolver(
@@ -739,13 +771,31 @@ impl AppState {
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let fabric_bamboo_bin =
             std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bamboo"));
-        let fabric_deployer = Arc::new(bamboo_server_tools::FabricDeployer::new(
+        let credential_store = Arc::new(bamboo_config::CredentialStore::open(&bamboo_home_dir));
+        let mut fabric_deployer = bamboo_server_tools::FabricDeployer::new(
             config.clone(),
             config_io_lock.clone(),
             bamboo_home_dir.clone(),
             fabric_registry,
             fabric_bamboo_bin,
-        ));
+        );
+        if let Some(facade) = config_facade.clone() {
+            let event_sink = account_sink.clone();
+            fabric_deployer = fabric_deployer.with_modular_persistence(
+                facade,
+                credential_store.clone(),
+                Arc::new(move |event| {
+                    super::config_runtime::publish_registry_event(&event_sink, event);
+                }),
+            );
+        }
+        if let Err(error) = fabric_deployer.reconcile_stale_nodes_on_boot().await {
+            tracing::warn!(
+                error = %error,
+                "cluster-fabric boot reconcile failed; retaining the last adopted state"
+            );
+        }
+        let fabric_deployer = Arc::new(fabric_deployer);
         // Cluster health monitor: periodically probe deployed workers on the bus and
         // flip node status live (Running↔Unreachable) + auto-recover. Server-scoped
         // — it runs under BOTH the embedded and an external broker (it reads the
@@ -774,6 +824,7 @@ impl AppState {
             config_snapshot.subagents().broker.clone(),
             fabric_deployer.clone(),
             project_store.clone(),
+            workspace_resolver.clone(),
         );
         let workflow_run_tool =
             Arc::new(crate::workflow::WorkflowRunTool::new(workflow_runs.clone()));
@@ -841,6 +892,7 @@ impl AppState {
                 provider_registry.clone(),
                 permission_checker.clone(),
                 project_store.clone(),
+                workspace_resolver.clone(),
             )
             .await
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
@@ -864,6 +916,7 @@ impl AppState {
             subagent_model_resolver: None,
             config: config.clone(),
             project_store: Some(project_store.clone()),
+            workspace_resolver: workspace_resolver.clone(),
             parent_wait_slots: Arc::new(dashmap::DashMap::new()),
         });
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
@@ -885,12 +938,6 @@ impl AppState {
         // spawn scheduler, clobbered resume, expired wait lease, ...). Spawned
         // AFTER `set_root_tools` above so a boot-time parent resume can spawn.
         child_completion_coordinator.spawn_child_wait_watchdog();
-
-        // Cluster-fabric reconcile: session-bound workers died with the previous
-        // bamboo process (kill-on-drop child / in-memory russh session), so any
-        // persisted `Running`/`Deploying` node state is stale on boot. Flip it to
-        // `Unreachable` so the UI/agent see reality (a redeploy brings it back).
-        reconcile_fabric_on_boot(&config, &bamboo_home_dir).await;
 
         // `ServiceManager` (issue #479 / epic #477 prereq): supervises
         // long-running "service" plugins. Always constructed — fully inert
@@ -929,8 +976,6 @@ impl AppState {
                 mcp_manager.clone(),
                 account_sink.clone(),
             );
-        let credential_store = Arc::new(bamboo_config::CredentialStore::open(&bamboo_home_dir));
-
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             config,
@@ -951,6 +996,7 @@ impl AppState {
             session_store,
             project_store,
             project_context_resolver,
+            workspace_resolver,
             session_repo,
             persistence,
             session_inbox,
@@ -1175,41 +1221,108 @@ async fn broker_endpoint_reachable(endpoint: &str) -> bool {
     )
 }
 
-/// On boot, mark stale cluster-fabric node state as `Unreachable`: workers
-/// deployed by the previous process were session-bound (they died with it), so a
-/// persisted `Running`/`Deploying` status no longer reflects reality. Best-effort
-/// + persisted so the UI and `cluster status` don't show phantom-running nodes.
-async fn reconcile_fabric_on_boot(
-    config: &Arc<RwLock<bamboo_llm::Config>>,
-    data_dir: &std::path::Path,
-) {
-    use bamboo_config::cluster_fabric::NodeStatus;
-
-    let snapshot = {
-        let mut cfg = config.write().await;
-        let mut changed = 0usize;
-        for node in &mut cfg.cluster_fabric.nodes {
-            if let Some(state) = node.state.as_mut() {
-                if matches!(state.status, NodeStatus::Running | NodeStatus::Deploying) {
-                    state.status = NodeStatus::Unreachable;
-                    state.last_error =
-                        Some("orchestrator restarted; worker no longer tracked".to_string());
-                    changed += 1;
-                }
-            }
-        }
-        if changed == 0 {
-            return;
-        }
-        tracing::info!(
-            reconciled = changed,
-            "cluster-fabric: marked stale Running nodes Unreachable on boot"
-        );
-        cfg.clone()
+#[cfg(test)]
+mod fabric_boot_reconcile_tests {
+    use super::*;
+    use bamboo_config::cluster_fabric::{
+        DeployProfile, Node, NodePlacement, NodeState, NodeStatus, TrustLevel,
     };
+    use bamboo_config::{ClusterNodeCredentialIntents, ConfigFacade};
+    use std::collections::BTreeMap;
 
-    if let Err(e) = snapshot.save_to_dir(data_dir.to_path_buf()) {
-        tracing::warn!("cluster-fabric boot reconcile: failed to persist: {e}");
+    #[tokio::test]
+    async fn restart_reconcile_keeps_runtime_process_facade_and_disk_on_one_revision() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x7b; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let first = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        first
+            .update_cluster_fabric_credentials(
+                0,
+                BTreeMap::from([(
+                    "boot-node".to_string(),
+                    ClusterNodeCredentialIntents::clear_all(),
+                )]),
+                |config| {
+                    config.cluster_fabric.nodes.push(Node {
+                        id: "boot-node".to_string(),
+                        label: "boot-node".to_string(),
+                        placement: NodePlacement::Local,
+                        trust_level: TrustLevel::Trusted,
+                        deploy: DeployProfile::default(),
+                        state: Some(NodeState {
+                            status: NodeStatus::Running,
+                            worker_id: Some("stale-worker".to_string()),
+                            ..Default::default()
+                        }),
+                        enabled: true,
+                    });
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .cluster_fabric
+                .snapshot()
+                .revision,
+            1
+        );
+        drop(first);
+
+        let restarted = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let process_snapshot = restarted
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .cluster_fabric
+            .snapshot();
+        assert_eq!(process_snapshot.revision, 2);
+        assert_eq!(
+            process_snapshot
+                .data
+                .0
+                .node("boot-node")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
+        assert_eq!(
+            restarted
+                .config
+                .read()
+                .await
+                .cluster_fabric
+                .node("boot-node")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.registry().cluster_fabric.snapshot().revision, 2);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .cluster_fabric
+                .node("boot-node")
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()
+                .status,
+            NodeStatus::Unreachable
+        );
     }
 }
 

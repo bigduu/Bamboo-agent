@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROJECT_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const PROJECT_INDEX_SCHEMA_VERSION: u32 = 1;
+pub const PROJECT_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const PROJECT_INDEX_SCHEMA_VERSION: u32 = 2;
 
 fn initial_project_revision() -> u64 {
     1
@@ -125,6 +125,15 @@ pub enum ProjectStatus {
     Archived,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPathStatus {
+    Configured,
+    NeedsSelection,
+    #[default]
+    NeedsConfiguration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceBinding {
     pub path: String,
@@ -144,6 +153,20 @@ pub struct ProjectManifest {
     pub description: Option<String>,
     #[serde(default)]
     pub status: ProjectStatus,
+    /// Canonical user source/work folder used when an assigned session has no
+    /// explicit or persisted workspace. This is distinct from Bamboo's private
+    /// `${BAMBOO_DATA_DIR}/projects/<id>` Project home.
+    ///
+    /// Legacy v1 manifests may remain unconfigured (`None`) until the user
+    /// selects a path. New active Projects must be created with this field.
+    #[serde(default)]
+    pub project_path: Option<String>,
+    /// Explicit migration/configuration state. Consumers must not infer a
+    /// primary path from `workspace_bindings` ordering or labels.
+    #[serde(default)]
+    pub project_path_status: ProjectPathStatus,
+    /// Additional registered workspaces/worktrees. `project_path` is itself an
+    /// authoritative registered root and is not duplicated in this collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_bindings: Vec<WorkspaceBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,6 +194,8 @@ impl ProjectManifest {
             name: name.into(),
             description,
             status: ProjectStatus::Active,
+            project_path: None,
+            project_path_status: ProjectPathStatus::NeedsConfiguration,
             workspace_bindings: Vec::new(),
             legacy_project_keys: Vec::new(),
             revision: 1,
@@ -178,6 +203,20 @@ impl ProjectManifest {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Every workspace root owned by this Project, with the primary
+    /// `project_path` first when configured.
+    pub fn workspace_roots(&self) -> impl Iterator<Item = &str> {
+        self.project_path.iter().map(String::as_str).chain(
+            self.workspace_bindings
+                .iter()
+                .map(|binding| binding.path.as_str()),
+        )
+    }
+
+    pub fn workspace_count(&self) -> usize {
+        usize::from(self.project_path.is_some()) + self.workspace_bindings.len()
     }
 }
 
@@ -188,6 +227,10 @@ pub struct ProjectIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub status: ProjectStatus,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub project_path_status: ProjectPathStatus,
     pub revision: u64,
     pub resource_revision: u64,
     pub workspace_count: usize,
@@ -202,9 +245,11 @@ impl From<&ProjectManifest> for ProjectIndexEntry {
             name: manifest.name.clone(),
             description: manifest.description.clone(),
             status: manifest.status,
+            project_path: manifest.project_path.clone(),
+            project_path_status: manifest.project_path_status,
             revision: manifest.revision,
             resource_revision: manifest.resource_revision,
-            workspace_count: manifest.workspace_bindings.len(),
+            workspace_count: manifest.workspace_count(),
             created_at: manifest.created_at,
             updated_at: manifest.updated_at,
         }
@@ -257,7 +302,9 @@ pub struct ProjectResourceSummary {
     pub resources: Vec<ProjectResourceEntry>,
 }
 
-/// Pre-resolved legacy session input for the migration dry-run seam.
+/// Legacy session input for the migration dry-run seam. Callers may provide
+/// canonical/Git/key evidence explicitly; the server can enrich only omitted
+/// evidence from a readable `workspace_path`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacySessionProjectInput {
     pub session_id: String,
@@ -399,6 +446,11 @@ mod tests {
         });
         let manifest: ProjectManifest = serde_json::from_value(value).unwrap();
         assert_eq!(manifest.status, ProjectStatus::Active);
+        assert!(manifest.project_path.is_none());
+        assert_eq!(
+            manifest.project_path_status,
+            ProjectPathStatus::NeedsConfiguration
+        );
         assert!(manifest.workspace_bindings.is_empty());
         assert!(manifest.legacy_project_keys.is_empty());
         assert_eq!(manifest.revision, 1);

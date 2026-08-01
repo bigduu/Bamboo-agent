@@ -5,8 +5,8 @@
 //! events into [`LLMChunk`] so the rest of Bamboo can stay provider-agnostic.
 
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use crate::provider::ResponsesRequestOptions;
-use crate::provider::Result;
+use crate::cache::PromptCachePlan;
+use crate::provider::{LLMError, ResponsesRequestOptions, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::MessagePart;
 use bamboo_domain::ReasoningEffort;
@@ -32,6 +32,101 @@ use std::collections::{HashMap, HashSet};
 ///
 /// For tool-result messages (`Role::Tool`), we emit a `function_call_output` item.
 pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
+    messages_to_responses_input_json_with_cache(messages, None).0
+}
+
+fn message_supports_explicit_breakpoint(message: &Message) -> bool {
+    matches!(message.role, Role::System | Role::User | Role::Tool)
+}
+
+fn explicit_breakpoint_message_ids(
+    messages: &[Message],
+    cache_plan: Option<&PromptCachePlan>,
+) -> HashSet<String> {
+    let Some(cache_plan) = cache_plan.filter(|plan| plan.is_enabled()) else {
+        return HashSet::new();
+    };
+
+    let mut selected = HashSet::new();
+    for requested_id in &cache_plan.breakpoint_message_ids {
+        let Some(requested_index) = messages
+            .iter()
+            .position(|message| message.id == *requested_id)
+        else {
+            continue;
+        };
+        // Responses only permits markers on input_text/input_image/input_file.
+        // When a provider-neutral plan ends on an assistant/function item,
+        // select the nearest preceding cacheable input block rather than
+        // emitting an invalid marker or expanding the prefix past the target.
+        if let Some(message) = messages[..=requested_index]
+            .iter()
+            .rev()
+            .find(|message| message_supports_explicit_breakpoint(message))
+        {
+            selected.insert(message.id.clone());
+        }
+    }
+    selected
+}
+
+fn add_explicit_breakpoint(content: &mut Value) -> bool {
+    let marker = json!({"mode": "explicit"});
+    match content {
+        Value::String(text) => {
+            let text = std::mem::take(text);
+            *content = json!([{
+                "type": "input_text",
+                "text": text,
+                "prompt_cache_breakpoint": marker,
+            }]);
+            true
+        }
+        Value::Array(parts) => {
+            let Some(part) = parts.iter_mut().rev().find(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("input_text" | "input_image" | "input_file")
+                )
+            }) else {
+                return false;
+            };
+            part["prompt_cache_breakpoint"] = marker;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn count_responses_explicit_breakpoints(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(count_responses_explicit_breakpoints)
+            .sum(),
+        Value::Object(object) => {
+            let this_block = (matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_text" | "input_image" | "input_file")
+            ) && object
+                .get("prompt_cache_breakpoint")
+                .and_then(|breakpoint| breakpoint.get("mode"))
+                .and_then(Value::as_str)
+                == Some("explicit")) as usize;
+            this_block
+                + object
+                    .values()
+                    .map(count_responses_explicit_breakpoints)
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn messages_to_responses_input_json_with_cache(
+    messages: &[Message],
+    cache_plan: Option<&PromptCachePlan>,
+) -> (Vec<Value>, usize) {
     // If any message contains image parts, emit a "typed" content array shape so
     // multimodal inputs have a chance to reach upstream Responses implementations.
     let has_images = messages.iter().any(|m| {
@@ -43,6 +138,8 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
     });
 
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let breakpoint_message_ids = explicit_breakpoint_message_ids(messages, cache_plan);
+    let mut rendered_breakpoints = 0usize;
 
     for m in messages {
         match m.role {
@@ -79,11 +176,17 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                 // Emit tool result as a structured function_call_output item.
                 let call_id = m.tool_call_id.as_deref().unwrap_or("");
                 if !call_id.is_empty() {
-                    out.push(json!({
+                    let mut item = json!({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": tool_output_value(m),
-                    }));
+                    });
+                    if breakpoint_message_ids.contains(&m.id)
+                        && add_explicit_breakpoint(&mut item["output"])
+                    {
+                        rendered_breakpoints = rendered_breakpoints.saturating_add(1);
+                    }
+                    out.push(item);
                 } else {
                     // Fallback: no call_id available — degrade to user message with
                     // prefix. Preserve any image parts as a typed content array so
@@ -96,11 +199,17 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                     } else {
                         json!(prefixed)
                     };
-                    out.push(json!({
+                    let mut item = json!({
                         "type": "message",
                         "role": "user",
                         "content": content,
-                    }));
+                    });
+                    if breakpoint_message_ids.contains(&m.id)
+                        && add_explicit_breakpoint(&mut item["content"])
+                    {
+                        rendered_breakpoints = rendered_breakpoints.saturating_add(1);
+                    }
+                    out.push(item);
                 }
             }
 
@@ -111,16 +220,22 @@ pub fn messages_to_responses_input_json(messages: &[Message]) -> Vec<Value> {
                     "user"
                 };
                 let content = build_content_value(m, has_images, None, "input_text");
-                out.push(json!({
+                let mut item = json!({
                     "type": "message",
                     "role": role,
                     "content": content,
-                }));
+                });
+                if breakpoint_message_ids.contains(&m.id)
+                    && add_explicit_breakpoint(&mut item["content"])
+                {
+                    rendered_breakpoints = rendered_breakpoints.saturating_add(1);
+                }
+                out.push(item);
             }
         }
     }
 
-    out
+    (out, rendered_breakpoints)
 }
 
 fn assistant_phase_for_responses_input(message: &Message) -> Option<&'static str> {
@@ -315,6 +430,7 @@ pub fn select_responses_input_messages<'a>(
 }
 
 /// Build a standard Responses API streaming request body.
+#[allow(clippy::too_many_arguments)]
 pub fn build_responses_body(
     model: &str,
     messages: &[Message],
@@ -323,6 +439,7 @@ pub fn build_responses_body(
     reasoning_effort: Option<ReasoningEffort>,
     responses_options: Option<&ResponsesRequestOptions>,
     parallel_tool_calls: Option<bool>,
+    cache_plan: Option<&PromptCachePlan>,
 ) -> Value {
     let instructions = responses_options
         .and_then(|opts| opts.instructions.as_deref())
@@ -331,9 +448,29 @@ pub fn build_responses_body(
     let input_selection = select_responses_input_messages(messages, responses_options);
     let effective_messages = input_selection.input_messages;
 
+    let explicit_cache_supported = supports_openai_explicit_prompt_cache(model);
+    let caller_cache_input = explicit_cache_supported
+        .then(|| {
+            responses_options.and_then(|options| options.raw_input_with_cache_breakpoints.as_ref())
+        })
+        .flatten();
+    let (input, rendered_breakpoints, generated_breakpoints) =
+        if let Some(raw_input) = caller_cache_input {
+            (
+                raw_input.clone(),
+                count_responses_explicit_breakpoints(raw_input),
+                false,
+            )
+        } else {
+            let (input, rendered_breakpoints) = messages_to_responses_input_json_with_cache(
+                effective_messages,
+                explicit_cache_supported.then_some(cache_plan).flatten(),
+            );
+            (Value::Array(input), rendered_breakpoints, true)
+        };
     let mut body = json!({
         "model": model,
-        "input": messages_to_responses_input_json(effective_messages),
+        "input": input,
         "stream": true,
     });
 
@@ -408,7 +545,70 @@ pub fn build_responses_body(
         .unwrap_or(false);
     body["store"] = json!(store);
 
+    if explicit_cache_supported {
+        if let Some(prompt_cache_key) = responses_options
+            .and_then(|opts| opts.prompt_cache_key.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            body["prompt_cache_key"] = json!(prompt_cache_key);
+        }
+
+        if let Some(prompt_cache_options) =
+            responses_options.and_then(|opts| opts.prompt_cache_options.as_ref())
+        {
+            if generated_breakpoints && rendered_breakpoints > 0 {
+                let mut merged =
+                    serde_json::Map::from_iter([("mode".to_string(), json!("explicit"))]);
+                if let Some(caller_fields) = prompt_cache_options.as_object() {
+                    merged.extend(caller_fields.clone());
+                    body["prompt_cache_options"] = Value::Object(merged);
+                } else {
+                    // Direct internal callers can construct a non-object value;
+                    // preserve it so the upstream returns the authoritative
+                    // validation error instead of silently changing intent.
+                    body["prompt_cache_options"] = prompt_cache_options.clone();
+                }
+            } else {
+                body["prompt_cache_options"] = prompt_cache_options.clone();
+            }
+        } else if generated_breakpoints && rendered_breakpoints > 0 {
+            body["prompt_cache_options"] = json!({"mode": "explicit"});
+        }
+    }
+
     body
+}
+
+/// Explicit prompt-cache controls were introduced for GPT-5.6 and later GPT
+/// model families. Unknown aliases fail closed because older models reject the
+/// fields with HTTP 400.
+pub fn supports_openai_explicit_prompt_cache(model: &str) -> bool {
+    let normalized = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
+    let Some(version) = normalized.strip_prefix("gpt-") else {
+        return false;
+    };
+    let numeric = version
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .next()
+        .unwrap_or("");
+    let mut components = numeric.split('.');
+    let Some(major) = components
+        .next()
+        .and_then(|component| component.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let minor = components
+        .next()
+        .and_then(|component| component.parse::<u64>().ok())
+        .unwrap_or(0);
+    major > 5 || major == 5 && minor >= 6
 }
 
 #[derive(Debug, Default)]
@@ -437,7 +637,7 @@ struct AccFnCall {
 /// - `response.content_part.added/done` (output_text parts) -> `LLMChunk::Token(...)`
 /// - `response.output_item.added/done` message output_text -> `LLMChunk::Token(...)`
 /// - `response.output_item.*` + `response.function_call_arguments.delta` -> `LLMChunk::ToolCalls`
-/// - `response.completed` -> `LLMChunk::Done`
+/// - `response.completed` -> terminal output fallbacks, provider usage, then `LLMChunk::Done`
 pub struct ResponsesSseParser {
     // item_id -> accumulated function call
     fn_calls: HashMap<String, AccFnCall>,
@@ -455,6 +655,13 @@ pub struct ResponsesSseParser {
     // Output indexes that already surfaced any user-visible text stream.
     // Used to suppress redundant message snapshots in `response.output_item.done`.
     streamed_text_output_indexes: HashSet<i64>,
+    // Function-call item IDs, provider call IDs, and output indexes that already
+    // produced a downstream ToolCalls chunk. A completed response can repeat the
+    // authoritative output_item.done snapshot, so all three identities are
+    // retained to suppress the fallback without relying on any one optional key.
+    emitted_tool_item_ids: HashSet<String>,
+    emitted_tool_call_ids: HashSet<String>,
+    emitted_tool_output_indexes: HashSet<i64>,
     // Reasoning output item IDs that have already emitted summary text.
     streamed_reasoning_item_ids: HashSet<String>,
     // Some upstreams omit item_id on reasoning deltas; use the same done-fallback guard
@@ -481,6 +688,12 @@ pub struct ResponsesSseParser {
     reasoning_text_chars: usize,
     logged_summary: bool,
     emitted_response_id: Option<String>,
+    retain_protocol_events: bool,
+    /// Once a protocol terminal is observed, every later frame is ignored.
+    ///
+    /// Responses usage and `Done` are cumulative terminal data, so accepting a
+    /// duplicated `response.completed` frame would double-publish both.
+    terminal_seen: bool,
 }
 
 impl Default for ResponsesSseParser {
@@ -507,6 +720,9 @@ impl ResponsesSseParser {
             text_delta_stream_keys: HashSet::new(),
             text_done_stream_keys: HashSet::new(),
             streamed_text_output_indexes: HashSet::new(),
+            emitted_tool_item_ids: HashSet::new(),
+            emitted_tool_call_ids: HashSet::new(),
+            emitted_tool_output_indexes: HashSet::new(),
             streamed_reasoning_item_ids: HashSet::new(),
             saw_unkeyed_reasoning_delta: false,
             reasoning_item_content: HashMap::new(),
@@ -522,7 +738,14 @@ impl ResponsesSseParser {
             reasoning_text_chars: 0,
             logged_summary: false,
             emitted_response_id: None,
+            retain_protocol_events: false,
+            terminal_seen: false,
         }
+    }
+
+    pub fn with_protocol_events(mut self, retain_protocol_events: bool) -> Self {
+        self.retain_protocol_events = retain_protocol_events;
+        self
     }
 
     fn event_type<'a>(&self, event: &'a str, v: &'a Value) -> &'a str {
@@ -600,6 +823,136 @@ impl ResponsesSseParser {
                 arguments: acc.arguments,
             },
         })
+    }
+
+    fn function_call_item_key(
+        &self,
+        item: &Value,
+        item_key_hint: Option<&str>,
+        output_index: Option<i64>,
+    ) -> Option<String> {
+        let inner_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let item_key_hint = item_key_hint.filter(|id| !id.is_empty());
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+
+        // Incremental output_item.done snapshots can be sparse. Prefer whichever
+        // identity already owns the added/delta accumulator before choosing a new
+        // key; otherwise a nested call_id can steal precedence from the outer
+        // item_id that holds the accumulated name and arguments.
+        for candidate in [inner_id, item_key_hint, call_id].into_iter().flatten() {
+            if self.fn_calls.contains_key(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+
+        inner_id
+            .or(item_key_hint)
+            .or(call_id)
+            .map(str::to_string)
+            .or_else(|| output_index.map(|index| format!("output:{index}")))
+    }
+
+    fn tool_call_was_emitted(
+        &self,
+        item_key: &str,
+        call_id: Option<&str>,
+        output_index: Option<i64>,
+    ) -> bool {
+        self.emitted_tool_item_ids.contains(item_key)
+            || call_id.is_some_and(|id| self.emitted_tool_call_ids.contains(id))
+            || output_index.is_some_and(|index| self.emitted_tool_output_indexes.contains(&index))
+    }
+
+    fn mark_tool_call_emitted(&mut self, item_key: &str, call_id: &str, output_index: Option<i64>) {
+        self.emitted_tool_item_ids.insert(item_key.to_string());
+        if !call_id.is_empty() {
+            self.emitted_tool_call_ids.insert(call_id.to_string());
+        }
+        if let Some(output_index) = output_index {
+            self.emitted_tool_output_indexes.insert(output_index);
+        }
+    }
+
+    fn emit_function_call_item(
+        &mut self,
+        item: &Value,
+        item_key_hint: Option<&str>,
+        output_index: Option<i64>,
+    ) -> Option<LLMChunk> {
+        let item_key = self.function_call_item_key(item, item_key_hint, output_index)?;
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if self.tool_call_was_emitted(item_key.as_str(), call_id, output_index) {
+            return None;
+        }
+
+        self.apply_done_fn_call_item(item_key.as_str(), item);
+        let call = self.finalize_tool_call(item_key.as_str())?;
+        self.mark_tool_call_emitted(item_key.as_str(), call.id.as_str(), output_index);
+        Some(LLMChunk::ToolCalls(vec![call]))
+    }
+
+    fn emit_completed_message_item(&mut self, item: &Value, output_index: i64) -> Option<LLMChunk> {
+        if self.streamed_text_output_indexes.contains(&output_index) {
+            return None;
+        }
+
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let text = Self::message_item_output_text(item);
+        let out = self.emit_done_text(item_id, text.as_str());
+        if out.is_some() {
+            self.streamed_text_output_indexes.insert(output_index);
+        }
+        out
+    }
+
+    fn completed_output_chunks(&mut self, value: &Value) -> Vec<LLMChunk> {
+        let Some(output) = value
+            .get("response")
+            .and_then(|response| response.get("output"))
+            .or_else(|| value.get("output"))
+            .and_then(Value::as_array)
+        else {
+            return Vec::new();
+        };
+
+        let mut chunks = Vec::new();
+        for (output_index, item) in output.iter().enumerate() {
+            let Ok(output_index) = i64::try_from(output_index) else {
+                continue;
+            };
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message" => {
+                    if let Some(chunk) = self.emit_completed_message_item(item, output_index) {
+                        chunks.push(chunk);
+                    }
+                }
+                "function_call" => {
+                    if let Some(chunk) =
+                        self.emit_function_call_item(item, None, Some(output_index))
+                    {
+                        chunks.push(chunk);
+                    }
+                }
+                // Unknown and malformed terminal items are intentionally ignored:
+                // gateways vary, and one unsupported output must not discard valid
+                // siblings from the same completed response.
+                _ => {}
+            }
+        }
+        chunks
     }
 
     fn text_item_id(v: &Value) -> Option<String> {
@@ -1039,18 +1392,35 @@ impl ResponsesSseParser {
         Some(LLMChunk::ResponseId(response_id.to_string()))
     }
 
-    pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            // Be lenient: some upstreams occasionally send non-JSON keepalives.
-            return Ok(None);
-        };
+    fn terminal_error_message(event_type: &str, value: &Value) -> String {
+        let response = value.get("response").unwrap_or(value);
+        let error = response
+            .get("error")
+            .or_else(|| value.get("error"))
+            .unwrap_or(response);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.as_str())
+            .or_else(|| value.get("message").and_then(Value::as_str));
+        let code = error
+            .get("code")
+            .and_then(Value::as_str)
+            .or_else(|| response.get("status").and_then(Value::as_str));
+        let incomplete_reason = response
+            .get("incomplete_details")
+            .or_else(|| value.get("incomplete_details"))
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str);
 
-        let event_type = self.event_type(event, &v);
+        let detail = message
+            .or(incomplete_reason)
+            .or(code)
+            .unwrap_or("upstream returned no error details");
+        format!("OpenAI Responses {event_type}: {detail}")
+    }
 
-        if let Some(chunk) = self.maybe_emit_response_id(event_type, &v) {
-            return Ok(Some(chunk));
-        }
-
+    fn handle_event_value(&mut self, event_type: &str, v: Value) -> Result<Option<LLMChunk>> {
         match event_type {
             // `summary_part.added` is typically a shape/placeholder signal; text is usually empty.
             "response.reasoning_summary_part.added" => {
@@ -1218,14 +1588,17 @@ impl ResponsesSseParser {
                     .and_then(|value| value.as_str())
                     .or_else(|| v.get("delta").and_then(|value| value.as_str()))
                     .unwrap_or("");
-                if let Some(output_index) = Self::text_output_index(&v) {
-                    self.streamed_text_output_indexes.insert(output_index);
+                let output_index = Self::text_output_index(&v);
+                let out = if let Some(stream_key) = Self::text_stream_key(&v) {
+                    self.emit_text_done_with_key(stream_key.as_str(), text)
+                } else {
+                    let item_id = Self::text_item_id(&v);
+                    self.emit_done_text(item_id.as_deref(), text)
+                };
+                if out.is_some() {
+                    self.streamed_text_output_indexes.extend(output_index);
                 }
-                if let Some(stream_key) = Self::text_stream_key(&v) {
-                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text));
-                }
-                let item_id = Self::text_item_id(&v);
-                Ok(self.emit_done_text(item_id.as_deref(), text))
+                Ok(out)
             }
 
             "response.content_part.added" => {
@@ -1251,14 +1624,17 @@ impl ResponsesSseParser {
 
             "response.content_part.done" => {
                 let text = Self::content_part_output_text(&v, false);
-                if let Some(output_index) = Self::text_output_index(&v) {
-                    self.streamed_text_output_indexes.insert(output_index);
+                let output_index = Self::text_output_index(&v);
+                let out = if let Some(stream_key) = Self::text_stream_key(&v) {
+                    self.emit_text_done_with_key(stream_key.as_str(), text.as_str())
+                } else {
+                    let item_id = Self::text_item_id(&v);
+                    self.emit_done_text(item_id.as_deref(), text.as_str())
+                };
+                if out.is_some() {
+                    self.streamed_text_output_indexes.extend(output_index);
                 }
-                if let Some(stream_key) = Self::text_stream_key(&v) {
-                    return Ok(self.emit_text_done_with_key(stream_key.as_str(), text.as_str()));
-                }
-                let item_id = Self::text_item_id(&v);
-                Ok(self.emit_done_text(item_id.as_deref(), text.as_str()))
+                Ok(out)
             }
 
             "response.output_item.added" => {
@@ -1313,6 +1689,7 @@ impl ResponsesSseParser {
             "response.output_item.done" => {
                 // Emit tool call when the function_call item is done.
                 let item_id = Self::text_item_id(&v).unwrap_or_default();
+                let output_index = Self::text_output_index(&v);
 
                 if let Some(item) = v.get("item") {
                     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1331,7 +1708,6 @@ impl ResponsesSseParser {
                         ));
                     }
                     if item_type == "message" {
-                        let output_index = Self::text_output_index(&v);
                         if output_index
                             .is_some_and(|index| self.streamed_text_output_indexes.contains(&index))
                         {
@@ -1353,8 +1729,12 @@ impl ResponsesSseParser {
                         }
                         return Ok(out);
                     }
-                    if item_type == "function_call" && !item_id.is_empty() {
-                        self.apply_done_fn_call_item(&item_id, item);
+                    if item_type == "function_call" {
+                        return Ok(self.emit_function_call_item(
+                            item,
+                            (!item_id.is_empty()).then_some(item_id.as_str()),
+                            output_index,
+                        ));
                     }
                 }
 
@@ -1365,29 +1745,107 @@ impl ResponsesSseParser {
                 let Some(call) = self.finalize_tool_call(&item_id) else {
                     return Ok(None);
                 };
-
+                self.mark_tool_call_emitted(item_id.as_str(), call.id.as_str(), output_index);
                 Ok(Some(LLMChunk::ToolCalls(vec![call])))
             }
 
-            "response.completed" => {
-                let usage = v
-                    .get("response")
-                    .and_then(|response| response.get("usage"))
-                    .or_else(|| v.get("usage"));
-                self.log_reasoning_summary_if_needed(usage);
-                // Surface provider-side prompt cache hits so the same accounting
-                // and frontend badge work for the Responses API. `Done` is only an
-                // informational log downstream (the stream terminates on EOF), so
-                // emitting CacheUsage here in its place is safe.
-                if let Some(cache_chunk) =
-                    usage.and_then(crate::cache::cache_usage_from_openai_usage)
-                {
-                    return Ok(Some(cache_chunk));
-                }
-                Ok(Some(LLMChunk::Done))
-            }
-
             _ => Ok(None),
+        }
+    }
+
+    /// Parse one Responses SSE event into every logical downstream chunk it carries.
+    ///
+    /// Most events produce zero or one chunk. `response.completed` can carry a
+    /// response ID, several output items, provider usage, and terminal completion
+    /// in the same frame; returning a vector keeps all of them without deferring
+    /// state to a later event that may never arrive.
+    pub fn handle_event_multi(&mut self, event: &str, data: &str) -> Result<Vec<LLMChunk>> {
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            // Be lenient: some upstreams occasionally send non-JSON keepalives.
+            return Ok(Vec::new());
+        };
+
+        let event_type = self.event_type(event, &v).to_string();
+        if self.terminal_seen {
+            return Ok(Vec::new());
+        }
+
+        let response_status = v
+            .get("response")
+            .and_then(|response| response.get("status"))
+            .and_then(Value::as_str);
+        let top_level_error = v.get("error").is_some_and(super::sse::sse_error_is_present);
+        if top_level_error
+            || matches!(response_status, Some("failed" | "incomplete" | "cancelled"))
+            || matches!(
+                event_type.as_str(),
+                "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.error"
+                    | "error"
+            )
+        {
+            self.terminal_seen = true;
+            let terminal_type = if event_type.is_empty() {
+                "error"
+            } else {
+                event_type.as_str()
+            };
+            return Err(LLMError::Stream(Self::terminal_error_message(
+                terminal_type,
+                &v,
+            )));
+        }
+
+        let mut chunks = Vec::new();
+        if self.retain_protocol_events && event_type.starts_with("response.") {
+            chunks.push(LLMChunk::ResponsesEvent {
+                event_type: event_type.clone(),
+                data: Box::new(v.clone()),
+            });
+        }
+        if let Some(chunk) = self.maybe_emit_response_id(event_type.as_str(), &v) {
+            chunks.push(chunk);
+        }
+
+        if event_type == "response.completed" {
+            self.terminal_seen = true;
+            chunks.extend(self.completed_output_chunks(&v));
+            let usage = v
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .or_else(|| v.get("usage"));
+            self.log_reasoning_summary_if_needed(usage);
+            if let Some(usage_chunk) =
+                usage.and_then(crate::cache::provider_usage_from_openai_usage)
+            {
+                chunks.push(usage_chunk);
+            }
+            chunks.push(LLMChunk::Done);
+            return Ok(chunks);
+        }
+
+        if let Some(chunk) = self.handle_event_value(event_type.as_str(), v)? {
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+
+    /// Backward-compatible helper for callers that only accept one chunk per event.
+    ///
+    /// Responses provider streams use [`Self::handle_event_multi`]. Returning an
+    /// explicit error here prevents a multi-output terminal frame from being
+    /// silently truncated by legacy callers.
+    #[allow(dead_code)]
+    pub fn handle_event(&mut self, event: &str, data: &str) -> Result<Option<LLMChunk>> {
+        let mut chunks = self.handle_event_multi(event, data)?;
+        match chunks.len() {
+            0 => Ok(None),
+            1 => Ok(chunks.pop()),
+            count => Err(LLMError::Stream(format!(
+                "Responses SSE event produced {count} chunks; use handle_event_multi"
+            ))),
         }
     }
 }
@@ -1402,7 +1860,8 @@ mod tests {
 
     #[test]
     fn build_responses_body_includes_input_and_stream() {
-        let body = build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None, None, None);
+        let body =
+            build_responses_body("gpt-5.3-codex", &[], &[], Some(123), None, None, None, None);
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_output_tokens"], 123);
@@ -1427,7 +1886,12 @@ mod tests {
                 previous_response_id: Some("resp_123".to_string()),
                 truncation: Some("auto".to_string()),
                 text_verbosity: Some("high".to_string()),
+                prompt_cache_key: None,
+                prompt_cache_options: None,
+                raw_input_with_cache_breakpoints: None,
+                retain_protocol_events: false,
             }),
+            None,
             None,
         );
         assert_eq!(body["reasoning"]["effort"], "high");
@@ -1445,7 +1909,7 @@ mod tests {
 
     #[test]
     fn build_responses_body_with_parallel_tool_calls() {
-        let body = build_responses_body("gpt-5.4", &[], &[], None, None, None, Some(false));
+        let body = build_responses_body("gpt-5.4", &[], &[], None, None, None, Some(false), None);
         assert_eq!(body["parallel_tool_calls"], false);
     }
 
@@ -1465,6 +1929,7 @@ mod tests {
                 instructions: Some("Stable instructions".to_string()),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -1494,6 +1959,7 @@ mod tests {
                 input_messages: Some(explicit_input_messages),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -1527,6 +1993,7 @@ mod tests {
                 previous_response_id: Some("resp_123".to_string()),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -1576,6 +2043,7 @@ mod tests {
                 previous_response_id: Some("resp_tool".to_string()),
                 ..Default::default()
             }),
+            None,
             None,
         );
 
@@ -1993,6 +2461,32 @@ mod tests {
     }
 
     #[test]
+    fn parser_empty_output_text_done_does_not_hide_completed_message() {
+        let mut parser = ResponsesSseParser::new();
+        let done = parser
+            .handle_event(
+                "response.output_text.done",
+                r#"{"type":"response.output_text.done","item_id":"msg_terminal","output_index":0,"content_index":0,"text":""}"#,
+            )
+            .expect("empty text done");
+        assert!(done.is_none());
+
+        let completed = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"real terminal text"}]}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(completed.len(), 2);
+        assert!(matches!(
+            &completed[0],
+            LLMChunk::Token(text) if text == "real terminal text"
+        ));
+        assert!(matches!(completed[1], LLMChunk::Done));
+    }
+
+    #[test]
     fn parser_skips_output_text_done_after_streaming_delta_for_same_item() {
         let mut p = ResponsesSseParser::new();
         let _ = p
@@ -2035,6 +2529,36 @@ mod tests {
         match out {
             Some(LLMChunk::Token(t)) => assert_eq!(t, "hello from part done"),
             other => panic!("expected token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_empty_or_non_text_content_part_done_does_not_hide_completed_message() {
+        let done_payloads = [
+            r#"{"type":"response.content_part.done","item_id":"msg_terminal","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}"#,
+            r#"{"type":"response.content_part.done","item_id":"msg_terminal","output_index":0,"content_index":0,"part":{"type":"refusal","refusal":"not output text"}}"#,
+        ];
+
+        for done_payload in done_payloads {
+            let mut parser = ResponsesSseParser::new();
+            let done = parser
+                .handle_event("response.content_part.done", done_payload)
+                .expect("content part done");
+            assert!(done.is_none());
+
+            let completed = parser
+                .handle_event_multi(
+                    "response.completed",
+                    r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"real terminal text"}]}]}}"#,
+                )
+                .expect("completed event");
+
+            assert_eq!(completed.len(), 2);
+            assert!(matches!(
+                &completed[0],
+                LLMChunk::Token(text) if text == "real terminal text"
+            ));
+            assert!(matches!(completed[1], LLMChunk::Done));
         }
     }
 
@@ -2082,6 +2606,236 @@ mod tests {
             )
             .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn parser_recovers_terminal_only_message_from_completed_output() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_terminal","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from completion"}]}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        match &chunks[0] {
+            LLMChunk::Token(text) => assert_eq!(text, "Hello from completion"),
+            other => panic!("expected terminal token, got {other:?}"),
+        }
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_recovers_terminal_only_function_call_from_completed_output() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"fc_terminal","type":"function_call","call_id":"call_terminal","name":"search","arguments":"{\"q\":\"bamboo\"}"}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        match &chunks[0] {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_terminal");
+                assert_eq!(calls[0].function.name, "search");
+                assert_eq!(calls[0].function.arguments, r#"{"q":"bamboo"}"#);
+            }
+            other => panic!("expected terminal tool call, got {other:?}"),
+        }
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_fallback_does_not_repeat_normally_streamed_text_or_tool() {
+        let mut parser = ResponsesSseParser::new();
+
+        let created = parser
+            .handle_event(
+                "response.created",
+                r#"{"type":"response.created","response":{"id":"resp_streamed"}}"#,
+            )
+            .expect("created event");
+        assert!(matches!(
+            created,
+            Some(LLMChunk::ResponseId(response_id)) if response_id == "resp_streamed"
+        ));
+
+        let text = parser
+            .handle_event(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_streamed","output_index":0,"content_index":0,"delta":"already streamed"}"#,
+            )
+            .expect("text delta");
+        assert!(matches!(
+            text,
+            Some(LLMChunk::Token(token)) if token == "already streamed"
+        ));
+
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_streamed","output_index":1,"delta":"{\"q\":\"streamed\"}"}"#,
+            )
+            .expect("tool arguments delta");
+        let tool = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":"{\"q\":\"streamed\"}"}}"#,
+            )
+            .expect("tool item done");
+        assert!(matches!(tool, Some(LLMChunk::ToolCalls(calls)) if calls.len() == 1));
+
+        let completed = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_streamed","output":[{"id":"msg_streamed","type":"message","content":[{"type":"output_text","text":"already streamed"}]},{"id":"fc_streamed","type":"function_call","call_id":"call_streamed","name":"search","arguments":"{\"q\":\"streamed\"}"}]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(completed.len(), 1);
+        assert!(matches!(completed[0], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_output_preserves_multiple_mixed_items_and_ignores_unknowns() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"first"},{"type":"refusal","refusal":"ignored"},{"type":"output_text","text":" message"}]},{"type":"computer_call","id":"unknown_1"},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a\"}"},{"id":"fc_bad","type":"function_call","call_id":"call_bad","arguments":"{}"},{"id":"msg_2","type":"message","content":[{"type":"output_text","text":"second message"}]},{"id":"fc_2","type":"function_call","call_id":"call_2","name":"read_file","arguments":"{\"path\":\"b\"}"},null]}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 5);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "first message"));
+        assert!(
+            matches!(&chunks[1], LLMChunk::ToolCalls(calls) if calls.len() == 1 && calls[0].id == "call_1")
+        );
+        assert!(matches!(&chunks[2], LLMChunk::Token(text) if text == "second message"));
+        assert!(
+            matches!(&chunks[3], LLMChunk::ToolCalls(calls) if calls.len() == 1 && calls[0].id == "call_2")
+        );
+        assert!(matches!(chunks[4], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_only_response_id_coexists_with_output_usage_and_done() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"id":"resp_terminal","output":[{"id":"msg_terminal","type":"message","content":[{"type":"output_text","text":"terminal answer"}]}],"usage":{"input_tokens":21,"output_tokens":13,"input_tokens_details":{"cached_tokens":8},"output_tokens_details":{"reasoning_tokens":5}}}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 4);
+        assert!(matches!(&chunks[0], LLMChunk::ResponseId(id) if id == "resp_terminal"));
+        assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
+        assert!(matches!(
+            chunks[2],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(21),
+                output_tokens: Some(13),
+                reasoning_tokens: Some(5),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(8),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[3], LLMChunk::Done));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. }))
+                .count(),
+            1,
+            "one terminal provider event must emit usage exactly once"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !matches!(chunk, LLMChunk::CacheUsage { .. })),
+            "combined provider usage must not also emit legacy cache usage"
+        );
+    }
+
+    #[test]
+    fn parser_completed_usage_preserves_totals_with_zero_cache() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":34,"output_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":3}}}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            chunks[0],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(34),
+                output_tokens: Some(12),
+                reasoning_tokens: Some(3),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(0),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_usage_does_not_invent_missing_totals() {
+        let mut parser = ResponsesSseParser::new();
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"usage":{"total_tokens":46,"input_tokens":null,"output_tokens_details":{}}}}"#,
+            )
+            .expect("completed event");
+
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(
+            chunks[0],
+            LLMChunk::ProviderUsage {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: Some(46),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+            }
+        ));
+        assert!(matches!(chunks[1], LLMChunk::Done));
+    }
+
+    #[test]
+    fn parser_completed_is_lenient_for_malformed_payloads() {
+        let mut parser = ResponsesSseParser::new();
+        assert!(parser
+            .handle_event_multi("response.completed", "not-json")
+            .expect("malformed keepalive")
+            .is_empty());
+
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"output":"not-an-array"}}"#,
+            )
+            .expect("malformed output");
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], LLMChunk::Done));
     }
 
     /// #237 finding 4: an aggregator that puts a non-empty `arguments` snapshot
@@ -2313,6 +3067,72 @@ mod tests {
             }
             other => panic!("expected tool_calls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parser_keeps_outer_item_id_for_sparse_function_call_done_item() {
+        let mut parser = ResponsesSseParser::new();
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"id":"fc_outer","type":"function_call","call_id":"call_outer","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_outer","delta":"{\"q\":\"outer\"}"}"#,
+            )
+            .expect("tool arguments delta");
+
+        let chunk = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item_id":"fc_outer","item":{"type":"function_call"}}"#,
+            )
+            .expect("tool item done");
+
+        assert!(matches!(
+            chunk,
+            Some(LLMChunk::ToolCalls(calls))
+                if calls.len() == 1
+                    && calls[0].id == "call_outer"
+                    && calls[0].function.name == "search"
+                    && calls[0].function.arguments == r#"{"q":"outer"}"#
+        ));
+    }
+
+    #[test]
+    fn parser_sparse_function_done_call_id_reuses_outer_item_accumulator() {
+        let mut parser = ResponsesSseParser::new();
+        parser
+            .handle_event(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item_id":"fc_outer","item":{"type":"function_call","call_id":"call_outer","name":"search","arguments":""}}"#,
+            )
+            .expect("tool item added");
+        parser
+            .handle_event(
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_outer","delta":"{\"q\":\"outer\"}"}"#,
+            )
+            .expect("tool arguments delta");
+
+        let chunk = parser
+            .handle_event(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item_id":"fc_outer","item":{"type":"function_call","call_id":"call_outer"}}"#,
+            )
+            .expect("sparse tool item done");
+
+        assert!(matches!(
+            chunk,
+            Some(LLMChunk::ToolCalls(calls))
+                if calls.len() == 1
+                    && calls[0].id == "call_outer"
+                    && calls[0].function.name == "search"
+                    && calls[0].function.arguments == r#"{"q":"outer"}"#
+        ));
     }
 
     #[test]
@@ -2680,7 +3500,8 @@ mod tests {
                 }]),
             ),
         ];
-        let mut body = build_responses_body("gpt-5.4", &messages, &[], None, None, None, None);
+        let mut body =
+            build_responses_body("gpt-5.4", &messages, &[], None, None, None, None, None);
         let config = KeywordMaskingConfig {
             entries: vec![KeywordEntry {
                 pattern: "hunter2".to_string(),
@@ -2702,5 +3523,402 @@ mod tests {
         // ...but the correlation id and tool name are preserved.
         assert_eq!(function_call["call_id"], "call_1");
         assert_eq!(function_call["name"], "search");
+    }
+
+    #[test]
+    fn gpt_5_6_lowers_stable_plan_to_explicit_breakpoint() {
+        let mut stable_user = Message::user("stable prefix");
+        stable_user.id = "stable-user".to_string();
+        let mut assistant = Message::assistant("stable answer", None);
+        assistant.id = "stable-assistant".to_string();
+        let mut volatile_user = Message::user("changing suffix");
+        volatile_user.id = "volatile-user".to_string();
+        let messages = vec![stable_user, assistant, volatile_user];
+        let plan = PromptCachePlan {
+            cache_tools: true,
+            cache_system: true,
+            // Assistant output blocks cannot carry Responses breakpoints, so
+            // lowering must select the nearest preceding input block.
+            breakpoint_message_ids: vec!["stable-assistant".to_string()],
+            ..Default::default()
+        };
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("tenant:stable".to_string()),
+            ..Default::default()
+        };
+
+        let body = build_responses_body(
+            "gpt-5.6-sol",
+            &messages,
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(body["prompt_cache_key"], "tenant:stable");
+        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(
+            body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert!(body["input"][1]["content"]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        assert!(body["input"][2]["content"]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+    }
+
+    #[test]
+    fn caller_cache_policy_wins_and_legacy_models_are_gated() {
+        let mut stable = Message::user("stable");
+        stable.id = "stable".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["stable".to_string()],
+            ..Default::default()
+        };
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("cache-key".to_string()),
+            prompt_cache_options: Some(json!({"mode": "implicit", "ttl": "30m"})),
+            ..Default::default()
+        };
+
+        let supported = build_responses_body(
+            "gpt-5.6-terra",
+            std::slice::from_ref(&stable),
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+        assert_eq!(
+            supported["prompt_cache_options"],
+            json!({"mode": "implicit", "ttl": "30m"})
+        );
+
+        let ttl_only_options = ResponsesRequestOptions {
+            prompt_cache_options: Some(json!({"ttl": "30m"})),
+            ..Default::default()
+        };
+        let ttl_only = build_responses_body(
+            "gpt-5.6-terra",
+            std::slice::from_ref(&stable),
+            &[],
+            None,
+            None,
+            Some(&ttl_only_options),
+            None,
+            Some(&plan),
+        );
+        assert_eq!(
+            ttl_only["prompt_cache_options"],
+            json!({"mode": "explicit", "ttl": "30m"})
+        );
+
+        let legacy = build_responses_body(
+            "gpt-5.5",
+            &[stable],
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+        assert!(legacy.get("prompt_cache_key").is_none());
+        assert!(legacy.get("prompt_cache_options").is_none());
+        assert!(legacy["input"][0]["content"].is_string());
+    }
+
+    #[test]
+    fn caller_authored_responses_breakpoints_survive_without_policy_rewrite() {
+        let raw_input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_file",
+                    "file_id": "file_123",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                },
+                {
+                    "type": "input_text",
+                    "text": "volatile question"
+                }
+            ]
+        }]);
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("tenant:file-prefix".to_string()),
+            raw_input_with_cache_breakpoints: Some(raw_input.clone()),
+            ..Default::default()
+        };
+
+        let body =
+            build_responses_body("gpt-5.6", &[], &[], None, None, Some(&options), None, None);
+        assert_eq!(body["input"], raw_input);
+        assert_eq!(body["prompt_cache_key"], "tenant:file-prefix");
+        assert!(
+            body.get("prompt_cache_options").is_none(),
+            "the caller omitted policy, so OpenAI's implicit default must remain"
+        );
+
+        let explicit_options = ResponsesRequestOptions {
+            prompt_cache_options: Some(json!({"mode": "explicit", "ttl": "30m"})),
+            ..options.clone()
+        };
+        let explicit = build_responses_body(
+            "gpt-5.6",
+            &[],
+            &[],
+            None,
+            None,
+            Some(&explicit_options),
+            None,
+            None,
+        );
+        assert_eq!(
+            explicit["prompt_cache_options"],
+            json!({"mode": "explicit", "ttl": "30m"})
+        );
+
+        let legacy =
+            build_responses_body("gpt-5.5", &[], &[], None, None, Some(&options), None, None);
+        assert_eq!(legacy["input"], json!([]));
+        assert!(legacy.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn explicit_breakpoint_keeps_same_stable_prefix_when_tail_changes() {
+        let mut stable = Message::user("same stable prefix");
+        stable.id = "stable".to_string();
+        let mut volatile_a = Message::user("volatile A");
+        volatile_a.id = "tail-a".to_string();
+        let mut volatile_b = Message::user("volatile B");
+        volatile_b.id = "tail-b".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["stable".to_string()],
+            ..Default::default()
+        };
+
+        let first = build_responses_body(
+            "gpt-5.6",
+            &[stable.clone(), volatile_a],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
+        let second = build_responses_body(
+            "gpt-5.6",
+            &[stable, volatile_b],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(first["input"][0], second["input"][0]);
+        assert_eq!(
+            first["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_ne!(first["input"][1], second["input"][1]);
+    }
+
+    #[test]
+    fn explicit_breakpoint_can_end_after_typed_tool_output() {
+        let mut tool_output = Message::tool_result("call_1", "stable tool output");
+        tool_output.id = "tool-output".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["tool-output".to_string()],
+            ..Default::default()
+        };
+
+        let body = build_responses_body(
+            "gpt-5.6",
+            &[tool_output],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(body["input"][0]["type"], "function_call_output");
+        assert_eq!(
+            body["input"][0]["output"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(body["input"][0]["output"][0]["text"], "stable tool output");
+    }
+
+    #[test]
+    fn request_overrides_run_after_generated_cache_defaults() {
+        use bamboo_config::{
+            BodyPatch, BodyPatchOp, PatchValue, RequestOverridesConfig, RequestScopeOverride,
+        };
+
+        let mut stable = Message::user("stable");
+        stable.id = "stable".to_string();
+        let plan = PromptCachePlan {
+            breakpoint_message_ids: vec!["stable".to_string()],
+            ..Default::default()
+        };
+        let options = ResponsesRequestOptions {
+            prompt_cache_key: Some("generated".to_string()),
+            ..Default::default()
+        };
+        let mut body = build_responses_body(
+            "gpt-5.6",
+            &[stable],
+            &[],
+            None,
+            None,
+            Some(&options),
+            None,
+            Some(&plan),
+        );
+        let overrides = RequestOverridesConfig {
+            common: RequestScopeOverride {
+                headers: Default::default(),
+                body_patch: vec![
+                    BodyPatch {
+                        path: "prompt_cache_key".to_string(),
+                        op: BodyPatchOp::Set,
+                        value: Some(PatchValue::Json(json!("operator-key"))),
+                    },
+                    BodyPatch {
+                        path: "prompt_cache_options".to_string(),
+                        op: BodyPatchOp::Remove,
+                        value: None,
+                    },
+                ],
+            },
+            endpoints: Default::default(),
+            rules: Vec::new(),
+        };
+
+        crate::providers::common::request_overrides::apply_overrides_to_body_with_env(
+            &mut body,
+            Some(&overrides),
+            crate::providers::common::request_overrides::ENDPOINT_RESPONSES,
+            Some("gpt-5.6"),
+            &HashMap::new(),
+        );
+
+        assert_eq!(body["prompt_cache_key"], "operator-key");
+        assert!(body.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn explicit_cache_model_gate_is_fail_closed() {
+        assert!(supports_openai_explicit_prompt_cache("gpt-5.6"));
+        assert!(supports_openai_explicit_prompt_cache("openai/gpt-5.6-luna"));
+        assert!(supports_openai_explicit_prompt_cache("gpt-6"));
+        assert!(!supports_openai_explicit_prompt_cache("gpt-5.5"));
+        assert!(!supports_openai_explicit_prompt_cache("chat-latest"));
+    }
+
+    #[test]
+    fn failure_and_incomplete_events_are_terminal_errors() {
+        for (event, payload, detail) in [
+            (
+                "response.failed",
+                r#"{"type":"response.failed","response":{"error":{"message":"quota exhausted"}}}"#,
+                "quota exhausted",
+            ),
+            (
+                "response.incomplete",
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+                "max_output_tokens",
+            ),
+            (
+                "error",
+                r#"{"type":"error","error":{"message":"bad gateway"}}"#,
+                "bad gateway",
+            ),
+            (
+                "response.cancelled",
+                r#"{"type":"response.cancelled","response":{"status":"cancelled","error":{"message":"request cancelled"}}}"#,
+                "request cancelled",
+            ),
+            (
+                "",
+                r#"{"error":{"message":"untyped upstream error"}}"#,
+                "untyped upstream error",
+            ),
+        ] {
+            let mut parser = ResponsesSseParser::new();
+            let error = parser
+                .handle_event_multi(event, payload)
+                .expect_err("terminal event must fail");
+            assert!(error.to_string().contains(detail));
+            assert!(parser
+                .handle_event_multi(
+                    "response.completed",
+                    r#"{"type":"response.completed","response":{}}"#,
+                )
+                .expect("post-terminal frame is ignored")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn duplicate_completed_emits_usage_and_done_once() {
+        let mut parser = ResponsesSseParser::new();
+        let payload = r#"{"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":5},"output_tokens_details":{"reasoning_tokens":1}}}}"#;
+        let first = parser
+            .handle_event_multi("response.completed", payload)
+            .expect("first terminal");
+        assert!(matches!(
+            first.as_slice(),
+            [
+                LLMChunk::ProviderUsage {
+                    input_tokens: Some(8),
+                    output_tokens: Some(2),
+                    total_tokens: Some(10),
+                    reasoning_tokens: Some(1),
+                    cache_read_input_tokens: Some(3),
+                    cache_write_input_tokens: Some(5),
+                    ..
+                },
+                LLMChunk::Done
+            ]
+        ));
+        assert!(parser
+            .handle_event_multi("response.completed", payload)
+            .expect("duplicate terminal is ignored")
+            .is_empty());
+    }
+
+    #[test]
+    fn provider_parser_retains_raw_protocol_event_before_normalized_chunks() {
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None)
+            .with_protocol_events(true);
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                r#"{"type":"response.completed","sequence_number":42,"response":{"id":"resp_raw","output":[{"id":"msg_a","type":"message","content":[{"type":"output_text","text":"a"}]},{"id":"rs_a","type":"reasoning","summary":[{"type":"summary_text","text":"why"}]},{"id":"msg_b","type":"message","content":[{"type":"output_text","text":"b"}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}"#,
+            )
+            .expect("completed event");
+
+        assert!(matches!(
+            &chunks[0],
+            LLMChunk::ResponsesEvent { event_type, data }
+                if event_type == "response.completed"
+                    && data["response"]["output"].as_array().is_some_and(|items| items.len() == 3)
+                    && data["sequence_number"] == 42
+        ));
+        assert!(matches!(chunks.last(), Some(LLMChunk::Done)));
     }
 }

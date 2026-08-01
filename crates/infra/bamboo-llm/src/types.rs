@@ -10,6 +10,16 @@ pub enum LLMChunk {
     /// when provider parsers filter the frame's payload (#618).
     TransportActivity,
     ResponseId(String),
+    /// Original OpenAI Responses protocol event, retained alongside Bamboo's
+    /// provider-neutral chunks.
+    ///
+    /// Compatibility endpoints can forward this structure without collapsing
+    /// multiple message/reasoning/function items. Agent/runtime consumers ignore
+    /// it and continue using the normalized Token/ToolCalls/usage variants.
+    ResponsesEvent {
+        event_type: String,
+        data: Box<serde_json::Value>,
+    },
     Token(String),
     ReasoningToken(String),
     /// Provider-minted cryptographic signature covering the turn's accumulated
@@ -43,6 +53,34 @@ pub enum LLMChunk {
         /// does not report it on this event.
         input_tokens: u64,
     },
+    /// Authoritative token-usage snapshot reported by one provider event.
+    ///
+    /// Every field is optional so parsers preserve the distinction between a
+    /// provider reporting `0` and omitting a field entirely. Cache counts are
+    /// carried alongside the input/output totals because OpenAI-compatible
+    /// terminal events report all of them in one object and the single-chunk
+    /// Chat Completions parser must not discard either half.
+    ///
+    /// `reasoning_tokens` is a subset of `output_tokens` for OpenAI Responses
+    /// and reasoning Chat Completions. Consumers must not add it to the output
+    /// total.
+    ProviderUsage {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        /// Provider-reported request total. This is preserved independently
+        /// instead of being reconstructed from input/output so compatibility
+        /// endpoints can forward the authoritative wire value.
+        total_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        cache_creation_input_tokens: Option<u64>,
+        cache_read_input_tokens: Option<u64>,
+        /// OpenAI Responses `input_tokens_details.cache_write_tokens`.
+        ///
+        /// This is deliberately distinct from Anthropic cache creation:
+        /// OpenAI does not define it as a disjoint prompt subset that can be
+        /// folded into Bamboo's historical fresh/read/creation counters.
+        cache_write_input_tokens: Option<u64>,
+    },
     /// Token usage summary at the end of an Anthropic response.
     UsageSummary {
         output_tokens: u64,
@@ -62,8 +100,10 @@ impl LLMChunk {
             Self::ToolCallsIndexed(calls) => !calls.is_empty(),
             Self::TransportActivity
             | Self::ResponseId(_)
+            | Self::ResponsesEvent { .. }
             | Self::ReasoningSignature(_)
             | Self::CacheUsage { .. }
+            | Self::ProviderUsage { .. }
             | Self::UsageSummary { .. }
             | Self::Done => false,
         }

@@ -40,7 +40,11 @@ impl ModelCatalogService {
                                 reference: ProviderModelRef::new(&meta.id, &info.id),
                                 display_name: info.id.clone(),
                                 provider_display_name: meta.display_name.clone(),
-                                capabilities: ModelCapabilities::default(),
+                                capabilities: ModelCapabilities {
+                                    max_context_tokens: info.max_context_tokens,
+                                    max_output_tokens: info.max_output_tokens,
+                                    ..ModelCapabilities::default()
+                                },
                                 source: Some(ModelSource::Upstream),
                                 discovered_at: None,
                             });
@@ -86,7 +90,11 @@ impl ModelCatalogService {
                 reference: ProviderModelRef::new(provider_name, &info.id),
                 display_name: info.id.clone(),
                 provider_display_name: provider_display_name.clone(),
-                capabilities: ModelCapabilities::default(),
+                capabilities: ModelCapabilities {
+                    max_context_tokens: info.max_context_tokens,
+                    max_output_tokens: info.max_output_tokens,
+                    ..ModelCapabilities::default()
+                },
                 source: Some(ModelSource::Upstream),
                 discovered_at: None,
             })
@@ -291,6 +299,33 @@ mod tests {
         assert_eq!(model.reference.provider, "openai");
         assert_eq!(model.reference.model, "gpt-4o");
         assert_eq!(model.provider_display_name, "OpenAI");
+    }
+
+    #[tokio::test]
+    async fn catalog_preserves_dynamic_model_token_limits() {
+        let registry = make_registry(
+            vec![(
+                "copilot",
+                vec![ProviderModelInfo {
+                    id: "dynamic-model".to_string(),
+                    max_context_tokens: Some(264_000),
+                    max_output_tokens: Some(64_000),
+                }],
+            )],
+            "copilot",
+        );
+        let service = ModelCatalogService::new(registry);
+        let catalog = service.get_catalog().await;
+
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(
+            catalog.models[0].capabilities.max_context_tokens,
+            Some(264_000)
+        );
+        assert_eq!(
+            catalog.models[0].capabilities.max_output_tokens,
+            Some(64_000)
+        );
     }
 
     #[tokio::test]

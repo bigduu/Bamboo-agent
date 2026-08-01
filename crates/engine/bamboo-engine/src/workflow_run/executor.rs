@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{
-    FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult,
+    FunctionCall, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor,
+    ToolOutcome, ToolResult,
 };
 use bamboo_domain::{
     validate_schema, CompiledWorkflow, FailurePolicy, StartWorkflowRun, ValueRef,
@@ -94,6 +95,14 @@ pub trait WorkflowPolicyPort: Send + Sync {
     ) -> PermissionDecision;
 }
 
+#[async_trait]
+pub trait WorkflowSessionPermissionPort: Send + Sync {
+    async fn flags_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ToolExecutionSessionFlags, String>;
+}
+
 /// Resolves a typed, persisted-safe capability handle to ephemeral secret
 /// material. Implementations own access control; raw values are never returned
 /// in snapshots/events/errors.
@@ -144,6 +153,7 @@ pub struct WorkflowRunEngine {
     ceilings: WorkflowBudgets,
     active: DashMap<String, Arc<ActiveRun>>,
     events: DashMap<String, broadcast::Sender<WorkflowRunEvent>>,
+    session_permissions: std::sync::RwLock<Option<Arc<dyn WorkflowSessionPermissionPort>>>,
 }
 
 struct ActiveRun {
@@ -229,7 +239,15 @@ impl WorkflowRunEngine {
             ceilings,
             active: DashMap::new(),
             events: DashMap::new(),
+            session_permissions: std::sync::RwLock::new(None),
         })
+    }
+
+    pub fn set_session_permission_port(&self, port: Arc<dyn WorkflowSessionPermissionPort>) {
+        *self
+            .session_permissions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(port);
     }
 
     pub async fn run(
@@ -1532,16 +1550,43 @@ impl RunContext {
                         arguments,
                     },
                 };
+                let permission_port = self
+                    .engine
+                    .session_permissions
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let session_flags = match permission_port {
+                    Some(port) => port.flags_for_session(&session_id).await.map_err(|error| {
+                        failure(
+                            WorkflowFailureCode::ExecutionFailed,
+                            format!("workflow session permission posture is unavailable: {error}"),
+                            true,
+                        )
+                    })?,
+                    None => ToolExecutionSessionFlags::default(),
+                };
                 let context = ToolExecutionContext {
                     session_id: Some(&session_id),
                     tool_call_id: &call.id,
                     event_tx: None,
                     available_tool_schemas: None,
-                    bypass_permissions: false,
+                    bypass_permissions: session_flags.bypass_permissions,
+                    auto_approve_permissions: session_flags.auto_approve_permissions,
+                    plan_read_only: session_flags.plan_read_only,
                     can_async_resume: false,
                     bash_completion_sink: None,
                     pre_parsed_args: Some(&resolved_input),
                 };
+                if session_flags.plan_read_only
+                    && !bamboo_tools::orchestrator::plan_mode_allows_tool(&call.function.name)
+                {
+                    return Err(failure(
+                        WorkflowFailureCode::ExecutionFailed,
+                        format!("Plan mode: {} operation blocked", call.function.name),
+                        false,
+                    ));
+                }
                 let outcome = self
                     .engine
                     .tools

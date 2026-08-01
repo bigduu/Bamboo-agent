@@ -150,10 +150,10 @@ impl RoundActivity {
     fn absorb_attempt(&mut self, stream_output: &StreamHandlingOutput) {
         self.prompt_tokens = self
             .prompt_tokens
-            .saturating_add(stream_output.input_tokens);
+            .saturating_add(stream_output.prompt_tokens_for_runtime_budget());
         self.completion_tokens = self
             .completion_tokens
-            .saturating_add(stream_output.output_tokens);
+            .saturating_add(stream_output.completion_tokens_for_runtime_budget());
         self.tool_call_count = self
             .tool_call_count
             .saturating_add(stream_output.tool_calls.len() as u32);
@@ -1291,19 +1291,21 @@ async fn handle_tool_calls_path(
         biased;
         _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
         result = crate::runtime::runner::tool_execution::execute_round_tool_calls(
-            &stream_output.tool_calls,
-            frame,
-            session,
-            runtime_state,
-            task_context,
-            compression_model
-                .as_deref()
-                .or(auxiliary_models.background_model_name.as_deref()),
-            auxiliary_models
-                .summarization_model_provider
-                .as_ref()
-                .or(auxiliary_models.background_model_provider.as_ref()),
-            &tool_schemas,
+            crate::runtime::runner::tool_execution::RoundToolExecution {
+                tool_calls: &stream_output.tool_calls,
+                frame,
+                session,
+                runtime_state,
+                task_context,
+                compression_model_name: compression_model
+                    .as_deref()
+                    .or(auxiliary_models.background_model_name.as_deref()),
+                compression_model_provider: auxiliary_models
+                    .summarization_model_provider
+                    .as_ref()
+                    .or(auxiliary_models.background_model_provider.as_ref()),
+                tool_schemas: &tool_schemas,
+            },
         ) => result?,
     };
 
@@ -1652,13 +1654,13 @@ pub(super) async fn run_pipeline(
             })
             .await;
 
-        // --- Turn-boundary refresh from disk: injected messages + live bypass ---
+        // --- Turn-boundary refresh from disk: messages + live permission mode ---
         // A single load also picks up a mid-run `PATCH /sessions
-        // {bypass_permissions}`: the run owns a Session taken at spawn and never
-        // otherwise re-reads storage, so without this a bypass flip would not
-        // take effect until the next run. Adopt the disk value onto BOTH the
-        // live runtime state and the owned session so this round's per-tool-call
-        // `ToolExecutionSessionFlags::from_session` sees it. #540.
+        // {permission_mode|bypass_permissions}`: the run owns a Session taken at
+        // spawn and never otherwise re-reads storage, so without this a mode
+        // transition would not take effect until the next run. Adopt the disk
+        // value onto BOTH the live runtime state and the owned session so this
+        // round's per-tool-call flags see it. #540/#770.
         if let Some(notifications) = config.session_activation_notifications.as_ref() {
             let mut receiver = notifications.lock();
             if receiver.has_changed().unwrap_or(false) {
@@ -1684,12 +1686,12 @@ pub(super) async fn run_pipeline(
                 "turn boundary admitted durable SessionInbox work"
             );
         }
-        if let Some(disk_bypass) = turn_refresh.disk_bypass_permissions {
-            state.runtime_state.bypass_permissions = disk_bypass;
+        if let Some(disk_mode) = turn_refresh.disk_permission_mode {
+            state.runtime_state.set_permission_mode(disk_mode);
             session
                 .agent_runtime_state
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .bypass_permissions = disk_bypass;
+                .set_permission_mode(disk_mode);
         }
 
         // --- Cancellation check ---
@@ -4255,6 +4257,7 @@ mod tests {
                 thinking_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                provider_usage: None,
                 input_tokens: input,
             }
         }
@@ -4283,6 +4286,57 @@ mod tests {
         activity.absorb_attempt(&attempt(u64::MAX, u64::MAX, vec![]));
         assert_eq!(activity.prompt_tokens, u64::MAX);
         assert_eq!(activity.completion_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn round_activity_prefers_provider_prompt_total_without_adding_reasoning_twice() {
+        use crate::runtime::stream::handler::{ProviderUsageSnapshot, StreamHandlingOutput};
+
+        let mut output = StreamHandlingOutput {
+            response_id: None,
+            content: "answer".to_string(),
+            reasoning_content: "thought".to_string(),
+            reasoning_signature: None,
+            token_count: 6,
+            tool_calls: Vec::new(),
+            // Deliberately conflicting legacy flat values prove runtime
+            // guardrails consult the authoritative provider snapshot.
+            output_tokens: 56,
+            thinking_tokens: 78,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 768,
+            provider_usage: Some(ProviderUsageSnapshot {
+                input_tokens: Some(1000),
+                output_tokens: Some(120),
+                total_tokens: Some(1120),
+                reasoning_tokens: Some(20),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(768),
+                cache_write_input_tokens: None,
+            }),
+            input_tokens: 232,
+        };
+
+        let mut activity = super::RoundActivity::default();
+        activity.absorb_attempt(&output);
+
+        assert_eq!(activity.prompt_tokens, 1000);
+        assert_eq!(
+            activity.completion_tokens, 120,
+            "reasoning is a subset of provider output, not additional output"
+        );
+
+        output
+            .provider_usage
+            .as_mut()
+            .expect("provider usage")
+            .output_tokens = Some(0);
+        let mut zero_activity = super::RoundActivity::default();
+        zero_activity.absorb_attempt(&output);
+        assert_eq!(
+            zero_activity.completion_tokens, 0,
+            "explicit provider zero must beat a nonzero legacy flat value"
+        );
     }
 
     /// PR #539 review #2: `runtime.budget_exceeded_kind` must be cleared at
@@ -4567,6 +4621,19 @@ mod tests {
         assert!(should_retry_turn_error(&AgentError::LLM(
             "API error: HTTP 503: Service Unavailable".to_string(),
         )));
+    }
+
+    #[test]
+    fn empty_assistant_response_is_terminal_by_variant_not_message_text() {
+        assert!(!should_retry_turn_error(
+            &AgentError::EmptyAssistantResponse {
+                response_id: Some("resp_740".to_string()),
+            }
+        ));
+
+        // Unknown provider failures retain the existing allow-by-default
+        // behavior. The empty-response decision is made by the typed variant,
+        // not by matching this legacy message text.
         assert!(should_retry_turn_error(&AgentError::LLM(
             "empty assistant response".to_string(),
         )));
@@ -4706,6 +4773,7 @@ mod tests {
     fn test_map_turn_error_only_cancelled_gets_cancelled_status() {
         let errors = vec![
             AgentError::LLM("error".to_string()),
+            AgentError::EmptyAssistantResponse { response_id: None },
             AgentError::Tool("error".to_string()),
             AgentError::SessionNotFound("id".to_string()),
             AgentError::Budget("error".to_string()),
@@ -5368,6 +5436,7 @@ mod tests {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_usage: None,
             input_tokens: 0,
         }
     }
@@ -5496,18 +5565,18 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_round_tool_calls(
-                std::slice::from_ref(&single_read_call()),
-                &frame,
-                &mut session,
-                &mut runtime_state,
-                &mut task_context,
+            execute_round_tool_calls(crate::runtime::runner::tool_execution::RoundToolExecution {
+                tool_calls: std::slice::from_ref(&single_read_call()),
+                frame: &frame,
+                session: &mut session,
+                runtime_state: &mut runtime_state,
+                task_context: &mut task_context,
                 // No compression model -> mid-turn compression short-circuits, so
                 // the healthy path is exercised without any auxiliary LLM call.
-                None,
-                None,
-                &tool_schemas,
-            ),
+                compression_model_name: None,
+                compression_model_provider: None,
+                tool_schemas: &tool_schemas,
+            }),
         )
         .await
         .expect("normal tool batch did not complete within 10s");
@@ -5715,6 +5784,7 @@ mod tests {
             thinking_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_usage: None,
             input_tokens: 0,
         };
 

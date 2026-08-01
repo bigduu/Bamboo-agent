@@ -1,14 +1,20 @@
 use actix_web::{http::StatusCode, web};
-use bamboo_skills::{WorkflowCatalogEntry, WorkflowKind, WorkflowSource, WorkflowStatus};
+use bamboo_skills::{
+    LegacyWorkflowMigrationStatus, WorkflowCatalogEntry, WorkflowKind, WorkflowSource,
+    WorkflowStatus,
+};
 
 use std::collections::HashSet;
 
 use super::handlers::{append_unique, expand_arguments};
-use super::sources::{catalog_entry_to_command, list_markdown_commands};
+use super::sources::{
+    legacy_workflow_catalog_entry_to_command, list_markdown_commands,
+    skill_catalog_entry_to_command,
+};
 use super::types::CommandItem;
 
 #[test]
-fn catalog_entry_to_command_maps_metadata_without_prompt() {
+fn skill_catalog_entry_to_command_maps_metadata_without_prompt() {
     let entry = WorkflowCatalogEntry {
         id: "sample".into(),
         name: "Sample".into(),
@@ -26,7 +32,7 @@ fn catalog_entry_to_command_maps_metadata_without_prompt() {
         winner: true,
         shadowed_candidates: vec![],
     };
-    let command = catalog_entry_to_command(&entry);
+    let command = skill_catalog_entry_to_command(&entry).unwrap();
 
     assert_eq!(command.id, "skill-sample");
     assert_eq!(command.name, "sample");
@@ -36,7 +42,7 @@ fn catalog_entry_to_command_maps_metadata_without_prompt() {
 }
 
 #[test]
-fn orchestration_catalog_entry_stays_selectable_as_skill_until_workflow_run_exists() {
+fn orchestration_catalog_entry_is_omitted_from_legacy_workflow_commands() {
     let entry = WorkflowCatalogEntry {
         id: "review-run".into(),
         name: "Review run".into(),
@@ -55,11 +61,32 @@ fn orchestration_catalog_entry_stays_selectable_as_skill_until_workflow_run_exis
         shadowed_candidates: vec![],
     };
 
-    let command = catalog_entry_to_command(&entry);
+    assert!(legacy_workflow_catalog_entry_to_command(&entry).is_none());
+}
 
-    assert_eq!(command.id, "skill-review-run");
-    assert_eq!(command.command_type, "skill");
-    assert_eq!(command.metadata["kind"], "orchestration");
+#[test]
+fn source_backed_legacy_catalog_entry_maps_to_workflow_command() {
+    let entry = WorkflowCatalogEntry {
+        id: "review".into(),
+        name: "Review".into(),
+        description: "Legacy review workflow".into(),
+        kind: WorkflowKind::Instruction,
+        source: WorkflowSource::User,
+        revision: 3,
+        version: "1".into(),
+        invocation_policy: serde_json::json!({"explicit": true}),
+        argument_schema: serde_json::json!({"type": "object"}),
+        status: WorkflowStatus::Valid,
+        legacy: true,
+        migration_status: Some(LegacyWorkflowMigrationStatus::Available),
+        last_error: None,
+        winner: true,
+        shadowed_candidates: vec![],
+    };
+
+    let command = legacy_workflow_catalog_entry_to_command(&entry).unwrap();
+    assert_eq!(command.id, "workflow-review");
+    assert_eq!(command.command_type, "workflow");
 }
 
 #[tokio::test]
@@ -114,6 +141,83 @@ async fn prompt_preset_list_item_can_be_resolved_and_expanded() {
         .to_request();
     let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
     assert_eq!(body["content"], "Review code");
+}
+
+#[actix_web::test]
+async fn command_palette_keeps_skill_and_workflow_sources_separate() {
+    let data = tempfile::tempdir().expect("data dir");
+    let skill = data.path().join("skills/review");
+    std::fs::create_dir_all(&skill).expect("skill root");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Review Skill\n---\nSKILL BODY MUST NOT SERVE AS WORKFLOW\n",
+    )
+    .expect("skill");
+    let workflows = data.path().join("workflows");
+    std::fs::create_dir_all(&workflows).expect("workflow root");
+    let workflow_body = "---\ndescription: Review Workflow\n---\nSOURCE WORKFLOW BODY\n";
+    std::fs::write(workflows.join("review.md"), workflow_body).expect("legacy workflow");
+    let orchestration = data.path().join("skills/orchestrate");
+    std::fs::create_dir_all(&orchestration).expect("orchestration root");
+    std::fs::write(
+        orchestration.join("SKILL.md"),
+        "---\nname: orchestrate\ndescription: True orchestration\n---\nSupport text\n",
+    )
+    .expect("orchestration instructions");
+    std::fs::write(
+        orchestration.join("workflow.yaml"),
+        "id: orchestrate\nname: Orchestrate\ndescription: Runs tools\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .expect("orchestration metadata");
+
+    let app_state = web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(app_state)
+            .configure(super::config),
+    )
+    .await;
+
+    let list: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands")
+            .to_request(),
+    )
+    .await;
+    let commands = list["commands"].as_array().expect("commands");
+    let review = commands
+        .iter()
+        .filter(|command| command["name"] == "review")
+        .collect::<Vec<_>>();
+    assert!(review.iter().any(|command| command["type"] == "skill"));
+    assert!(review.iter().any(|command| command["type"] == "workflow"));
+    assert!(commands
+        .iter()
+        .all(|command| command["name"] != "orchestrate"));
+
+    let workflow: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands/workflow/review")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(workflow["content"], workflow_body);
+    assert!(!workflow["content"].as_str().unwrap().contains("SKILL BODY"));
+
+    let orchestration = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/commands/workflow/orchestrate")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(orchestration.status(), StatusCode::NOT_FOUND);
 }
 
 #[cfg(unix)]
@@ -189,6 +293,22 @@ fn command_conflicts_keep_first_source_by_documented_precedence() {
 
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].metadata["source"], "project");
+}
+
+#[test]
+fn same_name_skill_and_workflow_commands_both_survive() {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    let mut skill = command("review", "skill");
+    skill.command_type = "skill".to_string();
+    let mut workflow = command("review", "workflow");
+    workflow.command_type = "workflow".to_string();
+
+    append_unique(&mut merged, &mut seen, vec![skill, workflow]);
+
+    assert_eq!(merged.len(), 2);
+    assert!(merged.iter().any(|item| item.command_type == "skill"));
+    assert!(merged.iter().any(|item| item.command_type == "workflow"));
 }
 
 #[actix_web::test]

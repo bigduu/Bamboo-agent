@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use crate::composition::CompositionExecutor;
 use crate::tools::executor::execute_tool_call_with_context;
 use crate::tools::{
-    convert_from_standard_result, AgenticToolResult, ToolCall, ToolError, ToolExecutionContext,
-    ToolExecutionSessionFlags, ToolExecutor, ToolResult,
+    convert_from_standard_result, plan_mode_allows_tool, AgenticToolResult, ToolCall, ToolError,
+    ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolResult,
 };
 use crate::{AgentEvent, Message, PendingQuestionSource, Session};
 
@@ -198,6 +198,7 @@ pub async fn handle_tool_result_with_agentic_support(
     event_tx: &mpsc::Sender<AgentEvent>,
     session: &mut Session,
     tools: &dyn ToolExecutor,
+    session_flags: ToolExecutionSessionFlags,
     composition_executor: Option<Arc<CompositionExecutor>>,
 ) -> ToolHandlingOutcome {
     let should_wait_for_children = is_waiting_for_children_control(result);
@@ -281,7 +282,15 @@ pub async fn handle_tool_result_with_agentic_support(
                 ),
             ));
 
-            execute_sub_actions(&actions, event_tx, session, tools, composition_executor).await
+            execute_sub_actions(
+                &actions,
+                event_tx,
+                session,
+                tools,
+                session_flags,
+                composition_executor,
+            )
+            .await
         }
     }
 }
@@ -334,6 +343,7 @@ pub async fn execute_sub_actions(
     event_tx: &mpsc::Sender<AgentEvent>,
     session: &mut Session,
     tools: &dyn ToolExecutor,
+    session_flags: ToolExecutionSessionFlags,
     composition_executor: Option<Arc<CompositionExecutor>>,
 ) -> ToolHandlingOutcome {
     let mut pending: VecDeque<ToolCall> = actions.iter().cloned().collect();
@@ -359,6 +369,25 @@ pub async fn execute_sub_actions(
 
         processed += 1;
 
+        if session_flags.plan_read_only && !plan_mode_allows_tool(&action.function.name) {
+            let error = format!(
+                "Plan mode: {} operation blocked",
+                action.function.name.trim()
+            );
+            let _ = event_tx
+                .send(AgentEvent::ToolError {
+                    tool_call_id: action.id.clone(),
+                    error: error.clone(),
+                })
+                .await;
+            session.add_message(Message::tool_result_with_status(
+                action.id.clone(),
+                error,
+                false,
+            ));
+            continue;
+        }
+
         let args =
             parse_tool_args(&action.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -378,7 +407,7 @@ pub async fn execute_sub_actions(
             &action.id,
             event_tx,
             available_tools.as_slice(),
-            ToolExecutionSessionFlags::from_session(session),
+            session_flags,
             // bamboo-agent-core's own loop has no engine suspend/resume
             // machinery (that lives in bamboo-engine's pipeline), so it can
             // never safely auto-promote a Bash command — keep it synchronous
@@ -512,6 +541,37 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ContextRecordingExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+        flags: std::sync::Mutex<Vec<ToolExecutionSessionFlags>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ContextRecordingExecutor {
+        async fn execute(&self, _call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+            unreachable!("sub-actions must use context-aware dispatch")
+        }
+
+        async fn execute_with_context(
+            &self,
+            _call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> crate::tools::executor::Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.flags.lock().unwrap().push(ToolExecutionSessionFlags {
+                bypass_permissions: ctx.bypass_permissions,
+                auto_approve_permissions: ctx.auto_approve_permissions,
+                plan_read_only: ctx.plan_read_only,
+            });
+            Ok(ToolResult::text(true, "sub-action-done"))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
     fn make_tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),
@@ -548,6 +608,7 @@ mod tests {
             &event_tx,
             &mut session,
             tools.as_ref(),
+            ToolExecutionSessionFlags::default(),
             None,
         )
         .await;
@@ -589,6 +650,7 @@ mod tests {
             &event_tx,
             &mut session,
             tools.as_ref(),
+            ToolExecutionSessionFlags::default(),
             None,
         )
         .await;
@@ -646,6 +708,7 @@ mod tests {
             &event_tx,
             &mut session,
             tools.as_ref(),
+            ToolExecutionSessionFlags::default(),
             None,
         )
         .await;
@@ -676,6 +739,97 @@ mod tests {
 
         assert!(saw_sub_start);
         assert!(saw_sub_complete);
+    }
+
+    #[tokio::test]
+    async fn plan_blocks_mutating_sub_action_before_executor_dispatch() {
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let tools = Arc::new(ContextRecordingExecutor::default());
+        let mut session = Session::new("plan-sub-action", "test-model");
+        let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
+        let result = ToolResult {
+            success: true,
+            result: serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                actions: vec![make_tool_call("call_write", "Write", "{}")],
+                reason: "mutate".to_string(),
+            })
+            .unwrap(),
+            display_preference: None,
+            images: Vec::new(),
+        };
+        let flags = ToolExecutionSessionFlags {
+            bypass_permissions: false,
+            auto_approve_permissions: true,
+            plan_read_only: true,
+        };
+
+        let outcome = handle_tool_result_with_agentic_support(
+            &result,
+            &parent_call,
+            &event_tx,
+            &mut session,
+            tools.as_ref(),
+            flags,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, ToolHandlingOutcome::Continue);
+        assert_eq!(tools.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("call_write")
+                && message.content.contains("Plan mode")
+        }));
+    }
+
+    #[tokio::test]
+    async fn global_and_explicit_auto_flags_survive_sub_action_dispatch_without_pause() {
+        for explicit in [false, true] {
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let tools = Arc::new(ContextRecordingExecutor::default());
+            let mut session = Session::new(format!("auto-sub-{explicit}"), "test-model");
+            let configured = if explicit {
+                bamboo_domain::PermissionMode::Default
+            } else {
+                bamboo_domain::PermissionMode::Auto
+            };
+            if explicit {
+                let mut runtime = bamboo_domain::AgentRuntimeState::new(&session.id);
+                runtime.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+                session.agent_runtime_state = Some(runtime);
+            }
+            let flags =
+                ToolExecutionSessionFlags::from_session_and_configured_mode(&session, configured);
+            assert!(flags.auto_approve_permissions);
+            let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
+            let result = ToolResult {
+                success: true,
+                result: serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                    actions: vec![make_tool_call("call_sub", "sub_tool", "{}")],
+                    reason: "context".to_string(),
+                })
+                .unwrap(),
+                display_preference: None,
+                images: Vec::new(),
+            };
+
+            let outcome = handle_tool_result_with_agentic_support(
+                &result,
+                &parent_call,
+                &event_tx,
+                &mut session,
+                tools.as_ref(),
+                flags,
+                None,
+            )
+            .await;
+
+            assert_eq!(outcome, ToolHandlingOutcome::Continue);
+            assert!(!session.has_pending_question());
+            assert_eq!(tools.flags.lock().unwrap().as_slice(), &[flags]);
+            assert!(std::iter::from_fn(|| event_rx.try_recv().ok())
+                .all(|event| !matches!(event, AgentEvent::NeedClarification { .. })));
+        }
     }
 
     #[test]

@@ -5,8 +5,26 @@ pub enum McpError {
     #[error("Transport error: {0}")]
     Transport(String),
 
+    #[error("HTTP request failed with status {status}: {body}")]
+    HttpStatus { status: u16, body: String },
+
+    #[error("HTTP {status} returned protocol error {code}: {message}")]
+    HttpProtocol {
+        status: u16,
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    #[error("Remote protocol error {code}: {message}")]
+    RemoteProtocol {
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
 
     #[error("Connection error: {0}")]
     Connection(String),
@@ -73,6 +91,19 @@ mod tests {
     fn test_error_display_protocol() {
         let error = McpError::Protocol("invalid message".to_string());
         assert_eq!(format!("{}", error), "Protocol error: invalid message");
+    }
+
+    #[test]
+    fn test_error_display_remote_protocol() {
+        let error = McpError::RemoteProtocol {
+            code: -32022,
+            message: "Unsupported protocol version".to_string(),
+            data: None,
+        };
+        assert_eq!(
+            format!("{}", error),
+            "Remote protocol error -32022: Unsupported protocol version"
+        );
     }
 
     #[test]

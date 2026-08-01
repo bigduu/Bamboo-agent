@@ -22,20 +22,28 @@ async fn test_get_command_by_id_workflow() {
     ))
     .await;
 
-    let req = test::TestRequest::get()
-        .uri("/v1/commands/workflow/test-workflow")
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-
-    assert!(resp.status().is_success());
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let req = test::TestRequest::get()
+                .uri("/v1/commands/workflow/test-workflow")
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            if resp.status().is_success() {
+                break resp;
+            }
+            assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("watcher should publish the legacy Workflow source");
 
     let body = test::read_body(resp).await;
     let result: Value = serde_json::from_slice(&body).expect("Response should be valid JSON");
 
     assert_eq!(result["type"], "workflow");
     assert_eq!(result["name"], "test-workflow");
-    assert!(result.get("content").is_some());
+    assert_eq!(result["content"], workflow_content);
 }
 
 #[actix_web::test]

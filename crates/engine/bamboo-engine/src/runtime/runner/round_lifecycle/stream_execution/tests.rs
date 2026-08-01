@@ -439,7 +439,7 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
 }
 
 #[tokio::test]
-async fn execute_llm_stream_emits_final_budget_event_with_stream_usage() {
+async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-final-budget", "test-model");
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
@@ -456,14 +456,25 @@ async fn execute_llm_stream_emits_final_budget_event_with_stream_usage() {
     };
 
     let llm = mock_llm(vec![
-        LLMChunk::CacheUsage {
-            cache_creation_input_tokens: 21,
-            cache_read_input_tokens: 34,
-            input_tokens: 12,
+        LLMChunk::ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(80),
+            total_tokens: Some(180),
+            reasoning_tokens: Some(24),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(34),
+            cache_write_input_tokens: None,
         },
+        // Later legacy summaries/cache frames must not overwrite authoritative
+        // provider fields or double the cache badge.
         LLMChunk::UsageSummary {
             output_tokens: 56,
             thinking_tokens: 78,
+        },
+        LLMChunk::CacheUsage {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 34,
+            input_tokens: 66,
         },
         LLMChunk::Done,
     ]);
@@ -504,21 +515,28 @@ async fn execute_llm_stream_emits_final_budget_event_with_stream_usage() {
 
     match event_rx.recv().await.expect("final budget event expected") {
         AgentEvent::TokenBudgetUpdated { usage } => {
-            assert_eq!(usage.thinking_tokens, 78);
+            assert_eq!(usage.thinking_tokens, 24);
             assert_eq!(usage.cache_read_input_tokens, 34);
         }
         other => panic!("unexpected second event: {other:?}"),
     }
 
-    assert_eq!(stream_output.output_tokens, 56);
-    assert_eq!(stream_output.thinking_tokens, 78);
+    assert_eq!(stream_output.input_tokens, 66);
+    assert_eq!(stream_output.output_tokens, 80);
+    assert_eq!(stream_output.thinking_tokens, 24);
     assert_eq!(stream_output.cache_read_input_tokens, 34);
+    assert_eq!(
+        stream_output
+            .provider_usage
+            .and_then(|usage| usage.input_tokens),
+        Some(100)
+    );
     assert_eq!(
         session
             .token_usage
             .as_ref()
             .map(|usage| (usage.thinking_tokens, usage.cache_read_input_tokens)),
-        Some((78, 34))
+        Some((24, 34))
     );
 }
 

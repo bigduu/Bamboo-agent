@@ -168,10 +168,11 @@ TLS termination — no ACME/auto-cert). All overridable per-invocation with
 - `hooks.image_fallback` — how image parts are handled when the effective
   model/path is text-only (drop, OCR-replace, etc. — see
   `ImageFallbackHookConfig`).
-- `lifecycle_hooks` — config-driven shell commands for session, prompt, tool,
-  compaction, and notification events. It lives in `hooks.json`; see the
-  [lifecycle hooks guide](lifecycle-hooks.md) for the complete schema and
-  stdin/stdout contract.
+- `lifecycle_hooks` — config-driven command or external `.js`/`.py`/`.sh`/
+  `.ps1`/`.bat` script handlers for session, prompt, tool, compaction, and
+  notification events. It lives in `hooks.json`; see the
+  [lifecycle hooks guide](lifecycle-hooks.md) for runtime selection, the
+  security model, and the input/output contract.
 
 ## LLM stream timeouts
 
@@ -211,6 +212,8 @@ the shipped defaults, so an empty `{}` is already reasonable:
 | Field | Default | What it does |
 |---|---|---|
 | `background_model` | `None` | Model used for memory extraction/consolidation background work; falls back to the primary model. |
+| `summary_target_ratio` | `0.20` | Desired durable conversation-summary size relative to the raw source tokens represented by it. Hierarchical reducers retain this global ratio instead of applying it again at every level. |
+| `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
 | `project_prompt_injection` | `true` | Inject relevant project-scoped memory into the system prompt. |
@@ -229,6 +232,11 @@ the shipped defaults, so an empty `{}` is already reasonable:
 | `memory_active_capacity` | `0` (unbounded/off) | Cap on "active" memory count before older ones archive. |
 | `capacity_max_archivals_per_run` | `50` | Cap per capacity-enforcement pass. |
 | `granularity_freshness_gardener_enabled` | `true` | Background staleness/granularity pass. |
+
+Automatic conversation compression always maps bounded source chunks and then
+reduces their summaries, even when the selected source would fit in one model
+request. Large terminal results are reduced into bounded multipart sections;
+the persisted summary keeps the single overall `summary_target_ratio` budget.
 
 `project_prompt_injection` / `relevant_recall` / `relevant_recall_rerank` /
 `project_first_dream` can also be flipped via env vars — see
@@ -469,31 +477,56 @@ catch-all — not yet promoted to a typed top-level field). Shape
 `whitelist: Vec<PermissionRule>`, `enabled: bool`, `session_grant_duration_secs`
 (default `1800`), `mode: Option<PermissionMode>`, `confirm_threshold:
 Option<RiskLevel>`, `ask_rules: Vec<String>` — glob-ish patterns like
-`"Bash(rm -rf *)"` that force a confirmation prompt even under a bypass
-permission mode. The design invariant: bypass mode means "run everything
-without prompting" *except* the user's own `ask_rules` and a small hard-coded
-set of catastrophic commands (`sudo`, `curl | sh`, `dd`, `rm -rf /`, …), which
-always prompt regardless of mode.
+`"Bash(rm -rf *)"` that force a confirmation prompt even under the legacy
+`bypassPermissions` mode. The design invariant: bypass skips ordinary prompts
+but still asks for the user's own `ask_rules` and a small hard-coded set of
+catastrophic commands (`sudo`, `curl | sh`, `dd`, `rm -rf /`, …). The stronger
+`auto` mode emits no approval prompt, including for those forced-ask cases, but
+still enforces explicit policy and platform denials.
 
 ## Model limits (`model_limits.json`)
 
 A separate file, `${data_dir}/model_limits.json` — user-supplied
-context/output token limit overrides, consulted only when provider runtime
-metadata doesn't already know a model's limits:
+context/output token limit overrides. Explicit user matches take precedence
+over provider runtime metadata. The legacy standalone representation is a raw
+array:
 
 ```json
 [
-  { "model_pattern": "my-custom-model-*", "max_context_tokens": 128000, "max_output_tokens": 8192 }
+  { "model_pattern": "my-custom-model", "max_context_tokens": 136192, "max_output_tokens": 8192 }
 ]
 ```
 
-`model_pattern` matches against the model id (glob-style), `safety_margin` is
-an optional token buffer subtracted from the limit. With no match anywhere
-(provider metadata nor this file), Bamboo falls back to a global default of
-200K context / 64K output — deliberately with **no built-in per-model table**,
-so the fallback never goes stale as models are updated upstream. Manage this
-via `PUT`/`DELETE` on the model-limits HTTP routes rather than hand-editing,
-if you're running the server.
+`model_pattern` is either an exact model id or a literal substring of the
+runtime model id; `*` and other glob characters have no special meaning.
+Among substring matches, the longest pattern wins.
+
+`max_context_tokens` is the provider's **total input + output context
+window**, not its input allowance alone. Bamboo derives the per-request input
+limit as:
+
+```text
+max_request_input_tokens =
+    max_context_tokens - max_output_tokens - safety_margin
+```
+
+`safety_margin` is optional. When `max_output_tokens` is omitted, Bamboo
+derives it from the context window. Provider metadata that exposes separate
+`max_input_tokens` and `max_output_tokens` is normalized to the same total
+context-window contract before runtime budgeting.
+
+The modular configuration store persists this section in a revisioned
+`{schema_version, revision, data}` envelope. Runtime loading accepts both that
+envelope and the legacy raw array, and root sessions re-read the sidecar at
+the start of every agent round; an explicit session/child or engine-level
+`TokenBudget` remains an intentional higher-priority override. Manage the
+section through Bamboo's settings API instead of hand-editing it while the
+server is running.
+
+With no matching user or provider value, Bamboo falls back to a global default
+of 1M total context / 128K output. There is deliberately **no built-in
+per-model table**, so stale hard-coded model names cannot override live
+provider metadata.
 
 ## Schedules (`schedules.json`)
 

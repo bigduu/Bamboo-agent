@@ -79,21 +79,61 @@ pub async fn create_child_action(
         child.reasoning_effort = Some(effort);
     }
 
-    // Children inherit the parent's "bypass permissions" mode: a bypassed
-    // parent shouldn't be re-gated the moment it delegates work to a sub-agent.
-    // Seed the child's runtime state so the flag is live from its first run
-    // (startup carries it forward thereafter) and mirrored into the index.
-    if input
+    // Children inherit the parent's exact permission posture. Auto must remain
+    // distinct from legacy Bypass so forced confirmations do not reappear at a
+    // child boundary.
+    let inherited_permission_mode = input
         .parent_session
         .agent_runtime_state
         .as_ref()
-        .is_some_and(|state| state.bypass_permissions)
-    {
-        child
-            .agent_runtime_state
-            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-            .bypass_permissions = true;
-    }
+        .map(|state| state.effective_permission_mode())
+        .unwrap_or_default();
+    child
+        .agent_runtime_state
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+        .set_permission_mode(inherited_permission_mode);
+    let parent_audit =
+        bamboo_domain::PermissionAuditSnapshot::from_metadata(&input.parent_session.metadata);
+    let parent_plan_active = input
+        .parent_session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.plan_mode.is_some());
+    let effective = if parent_plan_active {
+        bamboo_domain::PermissionMode::Plan
+    } else {
+        parent_audit
+            .as_ref()
+            .filter(|audit| {
+                audit.resolution.requested == inherited_permission_mode
+                    && audit.resolution.is_consistent()
+            })
+            .map(|audit| audit.resolution.effective)
+            .unwrap_or_else(|| {
+                bamboo_domain::resolve_permission_mode(
+                    inherited_permission_mode,
+                    bamboo_domain::PermissionMode::Default,
+                )
+                .effective
+            })
+    };
+    let resolution = bamboo_domain::PermissionModeResolution {
+        requested: inherited_permission_mode,
+        effective,
+    };
+    bamboo_domain::record_permission_audit(
+        &mut child.metadata,
+        &bamboo_domain::PermissionAuditSeed::new(
+            parent_audit
+                .as_ref()
+                .map(|audit| audit.policy_revision)
+                .unwrap_or_default(),
+            resolution,
+            format!("child_activation:{}", resolution.effective.as_str()),
+        ),
+        Some(&Utc::now().to_rfc3339()),
+    )
+    .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
 
     // #73: children inherit "no interactive human approver" too — if the run has
     // no human to answer approvals (headless / scheduled / deployed), neither do
@@ -111,15 +151,24 @@ pub async fn create_child_action(
             .no_human_approver = true;
     }
 
-    // `set_workspace` returns the FINAL stored path, which may differ from
-    // the requested one when workspace-root confinement (#217) relocated it —
-    // store that back onto the domain field so `child.workspace` never
-    // diverges from where tools actually run.
-    let stored_workspace = bamboo_agent_core::workspace_state::set_workspace(
+    // `validate_child_workspace` already returned the confinement-adjusted,
+    // ownership-checked path. Publish that exact authority without applying a
+    // process-global confinement policy a second time: server embeddings may
+    // use an instance-scoped resolver whose policy differs from the first
+    // AppState registered in this process.
+    let stored_workspace = port.publish_child_workspace(
         &child.id,
         std::path::PathBuf::from(final_workspace),
+        input.workspace_source.as_str(),
     );
     child.workspace = Some(stored_workspace.to_string_lossy().to_string());
+    child.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+        &stored_workspace,
+    ));
+    child.metadata.insert(
+        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        input.workspace_source.as_str().to_string(),
+    );
 
     child
         .metadata

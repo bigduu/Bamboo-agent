@@ -97,16 +97,16 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         ctx.round,
     );
 
-    if clarification::maybe_handle_user_question_tool(
-        ctx.tool_call,
-        ctx.result,
-        ctx.session,
-        ctx.event_tx,
-        ctx.metrics_collector,
-        ctx.session_id,
-        ctx.round_id,
-        ctx.config,
-    )
+    if clarification::maybe_handle_user_question_tool(clarification::UserQuestionToolContext {
+        tool_call: ctx.tool_call,
+        result: ctx.result,
+        session: ctx.session,
+        event_tx: ctx.event_tx,
+        metrics_collector: ctx.metrics_collector,
+        session_id: ctx.session_id,
+        round_id: ctx.round_id,
+        config: ctx.config,
+    })
     .await
     {
         ctx.state.mark_awaiting_clarification();
@@ -158,6 +158,7 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         ctx.event_tx,
         ctx.session,
         ctx.tools.as_ref(),
+        ctx.session_flags,
         // Legacy ad-hoc CompositionExecutor dispatch is intentionally disabled
         // in the agent runtime. Catalog-pinned workflow_run is the single
         // production orchestration authority (#578).

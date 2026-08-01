@@ -5,12 +5,17 @@
 //! responses are counts/revisions only and never include file contents,
 //! environment values, headers, or credentials.
 
+use std::path::Path;
+
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
     LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectStatus, WorkspaceBinding,
 };
-use bamboo_projects::{plan_legacy_migration, ProjectStoreError};
+use bamboo_memory::memory_store::project_key_from_path;
+use bamboo_projects::{
+    canonicalize_workspace_path, plan_legacy_migration, resolve_git_common_dir, ProjectStoreError,
+};
 use serde::Deserialize;
 
 use crate::app_state::AppState;
@@ -20,6 +25,9 @@ pub struct CreateProjectRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Existing user source/work folder. New active Projects cannot be
+    /// created without an authoritative default execution directory.
+    pub project_path: String,
     #[serde(default)]
     pub workspace_bindings: Vec<WorkspaceBinding>,
 }
@@ -40,6 +48,10 @@ pub struct PatchProjectRequest {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_nullable_description")]
     pub description: Option<Option<String>>,
+    /// Select a new authoritative Project folder using the same Project CAS
+    /// revision as name/description updates.
+    #[serde(default)]
+    pub project_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +77,106 @@ pub struct LegacyMemoryMigrationRequest {
 #[derive(Debug, Deserialize)]
 pub struct LegacyMemoryMigrationStatusQuery {
     pub legacy_project_key: String,
+}
+
+fn missing_legacy_evidence(input: &LegacySessionProjectInput) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if input.canonical_path.is_none() {
+        fields.push("canonical_path");
+    }
+    if input.git_common_dir.is_none() {
+        fields.push("git_common_dir");
+    }
+    if input.legacy_project_keys.is_empty() {
+        fields.push("legacy_project_keys");
+    }
+    fields
+}
+
+fn readable_canonical_workspace(workspace_path: &str) -> std::result::Result<String, String> {
+    let canonical = canonicalize_workspace_path(Path::new(workspace_path))
+        .map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        format!(
+            "canonical Workspace metadata is unavailable ({}): {error}",
+            canonical
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "canonical Workspace is not a plain directory ({canonical})"
+        ));
+    }
+    let mut entries = std::fs::read_dir(&canonical).map_err(|error| {
+        format!(
+            "canonical Workspace is not readable ({}): {error}",
+            canonical
+        )
+    })?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(|error| {
+            format!(
+                "canonical Workspace is not readable ({}): {error}",
+                canonical
+            )
+        })?;
+    }
+    Ok(canonical)
+}
+
+fn enrich_legacy_dry_run_sessions(
+    inputs: &[LegacySessionProjectInput],
+) -> (Vec<LegacySessionProjectInput>, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let sessions = inputs
+        .iter()
+        .cloned()
+        .map(|mut input| {
+            let missing = missing_legacy_evidence(&input);
+            if missing.is_empty() {
+                return input;
+            }
+            let Some(workspace_path) = input.workspace_path.as_deref() else {
+                diagnostics.push(format!(
+                    "session {} could not enrich {} because workspace_path is absent",
+                    input.session_id,
+                    missing.join(", ")
+                ));
+                return input;
+            };
+            let canonical_workspace = match readable_canonical_workspace(workspace_path) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    diagnostics.push(format!(
+                        "session {} could not enrich {} from workspace_path: {error}",
+                        input.session_id,
+                        missing.join(", ")
+                    ));
+                    return input;
+                }
+            };
+
+            if input.canonical_path.is_none() {
+                input.canonical_path = Some(canonical_workspace.clone());
+            }
+            if input.git_common_dir.is_none() {
+                match resolve_git_common_dir(Path::new(&canonical_workspace)) {
+                    Ok(git_common_dir) => input.git_common_dir = git_common_dir,
+                    Err(error) => diagnostics.push(format!(
+                        "session {} could not enrich git_common_dir from workspace_path: {error}",
+                        input.session_id
+                    )),
+                }
+            }
+            if input.legacy_project_keys.is_empty() {
+                input
+                    .legacy_project_keys
+                    .push(project_key_from_path(Path::new(&canonical_workspace)));
+            }
+            input
+        })
+        .collect();
+    (sessions, diagnostics)
 }
 
 fn parse_if_match(req: &HttpRequest) -> std::result::Result<u64, HttpResponse> {
@@ -95,12 +207,41 @@ fn parse_id(raw: &str) -> std::result::Result<ProjectId, HttpResponse> {
 }
 
 fn project_error(error: ProjectStoreError) -> HttpResponse {
+    if let ProjectStoreError::NotArchived(project_id) = &error {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_not_archived",
+                "message": "Project is not archived"
+            },
+            "project_id": project_id,
+        }));
+    }
+    if let ProjectStoreError::ProjectPathUnbindConflict {
+        project_id,
+        project_path,
+    } = &error
+    {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_path_unbind_conflict",
+                "message": "Select another Project path before unbinding the current primary folder"
+            },
+            "project_id": project_id,
+            "project_path": project_path,
+        }));
+    }
     let (status, message) = match error {
         ProjectStoreError::NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
         ProjectStoreError::Conflict { .. } => (StatusCode::PRECONDITION_FAILED, error.to_string()),
         ProjectStoreError::AlreadyExists(_)
+        | ProjectStoreError::NotArchived(_)
         | ProjectStoreError::Validation(_)
-        | ProjectStoreError::InvalidPathComponent(_) => (StatusCode::CONFLICT, error.to_string()),
+        | ProjectStoreError::InvalidPathComponent(_)
+        | ProjectStoreError::ProjectPathUnbindConflict { .. } => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
         ProjectStoreError::Io(_) | ProjectStoreError::Json(_) => {
             tracing::error!(%error, "Project registry operation failed");
             (
@@ -110,6 +251,42 @@ fn project_error(error: ProjectStoreError) -> HttpResponse {
         }
     };
     crate::error::json_error(status, message)
+}
+
+fn project_path_validation_error(
+    error: crate::project_context::ProjectWorkspaceValidationError,
+) -> HttpResponse {
+    match error {
+        crate::project_context::ProjectWorkspaceValidationError::Invalid {
+            code,
+            workspace,
+            message,
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": code,
+                "message": message
+            },
+            "project_path": workspace,
+        })),
+        crate::project_context::ProjectWorkspaceValidationError::Conflict {
+            workspace,
+            owner_project_id,
+            session_project_id,
+        } => HttpResponse::Conflict().json(serde_json::json!({
+            "error": {
+                "type": "api_error",
+                "code": "project_path_conflict",
+                "message": "Project path belongs to another Project"
+            },
+            "project_path": workspace,
+            "owner_project_id": owner_project_id,
+            "project_id": session_project_id,
+        })),
+        crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+            project_error(error)
+        }
+    }
 }
 
 fn with_etag(project: &ProjectManifest, status: StatusCode) -> HttpResponse {
@@ -132,9 +309,19 @@ pub async fn create_project(
     state: web::Data<AppState>,
     request: web::Json<CreateProjectRequest>,
 ) -> Result<HttpResponse> {
-    let project = match state.project_store.create_with_bindings(
+    let project_path = match crate::project_context::validate_project_path_candidate_with_resolver(
+        &state.project_store,
+        None,
+        &request.project_path,
+        &state.workspace_resolver,
+    ) {
+        Ok(project_path) => bamboo_config::paths::path_to_display_string(&project_path),
+        Err(error) => return Ok(project_path_validation_error(error)),
+    };
+    let project = match state.project_store.create_with_project_path(
         request.name.clone(),
         request.description.clone(),
+        project_path,
         request.workspace_bindings.clone(),
     ) {
         Ok(project) => project,
@@ -178,7 +365,7 @@ pub async fn patch_project(
         Ok(revision) => revision,
         Err(response) => return Ok(response),
     };
-    let project = match state.project_store.update(&id, expected, |project| {
+    let mutate = |project: &mut ProjectManifest| {
         if let Some(name) = request.name.as_ref() {
             project.name = name.clone();
         }
@@ -186,7 +373,25 @@ pub async fn patch_project(
             project.description = description.clone();
         }
         Ok(())
-    }) {
+    };
+    let result = if let Some(project_path) = request.project_path.as_deref() {
+        let project_path =
+            match crate::project_context::validate_project_path_candidate_with_resolver(
+                &state.project_store,
+                Some(&id),
+                project_path,
+                &state.workspace_resolver,
+            ) {
+                Ok(project_path) => bamboo_config::paths::path_to_display_string(&project_path),
+                Err(error) => return Ok(project_path_validation_error(error)),
+            };
+        state
+            .project_store
+            .update_with_project_path(&id, expected, &project_path, mutate)
+    } else {
+        state.project_store.update(&id, expected, mutate)
+    };
+    let project = match result {
         Ok(project) => project,
         Err(error) => return Ok(project_error(error)),
     };
@@ -308,6 +513,33 @@ pub async fn archive_project(
     Ok(with_etag(&project, StatusCode::OK))
 }
 
+pub async fn unarchive_project(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    http_request: HttpRequest,
+) -> Result<HttpResponse> {
+    let id = match parse_id(&path) {
+        Ok(id) => id,
+        Err(response) => return Ok(response),
+    };
+    let expected = match parse_if_match(&http_request) {
+        Ok(revision) => revision,
+        Err(response) => return Ok(response),
+    };
+    let project = match state.project_store.unarchive(&id, expected) {
+        Ok(project) => project,
+        Err(error) => return Ok(project_error(error)),
+    };
+    state.account_sink.record(
+        None,
+        &AgentEvent::ProjectUpdated {
+            project_id: project.id.to_string(),
+            revision: project.revision,
+        },
+    );
+    Ok(with_etag(&project, StatusCode::OK))
+}
+
 pub async fn legacy_dry_run(
     state: web::Data<AppState>,
     request: web::Json<LegacyDryRunRequest>,
@@ -316,7 +548,10 @@ pub async fn legacy_dry_run(
         Ok(projects) => projects,
         Err(error) => return Ok(project_error(error)),
     };
-    Ok(HttpResponse::Ok().json(plan_legacy_migration(&request.sessions, &projects)))
+    let (sessions, diagnostics) = enrich_legacy_dry_run_sessions(&request.sessions);
+    let mut report = plan_legacy_migration(&sessions, &projects);
+    report.diagnostics.extend(diagnostics);
+    Ok(HttpResponse::Ok().json(report))
 }
 
 pub async fn migrate_legacy_memory(
@@ -431,7 +666,11 @@ pub fn is_active(project: &ProjectManifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
     use actix_web::{http::header, test, App};
+    use bamboo_domain::{LegacyProjectDryRunReport, LegacyProjectMatchBasis};
     use serde_json::Value;
 
     async fn app_state() -> (tempfile::TempDir, web::Data<AppState>) {
@@ -440,6 +679,36 @@ mod tests {
             .await
             .expect("test AppState");
         (dir, web::Data::new(state))
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .expect("git must be installed for migration dry-run tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialize_git_repository(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        run_git(root, &["init", "-q"]);
+        run_git(
+            root,
+            &["config", "user.email", "legacy-dry-run@example.test"],
+        );
+        run_git(root, &["config", "user.name", "Legacy Dry Run Test"]);
+        run_git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("README.md"), "legacy dry-run\n").unwrap();
+        run_git(root, &["add", "README.md"]);
+        run_git(root, &["commit", "-q", "-m", "initial"]);
     }
 
     macro_rules! project_app {
@@ -458,6 +727,10 @@ mod tests {
                 .route("/projects/{id}/resources", web::get().to(project_resources))
                 .route("/projects/{id}/archive", web::post().to(archive_project))
                 .route(
+                    "/projects/{id}/unarchive",
+                    web::post().to(unarchive_project),
+                )
+                .route(
                     "/projects/migrations/legacy/dry-run",
                     web::post().to(legacy_dry_run),
                 )
@@ -473,10 +746,38 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn create_project_rejects_unavailable_path_without_registry_side_effects() {
+        let (dir, state) = app_state().await;
+        let app = test::init_service(project_app!(state.clone())).await;
+        let missing = dir.path().join("missing-project");
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects")
+                .set_json(serde_json::json!({
+                    "name": "Must not persist",
+                    "project_path": missing
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["error"]["code"], "project_path_unavailable",
+            "unexpected response: {body}"
+        );
+        assert!(state.project_store.list().unwrap().is_empty());
+    }
+
+    #[actix_web::test]
     async fn project_routes_enforce_etag_cas_and_keep_identity_stable() {
         let (dir, state) = app_state().await;
         let mut feed = state.account_sink.subscribe();
         let app = test::init_service(project_app!(state.clone())).await;
+        let project_path = dir.path().join("zenith");
+        std::fs::create_dir_all(&project_path).unwrap();
 
         let create = test::call_service(
             &app,
@@ -484,7 +785,8 @@ mod tests {
                 .uri("/projects")
                 .set_json(serde_json::json!({
                     "name": "Zenith",
-                    "description": "first"
+                    "description": "first",
+                    "project_path": project_path
                 }))
                 .to_request(),
         )
@@ -492,6 +794,20 @@ mod tests {
         assert_eq!(create.status(), StatusCode::CREATED);
         assert_eq!(create.headers().get(header::ETAG).unwrap(), "\"1\"");
         let created: ProjectManifest = test::read_body_json(create).await;
+        assert_eq!(
+            created.project_path.as_deref(),
+            Some(
+                project_path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            created.project_path_status,
+            bamboo_domain::ProjectPathStatus::Configured
+        );
         let home = state.project_store.paths().project_home(&created.id);
         assert!(home.ends_with(created.id.as_str()));
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
@@ -551,11 +867,70 @@ mod tests {
             AgentEvent::ProjectUpdated { project_id, .. } if project_id == renamed.id.as_str()
         ));
 
+        let moved_project_path = dir.path().join("zenith-moved");
+        std::fs::create_dir_all(&moved_project_path).unwrap();
+        let moved = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/projects/{}", renamed.id))
+                .insert_header((header::IF_MATCH, "\"2\""))
+                .set_json(serde_json::json!({"project_path": moved_project_path}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(moved.status(), StatusCode::OK);
+        assert_eq!(moved.headers().get(header::ETAG).unwrap(), "\"3\"");
+        let moved: ProjectManifest = test::read_body_json(moved).await;
+        assert_eq!(moved.id, created.id);
+        assert_eq!(
+            moved.project_path.as_deref(),
+            Some(
+                moved_project_path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        let path_updated_event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            &path_updated_event.event,
+            AgentEvent::ProjectUpdated {
+                project_id,
+                revision: 3,
+            } if project_id == renamed.id.as_str()
+        ));
+
+        let primary_unbind = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri(&format!("/projects/{}/workspaces", renamed.id))
+                .insert_header((header::IF_MATCH, "\"3\""))
+                .set_json(serde_json::json!({"path": moved_project_path}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(primary_unbind.status(), StatusCode::CONFLICT);
+        let primary_unbind: Value = test::read_body_json(primary_unbind).await;
+        assert_eq!(
+            primary_unbind["error"]["code"],
+            "project_path_unbind_conflict"
+        );
+        assert_eq!(
+            state.project_store.get(&renamed.id).unwrap().project_path,
+            moved.project_path
+        );
+
         let listed =
             test::call_service(&app, test::TestRequest::get().uri("/projects").to_request()).await;
         assert_eq!(listed.status(), StatusCode::OK);
         let listed: Value = test::read_body_json(listed).await;
         assert_eq!(listed["projects"][0]["id"], renamed.id.to_string());
+        assert_eq!(listed["projects"][0]["project_path_status"], "configured");
 
         // Resource API returns only counts/revisions; file contents and secret
         // values never cross the contract.
@@ -706,6 +1081,459 @@ mod tests {
         .await;
         assert_eq!(dry_run.status(), StatusCode::OK);
         drop(dir);
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_enriches_exact_match_without_persisting() {
+        let (dir, state) = app_state().await;
+        let workspace = dir.path().join("exact-workspace");
+        let alias_child = workspace.join("alias");
+        std::fs::create_dir_all(&alias_child).unwrap();
+        let project = state
+            .project_store
+            .create_with_project_path("Exact match", None, workspace.to_string_lossy(), Vec::new())
+            .unwrap();
+        let before = state.project_store.get(&project.id).unwrap();
+        let manifest_path = state.project_store.paths().manifest_path(&project.id);
+        let index_path = state.project_store.paths().index_path();
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+        let index_bytes = std::fs::read(&index_path).unwrap();
+        let app = test::init_service(project_app!(state.clone())).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [{
+                        "session_id": "canonical-exact",
+                        "workspace_path": alias_child.join("..")
+                    }]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].session_id, "canonical-exact");
+        assert_eq!(report.assignments[0].project_id, project.id);
+        assert_eq!(
+            report.assignments[0].basis,
+            LegacyProjectMatchBasis::ExactCanonicalBinding
+        );
+        assert!(report.suggestions.is_empty());
+        assert!(report.unassigned.is_empty());
+
+        assert_eq!(state.project_store.get(&project.id).unwrap(), before);
+        assert_eq!(std::fs::read(manifest_path).unwrap(), manifest_bytes);
+        assert_eq!(std::fs::read(index_path).unwrap(), index_bytes);
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_matches_linked_worktree_by_derived_git_common_dir() {
+        let (dir, state) = app_state().await;
+        let repository = dir.path().join("main-repository");
+        let linked_worktree = dir.path().join("linked-worktree");
+        initialize_git_repository(&repository);
+        let linked_arg = linked_worktree.to_string_lossy().into_owned();
+        run_git(
+            &repository,
+            &["worktree", "add", "-q", "-b", "linked-match", &linked_arg],
+        );
+        let project = state
+            .project_store
+            .create_with_project_path("Git match", None, repository.to_string_lossy(), Vec::new())
+            .unwrap();
+        let app = test::init_service(project_app!(state.clone())).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [{
+                        "session_id": "linked-session",
+                        "workspace_path": linked_worktree
+                    }]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].session_id, "linked-session");
+        assert_eq!(report.assignments[0].project_id, project.id);
+        assert_eq!(
+            report.assignments[0].basis,
+            LegacyProjectMatchBasis::GitCommonDir
+        );
+        assert!(report.suggestions.is_empty());
+        assert!(report.unassigned.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_groups_git_worktrees_with_derived_memory_keys() {
+        let (dir, state) = app_state().await;
+        let repository = dir.path().join("group-repository");
+        let linked_worktree = dir.path().join("group-worktree");
+        initialize_git_repository(&repository);
+        let linked_arg = linked_worktree.to_string_lossy().into_owned();
+        run_git(
+            &repository,
+            &["worktree", "add", "-q", "-b", "linked-group", &linked_arg],
+        );
+        let expected_keys = [
+            project_key_from_path(&repository),
+            project_key_from_path(&linked_worktree),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let app = test::init_service(project_app!(state)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": "main-session",
+                            "workspace_path": repository
+                        },
+                        {
+                            "session_id": "worktree-session",
+                            "workspace_path": linked_worktree
+                        }
+                    ]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert!(report.assignments.is_empty());
+        assert_eq!(report.suggestions.len(), 1);
+        assert_eq!(
+            report.suggestions[0].basis,
+            LegacyProjectMatchBasis::GitCommonDir
+        );
+        assert_eq!(
+            report.suggestions[0]
+                .session_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            ["main-session".to_string(), "worktree-session".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            report.suggestions[0]
+                .legacy_project_keys
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_keys
+        );
+        assert!(report.unassigned.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_keeps_all_explicit_evidence_authoritative() {
+        let (dir, state) = app_state().await;
+        let workspace = dir.path().join("explicit-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let app = test::init_service(project_app!(state)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": "explicit-a",
+                            "workspace_path": &workspace,
+                            "canonical_path": "/caller/canonical-a",
+                            "git_common_dir": "/caller/shared/.git",
+                            "legacy_project_keys": ["caller-key-a"]
+                        },
+                        {
+                            "session_id": "explicit-b",
+                            "workspace_path": &workspace,
+                            "canonical_path": "/caller/canonical-b",
+                            "git_common_dir": "/caller/shared/.git",
+                            "legacy_project_keys": ["caller-key-b"]
+                        }
+                    ]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert!(report.assignments.is_empty());
+        assert_eq!(report.suggestions.len(), 1);
+        assert_eq!(
+            report.suggestions[0].basis,
+            LegacyProjectMatchBasis::GitCommonDir
+        );
+        assert_eq!(
+            report.suggestions[0].legacy_project_keys,
+            vec!["caller-key-a".to_string(), "caller-key-b".to_string()]
+        );
+        assert!(report.unassigned.is_empty());
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn legacy_dry_run_skips_missing_workspace_enrichment_with_diagnostics() {
+        let (dir, state) = app_state().await;
+        let missing = dir.path().join("missing-workspace");
+        let inputs = vec![LegacySessionProjectInput {
+            session_id: "missing-session".to_string(),
+            workspace_path: Some(missing.to_string_lossy().into_owned()),
+            canonical_path: None,
+            git_common_dir: None,
+            legacy_project_keys: Vec::new(),
+        }];
+        let (enriched, diagnostics) = enrich_legacy_dry_run_sessions(&inputs);
+        assert!(enriched[0].canonical_path.is_none());
+        assert!(enriched[0].git_common_dir.is_none());
+        assert!(enriched[0].legacy_project_keys.is_empty());
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("missing-session")
+                && diagnostic.contains("legacy_project_keys")
+                && diagnostic.contains("could not be canonicalized")
+        }));
+        let app = test::init_service(project_app!(state)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/projects/migrations/legacy/dry-run")
+                .set_json(serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": "missing-session",
+                            "workspace_path": missing
+                        },
+                        {
+                            "session_id": "absent-session"
+                        }
+                    ]
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: LegacyProjectDryRunReport = test::read_body_json(response).await;
+        assert!(report.assignments.is_empty());
+        assert!(report.suggestions.is_empty());
+        assert_eq!(report.unassigned.len(), 2);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("missing-session")));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("absent-session")));
+    }
+
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn legacy_dry_run_skips_unreadable_workspace_enrichment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = dir.path().join("guarded");
+        let workspace = guarded.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let original_permissions = std::fs::metadata(&guarded).unwrap().permissions();
+        let mut blocked_permissions = original_permissions.clone();
+        blocked_permissions.set_mode(0o000);
+        std::fs::set_permissions(&guarded, blocked_permissions).unwrap();
+
+        if std::fs::read_dir(&workspace).is_ok() {
+            std::fs::set_permissions(&guarded, original_permissions).unwrap();
+            return;
+        }
+        let inputs = vec![LegacySessionProjectInput {
+            session_id: "unreadable-session".to_string(),
+            workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            canonical_path: None,
+            git_common_dir: None,
+            legacy_project_keys: Vec::new(),
+        }];
+        let (enriched, diagnostics) = enrich_legacy_dry_run_sessions(&inputs);
+        std::fs::set_permissions(&guarded, original_permissions).unwrap();
+
+        assert!(enriched[0].canonical_path.is_none());
+        assert!(enriched[0].git_common_dir.is_none());
+        assert!(enriched[0].legacy_project_keys.is_empty());
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("unreadable-session") && diagnostic.contains("could not enrich")
+        }));
+    }
+
+    #[actix_web::test]
+    async fn unarchive_route_is_cas_guarded_replayable_and_preserves_ownership() {
+        let (dir, state) = app_state().await;
+        let app = test::init_service(project_app!(state.clone())).await;
+        let project_path = dir.path().join("zenith");
+        let workspace_path = dir.path().join("worktree");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Zenith",
+                Some("Restore me".to_string()),
+                project_path.to_string_lossy(),
+                vec![WorkspaceBinding {
+                    path: workspace_path.to_string_lossy().into_owned(),
+                    label: Some("Issue worktree".to_string()),
+                    git_common_dir: None,
+                }],
+            )
+            .unwrap();
+        let project = state
+            .project_store
+            .update(&project.id, project.revision, |manifest| {
+                manifest
+                    .legacy_project_keys
+                    .push("legacy-zenith".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let archived = state
+            .project_store
+            .archive(&project.id, project.revision)
+            .unwrap();
+
+        let session_id = "project-unarchive-session";
+        let mut session = bamboo_agent_core::Session::new(session_id, "test-model");
+        session.set_project_id_meta(archived.id.to_string());
+        session.set_workspace_path_meta(archived.workspace_bindings[0].path.clone());
+        state.storage.save_session(&session).await.unwrap();
+
+        let missing = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", archived.id))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", archived.id))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", archived.revision + 1)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            state.project_store.get(&archived.id).unwrap(),
+            archived,
+            "stale restore must not mutate the Project"
+        );
+
+        let journal_cursor = state.account_sink.latest_seq();
+        let mut feed = state.account_sink.subscribe();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", archived.id))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", archived.revision)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            format!("\"{}\"", archived.revision + 1).as_str()
+        );
+        let restored: ProjectManifest = test::read_body_json(response).await;
+        assert_eq!(restored.status, ProjectStatus::Active);
+        assert_eq!(restored.revision, archived.revision + 1);
+        assert_eq!(restored.id, archived.id);
+        assert_eq!(restored.project_path, archived.project_path);
+        assert_eq!(restored.project_path_status, archived.project_path_status);
+        assert_eq!(restored.workspace_bindings, archived.workspace_bindings);
+        assert_eq!(restored.legacy_project_keys, archived.legacy_project_keys);
+        assert_eq!(restored.resource_revision, archived.resource_revision);
+        assert_eq!(restored.created_at, archived.created_at);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), feed.recv())
+            .await
+            .expect("ProjectUpdated delivery")
+            .expect("account feed event");
+        assert!(matches!(
+            &event.event,
+            AgentEvent::ProjectUpdated {
+                project_id,
+                revision,
+            } if project_id == restored.id.as_str() && *revision == restored.revision
+        ));
+        let replay = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            journal_cursor,
+        )
+        .expect("journal replay");
+        assert!(replay.iter().any(|change| matches!(
+            &change.event,
+            AgentEvent::ProjectUpdated {
+                project_id,
+                revision,
+            } if project_id == restored.id.as_str() && *revision == restored.revision
+        )));
+
+        let persisted_session = state
+            .storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .expect("persisted session");
+        assert_eq!(
+            persisted_session.project_id_meta().as_deref(),
+            Some(restored.id.as_str())
+        );
+        assert_eq!(
+            persisted_session.workspace_path_meta(),
+            Some(restored.workspace_bindings[0].path.clone())
+        );
+
+        let repeated = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/projects/{}/unarchive", restored.id))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", restored.revision)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(repeated.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(repeated).await;
+        assert_eq!(body["error"]["code"], "project_not_archived");
+        assert_eq!(body["project_id"], restored.id.to_string());
+        assert_eq!(
+            state.project_store.get(&restored.id).unwrap(),
+            restored,
+            "repeated restore must not create stale optimistic state"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), feed.recv())
+                .await
+                .is_err(),
+            "rejected restore must not publish ProjectUpdated"
+        );
     }
 
     #[actix_web::test]

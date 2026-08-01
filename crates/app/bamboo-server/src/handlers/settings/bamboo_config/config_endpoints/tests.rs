@@ -14,6 +14,7 @@ use super::reset::remove_config_file_if_exists;
 fn access_control_fixture() -> bamboo_config::AccessControlConfig {
     bamboo_config::AccessControlConfig {
         password_enabled: true,
+        repair_required: false,
         password_hash: Some("a".repeat(64)),
         password_salt: Some("00112233445566778899aabbccddeeff".to_string()),
         password_credential_ref: None,
@@ -218,8 +219,15 @@ async fn redacted_full_payload_update_preserves_access_control_and_rejects_mutat
         .iter()
         .map(|device| device.device_id.clone())
         .collect();
-    let expected_revision = app_state.credential_store.revision().unwrap();
-    let (committed, _) = app_state
+    let expected_revision = app_state
+        .config_facade
+        .as_ref()
+        .unwrap()
+        .registry()
+        .access_control
+        .snapshot()
+        .revision;
+    let (committed, _, _, _) = app_state
         .update_access_control_credentials(expected_revision, true, device_intents, move |config| {
             config.access_control = Some(fixture);
             Ok(())
@@ -1010,7 +1018,7 @@ async fn codex_provider_reference_round_trip_preserves_masked_provider_secret() 
 }
 
 #[actix_web::test]
-async fn redacted_full_payload_provider_update_preserves_notification_credential() {
+async fn secret_omitting_full_payload_provider_update_preserves_notification_credential() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -1030,6 +1038,7 @@ async fn redacted_full_payload_provider_update_preserves_notification_credential
     let set_notification = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 0,
             "notifications": {
                 "ntfy": {
                     "enabled": true,
@@ -1056,6 +1065,10 @@ async fn redacted_full_payload_provider_update_preserves_notification_credential
         full_payload["notifications"]["ntfy"]["token"],
         "****...****"
     );
+    full_payload["notifications"]["ntfy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("token");
     full_payload["provider"] = serde_json::json!("openai");
     full_payload["providers"] = serde_json::json!({
         "openai": {"api_key": "sk-provider-from-full-payload", "model": "gpt-test"}
@@ -1098,13 +1111,11 @@ async fn redacted_full_payload_provider_update_preserves_notification_credential
     assert!(!notifications.contains("token_encrypted"));
 }
 
-/// End-to-end: POST an ntfy token, confirm the GET response masks it, then
-/// POST again with the masked placeholder unchanged (as the UI would on an
-/// unrelated field edit) — the exact-mask keep-on-save rule must resolve that
-/// back to the live plaintext rather than wiping the stored secret. #430-style
-/// contract, applied to the new notification channel secrets.
+/// Root compatibility writes require the owned Notifications revision, reject
+/// a mask as data, and preserve the stored secret when the credential field is
+/// omitted explicitly.
 #[actix_web::test]
-async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
+async fn notification_compatibility_write_rejects_masks_and_keeps_omitted_secret() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -1127,6 +1138,7 @@ async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
     let post = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 0,
             "notifications": {
                 "ntfy": {
                     "enabled": true,
@@ -1162,11 +1174,11 @@ async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
     assert_eq!(body["notifications"]["ntfy"]["token"], "****...****");
     assert_eq!(body["notifications"]["ntfy"]["topic"], "bamboo-alerts");
 
-    // 3) Re-POST with the masked placeholder (as the UI echoes it back) plus
-    // an unrelated field change — the secret must survive untouched.
+    // 3) A masked placeholder is never accepted as data.
     let post2 = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 1,
             "notifications": {
                 "ntfy": {
                     "enabled": true,
@@ -1178,9 +1190,29 @@ async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
         }))
         .to_request();
     let post2_resp = test::call_service(&app, post2).await;
+    assert_eq!(
+        post2_resp.status(),
+        actix_web::http::StatusCode::BAD_REQUEST
+    );
+
+    // 4) Omission is the bounded compatibility form of `keep`.
+    let post3 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "expected_revision": 1,
+            "notifications": {
+                "ntfy": {
+                    "enabled": true,
+                    "base_url": "https://ntfy.sh",
+                    "topic": "renamed-topic"
+                }
+            }
+        }))
+        .to_request();
+    let post3_resp = test::call_service(&app, post3).await;
     assert!(
-        post2_resp.status().is_success(),
-        "second set config should succeed"
+        post3_resp.status().is_success(),
+        "secret-omitting update should succeed"
     );
 
     let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
@@ -1195,12 +1227,11 @@ async fn set_then_get_bamboo_config_masks_and_preserves_ntfy_token() {
     );
 }
 
-/// End-to-end for #455: a settings PATCH that sets a bamboo-connect platform
-/// must persist into the standalone `connect.json` — NOT into `config.json`
-/// — while the settings API (GET redaction, masked-token keep-on-save)
-/// behaves exactly as it did before the persistence split.
+/// End-to-end for #455/#738: a compatibility settings write persists into the
+/// standalone `connect.json`, uses the Connect section revision, rejects masks,
+/// and treats omission as the bounded `keep` form.
 #[actix_web::test]
-async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves_masked_token() {
+async fn connect_compatibility_write_is_revisioned_and_keeps_omitted_token() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -1235,6 +1266,7 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
     let post = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 0,
             "connect": {
                 "platforms": [
                     { "type": "telegram", "token": "tg-real-secret", "allow_from": ["u1"] }
@@ -1290,12 +1322,11 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
     assert_eq!(body["connect"]["platforms"][0]["token"], "****...****");
     assert_eq!(body["connect"]["platforms"][0]["type"], "telegram");
 
-    // 3) Re-POST with the masked placeholder (as the UI echoes it back) plus
-    // an unrelated field change — the secret must survive untouched, and
-    // still land only in connect.json.
+    // 3) A masked placeholder is never accepted as data.
     let post2 = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 1,
             "connect": {
                 "platforms": [
                     { "type": "telegram", "token": "****...****", "allow_from": ["u1", "u2"] }
@@ -1304,9 +1335,27 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
         }))
         .to_request();
     let post2_resp = test::call_service(&app, post2).await;
+    assert_eq!(
+        post2_resp.status(),
+        actix_web::http::StatusCode::BAD_REQUEST
+    );
+
+    // 4) Omission is the bounded compatibility form of `keep`.
+    let post3 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "expected_revision": 1,
+            "connect": {
+                "platforms": [
+                    { "type": "telegram", "allow_from": ["u1", "u2"] }
+                ]
+            }
+        }))
+        .to_request();
+    let post3_resp = test::call_service(&app, post3).await;
     assert!(
-        post2_resp.status().is_success(),
-        "second set config should succeed"
+        post3_resp.status().is_success(),
+        "secret-omitting update should succeed"
     );
 
     let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
@@ -1328,7 +1377,7 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
         serde_json::from_str(&connect_text_after).expect("connect.json should parse");
     assert_eq!(
         connect_json_after["data"]["platforms"][0]["token_credential_ref"], reference,
-        "masked round-trip preserves the stable token reference"
+        "omission preserves the stable token reference"
     );
     assert_eq!(
         bamboo_config::CredentialStore::open(&data_dir)
@@ -1337,17 +1386,16 @@ async fn set_bamboo_config_persists_connect_into_connect_json_only_and_preserves
             .unwrap()
             .expose(),
         "tg-real-secret",
-        "masked round-trip preserves the real token in the credential store"
+        "omission preserves the real token in the credential store"
     );
     assert!(!config_file_path(&data_dir).exists());
 }
 
 /// Feishu adapter config plumbing (epic #447 phase 3, §2a): `app_id`/`domain`
-/// are plain fields, `app_secret` follows the exact same encrypted-at-rest +
-/// masked-GET + masked-preserve-on-PATCH contract as the Telegram `token`
-/// above.
+/// are plain fields, while `app_secret` is isolated, masks are rejected on
+/// write, and omission preserves the credential.
 #[actix_web::test]
-async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_masked_value() {
+async fn feishu_compatibility_write_rejects_mask_and_keeps_omitted_app_secret() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -1373,6 +1421,7 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
     let post = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 0,
             "connect": {
                 "platforms": [
                     {
@@ -1428,11 +1477,11 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
     assert_eq!(body["connect"]["platforms"][0]["app_id"], "cli_real_app_id");
     assert_eq!(body["connect"]["platforms"][0]["domain"], "lark");
 
-    // 3) Re-POST with the masked placeholder plus an unrelated field change —
-    // the secret must survive untouched.
+    // 3) A masked placeholder is never accepted as data.
     let post2 = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 1,
             "connect": {
                 "platforms": [
                     {
@@ -1447,9 +1496,32 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
         }))
         .to_request();
     let post2_resp = test::call_service(&app, post2).await;
+    assert_eq!(
+        post2_resp.status(),
+        actix_web::http::StatusCode::BAD_REQUEST
+    );
+
+    // 4) Omission is the bounded compatibility form of `keep`.
+    let post3 = test::TestRequest::post()
+        .uri("/bamboo/config")
+        .set_json(serde_json::json!({
+            "expected_revision": 1,
+            "connect": {
+                "platforms": [
+                    {
+                        "type": "feishu",
+                        "app_id": "cli_real_app_id",
+                        "domain": "lark",
+                        "allow_from": ["ou_1", "ou_2"]
+                    }
+                ]
+            }
+        }))
+        .to_request();
+    let post3_resp = test::call_service(&app, post3).await;
     assert!(
-        post2_resp.status().is_success(),
-        "second set config should succeed"
+        post3_resp.status().is_success(),
+        "secret-omitting update should succeed"
     );
 
     let get2 = test::TestRequest::get().uri("/bamboo/config").to_request();
@@ -1471,7 +1543,7 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
         serde_json::from_str(&connect_text_after).expect("connect.json should parse");
     assert_eq!(
         connect_json_after["data"]["platforms"][0]["app_secret_credential_ref"], reference,
-        "masked round-trip preserves the stable app-secret reference"
+        "omission preserves the stable app-secret reference"
     );
     assert_eq!(
         bamboo_config::CredentialStore::open(&data_dir)
@@ -1480,19 +1552,14 @@ async fn set_bamboo_config_persists_feishu_app_secret_encrypted_and_preserves_ma
             .unwrap()
             .expose(),
         "feishu-real-secret",
-        "masked round-trip preserves the real app_secret in the credential store"
+        "omission preserves the real app_secret in the credential store"
     );
 }
 
-/// #490 end-to-end: the settings PATCH surface must preserve a masked secret
-/// even when a preceding platform entry is removed in the same request,
-/// shifting the kept entry's array index. Stored platforms are
-/// `[telegram, feishu]`; the client disables telegram and re-POSTs only the
-/// (still-masked) feishu entry, which now lands at index 0 instead of 1.
-/// Before the #490 fix, the positional type-guard (added for #454) saw
-/// telegram≠feishu at index 0 and silently dropped the feishu app_secret.
+/// #490/#738 end-to-end: omission must preserve a credential by stable
+/// platform id even when removing a preceding entry shifts its array index.
 #[actix_web::test]
-async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_removed() {
+async fn connect_omission_preserves_secret_when_preceding_platform_is_removed() {
     use crate::app_state::AppState;
     use actix_web::{test, web, App};
 
@@ -1517,6 +1584,7 @@ async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_remov
     let post = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 0,
             "connect": {
                 "platforms": [
                     { "type": "telegram", "token": "tg-real-secret", "allow_from": ["u1"] },
@@ -1546,17 +1614,18 @@ async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_remov
         .to_string();
     let feishu_ref = bamboo_config::credential_ref("connect", &feishu_id, "app_secret").unwrap();
 
-    // 3) Re-POST with telegram removed — the UI's echoed feishu entry (still
-    // masked) now sits at index 0, not index 1 where it was stored.
+    // 3) Re-POST with telegram removed and the Feishu secret omitted. The
+    // stable id identifies the same entry even though it moves to index 0.
     let post2 = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 1,
             "connect": {
                 "platforms": [
                     {
+                        "id": feishu_id,
                         "type": "feishu",
                         "app_id": "cli_real_app_id",
-                        "app_secret": "****...****",
                         "domain": "lark",
                         "allow_from": ["ou_1"]
                     }
@@ -1609,7 +1678,7 @@ async fn set_bamboo_config_preserves_masked_secret_when_preceding_platform_remov
             .unwrap()
             .expose(),
         "feishu-real-secret",
-        "masked secret must resolve by stable identity after a preceding entry was removed"
+        "omitted secret must resolve by stable identity after a preceding entry was removed"
     );
 }
 
@@ -1644,6 +1713,7 @@ async fn reset_bamboo_config_rejects_modular_layout_without_mutation() {
     let post = test::TestRequest::post()
         .uri("/bamboo/config")
         .set_json(serde_json::json!({
+            "expected_revision": 0,
             "connect": {
                 "platforms": [
                     { "type": "telegram", "token": "tg-reset-me", "allow_from": ["u1"] }
@@ -1699,10 +1769,14 @@ async fn reset_bamboo_config_rejection_preserves_connect_backup() {
     // Configure a connect platform, then change it again so a
     // `connect.json.bak` gets written (the save path backs up the previous
     // connect.json before overwriting it).
-    for token in ["tg-first-token", "tg-second-token"] {
+    for (expected_revision, token) in ["tg-first-token", "tg-second-token"]
+        .into_iter()
+        .enumerate()
+    {
         let post = test::TestRequest::post()
             .uri("/bamboo/config")
             .set_json(serde_json::json!({
+                "expected_revision": expected_revision,
                 "connect": {
                     "platforms": [
                         { "type": "telegram", "token": token, "allow_from": ["u1"] }

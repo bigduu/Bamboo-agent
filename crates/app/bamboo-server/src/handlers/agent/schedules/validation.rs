@@ -261,52 +261,70 @@ pub(super) async fn validate_auto_execute_run_config(
             }
         }
     }
-    normalized.workspace_path = match crate::project_context::validate_workspace_assignment(
-        &state.project_store,
-        run_config.project_id.as_ref(),
-        run_config.workspace_path.as_deref(),
-    ) {
-        Ok(workspace) => workspace
-            .as_deref()
-            .map(bamboo_config::paths::path_to_display_string),
-        Err(crate::project_context::ProjectWorkspaceValidationError::Invalid {
-            code,
-            workspace,
-            message,
-        }) => {
-            return Err(HttpResponse::BadRequest().json(serde_json::json!({
-                "error": {
-                    "type": "api_error",
-                    "code": code,
-                    "message": message
-                },
-                "workspace": workspace,
-            })));
-        }
-        Err(crate::project_context::ProjectWorkspaceValidationError::Conflict {
-            workspace,
-            owner_project_id,
-            session_project_id,
-        }) => {
-            return Err(HttpResponse::Conflict().json(serde_json::json!({
-                "error": {
-                    "type": "api_error",
-                    "code": "project_workspace_conflict",
-                    "message": "Workspace belongs to another Project"
-                },
-                "workspace": workspace,
-                "owner_project_id": owner_project_id,
-                "session_project_id": session_project_id,
-            })));
-        }
-        Err(crate::project_context::ProjectWorkspaceValidationError::Store(error)) => {
-            return Err(HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": crate::error::error_value(format!(
-                    "failed to validate run_config.workspace_path: {error}"
-                ))
-            })));
-        }
-    };
+    let validated_workspace =
+        match crate::project_context::validate_workspace_assignment_with_resolver(
+            &state.project_store,
+            run_config.project_id.as_ref(),
+            run_config.workspace_path.as_deref(),
+            &state.workspace_resolver,
+        ) {
+            Ok(workspace) => workspace,
+            Err(crate::project_context::ProjectWorkspaceValidationError::Invalid {
+                code,
+                workspace,
+                message,
+            }) => {
+                let mut response = if code.starts_with("project_path_") {
+                    HttpResponse::Conflict()
+                } else {
+                    HttpResponse::BadRequest()
+                };
+                return Err(response.json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": code,
+                        "message": message
+                    },
+                    "workspace": workspace,
+                })));
+            }
+            Err(crate::project_context::ProjectWorkspaceValidationError::Conflict {
+                workspace,
+                owner_project_id,
+                session_project_id,
+            }) => {
+                return Err(HttpResponse::Conflict().json(serde_json::json!({
+                    "error": {
+                        "type": "api_error",
+                        "code": "project_workspace_conflict",
+                        "message": "Workspace belongs to another Project"
+                    },
+                    "workspace": workspace,
+                    "owner_project_id": owner_project_id,
+                    "session_project_id": session_project_id,
+                })));
+            }
+            Err(crate::project_context::ProjectWorkspaceValidationError::Store(error)) => {
+                return Err(HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": crate::error::error_value(format!(
+                        "failed to validate run_config.workspace_path: {error}"
+                    ))
+                })));
+            }
+        };
+    // Keep omission durable so execution resolves the current Project path.
+    // Persisting the validated fallback here would turn a Project default into
+    // an explicit path and make later Project path CAS updates ineffective.
+    normalized.workspace_path = run_config
+        .workspace_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+        .and(
+            validated_workspace
+                .as_deref()
+                .map(bamboo_config::paths::path_to_display_string),
+        );
     if !run_config.auto_execute {
         return Ok(normalized);
     }

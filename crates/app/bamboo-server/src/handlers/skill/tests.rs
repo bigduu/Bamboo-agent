@@ -156,6 +156,156 @@ async fn get_available_workflows_maps_listing_failures_to_internal_error() {
     }
 }
 
+#[actix_web::test]
+async fn historical_legacy_import_bundle_is_not_a_public_skill() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let source = temp_dir.path().join("workflows/legacy.md");
+    tokio::fs::create_dir_all(source.parent().expect("workflow parent"))
+        .await
+        .expect("workflow dir");
+    tokio::fs::write(&source, "Legacy Workflow body\n")
+        .await
+        .expect("workflow source");
+    let bundle = temp_dir.path().join("skills/legacy/SKILL.md");
+    tokio::fs::create_dir_all(bundle.parent().expect("bundle parent"))
+        .await
+        .expect("bundle dir");
+    let bundle_body = format!(
+        "---\nname: legacy\ndescription: Imported legacy workflow\nmetadata:\n  legacy_import: true\n  legacy_name: legacy\n  original_source: '{}'\n---\nLegacy Workflow body\n",
+        source.display()
+    );
+    tokio::fs::write(&bundle, &bundle_body)
+        .await
+        .expect("legacy bundle");
+
+    let state = web::Data::new(
+        AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route("/skills", web::get().to(super::list_skills))
+            .route("/skills/{id}", web::get().to(super::get_skill)),
+    )
+    .await;
+
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/skills?include_disabled=true")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert!(!listed["skills"]
+        .as_array()
+        .expect("skills")
+        .iter()
+        .any(|skill| skill["id"] == "legacy"));
+
+    let detail = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/skills/legacy")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        tokio::fs::read_to_string(&bundle)
+            .await
+            .expect("bundle preserved"),
+        bundle_body
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&source)
+            .await
+            .expect("source preserved"),
+        "Legacy Workflow body\n"
+    );
+}
+
+#[actix_web::test]
+async fn orchestration_workflow_is_not_a_public_skill_but_explicit_migration_is() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let skills = temp_dir.path().join("skills");
+    let orchestration = skills.join("deploy");
+    tokio::fs::create_dir_all(&orchestration)
+        .await
+        .expect("orchestration bundle");
+    tokio::fs::write(
+        orchestration.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Deploy workflow\n---\nDeploy instructions\n",
+    )
+    .await
+    .expect("orchestration instructions");
+    tokio::fs::write(
+        orchestration.join("workflow.yaml"),
+        "id: deploy\nname: Deploy\ndescription: Deploy workflow\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .await
+    .expect("workflow definition");
+
+    let migration = skills.join("migrated");
+    tokio::fs::create_dir_all(&migration)
+        .await
+        .expect("migration bundle");
+    tokio::fs::write(
+        migration.join("SKILL.md"),
+        "---\nname: migrated\ndescription: Explicitly migrated workflow\nmetadata:\n  legacy_migration: true\n  legacy_name: migrated\n  original_source: workflows/migrated.md\n---\nMigrated instructions\n",
+    )
+    .await
+    .expect("migrated skill");
+
+    let state = web::Data::new(
+        AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route("/skills", web::get().to(super::list_skills))
+            .route("/skills/{id}", web::get().to(super::get_skill)),
+    )
+    .await;
+
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/skills?include_disabled=true")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: serde_json::Value = actix_web::test::read_body_json(response).await;
+    let listed_ids = listed["skills"]
+        .as_array()
+        .expect("skills")
+        .iter()
+        .filter_map(|skill| skill["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!listed_ids.contains(&"deploy"));
+    assert!(listed_ids.contains(&"migrated"));
+
+    for (id, expected) in [
+        ("deploy", StatusCode::NOT_FOUND),
+        ("migrated", StatusCode::OK),
+    ] {
+        let detail = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!("/skills/{id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail.status(), expected, "{id}");
+    }
+}
+
 #[tokio::test]
 async fn filtered_tools_rejects_runner_marker_when_pinned_snapshot_is_missing() {
     let temp_dir = tempfile::tempdir().expect("temp dir");

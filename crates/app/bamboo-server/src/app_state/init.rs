@@ -490,6 +490,7 @@ pub fn build_schedule_manager(
     account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
     notification_relay: crate::app_state::session_events::NotificationRelayDeps,
     project_store: Arc<bamboo_projects::ProjectStore>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Arc<ScheduleManager> {
     let base_ctx = ScheduleContext {
         schedule_store,
@@ -504,6 +505,7 @@ pub fn build_schedule_manager(
         app_data_dir,
         trigger_engine: crate::schedule_app::default_trigger_engine(),
         project_store,
+        workspace_resolver,
         notification_relay,
         resolve_run_config: Arc::new(|_| unimplemented!("replaced by build_schedule_context")),
     };
@@ -535,6 +537,7 @@ pub async fn build_connect_manager(
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
     permission_checker: Arc<PermissionChecker>,
     project_store: Arc<bamboo_projects::ProjectStore>,
+    workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 ) -> Result<crate::connect::ConnectManager, String> {
     let config_snapshot = config.read().await.clone();
     let resolved_connect = bamboo_engine::resolved_defaults::resolve_default_run_config(
@@ -567,10 +570,15 @@ pub async fn build_connect_manager(
                 }
             }
         }
-        crate::project_context::validate_workspace_assignment(
+        crate::project_context::validate_workspace_assignment_with_resolver(
             &project_store,
             platform.project_id.as_ref(),
-            resolved_connect.workspace_path.as_deref(),
+            platform
+                .project_id
+                .is_none()
+                .then_some(resolved_connect.workspace_path.as_deref())
+                .flatten(),
+            &workspace_resolver,
         )
         .map_err(|error| {
             format!(
@@ -590,6 +598,7 @@ pub async fn build_connect_manager(
         config,
         provider_registry,
         project_store,
+        workspace_resolver,
         project_ids_by_platform: Arc::new(project_ids_by_platform),
         permission_checker,
     };

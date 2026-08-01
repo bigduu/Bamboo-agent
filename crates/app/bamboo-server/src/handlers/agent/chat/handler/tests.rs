@@ -197,18 +197,31 @@ fn resolve_workspace_path_uses_request_then_metadata() {
 // disk fallback is unit-tested directly + deterministically in bamboo-engine's
 // session_app::chat (default_workspace_from_data_dir_reads_configured_work_area).
 
-#[test]
-fn sync_runtime_workspace_persists_workspace_for_tools() {
-    let temp_dir = tempfile::tempdir().expect("temp dir should be created");
-    let workspace = temp_dir.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace should exist");
+#[actix_web::test]
+async fn sync_runtime_workspace_materializes_with_the_states_provider() {
+    let app_home = tempfile::tempdir().expect("app home");
+    let state = crate::AppState::new(app_home.path().to_path_buf())
+        .await
+        .expect("app state");
+    let root = bamboo_config::paths::resolve_workspace_root_in(app_home.path());
+    let workspace = root.join("session-runtime-workspace");
     let session_id = "session-runtime-workspace";
+    assert!(!workspace.exists());
 
-    sync_runtime_workspace(session_id, Some(workspace.to_string_lossy().as_ref()));
+    sync_runtime_workspace(
+        &state,
+        session_id,
+        Some(workspace.to_string_lossy().as_ref()),
+        "session_fallback",
+    );
 
     let resolved = bamboo_tools::tools::workspace_state::get_workspace(session_id)
         .expect("workspace should be stored");
-    assert_eq!(resolved, workspace.canonicalize().unwrap_or(workspace));
+    assert_eq!(resolved, workspace);
+    assert!(
+        resolved.is_dir(),
+        "instance root should materialize fallback"
+    );
 }
 
 #[test]
@@ -613,13 +626,63 @@ mod optional_model_e2e {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: Value = test::read_body_json(response).await;
-        assert_eq!(body["error"]["code"], "workspace_not_found");
+        assert_eq!(body["error"]["code"], "workspace_invalid");
         assert!(state
             .storage
             .load_session("chat-invalid-workspace")
             .await
             .expect("load")
             .is_none());
+    }
+
+    #[actix_web::test]
+    async fn chat_explicit_workspace_switch_requires_existing_project_binding() {
+        let state = new_state().await;
+        let project_path = tempdir().expect("Project path");
+        let unbound = tempdir().expect("unbound workspace");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Assigned Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Project");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": "chat-unbound-workspace",
+                    "project_id": project.id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "workspace_path": unbound.path(),
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "project_workspace_unbound");
+        assert_eq!(body["session_project_id"], project.id.as_str());
+        assert!(
+            state
+                .storage
+                .load_session("chat-unbound-workspace")
+                .await
+                .expect("load")
+                .is_none(),
+            "binding validation must happen before chat creates the session"
+        );
     }
 
     #[actix_web::test]
@@ -718,8 +781,26 @@ mod optional_model_e2e {
     #[actix_web::test]
     async fn chat_membership_authority_is_durable_storage_not_stale_cache() {
         let state = new_state().await;
-        let project_a = state.project_store.create("Project A", None).unwrap();
-        let project_b = state.project_store.create("Project B", None).unwrap();
+        let project_a_path = tempdir().expect("Project A path");
+        let project_b_path = tempdir().expect("Project B path");
+        let project_a = state
+            .project_store
+            .create_with_project_path(
+                "Project A",
+                None,
+                project_a_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let project_b = state
+            .project_store
+            .create_with_project_path(
+                "Project B",
+                None,
+                project_b_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
         let session_id = "chat-authoritative-project-storage";
         let mut durable = Session::new(session_id, "test-model");
         durable.set_project_id_meta(project_b.id.to_string());
@@ -764,24 +845,27 @@ mod optional_model_e2e {
     }
 
     #[actix_web::test]
-    async fn chat_validates_configured_default_workspace_before_session_side_effects() {
+    async fn chat_uses_assigned_project_path_before_foreign_configured_default() {
         let state = new_state().await;
-        let workspace = tempdir().expect("default workspace");
+        let workspace = tempdir().expect("foreign default workspace");
+        let other_workspace = tempdir().expect("assigned Project path");
         let owner = state
             .project_store
-            .create_with_bindings(
+            .create_with_project_path(
                 "Default Owner",
                 None,
-                vec![bamboo_domain::WorkspaceBinding {
-                    path: workspace.path().to_string_lossy().into_owned(),
-                    label: None,
-                    git_common_dir: None,
-                }],
+                workspace.path().to_string_lossy(),
+                Vec::new(),
             )
             .expect("owner Project");
         let other = state
             .project_store
-            .create("Other Project", None)
+            .create_with_project_path(
+                "Other Project",
+                None,
+                other_workspace.path().to_string_lossy(),
+                Vec::new(),
+            )
             .expect("other Project");
         state.config.write().await.default_work_area = Some(bamboo_config::DefaultWorkAreaConfig {
             path: Some(workspace.path().to_string_lossy().into_owned()),
@@ -798,26 +882,33 @@ mod optional_model_e2e {
             test::TestRequest::post()
                 .uri("/api/v1/chat")
                 .set_json(serde_json::json!({
-                    "session_id": "chat-default-conflict",
+                    "session_id": "chat-project-default",
                     "project_id": other.id.to_string(),
-                    "message": "must not persist",
+                    "message": "use Project path",
                     "model": "test-model"
                 }))
                 .to_request(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body: Value = test::read_body_json(response).await;
-        assert_eq!(body["error"]["code"], "project_workspace_conflict");
-        assert_eq!(body["owner_project_id"], owner.id.as_str());
-        assert!(state
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let persisted = state
             .storage
-            .load_session("chat-default-conflict")
+            .load_session("chat-project-default")
             .await
             .expect("load")
-            .is_none());
-        assert!(
-            bamboo_agent_core::workspace_state::peek_workspace("chat-default-conflict").is_none()
+            .expect("session");
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(
+                bamboo_config::paths::path_to_display_string(
+                    &other_workspace.path().canonicalize().unwrap()
+                )
+                .as_str()
+            )
+        );
+        assert_ne!(
+            persisted.project_id_meta().as_deref(),
+            Some(owner.id.as_str())
         );
     }
 
@@ -825,20 +916,18 @@ mod optional_model_e2e {
     async fn chat_persists_same_project_configured_default_and_prompt_marker() {
         let state = new_state().await;
         let workspace = tempdir().expect("default workspace");
+        let foreign_default = tempdir().expect("foreign global default");
         let project = state
             .project_store
-            .create_with_bindings(
+            .create_with_project_path(
                 "Default Owner",
                 None,
-                vec![bamboo_domain::WorkspaceBinding {
-                    path: workspace.path().to_string_lossy().into_owned(),
-                    label: None,
-                    git_common_dir: None,
-                }],
+                workspace.path().to_string_lossy(),
+                Vec::new(),
             )
             .expect("Project");
         state.config.write().await.default_work_area = Some(bamboo_config::DefaultWorkAreaConfig {
-            path: Some(workspace.path().to_string_lossy().into_owned()),
+            path: Some(foreign_default.path().to_string_lossy().into_owned()),
         });
         let app = test::init_service(
             App::new()
@@ -878,16 +967,58 @@ mod optional_model_e2e {
             Some(canonical.as_path())
         );
         let snapshot = session.prompt_snapshot.expect("prompt snapshot");
-        assert!(snapshot
-            .workspace_context
-            .as_deref()
-            .is_some_and(|value| value.contains("Binding status: registered")));
+        assert!(snapshot.workspace_context.as_deref().is_some_and(|value| {
+            value.contains("Binding status: registered")
+                && value.contains("Workspace source: project_default")
+        }));
         assert_eq!(
             snapshot
                 .effective_system_prompt
                 .matches("BAMBOO_WORKSPACE_CONTEXT_START")
                 .count(),
             1
+        );
+    }
+
+    #[actix_web::test]
+    async fn chat_project_without_path_fails_before_session_side_effects() {
+        let state = new_state().await;
+        let project = state
+            .project_store
+            .create("Legacy unconfigured", None)
+            .expect("legacy Project");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": "chat-project-path-missing",
+                    "project_id": project.id.to_string(),
+                    "message": "must not persist",
+                    "model": "test-model"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "project_path_missing");
+        assert!(state
+            .storage
+            .load_session("chat-project-path-missing")
+            .await
+            .expect("load")
+            .is_none());
+        assert!(
+            bamboo_agent_core::workspace_state::peek_workspace("chat-project-path-missing")
+                .is_none()
         );
     }
 
@@ -901,11 +1032,10 @@ mod optional_model_e2e {
                 user_prompt_submit: vec![bamboo_config::LifecycleHookGroup {
                     enabled: true,
                     matcher: None,
-                    hooks: vec![bamboo_config::LifecycleHookCommand {
-                        hook_type: bamboo_config::LifecycleHookType::Command,
-                        command: "printf 'prompt rejected by policy' >&2; exit 2".to_string(),
-                        timeout_ms: bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
-                    }],
+                    hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                        "printf 'prompt rejected by policy' >&2; exit 2",
+                        bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                    )],
                 }],
                 ..Default::default()
             };

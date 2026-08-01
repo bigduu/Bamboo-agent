@@ -13,6 +13,7 @@ members = [
     "crates/infra/bamboo-memory",
     "crates/infra/bamboo-metrics",
     "crates/infra/bamboo-notification",
+    "crates/infra/bamboo-hooks",
     "crates/infra/bamboo-skills",
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-plugin",
@@ -53,6 +54,7 @@ default-members = [
     "crates/infra/bamboo-memory",
     "crates/infra/bamboo-metrics",
     "crates/infra/bamboo-notification",
+    "crates/infra/bamboo-hooks",
     "crates/infra/bamboo-skills",
     "crates/infra/bamboo-mcp",
     "crates/infra/bamboo-plugin",
@@ -78,7 +80,7 @@ resolver = "2"
 # version at publish time; all members inherit via `version.workspace = true`.
 # Do NOT hardcode a real version here.
 version = "0.0.0"
-rust-version = "1.84"
+rust-version = "1.95"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -93,7 +95,7 @@ hex = "0.4"
 name = "bamboo-agent"
 version.workspace = true
 edition = "2021"
-rust-version = "1.84"
+rust-version = "1.95"
 license = "MIT"
 authors = ["mugeng.du@gmail.com"]
 description = "A fully self-contained AI agent backend framework with built-in web services, multi-LLM provider support, and comprehensive tool execution"
@@ -193,7 +195,6 @@ reqwest-retry = "0.9"
 
 # Encryption
 aes-gcm = "0.11"
-base64 = "0.22"
 sha2 = "0.11"
 hex = "0.4"
 rand = "0.10"

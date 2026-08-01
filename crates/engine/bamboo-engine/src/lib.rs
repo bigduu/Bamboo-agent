@@ -29,6 +29,7 @@ pub use workflow_run::{
     AgentStepPort, AgentStepResult, FileWorkflowRunRepository, NamedAgentSpec, PermissionDecision,
     WorkflowDefinitionPort, WorkflowPolicyPort, WorkflowPolicyTarget, WorkflowRunEngine,
     WorkflowRunError, WorkflowRunRepository, WorkflowSecretMaterial, WorkflowSecretResolverPort,
+    WorkflowSessionPermissionPort,
 };
 
 pub use app_context::AgentSessionContext;
@@ -61,11 +62,14 @@ pub use runtime::agent::{AgentBuilder, DirectExecutionLease};
 // `AgentRuntime::execute`.
 pub use runtime::config::{
     ApprovalDelegate, AuxiliaryModelConfig, BashResumeHook, ChildApprovalOutcome,
-    ChildApprovalRequest, GuardianConfig, GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
+    ChildApprovalRequest, DisabledFilterResolver, DisabledFilterSets, GuardianConfig,
+    GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
 };
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
 pub use runtime::hooks::{
-    test_lifecycle_shell_command, HookRunner, ShellCommandHook, ShellHookEvent, ShellHookTestOutput,
+    test_lifecycle_handler, test_lifecycle_shell_command, HookRunner, LifecycleHookEvent,
+    LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
+    ShellHookTestOutput,
 };
 pub use runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,

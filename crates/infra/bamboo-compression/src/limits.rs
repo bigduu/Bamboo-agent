@@ -1,9 +1,10 @@
 //! Model context window limits registry.
 //!
 //! There is intentionally **no** built-in per-model table. Real per-model
-//! values come from two sources, in priority order:
-//!   1. provider runtime metadata (e.g. Copilot reports real context/output),
-//!   2. user overrides persisted in `model_limits.json`.
+//! values come from provider runtime metadata (e.g. Copilot reports real
+//! context/output) and user overrides persisted in `model_limits.json`.
+//! Runtime resolution gives explicit user configuration precedence over
+//! provider metadata.
 //!
 //! Anything without a match falls back to a single global default
 //! (`DEFAULT_MAX_CONTEXT_TOKENS` / `DEFAULT_MAX_OUTPUT_TOKENS`). This keeps the
@@ -55,7 +56,7 @@ pub fn is_default_limit(limit: &ModelLimit) -> bool {
 pub struct ModelLimit {
     /// Model identifier (partial match supported, e.g., "gpt-4" matches "gpt-4o")
     pub model_pattern: String,
-    /// Maximum context window size in tokens
+    /// Maximum total context window size (input + output) in tokens
     pub max_context_tokens: u32,
     /// Maximum output tokens (defaults to min(max_context / 4,
     /// DEFAULT_MAX_OUTPUT_TOKENS) when unset — see [`Self::get_max_output_tokens`])
@@ -131,6 +132,9 @@ impl ModelLimitsRegistry {
 
     /// Load user overrides from the registry's configured path.
     ///
+    /// Accepts both the legacy raw array and the revisioned section envelope
+    /// written by Bamboo's modular configuration store.
+    ///
     /// No-op when the registry was created without a `config_path` (use
     /// [`Self::with_config_path`] — e.g. with [`get_default_config_path`] — to
     /// point it at `{bamboo_data_dir}/model_limits.json`).
@@ -140,16 +144,33 @@ impl ModelLimitsRegistry {
         };
 
         if !path.exists() {
+            // A previously loaded file may have been deleted between reloads.
+            // Treat absence as an empty override set instead of retaining stale
+            // in-memory patterns.
+            self.user_limits.clear();
             return Ok(());
         }
 
         let content = tokio::fs::read_to_string(&path).await?;
-        let limits: Vec<ModelLimit> = serde_json::from_str(&content)
+        let value: Value = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let data = value
+            .as_object()
+            .filter(|object| {
+                object.contains_key("schema_version")
+                    && object.contains_key("revision")
+                    && object.contains_key("data")
+            })
+            .and_then(|object| object.get("data"))
+            .cloned()
+            .unwrap_or(value);
+        let limits: Vec<ModelLimit> = serde_json::from_value(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-        for limit in limits {
-            self.user_limits.insert(limit.model_pattern.clone(), limit);
-        }
+        self.user_limits = limits
+            .into_iter()
+            .map(|limit| (limit.model_pattern.clone(), limit))
+            .collect();
 
         tracing::info!(
             "Loaded {} user model limits from {:?}",
@@ -516,6 +537,115 @@ mod tests {
         assert_eq!(unknown.model_pattern, DEFAULT_MODEL_PATTERN);
         assert_eq!(unknown.max_context_tokens, 1_000_000);
         assert_eq!(unknown.get_max_output_tokens(), 128_000);
+    }
+
+    #[tokio::test]
+    async fn revisioned_model_limits_sidecar_drives_runtime_resolution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        tokio::fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "revision": 7,
+                "data": [{
+                    "model_pattern": "dynamic-summary-model",
+                    "max_context_tokens": 96000,
+                    "max_output_tokens": 12000,
+                    "safety_margin": 800
+                }]
+            }"#,
+        )
+        .await
+        .expect("seed revisioned overrides");
+
+        let mut registry = ModelLimitsRegistry::with_config_path(path);
+        registry
+            .load_user_config()
+            .await
+            .expect("load revisioned model-limit sidecar");
+
+        let limit = registry
+            .get("dynamic-summary-model")
+            .expect("revisioned override present");
+        assert_eq!(limit.max_context_tokens, 96_000);
+        assert_eq!(limit.get_max_output_tokens(), 12_000);
+        assert_eq!(limit.get_safety_margin(), 800);
+    }
+
+    #[tokio::test]
+    async fn reloading_user_config_replaces_removed_patterns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        tokio::fs::write(
+            &path,
+            r#"[{
+                "model_pattern": "removed-model",
+                "max_context_tokens": 64000,
+                "max_output_tokens": 8000
+            }]"#,
+        )
+        .await
+        .expect("seed legacy sidecar");
+
+        let mut registry = ModelLimitsRegistry::with_config_path(&path);
+        registry.load_user_config().await.expect("first load");
+        assert!(registry.get("removed-model").is_some());
+
+        tokio::fs::write(
+            &path,
+            r#"{
+                "schema_version": 1,
+                "revision": 2,
+                "data": [{
+                    "model_pattern": "replacement-model",
+                    "max_context_tokens": 96000,
+                    "max_output_tokens": 12000
+                }]
+            }"#,
+        )
+        .await
+        .expect("replace sidecar");
+        registry.load_user_config().await.expect("reload");
+
+        assert!(registry.get("removed-model").is_none());
+        assert_eq!(
+            registry
+                .get("replacement-model")
+                .expect("replacement pattern")
+                .max_context_tokens,
+            96_000
+        );
+    }
+
+    #[tokio::test]
+    async fn reloading_after_sidecar_deletion_clears_stale_patterns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        tokio::fs::write(
+            &path,
+            r#"[{
+                "model_pattern": "deleted-model",
+                "max_context_tokens": 64000,
+                "max_output_tokens": 8000
+            }]"#,
+        )
+        .await
+        .expect("seed model-limit sidecar");
+
+        let mut registry = ModelLimitsRegistry::with_config_path(&path);
+        registry.load_user_config().await.expect("first load");
+        assert!(registry.get("deleted-model").is_some());
+
+        tokio::fs::remove_file(&path)
+            .await
+            .expect("remove model-limit sidecar");
+        registry.load_user_config().await.expect("reload deletion");
+
+        assert!(
+            registry.get("deleted-model").is_none(),
+            "deleting the sidecar must not leave its patterns active in memory"
+        );
     }
 
     #[tokio::test]

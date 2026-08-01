@@ -330,6 +330,33 @@ impl ForwardStatus {
     }
 }
 
+/// Provider token details that are not safely interchangeable with the base
+/// prompt/completion totals.
+///
+/// The fields stay optional so a missing provider value is distinct from an
+/// authoritative zero. In particular, OpenAI cache writes are not Anthropic
+/// cache creations and must never be folded into that counter.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardTokenDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+}
+
+impl ForwardTokenDetails {
+    pub fn is_empty(&self) -> bool {
+        self.cache_creation_input_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_write_input_tokens.is_none()
+            && self.reasoning_output_tokens.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ForwardRequestMetrics {
     pub forward_id: String,
@@ -341,6 +368,8 @@ pub struct ForwardRequestMetrics {
     pub status_code: Option<u16>,
     pub status: Option<ForwardStatus>,
     pub token_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "ForwardTokenDetails::is_empty")]
+    pub token_details: ForwardTokenDetails,
     pub error: Option<String>,
     pub duration_ms: Option<u64>,
 }
@@ -351,6 +380,8 @@ pub struct ForwardMetricsSummary {
     pub successful_requests: u64,
     pub failed_requests: u64,
     pub total_tokens: TokenUsage,
+    #[serde(default, skip_serializing_if = "ForwardTokenDetails::is_empty")]
+    pub token_details: ForwardTokenDetails,
     pub avg_duration_ms: Option<u64>,
 }
 
@@ -361,6 +392,8 @@ pub struct ForwardEndpointMetrics {
     pub successful: u64,
     pub failed: u64,
     pub tokens: TokenUsage,
+    #[serde(default, skip_serializing_if = "ForwardTokenDetails::is_empty")]
+    pub token_details: ForwardTokenDetails,
     pub avg_duration_ms: Option<u64>,
 }
 
@@ -649,6 +682,12 @@ mod tests {
             status_code: Some(200),
             status: Some(ForwardStatus::Success),
             token_usage: None,
+            token_details: ForwardTokenDetails {
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(32),
+                cache_write_input_tokens: Some(48),
+                reasoning_output_tokens: Some(5),
+            },
             error: None,
             duration_ms: Some(250),
         };
@@ -656,6 +695,8 @@ mod tests {
         let json = serde_json::to_string(&metrics).unwrap();
         assert!(json.contains("\"forward_id\":\"fwd-123\""));
         assert!(json.contains("\"endpoint\":\"/api/chat\""));
+        assert!(json.contains("\"cache_read_input_tokens\":32"));
+        assert!(json.contains("\"cache_write_input_tokens\":48"));
     }
 
     #[test]
@@ -665,6 +706,7 @@ mod tests {
             successful_requests: 950,
             failed_requests: 50,
             total_tokens: TokenUsage::default(),
+            token_details: ForwardTokenDetails::default(),
             avg_duration_ms: Some(200),
         };
 

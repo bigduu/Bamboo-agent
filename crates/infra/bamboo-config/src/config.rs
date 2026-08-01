@@ -224,6 +224,12 @@ pub struct AccessControlConfig {
     /// Whether password protection is enabled.
     #[serde(default)]
     pub password_enabled: bool,
+    /// A malformed legacy verifier or device record was isolated into the
+    /// encrypted recovery store and needs an explicit user repair. Runtime
+    /// authorization treats this as fail-closed even when no usable verifier
+    /// can be hydrated.
+    #[serde(default)]
+    pub repair_required: bool,
     /// Runtime-only password verifier hash. Legacy documents may still
     /// deserialize it for migration, but ordinary section serialization never
     /// writes verifier material.
@@ -291,6 +297,16 @@ pub struct MemoryConfig {
     /// Falls back to the provider fast model when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model: Option<String>,
+    /// Desired conversation-summary size as a fraction of the raw source tokens
+    /// represented by that summary. The default keeps roughly 20% of source
+    /// content as durable working memory.
+    #[serde(default = "default_summary_target_ratio")]
+    pub summary_target_ratio: f64,
+    /// Maximum fraction of the summarization model context window consumed by a
+    /// fully rendered map/reduce request, including reserved output and safety
+    /// margin.
+    #[serde(default = "default_summary_safe_window_percent")]
+    pub summary_safe_window_percent: u8,
     /// Whether lightweight automatic Dream-style consolidation should run in the
     /// background. Default ON (memory redesign L4): each tick no-ops when there is
     /// no background model configured or no new candidate sessions, so it is free
@@ -423,6 +439,8 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             background_model: None,
+            summary_target_ratio: default_summary_target_ratio(),
+            summary_safe_window_percent: default_summary_safe_window_percent(),
             auto_dream_enabled: default_true_auto_dream_enabled(),
             auto_dream_interval_secs: default_auto_dream_interval_secs(),
             project_prompt_injection: default_true_memory_project_prompt_injection(),
@@ -448,6 +466,14 @@ impl Default for MemoryConfig {
                 default_true_granularity_freshness_gardener_enabled(),
         }
     }
+}
+
+fn default_summary_target_ratio() -> f64 {
+    0.20
+}
+
+fn default_summary_safe_window_percent() -> u8 {
+    80
 }
 
 fn default_true_granularity_freshness_gardener_enabled() -> bool {
@@ -1501,7 +1527,7 @@ pub struct ConfigValues {
     #[serde(default)]
     pub hooks: HooksConfig,
 
-    /// User-configured agent lifecycle command hooks.
+    /// User-configured agent lifecycle command or external script handlers.
     ///
     /// This is intentionally separate from `hooks`, which is already the
     /// provider HTTP request-hook namespace. Lifecycle hooks are snapshotted
@@ -2269,7 +2295,7 @@ impl LifecycleHooksConfig {
     }
 }
 
-/// A matcher and its ordered command-hook list for one lifecycle event.
+/// A matcher and its ordered handler list for one lifecycle event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleHookGroup {
     /// A disabled group remains persisted and editable but is not registered
@@ -2282,7 +2308,7 @@ pub struct LifecycleHookGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<String>,
     #[serde(default)]
-    pub hooks: Vec<LifecycleHookCommand>,
+    pub hooks: Vec<LifecycleHookHandler>,
 }
 
 impl Default for LifecycleHookGroup {
@@ -2295,24 +2321,119 @@ impl Default for LifecycleHookGroup {
     }
 }
 
-/// Supported lifecycle hook implementation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LifecycleHookType {
-    Command,
+/// One configured lifecycle hook handler.
+///
+/// The internally tagged representation preserves the existing command JSON
+/// while allowing handler-specific validation for external scripts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LifecycleHookHandler {
+    Command {
+        command: String,
+        #[serde(
+            default = "default_lifecycle_hook_timeout_ms",
+            skip_serializing_if = "lifecycle_hook_timeout_is_default"
+        )]
+        timeout_ms: u64,
+    },
+    Script {
+        path: String,
+        #[serde(default, skip_serializing_if = "LifecycleScriptRunner::is_auto")]
+        runner: LifecycleScriptRunner,
+        #[serde(
+            default = "default_lifecycle_hook_timeout_ms",
+            skip_serializing_if = "lifecycle_hook_timeout_is_default"
+        )]
+        timeout_ms: u64,
+    },
 }
 
-/// One configured lifecycle shell command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LifecycleHookCommand {
-    #[serde(rename = "type")]
-    pub hook_type: LifecycleHookType,
-    pub command: String,
-    #[serde(
-        default = "default_lifecycle_hook_timeout_ms",
-        skip_serializing_if = "lifecycle_hook_timeout_is_default"
-    )]
-    pub timeout_ms: u64,
+/// Runtime used to execute a lifecycle script.
+///
+/// `auto` infers the language from the file extension and tries the system
+/// runtimes in a deterministic order. Explicit runners are useful when both
+/// Node.js and Bun are installed or when a deployment standardizes one binary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LifecycleScriptRunner {
+    #[default]
+    Auto,
+    Node,
+    Bun,
+    Python,
+    Bash,
+    PowerShell,
+    Cmd,
+}
+
+impl LifecycleScriptRunner {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Node => "node",
+            Self::Bun => "bun",
+            Self::Python => "python",
+            Self::Bash => "bash",
+            Self::PowerShell => "powershell",
+            Self::Cmd => "cmd",
+        }
+    }
+
+    /// Whether this runner can execute the supplied supported script path.
+    pub fn supports_path(self, path: &str) -> bool {
+        let extension = lifecycle_script_extension(path);
+        match self {
+            Self::Auto => extension.is_some(),
+            Self::Node | Self::Bun => {
+                matches!(extension.as_deref(), Some("js" | "mjs" | "cjs"))
+            }
+            Self::Python => matches!(extension.as_deref(), Some("py")),
+            Self::Bash => matches!(extension.as_deref(), Some("sh")),
+            Self::PowerShell => matches!(extension.as_deref(), Some("ps1")),
+            Self::Cmd => matches!(extension.as_deref(), Some("bat" | "cmd")),
+        }
+    }
+}
+
+/// Return the normalized extension when the path names a supported lifecycle
+/// script.
+pub fn lifecycle_script_extension(path: &str) -> Option<String> {
+    let extension = std::path::Path::new(path)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "js" | "mjs" | "cjs" | "py" | "sh" | "ps1" | "bat" | "cmd"
+    )
+    .then_some(extension)
+}
+
+impl LifecycleHookHandler {
+    pub fn command(command: impl Into<String>, timeout_ms: u64) -> Self {
+        Self::Command {
+            command: command.into(),
+            timeout_ms,
+        }
+    }
+
+    pub fn script(path: impl Into<String>, runner: LifecycleScriptRunner, timeout_ms: u64) -> Self {
+        Self::Script {
+            path: path.into(),
+            runner,
+            timeout_ms,
+        }
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::Command { timeout_ms, .. } | Self::Script { timeout_ms, .. } => *timeout_ms,
+        }
+    }
 }
 
 /// Request override configuration for provider-specific HTTP behavior.
@@ -2502,6 +2623,8 @@ fn default_true_hooks() -> bool {
 ///   "model": "gpt-4"
 /// }
 /// ```
+pub const OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY: &str = "explicit_prompt_cache";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenAIConfig {
     /// OpenAI API key (plaintext, in-memory only).
@@ -2554,6 +2677,21 @@ pub struct OpenAIConfig {
     /// Preserve unknown keys under `providers.openai`.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl OpenAIConfig {
+    /// Whether Bamboo may lower its provider-neutral cache plan into GPT-5.6+
+    /// `prompt_cache_options` and `prompt_cache_breakpoint` fields.
+    ///
+    /// This defaults to enabled. OpenAI-compatible upstreams that have not yet
+    /// implemented the explicit-cache request fields can opt out without
+    /// disabling `prompt_cache_key` or the upstream's implicit prompt cache.
+    pub fn explicit_prompt_cache_enabled(&self) -> bool {
+        self.extra
+            .get(OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
 }
 
 /// Anthropic provider configuration
@@ -4070,6 +4208,13 @@ impl Config {
     /// Update the global env vars cache (called on config load / reload).
     pub fn publish_env_vars(&self) {
         let map = self.env_vars_as_map();
+
+        #[cfg(any(test, feature = "test-utils"))]
+        if crate::test_support::env_vars_cache_override_is_active() {
+            crate::test_support::publish_env_vars_to_override(map, self.prompt_safe_env_vars());
+            return;
+        }
+
         let mut env_guard = env_vars_cache().write().recover_poison();
         *env_guard = map;
 
@@ -4080,11 +4225,21 @@ impl Config {
 
     /// Read the current env vars snapshot (called by Bash tool at process spawn time).
     pub fn current_env_vars() -> HashMap<String, String> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(env_vars) = crate::test_support::current_env_vars_override() {
+            return env_vars;
+        }
+
         env_vars_cache().read().recover_poison().clone()
     }
 
     /// Read the current prompt-safe env var snapshot (names + metadata only; no secret values).
     pub fn current_prompt_safe_env_vars() -> Vec<PromptSafeEnvVarEntry> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(env_vars) = crate::test_support::current_prompt_safe_env_vars_override() {
+            return env_vars;
+        }
+
         prompt_safe_env_vars_cache().read().recover_poison().clone()
     }
 
@@ -4969,11 +5124,11 @@ mod tests {
             "legacy groups without an enabled flag remain active"
         );
         assert_eq!(
-            config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms,
+            config.lifecycle_hooks.pre_tool_use[0].hooks[0].timeout_ms(),
             DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS
         );
         assert_eq!(
-            config.lifecycle_hooks.session_start[0].hooks[0].timeout_ms,
+            config.lifecycle_hooks.session_start[0].hooks[0].timeout_ms(),
             25
         );
 
@@ -4994,6 +5149,62 @@ mod tests {
             .get("timeout_ms")
             .is_none());
         assert!(json.get("hooks").is_some());
+    }
+
+    #[test]
+    fn script_lifecycle_hook_uses_auto_runner_and_shared_timeout_default() {
+        let handler: LifecycleHookHandler = serde_json::from_value(serde_json::json!({
+            "type": "script",
+            "path": ".bamboo/hooks/check.js"
+        }))
+        .expect("script lifecycle hook should deserialize");
+
+        assert_eq!(handler.timeout_ms(), DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS);
+        assert!(matches!(
+            handler,
+            LifecycleHookHandler::Script {
+                runner: LifecycleScriptRunner::Auto,
+                ..
+            }
+        ));
+        let json = serde_json::to_value(handler).expect("script hook should serialize");
+        assert_eq!(json["type"], "script");
+        assert!(json.get("timeout_ms").is_none());
+        assert!(json.get("runner").is_none());
+    }
+
+    #[test]
+    fn script_runner_support_is_extension_aware() {
+        assert!(LifecycleScriptRunner::Auto.supports_path("guard.PS1"));
+        assert!(LifecycleScriptRunner::Node.supports_path("guard.mjs"));
+        assert!(LifecycleScriptRunner::Bun.supports_path("guard.cjs"));
+        assert!(LifecycleScriptRunner::Python.supports_path("guard.py"));
+        assert!(LifecycleScriptRunner::Bash.supports_path("guard.sh"));
+        assert!(LifecycleScriptRunner::PowerShell.supports_path("guard.ps1"));
+        assert!(LifecycleScriptRunner::Cmd.supports_path("guard.bat"));
+        assert!(LifecycleScriptRunner::Cmd.supports_path("guard.cmd"));
+        assert!(!LifecycleScriptRunner::Node.supports_path("guard.py"));
+        assert!(!LifecycleScriptRunner::Auto.supports_path("guard.rb"));
+    }
+
+    #[test]
+    fn script_runner_names_round_trip_through_config_json() {
+        for (runner, name) in [
+            (LifecycleScriptRunner::Auto, "auto"),
+            (LifecycleScriptRunner::Node, "node"),
+            (LifecycleScriptRunner::Bun, "bun"),
+            (LifecycleScriptRunner::Python, "python"),
+            (LifecycleScriptRunner::Bash, "bash"),
+            (LifecycleScriptRunner::PowerShell, "powershell"),
+            (LifecycleScriptRunner::Cmd, "cmd"),
+        ] {
+            let json = serde_json::to_value(runner).unwrap();
+            assert_eq!(json, name);
+            assert_eq!(
+                serde_json::from_value::<LifecycleScriptRunner>(json).unwrap(),
+                runner
+            );
+        }
     }
 
     #[test]
@@ -5385,6 +5596,7 @@ mod tests {
         // identical for instances that never paired a device.
         let access = AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
             password_credential_ref: None,
@@ -5415,6 +5627,7 @@ mod tests {
         };
         let access = AccessControlConfig {
             password_enabled: true,
+            repair_required: false,
             password_hash: Some("deadbeef".to_string()),
             password_salt: Some("01020304".to_string()),
             password_credential_ref: None,
@@ -7450,6 +7663,8 @@ mod tests {
         let legacy = serde_json::json!({
             "memory": MemoryConfig {
                 background_model: Some("dream-fast".to_string()),
+                summary_target_ratio: 0.20,
+                summary_safe_window_percent: 80,
                 auto_dream_enabled: true,
                 auto_dream_interval_secs: 900,
                 project_prompt_injection: false,
@@ -7515,6 +7730,18 @@ mod tests {
             memory.capacity_max_archivals_per_run, 50,
             "omitted field takes the serde default fn"
         );
+    }
+
+    #[test]
+    fn compression_summary_budget_defaults_to_twenty_percent_and_eighty_percent_window() {
+        let defaults = MemoryConfig::default();
+        assert_eq!(defaults.summary_target_ratio, 0.20);
+        assert_eq!(defaults.summary_safe_window_percent, 80);
+
+        let parsed: Config = serde_json::from_str(r#"{"memory":{}}"#).expect("parse");
+        let memory = parsed.memory.as_ref().expect("memory present");
+        assert_eq!(memory.summary_target_ratio, 0.20);
+        assert_eq!(memory.summary_safe_window_percent, 80);
     }
 
     /// L4: the maintenance integrators are ON by default — both via

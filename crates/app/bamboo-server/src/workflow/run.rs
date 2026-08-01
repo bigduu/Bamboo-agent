@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_agent_core::tools::{
+    Tool, ToolClass, ToolCtx, ToolError, ToolExecutionSessionFlags, ToolOutcome, ToolResult,
+};
 use bamboo_domain::{
     StartWorkflowRun, WorkflowBudgets, WorkflowDefinitionBundle, WorkflowProgress,
     WorkflowRunDefinition, WorkflowRunSnapshot,
@@ -13,6 +15,7 @@ use bamboo_engine::{
     AgentStepPort, AgentStepResult, FileWorkflowRunRepository, NamedAgentSpec, PermissionDecision,
     WorkflowDefinitionPort, WorkflowPolicyPort, WorkflowPolicyTarget, WorkflowRunEngine,
     WorkflowRunError, WorkflowSecretMaterial, WorkflowSecretResolverPort,
+    WorkflowSessionPermissionPort,
 };
 use bamboo_skills::SkillManager;
 use serde::Deserialize;
@@ -47,12 +50,54 @@ pub struct WorkflowRunAccess {
     sessions: bamboo_engine::SessionRepository,
 }
 
+struct ServerWorkflowSessionPermissions {
+    sessions: bamboo_engine::SessionRepository,
+    permission_config: Arc<bamboo_tools::permission::PermissionConfig>,
+}
+
+#[async_trait]
+impl WorkflowSessionPermissionPort for ServerWorkflowSessionPermissions {
+    async fn flags_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ToolExecutionSessionFlags, String> {
+        let session = self
+            .sessions
+            .try_load(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("workflow session '{session_id}' does not exist"))?;
+        let configured = if session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.plan_mode.is_some())
+        {
+            bamboo_domain::PermissionMode::Plan
+        } else {
+            self.permission_config.mode()
+        };
+        Ok(ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &session, configured,
+        ))
+    }
+}
+
 impl WorkflowRunAccess {
     pub async fn new(
         data_dir: &Path,
         tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
         skills: Arc<SkillManager>,
         sessions: bamboo_engine::SessionRepository,
+    ) -> Result<Self, String> {
+        Self::new_with_permission_config(data_dir, tools, skills, sessions, None).await
+    }
+
+    pub async fn new_with_permission_config(
+        data_dir: &Path,
+        tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+        skills: Arc<SkillManager>,
+        sessions: bamboo_engine::SessionRepository,
+        permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     ) -> Result<Self, String> {
         let repository = Arc::new(
             FileWorkflowRunRepository::new(data_dir.join("workflow-runs"))
@@ -76,6 +121,12 @@ impl WorkflowRunAccess {
                 max_cost_micros: Some(MAX_COST_MICROS),
             },
         );
+        if let Some(permission_config) = permission_config {
+            engine.set_session_permission_port(Arc::new(ServerWorkflowSessionPermissions {
+                sessions: sessions.clone(),
+                permission_config,
+            }));
+        }
         engine
             .recover()
             .await
@@ -678,7 +729,7 @@ enum WorkflowToolInput {
         #[serde(default)]
         budget: Option<WorkflowBudgets>,
     },
-    List,
+    List {},
     Get {
         run_id: String,
     },
@@ -722,14 +773,41 @@ impl Tool for WorkflowRunTool {
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
-            "oneOf": [
-                {"properties": {"action": {"const": "start"}, "workflow_id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1}, "args": {"type": "object", "default": {}}, "budget": {"type": "object", "properties": {"max_concurrency": {"type":"integer","minimum":1}, "max_agents": {"type":"integer","minimum":0}, "max_steps": {"type":"integer","minimum":1}, "max_retries": {"type":"integer","minimum":0}, "max_nesting_depth": {"type":"integer","minimum":1}, "wall_time_ms": {"type":"integer","minimum":1}, "max_tokens": {"type":"integer","minimum":0}, "max_cost_micros": {"type":"integer","minimum":0}}, "required": ["max_concurrency","max_agents","max_steps","max_retries","max_nesting_depth","wall_time_ms"], "additionalProperties": false}}, "required": ["action", "workflow_id", "revision"], "additionalProperties": false},
-                {"properties": {"action": {"const": "list"}}, "required": ["action"], "additionalProperties": false},
-                {"properties": {"action": {"const": "get"}, "run_id": {"type": "string"}}, "required": ["action", "run_id"], "additionalProperties": false},
-                {"properties": {"action": {"const": "events"}, "run_id": {"type": "string"}, "since": {"type": "integer", "minimum": 0}}, "required": ["action", "run_id"], "additionalProperties": false},
-                {"properties": {"action": {"const": "cancel"}, "run_id": {"type": "string"}}, "required": ["action", "run_id"], "additionalProperties": false},
-                {"properties": {"action": {"const": "restart"}, "run_id": {"type": "string"}}, "required": ["action", "run_id"], "additionalProperties": false}
-            ]
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "list", "get", "events", "cancel", "restart"]
+                },
+                "workflow_id": {"type": "string", "minLength": 1},
+                "revision": {"type": "integer", "minimum": 1},
+                "args": {"type": "object", "default": {}},
+                "budget": {
+                    "type": "object",
+                    "properties": {
+                        "max_concurrency": {"type": "integer", "minimum": 1},
+                        "max_agents": {"type": "integer", "minimum": 0},
+                        "max_steps": {"type": "integer", "minimum": 1},
+                        "max_retries": {"type": "integer", "minimum": 0},
+                        "max_nesting_depth": {"type": "integer", "minimum": 1},
+                        "wall_time_ms": {"type": "integer", "minimum": 1},
+                        "max_tokens": {"type": "integer", "minimum": 0},
+                        "max_cost_micros": {"type": "integer", "minimum": 0}
+                    },
+                    "required": [
+                        "max_concurrency",
+                        "max_agents",
+                        "max_steps",
+                        "max_retries",
+                        "max_nesting_depth",
+                        "wall_time_ms"
+                    ],
+                    "additionalProperties": false
+                },
+                "run_id": {"type": "string"},
+                "since": {"type": "integer", "minimum": 0}
+            },
+            "required": ["action"],
+            "additionalProperties": false
         })
     }
 
@@ -758,7 +836,7 @@ impl Tool for WorkflowRunTool {
                     .await
                     .map_err(workflow_tool_error)?,
             )),
-            WorkflowToolInput::List => serde_json::to_value(
+            WorkflowToolInput::List {} => serde_json::to_value(
                 self.access
                     .list_for_session(session_id)
                     .await
@@ -823,6 +901,7 @@ mod tests {
         FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema,
     };
     use bamboo_agent_core::Session;
+    use bamboo_llm::protocol::{gemini::GeminiTool, ToProvider};
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 
@@ -910,6 +989,96 @@ mod tests {
         .await
         .expect("workflow access");
         (access, repo, directory)
+    }
+
+    fn canonical_workflow_run_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "list", "get", "events", "cancel", "restart"]
+                },
+                "workflow_id": {"type": "string", "minLength": 1},
+                "revision": {"type": "integer", "minimum": 1},
+                "args": {"type": "object", "default": {}},
+                "budget": {
+                    "type": "object",
+                    "properties": {
+                        "max_concurrency": {"type": "integer", "minimum": 1},
+                        "max_agents": {"type": "integer", "minimum": 0},
+                        "max_steps": {"type": "integer", "minimum": 1},
+                        "max_retries": {"type": "integer", "minimum": 0},
+                        "max_nesting_depth": {"type": "integer", "minimum": 1},
+                        "wall_time_ms": {"type": "integer", "minimum": 1},
+                        "max_tokens": {"type": "integer", "minimum": 0},
+                        "max_cost_micros": {"type": "integer", "minimum": 0}
+                    },
+                    "required": [
+                        "max_concurrency",
+                        "max_agents",
+                        "max_steps",
+                        "max_retries",
+                        "max_nesting_depth",
+                        "wall_time_ms"
+                    ],
+                    "additionalProperties": false
+                },
+                "run_id": {"type": "string"},
+                "since": {"type": "integer", "minimum": 0}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })
+    }
+
+    #[tokio::test]
+    async fn workflow_run_schema_is_flat_complete_and_canonical() {
+        let (access, _, _) = workflow_test_access().await;
+        let schema = WorkflowRunTool::new(access).parameters_schema();
+
+        for combinator in ["oneOf", "anyOf", "allOf"] {
+            assert!(
+                schema.get(combinator).is_none(),
+                "workflow_run must not advertise root {combinator}"
+            );
+        }
+        assert_eq!(schema, canonical_workflow_run_schema());
+    }
+
+    #[tokio::test]
+    async fn workflow_run_schema_survives_openai_sanitization_with_all_properties() {
+        let (access, _, _) = workflow_test_access().await;
+        let schema = WorkflowRunTool::new(access).parameters_schema();
+        let sanitized =
+            bamboo_llm::providers::common::tool_schema::sanitize_openai_function_parameters_schema(
+                &schema,
+            );
+
+        let properties = sanitized["properties"]
+            .as_object()
+            .expect("sanitized workflow_run properties");
+        assert!(!properties.is_empty());
+        assert_eq!(properties.len(), 7);
+        assert_eq!(sanitized, canonical_workflow_run_schema());
+    }
+
+    #[tokio::test]
+    async fn workflow_run_schema_reaches_gemini_unchanged() {
+        let (access, _, _) = workflow_test_access().await;
+        let direct = WorkflowRunTool::new(access).to_schema();
+        let gemini: GeminiTool = direct.to_provider().expect("Gemini tool conversion");
+        let declaration = gemini
+            .function_declarations
+            .first()
+            .expect("workflow_run declaration");
+
+        assert_eq!(declaration.name, "workflow_run");
+        assert_eq!(
+            declaration.parameters_json_schema.as_ref(),
+            Some(&canonical_workflow_run_schema())
+        );
+        assert!(declaration.parameters.is_none());
     }
 
     #[tokio::test]
@@ -1095,6 +1264,38 @@ mod tests {
         assert!(error.to_string().contains("unknown field"));
     }
 
+    #[test]
+    fn tool_input_rejects_fields_from_other_actions() {
+        let invalid = [
+            json!({"action": "list", "run_id": "run-1"}),
+            json!({"action": "get", "run_id": "run-1", "since": 1}),
+            json!({"action": "events", "run_id": "run-1", "workflow_id": "flow"}),
+            json!({"action": "cancel", "run_id": "run-1", "revision": 1}),
+            json!({"action": "restart", "run_id": "run-1", "budget": {}}),
+            json!({
+                "action": "start",
+                "workflow_id": "flow",
+                "revision": 1,
+                "run_id": "run-1"
+            }),
+        ];
+
+        for input in invalid {
+            let error = serde_json::from_value::<WorkflowToolInput>(input.clone())
+                .expect_err("action-specific fields must remain authoritative at runtime");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected error for {input}: {error}"
+            );
+        }
+
+        assert!(matches!(
+            serde_json::from_value::<WorkflowToolInput>(json!({"action": "list"}))
+                .expect("fieldless list action"),
+            WorkflowToolInput::List {}
+        ));
+    }
+
     #[tokio::test]
     async fn omitted_start_args_and_zero_budgets_match_schema() {
         let WorkflowToolInput::Start { args, .. } =
@@ -1115,22 +1316,22 @@ mod tests {
 
         let (access, _, _) = workflow_test_access().await;
         let schema = WorkflowRunTool { access }.parameters_schema();
-        let start = &schema["oneOf"][0];
-        assert_eq!(start["properties"]["args"]["default"], json!({}));
+        let properties = &schema["properties"];
+        assert_eq!(properties["args"]["default"], json!({}));
         assert_eq!(
-            start["properties"]["budget"]["properties"]["max_agents"]["minimum"],
+            properties["budget"]["properties"]["max_agents"]["minimum"],
             0
         );
         assert_eq!(
-            start["properties"]["budget"]["properties"]["max_retries"]["minimum"],
+            properties["budget"]["properties"]["max_retries"]["minimum"],
             0
         );
         assert_eq!(
-            start["properties"]["budget"]["properties"]["max_tokens"]["minimum"],
+            properties["budget"]["properties"]["max_tokens"]["minimum"],
             0
         );
         assert_eq!(
-            start["properties"]["budget"]["properties"]["max_cost_micros"]["minimum"],
+            properties["budget"]["properties"]["max_cost_micros"]["minimum"],
             0
         );
     }

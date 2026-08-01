@@ -73,6 +73,7 @@ pub(super) struct ToolExecutionApplyContext<'a> {
     pub round: usize,
     pub session: &'a mut Session,
     pub tools: &'a Arc<dyn ToolExecutor>,
+    pub session_flags: ToolExecutionSessionFlags,
     pub config: &'a AgentLoopConfig,
     pub runtime_state: &'a mut AgentRuntimeState,
     pub task_context: &'a mut Option<TaskLoopContext>,
@@ -223,7 +224,9 @@ pub(super) async fn execute_tool_call_only(
                     AgentHookPoint::BeforeToolExecution,
                     hook_outcome.injected_contexts,
                 );
-                if let Some(outcome) =
+                if ctx.session_flags.auto_approve_permissions {
+                    permission_override = Some(bamboo_tools::HookPermissionOverride::Allow);
+                } else if let Some(outcome) =
                     hook_ask_outcome(ctx.tool_call, ctx.config, session, runtime_state, &args).await
                 {
                     let end_event = match &outcome.result {
@@ -384,6 +387,11 @@ async fn hook_ask_outcome(
             )
         };
 
+    let requested_mode = runtime_state.effective_permission_mode();
+    let resolution = bamboo_domain::resolve_permission_mode(
+        requested_mode,
+        config.permission_mode.unwrap_or_default(),
+    );
     let request = bamboo_tools::permission::PermissionRequest {
         request_id: tool_call.id.clone(),
         session_id: session.id.clone(),
@@ -394,8 +402,9 @@ async fn hook_ask_outcome(
         operation_summary,
         risk_level,
         reason_code: bamboo_tools::permission::PermissionReasonCode::ConfiguredAlwaysAsk,
-        effective_mode: config.permission_mode.unwrap_or_default(),
-        bypass_requested: runtime_state.bypass_permissions,
+        effective_mode: resolution.effective,
+        bypass_requested: resolution.bypass_permissions(),
+        auto_approve_requested: requested_mode == bamboo_domain::SessionPermissionMode::Auto,
         policy_revision: 0,
         matched_rule: None,
         allowed_decisions: bamboo_tools::permission::PermissionRequest::forced_decisions(),
@@ -583,6 +592,7 @@ pub(super) async fn apply_tool_execution_outcome(
                         round: ctx.round,
                         session: ctx.session,
                         tools: ctx.tools,
+                        session_flags: ctx.session_flags,
                         config: ctx.config,
                         task_context: ctx.task_context,
                         state: ctx.state,
@@ -651,9 +661,7 @@ mod hook_tests {
         AsyncWaitKind, FunctionCall, RunningCompletion, RunningHandle, ToolError,
     };
     use bamboo_agent_core::AgentHook;
-    use bamboo_config::{
-        LifecycleHookCommand, LifecycleHookGroup, LifecycleHookType, LifecycleHooksConfig,
-    };
+    use bamboo_config::{LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct DenyToolHook;
@@ -931,6 +939,10 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
         let mut task_context = None;
         let mut state = RoundExecutionState::default();
+        let session_flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            config.permission_mode.unwrap_or_default(),
+        );
         apply_tool_execution_outcome(
             ToolExecutionApplyContext {
                 tool_call,
@@ -941,6 +953,7 @@ mod hook_tests {
                 round: 0,
                 session,
                 tools,
+                session_flags,
                 config,
                 runtime_state: &mut runtime_state,
                 task_context: &mut task_context,
@@ -1008,11 +1021,10 @@ mod hook_tests {
             pre_tool_use: vec![LifecycleHookGroup {
                 enabled: true,
                 matcher: Some("^bash$".to_string()),
-                hooks: vec![LifecycleHookCommand {
-                    hook_type: LifecycleHookType::Command,
-                    command: "printf 'configured bash denial' >&2; exit 2".to_string(),
-                    timeout_ms: 1_000,
-                }],
+                hooks: vec![LifecycleHookHandler::command(
+                    "printf 'configured bash denial' >&2; exit 2",
+                    1_000,
+                )],
             }],
             ..LifecycleHooksConfig::default()
         };

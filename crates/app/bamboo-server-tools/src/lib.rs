@@ -26,7 +26,7 @@ pub use ask_agent::AskAgentTool;
 pub use cluster_tool::ClusterTool;
 pub use compact::CompactContextTool;
 pub use deploy_agent::{DeployAgentTool, Deployed, DeployedRegistry};
-pub use fabric_deploy::{FabricDeployer, FabricError};
+pub use fabric_deploy::{FabricActionResult, FabricCommitSnapshot, FabricDeployer, FabricError};
 pub use ledger::{LedgerScheduleBridge, LedgerTool};
 pub use memory::MemoryTool;
 pub use notify::{NotificationDispatcher, NotifyTool};

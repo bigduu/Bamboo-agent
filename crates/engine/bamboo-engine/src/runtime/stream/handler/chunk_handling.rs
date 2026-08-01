@@ -22,6 +22,7 @@ pub(super) async fn handle_chunk_result(
             state.set_response_id(response_id);
             Ok(())
         }
+        Ok(LLMChunk::ResponsesEvent { .. }) => Ok(()),
         Ok(LLMChunk::Token(token)) => {
             state.append_token(&token);
             if let Some(event_tx) = event_tx {
@@ -113,6 +114,38 @@ pub(super) async fn handle_chunk_result(
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
                 input_tokens,
+            );
+            Ok(())
+        }
+        Ok(LLMChunk::ProviderUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            reasoning_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+        }) => {
+            tracing::debug!(
+                "[{}] Provider usage: input={:?}, output={:?}, reasoning={:?}, \
+                 total={:?}, cache_creation={:?}, cache_read={:?}, cache_write={:?}",
+                session_id,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens
+            );
+            state.record_provider_usage(
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                reasoning_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
             );
             Ok(())
         }

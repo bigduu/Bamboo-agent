@@ -90,10 +90,52 @@ where
     Box::pin(stream)
 }
 
+/// Like [`llm_stream_from_sse_multi`], but requires an explicit protocol
+/// completion chunk.
+///
+/// A clean HTTP/SSE EOF is transport completion, not proof that an OpenAI
+/// Responses request succeeded. This adapter stops after the first `Done` or
+/// error and turns a premature EOF into one stream error.
+pub fn llm_stream_from_sse_multi_requiring_done<H>(
+    response: Response,
+    handler: H,
+    protocol: &'static str,
+) -> LLMStream
+where
+    H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
+{
+    require_done_terminal(llm_stream_from_sse_multi(response, handler), protocol)
+}
+
+fn require_done_terminal(upstream: LLMStream, protocol: &'static str) -> LLMStream {
+    let stream = stream::unfold(
+        (upstream, false),
+        move |(mut upstream, terminal)| async move {
+            if terminal {
+                return None;
+            }
+
+            match upstream.next().await {
+                Some(Ok(LLMChunk::Done)) => Some((Ok(LLMChunk::Done), (upstream, true))),
+                Some(Err(error)) => Some((Err(error), (upstream, true))),
+                Some(other) => Some((other, (upstream, false))),
+                None => Some((
+                    Err(LLMError::Stream(format!(
+                        "{protocol} stream ended before a protocol terminal event"
+                    ))),
+                    (upstream, true),
+                )),
+            }
+        },
+    );
+    Box::pin(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::anthropic::{parse_anthropic_sse_event, AnthropicStreamState};
+    use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict_multi;
     use crate::providers::common::openai_responses::ResponsesSseParser;
     use futures::StreamExt;
     use serde_json::json;
@@ -204,6 +246,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_responses_completed_frame_flattens_every_parser_chunk() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"output\":[{\"id\":\"msg_terminal\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"terminal answer\"}]}],\"usage\":{\"input_tokens\":21,\"output_tokens\":13,\"input_tokens_details\":{\"cached_tokens\":8},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n",
+                        "\n",
+                    )
+                    .to_string(),
+                )
+                .expect("http response"),
+        );
+        let mut parser = ResponsesSseParser::new();
+        let mut stream = llm_stream_from_sse_multi(response, move |event, data| {
+            parser.handle_event_multi(event, data)
+        });
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 4);
+        assert!(matches!(&chunks[0], LLMChunk::ResponseId(id) if id == "resp_terminal"));
+        assert!(matches!(&chunks[1], LLMChunk::Token(text) if text == "terminal answer"));
+        assert!(matches!(
+            chunks[2],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(21),
+                output_tokens: Some(13),
+                reasoning_tokens: Some(5),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(8),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[3], LLMChunk::Done));
+    }
+
+    #[tokio::test]
+    async fn openai_chat_frame_flattens_business_output_and_usage_before_done() {
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n",
+                        "\n",
+                        "data: [DONE]\n",
+                        "\n",
+                    )
+                    .to_string(),
+                )
+                .expect("http response"),
+        );
+        let mut stream = llm_stream_from_sse_multi(response, |_event, data| {
+            parse_openai_compat_sse_data_strict_multi(data)
+        });
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("stream chunk"));
+        }
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(&chunks[0], LLMChunk::Token(text) if text == "answer"));
+        assert!(matches!(
+            chunks[1],
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(4),
+                cache_read_input_tokens: Some(3),
+                ..
+            }
+        ));
+        assert!(matches!(chunks[2], LLMChunk::Done));
+    }
+
+    #[tokio::test]
     async fn llm_stream_from_sse_maps_handler_errors_to_stream_error() {
         let sse_body = concat!("event: token\n", "data: boom\n", "\n");
 
@@ -228,5 +353,39 @@ mod tests {
             Err(LLMError::Stream(msg)) => assert!(msg.contains("API error")),
             Err(other) => panic!("expected LLMError::Stream, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn required_done_turns_clean_eof_into_one_error() {
+        let upstream: LLMStream = Box::pin(stream::iter(vec![Ok(LLMChunk::Token(
+            "partial".to_string(),
+        ))]));
+        let mut stream = require_done_terminal(upstream, "Responses");
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LLMChunk::Token(text))) if text == "partial"
+        ));
+        let error = stream
+            .next()
+            .await
+            .expect("premature EOF error")
+            .expect_err("EOF must not synthesize success");
+        assert!(error
+            .to_string()
+            .contains("ended before a protocol terminal"));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn required_done_stops_after_first_success_terminal() {
+        let upstream: LLMStream = Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Done),
+            Ok(LLMChunk::Token("after".to_string())),
+        ]));
+        let mut stream = require_done_terminal(upstream, "Responses");
+
+        assert!(matches!(stream.next().await, Some(Ok(LLMChunk::Done))));
+        assert!(stream.next().await.is_none());
     }
 }

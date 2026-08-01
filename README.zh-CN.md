@@ -99,7 +99,7 @@ graph TD
 
 - `counter` — 通过 tiktoken BPE 或启发式估算计 token（`TiktokenTokenCounter` / `HeuristicTokenCounter`）。
 - `segmenter` — 分段时保持工具调用的原子性（不会把一次 tool call 拆散）。
-- `limits` — **刻意不内置 per-model 表**。真实上下文/输出上限来自 (1) provider 运行时元数据，(2) 用户在 `model_limits.json` 的覆盖；都没有则回落到全局默认 **200K 上下文 / 64K 输出**。这样模型更新换代也不会让表过时。
+- `limits` — **刻意不内置 per-model 表**。`model_limits.json` 中的显式用户覆盖优先于 provider 运行时元数据；两者都没有时回落到全局默认 **1M 输入+输出总上下文 / 128K 输出**。构建 prompt 时会从总窗口预留输出额度和 tokenizer 安全余量，root session 每轮都会重新读取当前实例目录下的覆盖文件。
 - `summarizer` / `preparation` — 构建压缩计划、生成摘要消息、按预算准备上下文（`prepare_hybrid_context`），并能估算 prompt cache 节省。
 - **超大输出处理** — 工具产生的超大输出在 `bamboo-tools/output_manager.rs` 处会被裁剪/管理，避免一次性塞爆上下文。
 
@@ -121,6 +121,8 @@ graph TD
 ---
 
 ## 快速开始与开发
+
+从源码构建 Bamboo 需要 **Rust 1.95 或更高版本**。
 
 ### 启动服务
 

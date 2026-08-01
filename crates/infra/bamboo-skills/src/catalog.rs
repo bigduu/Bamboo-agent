@@ -92,10 +92,27 @@ pub struct WorkflowCatalogEntry {
     pub shadowed_candidates: Vec<ShadowedWorkflowCandidate>,
 }
 
+impl WorkflowCatalogEntry {
+    /// Only orchestration bundles and explicit legacy workflow adapters belong
+    /// to the public Workflow identity. Plain instruction Skills stay in the
+    /// Skill catalog even though the runtime shares discovery internals.
+    pub fn is_public_workflow(&self) -> bool {
+        self.kind == WorkflowKind::Orchestration || self.legacy
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowCatalogSnapshot {
     pub revision: u64,
     pub entries: Vec<WorkflowCatalogEntry>,
+}
+
+impl WorkflowCatalogSnapshot {
+    pub fn public_workflows(mut self) -> Self {
+        self.entries
+            .retain(WorkflowCatalogEntry::is_public_workflow);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +128,10 @@ pub struct WorkflowCatalogEvent {
     pub workflow_id: String,
     pub revision: u64,
     pub kind: WorkflowCatalogEventKind,
+    /// Whether this transition belongs to the public Workflow identity rather
+    /// than to an instruction-only Skill sharing the internal catalog.
+    #[serde(default)]
+    pub public_workflow: bool,
     /// `global`, `project:<id>`, or an opaque `workspace:<hash>`; never an
     /// absolute filesystem path.
     pub scope: String,
@@ -326,6 +347,22 @@ mod tests {
         assert!(!json.contains("prompt"));
         assert!(!json.contains("SKILL.md"));
         assert!(!json.contains("references"));
+    }
+
+    #[test]
+    fn workflow_event_decodes_legacy_payload_without_namespace_marker() {
+        let event: WorkflowCatalogEvent = serde_json::from_value(serde_json::json!({
+            "workflow_id": "legacy-review",
+            "revision": 7,
+            "kind": "changed",
+            "scope": "global"
+        }))
+        .expect("older event DTO remains readable");
+
+        assert_eq!(event.workflow_id, "legacy-review");
+        assert_eq!(event.revision, 7);
+        assert_eq!(event.kind, WorkflowCatalogEventKind::Changed);
+        assert!(!event.public_workflow);
     }
 
     #[tokio::test]

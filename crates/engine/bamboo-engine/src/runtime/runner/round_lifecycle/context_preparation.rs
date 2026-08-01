@@ -1,4 +1,4 @@
-use crate::llm_summarizer::LlmSummarizer;
+use crate::llm_summarizer::{LlmSummarizer, SummaryRequestBudget};
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_external_memory_context_block,
@@ -10,9 +10,9 @@ use bamboo_agent_core::{
     AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Role, Session,
 };
 use bamboo_compression::{
-    apply_compression_plan, build_forced_compression_plan_with_summary,
-    estimate_context_compression_exposure, prepare_hybrid_context, summary_source_messages,
-    PreparedContext, Summarizer, TiktokenTokenCounter, TokenBudget, TokenCounter,
+    apply_compression_plan, build_forced_compression_candidate_plan_with_fixed_tokens,
+    estimate_context_compression_exposure, finalize_compression_candidate_plan,
+    prepare_hybrid_context, PreparedContext, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
 use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload};
 use bamboo_llm::LLMProvider;
@@ -308,9 +308,15 @@ async fn maybe_apply_host_context_compression_with_budget(
     };
 
     let trigger_type_clone = trigger_type.clone();
+    let logical_pass_id = uuid::Uuid::new_v4().to_string();
 
-    let messages = summary_source_messages(session);
-    if messages.len() < 3 {
+    let active_non_system_count = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .filter(|message| !matches!(message.role, Role::System))
+        .count();
+    if active_non_system_count < 3 {
         tracing::warn!(
             "[{}] {} context compression skipped: usage={:.1}%, auto_threshold={:.1}%, critical_threshold={}%, not enough active messages ({})",
             session_id,
@@ -318,7 +324,7 @@ async fn maybe_apply_host_context_compression_with_budget(
             usage_percent,
             auto_threshold,
             FORCE_CONTEXT_COMPRESSION_PERCENT,
-            messages.len()
+            active_non_system_count
         );
         return Ok(false);
     }
@@ -338,6 +344,38 @@ async fn maybe_apply_host_context_compression_with_budget(
         emit_context_compression_status(event_tx, phase_label, "skipped_no_background_model").await;
         return Ok(false);
     };
+
+    let compression_context_blocks =
+        build_compression_context_blocks(session, config.app_data_dir.as_deref());
+    let counter = TiktokenTokenCounter::default();
+    let additional_fixed_tokens = compression_context_blocks
+        .iter()
+        .fold(0u32, |total, block| {
+            total.saturating_add(counter.count_message(&block.render_runtime_context_message()))
+        });
+    let candidate = match build_forced_compression_candidate_plan_with_fixed_tokens(
+        session,
+        model_name,
+        Some(budget),
+        config.summary_target_ratio,
+        trigger_type_clone,
+        additional_fixed_tokens,
+    ) {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            tracing::warn!(
+                "[{}] {} context compression pass {} candidate planning failed before summarization: {}",
+                session_id,
+                phase_label,
+                logical_pass_id,
+                reason
+            );
+            let status = format!("failed_candidate_plan:{reason}");
+            emit_context_compression_status(event_tx, phase_label, &status).await;
+            return Ok(false);
+        }
+    };
+    let messages = candidate.messages_to_summarize.clone();
 
     let mut hook_compression_instructions = Vec::new();
     if config
@@ -381,9 +419,6 @@ async fn maybe_apply_host_context_compression_with_budget(
         .conversation_summary
         .as_ref()
         .map(|summary| summary.content.clone());
-    let compression_context_blocks =
-        build_compression_context_blocks(session, config.app_data_dir.as_deref());
-
     let base_instructions = session
         .compression_instructions
         .as_deref()
@@ -407,58 +442,101 @@ async fn maybe_apply_host_context_compression_with_budget(
         .as_ref()
         .or(config.background_model_provider.as_ref())
         .unwrap_or(llm);
-    // Mid-turn compression is BEST-EFFORT (it runs between a turn's tool calls,
-    // after the assistant message is already committed). A transient
-    // summarization failure there must NOT be papered over with a low-quality
-    // heuristic summary that mutates in-flight context; it should SURFACE so the
-    // mid-turn call site can skip compression and continue with the uncompressed
-    // context (see `maybe_apply_mid_turn_context_compression_after_tool`). Every
-    // other phase (pre-turn, overflow-recovery) keeps the heuristic fallback so a
-    // round that genuinely needs the context reduced stays resilient. (issue #238)
-    let heuristic_fallback_on_error = phase_label != "mid-turn";
+    let summary_model_budget = super::token_budget::resolve_auxiliary_token_budget(
+        config,
+        summary_model,
+        summary_provider.as_ref(),
+    )
+    .await;
+    let summary_request_budget = SummaryRequestBudget::from_token_budget(
+        &summary_model_budget,
+        config.summary_safe_window_percent,
+        candidate.target_summary_tokens,
+        candidate.summary_target_ratio,
+    );
+    // A bounded pass is a single archive transaction even when it uses several
+    // provider requests. Any failed map/reduce stage must surface without
+    // substituting a heuristic summary, otherwise the caller could archive a
+    // candidate set after only part of the source was successfully processed.
+    // The mid-turn caller still swallows this error as best-effort (#238);
+    // pre-turn/overflow callers retain the unchanged session and can retry.
     let summarizer = LlmSummarizer::new(
         Arc::clone(summary_provider),
         summary_model.to_string(),
         existing_summary.clone(),
         None,
     )
-    .with_heuristic_fallback_on_error(heuristic_fallback_on_error)
+    .with_heuristic_fallback_on_error(false)
     .with_context_blocks(compression_context_blocks)
     .with_custom_instructions(compression_instructions)
     .with_summary_mode(if existing_summary.is_some() {
         crate::llm_summarizer::SummaryMode::IncrementalMerge
     } else {
         crate::llm_summarizer::SummaryMode::FullRewrite
-    });
+    })
+    .with_request_budget(summary_request_budget);
+    let mut summarizer =
+        summarizer.with_logical_pass_context(logical_pass_id.clone(), phase_label.to_string());
+    if let Some(tx) = event_tx {
+        let progress_tx = tx.clone();
+        let progress_phase = phase_label.to_string();
+        summarizer = summarizer.with_progress_callback(Arc::new(
+            move |progress: &crate::llm_summarizer::SummarizationProgress| {
+                let status = format!(
+                    "{}:{}/{} input={} output={} safe={} model_limit={}",
+                    progress.stage,
+                    progress.stage_index,
+                    progress.stage_count,
+                    progress.estimated_input_tokens,
+                    progress.requested_output_tokens,
+                    progress.safe_request_tokens,
+                    progress.model_context_tokens,
+                );
+                let _ = progress_tx.try_send(AgentEvent::ContextCompressionStatus {
+                    phase: progress_phase.clone(),
+                    status,
+                });
+            },
+        ));
+    }
     emit_context_compression_status(event_tx, phase_label, "started").await;
-    let summary = match summarizer.summarize(&messages).await {
-        Ok(summary) => summary,
+    let summary_report = match summarizer.summarize_with_report(&messages).await {
+        Ok(report) => report,
         Err(error) => {
-            emit_context_compression_status(event_tx, phase_label, "failed").await;
+            tracing::warn!(
+                logical_pass_id = %logical_pass_id,
+                phase = phase_label,
+                error = %error,
+                "Bounded context compression failed before commit"
+            );
+            let status = format!("failed:{error}");
+            emit_context_compression_status(event_tx, phase_label, &status).await;
             return Err(AgentError::Budget(error.to_string()));
         }
     };
 
-    let mut plan = match build_forced_compression_plan_with_summary(
-        session,
-        model_name,
-        Some(budget),
-        summary,
-        trigger_type_clone,
-    ) {
-        Ok(plan) => plan,
-        Err(reason) => {
-            tracing::warn!(
+    let mut plan =
+        match finalize_compression_candidate_plan(session, candidate, summary_report.content) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                tracing::warn!(
                 "[{}] {} context compression attempted (usage={:.1}%) but plan build failed: {}",
                 session_id,
                 phase_label,
                 usage_percent,
                 reason
             );
-            emit_context_compression_status(event_tx, phase_label, "failed").await;
-            return Ok(false);
-        }
-    };
+                let status = format!("failed_postcondition:{reason}");
+                emit_context_compression_status(event_tx, phase_label, &status).await;
+                return Ok(false);
+            }
+        };
+    plan.summary_budget_clamped = summary_report.budget_clamped;
+    plan.summary_budget_clamp_reason = summary_report.budget_clamp_reason;
+    plan.summarization_map_calls = summary_report.map_calls;
+    plan.summarization_reduce_calls = summary_report.reduce_calls;
+    plan.summarization_fallback_used = summary_report.fallback_used;
+    plan.logical_pass_id = Some(logical_pass_id);
 
     let elapsed = start.elapsed();
     let latency_ms = elapsed.as_millis() as u64;

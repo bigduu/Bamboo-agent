@@ -7,15 +7,8 @@
 # - agent::stream::handler - Legacy /stream endpoint, replaced by /execute + /events
 # - BambooConfig - Legacy config format, replaced by core::Config
 
-# Allow these lints globally
-msrv = "1.84"
-
-# Temporary: Allow MSRV violations until we update MSRV or refactor code
-# These are pre-existing issues, not introduced by recent changes
-#
-# Violations:
-# - is_none_or() stable since 1.82.0
-# - std::io::Error::other() stable since 1.74.0
+# Keep version-aware lints aligned with the workspace's declared MSRV.
+msrv = "1.95"
 
 # Allow doc over-indentation (pre-existing style)
 doc-valid-idents = []
