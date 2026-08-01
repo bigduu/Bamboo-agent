@@ -39,6 +39,7 @@ pub struct OpenAIProvider {
     base_url: String,
     responses_only_models: Vec<String>,
     default_reasoning_effort: Option<ReasoningEffort>,
+    explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
 }
@@ -52,6 +53,7 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
             default_reasoning_effort: None,
+            explicit_prompt_cache: true,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
         }
@@ -85,6 +87,16 @@ impl OpenAIProvider {
     /// Configure default reasoning effort for requests sent through this provider.
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.default_reasoning_effort = effort;
+        self
+    }
+
+    /// Enable or disable Bamboo-generated GPT-5.6+ explicit prompt-cache
+    /// controls for this provider instance.
+    ///
+    /// Disabling this does not remove a caller-supplied `prompt_cache_key`, so
+    /// compatible upstreams can continue using their implicit prompt cache.
+    pub fn with_explicit_prompt_cache(mut self, enabled: bool) -> Self {
+        self.explicit_prompt_cache = enabled;
         self
     }
 
@@ -175,6 +187,7 @@ impl OpenAIProvider {
             ResponsesInputSource::Explicit => "explicit",
             ResponsesInputSource::Generic => "generic",
         };
+        let generated_cache_plan = self.explicit_prompt_cache.then_some(cache_plan).flatten();
         let mut body = build_responses_body(
             model,
             messages,
@@ -183,7 +196,7 @@ impl OpenAIProvider {
             reasoning_effort,
             responses_options,
             parallel_tool_calls,
-            cache_plan,
+            generated_cache_plan,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -197,7 +210,7 @@ impl OpenAIProvider {
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
-            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} [{}]",
+            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} [{}]",
             session_log_id,
             model,
             reasoning_effort
@@ -212,6 +225,7 @@ impl OpenAIProvider {
             input_selection.original_len,
             input_selection.effective_len,
             input_selection.fallback_removed_duplicate_system,
+            self.explicit_prompt_cache,
             request_purpose
         );
 
@@ -261,7 +275,7 @@ impl OpenAIProvider {
                     reasoning_effort,
                     Some(&fallback_options),
                     parallel_tool_calls,
-                    cache_plan,
+                    generated_cache_plan,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -333,7 +347,7 @@ impl OpenAIProvider {
                     None,
                     Some(&fallback_options),
                     parallel_tool_calls,
-                    cache_plan,
+                    generated_cache_plan,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -696,6 +710,7 @@ mod tests {
         let provider = OpenAIProvider::new("test_key");
         assert_eq!(provider.api_key, "test_key");
         assert_eq!(provider.base_url, "https://api.openai.com/v1");
+        assert!(provider.explicit_prompt_cache);
     }
 
     #[test]
@@ -713,11 +728,13 @@ mod tests {
 
     #[test]
     fn test_chained_builders() {
-        let provider =
-            OpenAIProvider::new("test_key").with_base_url("https://custom.openai.com/v1");
+        let provider = OpenAIProvider::new("test_key")
+            .with_base_url("https://custom.openai.com/v1")
+            .with_explicit_prompt_cache(false);
 
         assert_eq!(provider.api_key, "test_key");
         assert_eq!(provider.base_url, "https://custom.openai.com/v1");
+        assert!(!provider.explicit_prompt_cache);
     }
 
     #[test]
@@ -1054,6 +1071,47 @@ mod tests {
         OpenAIProvider::new("test-key")
             .with_base_url(server.uri())
             .with_responses_only_models(vec!["gpt-5*".to_string()])
+    }
+
+    #[tokio::test]
+    async fn responses_can_disable_generated_explicit_cache_without_dropping_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = responses_provider(&server).with_explicit_prompt_cache(false);
+        let mut stable = Message::user("stable prefix");
+        stable.id = "stable-message".to_string();
+        let options = LLMRequestOptions {
+            responses: Some(ResponsesRequestOptions {
+                prompt_cache_key: Some("session-cache-key".to_string()),
+                ..Default::default()
+            }),
+            cache: Some(crate::cache::PromptCachePlan {
+                breakpoint_message_ids: vec!["stable-message".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream_with_options(&[stable], &[], None, "gpt-5.6-sol", Some(&options))
+            .await
+            .expect("Responses request without generated explicit cache fields");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["prompt_cache_key"], "session-cache-key");
+        assert!(body.get("prompt_cache_options").is_none());
+        assert!(!body.to_string().contains("prompt_cache_breakpoint"));
     }
 
     #[tokio::test]
