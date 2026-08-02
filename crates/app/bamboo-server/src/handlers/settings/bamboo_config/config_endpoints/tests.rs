@@ -623,6 +623,139 @@ async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     assert_eq!(limits[0]["max_context_tokens"], 128000);
 }
 
+#[actix_web::test]
+async fn omitted_model_limits_preserves_modular_section_data_and_revision() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    assert!(
+        state.config_facade.is_some(),
+        "AppState must use the modular section layout for this regression"
+    );
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    let seed = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({
+                "model_limits": [{
+                    "model_pattern": "preserved-model",
+                    "max_context_tokens": 128000,
+                    "max_output_tokens": 16000,
+                    "safety_margin": 1000
+                }]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        seed.status().is_success(),
+        "seeding model limits should succeed"
+    );
+
+    let path = model_limits_file_path(&data_dir);
+    let before: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .expect("model-limits section should exist"),
+    )
+    .expect("model-limits section should be valid JSON");
+    assert_eq!(before["data"][0]["model_pattern"], "preserved-model");
+    let before_revision = before["revision"]
+        .as_u64()
+        .expect("model-limits section should have a revision");
+
+    let unrelated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({"headless_auth": true}))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        unrelated.status().is_success(),
+        "unrelated config patch should succeed"
+    );
+
+    let after: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .expect("model-limits section should remain present"),
+    )
+    .expect("model-limits section should remain valid JSON");
+    assert_eq!(
+        after["data"], before["data"],
+        "omitting model_limits must preserve its data"
+    );
+    assert_eq!(
+        after["revision"].as_u64(),
+        Some(before_revision),
+        "omitting model_limits must not create a new section revision"
+    );
+}
+
+#[actix_web::test]
+async fn explicit_empty_model_limits_clears_modular_section() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    for model_limits in [
+        serde_json::json!([{
+            "model_pattern": "cleared-model",
+            "max_context_tokens": 64000,
+            "max_output_tokens": 8000
+        }]),
+        serde_json::json!([]),
+    ] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/bamboo/config")
+                .set_json(serde_json::json!({"model_limits": model_limits}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+    }
+
+    let section: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(model_limits_file_path(&data_dir))
+            .await
+            .expect("empty modular section should remain present"),
+    )
+    .expect("model-limits section should remain valid JSON");
+    assert_eq!(section["data"], serde_json::json!([]));
+    assert_eq!(
+        section["revision"].as_u64(),
+        Some(2),
+        "seed and explicit clear must each commit exactly one revision"
+    );
+}
+
 fn transaction_file_snapshot(data_dir: &std::path::Path) -> BTreeMap<String, Option<Vec<u8>>> {
     [
         "credentials.json",
