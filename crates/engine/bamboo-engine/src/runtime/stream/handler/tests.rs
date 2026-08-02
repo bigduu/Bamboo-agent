@@ -11,6 +11,7 @@ use bamboo_config::StreamTimeoutConfig;
 use bamboo_llm::provider::LLMError;
 use bamboo_llm::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
 use bamboo_llm::providers::common::openai_responses::ResponsesSseParser;
+use bamboo_llm::providers::common::sse::llm_stream_from_sse_multi_requiring_done;
 use bamboo_llm::{LLMChunk, LLMStream};
 
 use super::consume::consume_llm_stream_internal;
@@ -762,6 +763,78 @@ async fn transport_keepalives_allow_midstream_semantic_gap_after_120_seconds() {
     .expect("live stream should survive a 180-second semantic gap");
 
     assert_eq!(output.content, "firstsecond");
+}
+
+#[tokio::test(start_paused = true)]
+async fn sse_comment_heartbeats_survive_transport_timeout_until_responses_completion() {
+    let chunks = vec![
+        (
+            Duration::ZERO,
+            bytes::Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"first\"}\n\n",
+            ),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"second\"}\n\n",
+            ),
+        ),
+        (
+            Duration::ZERO,
+            bytes::Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\"}}\n\n",
+            ),
+        ),
+    ];
+    let body_stream = stream::unfold(chunks.into_iter(), |mut chunks| async move {
+        let (delay, chunk) = chunks.next()?;
+        tokio::time::sleep(delay).await;
+        Some((Ok::<_, std::io::Error>(chunk), chunks))
+    });
+    let response = reqwest::Response::from(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .expect("http response"),
+    );
+    let mut parser = ResponsesSseParser::new();
+    let stream = llm_stream_from_sse_multi_requiring_done(
+        response,
+        move |event, data| parser.handle_event_multi(event, data),
+        "OpenAI Responses",
+    );
+    let context = timeout_context(45, 200, 200);
+
+    let output = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-comment-heartbeat",
+        &context,
+    )
+    .await
+    .expect("comment heartbeats should preserve transport liveness");
+
+    assert_eq!(output.content, "firstsecond");
+    assert_eq!(output.response_id.as_deref(), Some("resp_done"));
 }
 
 #[tokio::test(start_paused = true)]
