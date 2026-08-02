@@ -417,6 +417,7 @@ impl SectionProjection {
         model_limits: ModelLimitsSection,
     ) -> ConfigStoreResult<Self> {
         let mut disk = config.clone();
+        disk.clear_legacy_provider_aliases_for_instance_mode();
         disk.ensure_provider_instance_credentials_isolated()
             .map_err(|error| crate::ConfigStoreError::Validation(error.to_string()))?;
         disk.sanitize_mcp_credential_refs_for_disk();
@@ -782,15 +783,29 @@ where
         });
     let has_legacy_raw = legacy_raw.is_some();
     let typed_baseline = serde_json::to_value(value)?;
+    let instance_native_providers = name == "providers.json"
+        && typed_baseline
+            .get("default_provider_instance")
+            .is_some_and(|value| !value.is_null());
     let mut merged_data = match legacy_raw {
         Some(mut raw) => {
+            if instance_native_providers {
+                remove_instance_native_legacy_provider_fields(&mut raw);
+            }
             deep_merge_typed_over_raw(&mut raw, typed_baseline);
             raw
         }
         None => typed_baseline,
     };
     if let Some(existing_data) = existing_data.as_ref() {
-        deep_merge_json(&mut merged_data, existing_data.clone());
+        let mut existing_data = existing_data.clone();
+        if instance_native_providers {
+            remove_instance_native_legacy_provider_fields(&mut existing_data);
+        }
+        deep_merge_json(&mut merged_data, existing_data);
+    }
+    if instance_native_providers {
+        remove_instance_native_legacy_provider_fields(&mut merged_data);
     }
     // A materialized default is still the revision-zero baseline. Preserve an
     // already-versioned sidecar when migration leaves its data byte-equivalent;
@@ -874,6 +889,25 @@ fn deep_merge_json(base: &mut Value, overlay: Value) {
             }
         }
         (base, overlay) => *base = overlay,
+    }
+}
+
+/// Remove only legacy routing and known built-in aliases from an
+/// instance-native providers document. Unknown keys remain untouched so a
+/// newer runtime's provider metadata survives migration by an older binary.
+fn remove_instance_native_legacy_provider_fields(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "provider",
+        "openai",
+        "anthropic",
+        "gemini",
+        "copilot",
+        "bodhi",
+    ] {
+        object.remove(key);
     }
 }
 
@@ -2549,6 +2583,7 @@ fn preflight_legacy_root_sections(
     if let Some(providers) = load_strict_sidecar_value(data_dir, "providers.json")? {
         validate_preflight_provider_secret_consistency(&providers)?;
     }
+    let instance_native_providers = projection.providers.default_provider_instance.is_some();
     for descriptor in SECTION_DESCRIPTORS
         .iter()
         .filter(|descriptor| descriptor.id != SectionId::Credentials)
@@ -2573,13 +2608,23 @@ fn preflight_legacy_root_sections(
         };
         let mut data = match sections.remove(&id) {
             Some(mut legacy) => {
+                if id == SectionId::Providers && instance_native_providers {
+                    remove_instance_native_legacy_provider_fields(&mut legacy);
+                }
                 deep_merge_typed_over_raw(&mut legacy, typed_baseline);
                 legacy
             }
             None => typed_baseline,
         };
-        if let Some(existing) = load_strict_sidecar_value(data_dir, id.descriptor().file_name)? {
+        if let Some(mut existing) = load_strict_sidecar_value(data_dir, id.descriptor().file_name)?
+        {
+            if id == SectionId::Providers && instance_native_providers {
+                remove_instance_native_legacy_provider_fields(&mut existing);
+            }
             deep_merge_json(&mut data, existing);
+        }
+        if id == SectionId::Providers && instance_native_providers {
+            remove_instance_native_legacy_provider_fields(&mut data);
         }
         match id {
             SectionId::Core => {
@@ -5792,6 +5837,15 @@ mod tests {
     fn instance_native_projection_omits_legacy_provider_routing() {
         let mut config = Config::default();
         config.provider = "anthropic".to_string();
+        config.providers_mut().openai = Some(crate::OpenAIConfig::default());
+        config.providers_mut().anthropic = Some(crate::AnthropicConfig::default());
+        config.providers_mut().gemini = Some(crate::GeminiConfig::default());
+        config.providers_mut().copilot = Some(crate::CopilotConfig::default());
+        config.providers_mut().bodhi = Some(serde_json::from_value(json!({})).unwrap());
+        config
+            .providers_mut()
+            .extra
+            .insert("future_provider".to_string(), json!({"kept": true}));
         config.provider_instances.insert(
             "work".to_string(),
             serde_json::from_value(json!({
@@ -5807,6 +5861,10 @@ mod tests {
         let durable = serde_json::to_value(&projection.providers).unwrap();
 
         assert!(durable.get("provider").is_none());
+        for key in ["openai", "anthropic", "gemini", "copilot", "bodhi"] {
+            assert!(durable.get(key).is_none(), "persisted legacy alias {key}");
+        }
+        assert_eq!(durable["future_provider"]["kept"], true);
         assert_eq!(durable["default_provider_instance"], "work");
         assert!(durable["provider_instances"]["work"].is_object());
     }
@@ -7621,6 +7679,107 @@ mod tests {
         );
         assert_eq!(data["openai"]["model"], "sidecar-model");
         assert_eq!(data["openai"]["future_provider"]["nested"], "kept");
+    }
+
+    #[test]
+    fn instance_native_dual_config_migration_drops_legacy_aliases_and_restarts() {
+        let _key = crate::encryption::set_test_encryption_key([0x64; 32]);
+        let dir = TempDir::new().unwrap();
+        let instance_secret = "instance-native-migration-secret";
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "anthropic",
+                "defaults": {
+                    "chat": {"provider": "work", "model": "gpt-instance"}
+                },
+                "features": {
+                    "provider_model_ref": true,
+                    "dynamic_model_routing": false
+                },
+                "provider_instances": {
+                    "work": {
+                        "provider_type": "openai",
+                        "api_key": instance_secret,
+                        "model": "gpt-instance",
+                        "explicit_prompt_cache": false,
+                        "enabled": true,
+                        "future_instance": {"nested": "kept"}
+                    }
+                },
+                "default_provider_instance": "work",
+                "providers": {
+                    "openai": {"model": "inline-stale"},
+                    "anthropic": {"model": "inline-stale"},
+                    "future_provider": {"from_root": true}
+                }
+            }),
+        );
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({
+                "provider": "gemini",
+                "openai": {"model": "sidecar-stale"},
+                "gemini": {"model": "sidecar-stale"},
+                "future_provider": {"from_sidecar": true}
+            }),
+        );
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+
+        let providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        let data = &providers["data"];
+        for key in [
+            "provider",
+            "openai",
+            "anthropic",
+            "gemini",
+            "copilot",
+            "bodhi",
+        ] {
+            assert!(data.get(key).is_none(), "migrated legacy field {key}");
+        }
+        assert_eq!(data["default_provider_instance"], "work");
+        assert_eq!(data["defaults"]["chat"]["provider"], "work");
+        assert_eq!(data["features"]["provider_model_ref"], true);
+        assert_eq!(
+            data["provider_instances"]["work"]["future_instance"]["nested"],
+            "kept"
+        );
+        assert_eq!(
+            data["provider_instances"]["work"][crate::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY],
+            false
+        );
+        assert_eq!(data["future_provider"]["from_root"], true);
+        assert_eq!(data["future_provider"]["from_sidecar"], true);
+        assert!(!std::fs::read_to_string(dir.path().join("providers.json"))
+            .unwrap()
+            .contains(instance_secret));
+
+        let restarted = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(restarted.default_provider_instance.as_deref(), Some("work"));
+        assert_eq!(
+            restarted.provider_instances["work"].api_key,
+            instance_secret
+        );
+        assert_eq!(
+            restarted.provider_instances["work"].extra["future_instance"]["nested"],
+            "kept"
+        );
+        assert_eq!(
+            restarted.provider_instances["work"].extra
+                [crate::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY],
+            false
+        );
+        assert!(restarted.providers().openai.is_none());
+        assert!(restarted.providers().anthropic.is_none());
+        assert!(restarted.providers().gemini.is_none());
+        assert_eq!(
+            restarted.providers().extra["future_provider"]["from_sidecar"],
+            true
+        );
     }
 
     #[test]

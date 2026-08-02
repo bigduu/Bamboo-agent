@@ -1679,21 +1679,27 @@ struct NetworkConfigSection {
     server: ServerConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderRoutingConfigSection {
-    /// Legacy single-provider routing key.
-    ///
-    /// An explicit provider-instance default is authoritative, so persisting
-    /// this compatibility field in that mode only creates stale state that can
-    /// disagree with `default_provider_instance`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
+    #[serde(default = "default_provider")]
+    provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     defaults: Option<DefaultsConfig>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     provider_instances: HashMap<String, ProviderInstanceConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_provider_instance: Option<String>,
+}
+
+impl Default for ProviderRoutingConfigSection {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            defaults: None,
+            provider_instances: HashMap::new(),
+            default_provider_instance: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1858,8 +1864,6 @@ impl From<ConfigValues> for ConfigRoot {
             extra,
         } = values;
 
-        let provider = default_provider_instance.is_none().then_some(provider);
-
         Self {
             network: NetworkConfigSection {
                 http_proxy,
@@ -1967,7 +1971,7 @@ impl From<ConfigRoot> for ConfigValues {
             proxy_auth_encrypted,
             proxy_auth_credential_ref,
             headless_auth,
-            provider: provider.unwrap_or_else(default_provider),
+            provider,
             defaults,
             provider_instances,
             default_provider_instance,
@@ -1993,6 +1997,24 @@ impl From<ConfigRoot> for ConfigValues {
             extra,
         }
     }
+}
+
+/// Serialize the root-only durable document.
+///
+/// Public `Config` serialization intentionally retains the historical
+/// compatibility shape, including the legacy `provider` selector. Durable
+/// instance-native writes are narrower: the explicit instance default is the
+/// routing authority, so legacy routing fields must not be written back.
+fn durable_root_value(values: ConfigValues) -> serde_json::Result<Value> {
+    let instance_native = values.default_provider_instance.is_some();
+    let mut value = serde_json::to_value(ConfigRoot::from(values))?;
+    if instance_native {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("provider");
+            object.remove("providers");
+        }
+    }
+    Ok(value)
 }
 
 define_counted_struct! {
@@ -2140,6 +2162,19 @@ pub struct ProviderConfigs {
     /// Preserve unknown provider keys (forward compatibility).
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl ProviderConfigs {
+    /// Remove only the known legacy selector and built-in aliases while
+    /// preserving unknown forward-compatible provider entries in `extra`.
+    pub fn clear_legacy_builtin_aliases(&mut self) {
+        self.openai = None;
+        self.anthropic = None;
+        self.gemini = None;
+        self.copilot = None;
+        self.bodhi = None;
+        self.extra.remove("provider");
+    }
 }
 
 /// Feature flags for incremental rollout of new subsystems.
@@ -3213,6 +3248,15 @@ impl Config {
 
     pub fn providers_mut(&mut self) -> &mut ProviderConfigs {
         &mut self.providers.0
+    }
+
+    /// Canonicalize only the durable provider view when instance routing is
+    /// authoritative. Unknown provider entries remain available for forward
+    /// compatibility.
+    pub(crate) fn clear_legacy_provider_aliases_for_instance_mode(&mut self) {
+        if self.default_provider_instance.is_some() {
+            self.providers.0.clear_legacy_builtin_aliases();
+        }
     }
 
     /// Build the legacy full-config JSON view used by in-memory patching APIs.
@@ -4304,6 +4348,7 @@ impl Config {
     /// refreshed into their encrypted at-rest representation.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         let mut config = self.clone();
+        config.clear_legacy_provider_aliases_for_instance_mode();
         config.refresh_provider_api_keys_encrypted()?;
         config.providers.save_sync(data_dir)
     }
@@ -4323,6 +4368,7 @@ impl Config {
         }
 
         let mut to_save = self.clone();
+        to_save.clear_legacy_provider_aliases_for_instance_mode();
         to_save.extra.remove("data_dir");
         to_save.extra.remove("model");
         to_save.refresh_encrypted_secrets()?;
@@ -4335,7 +4381,7 @@ impl Config {
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
 
-        let mut root = serde_json::to_value(ConfigRoot::from(to_save.values.clone()))
+        let mut root = durable_root_value(to_save.values.clone())
             .context("Failed to serialize root config DTO to JSON")?;
         if let Some(object) = root.as_object_mut() {
             object.remove("connect");
@@ -4541,6 +4587,7 @@ impl Config {
         }
 
         let mut to_save = self.clone();
+        to_save.clear_legacy_provider_aliases_for_instance_mode();
         // Never persist `data_dir` into config.json (data dir is runtime-derived).
         to_save.extra.remove("data_dir");
         // Root-level `model` is deprecated; do not persist it.
@@ -4566,7 +4613,7 @@ impl Config {
         // in-memory struct) — only the serialized DOCUMENT that becomes
         // config.json's bytes has the key stripped, and that's done on the
         // `serde_json::Value` here, not via `#[serde(skip)]` on the field.
-        let mut config_value = serde_json::to_value(ConfigRoot::from(to_save.values.clone()))
+        let mut config_value = durable_root_value(to_save.values.clone())
             .context("Failed to serialize root config DTO to JSON")?;
         if let Some(obj) = config_value.as_object_mut() {
             obj.remove("connect");
@@ -5259,31 +5306,104 @@ mod tests {
     }
 
     #[test]
-    fn persistence_omits_legacy_provider_when_instance_default_is_explicit() {
+    fn compatibility_serialization_keeps_legacy_provider_in_instance_mode() {
         let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
             "provider_type": "openai",
             "enabled": true
         }))
         .unwrap();
-        let values = ConfigValues {
-            provider: "gemini".to_string(),
-            provider_instances: std::collections::HashMap::from([("work".to_string(), instance)]),
-            default_provider_instance: Some("work".to_string()),
-            ..ConfigValues::default()
-        };
+        let mut config = Config::default();
+        config.values.provider = "gemini".to_string();
+        config
+            .provider_instances
+            .insert("work".to_string(), instance);
+        config.default_provider_instance = Some("work".to_string());
+        config.providers_mut().openai = Some(OpenAIConfig::default());
 
-        let json = serde_json::to_value(ConfigRoot::from(values)).unwrap();
-        assert!(json.get("provider").is_none());
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["provider"], "gemini");
+        assert!(json["providers"]["openai"].is_object());
         assert_eq!(json["default_provider_instance"], "work");
 
-        let root: ConfigRoot = serde_json::from_value(json).unwrap();
-        let round_trip = ConfigValues::from(root);
-        assert_eq!(round_trip.provider, default_provider());
+        let round_trip: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.provider, "gemini");
         assert_eq!(
             round_trip.default_provider_instance.as_deref(),
             Some("work")
         );
         assert!(round_trip.provider_instances.contains_key("work"));
+        assert!(round_trip.providers().openai.is_some());
+    }
+
+    #[test]
+    fn instance_native_durable_writes_remove_only_legacy_builtin_aliases() {
+        let _key = crate::encryption::set_test_encryption_key([0x73; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.values.provider = "anthropic".to_string();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "model": "gpt-instance",
+                "enabled": true,
+                "future_instance_metadata": "preserved"
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+        config.features.provider_model_ref = true;
+        config.providers_mut().openai = Some(OpenAIConfig::default());
+        config.providers_mut().anthropic = Some(AnthropicConfig::default());
+        config
+            .providers_mut()
+            .extra
+            .insert("provider".to_string(), serde_json::json!("anthropic"));
+        config.providers_mut().extra.insert(
+            "future_provider".to_string(),
+            serde_json::json!({"kept": true}),
+        );
+
+        let (root_bytes, provider_bytes) =
+            config.prepare_provider_transaction_documents(&[]).unwrap();
+        let root: Value = serde_json::from_slice(&root_bytes).unwrap();
+        let providers: Value = serde_json::from_slice(&provider_bytes).unwrap();
+        assert!(root.get("provider").is_none());
+        assert!(root.get("providers").is_none());
+        assert_eq!(root["default_provider_instance"], "work");
+        assert_eq!(
+            root["provider_instances"]["work"]["future_instance_metadata"],
+            "preserved"
+        );
+        assert!(providers.get("provider").is_none());
+        for key in ["openai", "anthropic", "gemini", "copilot", "bodhi"] {
+            assert!(providers.get(key).is_none(), "persisted legacy alias {key}");
+        }
+        assert_eq!(providers["future_provider"]["kept"], true);
+
+        config.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let saved_root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        let saved_providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert!(saved_root.get("provider").is_none());
+        assert!(saved_root.get("providers").is_none());
+        assert_eq!(saved_root["default_provider_instance"], "work");
+        assert!(saved_providers.get("openai").is_none());
+        assert!(saved_providers.get("anthropic").is_none());
+        assert!(saved_providers.get("provider").is_none());
+        assert_eq!(saved_providers["future_provider"]["kept"], true);
+
+        config.providers_mut().gemini = Some(GeminiConfig::default());
+        config.save_providers_to_dir(dir.path()).unwrap();
+        let provider_only: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert!(provider_only.get("gemini").is_none());
+        assert!(provider_only.get("provider").is_none());
+        assert_eq!(provider_only["future_provider"]["kept"], true);
     }
 
     #[test]

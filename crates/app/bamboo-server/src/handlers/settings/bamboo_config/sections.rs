@@ -401,7 +401,7 @@ pub async fn put_provider_settings_section(
 
             let ProviderSettingsData {
                 provider,
-                providers,
+                mut providers,
                 defaults,
                 features,
                 provider_instances,
@@ -409,6 +409,10 @@ pub async fn put_provider_settings_section(
                 available_providers: _,
                 credential_status: _,
             } = data;
+
+            if default_provider_instance_id.is_some() {
+                providers.clear_legacy_builtin_aliases();
+            }
 
             for name in ["openai", "anthropic", "gemini", "bodhi"] {
                 if provider_exists(current.providers(), name) && !provider_exists(&providers, name)
@@ -2616,10 +2620,8 @@ mod tests {
         assert!(!updated_body.contains(hidden_forward_value));
         let updated: Value = serde_json::from_str(&updated_body).unwrap();
         assert_eq!(updated["revision"], 2);
-        assert_eq!(
-            updated["data"]["providers"]["openai"]["model"],
-            "gpt-edited"
-        );
+        assert_eq!(updated["data"]["providers"], json!({}));
+        assert_eq!(updated["data"]["credential_status"]["providers"], json!({}));
         assert_eq!(updated["data"]["defaults"]["fast"]["model"], "gpt-fast");
         assert_eq!(updated["data"]["features"]["provider_model_ref"], true);
         assert_eq!(updated["data"]["default_provider_instance_id"], "work");
@@ -2628,13 +2630,15 @@ mod tests {
             true
         );
 
+        let mut stale_data = updated["data"].clone();
+        stale_data["defaults"]["fast"]["model"] = json!("lost-update");
         let stale = test::call_service(
             &app,
             test::TestRequest::put()
                 .uri("/provider-settings")
                 .set_json(json!({
                     "expected_revision": 1,
-                    "data": editable_provider_settings()
+                    "data": stale_data
                 }))
                 .to_request(),
         )
@@ -2658,6 +2662,7 @@ mod tests {
         let mut cleared = updated["data"].clone();
         cleared["provider_instances"] = json!({});
         cleared["default_provider_instance_id"] = Value::Null;
+        cleared["providers"] = editable_provider_settings()["providers"].clone();
         let cleared = test::call_service(
             &app,
             test::TestRequest::put()
@@ -2666,6 +2671,10 @@ mod tests {
                     "expected_revision": 2,
                     "data": cleared,
                     "credential_changes": {
+                        "providers": {
+                            "openai": {"action": "replace", "value": openai_secret},
+                            "anthropic": {"action": "replace", "value": anthropic_secret}
+                        },
                         "provider_instances": {
                             "work": {"action": "clear"}
                         }
@@ -2684,6 +2693,19 @@ mod tests {
         assert_eq!(cleared["revision"], 3);
         assert!(cleared["data"]["provider_instances"]["work"].is_null());
         assert!(cleared["data"]["provider_instances"]["personal"].is_null());
+        state
+            .config
+            .write()
+            .await
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert(
+                "future_provider_metadata".to_string(),
+                json!(hidden_forward_value),
+            );
 
         let mut metadata_only = cleared["data"].clone();
         metadata_only["providers"]["openai"]["model"] = json!("gpt-metadata-only");
@@ -2775,9 +2797,18 @@ mod tests {
 
     #[actix_web::test]
     async fn instance_native_provider_settings_save_without_legacy_provider_fields() {
-        let _key = bamboo_config::encryption::set_test_encryption_key([0x74; 32]);
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        {
+            let mut config = state.config.write().await;
+            config.provider = "anthropic".to_string();
+            *config.providers_mut() = serde_json::from_value(json!({
+                "openai": {"model": "stale-openai"},
+                "anthropic": {"model": "stale-anthropic"}
+            }))
+            .unwrap();
+        }
         let app = test::init_service(
             App::new().app_data(state.clone()).service(
                 web::resource("/provider-settings")
@@ -2786,6 +2817,8 @@ mod tests {
             ),
         )
         .await;
+        let work_secret = "instance-native-work-secret";
+        let personal_secret = "instance-native-personal-secret";
 
         let saved = test::call_service(
             &app,
@@ -2797,7 +2830,8 @@ mod tests {
                         "provider": "anthropic",
                         "providers": {},
                         "defaults": {
-                            "chat": {"provider": "work", "model": "gpt-instance"}
+                            "chat": {"provider": "work", "model": "gpt-instance"},
+                            "fast": {"provider": "personal", "model": "claude-instance"}
                         },
                         "features": {
                             "provider_model_ref": true,
@@ -2808,13 +2842,19 @@ mod tests {
                                 "provider_type": "openai",
                                 "model": "gpt-instance",
                                 "enabled": true
+                            },
+                            "personal": {
+                                "provider_type": "anthropic",
+                                "model": "claude-instance",
+                                "enabled": true
                             }
                         },
                         "default_provider_instance_id": "work"
                     },
                     "credential_changes": {
                         "provider_instances": {
-                            "work": {"action": "replace", "value": "sk-instance-only"}
+                            "work": {"action": "replace", "value": work_secret},
+                            "personal": {"action": "replace", "value": personal_secret}
                         }
                     }
                 }))
@@ -2827,13 +2867,42 @@ mod tests {
             status.is_success(),
             "unexpected instance-native provider response {status}: {body}"
         );
-        assert!(!body.contains("sk-instance-only"));
+        assert!(!body.contains(work_secret));
+        assert!(!body.contains(personal_secret));
         let saved: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(saved["revision"], 1);
+        assert_eq!(saved["data"]["providers"], json!({}));
         assert_eq!(
             saved["data"]["credential_status"]["provider_instances"]["work"]["configured"],
             true
         );
+        assert_eq!(
+            saved["data"]["credential_status"]["provider_instances"]["personal"]["configured"],
+            true
+        );
+
+        let no_op = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": saved["data"].clone()
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = no_op.status();
+        let no_op_body = String::from_utf8(test::read_body(no_op).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "instance-native no-op save failed {status}: {no_op_body}"
+        );
+        assert!(!no_op_body.contains(work_secret));
+        assert!(!no_op_body.contains(personal_secret));
+        let no_op: Value = serde_json::from_str(&no_op_body).unwrap();
+        assert_eq!(no_op["revision"], 1);
+        assert_eq!(no_op["data"]["providers"], json!({}));
 
         let round_trip = test::call_service(
             &app,
@@ -2853,18 +2922,103 @@ mod tests {
             status.is_success(),
             "instance-native settings round trip failed {status}: {round_trip_body}"
         );
+        assert!(!round_trip_body.contains(work_secret));
+        assert!(!round_trip_body.contains(personal_secret));
+        let round_trip: Value = serde_json::from_str(&round_trip_body).unwrap();
+        assert_eq!(round_trip["revision"], 1);
+        assert_eq!(round_trip["data"]["providers"], json!({}));
+
+        let root_document: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert!(root_document.get("provider").is_none());
+        assert!(root_document.get("providers").is_none());
 
         let provider_document: Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
                 .unwrap();
         let provider_data = &provider_document["data"];
         assert!(provider_data.get("provider").is_none());
-        assert!(provider_data.get("openai").is_none());
-        assert!(provider_data.get("anthropic").is_none());
+        for key in ["openai", "anthropic", "gemini", "copilot", "bodhi"] {
+            assert!(
+                provider_data.get(key).is_none(),
+                "persisted legacy alias {key}"
+            );
+        }
         assert_eq!(provider_data["default_provider_instance"], "work");
+        assert_eq!(provider_data["defaults"]["fast"]["provider"], "personal");
+        assert_eq!(provider_data["features"]["provider_model_ref"], true);
+        assert!(provider_data["provider_instances"]["work"].is_object());
+        assert!(provider_data["provider_instances"]["personal"].is_object());
+        let work_ref = CredentialRef::parse(
+            provider_data["provider_instances"]["work"]["credential_ref"]
+                .as_str()
+                .expect("work credential ref is durable")
+                .to_string(),
+        )
+        .unwrap();
+        let personal_ref = CredentialRef::parse(
+            provider_data["provider_instances"]["personal"]["credential_ref"]
+                .as_str()
+                .expect("personal credential ref is durable")
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&work_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            work_secret
+        );
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&personal_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            personal_secret
+        );
+        let durable = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
+        assert!(!durable.contains(work_secret));
+        assert!(!durable.contains(personal_secret));
 
         assert!(state.config.read().await.providers().openai.is_none());
         assert!(state.config.read().await.providers().anthropic.is_none());
+        assert_eq!(state.config.read().await.provider_instances.len(), 2);
+
+        drop(app);
+        drop(state);
+        let restarted = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let restarted_health = restarted
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            restarted_health.status,
+            SectionStatus::Healthy,
+            "provider restart health: {restarted_health:?}"
+        );
+        let restarted_config = restarted.config.read().await;
+        assert_eq!(
+            restarted_config.default_provider_instance.as_deref(),
+            Some("work")
+        );
+        assert_eq!(restarted_config.provider_instances.len(), 2);
+        assert_eq!(
+            restarted_config.provider_instances["work"].api_key,
+            work_secret
+        );
+        assert_eq!(
+            restarted_config.provider_instances["personal"].api_key,
+            personal_secret
+        );
+        assert!(restarted_config.providers().openai.is_none());
+        assert!(restarted_config.providers().anthropic.is_none());
     }
 
     #[actix_web::test]
