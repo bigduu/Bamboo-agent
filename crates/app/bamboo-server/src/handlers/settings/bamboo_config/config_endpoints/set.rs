@@ -108,12 +108,14 @@ pub async fn set_bamboo_config(
         )
         .await?;
 
-    // Persist model_limits.json under the config write lock so two concurrent
-    // set_bamboo_config calls can't race / clobber each other's writes (the
-    // write itself is now atomic too — see common::write_model_limits_file). #42.
-    {
+    // Omission means "leave this independently owned section unchanged"; only
+    // an explicit model_limits field may replace or clear it. Persist under the
+    // config write lock so concurrent compatibility writes cannot clobber each
+    // other (the file commit is atomic too — see common::write_model_limits_file).
+    // #42, #775.
+    if let Some(model_limits_patch) = model_limits_patch.as_ref() {
         let _config_guard = app_state.config.write().await;
-        write_model_limits_file(&app_state.app_data_dir, model_limits_patch.as_ref()).await?;
+        write_model_limits_file(&app_state.app_data_dir, Some(model_limits_patch)).await?;
     }
 
     if effects.reload_provider == config_manager::ReloadMode::BestEffort {
