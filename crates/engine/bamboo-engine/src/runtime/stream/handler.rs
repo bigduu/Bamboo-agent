@@ -1,8 +1,12 @@
+use std::future::Future;
+use std::time::Duration;
+
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::tools::ToolCall;
-use bamboo_agent_core::{AgentError, AgentEvent};
+use bamboo_agent_core::{AgentError, AgentEvent, StreamTimeoutError, StreamTimeoutPhase};
 use bamboo_config::StreamTimeoutConfig;
 use bamboo_llm::LLMStream;
 
@@ -18,6 +22,8 @@ pub struct StreamTimeoutContext {
     pub(crate) policy: StreamTimeoutConfig,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
+    request_started_at: Option<Instant>,
+    turn_retry_eligible: bool,
 }
 
 impl StreamTimeoutContext {
@@ -35,13 +41,90 @@ impl StreamTimeoutContext {
             policy,
             provider: provider.and_then(sanitize_identifier),
             model: model.and_then(sanitize_identifier),
+            request_started_at: None,
+            turn_retry_eligible: false,
         }
+    }
+
+    /// Mark this as the primary turn response. Only that stream can safely ask
+    /// the outer agent loop to replay a timeout that occurs before semantic
+    /// output; auxiliary streams may run after durable turn side effects.
+    pub(crate) fn allow_turn_retry_before_semantic_output(mut self) -> Self {
+        self.turn_retry_eligible = true;
+        self
+    }
+
+    /// Bind a fresh request-dispatch timestamp so the first-semantic deadline
+    /// includes provider bootstrap time as documented.
+    pub(crate) fn begin_request(mut self) -> Self {
+        self.request_started_at = Some(Instant::now());
+        self
+    }
+
+    fn timeout_error(
+        &self,
+        session_id: &str,
+        phase: StreamTimeoutPhase,
+        deadline: Duration,
+        last_transport: Duration,
+        last_semantic: Option<Duration>,
+    ) -> AgentError {
+        let timeout = StreamTimeoutError::new(
+            phase,
+            deadline,
+            self.provider.clone(),
+            self.model.clone(),
+            last_transport,
+            last_semantic,
+            self.turn_retry_eligible,
+        );
+        tracing::warn!("[{}] LLM stream watchdog expired: {}", session_id, timeout,);
+        AgentError::StreamTimeout(timeout)
     }
 }
 
 impl Default for StreamTimeoutContext {
     fn default() -> Self {
         Self::new(StreamTimeoutConfig::default(), None, None)
+    }
+}
+
+/// Wait for a provider call to establish its response stream while preserving
+/// cancellation and the existing transport-idle policy.
+///
+/// Provider implementations return [`LLMStream`] only after the initial HTTP
+/// response has been established. Without this outer watchdog, a proxy that
+/// accepts the request but never returns response headers can hold the agent
+/// forever before the normal per-frame stream watchdog starts.
+pub(crate) async fn await_stream_bootstrap<F, T>(
+    future: F,
+    cancel_token: &CancellationToken,
+    session_id: &str,
+    timeout_context: &StreamTimeoutContext,
+) -> Result<T, AgentError>
+where
+    F: Future<Output = T>,
+{
+    let started_at = timeout_context
+        .request_started_at
+        .unwrap_or_else(Instant::now);
+    let deadline = Duration::from_secs(timeout_context.policy.transport_idle_timeout_secs);
+    let expires_at = started_at + deadline;
+
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => Err(AgentError::Cancelled),
+        result = future => Ok(result),
+        _ = tokio::time::sleep_until(expires_at) => {
+            let now = Instant::now();
+            Err(timeout_context.timeout_error(
+                session_id,
+                StreamTimeoutPhase::Bootstrap,
+                deadline,
+                now.saturating_duration_since(started_at),
+                None,
+            ))
+        }
     }
 }
 

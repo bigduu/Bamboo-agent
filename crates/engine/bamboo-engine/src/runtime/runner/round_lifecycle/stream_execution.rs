@@ -869,26 +869,41 @@ pub(super) async fn execute_llm_stream(
     planned.render.log(session_id);
     persist_request_render_metadata(session, &planned.render);
 
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+        config.stream_timeout,
+        provider_name,
+        Some(model),
+    )
+    .allow_turn_retry_before_semantic_output()
+    .begin_request();
+
     // ONE canonical dispatch: every provider renders the IR. The default lowering
     // (chat / continuation-delta) and the provider overrides (Anthropic block-native
     // system, OpenAI/Copilot Responses view) all derive their wire from this IR.
-    let stream = llm
-        .chat_stream_ir(
+    // The provider future itself is covered by the same transport-idle policy as
+    // the returned stream. This bounds proxies that accept the request but never
+    // return response headers, a phase the per-frame watchdog cannot observe.
+    let stream = crate::runtime::stream::handler::await_stream_bootstrap(
+        llm.chat_stream_ir(
             &prepared_envelope.ir,
             tool_schemas,
             Some(max_output_tokens),
             model,
             Some(&planned.request_options),
-        )
-        .await
-        .map_err(|error| {
-            let message = format_provider_error(error);
-            if is_llm_overflow_error(&message) {
-                AgentError::LLMOverflow(message)
-            } else {
-                AgentError::LLM(message)
-            }
-        })?;
+        ),
+        cancel_token,
+        session_id,
+        &timeout_context,
+    )
+    .await?
+    .map_err(|error| {
+        let message = format_provider_error(error);
+        if is_llm_overflow_error(&message) {
+            AgentError::LLMOverflow(message)
+        } else {
+            AgentError::LLM(message)
+        }
+    })?;
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.
@@ -918,11 +933,6 @@ pub(super) async fn execute_llm_stream(
         );
     }
 
-    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
-        config.stream_timeout,
-        provider_name,
-        Some(model),
-    );
     // A single structured explicit workflow has a fail-closed first step: the
     // model must call load_skill before any answer tokens become user-visible.
     // Keep that first stream silent; the pipeline verifies and executes the

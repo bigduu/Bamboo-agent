@@ -17,7 +17,7 @@ pub use agent::types::{
     ImageUrlRef, Message, MessageContent, MessagePart, MessagePhase, PendingQuestion,
     PendingQuestionSource, PromptMemoryObservability, PromptSnapshot, Role, Session, SessionKind,
 };
-pub use agent::AgentError;
+pub use agent::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
 pub use bamboo_domain::TokenBudgetUsage;
 pub use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,

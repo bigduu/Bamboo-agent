@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::GoldConfig;
 use crate::runtime::stream::handler::{
-    consume_llm_stream_silent_with_context, StreamTimeoutContext,
+    await_stream_bootstrap, consume_llm_stream_silent_with_context, StreamTimeoutContext,
 };
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
@@ -213,48 +213,46 @@ pub async fn evaluate_gold(
         cache: None,
     };
 
-    match llm
-        .chat_stream_with_options(
+    let timeout_context = frame.timeout_context.clone().begin_request();
+    let cancel_token = CancellationToken::new();
+    let stream = await_stream_bootstrap(
+        llm.chat_stream_with_options(
             &messages,
             &tools,
             Some(config.max_output_tokens),
             model,
             Some(&request_options),
-        )
-        .await
-    {
-        Ok(stream) => {
-            let stream_output = consume_llm_stream_silent_with_context(
-                stream,
-                &CancellationToken::new(),
-                session_id,
-                &frame.timeout_context,
-            )
+        ),
+        &cancel_token,
+        session_id,
+        &timeout_context,
+    )
+    .await?
+    .map_err(|error| AgentError::LLM(error.to_string()))?;
+    let stream_output =
+        consume_llm_stream_silent_with_context(stream, &cancel_token, session_id, &timeout_context)
             .await?;
 
-            let result = parse_gold_evaluation(
-                &stream_output.content,
-                &stream_output.tool_calls,
-                checkpoint,
-                iteration,
-                prompt_tokens,
-            );
+    let result = parse_gold_evaluation(
+        &stream_output.content,
+        &stream_output.tool_calls,
+        checkpoint,
+        iteration,
+        prompt_tokens,
+    );
 
-            let _ = event_tx
-                .send(AgentEvent::GoldEvaluationCompleted {
-                    session_id: session_id.to_string(),
-                    checkpoint: result.checkpoint,
-                    iteration: result.iteration,
-                    decision: result.decision,
-                    confidence: result.confidence,
-                    reasoning: result.reasoning.clone(),
-                })
-                .await;
+    let _ = event_tx
+        .send(AgentEvent::GoldEvaluationCompleted {
+            session_id: session_id.to_string(),
+            checkpoint: result.checkpoint,
+            iteration: result.iteration,
+            decision: result.decision,
+            confidence: result.confidence,
+            reasoning: result.reasoning.clone(),
+        })
+        .await;
 
-            Ok(result)
-        }
-        Err(error) => Err(AgentError::LLM(error.to_string())),
-    }
+    Ok(result)
 }
 
 pub fn build_gold_messages(

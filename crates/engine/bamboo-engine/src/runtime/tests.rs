@@ -374,6 +374,14 @@ struct AlwaysTransientProvider {
     calls: AtomicUsize,
 }
 
+struct BootstrapStallThenSuccessProvider {
+    calls: AtomicUsize,
+}
+
+struct TransportStallThenSuccessProvider {
+    calls: AtomicUsize,
+}
+
 #[async_trait]
 impl LLMProvider for AlwaysTransientProvider {
     async fn chat_stream(
@@ -387,6 +395,46 @@ impl LLMProvider for AlwaysTransientProvider {
         Err(LLMError::Api(
             "temporary provider dispatch failure".to_string(),
         ))
+    }
+}
+
+#[async_trait]
+impl LLMProvider for BootstrapStallThenSuccessProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => std::future::pending::<Result<LLMStream, LLMError>>().await,
+            1 => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("bootstrap retry recovered".to_string())),
+                Ok(LLMChunk::Done),
+            ]))),
+            call => panic!("unexpected LLM call {call}"),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for TransportStallThenSuccessProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(Box::pin(stream::pending())),
+            1 => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("transport retry recovered".to_string())),
+                Ok(LLMChunk::Done),
+            ]))),
+            call => panic!("unexpected LLM call {call}"),
+        }
     }
 }
 
@@ -499,6 +547,21 @@ async fn build_direct_execute_agent(
     persistence_override: Option<Arc<dyn RuntimeSessionPersistence>>,
     tools_override: Option<Arc<dyn ToolExecutor>>,
 ) -> (tempfile::TempDir, crate::runtime::Agent, Arc<dyn Storage>) {
+    build_direct_execute_agent_with_config(
+        provider,
+        persistence_override,
+        tools_override,
+        bamboo_llm::Config::default(),
+    )
+    .await
+}
+
+async fn build_direct_execute_agent_with_config(
+    provider: Arc<dyn LLMProvider>,
+    persistence_override: Option<Arc<dyn RuntimeSessionPersistence>>,
+    tools_override: Option<Arc<dyn ToolExecutor>>,
+    config: bamboo_llm::Config,
+) -> (tempfile::TempDir, crate::runtime::Agent, Arc<dyn Storage>) {
     let temp = tempfile::tempdir().expect("tempdir");
     let session_store = Arc::new(
         bamboo_storage::SessionStoreV2::new(temp.path().join("sessions"))
@@ -522,7 +585,7 @@ async fn build_direct_execute_agent(
         .attachment_reader(session_store)
         .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
         .metrics_collector(metrics)
-        .config(Arc::new(RwLock::new(bamboo_llm::Config::default())))
+        .config(Arc::new(RwLock::new(config)))
         .provider(provider)
         .default_tools(tools_override.unwrap_or_else(|| Arc::new(BuiltinToolExecutor::new())))
         .build()
@@ -703,6 +766,70 @@ async fn direct_execute_retries_transient_llm_errors_to_existing_limit() {
         3,
         "genuine transient LLM failures keep the existing three-attempt limit"
     );
+}
+
+#[tokio::test]
+async fn direct_execute_retries_a_stalled_stream_bootstrap() {
+    let provider = Arc::new(BootstrapStallThenSuccessProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let mut config = bamboo_llm::Config::default();
+    config.stream_timeout.transport_idle_timeout_secs = 1;
+    let (_temp, agent, _storage) =
+        build_direct_execute_agent_with_config(provider.clone(), None, None, config).await;
+    let mut session = Session::new("direct-bootstrap-timeout-retry", "test-model");
+    session.add_message(Message::user("retry a request that never returns headers"));
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect("retry-safe bootstrap timeout should recover");
+
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "the stalled bootstrap should be cancelled and replayed once"
+    );
+    assert!(session
+        .messages
+        .iter()
+        .any(|message| message.content == "bootstrap retry recovered"));
+}
+
+#[tokio::test]
+async fn direct_execute_retries_transport_idle_before_semantic_output() {
+    let provider = Arc::new(TransportStallThenSuccessProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let mut config = bamboo_llm::Config::default();
+    config.stream_timeout.transport_idle_timeout_secs = 1;
+    let (_temp, agent, _storage) =
+        build_direct_execute_agent_with_config(provider.clone(), None, None, config).await;
+    let mut session = Session::new("direct-transport-idle-retry", "test-model");
+    session.add_message(Message::user("retry a stream with no transport frames"));
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect("retry-safe transport idle timeout should recover");
+
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "the silent stream should be discarded and replayed once"
+    );
+    assert!(session
+        .messages
+        .iter()
+        .any(|message| message.content == "transport retry recovered"));
 }
 
 #[tokio::test]

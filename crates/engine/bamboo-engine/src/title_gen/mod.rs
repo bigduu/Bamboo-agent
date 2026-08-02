@@ -255,20 +255,33 @@ async fn try_llm_title(
         config_snapshot.stream_timeout,
         Some(&provider_name),
         Some(&model_name),
-    );
+    )
+    .begin_request();
 
     let fut = async move {
         let options = bamboo_llm::provider::LLMRequestOptions {
             request_purpose: Some("title_generation".to_string()),
             ..Default::default()
         };
-        let stream = provider
-            .chat_stream_with_options(&messages, &[], Some(64), &model_name, Some(&options))
-            .await
-            .map_err(|e| format!("chat_stream: {e}"))?;
+        let cancel_token = CancellationToken::new();
+        let stream = crate::runtime::stream::handler::await_stream_bootstrap(
+            provider.chat_stream_with_options(
+                &messages,
+                &[],
+                Some(64),
+                &model_name,
+                Some(&options),
+            ),
+            &cancel_token,
+            "title-gen",
+            &timeout_context,
+        )
+        .await
+        .map_err(|e| format!("chat_stream bootstrap: {e}"))?
+        .map_err(|e| format!("chat_stream: {e}"))?;
         let output = crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
             stream,
-            &CancellationToken::new(),
+            &cancel_token,
             "title-gen",
             &timeout_context,
         )
