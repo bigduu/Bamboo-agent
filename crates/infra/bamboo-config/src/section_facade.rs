@@ -246,10 +246,12 @@ pub struct CoreSection {
 /// shape. Routing/default/features fields are additive flattened keys, so the
 /// existing `AtomicJsonStore<ProviderConfigs>` and exact credential transaction
 /// can continue parsing them through `ProviderConfigs::extra`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersSection {
-    #[serde(default = "default_provider_name")]
-    pub provider: String,
+    /// Legacy single-provider routing key. Instance-native configurations with
+    /// an explicit default omit it from durable storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<DefaultsConfig>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -264,19 +266,6 @@ pub struct ProvidersSection {
 
 fn default_provider_name() -> String {
     "openai".to_string()
-}
-
-impl Default for ProvidersSection {
-    fn default() -> Self {
-        Self {
-            provider: default_provider_name(),
-            defaults: None,
-            provider_instances: HashMap::new(),
-            default_provider_instance: None,
-            features: FeatureFlags::default(),
-            providers: ProviderConfigs::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -428,6 +417,11 @@ impl SectionProjection {
         model_limits: ModelLimitsSection,
     ) -> ConfigStoreResult<Self> {
         let mut disk = config.clone();
+        let instance_native = disk
+            .default_provider_instance
+            .as_ref()
+            .is_some_and(|id| disk.provider_instances.contains_key(id));
+        disk.clear_legacy_provider_aliases_for_instance_mode();
         disk.ensure_provider_instance_credentials_isolated()
             .map_err(|error| crate::ConfigStoreError::Validation(error.to_string()))?;
         disk.sanitize_mcp_credential_refs_for_disk();
@@ -503,6 +497,8 @@ impl SectionProjection {
             plugin_trust,
             extra,
         } = disk.section_values();
+
+        let provider = (!instance_native).then_some(provider);
 
         Ok(Self {
             core: CoreSection {
@@ -614,7 +610,7 @@ impl SectionProjection {
                 proxy_auth_encrypted: None,
                 proxy_auth_credential_ref,
                 headless_auth,
-                provider,
+                provider: provider.unwrap_or_else(default_provider_name),
                 defaults,
                 provider_instances,
                 default_provider_instance,
@@ -791,15 +787,27 @@ where
         });
     let has_legacy_raw = legacy_raw.is_some();
     let typed_baseline = serde_json::to_value(value)?;
+    let instance_native_providers =
+        name == "providers.json" && has_explicit_default_provider_instance(&typed_baseline);
     let mut merged_data = match legacy_raw {
         Some(mut raw) => {
+            if instance_native_providers {
+                remove_instance_native_legacy_provider_fields(&mut raw);
+            }
             deep_merge_typed_over_raw(&mut raw, typed_baseline);
             raw
         }
         None => typed_baseline,
     };
     if let Some(existing_data) = existing_data.as_ref() {
-        deep_merge_json(&mut merged_data, existing_data.clone());
+        let mut existing_data = existing_data.clone();
+        if instance_native_providers {
+            remove_instance_native_legacy_provider_fields(&mut existing_data);
+        }
+        deep_merge_json(&mut merged_data, existing_data);
+    }
+    if instance_native_providers {
+        remove_instance_native_legacy_provider_fields(&mut merged_data);
     }
     // A materialized default is still the revision-zero baseline. Preserve an
     // already-versioned sidecar when migration leaves its data byte-equivalent;
@@ -884,6 +892,38 @@ fn deep_merge_json(base: &mut Value, overlay: Value) {
         }
         (base, overlay) => *base = overlay,
     }
+}
+
+/// Remove only legacy routing and known built-in aliases from an
+/// instance-native providers document. Unknown keys remain untouched so a
+/// newer runtime's provider metadata survives migration by an older binary.
+fn remove_instance_native_legacy_provider_fields(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "provider",
+        "openai",
+        "anthropic",
+        "gemini",
+        "copilot",
+        "bodhi",
+    ] {
+        object.remove(key);
+    }
+}
+
+fn has_explicit_default_provider_instance(value: &Value) -> bool {
+    let Some(default_id) = value
+        .get("default_provider_instance")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    value
+        .get("provider_instances")
+        .and_then(Value::as_object)
+        .is_some_and(|instances| instances.contains_key(default_id))
 }
 
 /// Merge a typed, precedence-resolved baseline over legacy raw JSON while
@@ -1086,8 +1126,19 @@ fn validate_core(value: &CoreSection) -> Result<(), String> {
     validate_json_serializable(value)
 }
 
+fn is_legacy_provider_type(value: &str) -> bool {
+    matches!(
+        value,
+        "openai" | "anthropic" | "gemini" | "copilot" | "bodhi"
+    )
+}
+
 fn validate_providers(value: &ProvidersSection) -> Result<(), String> {
-    if value.provider.trim().is_empty() {
+    if value
+        .provider
+        .as_ref()
+        .is_some_and(|provider| provider.trim().is_empty())
+    {
         return Err("default provider must not be empty".to_string());
     }
     for (id, instance) in &value.provider_instances {
@@ -1095,12 +1146,10 @@ fn validate_providers(value: &ProvidersSection) -> Result<(), String> {
             return Err("provider instance id and type must not be empty".to_string());
         }
     }
-    if value
-        .default_provider_instance
-        .as_ref()
-        .is_some_and(|id| !value.provider_instances.contains_key(id))
-    {
-        return Err("default provider instance does not exist".to_string());
+    if value.default_provider_instance.as_ref().is_some_and(|id| {
+        !value.provider_instances.contains_key(id) && !is_legacy_provider_type(id)
+    }) {
+        return Err("default provider instance or legacy provider type does not exist".to_string());
     }
     macro_rules! validate_builtin_credential {
         ($field:ident) => {
@@ -2554,6 +2603,11 @@ fn preflight_legacy_root_sections(
     if let Some(providers) = load_strict_sidecar_value(data_dir, "providers.json")? {
         validate_preflight_provider_secret_consistency(&providers)?;
     }
+    let instance_native_providers = projection
+        .providers
+        .default_provider_instance
+        .as_ref()
+        .is_some_and(|id| projection.providers.provider_instances.contains_key(id));
     for descriptor in SECTION_DESCRIPTORS
         .iter()
         .filter(|descriptor| descriptor.id != SectionId::Credentials)
@@ -2578,13 +2632,23 @@ fn preflight_legacy_root_sections(
         };
         let mut data = match sections.remove(&id) {
             Some(mut legacy) => {
+                if id == SectionId::Providers && instance_native_providers {
+                    remove_instance_native_legacy_provider_fields(&mut legacy);
+                }
                 deep_merge_typed_over_raw(&mut legacy, typed_baseline);
                 legacy
             }
             None => typed_baseline,
         };
-        if let Some(existing) = load_strict_sidecar_value(data_dir, id.descriptor().file_name)? {
+        if let Some(mut existing) = load_strict_sidecar_value(data_dir, id.descriptor().file_name)?
+        {
+            if id == SectionId::Providers && instance_native_providers {
+                remove_instance_native_legacy_provider_fields(&mut existing);
+            }
             deep_merge_json(&mut data, existing);
+        }
+        if id == SectionId::Providers && instance_native_providers {
+            remove_instance_native_legacy_provider_fields(&mut data);
         }
         match id {
             SectionId::Core => {
@@ -2725,7 +2789,7 @@ fn load_strict_planning_input_with_overrides(
             providers,
         } = providers;
         if owns_provider {
-            config.provider = provider;
+            config.provider = provider.unwrap_or_else(default_provider_name);
         }
         if owns_defaults {
             config.defaults = defaults;
@@ -5777,7 +5841,7 @@ mod tests {
     #[test]
     fn providers_section_remains_readable_by_existing_exact_transaction_wire_type() {
         let section = ProvidersSection {
-            provider: "openai".to_string(),
+            provider: Some("openai".to_string()),
             features: FeatureFlags {
                 dynamic_model_routing: true,
                 ..FeatureFlags::default()
@@ -5789,8 +5853,73 @@ mod tests {
         assert_eq!(legacy.extra["provider"], "openai");
         assert_eq!(legacy.extra["features"]["dynamic_model_routing"], true);
         let reparsed: ProvidersSection = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(reparsed.provider, "openai");
+        assert_eq!(reparsed.provider.as_deref(), Some("openai"));
         assert!(reparsed.features.dynamic_model_routing);
+    }
+
+    #[test]
+    fn instance_native_projection_omits_legacy_provider_routing() {
+        let mut config = Config::default();
+        config.provider = "anthropic".to_string();
+        config.providers_mut().openai = Some(crate::OpenAIConfig::default());
+        config.providers_mut().anthropic = Some(crate::AnthropicConfig::default());
+        config.providers_mut().gemini = Some(crate::GeminiConfig::default());
+        config.providers_mut().copilot = Some(crate::CopilotConfig::default());
+        config.providers_mut().bodhi = Some(serde_json::from_value(json!({})).unwrap());
+        config
+            .providers_mut()
+            .extra
+            .insert("future_provider".to_string(), json!({"kept": true}));
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(json!({
+                "provider_type": "openai",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+
+        let projection =
+            SectionProjection::from_config(&config, ModelLimitsSection::default()).unwrap();
+        let durable = serde_json::to_value(&projection.providers).unwrap();
+
+        assert!(durable.get("provider").is_none());
+        for key in ["openai", "anthropic", "gemini", "copilot", "bodhi"] {
+            assert!(durable.get(key).is_none(), "persisted legacy alias {key}");
+        }
+        assert_eq!(durable["future_provider"]["kept"], true);
+        assert_eq!(durable["default_provider_instance"], "work");
+        assert!(durable["provider_instances"]["work"].is_object());
+    }
+
+    #[test]
+    fn hybrid_legacy_default_projection_preserves_legacy_routing() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.providers_mut().openai = Some(crate::OpenAIConfig {
+            model: Some("gpt-legacy".to_string()),
+            ..crate::OpenAIConfig::default()
+        });
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(json!({
+                "provider_type": "copilot",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("openai".to_string());
+
+        let projection =
+            SectionProjection::from_config(&config, ModelLimitsSection::default()).unwrap();
+        let durable = serde_json::to_value(&projection.providers).unwrap();
+
+        assert_eq!(durable["provider"], "openai");
+        assert_eq!(durable["default_provider_instance"], "openai");
+        assert_eq!(durable["openai"]["model"], "gpt-legacy");
+        assert!(durable["provider_instances"]["work"].is_object());
+        assert!(validate_providers(&projection.providers).is_ok());
     }
 
     #[test]
@@ -6414,7 +6543,7 @@ mod tests {
 
         let providers = facade.registry().providers.snapshot();
         let mut provider_candidate = providers.data.as_ref().clone();
-        provider_candidate.provider = "anthropic".to_string();
+        provider_candidate.provider = Some("anthropic".to_string());
         facade
             .registry()
             .providers
@@ -7603,6 +7732,172 @@ mod tests {
         );
         assert_eq!(data["openai"]["model"], "sidecar-model");
         assert_eq!(data["openai"]["future_provider"]["nested"], "kept");
+    }
+
+    #[test]
+    fn instance_native_dual_config_migration_drops_legacy_aliases_and_restarts() {
+        let _key = crate::encryption::set_test_encryption_key([0x64; 32]);
+        let dir = TempDir::new().unwrap();
+        let instance_secret = "instance-native-migration-secret";
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "anthropic",
+                "defaults": {
+                    "chat": {"provider": "work", "model": "gpt-instance"}
+                },
+                "features": {
+                    "provider_model_ref": true,
+                    "dynamic_model_routing": false
+                },
+                "provider_instances": {
+                    "work": {
+                        "provider_type": "openai",
+                        "api_key": instance_secret,
+                        "model": "gpt-instance",
+                        "explicit_prompt_cache": false,
+                        "enabled": true,
+                        "future_instance": {"nested": "kept"}
+                    }
+                },
+                "default_provider_instance": "work",
+                "providers": {
+                    "openai": {"model": "inline-stale"},
+                    "anthropic": {"model": "inline-stale"},
+                    "future_provider": {"from_root": true}
+                }
+            }),
+        );
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({
+                "provider": "gemini",
+                "openai": {"model": "sidecar-stale"},
+                "gemini": {"model": "sidecar-stale"},
+                "future_provider": {"from_sidecar": true}
+            }),
+        );
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+
+        let providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        let data = &providers["data"];
+        for key in [
+            "provider",
+            "openai",
+            "anthropic",
+            "gemini",
+            "copilot",
+            "bodhi",
+        ] {
+            assert!(data.get(key).is_none(), "migrated legacy field {key}");
+        }
+        assert_eq!(data["default_provider_instance"], "work");
+        assert_eq!(data["defaults"]["chat"]["provider"], "work");
+        assert_eq!(data["features"]["provider_model_ref"], true);
+        assert_eq!(
+            data["provider_instances"]["work"]["future_instance"]["nested"],
+            "kept"
+        );
+        assert_eq!(
+            data["provider_instances"]["work"][crate::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY],
+            false
+        );
+        assert_eq!(data["future_provider"]["from_root"], true);
+        assert_eq!(data["future_provider"]["from_sidecar"], true);
+        assert!(!std::fs::read_to_string(dir.path().join("providers.json"))
+            .unwrap()
+            .contains(instance_secret));
+
+        let restarted = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(restarted.default_provider_instance.as_deref(), Some("work"));
+        assert_eq!(
+            restarted.provider_instances["work"].api_key,
+            instance_secret
+        );
+        assert_eq!(
+            restarted.provider_instances["work"].extra["future_instance"]["nested"],
+            "kept"
+        );
+        assert_eq!(
+            restarted.provider_instances["work"].extra
+                [crate::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY],
+            false
+        );
+        assert!(restarted.providers().openai.is_none());
+        assert!(restarted.providers().anthropic.is_none());
+        assert!(restarted.providers().gemini.is_none());
+        assert_eq!(
+            restarted.providers().extra["future_provider"]["from_sidecar"],
+            true
+        );
+    }
+
+    #[test]
+    fn hybrid_legacy_default_migration_preserves_legacy_alias_and_restarts() {
+        let _key = crate::encryption::set_test_encryption_key([0x65; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "openai",
+                "provider_instances": {
+                    "work": {
+                        "provider_type": "copilot",
+                        "enabled": true
+                    }
+                },
+                "default_provider_instance": "openai",
+                "providers": {
+                    "openai": {
+                        "model": "inline-model",
+                        "future_inline": true
+                    }
+                }
+            }),
+        );
+        write_json(
+            &dir.path().join("providers.json"),
+            &json!({
+                "provider": "openai",
+                "openai": {
+                    "model": "sidecar-model",
+                    "future_sidecar": true
+                }
+            }),
+        );
+
+        migrate_config_facade_layout(dir.path()).unwrap();
+
+        let providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        let data = &providers["data"];
+        assert_eq!(data["provider"], "openai");
+        assert_eq!(data["default_provider_instance"], "openai");
+        assert_eq!(data["openai"]["model"], "sidecar-model");
+        assert_eq!(data["openai"]["future_inline"], true);
+        assert_eq!(data["openai"]["future_sidecar"], true);
+        assert!(data["provider_instances"]["work"].is_object());
+
+        let restarted = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            restarted.default_provider_instance.as_deref(),
+            Some("openai")
+        );
+        assert!(restarted.provider_instances.contains_key("work"));
+        assert_eq!(
+            restarted
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("sidecar-model")
+        );
     }
 
     #[test]
