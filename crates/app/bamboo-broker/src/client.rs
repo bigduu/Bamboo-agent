@@ -32,6 +32,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
     connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::{BrokerFrame, ClientFrame};
@@ -55,6 +56,108 @@ pub(crate) type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, M
 /// never hang indefinitely if the broker dies after receiving `Deliver`.
 const DELIVER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Each phase of explicit client shutdown is bounded independently. Sending a
+/// Close frame can stall behind a wedged transport, and a reader can fail to
+/// observe cooperative cancellation, so neither phase may keep a caller alive
+/// indefinitely.
+pub(crate) const CLIENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Send and flush a WebSocket Close frame without trusting the transport to
+/// make progress forever. Shared by the ordinary and multiplexed client
+/// ownership shapes.
+pub(crate) async fn send_close(sink: &mut WsSink) -> BrokerResult<()> {
+    match tokio::time::timeout(CLIENT_SHUTDOWN_TIMEOUT, sink.send(Message::Close(None))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(BrokerError::Transport(format!("send websocket close: {e}"))),
+        Err(_) => Err(BrokerError::Transport(
+            "timed out sending websocket close".into(),
+        )),
+    }
+}
+
+/// Why the WebSocket reader stopped. Keep this deliberately low-cardinality:
+/// the supervisor logs the category, never frame contents, credentials, actor
+/// ids, or endpoint details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderExit {
+    IntentionalShutdown,
+    PeerClose,
+    PeerEof,
+    TransportError,
+}
+
+impl ReaderExit {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntentionalShutdown => "intentional_shutdown",
+            Self::PeerClose => "peer_close",
+            Self::PeerEof => "peer_eof",
+            Self::TransportError => "transport_error",
+        }
+    }
+}
+
+/// Authoritative ownership of the background reader. This value moves with
+/// the connection when a [`BrokerClient`] becomes a multiplexed client, so no
+/// public client shape can detach the read half from its owner.
+///
+/// The async shutdown path cooperatively cancels and awaits the reader. `Drop`
+/// is the non-async safety net: it marks the stop intentional, signals
+/// cancellation, and directly aborts the reader task (not merely the
+/// supervisor that owns its `JoinHandle`). Aborting the reader drops the split
+/// WebSocket source and therefore releases the underlying transport.
+pub(crate) struct ReaderLifecycle {
+    cancellation: CancellationToken,
+    reader_abort: tokio::task::AbortHandle,
+    supervisor: Option<tokio::task::JoinHandle<()>>,
+    intentional_shutdown: Arc<AtomicBool>,
+}
+
+impl ReaderLifecycle {
+    pub(crate) fn mark_intentional_shutdown(&self) {
+        self.intentional_shutdown.store(true, Ordering::SeqCst);
+    }
+
+    fn begin_intentional_shutdown(&self) {
+        self.mark_intentional_shutdown();
+        self.cancellation.cancel();
+    }
+
+    /// Cooperatively stop the reader and await its supervisor. If cooperative
+    /// cleanup misses its bound, directly abort the reader and give the
+    /// supervisor one final bounded chance to observe that outcome.
+    pub(crate) async fn shutdown(&mut self) {
+        self.begin_intentional_shutdown();
+        let Some(mut supervisor) = self.supervisor.take() else {
+            return;
+        };
+
+        if tokio::time::timeout(CLIENT_SHUTDOWN_TIMEOUT, &mut supervisor)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+
+        self.reader_abort.abort();
+        if tokio::time::timeout(CLIENT_SHUTDOWN_TIMEOUT, &mut supervisor)
+            .await
+            .is_err()
+        {
+            // The reader has already been aborted. This only prevents a
+            // pathological supervisor from becoming another detached task.
+            supervisor.abort();
+        }
+    }
+}
+
+impl Drop for ReaderLifecycle {
+    fn drop(&mut self) {
+        self.begin_intentional_shutdown();
+        self.reader_abort.abort();
+    }
+}
+
 /// One demuxed serve event from [`BrokerClient::next_message_or_cancel`]: either
 /// the next inbound message or the next out-of-band cancel. The inner `Option` is
 /// `None` once that lane's channel closes (the reader exited). #45.
@@ -67,6 +170,9 @@ pub enum ServeEvent {
 
 /// A connected broker client bound to one session mailbox.
 pub struct BrokerClient {
+    /// Declared first so Drop cancels the reader before the transport sink and
+    /// response receivers are released.
+    reader: ReaderLifecycle,
     sink: WsSink,
     messages: mpsc::UnboundedReceiver<InboxMessage>,
     delivered: mpsc::UnboundedReceiver<MsgId>,
@@ -88,10 +194,6 @@ pub struct BrokerClient {
     /// right now" (`next_message() -> None` but still alive) apart from "the
     /// connection died". See [`BrokerClient::reader_alive`].
     reader_alive: Arc<AtomicBool>,
-    /// Supervisor that awaits the reader's `JoinHandle` and logs its outcome;
-    /// ends on its own the moment the reader resolves (clean disconnect → no
-    /// leaked task). Replaces the old ignored `_reader` handle.
-    _supervisor: tokio::task::JoinHandle<()>,
 }
 
 impl BrokerClient {
@@ -160,13 +262,23 @@ impl BrokerClient {
         let (err_tx, errors) = mpsc::unbounded_channel();
         let (cancel_tx, cancels) = mpsc::unbounded_channel();
         let (conn_tx, connected) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let reader_cancellation = cancellation.clone();
         // The demux loop pushes `Message`/`Delivered`/`Cancel`/`Error` frames
-        // into their respective channels and ends when the stream closes or
-        // errors.
+        // into their respective channels. Cancellation is owned by the public
+        // client lifecycle, so dropping that owner always reaches this source
+        // half directly instead of detaching it behind a supervisor.
         let reader = tokio::spawn(async move {
-            while let Some(frame) = source.next().await {
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = reader_cancellation.cancelled() => {
+                        break ReaderExit::IntentionalShutdown;
+                    }
+                    frame = source.next() => frame,
+                };
                 match frame {
-                    Ok(Message::Text(t)) => match BrokerFrame::from_text(&t) {
+                    Some(Ok(Message::Text(t))) => match BrokerFrame::from_text(&t) {
                         Ok(BrokerFrame::Message { message }) => {
                             let _ = msg_tx.send(message);
                         }
@@ -199,7 +311,9 @@ impl BrokerClient {
                         }
                         _ => {}
                     },
-                    Ok(Message::Close(_)) | Err(_) => break,
+                    Some(Ok(Message::Close(_))) => break ReaderExit::PeerClose,
+                    Some(Err(_)) => break ReaderExit::TransportError,
+                    None => break ReaderExit::PeerEof,
                     _ => {}
                 }
             }
@@ -207,14 +321,26 @@ impl BrokerClient {
 
         // Supervise the reader so its termination is *observable* instead of
         // silently dropped (issue #52): log every exit kind and flip a shared
-        // flag callers can poll. The supervisor owns the reader handle and ends
-        // the instant the reader resolves — a clean disconnect leaves no leaked
-        // task. Holding this must not change the reader's behavior, so the
-        // reader body above is left exactly as it was.
+        // flag callers can poll. The movable lifecycle below owns cancellation,
+        // the reader's AbortHandle, and this supervisor, so neither ordinary
+        // clients nor multiplexed clients can detach the source half.
         let reader_alive = Arc::new(AtomicBool::new(true));
-        let supervisor = tokio::spawn(reader_supervisor(reader, reader_alive.clone()));
+        let intentional_shutdown = Arc::new(AtomicBool::new(false));
+        let reader_abort = reader.abort_handle();
+        let supervisor = tokio::spawn(reader_supervisor(
+            reader,
+            reader_alive.clone(),
+            intentional_shutdown.clone(),
+        ));
+        let reader = ReaderLifecycle {
+            cancellation,
+            reader_abort,
+            supervisor: Some(supervisor),
+            intentional_shutdown,
+        };
 
         Ok(Self {
+            reader,
             sink,
             messages,
             delivered,
@@ -222,8 +348,28 @@ impl BrokerClient {
             cancels,
             connected,
             reader_alive,
-            _supervisor: supervisor,
         })
+    }
+
+    /// Gracefully close this client without allowing cleanup to hang.
+    ///
+    /// The shutdown is intentionally two-stage: first send and flush a
+    /// WebSocket Close frame within a small bound, then cooperatively cancel
+    /// and await the reader/supervisor within their own bound. If the reader
+    /// does not cooperate, its lifecycle directly aborts it. Dropping the
+    /// future or the client at any point still runs the same direct-abort Drop
+    /// fallback.
+    pub async fn close(mut self) -> BrokerResult<()> {
+        // Mark intent before sending Close: a fast peer can echo Close and end
+        // the reader before `send` returns, and that is still our shutdown,
+        // not an unexpected reader death.
+        self.reader.mark_intentional_shutdown();
+        let close_result = send_close(&mut self.sink).await;
+
+        // Always clean up the source half, even when sending Close failed or
+        // timed out. Cleanup itself is bounded and escalates to direct abort.
+        self.reader.shutdown().await;
+        close_result
     }
 
     /// Durably enqueue `message` into session `to`'s mailbox; returns the stored
@@ -390,13 +536,15 @@ impl BrokerClient {
 
     /// Consume this (already connected + subscribed) client into a multiplexed
     /// request/reply driver so concurrent correlated requests on ONE connection
-    /// no longer serialize behind a single exclusive lock. The background reader
-    /// and supervisor keep running (detached) and feed `messages`, which the mux's
-    /// router drains and routes to per-request waiters by `correlation_id`. For a
-    /// replies-only connection (e.g. the MCP proxy) where every inbound message
-    /// is a correlated reply. #56.
+    /// no longer serialize behind a single exclusive lock. Ownership of the
+    /// background reader moves into the mux alongside the sink and channels, so
+    /// dropping either client shape terminates the same transport. The mux's
+    /// router drains `messages` and routes by `correlation_id`. For a replies-only
+    /// connection (e.g. the MCP proxy) where every inbound message is a
+    /// correlated reply. #56/#788.
     pub fn into_multiplexed(self, me: AgentRef) -> crate::mux::MultiplexedClient {
         crate::mux::MultiplexedClient::spawn(
+            self.reader,
             self.sink,
             self.messages,
             self.delivered,
@@ -427,15 +575,20 @@ impl BrokerClient {
 
 /// Await the reader task and make its exit observable (issue #52).
 ///
-/// - clean end (the demux loop returned / stream closed): `warn!`
+/// - intentional client shutdown: `debug!`
+/// - peer Close / EOF / transport error: categorized `warn!`
 /// - panic (`JoinError::is_panic`): `error!` with the panic message
-/// - other `JoinError` (cancelled / aborted): `error!`
+/// - unexpected cancellation / abort: `error!`
 ///
 /// In every case the shared `reader_alive` flag is cleared so callers can tell
 /// "the connection died" from "no messages right now". This owns the reader
 /// handle, so it resolves — and the supervisor task ends — exactly when the
 /// reader does: a clean disconnect leaves no leaked task.
-async fn reader_supervisor(reader: tokio::task::JoinHandle<()>, reader_alive: Arc<AtomicBool>) {
+async fn reader_supervisor(
+    reader: tokio::task::JoinHandle<ReaderExit>,
+    reader_alive: Arc<AtomicBool>,
+    intentional_shutdown: Arc<AtomicBool>,
+) {
     let outcome = reader.await;
     // Best-effort, eventually-consistent death signal: this store races the
     // reader dropping `msg_tx` (which is what makes `next_message()` return
@@ -445,13 +598,49 @@ async fn reader_supervisor(reader: tokio::task::JoinHandle<()>, reader_alive: Ar
     // `reader_alive` being false the instant `next_message()` returns `None`.
     reader_alive.store(false, Ordering::SeqCst);
     match outcome {
-        Ok(()) => {
-            tracing::warn!("broker reader task ended; connection closed");
-        }
         Err(err) if err.is_panic() => {
             tracing::error!(
                 "broker reader task panicked: {}",
                 panic_payload_message(err.into_panic())
+            );
+        }
+        Ok(exit) if intentional_shutdown.load(Ordering::SeqCst) => {
+            tracing::debug!(
+                reader_exit = exit.as_str(),
+                "broker reader stopped during intentional client shutdown"
+            );
+        }
+        Err(_) if intentional_shutdown.load(Ordering::SeqCst) => {
+            tracing::debug!(
+                reader_exit = "aborted",
+                "broker reader stopped during intentional client shutdown"
+            );
+        }
+        Ok(ReaderExit::IntentionalShutdown) => {
+            // Cancellation is only issued by ReaderLifecycle after it records
+            // intent. Keep this defensive arm low-noise if those operations
+            // are ever reordered in the future.
+            tracing::debug!(
+                reader_exit = ReaderExit::IntentionalShutdown.as_str(),
+                "broker reader stopped during intentional client shutdown"
+            );
+        }
+        Ok(ReaderExit::PeerClose) => {
+            tracing::warn!(
+                reader_exit = ReaderExit::PeerClose.as_str(),
+                "broker reader stopped after peer Close frame"
+            );
+        }
+        Ok(ReaderExit::PeerEof) => {
+            tracing::warn!(
+                reader_exit = ReaderExit::PeerEof.as_str(),
+                "broker reader stopped after peer EOF"
+            );
+        }
+        Ok(ReaderExit::TransportError) => {
+            tracing::warn!(
+                reader_exit = ReaderExit::TransportError.as_str(),
+                "broker reader stopped after transport error"
             );
         }
         Err(err) => {

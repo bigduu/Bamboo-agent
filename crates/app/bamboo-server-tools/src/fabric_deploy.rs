@@ -1841,21 +1841,40 @@ async fn verify_worker_connected(
         .await
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
-    loop {
-        match client.list_connected(role).await {
-            Ok(ids) if ids.iter().any(|id| id == worker_id) => return Ok(()),
-            Ok(_) => {}
-            Err(e) => return Err(e.to_string()),
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "worker '{worker_id}' never registered on the bus under role \
+    let timeout_error = || {
+        format!(
+            "worker '{worker_id}' never registered on the bus under role \
                  '{role}' within {}s",
-                timeout.as_secs()
-            ));
+            timeout.as_secs()
+        )
+    };
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(timeout_error());
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        match tokio::time::timeout(remaining, client.list_connected(role)).await {
+            Ok(Ok(ids)) if ids.iter().any(|id| id == worker_id) => break Ok(()),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => break Err(e.to_string()),
+            Err(_) => break Err(timeout_error()),
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(timeout_error());
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
+    };
+
+    // Presence clients are deliberately short-lived. Prefer a Close frame and
+    // bounded reader/supervisor cleanup; BrokerClient's direct-abort Drop path
+    // still guarantees release if the peer stopped making progress.
+    if client.close().await.is_err() {
+        tracing::debug!("fabric presence probe could not complete graceful broker close");
     }
+    result
 }
 
 /// Build the deployer for a node. `bamboo_bin` is the local `bamboo` path used
@@ -3771,16 +3790,32 @@ mod presence_verify_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    async fn start_broker() -> (String, tempfile::TempDir) {
+    async fn start_broker() -> (String, tempfile::TempDir, Arc<bamboo_broker::BrokerServer>) {
         let dir = tempfile::tempdir().unwrap();
         let core = Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
         let server = Arc::new(bamboo_broker::BrokerServer::new(core, "t"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let serving = Arc::clone(&server);
         tokio::spawn(async move {
-            let _ = server.serve(listener).await;
+            let _ = serving.serve(listener).await;
         });
-        (format!("ws://{addr}"), dir)
+        (format!("ws://{addr}"), dir, server)
+    }
+
+    async fn wait_for_active_connections(server: &bamboo_broker::BrokerServer, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.active_connections() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "active broker connections did not reach {expected}; current={}",
+                server.active_connections()
+            )
+        });
     }
 
     /// Connect + subscribe a worker so the broker's live-actor registry lists it
@@ -3812,7 +3847,7 @@ mod presence_verify_tests {
 
     #[tokio::test]
     async fn ok_when_worker_registered_under_role() {
-        let (endpoint, _dir) = start_broker().await;
+        let (endpoint, _dir, _server) = start_broker().await;
         let _worker = join(&endpoint, "w-mon", "monitor").await;
         let out =
             verify_worker_connected(&cfg(&endpoint), "w-mon", "monitor", Duration::from_secs(3))
@@ -3822,7 +3857,7 @@ mod presence_verify_tests {
 
     #[tokio::test]
     async fn times_out_when_worker_absent() {
-        let (endpoint, _dir) = start_broker().await;
+        let (endpoint, _dir, _server) = start_broker().await;
         // Nobody joined "monitor" — the probe must fail fast, never hang.
         let out = verify_worker_connected(
             &cfg(&endpoint),
@@ -3837,7 +3872,7 @@ mod presence_verify_tests {
 
     #[tokio::test]
     async fn role_scoped_ignores_worker_under_other_role() {
-        let (endpoint, _dir) = start_broker().await;
+        let (endpoint, _dir, _server) = start_broker().await;
         // Right id, wrong role bucket → must not satisfy a "monitor" probe.
         let _other = join(&endpoint, "w-mon", "builder").await;
         let out = verify_worker_connected(
@@ -3851,6 +3886,48 @@ mod presence_verify_tests {
             out.is_err(),
             "a worker under a different role must not count"
         );
+    }
+
+    /// Issue #788 regression at the Fabric call site: every absent-worker
+    /// health sweep creates a fresh presence client. With one server permit,
+    /// any leaked reader would make the very next sweep fail at connect and
+    /// active connections would climb/stick instead of returning to baseline.
+    #[tokio::test]
+    async fn repeated_absent_worker_probes_release_broker_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(bamboo_broker::BrokerCore::new(dir.path()));
+        let server = Arc::new(bamboo_broker::BrokerServer::with_limits(
+            core,
+            "t",
+            bamboo_broker::BrokerLimits {
+                max_connections: 1,
+                ..bamboo_broker::BrokerLimits::default()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = Arc::clone(&server);
+        tokio::spawn(async move {
+            let _ = serving.serve(listener).await;
+        });
+        let endpoint = format!("ws://{addr}");
+
+        for sweep in 0..6 {
+            let out = verify_worker_connected(
+                &cfg(&endpoint),
+                "absent-worker",
+                "monitor",
+                Duration::from_millis(50),
+            )
+            .await;
+            assert!(
+                matches!(out, Err(ref error) if error.contains("never registered")),
+                "sweep {sweep} must reach the expected absence timeout: {out:?}"
+            );
+            wait_for_active_connections(&server, 0).await;
+        }
+
+        assert_eq!(server.rejected_connections(), 0);
     }
 }
 
