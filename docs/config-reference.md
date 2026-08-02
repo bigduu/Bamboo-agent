@@ -191,7 +191,7 @@ main response stream and auxiliary silent model calls:
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `transport_idle_timeout_secs` | `120` | Maximum gap between valid provider transport frames. Parsed SSE ping/lifecycle frames count even when they contain no token. |
+| `transport_idle_timeout_secs` | `120` | Maximum gap between successfully received, non-empty provider response-body chunks. SSE ping/lifecycle events, comment heartbeats, and partial event fragments count even when they contain no token. |
 | `first_semantic_timeout_secs` | `600` | Maximum time from request dispatch to the first text, reasoning, or tool-call delta. Transport keepalives do not extend it. |
 | `semantic_idle_timeout_secs` | `600` | Maximum semantic-progress gap after output starts. Transport keepalives do not extend it. |
 
@@ -202,6 +202,29 @@ deadline, provider/model identifiers, and last transport/semantic activity,
 but never include prompts or raw provider payloads. A stream timeout is not
 automatically retried, because replay after partial output or tool-call deltas
 could duplicate externally visible state.
+
+### OpenAI-compatible proxy heartbeats
+
+An OpenAI-compatible proxy should either forward upstream response bytes or
+emit an SSE heartbeat more frequently than `transport_idle_timeout_secs`.
+Bamboo treats any successfully received, non-empty body chunk as transport
+activity before parsing SSE, including the standard comment form
+`: keep-alive\n\n`. These internal activity markers do not become model output
+and do not extend either semantic deadline.
+
+For example, CLIProxyAPI supports periodic streaming heartbeats with:
+
+```yaml
+streaming:
+  keepalive-seconds: 15
+```
+
+CLIProxyAPI documents `0` (disabled) as the default. Operators using that or
+another compatible proxy should choose a heartbeat interval safely below the
+transport timeout. If a proxy cannot emit heartbeats during long upstream
+reasoning gaps, configure `transport_idle_timeout_secs` at least as high as the
+intended semantic wait instead; disabling the bounded transport watchdog is
+not recommended.
 
 ## Memory / auto-dream / gardener
 

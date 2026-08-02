@@ -24,15 +24,43 @@ async fn start_broker() -> (String, TempDir) {
 /// the generous defaults — lets tests exercise `max_connections` /
 /// `messages_per_second` without waiting out production-sized quotas.
 async fn start_broker_with_limits(limits: BrokerLimits) -> (String, TempDir) {
+    let (endpoint, dir, _server) = start_observable_broker_with_limits(limits).await;
+    (endpoint, dir)
+}
+
+/// Lifecycle/limit tests retain the server handle so they can deterministically
+/// observe the semaphore rather than infer cleanup from sleeps or socket tools.
+async fn start_observable_broker_with_limits(
+    limits: BrokerLimits,
+) -> (String, TempDir, Arc<BrokerServer>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let core = Arc::new(BrokerCore::new(dir.path()));
     let server = Arc::new(BrokerServer::with_limits(core, TOKEN, limits));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
+    let serving = Arc::clone(&server);
     tokio::spawn(async move {
-        let _ = server.serve(listener).await;
+        let _ = serving.serve(listener).await;
     });
-    (format!("ws://{addr}"), dir)
+    (format!("ws://{addr}"), dir, server)
+}
+
+async fn wait_for_active_connections(server: &BrokerServer, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if server.active_connections() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "active connections did not reach {expected}; current={}",
+            server.active_connections()
+        )
+    });
 }
 
 fn agent(id: &str) -> AgentRef {
@@ -288,13 +316,185 @@ async fn unacked_messages_redelivered_after_broker_crash_and_restart() {
     server2.abort();
 }
 
+/// Issue #788: a short-lived presence-query client must not leave its reader,
+/// socket, or server connection permit alive after ordinary Drop.
+#[tokio::test]
+async fn short_lived_clients_release_connection_slot_on_drop() {
+    let (endpoint, _dir, server) = start_observable_broker_with_limits(BrokerLimits {
+        max_connections: 1,
+        ..BrokerLimits::default()
+    })
+    .await;
+
+    // This is the Fabric presence-probe shape: connect, query, then let the
+    // short-lived client fall out of scope. Alternate subscription state to
+    // prove both server branches release their registry/permit resources.
+    for cycle in 0..8 {
+        let mut client = BrokerClient::connect(&endpoint, agent("probe"), TOKEN)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle} failed to connect: {e}"));
+        if cycle % 2 == 0 {
+            client.subscribe().await.expect("subscribe");
+        }
+        assert!(client
+            .list_connected("absent-role")
+            .await
+            .expect("presence query")
+            .is_empty());
+        assert_eq!(server.active_connections(), 1);
+        drop(client);
+        wait_for_active_connections(&server, 0).await;
+    }
+
+    assert_eq!(server.rejected_connections(), 0);
+}
+
+#[tokio::test]
+async fn explicit_close_releases_connection_slot_after_bounded_cleanup() {
+    let (endpoint, _dir, server) = start_observable_broker_with_limits(BrokerLimits {
+        max_connections: 1,
+        ..BrokerLimits::default()
+    })
+    .await;
+
+    for cycle in 0..4 {
+        let mut client = BrokerClient::connect(&endpoint, agent("graceful"), TOKEN)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle} failed to connect: {e}"));
+        client
+            .list_connected("absent-role")
+            .await
+            .expect("presence query");
+        client.close().await.expect("graceful close");
+        wait_for_active_connections(&server, 0).await;
+    }
+
+    assert_eq!(server.rejected_connections(), 0);
+}
+
+#[tokio::test]
+async fn multiplexed_client_drop_releases_reader_and_connection_slot() {
+    let (endpoint, _dir, server) = start_observable_broker_with_limits(BrokerLimits {
+        max_connections: 1,
+        ..BrokerLimits::default()
+    })
+    .await;
+
+    let mut client = BrokerClient::connect(&endpoint, agent("mux"), TOKEN)
+        .await
+        .expect("connect");
+    client.subscribe().await.expect("subscribe");
+    let mux = client.into_multiplexed(agent("mux"));
+    assert!(mux.reader_alive());
+    assert_eq!(server.active_connections(), 1);
+
+    drop(mux);
+    wait_for_active_connections(&server, 0).await;
+
+    // If the mux had detached the reader, the only permit would still be held
+    // and this reconnect would be rejected.
+    let next = BrokerClient::connect(&endpoint, agent("after-mux"), TOKEN)
+        .await
+        .expect("slot released after mux drop");
+    next.close().await.expect("close reconnect");
+    wait_for_active_connections(&server, 0).await;
+
+    let mut graceful = BrokerClient::connect(&endpoint, agent("mux-close"), TOKEN)
+        .await
+        .expect("graceful mux connects");
+    graceful.subscribe().await.expect("subscribe graceful mux");
+    graceful
+        .into_multiplexed(agent("mux-close"))
+        .close()
+        .await
+        .expect("graceful mux close");
+    wait_for_active_connections(&server, 0).await;
+}
+
+/// A worker's long-lived subscribed connection and its short-lived per-run
+/// delivery connections intentionally authenticate with the same AgentRef.
+/// Closing a delivery-only connection must not unregister the worker.
+#[tokio::test]
+async fn delivery_only_disconnect_does_not_remove_same_identity_subscriber() {
+    let (endpoint, _dir, server) =
+        start_observable_broker_with_limits(BrokerLimits::default()).await;
+
+    let mut worker = BrokerClient::connect(&endpoint, agent("shared-worker"), TOKEN)
+        .await
+        .expect("worker connects");
+    worker.subscribe().await.expect("worker subscribes");
+
+    let mut delivery_only = BrokerClient::connect(&endpoint, agent("shared-worker"), TOKEN)
+        .await
+        .expect("delivery-only connection with same identity connects");
+    delivery_only
+        .list_connected("unused-role")
+        .await
+        .expect("delivery-only connection remains healthy");
+    drop(delivery_only);
+    wait_for_active_connections(&server, 1).await;
+
+    let mut sender = BrokerClient::connect(&endpoint, agent("sender"), TOKEN)
+        .await
+        .expect("sender connects");
+    let message = ask("sender");
+    sender
+        .deliver("shared-worker", message.clone())
+        .await
+        .expect("deliver after sibling disconnect");
+    let received = tokio::time::timeout(Duration::from_secs(2), worker.next_message())
+        .await
+        .expect("subscriber still receives live push")
+        .expect("worker connection remains open");
+    assert_eq!(received.id, message.id);
+}
+
+/// Reconnect ownership regression: once a new subscribed connection replaces
+/// an older connection for the same session, late cleanup from the old socket
+/// must not unregister the replacement.
+#[tokio::test]
+async fn replaced_subscriber_survives_old_connection_disconnect() {
+    let (endpoint, _dir, server) =
+        start_observable_broker_with_limits(BrokerLimits::default()).await;
+
+    let mut old = BrokerClient::connect(&endpoint, agent("reconnecting-worker"), TOKEN)
+        .await
+        .expect("old subscriber connects");
+    old.subscribe().await.expect("old subscriber subscribes");
+
+    let mut replacement = BrokerClient::connect(&endpoint, agent("reconnecting-worker"), TOKEN)
+        .await
+        .expect("replacement connects");
+    replacement
+        .subscribe()
+        .await
+        .expect("replacement subscribes");
+
+    drop(old);
+    wait_for_active_connections(&server, 1).await;
+
+    let mut sender = BrokerClient::connect(&endpoint, agent("reconnect-sender"), TOKEN)
+        .await
+        .expect("sender connects");
+    let message = ask("reconnect-sender");
+    sender
+        .deliver("reconnecting-worker", message.clone())
+        .await
+        .expect("deliver to replacement");
+    let received = tokio::time::timeout(Duration::from_secs(2), replacement.next_message())
+        .await
+        .expect("replacement receives live push")
+        .expect("replacement connection remains open");
+    assert_eq!(received.id, message.id);
+}
+
 /// Connection-flood DoS defense (#53): once `max_connections` accepted slots
 /// are all held, a new connection attempt must be rejected rather than
 /// accepted (which would let an attacker keep opening connections without
 /// bound).
 #[tokio::test]
 async fn max_connections_rejects_beyond_cap() {
-    let (endpoint, _dir) = start_broker_with_limits(BrokerLimits {
+    let (endpoint, _dir, server) = start_observable_broker_with_limits(BrokerLimits {
         max_connections: 1,
         ..BrokerLimits::default()
     })
@@ -318,6 +518,8 @@ async fn max_connections_rejects_beyond_cap() {
         second.is_err(),
         "a connection beyond max_connections must be rejected"
     );
+    assert_eq!(server.active_connections(), 1);
+    assert_eq!(server.rejected_connections(), 1);
 }
 
 /// The connection cap is a live pool, not a one-shot budget (#53): once a
@@ -336,10 +538,9 @@ async fn max_connections_slot_frees_on_disconnect() {
         // Take the one slot with a raw TCP connection — the semaphore permit
         // is acquired and held for the connection task's whole lifetime
         // regardless of whether the WS/Hello handshake ever completes, so
-        // this alone is enough to occupy the slot. (`BrokerClient` isn't used
-        // here because its background reader task outlives a mere `drop`,
-        // which would make this test about the client's lifecycle rather
-        // than the server's slot accounting.)
+        // this alone is enough to occupy the slot. Use raw TCP here to isolate
+        // the server's slot accounting from `BrokerClient` lifecycle behavior,
+        // which has dedicated Drop and explicit-close coverage above.
         let _raw = tokio::net::TcpStream::connect(addr)
             .await
             .expect("raw tcp connects");

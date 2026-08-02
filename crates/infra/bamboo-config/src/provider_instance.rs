@@ -31,7 +31,7 @@ pub fn synthesize_legacy_instances(config: &Config) -> Vec<(String, ProviderInst
                     responses_only_models: openai.responses_only_models.clone(),
                     request_overrides: openai.request_overrides.clone(),
                     enabled: true,
-                    extra: Default::default(),
+                    extra: openai.extra.clone(),
                 },
             ));
         }
@@ -193,6 +193,11 @@ mod tests {
     #[test]
     fn synthesize_produces_openai_from_legacy() {
         let mut config = clean_test_config();
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            crate::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
+            serde_json::json!(false),
+        );
         config.providers.openai = Some(crate::config::OpenAIConfig {
             api_key: "sk-test".to_string(),
             api_key_encrypted: None,
@@ -204,7 +209,7 @@ mod tests {
             reasoning_effort: None,
             responses_only_models: vec![],
             request_overrides: None,
-            extra: Default::default(),
+            extra,
             api_key_from_env: false,
         });
         // Clear any other legacy providers to isolate this test.
@@ -221,6 +226,11 @@ mod tests {
         assert_eq!(inst.provider_type, "openai");
         assert_eq!(inst.api_key, "sk-test");
         assert_eq!(inst.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            inst.extra
+                .get(crate::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]

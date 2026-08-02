@@ -1227,6 +1227,22 @@ enum ActorCommands {
     },
 }
 
+fn requested_log_level(log_level: Option<&str>, verbose: u8) -> Option<&str> {
+    log_level.or(match verbose {
+        0 => None,
+        1 => Some("debug"),
+        _ => Some("trace"),
+    })
+}
+
+fn log_level_to_seed(rust_log_is_set: bool, requested_level: Option<&str>) -> Option<&str> {
+    if rust_log_is_set {
+        None
+    } else {
+        requested_level
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1262,12 +1278,8 @@ async fn main() {
     // `serve`'s file logging — honors it uniformly. An explicit `RUST_LOG` still
     // wins. Validated to a plain level here (use `RUST_LOG` directly for
     // target-scoped directives).
-    let verbose_level = match cli.verbose {
-        0 => None,
-        1 => Some("debug"),
-        _ => Some("trace"),
-    };
-    if let Some(level) = cli.log_level.as_deref().or(verbose_level) {
+    let requested_log_level = requested_log_level(cli.log_level.as_deref(), cli.verbose);
+    if let Some(level) = requested_log_level {
         const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
         if !LEVELS.contains(&level.to_ascii_lowercase().as_str()) {
             eprintln!(
@@ -1276,26 +1288,28 @@ async fn main() {
             );
             std::process::exit(2);
         }
-        if std::env::var_os("RUST_LOG").is_none() {
-            // SAFETY: consistent with the other env seeding in this file. We run
-            // before any logging subscriber is installed and while the tokio
-            // worker threads (already spawned by `#[tokio::main]`) are parked and
-            // read no env, so this write races nothing in practice.
-            unsafe {
-                std::env::set_var("RUST_LOG", level);
-            }
+    }
+    if let Some(level) =
+        log_level_to_seed(std::env::var_os("RUST_LOG").is_some(), requested_log_level)
+    {
+        // SAFETY: consistent with the other env seeding in this file. We run
+        // before any logging subscriber is installed and while the tokio
+        // worker threads (already spawned by `#[tokio::main]`) are parked and
+        // read no env, so this write races nothing in practice.
+        unsafe {
+            std::env::set_var("RUST_LOG", level);
         }
     }
 
-    // Initialize logging (file + stdout, with rotation).
-    // Use debug level in debug builds, info in release.
-    let debug = cfg!(debug_assertions);
+    // Initialize logging (file + stdout, with rotation). The standalone server
+    // owns its quiet-by-default policy; embedding applications do not need to
+    // pass a log-level argument based on how the binary was built.
     match &cli.command {
         Some(Commands::Serve { data_dir, .. }) => {
             let home = data_dir
                 .clone()
                 .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
-            bamboo_agent::server::logging::init_logging_with_home(&home, debug);
+            bamboo_agent::server::logging::init_server_logging_with_home(&home);
         }
         Some(Commands::Config { .. }) => {
             // No file logging for config subcommand; stdout only.
@@ -2104,11 +2118,29 @@ fn serialize_config_for_cli(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_config_data_dir, serialize_config_for_cli};
+    use super::{
+        log_level_to_seed, requested_log_level, resolve_config_data_dir, serialize_config_for_cli,
+    };
     use bamboo_config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
     use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn requested_log_level_prefers_explicit_level_then_verbose_count() {
+        assert_eq!(requested_log_level(Some("error"), 2), Some("error"));
+        assert_eq!(requested_log_level(None, 0), None);
+        assert_eq!(requested_log_level(None, 1), Some("debug"));
+        assert_eq!(requested_log_level(None, 2), Some("trace"));
+        assert_eq!(requested_log_level(None, u8::MAX), Some("trace"));
+    }
+
+    #[test]
+    fn rust_log_prevents_cli_level_from_being_seeded() {
+        assert_eq!(log_level_to_seed(true, Some("debug")), None);
+        assert_eq!(log_level_to_seed(false, Some("debug")), Some("debug"));
+        assert_eq!(log_level_to_seed(false, None), None);
+    }
 
     /// `--config <dir>` pointing at an existing directory is used as-is (same
     /// semantics as `--data-dir`).

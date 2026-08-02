@@ -111,6 +111,8 @@ pub async fn create_provider_by_name(
             }
 
             provider = provider.with_reasoning_effort(openai_config.reasoning_effort);
+            provider =
+                provider.with_explicit_prompt_cache(openai_config.explicit_prompt_cache_enabled());
             provider = provider.with_request_overrides(openai_config.request_overrides.clone());
 
             Ok(Arc::new(provider.with_masking(masking_config.clone())))

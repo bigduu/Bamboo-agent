@@ -2619,6 +2619,8 @@ fn default_true_hooks() -> bool {
 ///   "model": "gpt-4"
 /// }
 /// ```
+pub const OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY: &str = "explicit_prompt_cache";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenAIConfig {
     /// OpenAI API key (plaintext, in-memory only).
@@ -2671,6 +2673,21 @@ pub struct OpenAIConfig {
     /// Preserve unknown keys under `providers.openai`.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl OpenAIConfig {
+    /// Whether Bamboo may lower its provider-neutral cache plan into GPT-5.6+
+    /// `prompt_cache_options` and `prompt_cache_breakpoint` fields.
+    ///
+    /// This defaults to enabled. OpenAI-compatible upstreams that have not yet
+    /// implemented the explicit-cache request fields can opt out without
+    /// disabling `prompt_cache_key` or the upstream's implicit prompt cache.
+    pub fn explicit_prompt_cache_enabled(&self) -> bool {
+        self.extra
+            .get(OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
 }
 
 /// Anthropic provider configuration

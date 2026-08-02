@@ -12,8 +12,9 @@
 //!   so a single run's logs are never split mid-stream on a byte threshold.
 //! - **Old files are purged.** At most [`DEFAULT_MAX_LOG_FILES`] dated files are
 //!   kept; the appender deletes the oldest beyond that on rollover.
-//! - **Level matches the build profile.** Debug builds default to `debug`, release
-//!   builds to `info`, and `RUST_LOG` always overrides both.
+//! - **Server logs are quiet by default.** `bamboo serve` defaults to `info` in
+//!   every build profile. Explicit `RUST_LOG` directives still override that
+//!   policy, while embedding APIs may opt into a build-profile-derived level.
 //!
 //! All initializers are best-effort and idempotent: they use `try_init`, so a
 //! second call (or a call after some other subscriber is installed) is a no-op
@@ -69,6 +70,22 @@ pub fn init_logging_with_home(home: &Path, debug: bool) {
     init_logging_with_options(options_for_home(home, debug));
 }
 
+/// Initialize file + stdout logging for the standalone `bamboo serve` process.
+///
+/// Server operation defaults to `info` in every build profile. A debug binary is
+/// an implementation detail of the development toolchain, not an operator
+/// request for dependency-wide debug logs. Callers can still opt in explicitly
+/// through `RUST_LOG`, `--log-level`, or `-v` before this initializer runs.
+pub fn init_server_logging_with_home(home: &Path) {
+    init_logging_with_options(options_for_server_home(home, cfg!(debug_assertions)));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogContext {
+    Server,
+    BuildProfile,
+}
+
 /// Build the [`LogOptions`] used by [`init_logging_with_home`]: logs under
 /// `{home}/logs`, level by build profile, shared defaults otherwise.
 ///
@@ -76,7 +93,16 @@ pub fn init_logging_with_home(home: &Path, debug: bool) {
 /// tested without installing a process-global subscriber.
 fn options_for_home(home: &Path, debug: bool) -> LogOptions {
     let mut opts = LogOptions::new(home.join("logs"));
-    opts.default_level = level_for(debug).to_string();
+    opts.default_level = level_for(LogContext::BuildProfile, debug).to_string();
+    opts
+}
+
+/// Build server options without installing a process-global subscriber.
+/// Keeping the build-profile input explicit makes the invariant directly
+/// testable: both debug and release servers must resolve to `info`.
+fn options_for_server_home(home: &Path, debug_build: bool) -> LogOptions {
+    let mut opts = LogOptions::new(home.join("logs"));
+    opts.default_level = level_for(LogContext::Server, debug_build).to_string();
     opts
 }
 
@@ -146,17 +172,17 @@ pub fn init_logging(debug: bool) {
     let _ = fmt()
         .with_target(true)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level_for(debug))),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(level_for(LogContext::BuildProfile, debug))),
         )
         .try_init();
 }
 
-/// Default level string for a build profile when `RUST_LOG` is unset.
-fn level_for(debug: bool) -> &'static str {
-    if debug {
-        "debug"
-    } else {
-        "info"
+/// Default level string for a logging context when `RUST_LOG` is unset.
+fn level_for(context: LogContext, debug_build: bool) -> &'static str {
+    match (context, debug_build) {
+        (LogContext::Server, _) | (LogContext::BuildProfile, false) => "info",
+        (LogContext::BuildProfile, true) => "debug",
     }
 }
 
@@ -168,9 +194,15 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     #[test]
-    fn level_for_maps_build_profile() {
-        assert_eq!(level_for(true), "debug");
-        assert_eq!(level_for(false), "info");
+    fn level_for_maps_build_profile_for_embedding_apis() {
+        assert_eq!(level_for(LogContext::BuildProfile, true), "debug");
+        assert_eq!(level_for(LogContext::BuildProfile, false), "info");
+    }
+
+    #[test]
+    fn server_level_is_info_in_debug_and_release_builds() {
+        assert_eq!(level_for(LogContext::Server, true), "info");
+        assert_eq!(level_for(LogContext::Server, false), "info");
     }
 
     #[test]
@@ -190,6 +222,15 @@ mod tests {
 
         let release = options_for_home(Path::new("/srv/data"), false);
         assert_eq!(release.default_level, "info");
+    }
+
+    #[test]
+    fn server_options_are_info_in_debug_and_release_builds() {
+        for debug_build in [true, false] {
+            let opts = options_for_server_home(Path::new("/srv/data"), debug_build);
+            assert_eq!(opts.dir, PathBuf::from("/srv/data/logs"));
+            assert_eq!(opts.default_level, "info");
+        }
     }
 
     #[test]

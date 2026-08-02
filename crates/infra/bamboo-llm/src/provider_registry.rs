@@ -369,6 +369,17 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
     let providers = config.providers_mut();
     match instance.provider_type.as_str() {
         "openai" => {
+            let extra = instance
+                .extra
+                .get(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY)
+                .map(|value| {
+                    std::iter::once((
+                        bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
+                        value.clone(),
+                    ))
+                    .collect()
+                })
+                .unwrap_or_default();
             providers.openai = Some(bamboo_config::OpenAIConfig {
                 api_key: instance.api_key.clone(),
                 // Key comes from the provider instance, not a BAMBOO_*_API_KEY env
@@ -383,7 +394,7 @@ fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConf
                 reasoning_effort: instance.reasoning_effort,
                 responses_only_models: instance.responses_only_models.clone(),
                 request_overrides: instance.request_overrides.clone(),
-                extra: Default::default(),
+                extra,
             });
         }
         "anthropic" => {
@@ -606,6 +617,11 @@ mod tests {
     #[test]
     fn test_apply_instance_to_config_openai() {
         let mut config = Config::default();
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
+            serde_json::json!(false),
+        );
         let instance = ProviderInstanceConfig {
             provider_type: "openai".to_string(),
             label: Some("Test OpenAI".to_string()),
@@ -620,7 +636,7 @@ mod tests {
             responses_only_models: vec![],
             request_overrides: None,
             enabled: true,
-            extra: Default::default(),
+            extra,
         };
 
         apply_instance_to_config(&mut config, &instance);
@@ -636,6 +652,7 @@ mod tests {
             Some("https://custom.api.com/v1")
         );
         assert_eq!(openai.model.as_deref(), Some("gpt-4o"));
+        assert!(!openai.explicit_prompt_cache_enabled());
         assert_eq!(config.provider, "openai");
     }
 

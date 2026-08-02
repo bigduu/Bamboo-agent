@@ -63,6 +63,7 @@ async fn recv(client: &mut BrokerClient) -> InboxMessage {
 ///   as a CA (`CaUsedAsEndEntity`) — being a trust anchor doesn't need
 ///   `CA:TRUE` (anchors aren't constraint-checked the way intermediate/leaf
 ///   certs are), so `CA:FALSE` satisfies both roles at once.
+///
 /// Returns `None` (skip) if `openssl` is unavailable or too old to support
 /// `-addext`.
 fn gen_self_signed(dir: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -95,9 +96,9 @@ fn gen_self_signed(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-/// Start a TLS-terminated broker; returns the `wss://` endpoint, the cert
-/// path (for the client to trust), and the mailbox-root guard.
-async fn start_tls_broker(cert: &Path, key: &Path) -> (String, TempDir) {
+/// Start a TLS-terminated broker; returns the `wss://` endpoint, mailbox-root
+/// guard, and an observability handle for deterministic lifecycle assertions.
+async fn start_tls_broker(cert: &Path, key: &Path) -> (String, TempDir, Arc<BrokerServer>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let core = Arc::new(BrokerCore::new(dir.path()));
     let server = Arc::new(
@@ -108,10 +109,26 @@ async fn start_tls_broker(cert: &Path, key: &Path) -> (String, TempDir) {
     assert!(server.is_tls(), "with_tls must flip is_tls() on");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
+    let serving = Arc::clone(&server);
     tokio::spawn(async move {
-        let _ = server.serve(listener).await;
+        let _ = serving.serve(listener).await;
     });
-    (format!("wss://{addr}"), dir)
+    (format!("wss://{addr}"), dir, server)
+}
+
+async fn wait_for_no_connections(server: &BrokerServer) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.active_connections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "TLS broker retained {} active connections",
+            server.active_connections()
+        )
+    });
 }
 
 #[tokio::test]
@@ -121,7 +138,7 @@ async fn ask_reply_round_trip_over_wss_with_trusted_self_signed_cert() {
         eprintln!("skipping wss round-trip test: openssl unavailable");
         return;
     };
-    let (endpoint, _mailbox_dir) = start_tls_broker(&cert, &key).await;
+    let (endpoint, _mailbox_dir, _server) = start_tls_broker(&cert, &key).await;
 
     // Trust EXACTLY this self-signed cert (the homelab/cross-network
     // quick-start path, #48) — no OS trust-store changes.
@@ -175,6 +192,48 @@ async fn ask_reply_round_trip_over_wss_with_trusted_self_signed_cert() {
     assert_eq!(body.answer, "all systems nominal, encrypted");
 }
 
+/// The reader/source ownership fix must release TLS transports too: retaining
+/// the `SplitStream` would otherwise keep the rustls session, TCP socket, and
+/// server semaphore permit alive exactly like plaintext WebSockets.
+#[tokio::test]
+async fn short_lived_wss_clients_release_on_drop_and_explicit_close() {
+    let cert_dir = tempfile::tempdir().expect("tempdir");
+    let Some((cert, key)) = gen_self_signed(cert_dir.path()) else {
+        eprintln!("skipping wss lifecycle test: openssl unavailable");
+        return;
+    };
+    let (endpoint, _mailbox_dir, server) = start_tls_broker(&cert, &key).await;
+    let tls_config = bamboo_broker::client_config_trusting_cert(&cert)
+        .expect("client config trusts generated certificate");
+
+    let mut dropped = BrokerClient::connect_with_tls(
+        &endpoint,
+        agent("tls-drop"),
+        TOKEN,
+        Some(tls_config.clone()),
+    )
+    .await
+    .expect("drop client connects over wss");
+    dropped
+        .list_connected("absent-role")
+        .await
+        .expect("presence query over wss");
+    assert_eq!(server.active_connections(), 1);
+    drop(dropped);
+    wait_for_no_connections(&server).await;
+
+    let mut graceful =
+        BrokerClient::connect_with_tls(&endpoint, agent("tls-close"), TOKEN, Some(tls_config))
+            .await
+            .expect("close client connects over wss");
+    graceful
+        .list_connected("absent-role")
+        .await
+        .expect("presence query over wss");
+    graceful.close().await.expect("bounded graceful close");
+    wait_for_no_connections(&server).await;
+}
+
 /// Security regression: a client that does NOT explicitly trust the
 /// self-signed cert (i.e. plain [`BrokerClient::connect`], the OS native root
 /// store) must be REJECTED — a self-signed cert must never be silently
@@ -189,7 +248,7 @@ async fn wss_with_untrusted_self_signed_cert_is_rejected() {
         eprintln!("skipping untrusted-cert rejection test: openssl unavailable");
         return;
     };
-    let (endpoint, _mailbox_dir) = start_tls_broker(&cert, &key).await;
+    let (endpoint, _mailbox_dir, _server) = start_tls_broker(&cert, &key).await;
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
