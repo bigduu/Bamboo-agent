@@ -15,6 +15,7 @@
 
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -94,6 +95,10 @@ pub struct BrokerServer {
     /// `limits.max_connections`. Held for the lifetime of each connection's
     /// task (#53).
     connection_slots: Arc<Semaphore>,
+    /// Monotonic, process-local count of connections rejected by the
+    /// semaphore limit. It has no labels or peer/session data, so exporting or
+    /// polling it cannot create high-cardinality or sensitive telemetry.
+    rejected_connections: AtomicU64,
     /// TLS acceptor for terminating `wss://` before the WS upgrade — `None`
     /// (the default) keeps the historical bare-`TcpStream` `ws://` behavior.
     /// Set via [`with_tls`](Self::with_tls). #48.
@@ -116,6 +121,7 @@ impl BrokerServer {
             core,
             token: token.into(),
             connection_slots: Arc::new(Semaphore::new(limits.max_connections)),
+            rejected_connections: AtomicU64::new(0),
             limits,
             tls: None,
         }
@@ -142,6 +148,21 @@ impl BrokerServer {
     /// — i.e. this server terminates `wss://`, not bare `ws://`.
     pub fn is_tls(&self) -> bool {
         self.tls.is_some()
+    }
+
+    /// Number of connections currently holding a server semaphore permit.
+    /// This includes accepted sockets still completing TLS/WS/Hello handshakes
+    /// because those sockets consume the same bounded resource.
+    pub fn active_connections(&self) -> usize {
+        self.limits
+            .max_connections
+            .saturating_sub(self.connection_slots.available_permits())
+    }
+
+    /// Total number of connections rejected because all permits were in use.
+    /// Monotonic for this server instance and intentionally unlabelled.
+    pub fn rejected_connections(&self) -> u64 {
+        self.rejected_connections.load(Ordering::Relaxed)
     }
 
     /// Accept connections forever, one task each. Returns only on a listener
@@ -183,9 +204,12 @@ impl BrokerServer {
                     });
                 }
                 Err(_) => {
+                    let rejected_connections =
+                        server.rejected_connections.fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::warn!(
                         max_connections = server.limits.max_connections,
-                        %peer,
+                        active_connections = server.active_connections(),
+                        rejected_connections,
                         "broker: max_connections reached — rejecting connection"
                     );
                     drop(stream);
@@ -250,6 +274,11 @@ impl BrokerServer {
 
         // 2. Serve: client frames in, subscription stream out.
         let mut sub_rx: Option<mpsc::UnboundedReceiver<PushItem>> = None;
+        // Multiple connections may authenticate as the same agent: the
+        // long-lived worker subscribes while short-lived per-run connections
+        // only deliver. Disconnecting a delivery-only connection must never
+        // remove the worker's subscriber entry. #788.
+        let mut subscription = None;
         let outcome = loop {
             tokio::select! {
                 biased;
@@ -298,10 +327,15 @@ impl BrokerServer {
                                 }
                             }
                         }
-                        Ok(Some(ClientFrame::Subscribe)) => match self.core.subscribe(&session_id, role.as_deref()).await {
-                            Ok(rx) => sub_rx = Some(rx),
-                            Err(e) => {
-                                let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string(), id: None }).await;
+                        Ok(Some(ClientFrame::Subscribe)) => {
+                            match self.core.subscribe_with_lease(&session_id, role.as_deref()).await {
+                                Ok((rx, lease)) => {
+                                    sub_rx = Some(rx);
+                                    subscription = Some(lease);
+                                }
+                                Err(e) => {
+                                    let _ = send(&mut sink, BrokerFrame::Error { reason: e.to_string(), id: None }).await;
+                                }
                             }
                         },
                         Ok(Some(ClientFrame::Ack { id })) => {
@@ -347,7 +381,9 @@ impl BrokerServer {
             }
         };
 
-        self.core.unsubscribe(&session_id).await;
+        if let Some(lease) = subscription {
+            self.core.unsubscribe_if_owner(&session_id, &lease).await;
+        }
         outcome
     }
 }

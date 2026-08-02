@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::client::WsSink;
+use crate::client::{send_close, ReaderLifecycle, WsSink, CLIENT_SHUTDOWN_TIMEOUT};
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::ClientFrame;
 
@@ -35,6 +35,10 @@ type Pending = Arc<Mutex<HashMap<MsgId, oneshot::Sender<InboxMessage>>>>;
 /// connected + subscribed [`crate::client::BrokerClient`] via
 /// `BrokerClient::into_multiplexed`.
 pub struct MultiplexedClient {
+    /// Authoritative ownership of the WebSocket reader. Dropping the mux
+    /// directly aborts that reader via `ReaderLifecycle::drop` instead of
+    /// detaching it behind its supervisor. #788.
+    reader: ReaderLifecycle,
     /// Locked only for the duration of one frame write — never across a reply wait.
     sink: Mutex<WsSink>,
     /// correlation_id (== the request msg.id) -> reply waiter.
@@ -46,7 +50,7 @@ pub struct MultiplexedClient {
     reader_alive: Arc<AtomicBool>,
     /// The correlation router; ends when `messages` closes (reader death) or when
     /// this client is dropped.
-    _router: JoinHandle<()>,
+    router: JoinHandle<()>,
     me: AgentRef,
 }
 
@@ -55,6 +59,7 @@ impl MultiplexedClient {
     /// that feeds `messages` keeps running independently; this router drains it
     /// and routes by `correlation_id`.
     pub(crate) fn spawn(
+        reader: ReaderLifecycle,
         sink: WsSink,
         mut messages: mpsc::UnboundedReceiver<InboxMessage>,
         delivered: mpsc::UnboundedReceiver<MsgId>,
@@ -82,13 +87,31 @@ impl MultiplexedClient {
         });
 
         Self {
+            reader,
             sink: Mutex::new(sink),
             pending,
             delivered: Mutex::new(delivered),
             reader_alive,
-            _router: router,
+            router,
             me,
         }
+    }
+
+    /// Gracefully close the underlying WebSocket and await bounded cleanup of
+    /// both the reader supervisor and correlation router. Drop remains a
+    /// direct-abort fallback if this future is cancelled or cleanup stalls.
+    pub async fn close(mut self) -> BrokerResult<()> {
+        self.reader.mark_intentional_shutdown();
+        let close_result = send_close(self.sink.get_mut()).await;
+        self.reader.shutdown().await;
+
+        if tokio::time::timeout(CLIENT_SHUTDOWN_TIMEOUT, &mut self.router)
+            .await
+            .is_err()
+        {
+            self.router.abort();
+        }
+        close_result
     }
 
     /// True while the underlying reader is still running. False once the
@@ -195,6 +218,16 @@ impl MultiplexedClient {
         sink.send(Message::text(frame.to_text()))
             .await
             .map_err(|e| BrokerError::Transport(format!("ws send: {e}")))
+    }
+}
+
+impl Drop for MultiplexedClient {
+    fn drop(&mut self) {
+        // ReaderLifecycle directly aborts the WebSocket reader when its field
+        // drops. Abort the router here as well so the mux leaves no detached
+        // per-connection task even if the runtime has not yet delivered the
+        // reader channel closure.
+        self.router.abort();
     }
 }
 
