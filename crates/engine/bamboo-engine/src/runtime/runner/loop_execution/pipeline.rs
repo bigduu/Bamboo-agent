@@ -50,8 +50,10 @@ const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
 // ---- Error classification (from rounds.rs) ----
 
 fn should_retry_turn_error(error: &AgentError) -> bool {
-    let AgentError::LLM(message) = error else {
-        return false;
+    let message = match error {
+        AgentError::StreamTimeout(timeout) => return timeout.retry_safe(),
+        AgentError::LLM(message) => message,
+        _ => return false,
     };
     let message = message.trim().to_ascii_lowercase();
     if message.is_empty() {
@@ -2560,7 +2562,9 @@ mod tests {
     };
     use crate::runtime::runner::state_bridge;
     use bamboo_agent_core::storage::Storage;
-    use bamboo_agent_core::{AgentError, AgentEvent, AgentHook, Message, Session};
+    use bamboo_agent_core::{
+        AgentError, AgentEvent, AgentHook, Message, Session, StreamTimeoutError, StreamTimeoutPhase,
+    };
     use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload, HookResult};
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
@@ -4679,9 +4683,42 @@ mod tests {
         assert!(!should_retry_turn_error(&AgentError::Budget(
             "budget exceeded".to_string(),
         )));
-        assert!(!should_retry_turn_error(&AgentError::StreamTimeout(
-            "semantic_output_started=true, retry_safe=false".to_string(),
-        )));
+    }
+
+    #[test]
+    fn retries_only_structurally_safe_stream_timeouts() {
+        let retry_safe = AgentError::StreamTimeout(StreamTimeoutError::new(
+            StreamTimeoutPhase::Bootstrap,
+            Duration::from_secs(120),
+            Some("provider".to_string()),
+            Some("model".to_string()),
+            Duration::from_secs(120),
+            None,
+            true,
+        ));
+        assert!(should_retry_turn_error(&retry_safe));
+
+        let partial_output = AgentError::StreamTimeout(StreamTimeoutError::new(
+            StreamTimeoutPhase::TransportIdle,
+            Duration::from_secs(120),
+            Some("provider".to_string()),
+            Some("model".to_string()),
+            Duration::from_secs(120),
+            Some(Duration::from_secs(120)),
+            true,
+        ));
+        assert!(!should_retry_turn_error(&partial_output));
+
+        let auxiliary_timeout = AgentError::StreamTimeout(StreamTimeoutError::new(
+            StreamTimeoutPhase::Bootstrap,
+            Duration::from_secs(120),
+            Some("provider".to_string()),
+            Some("model".to_string()),
+            Duration::from_secs(120),
+            None,
+            false,
+        ));
+        assert!(!should_retry_turn_error(&auxiliary_timeout));
     }
 
     #[test]

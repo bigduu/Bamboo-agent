@@ -93,25 +93,32 @@ pub(crate) async fn evaluate_gold_auto_answer_question(
         cache: None,
     };
 
-    let stream = provider
-        .chat_stream_with_options(
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+        stream_timeout,
+        Some(&provider_name),
+        Some(&model),
+    )
+    .begin_request();
+    let cancel_token = CancellationToken::new();
+    let stream = crate::runtime::stream::handler::await_stream_bootstrap(
+        provider.chat_stream_with_options(
             &messages,
             &tools,
             Some(gold_config.max_output_tokens),
             &model,
             Some(&request_options),
-        )
-        .await
-        .map_err(|error| format!("provider call failed: {error}"))?;
-
-    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
-        stream_timeout,
-        Some(&provider_name),
-        Some(&model),
+        ),
+        &cancel_token,
+        session_id,
+        &timeout_context,
     );
+    let stream = stream
+        .await
+        .map_err(|error| format!("provider bootstrap failed: {error}"))?
+        .map_err(|error| format!("provider call failed: {error}"))?;
     let stream_output = crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
         stream,
-        &CancellationToken::new(),
+        &cancel_token,
         session_id,
         &timeout_context,
     )

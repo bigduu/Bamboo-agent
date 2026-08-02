@@ -49,13 +49,15 @@ pub async fn evaluate_task_progress(
     llm: Arc<dyn LLMProvider>,
     frame: &TaskEvaluationFrame<'_>,
 ) -> Result<TaskEvaluationResult, AgentError> {
-    use crate::runtime::stream::handler::consume_llm_stream_silent_with_context;
+    use crate::runtime::stream::handler::{
+        await_stream_bootstrap, consume_llm_stream_silent_with_context,
+    };
 
     let event_tx = frame.event_tx;
     let session_id = frame.session_id;
     let model = frame.model;
     let reasoning_effort = frame.reasoning_effort;
-    let timeout_context = frame.timeout_context;
+    let timeout_context = frame.timeout_context.clone().begin_request();
 
     let in_progress_count = ctx
         .items
@@ -110,31 +112,31 @@ pub async fn evaluate_task_progress(
         request_purpose: Some("task_evaluation".to_string()),
         cache: None,
     };
-    match llm
-        .chat_stream_with_options(&messages, &tools, Some(8192), model, Some(&request_options))
-        .await
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let stream = match await_stream_bootstrap(
+        llm.chat_stream_with_options(&messages, &tools, Some(8192), model, Some(&request_options)),
+        &cancel_token,
+        session_id,
+        &timeout_context,
+    )
+    .await?
     {
-        Ok(stream) => {
-            let stream_output = consume_llm_stream_silent_with_context(
-                stream,
-                &tokio_util::sync::CancellationToken::new(),
-                session_id,
-                timeout_context,
-            )
-            .await?;
-
-            Ok(outcomes::build_success_result(
-                stream_output,
-                event_tx,
-                session_id,
-                prompt_tokens,
-                ctx.version,
-            )
-            .await)
-        }
+        Ok(stream) => stream,
         Err(error) => {
             tracing::warn!("[{}] Task evaluation failed: {}", session_id, error);
-            Ok(skipped_evaluation(&format!("Evaluation failed: {}", error)))
+            return Ok(skipped_evaluation(&format!("Evaluation failed: {}", error)));
         }
-    }
+    };
+    let stream_output =
+        consume_llm_stream_silent_with_context(stream, &cancel_token, session_id, &timeout_context)
+            .await?;
+
+    Ok(outcomes::build_success_result(
+        stream_output,
+        event_tx,
+        session_id,
+        prompt_tokens,
+        ctx.version,
+    )
+    .await)
 }

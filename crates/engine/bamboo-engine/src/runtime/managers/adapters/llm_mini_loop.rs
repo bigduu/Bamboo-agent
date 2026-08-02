@@ -109,17 +109,28 @@ impl MiniLoopExecutor for LLMMiniLoopExecutor {
             request_purpose: Some("mini_loop".to_string()),
             cache: None,
         };
-        let stream = self
-            .provider
-            .chat_stream_with_options(&messages, &[], Some(256), &self.model, Some(&options))
-            .await
-            .map_err(|e| AgentError::LLM(e.to_string()))?;
+        let timeout_context = self.timeout_context.clone().begin_request();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let stream = crate::runtime::stream::handler::await_stream_bootstrap(
+            self.provider.chat_stream_with_options(
+                &messages,
+                &[],
+                Some(256),
+                &self.model,
+                Some(&options),
+            ),
+            &cancel_token,
+            "mini-loop",
+            &timeout_context,
+        )
+        .await?
+        .map_err(|e| AgentError::LLM(e.to_string()))?;
 
         let output = crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
             stream,
-            &tokio_util::sync::CancellationToken::new(),
+            &cancel_token,
             "mini-loop",
-            &self.timeout_context,
+            &timeout_context,
         )
         .await?;
 

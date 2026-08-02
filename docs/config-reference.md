@@ -191,7 +191,7 @@ main response stream and auxiliary silent model calls:
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `transport_idle_timeout_secs` | `120` | Maximum gap between successfully received, non-empty provider response-body chunks. SSE ping/lifecycle events, comment heartbeats, and partial event fragments count even when they contain no token. |
+| `transport_idle_timeout_secs` | `120` | Maximum time for the provider call to establish its response stream, and the maximum subsequent gap between successfully received, non-empty response-body chunks. SSE ping/lifecycle events, comment heartbeats, and partial event fragments count even when they contain no token. |
 | `first_semantic_timeout_secs` | `600` | Maximum time from request dispatch to the first text, reasoning, or tool-call delta. Transport keepalives do not extend it. |
 | `semantic_idle_timeout_secs` | `600` | Maximum semantic-progress gap after output starts. Transport keepalives do not extend it. |
 
@@ -200,17 +200,21 @@ are rejected by config loading; invalid values constructed by an embedding are
 replaced with the safe defaults. Timeout errors report the expired phase,
 deadline, provider/model identifiers, and last transport/semantic activity,
 but never include prompts or raw provider payloads. A stream timeout is not
-automatically retried, because replay after partial output or tool-call deltas
-could duplicate externally visible state.
+retried after text, reasoning, or tool-call output has started, because replay
+could duplicate externally visible state. A timeout before any semantic output
+on the primary response stream is marked retry-safe and may use the agent
+loop's existing bounded turn retry policy. Auxiliary model calls are bounded by
+the same watchdogs but never replay the containing agent turn.
 
 ### OpenAI-compatible proxy heartbeats
 
-An OpenAI-compatible proxy should either forward upstream response bytes or
-emit an SSE heartbeat more frequently than `transport_idle_timeout_secs`.
-Bamboo treats any successfully received, non-empty body chunk as transport
-activity before parsing SSE, including the standard comment form
-`: keep-alive\n\n`. These internal activity markers do not become model output
-and do not extend either semantic deadline.
+An OpenAI-compatible proxy should establish the response stream within
+`transport_idle_timeout_secs`, then either forward upstream response bytes or
+emit an SSE heartbeat more frequently than that deadline. Bamboo treats any
+successfully received, non-empty body chunk as transport activity before
+parsing SSE, including the standard comment form `: keep-alive\n\n`. These
+internal activity markers do not become model output and do not extend either
+semantic deadline.
 
 For example, CLIProxyAPI supports periodic streaming heartbeats with:
 
