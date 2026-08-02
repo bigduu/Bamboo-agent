@@ -216,35 +216,41 @@ pub async fn create_provider_by_name(
 /// Validate provider configuration without creating the provider
 pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
     if let Some(instance_id) = config.default_provider_instance.as_deref() {
-        let instance = config.provider_instances.get(instance_id).ok_or_else(|| {
-            LLMError::Auth(format!(
-                "Default provider instance '{instance_id}' configuration required"
-            ))
-        })?;
-        if !instance.enabled {
+        if let Some(instance) = config.provider_instances.get(instance_id) {
+            if !instance.enabled {
+                return Err(LLMError::Auth(format!(
+                    "Default provider instance '{instance_id}' is disabled"
+                )));
+            }
+            return match instance.provider_type.as_str() {
+                "copilot" => Ok(()),
+                "openai" | "anthropic" | "gemini" | "bodhi" => {
+                    if instance.api_key.is_empty() {
+                        Err(LLMError::Auth(format!(
+                            "{} API key is required for provider instance '{instance_id}'",
+                            provider_display_name(&instance.provider_type)
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }
+                other => Err(LLMError::Auth(format!(
+                    "Unknown provider type '{other}' for provider instance '{instance_id}'"
+                ))),
+            };
+        }
+        if !AVAILABLE_PROVIDERS.contains(&instance_id) {
             return Err(LLMError::Auth(format!(
-                "Default provider instance '{instance_id}' is disabled"
+                "Default provider instance '{instance_id}' configuration required"
             )));
         }
-        return match instance.provider_type.as_str() {
-            "copilot" => Ok(()),
-            "openai" | "anthropic" | "gemini" | "bodhi" => {
-                if instance.api_key.is_empty() {
-                    Err(LLMError::Auth(format!(
-                        "{} API key is required for provider instance '{instance_id}'",
-                        provider_display_name(&instance.provider_type)
-                    )))
-                } else {
-                    Ok(())
-                }
-            }
-            other => Err(LLMError::Auth(format!(
-                "Unknown provider type '{other}' for provider instance '{instance_id}'"
-            ))),
-        };
     }
 
-    match config.provider.as_str() {
+    let provider_name = config
+        .default_provider_instance
+        .as_deref()
+        .unwrap_or(&config.provider);
+    match provider_name {
         "copilot" => Ok(()),
 
         "openai" => {
@@ -302,10 +308,7 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
             Ok(())
         }
 
-        _ => Err(LLMError::Auth(format!(
-            "Unknown provider: {}",
-            config.provider
-        ))),
+        _ => Err(LLMError::Auth(format!("Unknown provider: {provider_name}"))),
     }
 }
 
@@ -509,6 +512,31 @@ mod tests {
             .unwrap(),
         );
         config.default_provider_instance = Some("work".to_string());
+
+        assert!(validate_provider_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_legacy_default_alongside_explicit_instances() {
+        let mut config = config_with_provider(
+            "anthropic",
+            ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "sk-legacy".to_string(),
+                    ..OpenAIConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+        );
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "copilot",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("openai".to_string());
 
         assert!(validate_provider_config(&config).is_ok());
     }

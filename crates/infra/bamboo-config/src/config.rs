@@ -2006,7 +2006,10 @@ impl From<ConfigRoot> for ConfigValues {
 /// instance-native writes are narrower: the explicit instance default is the
 /// routing authority, so legacy routing fields must not be written back.
 fn durable_root_value(values: ConfigValues) -> serde_json::Result<Value> {
-    let instance_native = values.default_provider_instance.is_some();
+    let instance_native = values
+        .default_provider_instance
+        .as_ref()
+        .is_some_and(|id| values.provider_instances.contains_key(id));
     let mut value = serde_json::to_value(ConfigRoot::from(values))?;
     if instance_native {
         if let Some(object) = value.as_object_mut() {
@@ -3254,7 +3257,11 @@ impl Config {
     /// authoritative. Unknown provider entries remain available for forward
     /// compatibility.
     pub(crate) fn clear_legacy_provider_aliases_for_instance_mode(&mut self) {
-        if self.default_provider_instance.is_some() {
+        if self
+            .default_provider_instance
+            .as_ref()
+            .is_some_and(|id| self.provider_instances.contains_key(id))
+        {
             self.providers.0.clear_legacy_builtin_aliases();
         }
     }
@@ -5404,6 +5411,34 @@ mod tests {
         assert!(provider_only.get("gemini").is_none());
         assert!(provider_only.get("provider").is_none());
         assert_eq!(provider_only["future_provider"]["kept"], true);
+    }
+
+    #[test]
+    fn hybrid_legacy_default_preserves_its_builtin_alias_on_durable_writes() {
+        let mut config = Config::default();
+        config.values.provider = "openai".to_string();
+        config.providers_mut().openai = Some(OpenAIConfig {
+            model: Some("gpt-legacy".to_string()),
+            ..OpenAIConfig::default()
+        });
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "copilot",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("openai".to_string());
+
+        let (root_bytes, provider_bytes) =
+            config.prepare_provider_transaction_documents(&[]).unwrap();
+        let root: Value = serde_json::from_slice(&root_bytes).unwrap();
+        let providers: Value = serde_json::from_slice(&provider_bytes).unwrap();
+        assert_eq!(root["provider"], "openai");
+        assert_eq!(root["default_provider_instance"], "openai");
+        assert!(root["provider_instances"]["work"].is_object());
+        assert_eq!(providers["openai"]["model"], "gpt-legacy");
     }
 
     #[test]

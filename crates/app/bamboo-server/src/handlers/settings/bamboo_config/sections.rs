@@ -410,7 +410,10 @@ pub async fn put_provider_settings_section(
                 credential_status: _,
             } = data;
 
-            if default_provider_instance_id.is_some() {
+            let instance_native = default_provider_instance_id
+                .as_ref()
+                .is_some_and(|id| provider_instances.contains_key(id));
+            if instance_native {
                 providers.clear_legacy_builtin_aliases();
             }
 
@@ -3019,6 +3022,100 @@ mod tests {
         );
         assert!(restarted_config.providers().openai.is_none());
         assert!(restarted_config.providers().anthropic.is_none());
+    }
+
+    #[actix_web::test]
+    async fn hybrid_legacy_default_provider_settings_preserve_builtin_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+        let legacy_secret = "hybrid-legacy-openai-secret";
+
+        let saved = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {
+                        "provider": "openai",
+                        "providers": {
+                            "openai": {"model": "gpt-legacy"}
+                        },
+                        "defaults": {
+                            "chat": {"provider": "openai", "model": "gpt-legacy"}
+                        },
+                        "features": {},
+                        "provider_instances": {
+                            "work": {
+                                "provider_type": "copilot",
+                                "enabled": true
+                            }
+                        },
+                        "default_provider_instance_id": "openai"
+                    },
+                    "credential_changes": {
+                        "providers": {
+                            "openai": {"action": "replace", "value": legacy_secret}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = saved.status();
+        let body = String::from_utf8(test::read_body(saved).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "hybrid legacy-default save failed {status}: {body}"
+        );
+        assert!(!body.contains(legacy_secret));
+        let saved: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(saved["revision"], 1);
+        assert_eq!(saved["data"]["default_provider_instance_id"], "openai");
+        assert_eq!(saved["data"]["providers"]["openai"]["model"], "gpt-legacy");
+        assert!(saved["data"]["provider_instances"]["work"].is_object());
+
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert!(root.get("provider").is_none());
+        assert!(root.get("default_provider_instance").is_none());
+        let providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert_eq!(providers["data"]["provider"], "openai");
+        assert_eq!(providers["data"]["openai"]["model"], "gpt-legacy");
+        assert!(!std::fs::read_to_string(dir.path().join("providers.json"))
+            .unwrap()
+            .contains(legacy_secret));
+
+        drop(app);
+        drop(state);
+        let restarted = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let restarted_config = restarted.config.read().await;
+        assert_eq!(
+            restarted_config.default_provider_instance.as_deref(),
+            Some("openai")
+        );
+        assert!(restarted_config.provider_instances.contains_key("work"));
+        assert_eq!(
+            restarted_config
+                .providers()
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key,
+            legacy_secret
+        );
     }
 
     #[actix_web::test]
