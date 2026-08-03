@@ -205,6 +205,7 @@ fn create_connect_session(
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut session = Session::new(session_id.clone(), model.to_string());
     session.title = format!("Connect: {key}");
+    session.title_generated = true;
     session
         .metadata
         .insert("created_by_connect_key".to_string(), key.to_string());

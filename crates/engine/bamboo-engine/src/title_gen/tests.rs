@@ -3,29 +3,6 @@
 use super::*;
 
 #[test]
-fn test_is_untitled_handles_empty_and_default() {
-    assert!(is_untitled(""));
-    assert!(is_untitled("   "));
-    assert!(is_untitled("New Session"));
-    assert!(is_untitled("  New Session  "));
-    assert!(is_untitled("New Session - Bodhi"));
-    assert!(is_untitled("New Session with Bodhi"));
-    assert!(is_untitled("New session with Bodhi"));
-    assert!(is_untitled("新建会话"));
-    assert!(is_untitled("新建會話"));
-    assert!(is_untitled("Nouvelle session"));
-    assert!(is_untitled("新しいセッション"));
-    assert!(is_untitled("नया सत्र"));
-
-    assert!(!is_untitled("My great chat"));
-    assert!(!is_untitled("new session")); // case-sensitive on purpose
-    assert!(!is_untitled("New Session recap"));
-    assert!(!is_untitled("Bodhi session plan"));
-    assert!(!is_untitled("New Session with"));
-    assert!(!is_untitled("New Session -"));
-}
-
-#[test]
 fn test_heuristic_title_strips_code_fences_and_caps_length() {
     let input = "```rust\nfn main() {}\n```\nHelp me debug this Rust program please";
     let t = heuristic_title(input);
@@ -86,4 +63,25 @@ fn test_build_title_messages_short_input_passthrough() {
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[1].content, "Hi there");
     assert_eq!(msgs[0].role, bamboo_agent_core::Role::System);
+}
+
+#[test]
+fn first_user_text_skips_textless_turn_so_a_later_message_can_retry() {
+    let mut session = Session::new("retry-title", "model");
+    session.add_message(Message::user("   "));
+    session.add_message(Message::assistant("Image acknowledged", None));
+    session.add_message(Message::user("Use this later text for the title"));
+
+    assert_eq!(
+        first_user_text(&session).as_deref(),
+        Some("Use this later text for the title")
+    );
+}
+
+#[test]
+fn first_user_text_stays_empty_until_a_text_turn_exists() {
+    let mut session = Session::new("pending-title", "model");
+    session.add_message(Message::user("\n\t"));
+
+    assert!(first_user_text(&session).is_none());
 }

@@ -27,6 +27,7 @@ pub struct SessionSummary {
     pub kind: bamboo_agent_core::SessionKind,
     pub title: String,
     pub title_version: u64,
+    pub title_generated: bool,
     pub pinned: bool,
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
@@ -130,6 +131,7 @@ impl SessionSummary {
             kind: entry.kind,
             title: entry.title,
             title_version: entry.title_version,
+            title_generated: entry.title_generated,
             pinned: entry.pinned,
             parent_session_id: entry.parent_session_id,
             root_session_id: entry.root_session_id,
@@ -238,6 +240,10 @@ pub struct CreateSessionRequest {
     pub project_id: Option<bamboo_domain::ProjectId>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Explicit title lifecycle. UI placeholder titles send `false`; omitted
+    /// legacy requests with a non-empty title fail safe as finalized.
+    #[serde(default)]
+    pub title_generated: Option<bool>,
     #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]
@@ -377,6 +383,7 @@ mod tests {
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
 
         assert!(req.title.is_none());
+        assert!(req.title_generated.is_none());
         assert!(req.system_prompt.is_none());
         assert!(req.model.is_none());
         assert!(req.reasoning_effort.is_none());
@@ -384,10 +391,11 @@ mod tests {
 
     #[test]
     fn test_create_session_request_full() {
-        let json = r#"{"title":"Test Session","system_prompt":"You are helpful","model":"gpt-4","reasoning_effort":"high"}"#;
+        let json = r#"{"title":"Test Session","title_generated":false,"system_prompt":"You are helpful","model":"gpt-4","reasoning_effort":"high"}"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.title, Some("Test Session".to_string()));
+        assert_eq!(req.title_generated, Some(false));
         assert_eq!(req.system_prompt, Some("You are helpful".to_string()));
         assert_eq!(req.model, Some("gpt-4".to_string()));
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High));
@@ -398,6 +406,7 @@ mod tests {
         let req = CreateSessionRequest {
             project_id: None,
             title: Some("Test".to_string()),
+            title_generated: None,
             system_prompt: None,
             model: None,
             provider: None,
@@ -522,6 +531,7 @@ mod tests {
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,
+            title_generated: true,
             pinned: false,
             parent_session_id: None,
             root_session_id: "root-id".to_string(),
@@ -556,6 +566,7 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"session\""));
         assert!(json.contains("\"test-id\""));
+        assert!(json.contains("\"title_generated\":true"));
         assert!(json.contains("\"workspace_path\":\"/workspaces/zenith\""));
     }
 
@@ -570,6 +581,7 @@ mod tests {
             kind: bamboo_agent_core::SessionKind::Child,
             title: "My Session".to_string(),
             title_version: 0,
+            title_generated: true,
             pinned: true,
             parent_session_id: Some("parent-id".to_string()),
             root_session_id: "root-id".to_string(),
@@ -706,6 +718,7 @@ mod tests {
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,
+            title_generated: true,
             pinned: false,
             parent_session_id: None,
             root_session_id: "root".to_string(),

@@ -17,11 +17,23 @@ async fn make_state() -> AppState {
 async fn seed_session(state: &AppState, session_id: &str, title: &str) -> Session {
     let mut session = Session::new(session_id.to_string(), "test-model".to_string());
     session.title = title.to_string();
+    session.title_generated = true;
     state
         .storage
         .save_session(&session)
         .await
         .expect("seed save");
+    session
+}
+
+async fn seed_pending_session(state: &AppState, session_id: &str, title: &str) -> Session {
+    let mut session = Session::new(session_id.to_string(), "test-model".to_string());
+    session.title = title.to_string();
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("seed pending save");
     session
 }
 
@@ -43,6 +55,7 @@ async fn set_title_bumps_version_and_emits_event() {
     let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
     assert_eq!(persisted.title, "Hello");
     assert_eq!(persisted.title_version, 1);
+    assert!(persisted.title_generated);
     assert_eq!(persisted.metadata_version, 1); // bumped
 
     let event = tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
@@ -54,12 +67,14 @@ async fn set_title_bumps_version_and_emits_event() {
             session_id,
             title,
             title_version,
+            title_generated,
             source,
             ..
         } => {
             assert_eq!(session_id, "s1");
             assert_eq!(title, "Hello");
             assert_eq!(title_version, 1);
+            assert!(title_generated);
             assert_eq!(source, TitleSource::Manual);
         }
         other => panic!("unexpected event: {other:?}"),
@@ -89,10 +104,27 @@ async fn set_title_short_circuits_when_unchanged() {
 }
 
 #[tokio::test]
+async fn set_title_finalizes_pending_lifecycle_even_when_text_is_unchanged() {
+    let state = make_state().await;
+    seed_pending_session(&state, "s1", "Keep This Visible Title").await;
+
+    let result = SessionMetadataService::set_title(&state, "s1", "Keep This Visible Title", None)
+        .await
+        .expect("ok")
+        .expect("pending lifecycle finalized");
+    assert_eq!(result.1, 1);
+
+    let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
+    assert_eq!(persisted.title, "Keep This Visible Title");
+    assert!(persisted.title_generated);
+    assert_eq!(persisted.metadata_version, 1);
+}
+
+#[tokio::test]
 async fn apply_generated_title_aborts_on_concurrent_rename() {
     // B7: between the LLM call and commit, the user PATCH wins.
     // We simulate this by: (1) load_session called inside service sees
-    // a non-untitled disk title, so apply_generated_title returns None.
+    // a finalized lifecycle, so apply_generated_title returns None.
     let state = make_state().await;
     seed_session(&state, "s1", "User Picked This").await;
 
@@ -107,7 +139,7 @@ async fn apply_generated_title_aborts_on_concurrent_rename() {
     .expect("ok");
     assert!(
         result.is_none(),
-        "should abort because title is no longer untitled"
+        "should abort because the title lifecycle is finalized"
     );
 
     let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
@@ -134,13 +166,14 @@ async fn apply_generated_title_force_overrides_existing() {
 
     let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
     assert_eq!(persisted.title, "Forced Auto");
+    assert!(persisted.title_generated);
     assert_eq!(persisted.metadata_version, 1);
 }
 
 #[tokio::test]
-async fn apply_generated_title_accepts_prompt_scoped_default_placeholder() {
+async fn apply_generated_title_uses_lifecycle_not_visible_title_text() {
     let state = make_state().await;
-    seed_session(&state, "s1", "New session with Bodhi").await;
+    seed_pending_session(&state, "s1", "Looks Like A Custom Title").await;
 
     let result = SessionMetadataService::apply_generated_title(
         &state,
@@ -159,12 +192,13 @@ async fn apply_generated_title_accepts_prompt_scoped_default_placeholder() {
     let persisted = state.storage.load_session("s1").await.unwrap().unwrap();
     assert_eq!(persisted.title, "Real Generated Title");
     assert_eq!(persisted.title_version, 1);
+    assert!(persisted.title_generated);
 }
 
 #[tokio::test]
 async fn apply_generated_title_uses_correct_source_label() {
     let state = make_state().await;
-    seed_session(&state, "s1", "New Session").await;
+    seed_pending_session(&state, "s1", "New Session").await;
 
     let sender = state.get_session_event_sender("s1").await;
     let mut subscriber = sender.subscribe();
@@ -350,7 +384,7 @@ async fn concurrent_authoritative_title_writes_serialize() {
 #[tokio::test]
 async fn manual_title_beats_generated_title_without_lying_event() {
     let state = std::sync::Arc::new(make_state().await);
-    seed_session(&state, "m1", "New Session").await;
+    seed_pending_session(&state, "m1", "New Session").await;
 
     let sender = state.get_session_event_sender("m1").await;
     let mut subscriber = sender.subscribe();
@@ -381,11 +415,11 @@ async fn manual_title_beats_generated_title_without_lying_event() {
     // Manual rename must always apply (it's authoritative and always bumps).
     let _manual_changed = manual_result.expect("manual applied");
 
-    // Final persisted state: at least one write landed. Both are valid
-    // outcomes depending on race ordering. Key invariant: the two
-    // operations completed without error.
+    // Whether the generated commit happens before or after the manual
+    // operation starts, the serialized manual rename is the final state.
     let persisted = state.storage.load_session("m1").await.unwrap().unwrap();
-    assert!(persisted.title == "Manual Override" || persisted.title == "Auto Generated");
+    assert_eq!(persisted.title, "Manual Override");
+    assert!(persisted.title_generated);
 
     // Drain events — at least the manual event must be emitted.
     let mut saw_manual = false;

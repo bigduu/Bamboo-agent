@@ -339,9 +339,18 @@ fn clear_skill_runtime_state_removes_loaded_skill_markers() {
 
 mod optional_model_e2e {
     use actix_web::{http::StatusCode, test, web, App};
-    use bamboo_agent_core::Session;
+    use async_trait::async_trait;
+    use bamboo_agent_core::{AgentEvent, Session};
+    use bamboo_llm::{
+        LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelRouter,
+        ProviderRegistry,
+    };
     use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::Semaphore;
 
     use crate::routes::configure_routes;
     use crate::AppState;
@@ -350,6 +359,192 @@ mod optional_model_e2e {
         let temp_dir = tempdir().expect("tempdir").keep();
         bamboo_config::paths::init_bamboo_dir(temp_dir.clone());
         web::Data::new(AppState::new(temp_dir).await.expect("app state"))
+    }
+
+    struct BlockingTitleProvider {
+        calls: AtomicUsize,
+        started: Semaphore,
+        release: Semaphore,
+    }
+
+    impl BlockingTitleProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                started: Semaphore::new(0),
+                release: Semaphore::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for BlockingTitleProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            panic!("title generation must use request options")
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            assert_eq!(
+                options.and_then(|value| value.request_purpose.as_deref()),
+                Some("title_generation")
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("release semaphore stays open");
+
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LLMChunk::Token("Generated Immediately".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn title_test_state(provider: Arc<BlockingTitleProvider>) -> web::Data<AppState> {
+        let data_dir = tempdir().expect("tempdir").keep();
+        bamboo_config::paths::init_bamboo_dir(data_dir.clone());
+        let mut config = bamboo_llm::Config::from_data_dir(Some(data_dir.clone()));
+        config.provider = "openai".to_string();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("chat-model".to_string()),
+            fast_model: Some("title-model".to_string()),
+            ..Default::default()
+        });
+
+        let provider_trait: Arc<dyn LLMProvider> = provider.clone();
+        let mut app_state = AppState::new_with_provider(data_dir, config, provider_trait)
+            .await
+            .expect("app state");
+        let mut providers = HashMap::new();
+        providers.insert("openai".to_string(), provider as Arc<dyn LLMProvider>);
+        app_state.provider_registry =
+            Arc::new(ProviderRegistry::new(providers, "openai".to_string()));
+        app_state.provider_router = Arc::new(ProviderModelRouter::new(
+            app_state.provider_registry.clone(),
+        ));
+        web::Data::new(app_state)
+    }
+
+    /// #793: a durable user message is the trigger. No `/execute` request is
+    /// made, and a second message while the provider is blocked must not start
+    /// duplicate title work.
+    #[actix_web::test]
+    async fn chat_starts_title_generation_before_execute_and_deduplicates_inflight_work() {
+        let provider = BlockingTitleProvider::new();
+        let state = title_test_state(provider.clone()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let session_id = "chat-title-before-execute";
+        let sender = state.get_session_event_sender(session_id).await;
+        let mut title_events = sender.subscribe();
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": session_id,
+                    "message": "Fix title generation timing",
+                    "model": "chat-model"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let _started = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider.started.acquire(),
+        )
+        .await
+        .expect("title provider started without /execute")
+        .expect("started semaphore stays open");
+
+        let pending = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load pending session")
+            .expect("session persisted");
+        assert!(!pending.title_generated);
+        assert_eq!(pending.title_version, 0);
+
+        let second = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": session_id,
+                    "message": "Second durable user message",
+                    "model": "chat-model"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CREATED);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        provider.release.add_permits(1);
+        let finalized = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let session = state
+                    .storage
+                    .load_session(session_id)
+                    .await
+                    .expect("load finalized session")
+                    .expect("session remains present");
+                if session.title_generated {
+                    break session;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("title generation finalized");
+
+        assert_eq!(finalized.title, "Generated Immediately");
+        assert_eq!(finalized.title_version, 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        let event =
+            tokio::time::timeout(std::time::Duration::from_millis(500), title_events.recv())
+                .await
+                .expect("one title event arrives")
+                .expect("title event channel remains open");
+        assert!(matches!(
+            event,
+            AgentEvent::SessionTitleUpdated {
+                title_generated: true,
+                ..
+            }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), title_events.recv())
+                .await
+                .is_err(),
+            "deduplicated title work must not emit a second metadata event"
+        );
     }
 
     /// #480: omitting `model` on `POST /chat` falls back to the server's

@@ -129,19 +129,6 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
     );
 
-    // Kick off async auto-title generation for fresh, untitled sessions.
-    if crate::title_gen::is_untitled(&session.title)
-        && session
-            .messages
-            .iter()
-            .any(|m| matches!(m.role, bamboo_agent_core::Role::User))
-    {
-        crate::title_gen::spawn_title_generation(
-            state.clone().into_inner(),
-            session_id.to_string(),
-        );
-    }
-
     let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();
     let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids.into_iter().collect();
     let resolved_provider_name = session_effective_model_ref(&session)

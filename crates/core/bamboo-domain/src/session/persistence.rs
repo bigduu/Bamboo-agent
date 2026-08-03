@@ -112,7 +112,7 @@ pub fn restore_missing_admitted_inbox_messages(session: &mut Session, durable: &
 ///
 /// Implementors must:
 /// - Serialize concurrent saves per session ID.
-/// - Merge on-disk authoritative metadata (`title`, `pinned`, `title_version`,
+/// - Merge on-disk authoritative metadata (`title`, `title_generated`, `pinned`, `title_version`,
 ///   `metadata_version`) before writing, so UI edits are never clobbered.
 #[async_trait::async_trait]
 pub trait RuntimeSessionPersistence: Send + Sync {

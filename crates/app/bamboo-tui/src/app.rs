@@ -3079,6 +3079,7 @@ mod question_tests {
             id: id.into(),
             project_id: None,
             title: String::new(),
+            title_generated: true,
             model: String::new(),
             is_running: false,
             has_pending_question: false,
