@@ -15,6 +15,7 @@ fn title_event(session_id: &str) -> AgentEvent {
         session_id: session_id.to_string(),
         title: "test title".to_string(),
         title_version: 1,
+        title_generated: true,
         source: TitleSource::Manual,
         updated_at: Utc::now(),
     }

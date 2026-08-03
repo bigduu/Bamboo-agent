@@ -10,6 +10,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+fn default_title_generated() -> bool {
+    true
+}
+
 // Shared HTTP/SSE wire types live in bamboo-client-core (single source of truth
 // across the CLI and TUI front-ends); re-exported here so the rest of the TUI
 // can keep referring to `crate::api::types::{AgentEvent, ChatRequest, …}`.
@@ -34,6 +38,8 @@ pub struct SessionSummary {
     pub project_id: Option<String>,
     #[serde(default)]
     pub title: String,
+    #[serde(default = "default_title_generated")]
+    pub title_generated: bool,
     #[serde(default)]
     pub model: String,
     #[serde(default)]

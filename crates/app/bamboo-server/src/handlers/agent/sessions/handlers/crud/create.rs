@@ -334,6 +334,7 @@ fn build_new_session(
         id: id.to_string(),
         project_id: req.project_id.clone(),
         title: req.title.clone(),
+        title_generated: req.title_generated,
         system_prompt: req.system_prompt.clone(),
         model: req.model.clone(),
         model_ref: req.model_ref.clone(),

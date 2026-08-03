@@ -15,6 +15,10 @@ const TOOL_MESSAGE_HEAD_BYTES: usize = 160 * 1024;
 const TOOL_MESSAGE_TAIL_BYTES: usize = 64 * 1024;
 const TOOL_MESSAGE_TRUNCATION_MARKER: &str = "[... tool output truncated ...]";
 
+fn default_title_generated() -> bool {
+    true
+}
+
 /// Message role in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -599,6 +603,12 @@ pub struct Session {
     pub pinned: bool,
     #[serde(default)]
     pub title_version: u64,
+    /// Whether the initial title lifecycle has been finalized. New root
+    /// sessions start pending (`false`); generated, fallback, and explicit
+    /// manual titles finalize it (`true`). Legacy sessions default to `true`
+    /// so an upgrade never overwrites an existing user-authored title.
+    #[serde(default = "default_title_generated")]
+    pub title_generated: bool,
     /// Authoritative UI metadata revision. Bumped by every authoritative
     /// metadata write (title / pinned / future replayable metadata fields).
     /// Runtime / non-authoritative paths must not bump this; they read it
@@ -725,6 +735,7 @@ impl Session {
             title: "New Session".to_string(),
             pinned: false,
             title_version: 0,
+            title_generated: false,
             metadata_version: 0,
             kind: SessionKind::Root,
             parent_session_id: None,
@@ -808,6 +819,7 @@ impl Session {
             title: title.into(),
             pinned: false,
             title_version: 0,
+            title_generated: true,
             metadata_version: 0,
             kind: SessionKind::Child,
             parent_session_id: Some(parent_session_id),
@@ -1572,6 +1584,25 @@ mod tests {
     }
 
     #[test]
+    fn new_root_session_starts_with_pending_title_generation() {
+        let session = Session::new("root-1", "m");
+        assert!(!session.title_generated);
+
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["title_generated"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn legacy_session_without_title_lifecycle_fails_safe_as_generated() {
+        let session = Session::new("legacy", "m");
+        let mut json = serde_json::to_value(&session).unwrap();
+        json.as_object_mut().unwrap().remove("title_generated");
+
+        let restored: Session = serde_json::from_value(json).unwrap();
+        assert!(restored.title_generated);
+    }
+
+    #[test]
     fn new_child_is_depth_one_under_root() {
         let root = Session::new("root-1", "m");
         let child = Session::new_child_of("child-1", &root, "m", "c");
@@ -1579,6 +1610,7 @@ mod tests {
         assert_eq!(child.parent_session_id.as_deref(), Some("root-1"));
         assert_eq!(child.root_session_id, "root-1");
         assert_eq!(child.spawn_depth, 1);
+        assert!(child.title_generated);
     }
 
     #[test]

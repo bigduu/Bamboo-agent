@@ -27,13 +27,15 @@ pub trait SessionAccess: Send + Sync {
 
     /// Save a session to persistent storage only.
     ///
-    /// Implementations may merge concurrent UI edits to title/pinned/title_version
+    /// Implementations may merge concurrent UI edits to
+    /// title/title_generated/pinned/title_version
     /// from disk back into `session` (which is why this takes `&mut`).
     async fn save_session(&self, session: &mut Session) -> Result<(), SessionSaveError>;
 
     /// Save a session to persistent storage and update the in-memory cache.
     ///
-    /// Implementations may merge concurrent UI edits to title/pinned/title_version
+    /// Implementations may merge concurrent UI edits to
+    /// title/title_generated/pinned/title_version
     /// from disk back into `session` (which is why this takes `&mut`).
     async fn save_and_cache(&self, session: &mut Session) -> Result<(), SessionSaveError>;
 }

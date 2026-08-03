@@ -491,6 +491,7 @@ mod tests {
             session_id: "s".to_string(),
             title: "t".to_string(),
             title_version: 1,
+            title_generated: true,
             source: TitleSource::Manual,
             updated_at: Utc::now(),
         };

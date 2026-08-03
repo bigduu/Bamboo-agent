@@ -40,6 +40,10 @@ use bamboo_domain::{AgentHookPoint, HookResult, TaskItemStatus, TaskList};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+fn default_title_generated() -> bool {
+    true
+}
+
 /// Represents events emitted during agent execution.
 ///
 /// These events are streamed to clients via SSE to provide real-time
@@ -492,6 +496,8 @@ pub enum AgentEvent {
         session_id: String,
         title: String,
         title_version: u64,
+        #[serde(default = "default_title_generated")]
+        title_generated: bool,
         source: TitleSource,
         updated_at: chrono::DateTime<chrono::Utc>,
     },
@@ -1395,6 +1401,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             title: "My title".to_string(),
             title_version: 3,
+            title_generated: true,
             source: TitleSource::Auto,
             updated_at: Utc::now(),
         };
@@ -1404,7 +1411,31 @@ mod tests {
             "json: {json}"
         );
         assert!(json.contains("\"source\":\"auto\""), "json: {json}");
-        let _decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::SessionTitleUpdated {
+                title_generated: true,
+                ..
+            }
+        ));
+
+        let legacy = serde_json::json!({
+            "type": "session_title_updated",
+            "session_id": "sess-legacy",
+            "title": "Existing title",
+            "title_version": 2,
+            "source": "manual",
+            "updated_at": "2025-01-01T00:00:00Z"
+        });
+        let decoded: AgentEvent = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::SessionTitleUpdated {
+                title_generated: true,
+                ..
+            }
+        ));
     }
 
     #[test]

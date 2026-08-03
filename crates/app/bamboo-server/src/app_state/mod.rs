@@ -436,7 +436,7 @@ pub struct AppState {
     /// Tracks session ids whose auto-title generation is currently in flight.
     ///
     /// Used by [`crate::title_gen`] to dedupe concurrent invocations
-    /// (e.g. execute handler firing while a regenerate-title request is running).
+    /// (e.g. multiple chat messages arriving while a regenerate-title request is running).
     pub title_gen_in_flight: Arc<dashmap::DashSet<String>>,
 
     /// v2-P2 (#181, slice 2): in-memory one-time pairing codes. A 6-digit numeric

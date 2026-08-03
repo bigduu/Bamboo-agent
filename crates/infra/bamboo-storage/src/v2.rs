@@ -175,6 +175,8 @@ pub struct SessionIndexEntry {
     pub title: String,
     #[serde(default)]
     pub title_version: u64,
+    #[serde(default = "default_title_generated")]
+    pub title_generated: bool,
     pub pinned: bool,
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
@@ -261,6 +263,10 @@ pub struct SessionIndexEntry {
     /// `None` to the backend's own local host so the frontend always has a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<SessionPlacement>,
+}
+
+fn default_title_generated() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -944,6 +950,7 @@ impl SessionStoreV2 {
                     rel_path,
                     title: session.title.clone(),
                     title_version: session.title_version,
+                    title_generated: session.title_generated,
                     pinned: session.pinned,
                     parent_session_id: session.parent_session_id.clone(),
                     root_session_id: session.root_session_id.clone(),
@@ -1651,6 +1658,26 @@ mod tests {
         assert!(!index_path.exists());
         let _storage = SessionStoreV2::new(bamboo_home).await?;
         assert!(index_path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn title_lifecycle_is_indexed_and_legacy_rows_fail_safe() -> io::Result<()> {
+        let (storage, _dir) = create_temp_storage().await?;
+        let session = Session::new("pending-title", "m");
+        storage.save_session(&session).await?;
+
+        let entry = storage
+            .get_index_entry(&session.id)
+            .await
+            .expect("saved session is indexed");
+        assert!(!entry.title_generated);
+
+        let mut legacy = serde_json::to_value(&entry).unwrap();
+        legacy.as_object_mut().unwrap().remove("title_generated");
+        let decoded: SessionIndexEntry = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.title_generated);
 
         Ok(())
     }

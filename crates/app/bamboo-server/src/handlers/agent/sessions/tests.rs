@@ -17,6 +17,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
         rel_path: "sessions/root/children/child-1".to_string(),
         title: "Child Session".to_string(),
         title_version: 0,
+        title_generated: true,
         pinned: false,
         parent_session_id: Some("root".to_string()),
         root_session_id: "root".to_string(),
@@ -48,6 +49,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
     let summary = SessionSummary::from_entry(entry, false);
 
     assert_eq!(summary.last_run_status.as_deref(), Some("completed"));
+    assert!(summary.title_generated);
     assert_eq!(summary.last_run_error, None);
     assert_eq!(summary.schedule_run_id.as_deref(), Some("run-123"));
     assert_eq!(
@@ -78,6 +80,7 @@ fn session_summary_from_entry_propagates_subagent_type() {
         rel_path: "sessions/root/children/child-2".to_string(),
         title: "Plan Child".to_string(),
         title_version: 0,
+        title_generated: true,
         pinned: false,
         parent_session_id: Some("root".to_string()),
         root_session_id: "root".to_string(),

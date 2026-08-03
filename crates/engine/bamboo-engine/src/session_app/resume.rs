@@ -29,7 +29,8 @@ pub trait ResumeExecutionPort: Send + Sync {
 
     /// Persist a session and update any caches.
     ///
-    /// Implementations may merge concurrent UI edits to title/pinned/title_version
+    /// Implementations may merge concurrent UI edits to
+    /// title/title_generated/pinned/title_version
     /// from disk back into `session` (which is why this takes `&mut`).
     async fn save_and_cache_session(&self, session: &mut Session);
 

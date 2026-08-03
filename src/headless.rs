@@ -334,6 +334,7 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             }
             let mut session = Session::new(uuid::Uuid::new_v4().to_string(), String::new());
             session.title = title;
+            session.title_generated = true;
             if let Some(project_id) = requested_project.as_ref() {
                 session.set_project_id_meta(project_id.to_string());
             }

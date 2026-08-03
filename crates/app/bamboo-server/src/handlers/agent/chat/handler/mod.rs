@@ -659,7 +659,17 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         session.messages.len(),
         session.messages.last().map(|m| format!("{:?}", m.role)),
     );
+    let should_generate_title = !session.title_generated;
     drop(persistence_guard);
+
+    // Start title generation immediately after the user message is durable.
+    // This is intentionally independent of POST /execute and assistant-stream
+    // completion. Failed/no-text attempts leave the lifecycle pending, so a
+    // later durable user message can retry; the in-flight guard deduplicates
+    // overlapping chat requests.
+    if should_generate_title {
+        crate::title_gen::spawn_title_generation(state.clone().into_inner(), session_id.clone());
+    }
 
     HttpResponse::Created().json(ChatResponse {
         session_id: session_id.clone(),

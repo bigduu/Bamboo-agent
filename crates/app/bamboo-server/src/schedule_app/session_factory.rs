@@ -31,6 +31,7 @@ pub fn create_schedule_session(
         "startup".to_string(),
     );
     session.title = title;
+    session.title_generated = true;
     session.metadata.insert(
         "created_by_schedule_id".to_string(),
         job.schedule_id.clone(),

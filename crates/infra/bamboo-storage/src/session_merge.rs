@@ -1,8 +1,9 @@
 //! Merge-aware session save helper.
 //!
 //! Provides [`merge_save_session`], which preserves any concurrent UI edits to
-//! the authoritative metadata group (`title`, `title_version`, `pinned`,
-//! `metadata_version`) before writing the runtime-modified session to storage.
+//! the authoritative metadata group (`title`, `title_version`,
+//! `title_generated`, `pinned`, `metadata_version`) before writing the
+//! runtime-modified session to storage.
 //! Re-reads the latest persisted copy and only takes in-memory values when the
 //! caller's `metadata_version` strictly exceeds disk's.
 //!
@@ -10,8 +11,9 @@
 //!
 //! All authoritative metadata fields are grouped under `metadata_version`:
 //! when `disk.metadata_version >= session.metadata_version`, the on-disk
-//! `title`, `title_version`, `pinned`, and `metadata_version` overwrite the
-//! in-memory values before writing. Authoritative writers bump
+//! `title`, `title_version`, `title_generated`, `pinned`, and
+//! `metadata_version` overwrite the in-memory values before writing.
+//! Authoritative writers bump
 //! `metadata_version` (and `title_version` for title edits) before calling so
 //! their values survive the merge; non-authoritative writers don't bump and so
 //! are overwritten by any later disk changes.
@@ -227,7 +229,7 @@ impl LockedSessionStore {
     /// Runtime / non-authoritative save with per-session lock.
     ///
     /// Inside the lock: reload disk, merge the authoritative metadata group
-    /// (`title`, `title_version`, `pinned`, `metadata_version`) from disk into
+    /// (`title`, `title_version`, `title_generated`, `pinned`, `metadata_version`) from disk into
     /// the in-memory copy if disk's `metadata_version >= session.metadata_version`,
     /// then save.
     ///
@@ -777,6 +779,7 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
     if latest.metadata_version >= session.metadata_version {
         session.title = latest.title.clone();
         session.title_version = latest.title_version;
+        session.title_generated = latest.title_generated;
         session.pinned = latest.pinned;
         for key in AUTHORITATIVE_METADATA_KEYS {
             if let Some(value) = latest.metadata.get(*key) {
@@ -795,7 +798,7 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
 /// authoritative metadata group.
 ///
 /// Behaviour: if the on-disk session has `metadata_version >=
-/// session.metadata_version`, the on-disk `title`, `title_version`, `pinned`
+/// session.metadata_version`, the on-disk `title`, `title_version`, `title_generated`, `pinned`
 /// and `metadata_version` overwrite the in-memory values before writing.
 ///
 /// This is the stateless variant (no per-session lock). Prefer
@@ -1855,12 +1858,14 @@ mod tests {
         let mut on_disk = fresh(session_id);
         on_disk.title = "User Set This".to_string();
         on_disk.title_version = 0;
+        on_disk.title_generated = true;
         on_disk.metadata_version = 0;
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
         runtime_copy.title = "Stale Default".to_string();
         runtime_copy.title_version = 0;
+        runtime_copy.title_generated = false;
         runtime_copy.metadata_version = 0;
         runtime_copy.messages = vec![];
 
@@ -1871,7 +1876,9 @@ mod tests {
         let after = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(after.title, "User Set This");
         assert_eq!(after.title_version, 0);
+        assert!(after.title_generated);
         assert_eq!(runtime_copy.title, "User Set This");
+        assert!(runtime_copy.title_generated);
     }
 
     #[tokio::test]

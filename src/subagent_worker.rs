@@ -1081,6 +1081,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 identity.root_session_id
             };
             session.kind = SessionKind::Child;
+            session.title_generated = true;
         }
         if let Some(project_id) = run.project_id.as_ref() {
             session.set_project_id_meta(project_id.as_str());
