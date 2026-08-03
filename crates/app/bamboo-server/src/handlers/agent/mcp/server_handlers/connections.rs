@@ -1,8 +1,8 @@
 use actix_web::{web, HttpResponse, Responder};
 
-use crate::app_state::{AppState, ConfigUpdateEffects};
+use crate::app_state::AppState;
 
-use super::super::persist_config_error;
+use super::super::mutation_error_response;
 
 /// Connects/reconnects to an MCP server
 ///
@@ -11,54 +11,28 @@ use super::super::persist_config_error;
 pub async fn connect_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
-    // Enable + start using the stored config.
-    let mut server_cfg: Option<bamboo_mcp::McpServerConfig> = None;
-    if let Err(e) = state
-        .update_config(
-            |root| {
-                let Some(cfg) = root
-                    .mcp
-                    .servers
-                    .iter_mut()
-                    .find(|server| server.id == server_id)
-                else {
-                    return Err(crate::error::AppError::NotFound(format!(
-                        "Server '{}'",
-                        server_id
-                    )));
-                };
-                cfg.enabled = true;
-                server_cfg = Some(cfg.clone());
-                Ok(())
-            },
-            ConfigUpdateEffects::default(),
-        )
+    let response_server_id = server_id.clone();
+    let force_restart = std::collections::BTreeSet::from([server_id.clone()]);
+    if let Err(error) = state
+        .update_legacy_mcp_config(force_restart, move |mcp| {
+            let Some(cfg) = mcp.servers.iter_mut().find(|server| server.id == server_id) else {
+                return Err(crate::error::AppError::NotFound(format!(
+                    "Server '{}'",
+                    server_id
+                )));
+            };
+            cfg.enabled = true;
+            Ok(())
+        })
         .await
     {
-        // Preserve the previous endpoint error shape.
-        return match e {
-            crate::error::AppError::NotFound(_) => {
-                HttpResponse::NotFound().json(serde_json::json!({
-                    "error": crate::error::error_value(format!("Server '{}' not found", server_id))
-                }))
-            }
-            other => persist_config_error(format!("Failed to save config: {other}")),
-        };
+        return mutation_error_response(error);
     }
-    let Some(server_cfg) = server_cfg else {
-        return persist_config_error("Missing server config after connect".to_string());
-    };
 
-    let _ = state.mcp_manager.stop_server(&server_id).await;
-    match state.mcp_manager.start_server(server_cfg).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
-            "message": "Server connected",
-            "server_id": server_id
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": crate::error::error_value(format!("Failed to start server: {}", e))
-        })),
-    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "message": "Server connected",
+        "server_id": response_server_id
+    }))
 }
 
 /// Disconnects an MCP server
@@ -71,46 +45,27 @@ pub async fn disconnect_server(
 ) -> impl Responder {
     let server_id = path.into_inner();
 
-    if let Err(e) = state
-        .update_config(
-            |root| {
-                let Some(cfg) = root
-                    .mcp
-                    .servers
-                    .iter_mut()
-                    .find(|server| server.id == server_id)
-                else {
-                    return Err(crate::error::AppError::NotFound(format!(
-                        "Server '{}'",
-                        server_id
-                    )));
-                };
-                cfg.enabled = false;
-                Ok(())
-            },
-            ConfigUpdateEffects::default(),
-        )
+    let response_server_id = server_id.clone();
+    if let Err(error) = state
+        .update_legacy_mcp_config(std::collections::BTreeSet::new(), move |mcp| {
+            let Some(cfg) = mcp.servers.iter_mut().find(|server| server.id == server_id) else {
+                return Err(crate::error::AppError::NotFound(format!(
+                    "Server '{}'",
+                    server_id
+                )));
+            };
+            cfg.enabled = false;
+            Ok(())
+        })
         .await
     {
-        return match e {
-            crate::error::AppError::NotFound(_) => {
-                HttpResponse::NotFound().json(serde_json::json!({
-                    "error": crate::error::error_value(format!("Server '{}' not found", server_id))
-                }))
-            }
-            other => persist_config_error(format!("Failed to save config: {other}")),
-        };
+        return mutation_error_response(error);
     }
 
-    match state.mcp_manager.stop_server(&server_id).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
-            "message": "Server disconnected",
-            "server_id": server_id
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": crate::error::error_value(format!("Failed to disconnect server: {}", e))
-        })),
-    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "message": "Server disconnected",
+        "server_id": response_server_id
+    }))
 }
 
 /// Refreshes tools from an MCP server

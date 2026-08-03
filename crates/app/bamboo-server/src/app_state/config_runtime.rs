@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -172,6 +172,37 @@ fn run_generic_before_provider_publish_test_hook(data_dir: &Path) {
     }
 }
 
+#[cfg(test)]
+type ResetAfterDeleteTestHook = Box<dyn FnOnce() + Send + 'static>;
+#[cfg(test)]
+type ResetAfterDeleteTestHooks =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, ResetAfterDeleteTestHook>>;
+
+#[cfg(test)]
+fn reset_after_delete_test_hooks() -> &'static ResetAfterDeleteTestHooks {
+    static HOOKS: std::sync::OnceLock<ResetAfterDeleteTestHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_reset_after_delete_test_hook(data_dir: &Path, hook: impl FnOnce() + Send + 'static) {
+    reset_after_delete_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_reset_after_delete_test_hook(data_dir: &Path) {
+    let hook = reset_after_delete_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(data_dir);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct FacadeRuntimeMaterialization {
     config: Config,
     failures: BTreeSet<SectionId>,
@@ -293,6 +324,20 @@ pub struct ConfigWatcherRuntime {
 struct ConfigPathChanges {
     paths: Vec<PathBuf>,
     initial_mcp: bool,
+}
+
+/// Owned handles needed to publish provider and MCP effects for one committed
+/// configuration generation. Keeping them together makes it explicit that a
+/// detached transaction carries one immutable publication context end to end.
+struct ConfigRuntimeEffectContext {
+    app_data_dir: PathBuf,
+    config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
+    provider_registry: Arc<bamboo_llm::ProviderRegistry>,
+    provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
+    mcp_manager: Arc<McpServerManager>,
+    account_sink: Arc<bamboo_engine::events::AccountEventSink>,
+    config_live_health: Arc<std::sync::RwLock<ConfigLiveHealth>>,
+    mcp_config_live_health: Arc<std::sync::RwLock<ConfigLiveHealth>>,
 }
 
 impl ConfigWatcherRuntime {
@@ -1630,6 +1675,21 @@ fn set_live_health_revision(
     revision
 }
 
+fn set_live_health_from_snapshot<T>(
+    health: &std::sync::RwLock<ConfigLiveHealth>,
+    snapshot: &bamboo_config::SectionSnapshot<T>,
+) {
+    let mut health = health
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    health.revision = snapshot.revision;
+    health.loaded_at = snapshot.loaded_at;
+    health.source_path = snapshot.source_path.clone();
+    health.source_kind = snapshot.source_kind;
+    health.status = snapshot.status;
+    health.last_error = snapshot.last_error.clone();
+}
+
 #[derive(Debug)]
 pub(crate) enum ConfigSectionMutationError {
     Store(ConfigStoreError),
@@ -2352,6 +2412,190 @@ impl AppState {
         })?
     }
 
+    /// Apply one legacy MCP mutation through the typed MCP section's exact
+    /// credential/runtime transaction.
+    ///
+    /// Lock order is always `config_io_lock` -> MCP `reconcile_lock` -> live
+    /// `config` write. Provider locks are never acquired on this path. Runtime
+    /// connection, initialization, and tool discovery finish before the
+    /// durable MCP/credential boundary. The detached owner then publishes the
+    /// exact live section, runtime set, tool index, health, and events before a
+    /// later config generation may acquire `config_io_lock`.
+    pub(crate) async fn update_legacy_mcp_config<F>(
+        &self,
+        force_restart: BTreeSet<String>,
+        update: F,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut McpConfig) -> Result<(), AppError>,
+    {
+        // Apply the caller's mutation against the exact lock-time live
+        // generation. Cancellation while either guard is pending is pre-commit.
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let (mut candidate_config, expected_revision, credential_intents) = {
+            ensure_provider_mcp_migration_ready(&self.app_data_dir)
+                .map_err(map_exact_credential_store_error)?;
+            let facade = self.config_facade.as_ref().ok_or_else(|| {
+                AppError::BadRequest(
+                    "legacy MCP mutations require the modular configuration facade".to_string(),
+                )
+            })?;
+            let current = self.config.read().await.clone();
+            reject_if_recovery_pending(&current)?;
+            let mut candidate = current.mcp.clone();
+            update(&mut candidate)?;
+            let credential_intents =
+                normalize_legacy_mcp_credentials(&current.mcp, &mut candidate)?;
+            validate_mcp_config(&candidate).map_err(AppError::BadRequest)?;
+            let expected_revision = facade.registry().mcp.snapshot().revision;
+            let mut candidate_config = current;
+            candidate_config.mcp = candidate;
+            (candidate_config, expected_revision, credential_intents)
+        };
+
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let facade = config_facade.expect("validated modular configuration facade");
+            let runtime_candidate = candidate_config.mcp.clone();
+            let force_replacements = force_restart.into_iter().collect();
+            let durable_document =
+                credential_ref_mcp_document(&runtime_candidate).map_err(map_mcp_section_error)?;
+            bamboo_config::validate_mcp_section(&durable_document).map_err(AppError::BadRequest)?;
+            let current_document = facade.registry().mcp.snapshot();
+            let metadata_changed = serde_json::to_value(&current_document.data.0)
+                .map_err(AppError::SerializationError)?
+                != serde_json::to_value(&durable_document).map_err(AppError::SerializationError)?;
+            let credential_transaction = !credential_intents.is_empty();
+            let mut transaction_error = None;
+            let mut commit_events = Vec::new();
+            let mut published_config = None;
+            let commit_dir = app_data_dir.clone();
+            let commit_facade = facade.clone();
+            let result = mcp_manager
+                .reconcile_from_config_transactional_after_forcing(
+                    &runtime_candidate,
+                    &force_replacements,
+                    || async {
+                        // Acquiring the live guard before the durable call
+                        // closes the only cancellation window between disk and
+                        // process state.
+                        let mut live_config = config.write().await;
+                        if credential_transaction {
+                            let commit = tokio::task::spawn_blocking(move || {
+                                let commit = bamboo_config::persist_mcp_credential_transaction_at_revision_with_adoption(
+                                    &commit_dir,
+                                    &mut candidate_config,
+                                    &credential_intents,
+                                    expected_revision,
+                                    commit_facade.as_ref(),
+                                )?;
+                                Ok::<_, ConfigStoreError>((candidate_config, commit))
+                            })
+                            .await;
+                            match commit {
+                                Ok(Ok((mut committed, commit))) => {
+                                    #[cfg(test)]
+                                    run_credential_after_commit_before_live_test_hook(
+                                        &app_data_dir,
+                                        SectionId::Mcp,
+                                    );
+                                    match install_credential_section_commit(commit, &mut committed) {
+                                        Ok(installed) => {
+                                            *live_config = committed.clone();
+                                            commit_events = installed.events;
+                                            published_config = Some(committed);
+                                        }
+                                        Err(error) => {
+                                            transaction_error =
+                                                Some(map_exact_credential_store_error(error));
+                                            return Err(bamboo_mcp::McpError::InvalidConfig(
+                                                "MCP process adoption failed".to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                Ok(Err(error)) => {
+                                    transaction_error =
+                                        Some(map_exact_credential_store_error(error));
+                                    return Err(bamboo_mcp::McpError::InvalidConfig(
+                                        "MCP durable transaction failed".to_string(),
+                                    ));
+                                }
+                                Err(error) => {
+                                    transaction_error = Some(AppError::InternalError(
+                                        anyhow::anyhow!(
+                                            "MCP credential transaction task failed: {error}"
+                                        ),
+                                    ));
+                                    return Err(bamboo_mcp::McpError::InvalidConfig(
+                                        "MCP durable transaction failed".to_string(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            if metadata_changed {
+                                match facade
+                                    .registry()
+                                    .mcp
+                                    .commit(expected_revision, McpSection(durable_document))
+                                {
+                                    Ok(event) => commit_events.push(event),
+                                    Err(error) => {
+                                        transaction_error =
+                                            Some(map_exact_credential_store_error(error));
+                                        return Err(bamboo_mcp::McpError::InvalidConfig(
+                                            "MCP durable commit failed".to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            candidate_config.mcp = runtime_candidate.clone();
+                            *live_config = candidate_config.clone();
+                            published_config = Some(candidate_config);
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+
+            if let Some(error) = transaction_error {
+                return Err(error);
+            }
+            if result.is_err() {
+                tracing::warn!("legacy MCP runtime staging failed before durable commit");
+                let message =
+                    "MCP runtime initialization failed before commit; retaining last-known-good generation"
+                        .to_string();
+                return Err(AppError::InternalError(anyhow::anyhow!(message)));
+            }
+
+            // Runtime/tool-index publication is complete when transactional
+            // reconcile returns. Event/health publication therefore cannot
+            // prevent an already-committed generation from becoming runtime.
+            publish_exact_facade_events(&account_sink, &commit_events)?;
+            let snapshot = facade.registry().mcp.snapshot();
+            set_live_health_revision(
+                &mcp_config_live_health,
+                snapshot.revision,
+                Some((snapshot.source_path.clone(), SectionSourceKind::File)),
+            );
+            Ok::<_, AppError>(
+                published_config.expect("successful MCP transaction publishes config"),
+            )
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "legacy MCP config transaction task failed: {error}"
+            ))
+        })?
+    }
+
     /// Reset MCP metadata and its owned credentials at the runtime manager's
     /// pre-publication boundary, preserving the same durable-before-live
     /// ordering as a normal typed MCP write.
@@ -3060,6 +3304,247 @@ fn reference_headers(
     Ok(())
 }
 
+/// Convert the legacy MCP request shape (which carries credential plaintext
+/// inline) into the same server-owned references and explicit credential
+/// intents used by the typed MCP settings transaction.
+///
+/// The caller must hold `config_io_lock`. References supplied by a legacy
+/// client are never authoritative: an existing binding is retained by field
+/// identity, while a new binding receives its canonical server-owned ref.
+fn mcp_credential_refs(
+    config: &McpConfig,
+) -> Result<BTreeSet<bamboo_config::CredentialRef>, ConfigSectionMutationError> {
+    let mut references = BTreeSet::new();
+    for server in &config.servers {
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                for raw in stdio.env_credential_refs.values() {
+                    references.insert(bamboo_config::CredentialRef::parse(raw.clone()).map_err(
+                        |_| {
+                            ConfigSectionMutationError::Invalid(
+                                "MCP credential reference is invalid".to_string(),
+                            )
+                        },
+                    )?);
+                }
+            }
+            TransportConfig::Sse(http) => collect_mcp_header_refs(&http.headers, &mut references)?,
+            TransportConfig::StreamableHttp(http) => {
+                collect_mcp_header_refs(&http.headers, &mut references)?
+            }
+        }
+    }
+    Ok(references)
+}
+
+fn collect_mcp_header_refs(
+    headers: &[bamboo_mcp::HeaderConfig],
+    output: &mut BTreeSet<bamboo_config::CredentialRef>,
+) -> Result<(), ConfigSectionMutationError> {
+    for raw in headers
+        .iter()
+        .filter_map(|header| header.credential_ref.as_ref())
+    {
+        output.insert(
+            bamboo_config::CredentialRef::parse(raw.clone()).map_err(|_| {
+                ConfigSectionMutationError::Invalid(
+                    "MCP credential reference is invalid".to_string(),
+                )
+            })?,
+        );
+    }
+    Ok(())
+}
+
+fn normalize_legacy_mcp_credentials(
+    current: &McpConfig,
+    candidate: &mut McpConfig,
+) -> Result<BTreeSet<bamboo_config::CredentialRef>, AppError> {
+    let current_refs = mcp_credential_refs(current).map_err(map_mcp_section_error)?;
+    let mut intents = BTreeSet::new();
+
+    for candidate_server in &mut candidate.servers {
+        let current_server = current
+            .servers
+            .iter()
+            .find(|server| server.id == candidate_server.id);
+        match &mut candidate_server.transport {
+            TransportConfig::Stdio(candidate_stdio) => {
+                if !candidate_stdio.env_encrypted.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "MCP ciphertext is server-managed and cannot be supplied".to_string(),
+                    ));
+                }
+                let current_stdio = current_server.and_then(|server| match &server.transport {
+                    TransportConfig::Stdio(stdio) => Some(stdio),
+                    _ => None,
+                });
+                for (name, incoming_reference) in &candidate_stdio.env_credential_refs {
+                    let current_reference = current_stdio
+                        .and_then(|stdio| stdio.env_credential_refs.get(name))
+                        .map(String::as_str);
+                    if current_reference != Some(incoming_reference.as_str()) {
+                        return Err(AppError::BadRequest(
+                            "MCP credential references are server-managed and cannot be supplied"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let incoming = std::mem::take(&mut candidate_stdio.env);
+                candidate_stdio.env_credential_refs.clear();
+                for (name, value) in incoming {
+                    let current_reference = current_stdio
+                        .and_then(|stdio| stdio.env_credential_refs.get(&name))
+                        .map(|raw| {
+                            bamboo_config::CredentialRef::parse(raw.clone()).map_err(|_| {
+                                AppError::BadRequest(
+                                    "MCP credential reference is invalid".to_string(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let current_value = current_stdio.and_then(|stdio| stdio.env.get(&name));
+                    let (value, reference, touched) =
+                        if bamboo_config::patch::is_masked_api_key(&value) {
+                            let reference = current_reference.ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "masked MCP credential has no existing value".to_string(),
+                                )
+                            })?;
+                            let value = current_value.cloned().ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "referenced MCP credential is unavailable".to_string(),
+                                )
+                            })?;
+                            (value, reference, false)
+                        } else if value.is_empty() {
+                            if let Some(reference) = current_reference {
+                                intents.insert(reference);
+                            }
+                            continue;
+                        } else {
+                            let reference = current_reference.map_or_else(
+                                || {
+                                    bamboo_config::credential_ref(
+                                        "mcp",
+                                        &candidate_server.id,
+                                        &format!("env_{name}"),
+                                    )
+                                    .map_err(map_exact_credential_store_error)
+                                },
+                                Ok,
+                            )?;
+                            let touched = current_value != Some(&value);
+                            (value, reference, touched)
+                        };
+                    if touched {
+                        intents.insert(reference.clone());
+                    }
+                    candidate_stdio.env.insert(name.clone(), value);
+                    candidate_stdio
+                        .env_credential_refs
+                        .insert(name, reference.as_str().to_string());
+                }
+            }
+            TransportConfig::Sse(candidate_http) => normalize_legacy_mcp_headers(
+                &candidate_server.id,
+                current_server.and_then(|server| match &server.transport {
+                    TransportConfig::Sse(http) => Some(http.headers.as_slice()),
+                    _ => None,
+                }),
+                &mut candidate_http.headers,
+                &mut intents,
+            )?,
+            TransportConfig::StreamableHttp(candidate_http) => normalize_legacy_mcp_headers(
+                &candidate_server.id,
+                current_server.and_then(|server| match &server.transport {
+                    TransportConfig::StreamableHttp(http) => Some(http.headers.as_slice()),
+                    _ => None,
+                }),
+                &mut candidate_http.headers,
+                &mut intents,
+            )?,
+        }
+    }
+
+    let candidate_refs = mcp_credential_refs(candidate).map_err(map_mcp_section_error)?;
+    intents.extend(current_refs.symmetric_difference(&candidate_refs).cloned());
+    Ok(intents)
+}
+
+fn normalize_legacy_mcp_headers(
+    server_id: &str,
+    current: Option<&[bamboo_mcp::HeaderConfig]>,
+    candidate: &mut [bamboo_mcp::HeaderConfig],
+    intents: &mut BTreeSet<bamboo_config::CredentialRef>,
+) -> Result<(), AppError> {
+    for header in candidate {
+        if header.value_encrypted.is_some() {
+            return Err(AppError::BadRequest(
+                "MCP ciphertext is server-managed and cannot be supplied".to_string(),
+            ));
+        }
+        let current_header =
+            current.and_then(|headers| headers.iter().find(|current| current.name == header.name));
+        if header.credential_ref.as_deref().is_some_and(|incoming| {
+            current_header.and_then(|current| current.credential_ref.as_deref()) != Some(incoming)
+        }) {
+            return Err(AppError::BadRequest(
+                "MCP credential references are server-managed and cannot be supplied".to_string(),
+            ));
+        }
+        let current_reference = current_header
+            .and_then(|current| current.credential_ref.as_ref())
+            .map(|raw| {
+                bamboo_config::CredentialRef::parse(raw.clone()).map_err(|_| {
+                    AppError::BadRequest("MCP credential reference is invalid".to_string())
+                })
+            })
+            .transpose()?;
+        let current_value = current_header.map(|current| &current.value);
+        if bamboo_config::patch::is_masked_api_key(&header.value) {
+            let reference = current_reference.ok_or_else(|| {
+                AppError::BadRequest("masked MCP credential has no existing value".to_string())
+            })?;
+            header.value = current_value.cloned().ok_or_else(|| {
+                AppError::BadRequest("referenced MCP credential is unavailable".to_string())
+            })?;
+            header.credential_ref = Some(reference.as_str().to_string());
+        } else if header.value.is_empty() {
+            if let Some(reference) = current_reference {
+                intents.insert(reference);
+            }
+            header.credential_ref = None;
+        } else {
+            let reference = current_reference.map_or_else(
+                || {
+                    bamboo_config::credential_ref(
+                        "mcp",
+                        server_id,
+                        &format!("header_{}", header.name),
+                    )
+                    .map_err(map_exact_credential_store_error)
+                },
+                Ok,
+            )?;
+            if current_value != Some(&header.value) {
+                intents.insert(reference.clone());
+            }
+            header.credential_ref = Some(reference.as_str().to_string());
+        }
+        header.value_encrypted = None;
+    }
+    Ok(())
+}
+
+fn map_mcp_section_error(error: ConfigSectionMutationError) -> AppError {
+    match error {
+        ConfigSectionMutationError::Store(error) => map_exact_credential_store_error(error),
+        ConfigSectionMutationError::Invalid(message)
+        | ConfigSectionMutationError::Runtime(message) => AppError::BadRequest(message),
+    }
+}
+
 impl AppState {
     /// Reload the provider based on current configuration
     ///
@@ -3093,6 +3578,11 @@ impl AppState {
     /// }
     /// ```
     pub async fn reload_provider(&self) -> Result<(), bamboo_llm::LLMError> {
+        // Every direct provider reload participates in the same generation
+        // order as config writers. A caller may await construction, but no
+        // later durable/live config generation can commit and then be
+        // overwritten by this publication.
+        let _io = self.config_io_lock.lock().await;
         let config = self.config.read().await.clone();
         let candidate_registry =
             bamboo_llm::ProviderRegistry::from_config(&config, self.app_data_dir.clone()).await?;
@@ -3119,6 +3609,8 @@ impl AppState {
             bamboo_llm::LLMError::Auth(message)
         })?;
 
+        #[cfg(test)]
+        run_generic_before_provider_publish_test_hook(&self.app_data_dir);
         let mut provider = self.provider.write().await;
         self.provider_registry.replace_with(candidate_registry);
         *provider = new_provider;
@@ -3176,6 +3668,172 @@ impl AppState {
         new_config.publish_env_vars();
         *config = new_config.clone();
         new_config
+    }
+
+    /// Reload one exact root snapshot and publish its config, provider and MCP
+    /// runtimes under a single generation boundary.
+    ///
+    /// The detached owner retains `config_io_lock` through all publication, so
+    /// request cancellation cannot strand a newly installed live config ahead
+    /// of provider/MCP convergence and a later writer cannot be overwritten by
+    /// effects captured from this reload.
+    pub async fn reload_config_and_runtime(&self) -> Result<Config, AppError> {
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let config = self.config.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let account_sink = self.account_sink.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let new_config = config_facade
+                .as_ref()
+                .map(|facade| load_facade_effective_config(facade, &app_data_dir))
+                .unwrap_or_else(|| {
+                    Config::from_data_dir_without_publish(Some(app_data_dir.clone()))
+                });
+            if let Err(error) = bamboo_llm::validate_provider_config(&new_config) {
+                tracing::warn!("reloaded provider config is invalid");
+                let message =
+                    "provider configuration is invalid; retaining last-known-good generation"
+                        .to_string();
+                if let Some(facade) = config_facade.as_ref() {
+                    if let Some(event) = facade
+                        .registry()
+                        .mark_runtime_degraded(SectionId::Providers, message.clone())
+                    {
+                        publish_registry_event(&account_sink, &event);
+                    }
+                }
+                publish_section_failure(
+                    &config_live_health,
+                    &account_sink,
+                    "providers",
+                    SectionStatus::Invalid,
+                    message,
+                );
+                return Err(AppError::BadRequest(format!(
+                    "Invalid configuration: {error}"
+                )));
+            }
+            new_config.publish_env_vars();
+            *config.write().await = new_config.clone();
+            Self::apply_config_effects_owned(
+                new_config.clone(),
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
+                },
+                ConfigRuntimeEffectContext {
+                    app_data_dir,
+                    config_facade,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                    account_sink,
+                    config_live_health,
+                    mcp_config_live_health,
+                },
+            )
+            .await?;
+            Ok::<_, AppError>(new_config)
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "config/runtime reload transaction task failed: {error}"
+            ))
+        })?
+    }
+
+    /// Delete the legacy primary config, model-limits, and connect authorities,
+    /// then install the resulting default config/provider/MCP generation while
+    /// one detached owner retains `config_io_lock`.
+    ///
+    /// `config.json.bak` remains as the intentionally recoverable low-sensitivity
+    /// configuration snapshot. `connect.json.bak` is removed because it can
+    /// contain an immediately usable encrypted remote-control credential.
+    ///
+    /// Once dispatched, request cancellation cannot stop the reset between
+    /// file deletion and runtime convergence. Runtime failures are committed
+    /// as degraded last-known-good state because the destructive reset itself
+    /// has already crossed its durable boundary.
+    pub async fn reset_legacy_config_and_runtime(&self) -> Result<Config, AppError> {
+        if self.config_facade.is_some() {
+            return Err(AppError::BadRequest(
+                "full config reset spans multiple revisioned sections and is disabled without a recoverable manifest; reset sections individually through the typed section API"
+                    .to_string(),
+            ));
+        }
+
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let app_data_dir = self.app_data_dir.clone();
+        let config = self.config.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let account_sink = self.account_sink.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let mut deletion_error = None;
+            for path in [
+                app_data_dir.join("config.json"),
+                app_data_dir.join("model_limits.json"),
+                app_data_dir.join("connect.json"),
+                app_data_dir.join("connect.json.bak"),
+            ] {
+                let result = match tokio::fs::try_exists(&path).await {
+                    Ok(true) => tokio::fs::remove_file(&path).await,
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    tracing::warn!(
+                        file = %path.display(),
+                        "failed to delete one legacy config artifact during reset"
+                    );
+                    deletion_error.get_or_insert(error);
+                }
+            }
+            #[cfg(test)]
+            run_reset_after_delete_test_hook(&app_data_dir);
+
+            let new_config = Config::from_data_dir_without_publish(Some(app_data_dir.clone()));
+            new_config.publish_env_vars();
+            *config.write().await = new_config.clone();
+            Self::apply_config_effects_owned(
+                new_config.clone(),
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::BestEffort,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
+                },
+                ConfigRuntimeEffectContext {
+                    app_data_dir,
+                    config_facade: None,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                    account_sink,
+                    config_live_health,
+                    mcp_config_live_health,
+                },
+            )
+            .await?;
+            match deletion_error {
+                Some(error) => Err(AppError::StorageError(error)),
+                None => Ok(new_config),
+            }
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "legacy config reset transaction task failed: {error}"
+            ))
+        })?
     }
 
     async fn persist_config_snapshot(
@@ -3236,6 +3894,19 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
+        self.update_config_with_forced_mcp_replacements(update, effects, HashSet::new())
+            .await
+    }
+
+    pub(crate) async fn update_config_with_forced_mcp_replacements<F>(
+        &self,
+        update: F,
+        effects: ConfigUpdateEffects,
+        forced_mcp_replacements: HashSet<String>,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError>,
+    {
         // Cancellation while waiting for either guard is pre-commit and leaves
         // every authority untouched. After candidate construction there is no
         // await before the owned guard and candidate enter the detached task.
@@ -3276,6 +3947,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         // The detached task owns every step after dispatch. Dropping the
         // request's JoinHandle cannot strand a completed durable/facade commit
         // ahead of live publication, its exact events, or requested effects.
@@ -3317,14 +3990,20 @@ impl AppState {
                 // boundary as durable commit and live installation. Otherwise a
                 // later local writer can enqueue r2 before this task enqueues r1.
                 publish_exact_facade_events(&account_sink, &events)?;
-                Self::apply_config_effects_owned(
+                Self::apply_config_effects_owned_after_forcing(
                     snapshot.clone(),
                     effects,
-                    app_data_dir,
-                    config,
-                    provider_registry,
-                    provider,
-                    mcp_manager,
+                    ConfigRuntimeEffectContext {
+                        app_data_dir,
+                        config_facade,
+                        provider_registry,
+                        provider,
+                        mcp_manager,
+                        account_sink,
+                        config_live_health,
+                        mcp_config_live_health,
+                    },
+                    forced_mcp_replacements,
                 )
                 .await?;
                 snapshot
@@ -3411,6 +4090,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         let transaction = tokio::spawn(async move {
             let snapshot = {
                 let _io = io;
@@ -3487,11 +4168,16 @@ impl AppState {
                 Self::apply_config_effects_owned(
                     snapshot.clone(),
                     effects,
-                    app_data_dir,
-                    config,
-                    provider_registry,
-                    provider,
-                    mcp_manager,
+                    ConfigRuntimeEffectContext {
+                        app_data_dir,
+                        config_facade,
+                        provider_registry,
+                        provider,
+                        mcp_manager,
+                        account_sink,
+                        config_live_health,
+                        mcp_config_live_health,
+                    },
                 )
                 .await?;
                 snapshot
@@ -4380,6 +5066,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         let config_facade = self.config_facade.clone();
         let account_sink = self.account_sink.clone();
 
@@ -4504,33 +5192,21 @@ impl AppState {
                 publish_exact_facade_events(&account_sink, &installed.events)?;
             }
 
-            if effects.reload_provider {
-                match bamboo_llm::ProviderRegistry::from_config(&published, app_data_dir.clone())
-                    .await
-                {
-                    Ok(candidate_registry) => {
-                        if let Some(candidate_provider) = candidate_registry.get_default() {
-                            let mut live_provider = provider.write().await;
-                            provider_registry.replace_with(candidate_registry);
-                            *live_provider = candidate_provider;
-                        } else {
-                            tracing::warn!(
-                                "proxy auth committed but provider reload had no default provider"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "proxy auth committed but provider reload failed"
-                        );
-                    }
-                }
-            }
-
-            if effects.reconcile_mcp {
-                mcp_manager.reconcile_from_config(&published.mcp).await;
-            }
+            Self::apply_config_effects_owned(
+                published.clone(),
+                effects,
+                ConfigRuntimeEffectContext {
+                    app_data_dir,
+                    config_facade,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                    account_sink,
+                    config_live_health,
+                    mcp_config_live_health,
+                },
+            )
+            .await?;
 
             let (status, health) = if let Some(installed) = installed {
                 (
@@ -4601,6 +5277,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         let transaction = tokio::spawn(async move {
             // Same #126 serialization as update_config: mutate + persist under
             // the config-IO lock so a reload can't interleave. Provider/MCP
@@ -4641,11 +5319,16 @@ impl AppState {
                 Self::apply_config_effects_owned(
                     published.clone(),
                     effects,
-                    app_data_dir,
-                    config,
-                    provider_registry,
-                    provider,
-                    mcp_manager,
+                    ConfigRuntimeEffectContext {
+                        app_data_dir,
+                        config_facade,
+                        provider_registry,
+                        provider,
+                        mcp_manager,
+                        account_sink,
+                        config_live_health,
+                        mcp_config_live_health,
+                    },
                 )
                 .await?;
                 published
@@ -4662,59 +5345,194 @@ impl AppState {
     async fn apply_config_effects_owned(
         new_config: Config,
         effects: ConfigUpdateEffects,
-        app_data_dir: PathBuf,
-        config: Arc<RwLock<Config>>,
-        provider_registry: Arc<bamboo_llm::ProviderRegistry>,
-        provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
-        mcp_manager: Arc<McpServerManager>,
+        context: ConfigRuntimeEffectContext,
     ) -> Result<(), AppError> {
-        if effects.reload_provider {
-            // The caller retains config_io_lock through provider construction
-            // and publication, so this current live snapshot cannot be
-            // superseded while an awaited runtime build is in flight.
-            let live_config = config.read().await.clone();
-            let candidate_registry =
-                bamboo_llm::ProviderRegistry::from_config(&live_config, app_data_dir.clone())
-                    .await
-                    .map_err(|e| {
-                        AppError::InternalError(anyhow::anyhow!(
-                            "Failed to reload provider after updating config: {e}"
-                        ))
-                    })?;
-            let default_provider_name = candidate_registry.default_provider_name();
-            let candidate_provider = candidate_registry.get_default().ok_or_else(|| {
-                let message = if live_config.has_provider_instances() {
-                    format!(
-                        "Default provider instance '{}' is not available or failed to initialize",
-                        default_provider_name
-                    )
-                } else {
-                    format!(
-                        "Provider '{}' is not available or failed to initialize",
-                        live_config.provider
-                    )
-                };
-                AppError::InternalError(anyhow::anyhow!(
-                    "Failed to reload provider after updating config: {}",
+        Self::apply_config_effects_owned_after_forcing(new_config, effects, context, HashSet::new())
+            .await
+    }
+
+    async fn apply_config_effects_owned_after_forcing(
+        new_config: Config,
+        effects: ConfigUpdateEffects,
+        context: ConfigRuntimeEffectContext,
+        forced_mcp_replacements: HashSet<String>,
+    ) -> Result<(), AppError> {
+        let ConfigRuntimeEffectContext {
+            app_data_dir,
+            config_facade,
+            provider_registry,
+            provider,
+            mcp_manager,
+            account_sink,
+            config_live_health,
+            mcp_config_live_health,
+        } = context;
+        // The caller owns config_io_lock for this whole method. Build every
+        // runtime from `new_config` itself: consulting the mutable live view
+        // here would let one durable generation publish another generation's
+        // provider or MCP state.
+        let mut provider_failure = None;
+        if !matches!(
+            effects.reload_provider,
+            bamboo_config::patch::ReloadMode::None
+        ) {
+            let candidate = async {
+                let candidate_registry =
+                    bamboo_llm::ProviderRegistry::from_config(&new_config, app_data_dir.clone())
+                        .await?;
+                let default_provider_name = candidate_registry.default_provider_name();
+                let candidate_provider = candidate_registry.get_default().ok_or_else(|| {
+                    let message = if new_config.has_provider_instances() {
+                        format!(
+                            "Default provider instance '{}' is not available or failed to initialize",
+                            default_provider_name
+                        )
+                    } else {
+                        format!(
+                            "Provider '{}' is not available or failed to initialize",
+                            new_config.provider
+                        )
+                    };
                     bamboo_llm::LLMError::Auth(message)
+                })?;
+                Ok::<_, bamboo_llm::LLMError>((
+                    candidate_registry,
+                    candidate_provider,
+                    default_provider_name,
                 ))
-            })?;
-            #[cfg(test)]
-            run_generic_before_provider_publish_test_hook(&app_data_dir);
-            let mut live_provider = provider.write().await;
-            provider_registry.replace_with(candidate_registry);
-            *live_provider = candidate_provider;
-            tracing::info!(
-                default_provider = %default_provider_name,
-                "Provider reloaded successfully"
-            );
+            }
+            .await;
+
+            match candidate {
+                Ok((candidate_registry, candidate_provider, default_provider_name)) => {
+                    #[cfg(test)]
+                    run_generic_before_provider_publish_test_hook(&app_data_dir);
+                    {
+                        // Never hold the provider guard while acquiring the MCP
+                        // reconcile guard below.
+                        let mut live_provider = provider.write().await;
+                        provider_registry.replace_with(candidate_registry);
+                        *live_provider = candidate_provider;
+                    }
+                    if let Some(facade) = config_facade.as_ref() {
+                        let snapshot = facade.registry().providers.snapshot();
+                        set_live_health_revision(
+                            &config_live_health,
+                            snapshot.revision,
+                            Some((snapshot.source_path.clone(), snapshot.source_kind)),
+                        );
+                    } else {
+                        update_live_health(
+                            &config_live_health,
+                            SectionStatus::Healthy,
+                            None,
+                            true,
+                            Some((app_data_dir.join("config.json"), SectionSourceKind::File)),
+                        );
+                    }
+                    tracing::info!(
+                        default_provider = %default_provider_name,
+                        "Provider reloaded successfully"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!("committed provider generation could not start");
+                    let message =
+                        "provider runtime initialization failed; retaining last-known-good runtime"
+                            .to_string();
+                    if let Some(facade) = config_facade.as_ref() {
+                        if let Some(event) = facade
+                            .registry()
+                            .mark_runtime_degraded(SectionId::Providers, message.clone())
+                        {
+                            let snapshot = facade.registry().providers.snapshot();
+                            set_live_health_from_snapshot(&config_live_health, &snapshot);
+                            publish_registry_event(&account_sink, &event);
+                        }
+                    } else {
+                        publish_section_failure(
+                            &config_live_health,
+                            &account_sink,
+                            "providers",
+                            SectionStatus::Degraded,
+                            message.clone(),
+                        );
+                    }
+                    if matches!(
+                        effects.reload_provider,
+                        bamboo_config::patch::ReloadMode::Strict
+                    ) {
+                        provider_failure = Some(AppError::InternalError(anyhow::anyhow!(message)));
+                    }
+                }
+            }
         }
 
-        if effects.reconcile_mcp {
-            mcp_manager.reconcile_from_config(&new_config.mcp).await;
+        let mut mcp_failure = None;
+        if !matches!(
+            effects.reconcile_mcp,
+            bamboo_config::patch::ReloadMode::None
+        ) {
+            match mcp_manager
+                .reconcile_from_config_transactional_after_forcing(
+                    &new_config.mcp,
+                    &forced_mcp_replacements,
+                    || async { Ok(()) },
+                )
+                .await
+            {
+                Ok(()) => {
+                    if let Some(facade) = config_facade.as_ref() {
+                        let snapshot = facade.registry().mcp.snapshot();
+                        set_live_health_revision(
+                            &mcp_config_live_health,
+                            snapshot.revision,
+                            Some((snapshot.source_path.clone(), snapshot.source_kind)),
+                        );
+                    } else {
+                        update_live_health(
+                            &mcp_config_live_health,
+                            SectionStatus::Healthy,
+                            None,
+                            true,
+                            Some((app_data_dir.join("config.json"), SectionSourceKind::File)),
+                        );
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!("committed MCP generation could not start");
+                    let message =
+                        "MCP runtime initialization failed; retaining last-known-good runtime"
+                            .to_string();
+                    if let Some(facade) = config_facade.as_ref() {
+                        if let Some(event) = facade
+                            .registry()
+                            .mark_runtime_degraded(SectionId::Mcp, message.clone())
+                        {
+                            let snapshot = facade.registry().mcp.snapshot();
+                            set_live_health_from_snapshot(&mcp_config_live_health, &snapshot);
+                            publish_registry_event(&account_sink, &event);
+                        }
+                    } else {
+                        publish_section_failure(
+                            &mcp_config_live_health,
+                            &account_sink,
+                            "mcp",
+                            SectionStatus::Degraded,
+                            message.clone(),
+                        );
+                    }
+                    if matches!(
+                        effects.reconcile_mcp,
+                        bamboo_config::patch::ReloadMode::Strict
+                    ) {
+                        mcp_failure = Some(AppError::InternalError(anyhow::anyhow!(message)));
+                    }
+                }
+            }
         }
 
-        Ok(())
+        provider_failure.or(mcp_failure).map_or(Ok(()), Err)
     }
 
     /// Resolve a pending config-corruption recovery (#153; see
@@ -4882,6 +5700,79 @@ mod live_reload_tests {
         }
     }
 
+    fn working_stdio_mcp_config(dir: &Path, id: &str, secret: Option<&str>) -> McpConfig {
+        let script = dir.join(format!("{id}-mcp-fixture.py"));
+        std::fs::write(
+            &script,
+            r#"import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "server/discover":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Method not found"},
+        }), flush=True)
+        continue
+    if request.get("method") == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "config-generation-fixture", "version": "1.0.0"},
+        }
+    elif request.get("method") == "tools/list":
+        result = {"tools": []}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|command| {
+                std::process::Command::new(command)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            })
+            .expect("a Python interpreter is required for the MCP ordering fixture");
+        let mut env = std::collections::HashMap::new();
+        if let Some(secret) = secret {
+            env.insert("TOKEN".to_string(), secret.to_string());
+        }
+        McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: id.to_string(),
+                name: None,
+                enabled: true,
+                transport: TransportConfig::Stdio(StdioConfig {
+                    command: python.to_string(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    cwd: None,
+                    env,
+                    env_encrypted: std::collections::HashMap::new(),
+                    env_credential_refs: std::collections::HashMap::new(),
+                    startup_timeout_ms: 2_000,
+                }),
+                request_timeout_ms: 2_000,
+                healthcheck_interval_ms: 10_000,
+                reconnect: ReconnectConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        }
+    }
+
     fn mcp_document_bytes(revision: u64, config: &McpConfig) -> Vec<u8> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": 1,
@@ -4889,6 +5780,74 @@ mod live_reload_tests {
             "data": config,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_mcp_rejects_client_owned_stdio_and_header_credential_refs() {
+        let mut stdio_current = disabled_mcp_config("stdio-server");
+        let stdio_reference =
+            bamboo_config::credential_ref("mcp", "stdio-server", "env_TOKEN").unwrap();
+        let TransportConfig::Stdio(stdio) = &mut stdio_current.servers[0].transport else {
+            unreachable!()
+        };
+        stdio
+            .env
+            .insert("TOKEN".to_string(), "existing-secret".to_string());
+        stdio
+            .env_credential_refs
+            .insert("TOKEN".to_string(), stdio_reference.as_str().to_string());
+        let mut stdio_candidate = stdio_current.clone();
+        let TransportConfig::Stdio(stdio) = &mut stdio_candidate.servers[0].transport else {
+            unreachable!()
+        };
+        stdio
+            .env_credential_refs
+            .insert("TOKEN".to_string(), "mcp.foreign.env_token".to_string());
+        let error = normalize_legacy_mcp_credentials(&stdio_current, &mut stdio_candidate)
+            .expect_err("an arbitrary stdio credential ref must be rejected");
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message == "MCP credential references are server-managed and cannot be supplied"
+        ));
+
+        let header_reference =
+            bamboo_config::credential_ref("mcp", "http-server", "header_Authorization").unwrap();
+        let http_current = McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: "http-server".to_string(),
+                name: None,
+                enabled: false,
+                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
+                    url: "https://example.test/sse".to_string(),
+                    headers: vec![bamboo_mcp::HeaderConfig {
+                        name: "Authorization".to_string(),
+                        value: "existing-secret".to_string(),
+                        value_encrypted: None,
+                        credential_ref: Some(header_reference.as_str().to_string()),
+                    }],
+                    connect_timeout_ms: 100,
+                }),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        };
+        let mut http_candidate = http_current.clone();
+        let TransportConfig::Sse(http) = &mut http_candidate.servers[0].transport else {
+            unreachable!()
+        };
+        http.headers[0].credential_ref = Some("mcp.foreign.header_authorization".to_string());
+        let error = normalize_legacy_mcp_credentials(&http_current, &mut http_candidate)
+            .expect_err("an arbitrary header credential ref must be rejected");
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message == "MCP credential references are server-managed and cannot be supplied"
+        ));
     }
 
     #[test]
@@ -6434,8 +7393,8 @@ for line in sys.stdin:
                             Ok(())
                         },
                         ConfigUpdateEffects {
-                            reload_provider: true,
-                            reconcile_mcp: true,
+                            reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
                         },
                     )
                     .await
@@ -6488,8 +7447,8 @@ for line in sys.stdin:
                             Ok(())
                         },
                         ConfigUpdateEffects {
-                            reload_provider: false,
-                            reconcile_mcp: true,
+                            reload_provider: bamboo_config::patch::ReloadMode::None,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
                         },
                     )
                     .await
@@ -6507,6 +7466,755 @@ for line in sys.stdin:
             "the later durable config generation must remain the final runtime generation"
         );
         state.mcp_manager.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_provider_reload_cannot_publish_after_later_config_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.provider = "openai".to_string();
+        initial.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            api_key: "first-generation-key".to_string(),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            ..Default::default()
+        });
+        let mut state = AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            initial,
+            Arc::new(WorkingProvider),
+        )
+        .await
+        .unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let quiesced = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("startup config work must quiesce");
+        drop(quiesced);
+        let (reload_ready_tx, reload_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_provider_publish_test_hook(dir.path(), move || {
+            let _ = reload_ready_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let reload = {
+            let state = state.clone();
+            tokio::spawn(async move { state.reload_provider().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reload_ready_rx)
+            .await
+            .expect("direct reload reaches provider publication hook")
+            .unwrap();
+        assert!(state.config_io_lock.try_lock().is_err());
+
+        let mut later_instance: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "base_url": "http://127.0.0.1:1/v1",
+                "enabled": true
+            }))
+            .unwrap();
+        later_instance.api_key = "later-generation-key".to_string();
+        let (later_started_tx, later_started_rx) = tokio::sync::oneshot::channel();
+        let later = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = later_started_tx.send(());
+                state
+                    .update_config_with_provider_credentials(
+                        move |config| {
+                            config
+                                .provider_instances
+                                .insert("later-winner".to_string(), later_instance);
+                            config.default_provider_instance = Some("later-winner".to_string());
+                            Ok(())
+                        },
+                        BTreeSet::new(),
+                        BTreeSet::from(["later-winner".to_string()]),
+                        ConfigUpdateEffects {
+                            reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+                        },
+                    )
+                    .await
+            })
+        };
+        later_started_rx.await.unwrap();
+        assert!(!later.is_finished());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            reload.await.unwrap().unwrap();
+            later.await.unwrap().unwrap();
+        })
+        .await
+        .expect("serialized provider generations finish");
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .default_provider_instance
+                .as_deref(),
+            Some("later-winner")
+        );
+        assert_eq!(
+            state.provider_registry.default_provider_name(),
+            "later-winner"
+        );
+        let registry_default = state.provider_registry.get_default().unwrap();
+        let live_provider = state.provider.read().await.clone();
+        assert!(
+            Arc::ptr_eq(&registry_default, &live_provider),
+            "registry default and reloadable provider handle must publish one generation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn combined_reload_cannot_publish_captured_mcp_after_later_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.provider = "openai".to_string();
+        initial.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            api_key: "combined-reload-key".to_string(),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            ..Default::default()
+        });
+        let mut state = AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            initial,
+            Arc::new(WorkingProvider),
+        )
+        .await
+        .unwrap();
+        stop_config_watcher(&mut state);
+        state
+            .update_config_with_provider_credentials(
+                |_| Ok(()),
+                BTreeSet::from(["openai".to_string()]),
+                BTreeSet::new(),
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+        let first_mcp = working_stdio_mcp_config(dir.path(), "captured-first", None);
+        state
+            .update_config(
+                move |config| {
+                    config.mcp = first_mcp;
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let (reload_ready_tx, reload_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_provider_publish_test_hook(dir.path(), move || {
+            let _ = reload_ready_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let reload = {
+            let state = state.clone();
+            tokio::spawn(async move { state.reload_config_and_runtime().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reload_ready_rx)
+            .await
+            .expect("combined reload reaches provider publication hook")
+            .unwrap();
+        assert!(state.config_io_lock.try_lock().is_err());
+
+        let later_mcp = working_stdio_mcp_config(dir.path(), "later-winner", None);
+        let (later_started_tx, later_started_rx) = tokio::sync::oneshot::channel();
+        let later = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = later_started_tx.send(());
+                state
+                    .update_config(
+                        move |config| {
+                            config.mcp = later_mcp;
+                            Ok(())
+                        },
+                        ConfigUpdateEffects {
+                            reload_provider: bamboo_config::patch::ReloadMode::None,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
+                        },
+                    )
+                    .await
+            })
+        };
+        later_started_rx.await.unwrap();
+        assert!(!later.is_finished());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            reload.await.unwrap().unwrap();
+            later.await.unwrap().unwrap();
+        })
+        .await
+        .expect("serialized config/runtime generations finish");
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "later-winner");
+        assert_eq!(
+            state.mcp_manager.list_servers(),
+            vec!["later-winner".to_string()]
+        );
+        state.mcp_manager.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_mcp_credentials_round_trip_without_plaintext_in_durable_or_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let baseline_seq = state.account_sink.latest_seq();
+        let secret = "legacy-mcp-roundtrip-secret";
+        let mut candidate = disabled_mcp_config("credential-server");
+        let TransportConfig::Stdio(stdio) = &mut candidate.servers[0].transport else {
+            unreachable!()
+        };
+        stdio.env.insert("TOKEN".to_string(), secret.to_string());
+
+        state
+            .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                *mcp = candidate;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let live = state.config.read().await.clone();
+        let TransportConfig::Stdio(stdio) = &live.mcp.servers[0].transport else {
+            unreachable!()
+        };
+        assert_eq!(stdio.env["TOKEN"], secret);
+        let reference =
+            bamboo_config::CredentialRef::parse(stdio.env_credential_refs["TOKEN"].clone())
+                .unwrap();
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            secret
+        );
+        for path in [
+            dir.path().join("mcp.json"),
+            dir.path().join("credentials.json"),
+        ] {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        }
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        assert!(!format!("{events:?}").contains(secret));
+
+        state
+            .update_legacy_mcp_config(BTreeSet::new(), |mcp| {
+                let TransportConfig::Stdio(stdio) = &mut mcp.servers[0].transport else {
+                    unreachable!()
+                };
+                stdio
+                    .env
+                    .insert("TOKEN".to_string(), "****...****".to_string());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let live = state.config.read().await.clone();
+        let TransportConfig::Stdio(stdio) = &live.mcp.servers[0].transport else {
+            unreachable!()
+        };
+        assert_eq!(stdio.env["TOKEN"], secret);
+        assert_eq!(stdio.env_credential_refs["TOKEN"], reference.as_str());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_mcp_cancelled_start_finishes_before_later_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let secret = "legacy-mcp-cancel-secret";
+        let candidate = working_stdio_mcp_config(dir.path(), "cancelled-start", Some(secret));
+        let reference =
+            bamboo_config::credential_ref("mcp", "cancelled-start", "env_TOKEN").unwrap();
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_credential_after_commit_before_live_test_hook(dir.path(), SectionId::Mcp, move || {
+            let _ = commit_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                        *mcp = candidate;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), commit_rx)
+            .await
+            .expect("legacy MCP write reaches durable-before-live hook")
+            .unwrap();
+        assert!(state.config_io_lock.try_lock().is_err());
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(dir.path().join("mcp.json")).unwrap())
+                .contains(secret)
+        );
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let delete = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = delete_started_tx.send(());
+                state
+                    .update_legacy_mcp_config(BTreeSet::new(), |mcp| {
+                        mcp.servers.clear();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        delete_started_rx.await.unwrap();
+        assert!(!delete.is_finished());
+        release_tx.send(()).unwrap();
+        delete.await.unwrap().unwrap();
+
+        assert!(state.config.read().await.mcp.servers.is_empty());
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(state.mcp_manager.tool_index().all_aliases().is_empty());
+        assert!(state
+            .credential_store
+            .resolve(&reference)
+            .unwrap()
+            .is_none());
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(dir.path().join("mcp.json")).unwrap())
+                .contains(secret)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_rejects_secret_bearing_url_before_runtime_or_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let before = std::fs::read(dir.path().join("mcp.json")).unwrap();
+        let secret = "must-never-connect-or-log";
+        let candidate = McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: "unsafe-url".to_string(),
+                name: None,
+                enabled: true,
+                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
+                    url: format!("https://example.test/sse?token={secret}"),
+                    headers: vec![],
+                    connect_timeout_ms: 100,
+                }),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        };
+        let error = state
+            .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                *mcp = candidate;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(!error.to_string().contains(secret));
+        assert_eq!(std::fs::read(dir.path().join("mcp.json")).unwrap(), before);
+        assert!(state.config.read().await.mcp.servers.is_empty());
+        assert!(state.mcp_manager.list_servers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_start_failure_keeps_every_authority_on_the_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let disk_before = std::fs::read(dir.path().join("mcp.json")).unwrap();
+        let config_before = state.config.read().await.clone();
+        let facade_before = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .snapshot();
+        let health_before = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut failing = disabled_mcp_config("never-committed");
+        failing.servers[0].enabled = true;
+        let TransportConfig::Stdio(stdio) = &mut failing.servers[0].transport else {
+            unreachable!()
+        };
+        stdio.command = "definitely-not-a-real-mcp-command-before-commit-736".to_string();
+
+        let error = state
+            .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                *mcp = failing;
+                Ok(())
+            })
+            .await
+            .expect_err("runtime staging must fail before the MCP durable boundary");
+        assert!(matches!(error, AppError::InternalError(_)));
+        assert_eq!(
+            error.to_string(),
+            "Internal server error: MCP runtime initialization failed before commit; retaining last-known-good generation"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("mcp.json")).unwrap(),
+            disk_before
+        );
+        assert_eq!(
+            serde_json::to_value(state.config.read().await.clone()).unwrap(),
+            serde_json::to_value(config_before).unwrap()
+        );
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(state.mcp_manager.tool_index().all_aliases().is_empty());
+
+        let facade_after = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .snapshot();
+        assert_eq!(facade_after.revision, facade_before.revision);
+        assert_eq!(facade_after.loaded_at, facade_before.loaded_at);
+        assert_eq!(facade_after.status, facade_before.status);
+        let health_after = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(health_after.revision, health_before.revision);
+        assert_eq!(health_after.loaded_at, health_before.loaded_at);
+        assert_eq!(health_after.status, health_before.status);
+        assert_eq!(health_after.last_error, health_before.last_error);
+        assert!(bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|event| !matches!(
+            event.event,
+            AgentEvent::ConfigChanged { ref section, .. }
+                | AgentEvent::ConfigInvalid { ref section, .. }
+                | AgentEvent::ConfigRecovered { ref section, .. }
+                if section == "mcp"
+        )));
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_reload_retains_live_provider_generation_and_marks_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.server.port = 24_301;
+        initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let injected: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        let mut state = AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            initial.clone(),
+            injected.clone(),
+        )
+        .await
+        .unwrap();
+        stop_config_watcher(&mut state);
+        let expected_provider = state.config.read().await.provider.clone();
+
+        let mut invalid = initial;
+        invalid.provider = "unknown-invalid-provider".to_string();
+        invalid.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let error = state.reload_config_and_runtime().await.unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(state.config.read().await.server.port, 24_301);
+        assert_eq!(state.config.read().await.provider, expected_provider);
+        let live_provider = state.provider.read().await.clone();
+        assert!(Arc::ptr_eq(&live_provider, &injected));
+        let health = state
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(health.status, SectionStatus::Invalid);
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("provider configuration is invalid; retaining last-known-good generation")
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_provider_start_failure_publishes_one_exact_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let baseline_seq = state.account_sink.latest_seq();
+        let previous_provider = state.provider.read().await.clone();
+        let previous_default = state.provider_registry.default_provider_name();
+
+        let published = state
+            .update_config(
+                |config| {
+                    config.provider = "unknown-runtime-provider".to_string();
+                    config.default_provider_instance = None;
+                    config.provider_instances.clear();
+                    Ok(())
+                },
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::BestEffort,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+                },
+            )
+            .await
+            .expect("the durable provider generation commits with degraded runtime health");
+        assert_eq!(published.provider, "unknown-runtime-provider");
+        assert_eq!(
+            state.config.read().await.provider,
+            "unknown-runtime-provider"
+        );
+        assert_eq!(
+            state.provider_registry.default_provider_name(),
+            previous_default
+        );
+        assert!(Arc::ptr_eq(
+            &state.provider.read().await.clone(),
+            &previous_provider
+        ));
+
+        let facade_snapshot = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .providers
+            .snapshot();
+        let health = state
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(facade_snapshot.revision, 1);
+        assert_eq!(facade_snapshot.status, SectionStatus::Degraded);
+        assert_eq!(health.revision, facade_snapshot.revision);
+        assert_eq!(health.loaded_at, facade_snapshot.loaded_at);
+        assert_eq!(health.source_path, facade_snapshot.source_path);
+        assert_eq!(health.source_kind, facade_snapshot.source_kind);
+        assert_eq!(health.status, facade_snapshot.status);
+        assert_eq!(health.last_error, facade_snapshot.last_error);
+
+        let invalid_revisions = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            AgentEvent::ConfigInvalid { section, revision } if section == "providers" => {
+                Some(revision)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(invalid_revisions, vec![facade_snapshot.revision]);
+    }
+
+    #[tokio::test]
+    async fn committed_mcp_start_failure_publishes_one_exact_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut failing = disabled_mcp_config("committed-but-unstartable");
+        failing.servers[0].enabled = true;
+        let TransportConfig::Stdio(stdio) = &mut failing.servers[0].transport else {
+            unreachable!()
+        };
+        stdio.command = "definitely-not-a-real-mcp-command-736".to_string();
+
+        let published = state
+            .update_config(
+                move |config| {
+                    config.mcp = failing;
+                    Ok(())
+                },
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::None,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
+                },
+            )
+            .await
+            .expect("the durable MCP generation commits with degraded runtime health");
+        assert_eq!(published.mcp.servers[0].id, "committed-but-unstartable");
+        assert_eq!(
+            state.config.read().await.mcp.servers[0].id,
+            "committed-but-unstartable"
+        );
+        assert!(state.mcp_manager.list_servers().is_empty());
+
+        let facade_snapshot = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .snapshot();
+        let health = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(facade_snapshot.revision, 1);
+        assert_eq!(facade_snapshot.status, SectionStatus::Degraded);
+        assert_eq!(health.revision, facade_snapshot.revision);
+        assert_eq!(health.loaded_at, facade_snapshot.loaded_at);
+        assert_eq!(health.source_path, facade_snapshot.source_path);
+        assert_eq!(health.source_kind, facade_snapshot.source_kind);
+        assert_eq!(health.status, facade_snapshot.status);
+        assert_eq!(health.last_error, facade_snapshot.last_error);
+
+        let invalid_revisions = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            AgentEvent::ConfigInvalid { section, revision } if section == "mcp" => Some(revision),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(invalid_revisions, vec![facade_snapshot.revision]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_legacy_reset_finishes_deletion_and_runtime_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.server.port = 24_302;
+        initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+        std::fs::write(dir.path().join("config.json.bak"), b"recovery-marker").unwrap();
+        std::fs::write(dir.path().join("model_limits.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("connect.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("connect.json.bak"), b"credential-backup").unwrap();
+        let injected: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        let mut state =
+            AppState::new_with_provider(dir.path().to_path_buf(), initial, injected.clone())
+                .await
+                .unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let (deleted_tx, deleted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_reset_after_delete_test_hook(dir.path(), move || {
+            let _ = deleted_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            tokio::spawn(async move { state.reset_legacy_config_and_runtime().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), deleted_rx)
+            .await
+            .expect("reset reaches durable delete boundary")
+            .unwrap();
+        for path in [
+            dir.path().join("config.json"),
+            dir.path().join("model_limits.json"),
+            dir.path().join("connect.json"),
+            dir.path().join("connect.json.bak"),
+        ] {
+            assert!(!path.exists());
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json.bak")).unwrap(),
+            b"recovery-marker"
+        );
+        assert_eq!(state.config.read().await.server.port, 24_302);
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+
+        release_tx.send(()).unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("detached reset must finish live/runtime publication");
+        drop(completed);
+        assert_eq!(state.config.read().await.server.port, 9562);
+        assert!(state.mcp_manager.list_servers().is_empty());
+        let health = state
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            health.status,
+            SectionStatus::Degraded,
+            "the committed default config has no usable Anthropic credential, so reset must report truthful runtime degradation"
+        );
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("provider runtime initialization failed; retaining last-known-good runtime")
+        );
+        assert!(Arc::ptr_eq(&state.provider.read().await.clone(), &injected));
+    }
+
+    #[tokio::test]
+    async fn legacy_reset_converges_runtime_after_partial_delete_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.server.port = 24_303;
+        initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+        std::fs::write(dir.path().join("model_limits.json"), b"{}").unwrap();
+        let injected: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        let mut state =
+            AppState::new_with_provider(dir.path().to_path_buf(), initial, injected.clone())
+                .await
+                .unwrap();
+        stop_config_watcher(&mut state);
+
+        // A directory at a file path makes `remove_file` fail deterministically.
+        // The reset must still delete later sensitive artifacts and publish the
+        // generation represented by whatever remains on disk.
+        std::fs::create_dir(dir.path().join("connect.json")).unwrap();
+        std::fs::write(dir.path().join("connect.json.bak"), b"credential-backup").unwrap();
+
+        let error = state.reset_legacy_config_and_runtime().await.unwrap_err();
+        assert!(matches!(error, AppError::StorageError(_)));
+        assert!(!dir.path().join("config.json").exists());
+        assert!(!dir.path().join("model_limits.json").exists());
+        assert!(dir.path().join("connect.json").is_dir());
+        assert!(!dir.path().join("connect.json.bak").exists());
+        assert_eq!(state.config.read().await.server.port, 9562);
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(Arc::ptr_eq(&state.provider.read().await.clone(), &injected));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7951,8 +9659,8 @@ for line in sys.stdin:
                         }),
                         0,
                         ConfigUpdateEffects {
-                            reload_provider: true,
-                            reconcile_mcp: true,
+                            reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
                         },
                     )
                     .await

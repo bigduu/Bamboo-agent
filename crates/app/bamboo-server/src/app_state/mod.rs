@@ -517,8 +517,17 @@ pub mod watchers;
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConfigUpdateEffects {
-    pub reload_provider: bool,
-    pub reconcile_mcp: bool,
+    pub reload_provider: bamboo_config::patch::ReloadMode,
+    pub reconcile_mcp: bamboo_config::patch::ReloadMode,
+}
+
+impl Default for ConfigUpdateEffects {
+    fn default() -> Self {
+        Self {
+            reload_provider: bamboo_config::patch::ReloadMode::None,
+            reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+        }
+    }
 }

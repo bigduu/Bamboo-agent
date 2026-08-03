@@ -6,10 +6,9 @@ use bamboo_config::OpenAIConfig;
 use bamboo_llm::Config;
 
 use super::common::{
-    config_file_path, connect_backup_file_path, connect_file_path, model_limits_file_path,
-    read_model_limits_file, redacted_config_json, write_model_limits_file,
+    config_file_path, model_limits_file_path, read_model_limits_file, redacted_config_json,
+    write_model_limits_file,
 };
-use super::reset::remove_config_file_if_exists;
 
 fn access_control_fixture() -> bamboo_config::AccessControlConfig {
     bamboo_config::AccessControlConfig {
@@ -100,24 +99,6 @@ fn model_limits_file_path_appends_model_limits_json_filename() {
     assert_eq!(
         model_limits_file_path(dir.path()),
         dir.path().join("model_limits.json")
-    );
-}
-
-#[test]
-fn connect_file_path_appends_connect_json_filename() {
-    let dir = tempdir().expect("temp dir should be created");
-    assert_eq!(
-        connect_file_path(dir.path()),
-        dir.path().join("connect.json")
-    );
-}
-
-#[test]
-fn connect_backup_file_path_appends_connect_json_bak_filename() {
-    let dir = tempdir().expect("temp dir should be created");
-    assert_eq!(
-        connect_backup_file_path(dir.path()),
-        dir.path().join("connect.json.bak")
     );
 }
 
@@ -394,31 +375,6 @@ async fn generic_config_patch_rejects_access_control_without_partial_mutation() 
 }
 
 #[actix_web::test]
-async fn remove_config_file_if_exists_deletes_existing_file() {
-    let dir = tempdir().expect("temp dir should be created");
-    let path = dir.path().join("config.json");
-    tokio::fs::write(&path, "{}")
-        .await
-        .expect("test file should be written");
-
-    remove_config_file_if_exists(&path)
-        .await
-        .expect("existing config file should be deleted");
-    assert!(!path.exists());
-}
-
-#[actix_web::test]
-async fn remove_config_file_if_exists_is_noop_when_missing() {
-    let dir = tempdir().expect("temp dir should be created");
-    let path = dir.path().join("config.json");
-
-    remove_config_file_if_exists(&path)
-        .await
-        .expect("missing config file should not fail");
-    assert!(!path.exists());
-}
-
-#[actix_web::test]
 async fn redacted_config_json_injects_model_limits_from_file() {
     let dir = tempdir().expect("temp dir should be created");
     write_model_limits_file(
@@ -439,20 +395,6 @@ async fn redacted_config_json_injects_model_limits_from_file() {
         .await
         .expect("redacted config should serialize");
     assert_eq!(value["model_limits"][0]["model_pattern"], "gpt-5");
-}
-
-#[actix_web::test]
-async fn remove_config_file_if_exists_deletes_model_limits_file() {
-    let dir = tempdir().expect("temp dir should be created");
-    let path = dir.path().join("model_limits.json");
-    tokio::fs::write(&path, "[]")
-        .await
-        .expect("model limits file should be written");
-
-    remove_config_file_if_exists(&path)
-        .await
-        .expect("existing model limits file should be deleted");
-    assert!(!path.exists());
 }
 
 // --- Full persistence (all user-provided overrides are stored) ------------

@@ -1,10 +1,10 @@
 use actix_web::{web, HttpResponse, Responder};
 use std::collections::HashMap;
 
-use crate::app_state::{AppState, ConfigUpdateEffects};
+use crate::app_state::AppState;
 
-use super::super::api_types::{ImportServersRequest, ImportServersResponse, ImportStartError};
-use super::super::persist_config_error;
+use super::super::api_types::{ImportServersRequest, ImportServersResponse};
+use super::super::mutation_error_response;
 
 /// Merge one MCP server into a config's server list BY ID: replace an existing
 /// entry with the same id, or append a new one. Returns `true` if the server
@@ -65,70 +65,40 @@ pub async fn import_servers(
     let mut updated = 0usize;
     let mut removed = 0usize;
 
-    // Unified: update memory -> persist config.json. Then apply runtime updates.
-    let mut removed_ids: Vec<String> = Vec::new();
-    if let Err(e) = state
-        .update_config(
-            |root| {
-                let existing_ids: std::collections::HashSet<String> = root
-                    .mcp
-                    .servers
-                    .iter()
-                    .map(|server| server.id.clone())
-                    .collect();
+    // Stage every enabled incoming runtime before committing the exact MCP
+    // metadata/credential generation. A failed candidate leaves the previous
+    // durable/live/runtime generation untouched, so a successful import has
+    // no deferred per-server start errors.
+    let force_restart = server_ids.iter().cloned().collect();
+    if let Err(error) = state
+        .update_legacy_mcp_config(force_restart, |mcp| {
+            let existing_ids: std::collections::HashSet<String> =
+                mcp.servers.iter().map(|server| server.id.clone()).collect();
 
-                if replace {
-                    let incoming_ids: std::collections::HashSet<String> =
-                        incoming_by_id.keys().cloned().collect();
-                    let to_remove: Vec<String> =
-                        existing_ids.difference(&incoming_ids).cloned().collect();
-                    removed = to_remove.len();
-                    removed_ids = to_remove;
+            if replace {
+                let incoming_ids: std::collections::HashSet<String> =
+                    incoming_by_id.keys().cloned().collect();
+                let to_remove: Vec<String> =
+                    existing_ids.difference(&incoming_ids).cloned().collect();
+                removed = to_remove.len();
 
-                    root.mcp
-                        .servers
-                        .retain(|server| !incoming_ids.contains(&server.id));
+                mcp.servers
+                    .retain(|server| incoming_ids.contains(&server.id));
+            }
+
+            for server in incoming_by_id.values() {
+                if upsert_server_by_id(&mut mcp.servers, server.clone()) {
+                    added += 1;
+                } else {
+                    updated += 1;
                 }
+            }
 
-                for server in incoming_by_id.values() {
-                    if upsert_server_by_id(&mut root.mcp.servers, server.clone()) {
-                        added += 1;
-                    } else {
-                        updated += 1;
-                    }
-                }
-
-                Ok(())
-            },
-            ConfigUpdateEffects::default(),
-        )
+            Ok(())
+        })
         .await
     {
-        return persist_config_error(format!("Failed to save config: {e}"));
-    }
-
-    // Apply runtime changes best-effort (do not fail the import if some servers can't start).
-    for server_id in &removed_ids {
-        let _ = state.mcp_manager.stop_server(server_id).await;
-    }
-
-    let mut start_errors = Vec::new();
-    for id in &server_ids {
-        let Some(server_cfg) = incoming_by_id.get(id).cloned() else {
-            continue;
-        };
-
-        // In merge mode we only touch imported servers; in replace mode we also already stopped
-        // removed servers.
-        let _ = state.mcp_manager.stop_server(id).await;
-        if server_cfg.enabled {
-            if let Err(e) = state.mcp_manager.start_server(server_cfg).await {
-                start_errors.push(ImportStartError {
-                    server_id: id.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+        return mutation_error_response(error);
     }
 
     HttpResponse::Ok().json(ImportServersResponse {
@@ -138,6 +108,6 @@ pub async fn import_servers(
         updated,
         removed,
         server_ids,
-        start_errors,
+        start_errors: Vec::new(),
     })
 }

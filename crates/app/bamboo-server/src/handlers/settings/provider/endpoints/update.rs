@@ -31,10 +31,15 @@ pub(super) async fn handle_update_provider_config(
             },
             provider_credential_intents,
             std::collections::BTreeSet::new(),
-            // Persist first; reload below so we can return a clear provider-reload error.
             ConfigUpdateEffects {
-                reload_provider: false,
-                reconcile_mcp: true,
+                // The detached config transaction owns provider publication,
+                // so cancellation cannot strand the committed generation.
+                reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                // Preserve the endpoint's existing best-effort MCP reconcile:
+                // provider persistence/reload errors are authoritative here,
+                // while an unrelated MCP startup failure must not reject an
+                // already-committed provider update.
+                reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
             },
         )
         .await
@@ -43,13 +48,6 @@ pub(super) async fn handle_update_provider_config(
         Err(AppError::BadRequest(message)) => return Ok(bad_request_response(message)),
         Err(error) => return Err(error),
     };
-
-    if let Err(error) = app_state.reload_provider().await {
-        return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-            "success": false,
-            "error": crate::error::error_value(format!("Failed to reload provider: {error}"))
-        })));
-    }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

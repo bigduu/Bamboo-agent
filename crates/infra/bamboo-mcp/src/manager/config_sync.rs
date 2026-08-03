@@ -39,6 +39,28 @@ impl McpServerManager {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
+        self.reconcile_from_config_transactional_after_forcing(
+            config,
+            &HashSet::new(),
+            before_publish,
+        )
+        .await
+    }
+
+    /// Transactional reconcile with explicit runtime replacements even when
+    /// their effective configuration is unchanged. Legacy reconnect/update
+    /// endpoints use this to preserve their restart contract without doing an
+    /// out-of-transaction stop/start after the durable boundary.
+    pub async fn reconcile_from_config_transactional_after_forcing<F, Fut>(
+        &self,
+        config: &McpConfig,
+        force_replacements: &HashSet<String>,
+        before_publish: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let _reconcile = self.reconcile_lock.lock().await;
         let mut seen = HashSet::new();
         for server in &config.servers {
@@ -58,17 +80,18 @@ impl McpServerManager {
         let desired_proxy_fingerprint = manager_proxy_fingerprint(self.config.as_ref()).await;
         let mut replacements = Vec::new();
         for desired in config.servers.iter().filter(|server| server.enabled) {
-            let needs_replacement = self
-                .runtimes
-                .get(&desired.id)
-                .map(|runtime| {
-                    effective_server_config(&runtime.config) != effective_server_config(desired)
-                        || matches!(
-                            runtime.config.transport,
-                            TransportConfig::Sse(_) | TransportConfig::StreamableHttp(_)
-                        ) && runtime.proxy_fingerprint != desired_proxy_fingerprint
-                })
-                .unwrap_or(true);
+            let needs_replacement = force_replacements.contains(&desired.id)
+                || self
+                    .runtimes
+                    .get(&desired.id)
+                    .map(|runtime| {
+                        effective_server_config(&runtime.config) != effective_server_config(desired)
+                            || matches!(
+                                runtime.config.transport,
+                                TransportConfig::Sse(_) | TransportConfig::StreamableHttp(_)
+                            ) && runtime.proxy_fingerprint != desired_proxy_fingerprint
+                    })
+                    .unwrap_or(true);
             if !needs_replacement {
                 continue;
             }

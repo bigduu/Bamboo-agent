@@ -386,8 +386,8 @@ pub async fn create_provider_instance(
             std::collections::BTreeSet::new(),
             std::collections::BTreeSet::from([instance_id_for_intent]),
             ConfigUpdateEffects {
-                reload_provider: true,
-                reconcile_mcp: false,
+                reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
             },
         )
         .await?;
@@ -456,8 +456,8 @@ pub async fn update_provider_instance(
             std::collections::BTreeSet::new(),
             provider_instance_intents,
             ConfigUpdateEffects {
-                reload_provider: true,
-                reconcile_mcp: false,
+                reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
             },
         )
         .await?;
@@ -506,8 +506,8 @@ pub async fn delete_provider_instance(
             std::collections::BTreeSet::new(),
             provider_instance_intents,
             ConfigUpdateEffects {
-                reload_provider: true,
-                reconcile_mcp: false,
+                reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
             },
         )
         .await?;
@@ -541,8 +541,8 @@ pub async fn set_default_provider_instance(
                 Ok(())
             },
             ConfigUpdateEffects {
-                reload_provider: true,
-                reconcile_mcp: false,
+                reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
             },
         )
         .await?;
