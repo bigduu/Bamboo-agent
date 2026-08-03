@@ -1252,6 +1252,14 @@ fn validate_mcp(value: &McpSection) -> Result<(), String> {
     validate_json_serializable(value)
 }
 
+/// Validate the secret-free durable MCP projection before any caller stages
+/// network or process runtime work. This is the same validator installed on
+/// the authoritative MCP section store, exposed so compatibility writers
+/// cannot connect to a candidate that the later durable CAS would reject.
+pub fn validate_mcp_section(config: &bamboo_domain::mcp_config::McpConfig) -> Result<(), String> {
+    validate_mcp(&McpSection(config.clone()))
+}
+
 fn validate_secret_free_http_url(label: &str, raw: &str, allow_empty: bool) -> Result<(), String> {
     if raw.is_empty() && allow_empty {
         return Ok(());

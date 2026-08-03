@@ -1,4 +1,4 @@
-use actix_web::HttpResponse;
+use actix_web::{HttpResponse, ResponseError};
 
 mod api_types;
 mod server_handlers;
@@ -17,8 +17,6 @@ pub use server_handlers::{
 pub(crate) use server_handlers::upsert_server_by_id;
 pub use tool_handlers::{get_server_tools, list_tools};
 
-fn persist_config_error(message: impl Into<String>) -> HttpResponse {
-    HttpResponse::InternalServerError().json(serde_json::json!({
-        "error": crate::error::error_value(message.into())
-    }))
+fn mutation_error_response(error: crate::error::AppError) -> HttpResponse {
+    error.error_response()
 }

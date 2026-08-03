@@ -102,8 +102,12 @@ pub async fn set_bamboo_config(
             ConfigUpdateEffects {
                 // Best-effort: setup/UX flows must be able to persist partial config even when
                 // provider init isn't possible yet.
-                reload_provider: false,
-                reconcile_mcp: effects.reconcile_mcp,
+                reload_provider: effects.reload_provider,
+                reconcile_mcp: if effects.reconcile_mcp {
+                    bamboo_config::patch::ReloadMode::BestEffort
+                } else {
+                    bamboo_config::patch::ReloadMode::None
+                },
             },
         )
         .await?;
@@ -116,16 +120,6 @@ pub async fn set_bamboo_config(
     if let Some(model_limits_patch) = model_limits_patch.as_ref() {
         let _config_guard = app_state.config.write().await;
         write_model_limits_file(&app_state.app_data_dir, Some(model_limits_patch)).await?;
-    }
-
-    if effects.reload_provider == config_manager::ReloadMode::BestEffort {
-        if let Err(error) = app_state.reload_provider().await {
-            tracing::warn!(
-                "Config updated (provider={}, requested_reload=true) but provider reload failed: {}",
-                new_config.provider,
-                error
-            );
-        }
     }
 
     // The live config deliberately retains the current node heartbeat/runtime

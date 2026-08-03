@@ -200,11 +200,9 @@ pub struct ServerPluginInstaller {
 #[derive(Default)]
 struct InstallRollback {
     mcp_ids_added: Vec<String>,
-    mcp_ids_started: Vec<String>,
     preset_ids_added: Vec<String>,
     /// Service ids this install claimed ownership of (whether or not the
-    /// actual `start_service` call succeeded — best-effort, same contract as
-    /// `mcp_ids_added`/`mcp_ids_started`).
+    /// actual `start_service` call succeeded — best-effort).
     service_ids_added: Vec<String>,
     /// Subset of `service_ids_added` that actually got a running
     /// `ServiceManager` runtime started — only these need `stop_service` on
@@ -321,11 +319,14 @@ impl ServerPluginInstaller {
         let result = self
             .state
             .update_config(
-                move |cfg| {
-                    cfg.mcp.servers.retain(|server| server.id != owned_id);
+                move |config| {
+                    config.mcp.servers.retain(|server| server.id != owned_id);
                     Ok(())
                 },
-                ConfigUpdateEffects::default(),
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::None,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
+                },
             )
             .await;
         if let Err(error) = result {
@@ -333,13 +334,6 @@ impl ServerPluginInstaller {
                 mcp_server_id = %id,
                 %error,
                 "failed to remove plugin-owned mcp server from config.json; continuing"
-            );
-        }
-        if let Err(error) = self.state.mcp_manager.stop_server(id).await {
-            tracing::warn!(
-                mcp_server_id = %id,
-                %error,
-                "failed to stop plugin-owned mcp server; continuing"
             );
         }
     }
@@ -416,9 +410,6 @@ impl ServerPluginInstaller {
     /// Best-effort undo of an `install()` that failed partway through steps
     /// 1-3. See the module docs.
     async fn rollback_partial_install(&self, rollback: &InstallRollback) {
-        for id in &rollback.mcp_ids_started {
-            let _ = self.state.mcp_manager.stop_server(id).await;
-        }
         for id in &rollback.mcp_ids_added {
             self.remove_mcp_server(id).await;
         }
@@ -524,9 +515,10 @@ impl ServerPluginInstaller {
         let declared_for_recheck = declared_ids.clone();
         let owned_for_recheck: Vec<String> = previously_owned.to_vec();
         let plugin_id_for_recheck = manifest.id.clone();
+        let forced_mcp_replacements = reconciliation.to_register.iter().cloned().collect();
         self.state
-            .update_config(
-                move |cfg| {
+            .update_config_with_forced_mcp_replacements(
+                move |config| {
                     // TOCTOU guard: re-run the ownership pre-check against the
                     // LIVE config while holding config_io_lock, so a foreign
                     // entry that landed between our earlier read and now can't
@@ -536,7 +528,7 @@ impl ServerPluginInstaller {
                     // PLUGIN_OP_LOCK; this closes the residual window against a
                     // concurrent NON-plugin config write.
                     let live_existing: Vec<String> =
-                        cfg.mcp.servers.iter().map(|s| s.id.clone()).collect();
+                        config.mcp.servers.iter().map(|s| s.id.clone()).collect();
                     let live = reconcile_exclusive(
                         &declared_for_recheck,
                         &live_existing,
@@ -552,38 +544,25 @@ impl ServerPluginInstaller {
                     }
                     // Shared by-id merge (same helper import_servers uses).
                     for server in &owned_configs {
-                        upsert_server_by_id(&mut cfg.mcp.servers, server.clone());
+                        upsert_server_by_id(&mut config.mcp.servers, server.clone());
                     }
                     Ok(())
                 },
-                ConfigUpdateEffects::default(),
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::None,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
+                },
+                forced_mcp_replacements,
             )
             .await
             .map_err(|error| {
                 PluginError::Registration(format!("failed to write mcp servers to config: {error}"))
             })?;
-        // Config write for the whole batch succeeded — record ownership now,
-        // regardless of whether individual `start_server` calls below
-        // succeed (matches `import_servers`' best-effort start semantics: a
-        // config entry that fails to start is still a real, plugin-owned
-        // registration a user/CLI can retry starting later).
+        // The config generation is committed and live before ownership is
+        // claimed. Runtime activation is generation-serialized and reports
+        // degraded MCP health on failure, preserving the installer's existing
+        // best-effort activation contract without an out-of-lock start.
         rollback.mcp_ids_added = reconciliation.to_register.clone();
-
-        for server in &configs_to_register {
-            // Stop any stale running instance first, matching the
-            // update/import handlers' pattern.
-            let _ = self.state.mcp_manager.stop_server(&server.id).await;
-            if server.enabled {
-                match self.state.mcp_manager.start_server(server.clone()).await {
-                    Ok(()) => rollback.mcp_ids_started.push(server.id.clone()),
-                    Err(error) => tracing::warn!(
-                        mcp_server_id = %server.id,
-                        %error,
-                        "plugin-registered mcp server failed to start; config entry kept (best-effort)"
-                    ),
-                }
-            }
-        }
 
         Ok(reconciliation.to_register)
     }

@@ -60,9 +60,9 @@ pub async fn set_proxy_auth(
             ConfigUpdateEffects {
                 // Best-effort inside the detached post-commit convergence task:
                 // setup flows often set proxy auth before provider config is complete.
-                reload_provider: true,
+                reload_provider: bamboo_config::patch::ReloadMode::BestEffort,
                 // Proxy auth can affect SSE-based MCP servers too.
-                reconcile_mcp: true,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
             },
         )
         .await?;

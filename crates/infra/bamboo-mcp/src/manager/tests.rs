@@ -606,6 +606,90 @@ async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_in
 }
 
 #[tokio::test]
+async fn forced_transactional_reconcile_replaces_identical_effective_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("forced-reconnect-fixture.py");
+    std::fs::write(
+        &script,
+        r#"import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "server/discover":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Method not found"},
+        }), flush=True)
+        continue
+    if request.get("method") == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "forced-reconnect-fixture", "version": "1.0.0"},
+        }
+    elif request.get("method") == "tools/list":
+        result = {"tools": []}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+    )
+    .unwrap();
+    let python = ["python3", "python"]
+        .into_iter()
+        .find(|command| {
+            std::process::Command::new(command)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .expect("a Python interpreter is required for the forced reconnect fixture");
+    let mut server = create_test_server_config("forced");
+    server.transport = TransportConfig::Stdio(StdioConfig {
+        command: python.to_string(),
+        args: vec![script.to_string_lossy().into_owned()],
+        cwd: None,
+        env: std::collections::HashMap::new(),
+        env_encrypted: std::collections::HashMap::new(),
+        env_credential_refs: std::collections::HashMap::new(),
+        startup_timeout_ms: 2_000,
+    });
+    server.request_timeout_ms = 2_000;
+    let candidate = McpConfig {
+        version: 1,
+        servers: vec![server],
+    };
+    let manager = McpServerManager::new();
+    manager
+        .reconcile_from_config_transactional(&candidate)
+        .await
+        .unwrap();
+    let first = manager.runtimes.get("forced").unwrap().clone();
+
+    manager
+        .reconcile_from_config_transactional_after_forcing(
+            &candidate,
+            &std::collections::HashSet::from(["forced".to_string()]),
+            || async { Ok(()) },
+        )
+        .await
+        .unwrap();
+    let second = manager.runtimes.get("forced").unwrap().clone();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(
+        first.shutdown.load(Ordering::SeqCst),
+        "the replaced generation is synchronously fenced before cleanup"
+    );
+    assert_eq!(second.info.read().await.status, ServerStatus::Ready);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn committed_reconcile_publishes_all_removals_before_blocked_cleanup() {
     use std::sync::atomic::AtomicBool;
 
