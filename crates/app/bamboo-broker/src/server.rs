@@ -223,7 +223,7 @@ impl BrokerServer {
     /// serves both bare `TcpStream` (`ws://`) and `TlsStream<TcpStream>`
     /// (`wss://`) connections (#48) — mirrors
     /// `bamboo_subagent::transport::handle_conn`'s same genericization.
-    async fn handle_conn<S>(&self, stream: S) -> BrokerResult<()>
+    pub(crate) async fn handle_conn<S>(&self, stream: S) -> BrokerResult<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {

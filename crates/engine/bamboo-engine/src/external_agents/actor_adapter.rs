@@ -12,8 +12,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
@@ -47,9 +48,19 @@ pub const MAX_SPAWN_DEPTH: u32 = 4;
 /// Default cap on idle pooled (warm, reusable) workers kept per fingerprint.
 const DEFAULT_MAX_IDLE_PER_KEY: usize = 4;
 
+/// Process-wide-per-runner cap across every reuse fingerprint. Without this,
+/// workloads that continually change role/model/workspace can leave one parked
+/// worker in an unbounded number of otherwise-small buckets.
+const DEFAULT_MAX_IDLE_TOTAL: usize = DEFAULT_MAX_CONCURRENT_ACTORS;
+
 /// How long a pooled worker waits for its next assignment before reclaiming
 /// itself (must comfortably exceed the gap between sibling spawns).
 const POOLED_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Sweep often enough to retire an expired/dead pool entry even when no later
+/// child checks out the same fingerprint. The worker's own idle deadline is the
+/// primary process-side guard; this task closes the parent handle and pool entry.
+const POOLED_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Deadline for a local worker's FIRST frame after a Run is dispatched. A warm
 /// worker answers in seconds; a cold spawn within tens. Total silence past this
@@ -343,6 +354,98 @@ struct PooledWorker {
     worker: SpawnedChild,
     /// The bus mailbox this worker subscribes to (where its `Run`s are delivered).
     mailbox_id: String,
+    /// Set only while the worker is parked. Checked both at checkout and by the
+    /// background pool sweep; cleared before the worker is handed to a run.
+    parked_at: Option<Instant>,
+}
+
+type WorkerPool = HashMap<String, Vec<PooledWorker>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolReapReason {
+    ProcessExited,
+    IdleTimeout,
+}
+
+impl PoolReapReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessExited => "process_exited_while_parked",
+            Self::IdleTimeout => "pool_idle_timeout",
+        }
+    }
+}
+
+fn parked_worker_expired(parked_at: Option<Instant>, now: Instant, timeout: Duration) -> bool {
+    parked_at.is_some_and(|parked_at| now.saturating_duration_since(parked_at) >= timeout)
+}
+
+fn idle_pool_limit_reason(
+    pool: &WorkerPool,
+    key: &str,
+    max_per_key: usize,
+    max_total: usize,
+) -> Option<&'static str> {
+    if pool.get(key).map_or(0, Vec::len) >= max_per_key {
+        Some("pool_per_key_limit")
+    } else if pool.values().map(Vec::len).sum::<usize>() >= max_total {
+        Some("pool_global_limit")
+    } else {
+        None
+    }
+}
+
+fn take_reapable_workers(
+    pool: &mut WorkerPool,
+    now: Instant,
+    timeout: Duration,
+) -> Vec<(String, PoolReapReason, PooledWorker)> {
+    let mut reaped = Vec::new();
+    for (key, bucket) in pool.iter_mut() {
+        let mut retained = Vec::with_capacity(bucket.len());
+        for mut worker in std::mem::take(bucket) {
+            let reason = if !worker.worker.is_alive() {
+                Some(PoolReapReason::ProcessExited)
+            } else if parked_worker_expired(worker.parked_at, now, timeout) {
+                Some(PoolReapReason::IdleTimeout)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                reaped.push((key.clone(), reason, worker));
+            } else {
+                retained.push(worker);
+            }
+        }
+        *bucket = retained;
+    }
+    pool.retain(|_, bucket| !bucket.is_empty());
+    reaped
+}
+
+async fn reap_worker_pool_once(pool: &Arc<tokio::sync::Mutex<WorkerPool>>) -> usize {
+    let now = Instant::now();
+    let timeout = Duration::from_secs(POOLED_IDLE_TIMEOUT_SECS);
+    let reaped = {
+        let mut pool = pool.lock().await;
+        take_reapable_workers(&mut pool, now, timeout)
+    };
+    let count = reaped.len();
+    for (pool_key, reason, worker) in reaped {
+        let idle_ms = worker
+            .parked_at
+            .map(|parked_at| now.saturating_duration_since(parked_at).as_millis() as u64);
+        tracing::info!(
+            pool_key,
+            mailbox_id = %worker.mailbox_id,
+            worker_pid = ?worker.worker.pid(),
+            worker_idle_ms = ?idle_ms,
+            shutdown_reason = reason.as_str(),
+            "reaping parked sub-agent worker"
+        );
+        worker.worker.kill().await;
+    }
+    count
 }
 
 /// A role pinned to a remote resident worker (remote-actor-plan §3.4 / P1.5,
@@ -413,8 +516,10 @@ pub struct ActorChildRunner {
     /// parks its bus worker here so the next interchangeable child reuses it
     /// (delivers its `Run` to the same mailbox) instead of spawning a fresh
     /// process — collapsing N sibling sub-agents onto a few warm workers.
-    pool: Arc<tokio::sync::Mutex<HashMap<String, Vec<PooledWorker>>>>,
+    pool: Arc<tokio::sync::Mutex<WorkerPool>>,
     max_idle_per_key: usize,
+    max_idle_total: usize,
+    pool_reaper_started: AtomicBool,
     /// Host-side decision for a child's gated-tool approval request (Phase 2).
     /// `None` ⇒ fail-closed DENY (the safe default). A wired decider (policy or
     /// human-routing bridge) returns approve/deny over the actor WS.
@@ -555,6 +660,8 @@ impl ActorChildRunner {
             concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
             pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             max_idle_per_key: DEFAULT_MAX_IDLE_PER_KEY,
+            max_idle_total: DEFAULT_MAX_IDLE_TOTAL,
+            pool_reaper_started: AtomicBool::new(false),
             approval_decider: None,
             approval_reviewer: None,
             escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
@@ -693,6 +800,33 @@ impl ActorChildRunner {
         )
     }
 
+    /// Start one weakly-owned sweep task for this runner. It does not keep the
+    /// runner/pool alive, and it never holds the pool lock while killing a child.
+    fn ensure_pool_reaper(&self) {
+        if self
+            .pool_reaper_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let pool = Arc::downgrade(&self.pool);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(POOLED_REAPER_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Tokio intervals tick immediately once; consume that tick so a new
+            // runner does not scan an empty pool before its first worker parks.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(pool) = pool.upgrade() else {
+                    break;
+                };
+                let _ = reap_worker_pool_once(&pool).await;
+            }
+        });
+    }
+
     /// Check out a warm bus worker for `key`, reusing a live parked one if any,
     /// else spawning a fresh one that dials the bus. The returned worker is OWNED
     /// by the caller for the run's duration (checkout removes it from the pool, so
@@ -703,19 +837,43 @@ impl ActorChildRunner {
         key: &str,
         spec: &ProvisionSpec,
     ) -> crate::runtime::runner::Result<PooledWorker> {
+        self.ensure_pool_reaper();
         // Drain the bucket, skipping (and reaping) any worker whose process exited
-        // while parked. A live one is handed straight out for reuse.
+        // or crossed its idle deadline while parked. A live, fresh one is handed
+        // straight out for reuse.
         loop {
             let candidate = {
                 let mut pool = self.pool.lock().await;
-                pool.get_mut(key).and_then(|bucket| bucket.pop())
+                let candidate = pool.get_mut(key).and_then(|bucket| bucket.pop());
+                if pool.get(key).is_some_and(Vec::is_empty) {
+                    pool.remove(key);
+                }
+                candidate
             };
             let Some(mut candidate) = candidate else {
                 break;
             };
-            if candidate.worker.is_alive() {
+            let now = Instant::now();
+            let expired = parked_worker_expired(
+                candidate.parked_at,
+                now,
+                Duration::from_secs(POOLED_IDLE_TIMEOUT_SECS),
+            );
+            if candidate.worker.is_alive() && !expired {
+                candidate.parked_at = None;
                 return Ok(candidate);
             }
+            tracing::info!(
+                pool_key = key,
+                mailbox_id = %candidate.mailbox_id,
+                worker_pid = ?candidate.worker.pid(),
+                shutdown_reason = if expired {
+                    PoolReapReason::IdleTimeout.as_str()
+                } else {
+                    PoolReapReason::ProcessExited.as_str()
+                },
+                "discarding unusable parked sub-agent worker during checkout"
+            );
             candidate.worker.kill().await;
         }
 
@@ -726,6 +884,7 @@ impl ActorChildRunner {
         Ok(PooledWorker {
             worker: spawned,
             mailbox_id,
+            parked_at: None,
         })
     }
 
@@ -733,18 +892,41 @@ impl ActorChildRunner {
     /// (or it died), kill it instead. The worker stays dialed-in + subscribed
     /// while parked, so a reusing child just delivers a new `Run` to its mailbox.
     async fn release_bus_worker(&self, key: &str, mut worker: PooledWorker) {
+        self.ensure_pool_reaper();
         if !worker.worker.is_alive() {
+            tracing::info!(
+                pool_key = key,
+                mailbox_id = %worker.mailbox_id,
+                worker_pid = ?worker.worker.pid(),
+                shutdown_reason = "process_exited_before_park",
+                "discarding sub-agent worker instead of parking"
+            );
             worker.worker.kill().await;
             return;
         }
+        worker.parked_at = Some(Instant::now());
         let mut pool = self.pool.lock().await;
-        let bucket = pool.entry(key.to_string()).or_default();
-        if bucket.len() >= self.max_idle_per_key {
+        let key_count = pool.get(key).map_or(0, Vec::len);
+        let total_count = pool.values().map(Vec::len).sum::<usize>();
+        let limit_reason =
+            idle_pool_limit_reason(&pool, key, self.max_idle_per_key, self.max_idle_total);
+        if let Some(shutdown_reason) = limit_reason {
             drop(pool);
+            tracing::info!(
+                pool_key = key,
+                mailbox_id = %worker.mailbox_id,
+                worker_pid = ?worker.worker.pid(),
+                idle_workers_for_key = key_count,
+                idle_workers_total = total_count,
+                max_idle_per_key = self.max_idle_per_key,
+                max_idle_total = self.max_idle_total,
+                shutdown_reason,
+                "discarding sub-agent worker because the warm pool is full"
+            );
             worker.worker.kill().await;
             return;
         }
-        bucket.push(worker);
+        pool.entry(key.to_string()).or_default().push(worker);
     }
 
     /// Assemble the parent-resolved provisioning document for this child.
@@ -1287,6 +1469,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     let actor = PooledWorker {
                         worker: SpawnedChild::remote(record),
                         mailbox_id: job.child_session_id.clone(),
+                        parked_at: None,
                     };
                     let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(client);
                     (actor, client)
@@ -1337,6 +1520,7 @@ impl ExternalChildRunner for ActorChildRunner {
                             lease_expires_at: chrono::Utc::now(),
                         }),
                         mailbox_id,
+                        parked_at: None,
                     };
                     let client: Box<dyn bamboo_subagent::ChildLink> = Box::new(link);
                     (actor, client)
@@ -2551,6 +2735,78 @@ mod tests {
     use super::*;
     use crate::SessionActivationRouter;
     use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort, Storage};
+
+    fn processless_pool_worker(mailbox_id: &str) -> PooledWorker {
+        PooledWorker {
+            worker: SpawnedChild::remote(AgentRecord {
+                agent_id: mailbox_id.to_string(),
+                role: "test".to_string(),
+                labels: Vec::new(),
+                endpoint: "ws://127.0.0.1:1".to_string(),
+                pid: 0,
+                version: String::new(),
+                started_at: chrono::Utc::now(),
+                lease_expires_at: chrono::Utc::now(),
+            }),
+            mailbox_id: mailbox_id.to_string(),
+            parked_at: None,
+        }
+    }
+
+    #[test]
+    fn parked_worker_deadline_is_inclusive_and_ignores_checked_out_workers() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(300);
+        assert!(!parked_worker_expired(None, now, timeout));
+        assert!(!parked_worker_expired(
+            Some(now - timeout + Duration::from_millis(1)),
+            now,
+            timeout
+        ));
+        assert!(parked_worker_expired(Some(now - timeout), now, timeout));
+    }
+
+    #[test]
+    fn idle_pool_global_cap_bounds_distinct_fingerprints() {
+        let mut pool = WorkerPool::new();
+        pool.insert(
+            "fingerprint-a".to_string(),
+            vec![processless_pool_worker("a")],
+        );
+        pool.insert(
+            "fingerprint-b".to_string(),
+            vec![processless_pool_worker("b")],
+        );
+
+        assert_eq!(
+            idle_pool_limit_reason(&pool, "fingerprint-c", 4, 2),
+            Some("pool_global_limit")
+        );
+        assert_eq!(idle_pool_limit_reason(&pool, "fingerprint-c", 4, 3), None);
+        assert_eq!(
+            idle_pool_limit_reason(&pool, "fingerprint-a", 1, 8),
+            Some("pool_per_key_limit")
+        );
+    }
+
+    #[test]
+    fn pool_sweep_removes_dead_workers_and_empty_fingerprint_buckets() {
+        let mut pool = WorkerPool::new();
+        pool.insert(
+            "fingerprint-a".to_string(),
+            vec![processless_pool_worker("dead")],
+        );
+
+        let reaped = take_reapable_workers(
+            &mut pool,
+            Instant::now(),
+            Duration::from_secs(POOLED_IDLE_TIMEOUT_SECS),
+        );
+
+        assert!(pool.is_empty());
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].1, PoolReapReason::ProcessExited);
+    }
 
     #[test]
     fn actor_preflight_counts_only_current_session_scoped_denies() {

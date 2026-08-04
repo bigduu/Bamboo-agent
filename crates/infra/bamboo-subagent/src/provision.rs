@@ -37,6 +37,13 @@ pub struct ProvisionSpec {
     /// unified actor+mailbox transport); the parent drives it by mailbox id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bus: Option<BusEndpoint>,
+    /// Physical owner of a locally spawned worker. This is independent from
+    /// the durable parent/child session lifecycle: it lets the worker reclaim
+    /// its OS process if the spawning Bamboo instance disappears without
+    /// dropping the `Child` handle normally. Missing for older specs and for
+    /// operator-managed resident workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<WorkerOwner>,
     /// Isolated storage root for this actor's own session/mailbox files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_dir: Option<String>,
@@ -242,6 +249,21 @@ pub struct BusEndpoint {
     pub token: String,
 }
 
+/// Process-instance identity attached immediately before a local worker spawn.
+///
+/// `session_id` is diagnostic context for the activation that caused the
+/// spawn. A reusable worker can later serve other sessions, so durable child
+/// lifecycle remains authoritative elsewhere; `process_id` + `instance_id`
+/// are the physical ownership lease used by the orphan guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerOwner {
+    pub process_id: u32,
+    pub instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub worker_spawned_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// How a worker reaches the orchestrator's MCP proxy over the broker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpProxyConfig {
@@ -438,6 +460,7 @@ impl ProvisionSpec {
             executor,
             fabric_dir,
             bus: None,
+            owner: None,
             storage_dir: None,
             workspace: None,
             model: None,
@@ -583,6 +606,7 @@ mod tests {
         assert!(parsed.model.is_none());
         assert!(parsed.secrets.provider_credentials.is_empty());
         assert_eq!(parsed.limits, Limits::default());
+        assert!(parsed.owner.is_none());
         // Placement defaults to Local for a spec that predates the field.
         assert_eq!(parsed.placement, Placement::Local);
     }

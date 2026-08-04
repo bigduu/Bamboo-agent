@@ -46,6 +46,8 @@ pub mod error;
 
 pub mod commands;
 
+#[doc(hidden)]
+pub mod process_owner;
 pub mod project_worktree;
 /// The `bamboo subagent-worker` actor worker (provision via stdin, serve over WS).
 pub mod subagent_worker;
