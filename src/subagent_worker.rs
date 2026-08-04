@@ -62,11 +62,13 @@ pub async fn run() -> std::result::Result<(), String> {
             "subagent-worker",
             Some(owner.instance_id.clone()),
             owner.session_id.clone(),
+            owner.process_start_id,
         );
         tracing::info!(
             worker_id = %spec.identity.child_id,
             owner_pid = owner.process_id,
             owner_instance_id = %owner.instance_id,
+            owner_process_start_id = owner.process_start_id,
             owner_session_id = owner.session_id.as_deref().unwrap_or("none"),
             worker_spawned_at = %owner.worker_spawned_at,
             "subagent worker owner guard armed"

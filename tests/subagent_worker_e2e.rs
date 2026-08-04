@@ -165,6 +165,7 @@ async fn real_bamboo_worker_exits_when_its_direct_owner_is_sigkilled() {
     spec.owner = Some(WorkerOwner {
         process_id: shell_pid,
         instance_id: "owner-loss-e2e-instance".into(),
+        process_start_id: None,
         session_id: Some("owner-session".into()),
         worker_spawned_at: chrono::Utc::now(),
     });

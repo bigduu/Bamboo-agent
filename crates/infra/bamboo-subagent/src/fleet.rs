@@ -32,12 +32,10 @@ fn local_owner_instance_id() -> &'static str {
 /// cached spec cannot carry a stale PID/instance into a later spawn.
 fn provision_for_local_spawn(spec: &ProvisionSpec) -> ProvisionSpec {
     let mut provisioned = spec.clone();
-    provisioned.owner = Some(WorkerOwner {
-        process_id: std::process::id(),
-        instance_id: local_owner_instance_id().to_string(),
-        session_id: spec.identity.parent_id.clone(),
-        worker_spawned_at: chrono::Utc::now(),
-    });
+    provisioned.owner = Some(WorkerOwner::for_current_process(
+        local_owner_instance_id().to_string(),
+        spec.identity.parent_id.clone(),
+    ));
     provisioned
 }
 
@@ -231,6 +229,11 @@ mod tests {
         assert_eq!(first_owner.process_id, std::process::id());
         assert_eq!(first_owner.instance_id, second_owner.instance_id);
         assert_eq!(first_owner.session_id.as_deref(), Some("parent-session"));
+        #[cfg(windows)]
+        assert!(first_owner.process_start_id.is_some());
+        #[cfg(not(windows))]
+        assert!(first_owner.process_start_id.is_none());
+        assert_eq!(first_owner.process_start_id, second_owner.process_start_id);
         assert!(second_owner.worker_spawned_at >= first_owner.worker_spawned_at);
     }
 }
