@@ -623,8 +623,44 @@ impl Tool for ScheduleTasksTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_agent_core::tools::ToolExecutionContext;
+    use bamboo_agent_core::tools::{
+        FunctionCall, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags,
+    };
+    use bamboo_domain::{PermissionAuditSnapshot, PermissionMode, SessionPermissionMode};
+    use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
+    use futures::stream;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::{Mutex, Notify};
+
+    struct ScriptedScheduleProvider {
+        responses: Mutex<VecDeque<Vec<bamboo_llm::provider::Result<LLMChunk>>>>,
+        calls: AtomicUsize,
+        first_call_started: Arc<Notify>,
+        release_first_call: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for ScriptedScheduleProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_call_started.notify_one();
+                self.release_first_call.notified().await;
+            }
+            let chunks =
+                self.responses.lock().await.pop_front().ok_or_else(|| {
+                    LLMError::Api("scripted schedule provider exhausted".to_string())
+                })?;
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
 
     fn context(session_id: &str) -> ToolCtx {
         ToolExecutionContext {
@@ -640,6 +676,221 @@ mod tests {
             pre_parsed_args: None,
         }
         .to_tool_ctx()
+    }
+
+    #[tokio::test]
+    async fn auto_execute_schedule_runs_forced_ask_tool_without_approval_while_interactive_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        bamboo_config::paths::init_bamboo_dir(dir.path().to_path_buf());
+        let workspace = dir.path().join("scheduled-project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let scheduled_output = workspace.join("scheduled-auto.txt");
+        let interactive_output = workspace.join("interactive-must-not-run.txt");
+        let scheduled_command = format!("printf scheduled-auto > {}", scheduled_output.display());
+        let scheduled_call = ToolCall {
+            id: "scheduled-forced-ask".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({"command": scheduled_command}).to_string(),
+            },
+        };
+        let first_call_started = Arc::new(Notify::new());
+        let release_first_call = Arc::new(Notify::new());
+        let provider = Arc::new(ScriptedScheduleProvider {
+            responses: Mutex::new(VecDeque::from([
+                vec![
+                    Ok(LLMChunk::ToolCalls(vec![scheduled_call])),
+                    Ok(LLMChunk::Done),
+                ],
+                vec![
+                    Ok(LLMChunk::Token("scheduled complete".to_string())),
+                    Ok(LLMChunk::Done),
+                ],
+            ])),
+            calls: AtomicUsize::new(0),
+            first_call_started: first_call_started.clone(),
+            release_first_call: release_first_call.clone(),
+        });
+        let state = crate::AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            Config::default(),
+            provider,
+        )
+        .await
+        .expect("AppState with scripted provider");
+        let permission_config = state
+            .permission_checker
+            .permission_config()
+            .expect("config-backed permission checker");
+        permission_config.set_ask_rules(["Bash(printf *)".to_string()]);
+        assert_eq!(permission_config.mode(), PermissionMode::Default);
+
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Scheduled Auto",
+                None,
+                workspace.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let mut caller = Session::new("scheduled-auto-caller", "model");
+        caller.kind = SessionKind::Root;
+        caller.set_project_id_meta(project.id.to_string());
+        state.storage.save_session(&caller).await.unwrap();
+        let tool = ScheduleTasksTool::new(
+            state.schedule_store.clone(),
+            state.schedule_manager.clone(),
+            state.session_store.clone(),
+            state.storage.clone(),
+            state.config.clone(),
+            state.project_store.clone(),
+            state.workspace_resolver.clone(),
+        );
+        tool.invoke(
+            json!({
+                "action": "create",
+                "name": "forced ask scheduled auto",
+                "trigger": {"type": "interval", "every_seconds": 3600},
+                "enabled": false,
+                "run_config": {
+                    "auto_execute": true,
+                    "model": "test-model",
+                    "task_message": "run the scripted forced-ask command"
+                }
+            }),
+            context(&caller.id),
+        )
+        .await
+        .expect("create auto schedule");
+        let schedule = state.schedule_store.list_schedules().await.remove(0);
+        let mut account_feed = state.account_sink.subscribe();
+        tool.invoke(
+            json!({"action": "run_now", "schedule_id": schedule.id}),
+            context(&caller.id),
+        )
+        .await
+        .expect("enqueue scheduled auto run");
+        tokio::time::timeout(Duration::from_secs(5), first_call_started.notified())
+            .await
+            .expect("scheduled agent reaches scripted provider");
+
+        // The interactive request runs while the scheduled loop is active and
+        // uses the exact same process-global Default permission config.
+        let interactive = Session::new("concurrent-interactive", "model");
+        permission_config.register_session_workspace(
+            interactive.id.clone(),
+            workspace.to_string_lossy().to_string(),
+        );
+        let interactive_command = format!("printf interactive > {}", interactive_output.display());
+        let interactive_call = ToolCall {
+            id: "interactive-forced-ask".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({"command": interactive_command}).to_string(),
+            },
+        };
+        let (interactive_event_tx, mut interactive_event_rx) = tokio::sync::mpsc::channel(8);
+        let interactive_result = state
+            .tools_for(crate::tools::ToolSurface::Root)
+            .execute_with_context(
+                &interactive_call,
+                ToolExecutionContext {
+                    session_id: Some(&interactive.id),
+                    tool_call_id: &interactive_call.id,
+                    event_tx: Some(&interactive_event_tx),
+                    available_tool_schemas: None,
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                },
+            )
+            .await
+            .expect("interactive forced ask returns an approval pause");
+        assert_eq!(
+            interactive_result.display_preference.as_deref(),
+            Some("request_permissions")
+        );
+        let interactive_event =
+            tokio::time::timeout(Duration::from_secs(2), interactive_event_rx.recv())
+                .await
+                .expect("interactive approval event arrives before timeout");
+        assert!(matches!(
+            interactive_event,
+            Some(bamboo_agent_core::AgentEvent::ToolApprovalRequested { .. })
+        ));
+        assert!(!interactive_output.exists());
+        assert_eq!(permission_config.mode(), PermissionMode::Default);
+
+        release_first_call.notify_one();
+        let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(record) = state
+                    .schedule_store
+                    .list_run_records_for_schedule(&schedule.id)
+                    .await
+                    .into_iter()
+                    .find(|record| record.status.is_terminal())
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduled auto run reaches terminal state");
+        assert_eq!(terminal.status, bamboo_domain::ScheduleRunStatus::Success);
+        assert_eq!(
+            std::fs::read_to_string(&scheduled_output).unwrap(),
+            "scheduled-auto"
+        );
+        let scheduled_session_id = terminal.session_id.expect("scheduled session id");
+
+        let mut scheduled_approval_seen = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let change = account_feed.recv().await.expect("account event");
+                if change.session_id.as_deref() != Some(scheduled_session_id.as_str()) {
+                    continue;
+                }
+                if matches!(
+                    &change.event,
+                    bamboo_agent_core::AgentEvent::ToolApprovalRequested { .. }
+                ) {
+                    scheduled_approval_seen = true;
+                }
+                if matches!(
+                    &change.event,
+                    bamboo_agent_core::AgentEvent::Complete { .. }
+                        | bamboo_agent_core::AgentEvent::Cancelled { .. }
+                        | bamboo_agent_core::AgentEvent::Error { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("scheduled terminal event reaches account feed");
+        assert!(
+            !scheduled_approval_seen,
+            "scheduled Auto must never emit a human approval request"
+        );
+        let saved = state
+            .storage
+            .load_session(&scheduled_session_id)
+            .await
+            .unwrap()
+            .expect("saved scheduled session");
+        assert!(saved.pending_question.is_none());
+        let runtime = saved.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(runtime.permission_mode, SessionPermissionMode::Auto);
+        assert!(runtime.bypass_permissions);
+        assert!(runtime.no_human_approver);
     }
 
     #[tokio::test]
@@ -829,6 +1080,59 @@ mod tests {
             .await
             .expect("load fired session")
             .expect("fired session");
+        let runtime = fired_session
+            .agent_runtime_state
+            .as_ref()
+            .expect("scheduled session permission posture");
+        assert_eq!(runtime.permission_mode, SessionPermissionMode::Auto);
+        assert!(
+            runtime.bypass_permissions,
+            "legacy Auto compatibility mirror"
+        );
+        assert!(runtime.no_human_approver);
+        let initial_audit =
+            PermissionAuditSnapshot::from_metadata(&fired_session.metadata).unwrap();
+        assert_eq!(
+            initial_audit.resolution.requested,
+            SessionPermissionMode::Auto
+        );
+        assert_eq!(initial_audit.resolution.effective, PermissionMode::Auto);
+
+        let permission_config = state
+            .permission_checker
+            .permission_config()
+            .expect("config-backed permission checker");
+        assert_eq!(permission_config.mode(), PermissionMode::Default);
+        let interactive = Session::new("concurrent-interactive", "model");
+        assert_eq!(
+            ToolExecutionSessionFlags::from_session_and_configured_mode(
+                &interactive,
+                permission_config.mode(),
+            ),
+            ToolExecutionSessionFlags::default()
+        );
+
+        let mut first_runtime_carry_forward = fired_session.clone();
+        first_runtime_carry_forward.set_last_run_status("carried-forward");
+        state
+            .persistence
+            .merge_save_runtime(&mut first_runtime_carry_forward)
+            .await
+            .expect("ordinary runtime carry-forward");
+        let carried = state
+            .storage
+            .load_session(&fired.id)
+            .await
+            .expect("load carried scheduled session")
+            .expect("carried scheduled session");
+        let carried_runtime = carried.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(carried_runtime.permission_mode, SessionPermissionMode::Auto);
+        assert!(carried_runtime.bypass_permissions);
+        assert!(carried_runtime.no_human_approver);
+        assert_eq!(
+            PermissionAuditSnapshot::from_metadata(&carried.metadata).unwrap(),
+            initial_audit
+        );
         assert_eq!(
             bamboo_engine::project_context::ProjectContextResolver::project_id_from_session(
                 &fired_session
