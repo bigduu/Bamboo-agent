@@ -3707,6 +3707,26 @@ mod tests {
         Ok(skill_dir)
     }
 
+    async fn wait_for_watcher_quiescence(store: &SkillStore) {
+        let stable_for = super::SKILL_WATCH_MAX_BATCH + super::SKILL_WATCH_QUIET_PERIOD;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut last_activity = store.watcher_activity();
+            let mut last_change = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let activity = store.watcher_activity();
+                if activity != last_activity {
+                    last_activity = activity;
+                    last_change = tokio::time::Instant::now();
+                } else if last_change.elapsed() >= stable_for {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("skill watcher should become quiescent");
+    }
+
     fn orchestration_yaml(id: &str, revision: u64) -> String {
         format!(
             "workflow_schema: 1\nid: {id}\nrevision: {revision}\ninput_schema:\n  type: object\n  properties:\n    path:\n      type: string\n  required: [path]\n  additionalProperties: false\nsteps:\n  - id: inspect\n    type: tool\n    tool: read_file\n    args:\n      path:\n        from: args\n        pointer: /path\n    capabilities: [read]\n    output_schema:\n      type: object\n      additionalProperties: true\nplan:\n  type: step\n  step: inspect\nbudgets:\n  max_concurrency: 1\n  max_agents: 0\n  max_steps: 4\n  max_retries: 1\n  max_nesting_depth: 2\n  wall_time_ms: 10000\n"
@@ -5015,7 +5035,7 @@ Use this skill for testing.
         .await
         .expect("recursive plugin watch should publish removal");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        wait_for_watcher_quiescence(manager.store()).await;
         let stable_revision = manager.store().skill_catalog_snapshot().await.revision;
         let stable_activity = manager.store().watcher_activity();
         fs::create_dir_all(directory.path().join("data/sessions"))
@@ -5024,7 +5044,7 @@ Use this skill for testing.
         fs::write(directory.path().join("data/sessions/unrelated.json"), "{}")
             .await
             .expect("unrelated write");
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        wait_for_watcher_quiescence(manager.store()).await;
         assert_eq!(
             manager.store().skill_catalog_snapshot().await.revision,
             stable_revision,
@@ -5091,7 +5111,7 @@ Use this skill for testing.
         // so it can notice `.bamboo` being recreated. A project build tree may
         // therefore yield a cheap top-level event, but its recursive churn must
         // never cause catalog reloads or event-path canonicalization.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        wait_for_watcher_quiescence(store.as_ref()).await;
         let stable_revision = store.workflow_catalog_snapshot().await.revision;
         let stable_activity = store.watcher_activity();
         let build_output = workspace.join("target/debug/build/example/out");
@@ -5103,7 +5123,7 @@ Use this skill for testing.
                 .await
                 .expect("project build artifact");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        wait_for_watcher_quiescence(store.as_ref()).await;
         let after_churn = store.watcher_activity();
         assert_eq!(
             store.workflow_catalog_snapshot().await.revision,
