@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, MsgId, ReplyBody};
 use chrono::Utc;
@@ -27,6 +28,18 @@ pub enum Handled {
     Ack,
     /// Leave the message unacked (it will be redelivered on the next subscribe).
     Leave,
+}
+
+/// Why a mailbox worker stopped serving normally.
+///
+/// Transport errors still return [`crate::BrokerError`]. These reasons cover
+/// clean lifecycle exits and are intentionally separate from durable child
+/// business state (#592): callers use them for process/pool observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeExitReason {
+    ShutdownRequested,
+    ConnectionClosed,
+    IdleTimeout,
 }
 
 /// Connect as `me`, subscribe, and serve inbound messages with `handler` until
@@ -85,11 +98,29 @@ where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Handled> + Send + 'static,
 {
+    serve_mailbox_full_with_lifecycle(endpoint, me, token, handler, shutdown, tls_config, None)
+        .await
+        .map(|_| ())
+}
+
+async fn serve_mailbox_full_with_lifecycle<H, Fut>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    handler: H,
+    shutdown: CancellationToken,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    idle_timeout: Option<Duration>,
+) -> BrokerResult<ServeExitReason>
+where
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
+{
     let mut client =
         BrokerClient::connect_with_tls(endpoint, me.clone(), token, clone_tls_config(&tls_config))
             .await?;
     client.subscribe().await?;
-    serve_loop(&mut client, &me, handler, shutdown).await
+    serve_loop_with_idle_timeout(&mut client, &me, handler, shutdown, idle_timeout).await
 }
 
 /// [`BrokerClient::connect_with_tls`] takes an owned `ClientConfig` (it hands
@@ -144,6 +175,25 @@ where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Handled> + Send + 'static,
 {
+    serve_loop_with_idle_timeout(client, me, handler, shutdown, None)
+        .await
+        .map(|_| ())
+}
+
+/// Serve with an optional true-idle deadline and report the clean exit reason.
+/// The deadline is disabled while any handler is in flight and restarts only
+/// after the final completion is delivered and acked.
+pub async fn serve_loop_with_idle_timeout<H, Fut>(
+    client: &mut BrokerClient,
+    me: &AgentRef,
+    handler: H,
+    shutdown: CancellationToken,
+    idle_timeout: Option<Duration>,
+) -> BrokerResult<ServeExitReason>
+where
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
+{
     let handler = Arc::new(handler);
 
     // Live cancel tokens for runs still in flight, keyed by the run (message) id.
@@ -160,6 +210,10 @@ where
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Completion>();
 
     let mut messages_open = true;
+    let mut exit_reason = ServeExitReason::ConnectionClosed;
+    let idle_sleep =
+        tokio::time::sleep(idle_timeout.unwrap_or_else(|| Duration::from_secs(365 * 24 * 60 * 60)));
+    tokio::pin!(idle_sleep);
     loop {
         tokio::select! {
             // `biased`: drain finished handlers (arm A) ahead of a graceful-stop
@@ -196,6 +250,11 @@ where
                     Handled::Ack => client.ack(id).await?,
                     Handled::Leave => {}
                 }
+                if let Some(timeout) = idle_timeout {
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + timeout);
+                }
             }
             // B. Graceful stop requested (#49): stop pulling new work — mirrors
             //    the `Message(None)` connection-closed case below — but leave
@@ -206,6 +265,7 @@ where
             _ = shutdown.cancelled(), if messages_open => {
                 tracing::info!("broker worker: graceful shutdown requested — draining in-flight work");
                 messages_open = false;
+                exit_reason = ServeExitReason::ShutdownRequested;
             }
             // C. The next inbound message OR out-of-band cancel (demuxed over one
             //    `&mut client` borrow). A cancel trips the matching in-flight run's
@@ -214,6 +274,11 @@ where
             //    only the (cheap) wire I/O stays serialized through this owner. #45.
             event = client.next_message_or_cancel(), if messages_open => match event {
                 crate::client::ServeEvent::Cancel(Some(cid)) => {
+                    if let Some(timeout) = idle_timeout {
+                        idle_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + timeout);
+                    }
                     if let Some(tok) = inflight.get(&cid) {
                         tok.cancel();
                     }
@@ -221,8 +286,16 @@ where
                 // Cancel lane closed (reader gone). The message lane is fed by the
                 // same reader, so treat it as connection teardown: stop pulling and
                 // drain the in-flight handlers through arm A.
-                crate::client::ServeEvent::Cancel(None) => messages_open = false,
+                crate::client::ServeEvent::Cancel(None) => {
+                    messages_open = false;
+                    exit_reason = ServeExitReason::ConnectionClosed;
+                }
                 crate::client::ServeEvent::Message(Some(msg)) => {
+                    if let Some(timeout) = idle_timeout {
+                        idle_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + timeout);
+                    }
                     let id = msg.id.clone();
                     let reply_to = msg.from.session_id.clone();
                     let token = CancellationToken::new();
@@ -238,8 +311,22 @@ where
                 }
                 // Connection closed: stop pulling new messages and let the remaining
                 // in-flight handlers drain through arm A before we exit.
-                crate::client::ServeEvent::Message(None) => messages_open = false,
+                crate::client::ServeEvent::Message(None) => {
+                    messages_open = false;
+                    exit_reason = ServeExitReason::ConnectionClosed;
+                }
             },
+            _ = &mut idle_sleep,
+                if messages_open && inflight.is_empty() && idle_timeout.is_some() =>
+            {
+                tracing::info!(
+                    idle_timeout_ms = idle_timeout.expect("guarded").as_millis() as u64,
+                    shutdown_reason = "idle_timeout",
+                    "broker worker reached its true-idle deadline"
+                );
+                messages_open = false;
+                exit_reason = ServeExitReason::IdleTimeout;
+            }
         }
 
         // Once the message stream is closed, exit as soon as every in-flight run
@@ -248,7 +335,7 @@ where
             break;
         }
     }
-    Ok(())
+    Ok(exit_reason)
 }
 
 /// Convenience wrapper for `serve_mailbox` whose `Arc`-shared handler answers
@@ -343,6 +430,42 @@ pub async fn serve_executor_full<E>(
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
 {
+    serve_executor_full_with_lifecycle(endpoint, me, token, executor, shutdown, tls_config, None)
+        .await
+        .map(|_| ())
+}
+
+/// Serve an executor with bounded true-idle lifetime and return a structured
+/// clean shutdown reason. In-flight work disables the idle deadline; explicit
+/// shutdown keeps the existing graceful-drain behavior.
+pub async fn serve_executor_with_lifecycle<E>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    executor: Arc<E>,
+    shutdown: CancellationToken,
+    idle_timeout: Option<Duration>,
+) -> BrokerResult<ServeExitReason>
+where
+    E: bamboo_subagent::ChildExecutor + ?Sized,
+{
+    serve_executor_full_with_lifecycle(endpoint, me, token, executor, shutdown, None, idle_timeout)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_executor_full_with_lifecycle<E>(
+    endpoint: &str,
+    me: AgentRef,
+    token: &str,
+    executor: Arc<E>,
+    shutdown: CancellationToken,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    idle_timeout: Option<Duration>,
+) -> BrokerResult<ServeExitReason>
+where
+    E: bamboo_subagent::ChildExecutor + ?Sized,
+{
     let context: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
     // Per-run coordination so a SEPARATE Steer / ApprovalReply mailbox message can
@@ -354,7 +477,7 @@ where
     let token_owned = token.to_string();
     let me_owned = me.clone();
     let tls_owned = tls_config.clone();
-    serve_mailbox_full(
+    serve_mailbox_full_with_lifecycle(
         endpoint,
         me,
         token,
@@ -424,6 +547,7 @@ where
         },
         shutdown,
         tls_config,
+        idle_timeout,
     )
     .await
 }
@@ -766,6 +890,24 @@ mod tests {
             let _ = server.serve(listener).await;
         });
         (format!("ws://{addr}"), dir)
+    }
+
+    async fn start_single_connection() -> (
+        String,
+        tempfile::TempDir,
+        Arc<BrokerCore>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()));
+        let server = Arc::new(BrokerServer::new(core.clone(), TOKEN));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connection = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("worker connection");
+            let _ = server.handle_conn(stream).await;
+        });
+        (format!("ws://{addr}"), dir, core, connection)
     }
 
     fn ask(from: &str, q: &str) -> InboxMessage {
@@ -1382,6 +1524,156 @@ mod tests {
         assert!(events >= 1, "expected streamed events, got {events}");
         let oc: bamboo_subagent::ChildOutcome = serde_json::from_value(outcome.body).unwrap();
         assert_eq!(oc.result.as_deref(), Some("echo: ping pong"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reports_idle_timeout_for_unused_worker() {
+        let (endpoint, _dir) = start().await;
+        let reason = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_executor_with_lifecycle(
+                &endpoint,
+                AgentRef {
+                    session_id: "idle-timeout-worker".into(),
+                    role: None,
+                },
+                TOKEN,
+                Arc::new(bamboo_subagent::EchoExecutor),
+                CancellationToken::new(),
+                Some(Duration::from_millis(100)),
+            ),
+        )
+        .await
+        .expect("idle worker exits within the bound")
+        .expect("clean lifecycle exit");
+        assert_eq!(reason, ServeExitReason::IdleTimeout);
+    }
+
+    #[tokio::test]
+    async fn true_idle_timeout_never_fires_while_a_run_is_in_flight() {
+        use bamboo_subagent::{ChildExecutor, ChildOutcome, EventSink, RunSpec, SteerInbox};
+
+        struct BlockingEcho {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl ChildExecutor for BlockingEcho {
+            async fn run(
+                &self,
+                spec: RunSpec,
+                _events: EventSink,
+                _steer: SteerInbox,
+                _cancel: CancellationToken,
+            ) -> ChildOutcome {
+                self.started.notify_one();
+                self.release.notified().await;
+                ChildOutcome::completed(format!("echo: {}", spec.assignment))
+            }
+        }
+
+        let (endpoint, _dir) = start().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_endpoint = endpoint.clone();
+        let worker = tokio::spawn({
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                serve_executor_with_lifecycle(
+                    &worker_endpoint,
+                    AgentRef {
+                        session_id: "busy-worker".into(),
+                        role: None,
+                    },
+                    TOKEN,
+                    Arc::new(BlockingEcho { started, release }),
+                    CancellationToken::new(),
+                    Some(Duration::from_millis(100)),
+                )
+                .await
+            }
+        });
+        let mut parent = BrokerClient::connect(
+            &endpoint,
+            AgentRef {
+                session_id: "busy-parent".into(),
+                role: None,
+            },
+            TOKEN,
+        )
+        .await
+        .unwrap();
+        parent.subscribe().await.unwrap();
+        let request = ask("busy-parent", "held open");
+        let request_id = request.id.clone();
+        parent.deliver("busy-worker", request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("run starts");
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !worker.is_finished(),
+            "true-idle must be disabled while a handler is in flight"
+        );
+        release.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(2), parent.next_message())
+            .await
+            .expect("reply arrives")
+            .expect("reply present");
+        assert_eq!(reply.correlation_id, Some(request_id));
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("worker exits after becoming idle")
+            .expect("worker task")
+            .expect("clean lifecycle exit");
+        assert_eq!(reason, ServeExitReason::IdleTimeout);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reports_connection_closed_separately_from_idle() {
+        let (endpoint, _dir, core, connection) = start_single_connection().await;
+        let worker_endpoint = endpoint.clone();
+        let worker = tokio::spawn(async move {
+            serve_executor_with_lifecycle(
+                &worker_endpoint,
+                AgentRef {
+                    session_id: "disconnect-worker".into(),
+                    role: Some("disconnect-test".into()),
+                },
+                TOKEN,
+                Arc::new(bamboo_subagent::EchoExecutor),
+                CancellationToken::new(),
+                Some(Duration::from_secs(30)),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if core
+                    .connected_by_role("disconnect-test")
+                    .await
+                    .iter()
+                    .any(|id| id == "disconnect-worker")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker subscribes");
+
+        connection.abort();
+        let reason = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("worker observes connection loss")
+            .expect("worker task")
+            .expect("clean connection-close lifecycle exit");
+        assert_eq!(reason, ServeExitReason::ConnectionClosed);
     }
 
     /// Graceful shutdown (#49): tripping the shutdown token while an Ask is in

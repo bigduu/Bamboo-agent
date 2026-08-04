@@ -42,7 +42,7 @@ pub use proto::{
 };
 pub use provision::{
     BusEndpoint, Capabilities, ChildIdentity, ExecutorSpec, Limits, McpProxyConfig, ModelRefSpec,
-    Placement, ProvisionSpec, ScopedCredential, SecretsEnvelope, PROVISION_VERSION,
+    Placement, ProvisionSpec, ScopedCredential, SecretsEnvelope, WorkerOwner, PROVISION_VERSION,
 };
 pub use store::{
     ChildEntry, ChildFields, ChildStatus, ChildrenIndex, MetaExtractor, ProjectIndex, ProjectKey,

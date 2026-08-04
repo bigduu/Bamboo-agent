@@ -653,6 +653,206 @@ fn preserve_catalog_entry_revisions(
 type ProjectWorkspaceStoreKey = (String, PathBuf, Option<PathBuf>);
 type SharedSkillStore = std::sync::Arc<SkillStore>;
 
+const SKILL_WATCH_CHANNEL_CAPACITY: usize = 256;
+const SKILL_WATCH_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(120);
+const SKILL_WATCH_MAX_BATCH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Access events (and access-time metadata updates) cannot change a catalog.
+/// Reject them in the native callback so a Linux reload's own file reads do
+/// not refill the queue and trigger an unbounded reload feedback loop.
+fn watcher_event_can_change_catalog(event: &notify::Event) -> bool {
+    !matches!(
+        event.kind,
+        notify::EventKind::Access(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                notify::event::MetadataKind::AccessTime
+            ))
+    )
+}
+
+#[derive(Debug, Default)]
+struct SkillWatcherCounters {
+    received_events: AtomicU64,
+    rejected_events: AtomicU64,
+    coalesced_events: AtomicU64,
+    overflowed_events: AtomicU64,
+    reloads: AtomicU64,
+    reload_failures: AtomicU64,
+    registration_canonicalizations: AtomicU64,
+    watch_rebinds: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SkillWatcherActivity {
+    pub received_events: u64,
+    pub rejected_events: u64,
+    pub coalesced_events: u64,
+    pub overflowed_events: u64,
+    pub reloads: u64,
+    pub reload_failures: u64,
+    pub registration_canonicalizations: u64,
+    pub watch_rebinds: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct ProcessedWatcherBatch {
+    paths: Vec<PathBuf>,
+    relevant: bool,
+}
+
+impl SkillWatcherCounters {
+    fn snapshot(&self) -> SkillWatcherActivity {
+        SkillWatcherActivity {
+            received_events: self.received_events.load(Ordering::Relaxed),
+            rejected_events: self.rejected_events.load(Ordering::Relaxed),
+            coalesced_events: self.coalesced_events.load(Ordering::Relaxed),
+            overflowed_events: self.overflowed_events.load(Ordering::Relaxed),
+            reloads: self.reloads.load(Ordering::Relaxed),
+            reload_failures: self.reload_failures.load(Ordering::Relaxed),
+            registration_canonicalizations: self
+                .registration_canonicalizations
+                .load(Ordering::Relaxed),
+            watch_rebinds: self.watch_rebinds.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CatalogWatchPlan {
+    /// Actual catalog roots. Existing roots are watched recursively; missing
+    /// roots are discovered through a shallow nearest-existing ancestor.
+    catalog_roots: Vec<PathBuf>,
+    /// Structural containers whose creation makes a missing catalog root
+    /// reachable (for example `<workspace>/.bamboo`). Exact-match only.
+    container_paths: Vec<PathBuf>,
+}
+
+impl CatalogWatchPlan {
+    fn is_relevant(&self, path: &Path) -> bool {
+        self.catalog_roots
+            .iter()
+            .any(|root| path == root || path.starts_with(root))
+            || self
+                .container_paths
+                .iter()
+                .any(|container| path == container)
+    }
+}
+
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !path.is_absolute() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if current.is_dir() {
+            return Some(current.to_path_buf());
+        }
+        candidate = current.parent();
+    }
+    None
+}
+
+fn desired_catalog_watch_registrations(
+    plan: &CatalogWatchPlan,
+) -> BTreeMap<PathBuf, notify::RecursiveMode> {
+    fn insert(
+        registrations: &mut BTreeMap<PathBuf, notify::RecursiveMode>,
+        path: PathBuf,
+        mode: notify::RecursiveMode,
+    ) {
+        registrations
+            .entry(path)
+            .and_modify(|existing| {
+                if matches!(mode, notify::RecursiveMode::Recursive) {
+                    *existing = mode;
+                }
+            })
+            .or_insert(mode);
+    }
+
+    let mut desired = BTreeMap::new();
+    for root in &plan.catalog_roots {
+        if root.is_dir() {
+            insert(&mut desired, root.clone(), notify::RecursiveMode::Recursive);
+        }
+        if let Some(parent) = root.parent().and_then(nearest_existing_directory) {
+            insert(&mut desired, parent, notify::RecursiveMode::NonRecursive);
+        }
+    }
+    for container in &plan.container_paths {
+        if container.is_dir() {
+            insert(
+                &mut desired,
+                container.clone(),
+                notify::RecursiveMode::NonRecursive,
+            );
+        }
+        if let Some(parent) = container.parent().and_then(nearest_existing_directory) {
+            insert(&mut desired, parent, notify::RecursiveMode::NonRecursive);
+        }
+    }
+    desired
+}
+
+fn sync_catalog_watch_registrations<W: notify::Watcher>(
+    watcher: &mut W,
+    plan: &CatalogWatchPlan,
+    registered: &mut HashMap<PathBuf, notify::RecursiveMode>,
+    counters: &SkillWatcherCounters,
+) {
+    let desired = desired_catalog_watch_registrations(plan);
+    let stale: Vec<_> = registered
+        .iter()
+        .filter(|(path, mode)| desired.get(*path) != Some(*mode))
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in stale {
+        let _ = watcher.unwatch(&path);
+        registered.remove(&path);
+        counters.watch_rebinds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    for (path, mode) in desired {
+        if registered.get(&path) == Some(&mode) {
+            continue;
+        }
+        match watcher.watch(&path, mode) {
+            Ok(()) => {
+                registered.insert(path.clone(), mode);
+                counters.watch_rebinds.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    watch_root = %path.display(),
+                    recursive = matches!(mode, notify::RecursiveMode::Recursive),
+                    "skill watcher registration bound"
+                );
+            }
+            Err(error) => tracing::warn!(
+                "Failed to watch skill catalog root {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
 pub struct SkillStore {
     store_token: u64,
     /// Serializes publication and observation of the correlated snapshot maps below.
@@ -678,6 +878,9 @@ pub struct SkillStore {
     pinned_activations: RwLock<PinnedSkillActivations>,
     next_revision: AtomicU64,
     watcher_started: AtomicBool,
+    watcher_counters: Arc<SkillWatcherCounters>,
+    #[cfg(test)]
+    processed_watcher_batches: tokio::sync::broadcast::Sender<ProcessedWatcherBatch>,
     catalog_events: tokio::sync::broadcast::Sender<WorkflowCatalogEvent>,
     reload_lock: tokio::sync::Mutex<()>,
     mode_stores: RwLock<HashMap<String, std::sync::Arc<SkillStore>>>,
@@ -919,6 +1122,8 @@ impl SkillStore {
         workspace_overlay_dir: Option<PathBuf>,
     ) -> Self {
         let (catalog_events, _) = tokio::sync::broadcast::channel(128);
+        #[cfg(test)]
+        let (processed_watcher_batches, _) = tokio::sync::broadcast::channel(128);
         Self {
             store_token: NEXT_SKILL_STORE_TOKEN.fetch_add(1, Ordering::Relaxed),
             snapshot_publish_lock: RwLock::new(()),
@@ -933,6 +1138,9 @@ impl SkillStore {
             pinned_activations: RwLock::new(PinnedSkillActivations::default()),
             next_revision: AtomicU64::new(1),
             watcher_started: AtomicBool::new(false),
+            watcher_counters: Arc::new(SkillWatcherCounters::default()),
+            #[cfg(test)]
+            processed_watcher_batches,
             catalog_events,
             reload_lock: tokio::sync::Mutex::new(()),
             mode_stores: RwLock::new(HashMap::new()),
@@ -2587,140 +2795,258 @@ impl SkillStore {
             .await)
     }
 
-    /// Roots watched for skill, workflow metadata, project, and plugin changes.
-    pub(crate) fn watch_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![self
-            .config
-            .skills_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.config.skills_dir.clone())];
-        if let Some(project_home) = self.project_home_dir.as_ref() {
-            roots.push(project_home.clone());
+    fn normalize_catalog_watch_root(&self, path: &Path) -> PathBuf {
+        let mut cursor = path.to_path_buf();
+        let mut missing = Vec::new();
+        loop {
+            if let Ok(mut canonical) = std::fs::canonicalize(&cursor) {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                self.watcher_counters
+                    .registration_canonicalizations
+                    .fetch_add(1, Ordering::Relaxed);
+                return canonical;
+            }
+            let Some(name) = cursor.file_name().map(|name| name.to_os_string()) else {
+                return lexical_normalize_path(path);
+            };
+            missing.push(name);
+            if !cursor.pop() {
+                return lexical_normalize_path(path);
+            }
+            if cursor.as_os_str().is_empty() {
+                cursor.push(".");
+            }
+        }
+    }
+
+    /// Catalog sources and structural containers, normalized once when the
+    /// native watcher is registered. Event filtering remains purely lexical.
+    fn catalog_watch_plan(&self) -> CatalogWatchPlan {
+        let mut raw_roots: BTreeSet<PathBuf> = self
+            .discovery_dirs_for_mode(None)
+            .into_iter()
+            .map(|source| source.dir)
+            .collect();
+        let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
+        raw_roots.insert(plugins_root);
+        if let Some(data_dir) = self.config.skills_dir.parent() {
+            raw_roots.insert(data_dir.join("workflows"));
         }
         if let Some(workspace) = self.workspace_overlay_dir.as_ref() {
-            roots.push(workspace.clone());
-        }
-        roots
-    }
-
-    fn is_catalog_watch_path(&self, path: &Path) -> bool {
-        fn normalized(path: &Path) -> std::borrow::Cow<'_, Path> {
-            std::fs::canonicalize(path)
-                .map(std::borrow::Cow::Owned)
-                .unwrap_or_else(|_| std::borrow::Cow::Borrowed(path))
-        }
-        fn starts_with(path: &Path, root: &Path) -> bool {
-            path.starts_with(root) || normalized(path).starts_with(normalized(root).as_ref())
+            raw_roots.insert(workspace.join(".bamboo").join("workflows"));
         }
 
-        if starts_with(path, &self.config.skills_dir) {
-            return true;
+        let mut raw_containers = BTreeSet::new();
+        if let Some(workspace) = self.workspace_overlay_dir.as_ref() {
+            raw_containers.insert(workspace.join(".bamboo"));
         }
-        if let Some(data_dir) = self.config.skills_dir.parent() {
-            if starts_with(path, &data_dir.join("workflows"))
-                || starts_with(path, &data_dir.join("plugins"))
-            {
-                return true;
-            }
-            let normalized_path = normalized(path);
-            let normalized_data = normalized(data_dir);
-            if normalized_path
-                .strip_prefix(normalized_data.as_ref())
-                .ok()
-                .is_some_and(|relative| {
-                    relative
-                        .components()
-                        .next()
-                        .and_then(|component| component.as_os_str().to_str())
-                        .is_some_and(|name| name.starts_with("skills-"))
-                })
-            {
-                return true;
+        if self.config.skills_dir == bamboo_config::paths::bamboo_dir().join("skills") {
+            if let Some(agents_skills) = bamboo_config::paths::agents_skills_dir() {
+                if let Some(agents_root) = agents_skills.parent() {
+                    raw_containers.insert(agents_root.to_path_buf());
+                }
             }
         }
-        let project_match = self.project_home_dir.as_ref().is_some_and(|project_home| {
-            let normalized_path = normalized(path);
-            let normalized_project = normalized(project_home);
-            let relative = normalized_path
-                .strip_prefix(normalized_project.as_ref())
-                .ok()
-                .and_then(|relative| relative.components().next())
-                .and_then(|component| component.as_os_str().to_str());
-            relative.is_some_and(|name| name == "skills" || name.starts_with("skills-"))
-        });
-        project_match
-            || self
-                .workspace_overlay_dir
-                .as_ref()
-                .is_some_and(|workspace| {
-                    normalized(path)
-                        .strip_prefix(normalized(&workspace.join(".bamboo")).as_ref())
-                        .ok()
-                        .and_then(|relative| relative.components().next())
-                        .and_then(|component| component.as_os_str().to_str())
-                        .is_some_and(|name| {
-                            name == "skills" || name.starts_with("skills-") || name == "workflows"
-                        })
-                })
+
+        let catalog_roots: Vec<_> = raw_roots
+            .into_iter()
+            .map(|path| self.normalize_catalog_watch_root(&path))
+            .collect();
+        let mut container_paths: BTreeSet<_> = raw_containers
+            .into_iter()
+            .map(|path| self.normalize_catalog_watch_root(&path))
+            .collect();
+        // If more than the catalog leaf is missing (for example an as-yet
+        // uncreated project home), retain each missing intermediate directory
+        // as an exact structural trigger. This advances the shallow watch one
+        // level at a time without treating unrelated siblings as catalog churn.
+        for root in &catalog_roots {
+            let mut parent = root.parent();
+            while let Some(path) = parent {
+                if path.is_dir() {
+                    break;
+                }
+                container_paths.insert(path.to_path_buf());
+                parent = path.parent();
+            }
+        }
+
+        CatalogWatchPlan {
+            catalog_roots,
+            container_paths: container_paths.into_iter().collect(),
+        }
     }
 
-    /// Start an OS-backed recursive watcher. Debouncing coalesces editor atomic-renames and
-    /// avoids reloading once per low-level self-write event.
+    #[cfg(test)]
+    pub(crate) fn watcher_activity(&self) -> SkillWatcherActivity {
+        self.watcher_counters.snapshot()
+    }
+
+    #[cfg(test)]
+    fn subscribe_processed_watcher_batches(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ProcessedWatcherBatch> {
+        self.processed_watcher_batches.subscribe()
+    }
+
+    /// Start an OS-backed catalog watcher. Existing catalog directories alone
+    /// are recursive; their nearest existing parents are shallow anchors that
+    /// let missing roots be created and dynamically rebound. Raw events enter a
+    /// bounded queue, coalesce to a trailing-edge batch, and only then undergo
+    /// lexical filtering. Queue overflow marks the batch dirty and forces a
+    /// conservative full reload rather than losing a relevant change.
     pub fn start_live_reload(self: &std::sync::Arc<Self>) {
-        use notify::{RecursiveMode, Watcher};
         if self.watcher_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let weak = std::sync::Arc::downgrade(self);
-        let roots = self.watch_roots();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut watcher = match notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
-        }) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                tracing::warn!("Failed to start skill catalog watcher: {error}");
-                self.watcher_started.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-        for root in roots {
-            if root.exists() {
-                if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive) {
-                    tracing::warn!(
-                        "Failed to watch skill catalog root {}: {error}",
-                        root.display()
-                    );
+        let plan = self.catalog_watch_plan();
+        let counters = self.watcher_counters.clone();
+        let overflow_dirty = Arc::new(AtomicBool::new(false));
+        let callback_overflow = overflow_dirty.clone();
+        let callback_counters = counters.clone();
+        #[cfg(test)]
+        let processed_watcher_batches = self.processed_watcher_batches.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(
+            SKILL_WATCH_CHANNEL_CAPACITY,
+        );
+        let mut watcher =
+            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                callback_counters
+                    .received_events
+                    .fetch_add(1, Ordering::Relaxed);
+                if event
+                    .as_ref()
+                    .is_ok_and(|event| !watcher_event_can_change_catalog(event))
+                {
+                    callback_counters
+                        .rejected_events
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
-            }
-        }
+                match sender.try_send(event) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        callback_counters
+                            .overflowed_events
+                            .fetch_add(1, Ordering::Relaxed);
+                        callback_overflow.store(true, Ordering::Release);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    tracing::warn!("Failed to start skill catalog watcher: {error}");
+                    self.watcher_started.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+        let mut registered = HashMap::new();
+        sync_catalog_watch_registrations(&mut watcher, &plan, &mut registered, counters.as_ref());
+
         tokio::spawn(async move {
             // Keep the native watcher alive for exactly as long as the receiver loop.
-            let _watcher = watcher;
-            while let Some(event) = receiver.recv().await {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error) => {
-                        tracing::warn!("Skill catalog watcher error: {error}");
-                        continue;
+            let mut watcher = watcher;
+            while let Some(first) = receiver.recv().await {
+                let mut batch = vec![first];
+                let quiet = tokio::time::sleep(SKILL_WATCH_QUIET_PERIOD);
+                let maximum = tokio::time::sleep(SKILL_WATCH_MAX_BATCH);
+                tokio::pin!(quiet);
+                tokio::pin!(maximum);
+                loop {
+                    tokio::select! {
+                        maybe = receiver.recv() => match maybe {
+                            Some(event) => {
+                                batch.push(event);
+                                quiet.as_mut().reset(
+                                    tokio::time::Instant::now() + SKILL_WATCH_QUIET_PERIOD,
+                                );
+                            }
+                            None => break,
+                        },
+                        _ = &mut quiet => break,
+                        _ = &mut maximum => break,
                     }
+                }
+
+                counters
+                    .coalesced_events
+                    .fetch_add(batch.len().saturating_sub(1) as u64, Ordering::Relaxed);
+                let overflowed = overflow_dirty.swap(false, Ordering::AcqRel);
+                let mut relevant = overflowed;
+                let mut rejected = 0u64;
+                #[cfg(test)]
+                let mut observed_paths = Vec::new();
+                for event in batch {
+                    match event {
+                        Ok(event) => {
+                            let event_relevant = event
+                                .paths
+                                .iter()
+                                .any(|path| plan.is_relevant(&lexical_normalize_path(path)));
+                            #[cfg(test)]
+                            observed_paths.extend(
+                                event.paths.iter().map(|path| lexical_normalize_path(path)),
+                            );
+                            relevant |= event_relevant;
+                            rejected += u64::from(!event_relevant);
+                        }
+                        Err(error) => {
+                            // A backend error can mean the native watcher lost
+                            // events or a registration. Reconcile registrations
+                            // and publish one conservative full snapshot.
+                            relevant = true;
+                            tracing::warn!("Skill catalog watcher error: {error}");
+                        }
+                    }
+                }
+                #[cfg(test)]
+                let processed_batch = ProcessedWatcherBatch {
+                    paths: observed_paths,
+                    relevant,
                 };
+                counters
+                    .rejected_events
+                    .fetch_add(rejected, Ordering::Relaxed);
+
                 let Some(store) = weak.upgrade() else { break };
-                if !event
-                    .paths
-                    .iter()
-                    .any(|path| store.is_catalog_watch_path(path))
-                {
-                    continue;
+                if relevant {
+                    sync_catalog_watch_registrations(
+                        &mut watcher,
+                        &plan,
+                        &mut registered,
+                        counters.as_ref(),
+                    );
+                    match store.reload().await {
+                        Ok(_) => {
+                            counters.reloads.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            counters.reload_failures.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!("Live skill catalog reload failed: {error}");
+                        }
+                    }
                 }
-                // Editors commonly emit write + chmod + rename. Publish one snapshot after the
-                // filesystem has settled, while still reacting promptly to external changes.
-                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                while receiver.try_recv().is_ok() {}
-                if let Err(error) = store.reload().await {
-                    tracing::warn!("Live skill catalog reload failed: {error}");
-                }
+                #[cfg(test)]
+                let _ = processed_watcher_batches.send(processed_batch);
+                let activity = counters.snapshot();
+                tracing::debug!(
+                    store_token = store.store_token,
+                    watcher_received = activity.received_events,
+                    watcher_rejected = activity.rejected_events,
+                    watcher_coalesced = activity.coalesced_events,
+                    watcher_overflowed = activity.overflowed_events,
+                    watcher_reloads = activity.reloads,
+                    watcher_reload_failures = activity.reload_failures,
+                    watcher_registration_canonicalizations =
+                        activity.registration_canonicalizations,
+                    watcher_event_canonicalizations = 0,
+                    watcher_rebinds = activity.watch_rebinds,
+                    "skill watcher batch processed"
+                );
             }
         });
     }
@@ -3399,7 +3725,10 @@ mod tests {
 
     use tokio::fs;
 
-    use super::SkillStore;
+    use super::{
+        lexical_normalize_path, ProcessedWatcherBatch, RetainedResourceBudget, SkillSnapshotLimits,
+        SkillStore,
+    };
     use crate::store::builtin::{
         load_builtin_skill_bundles, BuiltinSkillBundle, WORKFLOW_BUILTINS,
     };
@@ -3437,6 +3766,75 @@ mod tests {
         );
         fs::write(&skill_file, content).await?;
         Ok(skill_dir)
+    }
+
+    async fn wait_for_processed_watcher_path(
+        batches: &mut tokio::sync::broadcast::Receiver<ProcessedWatcherBatch>,
+        expected_path: &Path,
+    ) -> ProcessedWatcherBatch {
+        let mut existing_prefix = expected_path;
+        let mut missing_suffix = Vec::new();
+        while !existing_prefix.exists() {
+            if let Some(name) = existing_prefix.file_name() {
+                missing_suffix.push(name.to_os_string());
+            }
+            existing_prefix = existing_prefix
+                .parent()
+                .expect("a watcher test path should have an existing ancestor");
+        }
+        let mut expected_path = std::fs::canonicalize(existing_prefix)
+            .unwrap_or_else(|_| lexical_normalize_path(existing_prefix));
+        for component in missing_suffix.iter().rev() {
+            expected_path.push(component);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match batches.recv().await {
+                    Ok(batch)
+                        if batch.paths.iter().any(|path| {
+                            path == &expected_path
+                                || path.starts_with(&expected_path)
+                                || expected_path.starts_with(path)
+                        }) =>
+                    {
+                        return batch;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        panic!("skill watcher test observation lagged by {skipped} batches")
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("skill watcher stopped before processing the expected path")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "skill watcher should process the filesystem event touching {}",
+                expected_path.display()
+            )
+        })
+    }
+
+    #[test]
+    fn watcher_event_filter_rejects_non_mutating_access() {
+        use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
+        use notify::{Event, EventKind};
+
+        let access = Event::new(EventKind::Access(AccessKind::Read));
+        let access_time = Event::new(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime,
+        )));
+        let content = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)));
+
+        assert!(!super::watcher_event_can_change_catalog(&access));
+        assert!(!super::watcher_event_can_change_catalog(&access_time));
+        assert!(super::watcher_event_can_change_catalog(&content));
+        assert!(super::watcher_event_can_change_catalog(&Event::new(
+            EventKind::Any
+        )));
     }
 
     fn orchestration_yaml(id: &str, revision: u64) -> String {
@@ -4596,7 +4994,74 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn os_watcher_hot_discovers_plugin_installed_after_startup() {
+    async fn watcher_plan_accepts_catalog_sources_and_rejects_workspace_build_churn() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(directory.path()).expect("canonical tempdir");
+        let skills_dir = root.join("data/skills");
+        let project_home = root.join("project-home");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&skills_dir).await.expect("skills dir");
+        fs::create_dir_all(&project_home)
+            .await
+            .expect("project home");
+        fs::create_dir_all(&workspace).await.expect("workspace");
+        let store = SkillStore::new_with_resource_scope(
+            SkillStoreConfig {
+                skills_dir: skills_dir.clone(),
+                active_mode: Some("code".to_string()),
+                ..Default::default()
+            },
+            Arc::new(RetainedResourceBudget::default()),
+            SkillSnapshotLimits::default(),
+            Some(project_home.clone()),
+            Some(workspace.clone()),
+        );
+        let plan = store.catalog_watch_plan();
+        let relevant = [
+            skills_dir.join("global/SKILL.md"),
+            root.join("data/skills-code/mode/SKILL.md"),
+            root.join("data/plugins/example/skills/plugin/SKILL.md"),
+            root.join("data/workflows/legacy.md"),
+            project_home.join("skills/project/SKILL.md"),
+            project_home.join("skills-code/project-mode/SKILL.md"),
+            workspace.join(".bamboo/skills/local/SKILL.md"),
+            workspace.join(".bamboo/skills-code/local-mode/SKILL.md"),
+            workspace.join(".bamboo/workflows/legacy.md"),
+            workspace.join(".bamboo"),
+        ];
+        for path in relevant {
+            assert!(
+                plan.is_relevant(&lexical_normalize_path(&path)),
+                "catalog path should be relevant: {}",
+                path.display()
+            );
+        }
+
+        let irrelevant = [
+            root.join("data/sessions/session.json"),
+            project_home.join("memory/index.json"),
+            workspace.join("target/debug/build/output"),
+            workspace.join("node_modules/pkg/index.js"),
+        ];
+        let canonicalizations = store.watcher_activity().registration_canonicalizations;
+        for _ in 0..10 {
+            for path in &irrelevant {
+                assert!(
+                    !plan.is_relevant(&lexical_normalize_path(path)),
+                    "non-catalog churn should be rejected: {}",
+                    path.display()
+                );
+            }
+        }
+        assert_eq!(
+            store.watcher_activity().registration_canonicalizations,
+            canonicalizations,
+            "event classification must remain lexical and filesystem-free"
+        );
+    }
+
+    #[tokio::test]
+    async fn os_watcher_rebinds_missing_plugin_root_and_tracks_add_edit_remove() {
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("data/skills");
         fs::create_dir_all(&skills_dir).await.expect("skills dir");
@@ -4606,10 +5071,13 @@ Use this skill for testing.
         });
         manager.initialize().await.expect("initialize manager");
         let initial_revision = manager.store().skill_catalog_snapshot().await.revision;
+        let initial_activity = manager.store().watcher_activity();
         let plugin_skills = directory.path().join("data/plugins/late/skills");
-        write_skill(&plugin_skills, "hot-plugin", "hot discovered", "Prompt")
+        let mut added_batches = manager.store().subscribe_processed_watcher_batches();
+        let plugin_root = write_skill(&plugin_skills, "hot-plugin", "hot discovered", "Prompt")
             .await
             .expect("plugin skill");
+        let plugin_file = plugin_root.join("SKILL.md");
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4627,20 +5095,76 @@ Use this skill for testing.
         })
         .await
         .expect("watcher should publish plugin without explicit refresh");
+        assert!(
+            wait_for_processed_watcher_path(&mut added_batches, &plugin_file)
+                .await
+                .relevant,
+            "a plugin skill addition must be classified as catalog-relevant"
+        );
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let stable_revision = manager.store().skill_catalog_snapshot().await.revision;
-        fs::create_dir_all(directory.path().join("data/sessions"))
+        let added_activity = manager.store().watcher_activity();
+        assert!(added_activity.reloads > initial_activity.reloads);
+        assert!(
+            added_activity.watch_rebinds > initial_activity.watch_rebinds,
+            "creating the missing plugins root must bind its recursive watch"
+        );
+        let mut edited_batches = manager.store().subscribe_processed_watcher_batches();
+        fs::write(
+            &plugin_file,
+            "---\nname: hot-plugin\ndescription: hot edited\n---\nEdited prompt\n",
+        )
+        .await
+        .expect("edit plugin skill");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if manager
+                    .store()
+                    .skill_catalog_snapshot()
+                    .await
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == "hot-plugin" && entry.description == "hot edited")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("recursive plugin watch should publish an edit");
+        assert!(
+            wait_for_processed_watcher_path(&mut edited_batches, &plugin_file)
+                .await
+                .relevant,
+            "a plugin skill edit must be classified as catalog-relevant"
+        );
+
+        let mut removed_batches = manager.store().subscribe_processed_watcher_batches();
+        fs::remove_dir_all(&plugin_root)
             .await
-            .expect("sessions dir");
-        fs::write(directory.path().join("data/sessions/unrelated.json"), "{}")
-            .await
-            .expect("unrelated write");
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(
-            manager.store().skill_catalog_snapshot().await.revision,
-            stable_revision,
-            "unrelated data-dir writes must not publish a catalog revision"
+            .expect("remove plugin skill");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !manager
+                    .store()
+                    .skill_catalog_snapshot()
+                    .await
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == "hot-plugin")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .expect("recursive plugin watch should publish removal");
+        assert!(
+            wait_for_processed_watcher_path(&mut removed_batches, &plugin_root)
+                .await
+                .relevant,
+            "a plugin skill removal must be classified as catalog-relevant"
         );
     }
 
@@ -4663,13 +5187,12 @@ Use this skill for testing.
         let initial_revision = store.workflow_catalog_snapshot().await.revision;
 
         let workflows = workspace.join(".bamboo/workflows");
+        let workflow_file = workflows.join("live-review.md");
+        let mut workflow_batches = store.subscribe_processed_watcher_batches();
         fs::create_dir_all(&workflows).await.expect("workflow dir");
-        fs::write(
-            workflows.join("live-review.md"),
-            "Review the live change.\n",
-        )
-        .await
-        .expect("legacy workflow");
+        fs::write(&workflow_file, "Review the live change.\n")
+            .await
+            .expect("legacy workflow");
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4688,6 +5211,51 @@ Use this skill for testing.
         })
         .await
         .expect("watcher should publish workspace legacy workflow");
+        assert!(
+            wait_for_processed_watcher_path(&mut workflow_batches, &workflow_file)
+                .await
+                .relevant,
+            "a workspace workflow write must be classified as catalog-relevant"
+        );
+
+        // The watcher keeps only a shallow registration on the workspace root
+        // so it can notice `.bamboo` being recreated. A project build tree may
+        // therefore yield a cheap top-level event, but its recursive churn must
+        // never cause catalog reloads or event-path canonicalization.
+        let stable_revision = store.workflow_catalog_snapshot().await.revision;
+        let stable_activity = store.watcher_activity();
+        let build_output = workspace.join("target/debug/build/example/out");
+        let build_root = workspace.join("target");
+        let mut build_batches = store.subscribe_processed_watcher_batches();
+        fs::create_dir_all(&build_output)
+            .await
+            .expect("project build output");
+        for index in 0..64 {
+            fs::write(build_output.join(format!("artifact-{index}")), b"churn")
+                .await
+                .expect("project build artifact");
+        }
+        assert!(
+            !wait_for_processed_watcher_path(&mut build_batches, &build_root)
+                .await
+                .relevant,
+            "a project build directory must be classified as catalog-irrelevant"
+        );
+        let after_churn = store.watcher_activity();
+        assert_eq!(
+            store.workflow_catalog_snapshot().await.revision,
+            stable_revision,
+            "project build churn must not publish a catalog revision"
+        );
+        assert_eq!(
+            after_churn.reloads, stable_activity.reloads,
+            "project build churn must not reload the catalog"
+        );
+        assert_eq!(
+            after_churn.registration_canonicalizations,
+            stable_activity.registration_canonicalizations,
+            "project build churn must not canonicalize delivered event paths"
+        );
     }
 
     #[tokio::test]
