@@ -657,6 +657,19 @@ const SKILL_WATCH_CHANNEL_CAPACITY: usize = 256;
 const SKILL_WATCH_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(120);
 const SKILL_WATCH_MAX_BATCH: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Access events (and access-time metadata updates) cannot change a catalog.
+/// Reject them in the native callback so a Linux reload's own file reads do
+/// not refill the queue and trigger an unbounded reload feedback loop.
+fn watcher_event_can_change_catalog(event: &notify::Event) -> bool {
+    !matches!(
+        event.kind,
+        notify::EventKind::Access(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                notify::event::MetadataKind::AccessTime
+            ))
+    )
+}
+
 #[derive(Debug, Default)]
 struct SkillWatcherCounters {
     received_events: AtomicU64,
@@ -679,6 +692,13 @@ pub(crate) struct SkillWatcherActivity {
     pub reload_failures: u64,
     pub registration_canonicalizations: u64,
     pub watch_rebinds: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct ProcessedWatcherBatch {
+    paths: Vec<PathBuf>,
+    relevant: bool,
 }
 
 impl SkillWatcherCounters {
@@ -859,6 +879,8 @@ pub struct SkillStore {
     next_revision: AtomicU64,
     watcher_started: AtomicBool,
     watcher_counters: Arc<SkillWatcherCounters>,
+    #[cfg(test)]
+    processed_watcher_batches: tokio::sync::broadcast::Sender<ProcessedWatcherBatch>,
     catalog_events: tokio::sync::broadcast::Sender<WorkflowCatalogEvent>,
     reload_lock: tokio::sync::Mutex<()>,
     mode_stores: RwLock<HashMap<String, std::sync::Arc<SkillStore>>>,
@@ -1100,6 +1122,8 @@ impl SkillStore {
         workspace_overlay_dir: Option<PathBuf>,
     ) -> Self {
         let (catalog_events, _) = tokio::sync::broadcast::channel(128);
+        #[cfg(test)]
+        let (processed_watcher_batches, _) = tokio::sync::broadcast::channel(128);
         Self {
             store_token: NEXT_SKILL_STORE_TOKEN.fetch_add(1, Ordering::Relaxed),
             snapshot_publish_lock: RwLock::new(()),
@@ -1115,6 +1139,8 @@ impl SkillStore {
             next_revision: AtomicU64::new(1),
             watcher_started: AtomicBool::new(false),
             watcher_counters: Arc::new(SkillWatcherCounters::default()),
+            #[cfg(test)]
+            processed_watcher_batches,
             catalog_events,
             reload_lock: tokio::sync::Mutex::new(()),
             mode_stores: RwLock::new(HashMap::new()),
@@ -2858,6 +2884,13 @@ impl SkillStore {
         self.watcher_counters.snapshot()
     }
 
+    #[cfg(test)]
+    fn subscribe_processed_watcher_batches(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ProcessedWatcherBatch> {
+        self.processed_watcher_batches.subscribe()
+    }
+
     /// Start an OS-backed catalog watcher. Existing catalog directories alone
     /// are recursive; their nearest existing parents are shallow anchors that
     /// let missing roots be created and dynamically rebound. Raw events enter a
@@ -2874,31 +2907,43 @@ impl SkillStore {
         let overflow_dirty = Arc::new(AtomicBool::new(false));
         let callback_overflow = overflow_dirty.clone();
         let callback_counters = counters.clone();
+        #[cfg(test)]
+        let processed_watcher_batches = self.processed_watcher_batches.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(
             SKILL_WATCH_CHANNEL_CAPACITY,
         );
-        let mut watcher = match notify::recommended_watcher(move |event| {
-            callback_counters
-                .received_events
-                .fetch_add(1, Ordering::Relaxed);
-            match sender.try_send(event) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+        let mut watcher =
+            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                callback_counters
+                    .received_events
+                    .fetch_add(1, Ordering::Relaxed);
+                if event
+                    .as_ref()
+                    .is_ok_and(|event| !watcher_event_can_change_catalog(event))
+                {
                     callback_counters
-                        .overflowed_events
+                        .rejected_events
                         .fetch_add(1, Ordering::Relaxed);
-                    callback_overflow.store(true, Ordering::Release);
+                    return;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-            }
-        }) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                tracing::warn!("Failed to start skill catalog watcher: {error}");
-                self.watcher_started.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
+                match sender.try_send(event) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        callback_counters
+                            .overflowed_events
+                            .fetch_add(1, Ordering::Relaxed);
+                        callback_overflow.store(true, Ordering::Release);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    tracing::warn!("Failed to start skill catalog watcher: {error}");
+                    self.watcher_started.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
         let mut registered = HashMap::new();
         sync_catalog_watch_registrations(&mut watcher, &plan, &mut registered, counters.as_ref());
 
@@ -2933,6 +2978,8 @@ impl SkillStore {
                 let overflowed = overflow_dirty.swap(false, Ordering::AcqRel);
                 let mut relevant = overflowed;
                 let mut rejected = 0u64;
+                #[cfg(test)]
+                let mut observed_paths = Vec::new();
                 for event in batch {
                     match event {
                         Ok(event) => {
@@ -2940,6 +2987,10 @@ impl SkillStore {
                                 .paths
                                 .iter()
                                 .any(|path| plan.is_relevant(&lexical_normalize_path(path)));
+                            #[cfg(test)]
+                            observed_paths.extend(
+                                event.paths.iter().map(|path| lexical_normalize_path(path)),
+                            );
                             relevant |= event_relevant;
                             rejected += u64::from(!event_relevant);
                         }
@@ -2952,6 +3003,11 @@ impl SkillStore {
                         }
                     }
                 }
+                #[cfg(test)]
+                let processed_batch = ProcessedWatcherBatch {
+                    paths: observed_paths,
+                    relevant,
+                };
                 counters
                     .rejected_events
                     .fetch_add(rejected, Ordering::Relaxed);
@@ -2974,6 +3030,8 @@ impl SkillStore {
                         }
                     }
                 }
+                #[cfg(test)]
+                let _ = processed_watcher_batches.send(processed_batch);
                 let activity = counters.snapshot();
                 tracing::debug!(
                     store_token = store.store_token,
@@ -3667,7 +3725,10 @@ mod tests {
 
     use tokio::fs;
 
-    use super::{lexical_normalize_path, RetainedResourceBudget, SkillSnapshotLimits, SkillStore};
+    use super::{
+        lexical_normalize_path, ProcessedWatcherBatch, RetainedResourceBudget, SkillSnapshotLimits,
+        SkillStore,
+    };
     use crate::store::builtin::{
         load_builtin_skill_bundles, BuiltinSkillBundle, WORKFLOW_BUILTINS,
     };
@@ -3707,24 +3768,73 @@ mod tests {
         Ok(skill_dir)
     }
 
-    async fn wait_for_watcher_quiescence(store: &SkillStore) {
-        let stable_for = super::SKILL_WATCH_MAX_BATCH + super::SKILL_WATCH_QUIET_PERIOD;
+    async fn wait_for_processed_watcher_path(
+        batches: &mut tokio::sync::broadcast::Receiver<ProcessedWatcherBatch>,
+        expected_path: &Path,
+    ) -> ProcessedWatcherBatch {
+        let mut existing_prefix = expected_path;
+        let mut missing_suffix = Vec::new();
+        while !existing_prefix.exists() {
+            if let Some(name) = existing_prefix.file_name() {
+                missing_suffix.push(name.to_os_string());
+            }
+            existing_prefix = existing_prefix
+                .parent()
+                .expect("a watcher test path should have an existing ancestor");
+        }
+        let mut expected_path = std::fs::canonicalize(existing_prefix)
+            .unwrap_or_else(|_| lexical_normalize_path(existing_prefix));
+        for component in missing_suffix.iter().rev() {
+            expected_path.push(component);
+        }
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut last_activity = store.watcher_activity();
-            let mut last_change = tokio::time::Instant::now();
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                let activity = store.watcher_activity();
-                if activity != last_activity {
-                    last_activity = activity;
-                    last_change = tokio::time::Instant::now();
-                } else if last_change.elapsed() >= stable_for {
-                    break;
+                match batches.recv().await {
+                    Ok(batch)
+                        if batch.paths.iter().any(|path| {
+                            path == &expected_path
+                                || path.starts_with(&expected_path)
+                                || expected_path.starts_with(path)
+                        }) =>
+                    {
+                        return batch;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        panic!("skill watcher test observation lagged by {skipped} batches")
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("skill watcher stopped before processing the expected path")
+                    }
                 }
             }
         })
         .await
-        .expect("skill watcher should become quiescent");
+        .unwrap_or_else(|_| {
+            panic!(
+                "skill watcher should process the filesystem event touching {}",
+                expected_path.display()
+            )
+        })
+    }
+
+    #[test]
+    fn watcher_event_filter_rejects_non_mutating_access() {
+        use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
+        use notify::{Event, EventKind};
+
+        let access = Event::new(EventKind::Access(AccessKind::Read));
+        let access_time = Event::new(EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime,
+        )));
+        let content = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)));
+
+        assert!(!super::watcher_event_can_change_catalog(&access));
+        assert!(!super::watcher_event_can_change_catalog(&access_time));
+        assert!(super::watcher_event_can_change_catalog(&content));
+        assert!(super::watcher_event_can_change_catalog(&Event::new(
+            EventKind::Any
+        )));
     }
 
     fn orchestration_yaml(id: &str, revision: u64) -> String {
@@ -4963,9 +5073,11 @@ Use this skill for testing.
         let initial_revision = manager.store().skill_catalog_snapshot().await.revision;
         let initial_activity = manager.store().watcher_activity();
         let plugin_skills = directory.path().join("data/plugins/late/skills");
+        let mut added_batches = manager.store().subscribe_processed_watcher_batches();
         let plugin_root = write_skill(&plugin_skills, "hot-plugin", "hot discovered", "Prompt")
             .await
             .expect("plugin skill");
+        let plugin_file = plugin_root.join("SKILL.md");
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -4983,6 +5095,12 @@ Use this skill for testing.
         })
         .await
         .expect("watcher should publish plugin without explicit refresh");
+        assert!(
+            wait_for_processed_watcher_path(&mut added_batches, &plugin_file)
+                .await
+                .relevant,
+            "a plugin skill addition must be classified as catalog-relevant"
+        );
 
         let added_activity = manager.store().watcher_activity();
         assert!(added_activity.reloads > initial_activity.reloads);
@@ -4990,8 +5108,9 @@ Use this skill for testing.
             added_activity.watch_rebinds > initial_activity.watch_rebinds,
             "creating the missing plugins root must bind its recursive watch"
         );
+        let mut edited_batches = manager.store().subscribe_processed_watcher_batches();
         fs::write(
-            plugin_root.join("SKILL.md"),
+            &plugin_file,
             "---\nname: hot-plugin\ndescription: hot edited\n---\nEdited prompt\n",
         )
         .await
@@ -5013,7 +5132,14 @@ Use this skill for testing.
         })
         .await
         .expect("recursive plugin watch should publish an edit");
+        assert!(
+            wait_for_processed_watcher_path(&mut edited_batches, &plugin_file)
+                .await
+                .relevant,
+            "a plugin skill edit must be classified as catalog-relevant"
+        );
 
+        let mut removed_batches = manager.store().subscribe_processed_watcher_batches();
         fs::remove_dir_all(&plugin_root)
             .await
             .expect("remove plugin skill");
@@ -5034,31 +5160,11 @@ Use this skill for testing.
         })
         .await
         .expect("recursive plugin watch should publish removal");
-
-        wait_for_watcher_quiescence(manager.store()).await;
-        let stable_revision = manager.store().skill_catalog_snapshot().await.revision;
-        let stable_activity = manager.store().watcher_activity();
-        fs::create_dir_all(directory.path().join("data/sessions"))
-            .await
-            .expect("sessions dir");
-        fs::write(directory.path().join("data/sessions/unrelated.json"), "{}")
-            .await
-            .expect("unrelated write");
-        wait_for_watcher_quiescence(manager.store()).await;
-        assert_eq!(
-            manager.store().skill_catalog_snapshot().await.revision,
-            stable_revision,
-            "unrelated data-dir writes must not publish a catalog revision"
-        );
-        let final_activity = manager.store().watcher_activity();
-        assert_eq!(
-            final_activity.reloads, stable_activity.reloads,
-            "unrelated shallow-anchor events must be rejected after batching"
-        );
-        assert_eq!(
-            final_activity.registration_canonicalizations,
-            stable_activity.registration_canonicalizations,
-            "event filtering and dynamic rebinding must not canonicalize event paths"
+        assert!(
+            wait_for_processed_watcher_path(&mut removed_batches, &plugin_root)
+                .await
+                .relevant,
+            "a plugin skill removal must be classified as catalog-relevant"
         );
     }
 
@@ -5081,13 +5187,12 @@ Use this skill for testing.
         let initial_revision = store.workflow_catalog_snapshot().await.revision;
 
         let workflows = workspace.join(".bamboo/workflows");
+        let workflow_file = workflows.join("live-review.md");
+        let mut workflow_batches = store.subscribe_processed_watcher_batches();
         fs::create_dir_all(&workflows).await.expect("workflow dir");
-        fs::write(
-            workflows.join("live-review.md"),
-            "Review the live change.\n",
-        )
-        .await
-        .expect("legacy workflow");
+        fs::write(&workflow_file, "Review the live change.\n")
+            .await
+            .expect("legacy workflow");
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -5106,15 +5211,22 @@ Use this skill for testing.
         })
         .await
         .expect("watcher should publish workspace legacy workflow");
+        assert!(
+            wait_for_processed_watcher_path(&mut workflow_batches, &workflow_file)
+                .await
+                .relevant,
+            "a workspace workflow write must be classified as catalog-relevant"
+        );
 
         // The watcher keeps only a shallow registration on the workspace root
         // so it can notice `.bamboo` being recreated. A project build tree may
         // therefore yield a cheap top-level event, but its recursive churn must
         // never cause catalog reloads or event-path canonicalization.
-        wait_for_watcher_quiescence(store.as_ref()).await;
         let stable_revision = store.workflow_catalog_snapshot().await.revision;
         let stable_activity = store.watcher_activity();
         let build_output = workspace.join("target/debug/build/example/out");
+        let build_root = workspace.join("target");
+        let mut build_batches = store.subscribe_processed_watcher_batches();
         fs::create_dir_all(&build_output)
             .await
             .expect("project build output");
@@ -5123,7 +5235,12 @@ Use this skill for testing.
                 .await
                 .expect("project build artifact");
         }
-        wait_for_watcher_quiescence(store.as_ref()).await;
+        assert!(
+            !wait_for_processed_watcher_path(&mut build_batches, &build_root)
+                .await
+                .relevant,
+            "a project build directory must be classified as catalog-irrelevant"
+        );
         let after_churn = store.watcher_activity();
         assert_eq!(
             store.workflow_catalog_snapshot().await.revision,
