@@ -115,7 +115,13 @@ pub struct FabricActionResult<T> {
     pub snapshot: FabricCommitSnapshot,
 }
 
-type FabricEventPublisher = Arc<dyn Fn(&ConfigSectionEvent) + Send + Sync>;
+type FabricEventPublisher = Arc<
+    dyn for<'a> Fn(
+            &'a ConfigSectionEvent,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 
 #[cfg(test)]
 type DeployBeforeFinalPersistTestHook = Box<dyn FnOnce(&Path) + Send + 'static>;
@@ -630,7 +636,7 @@ impl FabricDeployer {
             }
 
             if let (Some(event), Some(publish)) = (event.as_ref(), self.publish_event.as_ref()) {
-                publish(event);
+                publish(event).await;
             }
             if let Err(error) = committed_recovery {
                 return Err(FabricError::Committed(format!(
@@ -2039,7 +2045,10 @@ mod lifecycle_persistence_tests {
             .with_modular_persistence(
                 facade.clone(),
                 Arc::new(CredentialStore::open(data_dir.path())),
-                Arc::new(move |event| event_log.lock().unwrap().push(event.clone())),
+                Arc::new(move |event| {
+                    event_log.lock().unwrap().push(event.clone());
+                    Box::pin(std::future::ready(()))
+                }),
             ),
         );
         ModularFixture {
@@ -2252,7 +2261,10 @@ mod lifecycle_persistence_tests {
         .with_modular_persistence(
             facade.clone(),
             Arc::new(CredentialStore::open(data_dir.path())),
-            Arc::new(move |event| event_log.lock().unwrap().push(event.clone())),
+            Arc::new(move |event| {
+                event_log.lock().unwrap().push(event.clone());
+                Box::pin(std::future::ready(()))
+            }),
         );
 
         let credentials_path = data_dir.path().join("credentials.json");
@@ -4056,7 +4068,10 @@ mod health_check_tests {
             .with_modular_persistence(
                 facade.clone(),
                 Arc::new(CredentialStore::open(dir.path())),
-                Arc::new(move |event| event_log.lock().unwrap().push(event.clone())),
+                Arc::new(move |event| {
+                    event_log.lock().unwrap().push(event.clone());
+                    Box::pin(std::future::ready(()))
+                }),
             ),
         );
         ModularDeployerFixture {
@@ -4320,7 +4335,10 @@ mod health_check_tests {
             .with_modular_persistence(
                 replacement_facade.clone(),
                 Arc::new(CredentialStore::open(fixture.data_dir.path())),
-                Arc::new(move |event| replacement_event_log.lock().unwrap().push(event.clone())),
+                Arc::new(move |event| {
+                    replacement_event_log.lock().unwrap().push(event.clone());
+                    Box::pin(std::future::ready(()))
+                }),
             ),
         );
         let winner = replacement

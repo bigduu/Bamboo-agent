@@ -54,6 +54,41 @@ const TOKEN_USAGE_FILE: &str = "token-usage.jsonl";
 /// migration has completed, so it is skipped on subsequent boots.
 const RUNTIME_SIDECAR_MIGRATION_MARKER: &str = ".runtime_sidecar_migrated";
 const SESSION_LIFECYCLE_LOCK_FILE: &str = ".session-lifecycle.lock";
+const SESSION_INDEX_LOCK_FILE: &str = ".sessions-index.lock";
+
+struct SessionIndexFileGuard {
+    file: std::fs::File,
+}
+
+impl Drop for SessionIndexFileGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+async fn lock_index_file_exclusive_at(bamboo_home_dir: &Path) -> io::Result<SessionIndexFileGuard> {
+    let path = bamboo_home_dir.join(SESSION_INDEX_LOCK_FILE);
+    let file = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok::<_, io::Error>(file)
+    })
+    .await
+    .map_err(|error| other_io_error(format!("join session index lock task: {error}")))??;
+    Ok(SessionIndexFileGuard { file })
+}
+
+async fn persist_index_path_locked(index_path: &Path, index: &SessionsIndex) -> io::Result<()> {
+    let tmp = index_path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(index).map_err(|e| other_io_error(e.to_string()))?;
+    fs::write(&tmp, bytes).await?;
+    atomic_rename(&tmp, index_path).await
+}
 
 pub(crate) struct SessionLifecycleReadGuard {
     _process: OwnedRwLockReadGuard<()>,
@@ -274,6 +309,11 @@ pub struct SessionsIndex {
     pub version: u32,
     pub updated_at: DateTime<Utc>,
     pub sessions: HashMap<String, SessionIndexEntry>,
+    /// Durable crash-resume marker for an old/corrupt index rebuild. It lets a
+    /// second constructor join an in-progress rebuild without clearing entries
+    /// already recovered (or concurrently published by live session saves).
+    #[serde(default)]
+    rebuild_in_progress: bool,
 }
 
 impl SessionsIndex {
@@ -282,6 +322,7 @@ impl SessionsIndex {
             version: SESSIONS_INDEX_VERSION,
             updated_at: Utc::now(),
             sessions: HashMap::new(),
+            rebuild_in_progress: false,
         }
     }
 }
@@ -320,13 +361,19 @@ impl SessionStoreV2 {
         fs::create_dir_all(&sessions_dir).await?;
         search_index.init().await?;
 
+        // Index inspection and every decision that can publish, rename, or
+        // replace sessions.json share the same cross-process claim. In
+        // particular, a constructor that waited behind another process must
+        // re-read the now-current file instead of publishing a stale empty or
+        // corrupt-rebuild decision.
+        let index_file_claim = lock_index_file_exclusive_at(&bamboo_home_dir).await?;
+
         // A corrupt index must not be boot-fatal: back it up and rebuild from
         // the on-disk session tree after construction. Only a *corrupt* file
         // triggers this; a *missing* one keeps the fresh-empty-index path.
         let mut needs_rebuild = false;
-        let index = if index_path.exists() {
-            let raw = fs::read_to_string(&index_path).await?;
-            match serde_json::from_str::<SessionsIndex>(&raw) {
+        let index = match fs::read_to_string(&index_path).await {
+            Ok(raw) => match serde_json::from_str::<SessionsIndex>(&raw) {
                 Ok(index) if index.version >= SESSIONS_INDEX_VERSION => index,
                 Ok(index) => {
                     tracing::info!(
@@ -335,12 +382,20 @@ impl SessionStoreV2 {
                         SESSIONS_INDEX_VERSION,
                     );
                     needs_rebuild = true;
-                    let mut rebuilding = SessionsIndex::empty();
-                    // Keep an old-version marker on every incremental rebuild
-                    // persist. If the process crashes mid-scan, the next boot
-                    // must resume instead of accepting a partial current index.
-                    rebuilding.version = index.version.min(SESSIONS_INDEX_VERSION - 1);
-                    rebuilding
+                    if index.rebuild_in_progress {
+                        // Join/resume an existing rebuild without clearing
+                        // entries already recovered or added by live writers.
+                        index
+                    } else {
+                        let mut rebuilding = SessionsIndex::empty();
+                        // Publish the old-version marker while the inspection
+                        // claim is still held. Incremental rebuild writes keep
+                        // this marker so a crash forces the next boot to resume.
+                        rebuilding.version = index.version.min(SESSIONS_INDEX_VERSION - 1);
+                        rebuilding.rebuild_in_progress = true;
+                        persist_index_path_locked(&index_path, &rebuilding).await?;
+                        rebuilding
+                    }
                 }
                 Err(error) => {
                     // Best-effort backup so the corrupt bytes are preserved for
@@ -367,21 +422,30 @@ impl SessionStoreV2 {
                     needs_rebuild = true;
                     let mut rebuilding = SessionsIndex::empty();
                     rebuilding.version = 0;
+                    rebuilding.rebuild_in_progress = true;
+                    // The corrupt-read decision, backup, and replacement marker
+                    // are one claimed boundary. A waiting constructor re-reads
+                    // this marker instead of acting on stale corrupt bytes.
+                    persist_index_path_locked(&index_path, &rebuilding).await?;
                     rebuilding
                 }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let index = SessionsIndex::empty();
+                // Persist immediately so "index is mandatory" holds from boot.
+                // The missing-file decision and publish are indivisible with
+                // respect to every other constructor/index writer.
+                persist_index_path_locked(&index_path, &index).await?;
+                index
             }
-        } else {
-            let index = SessionsIndex::empty();
-            // Persist immediately so "index is mandatory" holds from boot.
-            let tmp = index_path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-            fs::write(
-                &tmp,
-                serde_json::to_vec_pretty(&index).map_err(|e| other_io_error(e.to_string()))?,
-            )
-            .await?;
-            atomic_rename(&tmp, &index_path).await?;
-            index
+            Err(error) => return Err(error),
         };
+
+        // Rebuild scanning and FTS work can be large. Release the global claim
+        // after the atomic marker decision; each incremental index mutation
+        // below takes only the ordinary short update_index claim and rebases
+        // from disk, preserving concurrent live writes.
+        drop(index_file_claim);
 
         let storage = Self {
             bamboo_home_dir,
@@ -413,8 +477,8 @@ impl SessionStoreV2 {
     /// [`Storage::load_session`]**, so recovered index entries reflect the
     /// freshest control-plane (a runtime-only save updates only the sidecar) and
     /// agree with the FTS index that [`Self::rebuild_search_index`] builds via
-    /// `load_session`. The result is folded back in via
-    /// [`Self::upsert_index_from_session`] with the same `rel_path`
+    /// `load_session`. The result is folded back in via the guarded,
+    /// no-regression index repair path with the same `rel_path`
     /// [`Self::save_session`] would compute — derived from the on-disk directory
     /// names (the physical location), which is what `abs_path_from_rel` + load
     /// rely on. A single unreadable/corrupt session is skipped with a warning,
@@ -456,14 +520,22 @@ impl SessionStoreV2 {
                 continue;
             };
 
-            // Recover the root session (if its session.json is present + valid).
-            if let Some(session) = Self::load_session_from_dir(&root_entry.path(), &root_id).await {
-                let rel_path = Self::root_rel_path(&root_id);
-                match self.upsert_index_from_session(&session, rel_path).await {
-                    Ok(()) => recovered += 1,
-                    Err(error) => {
-                        tracing::warn!("index rebuild: failed to index root {root_id}: {error}")
-                    }
+            // Re-probe and publish under the shared lifecycle boundary so a
+            // concurrent exclusive delete either completes before this read or
+            // removes the entry after this upsert; a late rebuild can never
+            // resurrect a deleted directory.
+            match self
+                .rebuild_index_entry_from_dir(
+                    &root_entry.path(),
+                    &root_id,
+                    Self::root_rel_path(&root_id),
+                )
+                .await
+            {
+                Ok(true) => recovered += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!("index rebuild: failed to index root {root_id}: {error}")
                 }
             }
 
@@ -499,15 +571,18 @@ impl SessionStoreV2 {
                 let Ok(child_id) = child_entry.file_name().into_string() else {
                     continue;
                 };
-                if let Some(session) =
-                    Self::load_session_from_dir(&child_entry.path(), &child_id).await
+                match self
+                    .rebuild_index_entry_from_dir(
+                        &child_entry.path(),
+                        &child_id,
+                        Self::child_rel_path(&root_id, &child_id),
+                    )
+                    .await
                 {
-                    let rel_path = Self::child_rel_path(&root_id, &child_id);
-                    match self.upsert_index_from_session(&session, rel_path).await {
-                        Ok(()) => recovered += 1,
-                        Err(error) => tracing::warn!(
-                            "index rebuild: failed to index child {child_id}: {error}"
-                        ),
+                    Ok(true) => recovered += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!("index rebuild: failed to index child {child_id}: {error}")
                     }
                 }
             }
@@ -520,6 +595,7 @@ impl SessionStoreV2 {
             // Publishing the current version is the commit point for a complete rebuild.
             // `persist_index_locked` writes a temp file and atomically renames it.
             index.version = SESSIONS_INDEX_VERSION;
+            index.rebuild_in_progress = false;
             Ok(())
         })
         .await?;
@@ -531,6 +607,21 @@ impl SessionStoreV2 {
             tracing::warn!("index rebuild: failed to rebuild search index: {error}");
         }
         Ok(())
+    }
+
+    async fn rebuild_index_entry_from_dir(
+        &self,
+        abs_dir: &Path,
+        session_id: &str,
+        rel_path: String,
+    ) -> io::Result<bool> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let Some(session) = Self::load_session_from_dir(abs_dir, session_id).await else {
+            return Ok(false);
+        };
+        self.repair_index_from_authoritative_session(&session, rel_path)
+            .await?;
+        Ok(true)
     }
 
     /// Load a session from a known on-disk directory during index rebuild,
@@ -599,6 +690,10 @@ impl SessionStoreV2 {
         .map_err(|error| other_io_error(format!("join session lifecycle lock task: {error}")))?
     }
 
+    async fn lock_index_file_exclusive(&self) -> io::Result<SessionIndexFileGuard> {
+        lock_index_file_exclusive_at(&self.bamboo_home_dir).await
+    }
+
     pub(crate) async fn lock_session_lifecycle_shared(
         &self,
     ) -> io::Result<SessionLifecycleReadGuard> {
@@ -662,24 +757,44 @@ impl SessionStoreV2 {
     }
 
     async fn persist_index_locked(&self, index: &SessionsIndex) -> io::Result<()> {
-        let tmp = self
-            .index_path
-            .with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-        let bytes = serde_json::to_vec_pretty(index).map_err(|e| other_io_error(e.to_string()))?;
-        fs::write(&tmp, bytes).await?;
-        atomic_rename(&tmp, &self.index_path).await?;
-        Ok(())
+        persist_index_path_locked(&self.index_path, index).await
     }
 
     async fn update_index<F, T>(&self, f: F) -> io::Result<T>
     where
         F: FnOnce(&mut SessionsIndex) -> io::Result<T>,
     {
-        let _guard = self.write_lock.lock().await;
-        let mut index = self.index.write().await;
+        let _process = self.write_lock.lock().await;
+        let _file = self.lock_index_file_exclusive().await?;
+        self.update_index_under_claim(f).await
+    }
+
+    async fn update_index_under_claim<F, T>(&self, f: F) -> io::Result<T>
+    where
+        F: FnOnce(&mut SessionsIndex) -> io::Result<T>,
+    {
+        let mut memory = self.index.write().await;
+        // Independent stores/processes have distinct in-memory snapshots. The
+        // fixed file claim makes disk the rebase point for every mutation so a
+        // stale writer cannot erase another process's just-published entries.
+        // Missing disk falls back to this process's old-version rebuild marker.
+        let mut index = match fs::read_to_string(&self.index_path).await {
+            Ok(raw) => match serde_json::from_str::<SessionsIndex>(&raw) {
+                Ok(index) => index,
+                Err(_) if memory.version < SESSIONS_INDEX_VERSION => memory.clone(),
+                Err(error) => {
+                    return Err(other_io_error(format!(
+                        "invalid sessions.json during locked update: {error}"
+                    )))
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => memory.clone(),
+            Err(error) => return Err(error),
+        };
         let out = f(&mut index)?;
         index.updated_at = Utc::now();
         self.persist_index_locked(&index).await?;
+        *memory = index;
         Ok(out)
     }
 
@@ -693,6 +808,70 @@ impl SessionStoreV2 {
     pub async fn get_index_entry(&self, session_id: &str) -> Option<SessionIndexEntry> {
         let index = self.index.read().await;
         index.sessions.get(session_id).cloned()
+    }
+
+    /// Recover a root session by its deterministic authoritative directory,
+    /// without trusting the rebuildable global index.
+    ///
+    /// Session-create idempotency uses this after an ambiguous commit: a crash
+    /// can happen after `session.json` is durable but before `sessions.json` is
+    /// published. When the authoritative file exists, this method loads it
+    /// directly (including the runtime sidecar overlay) and repairs the global
+    /// index before returning. FTS remains best-effort and is deliberately not
+    /// part of this recovery barrier.
+    pub async fn recover_root_session_from_disk(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(session_id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let Some(session) = self.load_authoritative_root_session(session_id).await? else {
+            return Ok(None);
+        };
+        self.repair_index_from_authoritative_session(&session, Self::root_rel_path(session_id))
+            .await?;
+        Ok(Some(session))
+    }
+
+    /// Strictly probe the deterministic root `session.json` without consulting
+    /// or mutating the rebuildable index. Missing is distinct from corrupt or
+    /// unreadable so an idempotent pending retry never overwrites damaged
+    /// authoritative data with the reserved UUID.
+    pub async fn probe_root_session_from_disk(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(session_id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        self.load_authoritative_root_session(session_id).await
+    }
+
+    async fn load_authoritative_root_session(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        let abs_dir = self.sessions_dir.join(session_id);
+        let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // Unlike best-effort global-index rebuild, operation recovery must not
+        // collapse an unreadable/corrupt authoritative result into "missing":
+        // doing so could turn a repairable failure into terminal 410 truth.
+        let main: Session = serde_json::from_str(&raw).map_err(|error| {
+            other_io_error(format!("invalid authoritative session.json: {error}"))
+        })?;
+        let sidecar =
+            Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), session_id).await?;
+        let mut session = overlay_runtime_sidecar(main, sidecar);
+        session.clear_stale_root_token_budget();
+        if session.id != session_id || session.kind != SessionKind::Root {
+            return Err(other_io_error(
+                "authoritative root session identity or kind mismatch",
+            ));
+        }
+        Ok(Some(session))
     }
 
     pub async fn resolve_rel_path(&self, session_id: &str) -> Option<String> {
@@ -883,6 +1062,25 @@ impl SessionStoreV2 {
         session: &Session,
         rel_path: String,
     ) -> io::Result<()> {
+        self.upsert_index_from_session_inner(session, rel_path, false)
+            .await
+    }
+
+    async fn repair_index_from_authoritative_session(
+        &self,
+        session: &Session,
+        rel_path: String,
+    ) -> io::Result<()> {
+        self.upsert_index_from_session_inner(session, rel_path, true)
+            .await
+    }
+
+    async fn upsert_index_from_session_inner(
+        &self,
+        session: &Session,
+        rel_path: String,
+        preserve_newer: bool,
+    ) -> io::Result<()> {
         let has_attachments = self.compute_has_attachments(&session.id).await;
         // Read the well-known runtime keys via the typed accessors, which prefer
         // `runtime_metadata` and fall back to the legacy `metadata` strings.
@@ -941,50 +1139,65 @@ impl SessionStoreV2 {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
-        self.update_index(|index| {
-            index.sessions.insert(
-                session.id.clone(),
-                SessionIndexEntry {
-                    id: session.id.clone(),
-                    kind: session.kind,
-                    rel_path,
-                    title: session.title.clone(),
-                    title_version: session.title_version,
-                    title_generated: session.title_generated,
-                    pinned: session.pinned,
-                    parent_session_id: session.parent_session_id.clone(),
-                    root_session_id: session.root_session_id.clone(),
-                    spawn_depth: session.spawn_depth,
-                    model: session.model.clone(),
-                    model_ref: session.model_ref.clone(),
-                    reasoning_effort: session.reasoning_effort,
-                    workspace_path,
-                    project_id,
-                    gold_config_json,
-                    created_by_schedule_id,
-                    schedule_run_id,
-                    created_at: session.created_at,
-                    updated_at: session.updated_at,
-                    last_activity_at: session.updated_at,
-                    message_count: session.messages.len(),
-                    has_attachments,
-                    has_pending_question: session.has_pending_question(),
-                    plan_mode,
-                    bypass_permissions,
-                    permission_mode,
-                    last_run_status,
-                    last_run_error,
-                    token_usage: session.token_usage.clone(),
-                    subagent_type,
-                    lifecycle,
-                    resident_name,
-                    placement,
-                },
-            );
+        let session_id = session.id.clone();
+        let entry = SessionIndexEntry {
+            id: session.id.clone(),
+            kind: session.kind,
+            rel_path,
+            title: session.title.clone(),
+            title_version: session.title_version,
+            title_generated: session.title_generated,
+            pinned: session.pinned,
+            parent_session_id: session.parent_session_id.clone(),
+            root_session_id: session.root_session_id.clone(),
+            spawn_depth: session.spawn_depth,
+            model: session.model.clone(),
+            model_ref: session.model_ref.clone(),
+            reasoning_effort: session.reasoning_effort,
+            workspace_path,
+            project_id,
+            gold_config_json,
+            created_by_schedule_id,
+            schedule_run_id,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            last_activity_at: session.updated_at,
+            message_count: session.messages.len(),
+            has_attachments,
+            has_pending_question: session.has_pending_question(),
+            plan_mode,
+            bypass_permissions,
+            permission_mode,
+            last_run_status,
+            last_run_error,
+            token_usage: session.token_usage.clone(),
+            subagent_type,
+            lifecycle,
+            resident_name,
+            placement,
+        };
+        self.update_index(move |index: &mut SessionsIndex| {
+            if preserve_newer {
+                if let Some(existing) = index.sessions.get_mut(&session_id) {
+                    if existing.updated_at > entry.updated_at {
+                        // A live process may already have published fresher
+                        // summary/control-plane fields than the authoritative
+                        // transcript snapshot being probed. Preserve those
+                        // fields while repairing canonical root identity/path.
+                        existing.id = entry.id.clone();
+                        existing.kind = entry.kind;
+                        existing.rel_path = entry.rel_path.clone();
+                        existing.parent_session_id = entry.parent_session_id.clone();
+                        existing.root_session_id = entry.root_session_id.clone();
+                        existing.spawn_depth = entry.spawn_depth;
+                        return Ok(());
+                    }
+                }
+            }
+            index.sessions.insert(session_id, entry);
             Ok(())
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn write_image_attachment(
@@ -1203,20 +1416,18 @@ impl SessionStoreV2 {
     /// - `bamboo_home_dir/sessions.json` (rewritten to empty index)
     pub async fn dev_reset(&self) -> io::Result<()> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _guard = self.write_lock.lock().await;
 
         // Remove the sessions directory entirely.
         let _ = fs::remove_dir_all(&self.sessions_dir).await;
         fs::create_dir_all(&self.sessions_dir).await?;
 
-        // Reset in-memory index and persist.
-        {
-            let mut index = self.index.write().await;
+        // Reset through the same cross-process rebase/publish boundary as every
+        // other index mutation; dev reset must not race a stale direct writer.
+        self.update_index(|index| {
             *index = SessionsIndex::empty();
-            self.persist_index_locked(&index).await?;
-        }
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     /// Delete a session. If the session is a root, deletes its entire directory (and all child sessions).
@@ -2201,6 +2412,56 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn fresh_constructor_waits_for_index_claim_then_reloads_published_index() -> io::Result<()>
+    {
+        // Prepare valid index bytes containing one entry without pre-populating
+        // the fresh target directory used by the race below.
+        let seed_dir = TempDir::new().map_err(io::Error::other)?;
+        let seed_store = SessionStoreV2::new(seed_dir.path().to_path_buf()).await?;
+        let seeded = Session::new("init-race-survivor", "test-model");
+        seed_store.save_session(&seeded).await?;
+        let seeded_index = fs::read(seed_dir.path().join("sessions.json")).await?;
+
+        let target_dir = TempDir::new().map_err(io::Error::other)?;
+        let target_home = target_dir.path().to_path_buf();
+        let claim = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(target_home.join(SESSION_INDEX_LOCK_FILE))?;
+        FileExt::lock_exclusive(&claim)?;
+
+        let contender_home = target_home.clone();
+        let mut contender = tokio::spawn(async move { SessionStoreV2::new(contender_home).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut contender)
+                .await
+                .is_err(),
+            "fresh initialization must inspect and publish only after acquiring the index claim"
+        );
+
+        // Simulate the process currently owning the claim publishing an index
+        // between the contender's start and its eventual inspection.
+        fs::write(target_home.join("sessions.json"), seeded_index).await?;
+        FileExt::unlock(&claim)?;
+
+        let storage = tokio::time::timeout(std::time::Duration::from_secs(2), contender)
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)??;
+        assert!(storage
+            .get_index_entry("init-race-survivor")
+            .await
+            .is_some());
+        let persisted: SessionsIndex =
+            serde_json::from_slice(&fs::read(target_home.join("sessions.json")).await?)
+                .map_err(io::Error::other)?;
+        assert!(persisted.sessions.contains_key("init-race-survivor"));
+        Ok(())
+    }
+
     // ── ⑤ Runtime sidecar migration ──────────────────────────────────────
 
     #[tokio::test]
@@ -2388,6 +2649,157 @@ mod tests {
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.model, session.model);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_root_session_repairs_missing_global_index_from_authoritative_file(
+    ) -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let session = Session::new("ambiguous-create", "test-model");
+        storage.save_session(&session).await?;
+
+        storage
+            .update_index(|index| {
+                index.sessions.remove(&session.id);
+                Ok(())
+            })
+            .await?;
+        assert!(storage.get_index_entry(&session.id).await.is_none());
+        assert!(
+            storage.load_session(&session.id).await?.is_none(),
+            "ordinary lookup trusts the missing rebuildable index"
+        );
+
+        let recovered = storage
+            .recover_root_session_from_disk(&session.id)
+            .await?
+            .expect("authoritative session.json must survive index loss");
+        assert_eq!(recovered.id, session.id);
+        assert!(storage.get_index_entry(&session.id).await.is_some());
+        assert!(storage.load_session(&session.id).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authoritative_recovery_repairs_path_without_regressing_newer_index_fields(
+    ) -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let session = Session::new("ambiguous-newer-index", "test-model");
+        storage.save_session(&session).await?;
+        let newer_at = session.updated_at + chrono::Duration::hours(1);
+        storage
+            .update_index(|index| {
+                let entry = index.sessions.get_mut(&session.id).unwrap();
+                entry.title = "newer-live-title".to_string();
+                entry.updated_at = newer_at;
+                entry.rel_path = "sessions/wrong-root".to_string();
+                Ok(())
+            })
+            .await?;
+
+        storage
+            .recover_root_session_from_disk(&session.id)
+            .await?
+            .expect("authoritative root remains available");
+        let repaired = storage.get_index_entry(&session.id).await.unwrap();
+        assert_eq!(repaired.rel_path, format!("sessions/{}", session.id));
+        assert_eq!(repaired.title, "newer-live-title");
+        assert_eq!(repaired.updated_at, newer_at);
+        assert_eq!(repaired.kind, SessionKind::Root);
+        assert_eq!(repaired.root_session_id, session.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_entry_waits_for_delete_and_does_not_resurrect_removed_session(
+    ) -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let storage =
+            std::sync::Arc::new(SessionStoreV2::new(temp_dir.path().to_path_buf()).await?);
+        let session = Session::new("rebuild-delete-race", "test-model");
+        storage.save_session(&session).await?;
+        let abs_dir = storage.sessions_dir.join(&session.id);
+        let rel_path = SessionStoreV2::root_rel_path(&session.id);
+
+        let delete_claim = storage.lock_session_lifecycle_exclusive().await?;
+        let rebuilding = std::sync::Arc::clone(&storage);
+        let session_id = session.id.clone();
+        let mut late_rebuild = tokio::spawn(async move {
+            rebuilding
+                .rebuild_index_entry_from_dir(&abs_dir, &session_id, rel_path)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut late_rebuild)
+                .await
+                .is_err(),
+            "rebuild probe must wait behind the exclusive delete lifecycle claim"
+        );
+
+        fs::remove_dir_all(storage.sessions_dir.join(&session.id)).await?;
+        storage
+            .update_index(|index| {
+                index.sessions.remove(&session.id);
+                Ok(())
+            })
+            .await?;
+        drop(delete_claim);
+
+        assert!(!late_rebuild.await.map_err(io::Error::other)??);
+        assert!(storage.get_index_entry(&session.id).await.is_none());
+        let persisted: SessionsIndex =
+            serde_json::from_slice(&fs::read(storage.index_path()).await?)
+                .map_err(io::Error::other)?;
+        assert!(!persisted.sessions.contains_key(&session.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_root_session_does_not_treat_corrupt_authoritative_file_as_missing(
+    ) -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let session = Session::new("ambiguous-corrupt-create", "test-model");
+        storage.save_session(&session).await?;
+        fs::write(
+            storage.sessions_dir.join(&session.id).join("session.json"),
+            b"not-json",
+        )
+        .await?;
+
+        let error = storage
+            .recover_root_session_from_disk(&session.id)
+            .await
+            .expect_err("corrupt authoritative data must remain retryable, not look deleted");
+        assert!(error
+            .to_string()
+            .contains("invalid authoritative session.json"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_store_index_updates_rebase_without_losing_entries() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        // Construct both before either write so the second instance starts with
+        // the exact stale empty snapshot that previously lost the first entry.
+        let first = SessionStoreV2::new(bamboo_home.clone()).await?;
+        let second = SessionStoreV2::new(bamboo_home.clone()).await?;
+        let first_session = Session::new("cross-process-index-first", "test-model");
+        let second_session = Session::new("cross-process-index-second", "test-model");
+
+        first.save_session(&first_session).await?;
+        second.save_session(&second_session).await?;
+
+        let persisted: SessionsIndex =
+            serde_json::from_slice(&fs::read(bamboo_home.join("sessions.json")).await?)
+                .map_err(io::Error::other)?;
+        assert!(persisted.sessions.contains_key(&first_session.id));
+        assert!(persisted.sessions.contains_key(&second_session.id));
+
+        let reopened = SessionStoreV2::new(bamboo_home).await?;
+        assert!(reopened.get_index_entry(&first_session.id).await.is_some());
+        assert!(reopened.get_index_entry(&second_session.id).await.is_some());
         Ok(())
     }
 

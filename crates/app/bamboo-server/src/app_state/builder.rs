@@ -172,6 +172,25 @@ impl AppState {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
         let (session_store, storage) = init_storage(&data_dir).await?;
+        let session_create_operations =
+            Arc::new(super::session_create_operations::SessionCreateOperationStore::new(&data_dir));
+        match session_create_operations.prune_expired().await {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(
+                target: "bamboo.session_create",
+                phase = "retention_cleanup",
+                outcome = "expired_pruned",
+                deleted,
+                "pruned expired session-create operation receipts"
+            ),
+            Err(error) => tracing::warn!(
+                target: "bamboo.session_create",
+                phase = "retention_cleanup",
+                outcome = "cleanup_failed",
+                error = %error,
+                "failed to prune expired session-create operation receipts"
+            ),
+        }
         let project_store = Arc::new(bamboo_projects::ProjectStore::open(&data_dir).map_err(
             |error| {
                 AppError::InternalError(anyhow::anyhow!(
@@ -787,7 +806,11 @@ impl AppState {
                 facade,
                 credential_store.clone(),
                 Arc::new(move |event| {
-                    super::config_runtime::publish_registry_event(&event_sink, event);
+                    let event_sink = event_sink.clone();
+                    let event = event.clone();
+                    Box::pin(async move {
+                        super::config_runtime::publish_registry_event(&event_sink, &event).await;
+                    })
                 }),
             );
         }
@@ -996,6 +1019,7 @@ impl AppState {
             sessions,
             storage,
             session_store,
+            session_create_operations,
             project_store,
             project_context_resolver,
             workspace_resolver,
