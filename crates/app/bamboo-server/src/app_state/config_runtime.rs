@@ -1768,7 +1768,13 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.plugin_trust = source.plugin_trust.clone();
         }
         SectionId::Memory => *target.memory_mut() = source.memory().clone(),
-        SectionId::Subagents => *target.subagents_mut() = source.subagents().clone(),
+        SectionId::Subagents => {
+            let runtime_broker = target.subagents().broker.clone();
+            *target.subagents_mut() = source.subagents().clone();
+            if target.subagents().broker.is_none() {
+                target.subagents_mut().broker = runtime_broker;
+            }
+        }
         SectionId::Notifications => target.notifications = source.notifications.clone(),
         SectionId::Connect => target.connect = source.connect.clone(),
         SectionId::ClusterFabric => target.cluster_fabric = source.cluster_fabric.clone(),
@@ -1794,6 +1800,15 @@ fn restore_authoritative_cluster_fabric(
 ) {
     if let Some(facade) = facade {
         candidate.cluster_fabric = facade.registry().cluster_fabric.snapshot().data.0.clone();
+    }
+}
+
+/// Preserve the process-only broker injected at boot when a config projection
+/// cannot carry it. An incoming runtime broker is authoritative, so external
+/// broker changes still replace the previous endpoint.
+fn preserve_runtime_broker(new_config: &mut Config, previous: &Config) {
+    if new_config.subagents().broker.is_none() {
+        new_config.subagents_mut().broker = previous.subagents().broker.clone();
     }
 }
 
@@ -4450,13 +4465,14 @@ impl AppState {
         // disk-reading Config authority.
         let _io = self.config_io_lock.lock().await;
         let mut config = self.config.write().await;
-        let new_config = self
+        let mut new_config = self
             .config_facade
             .as_ref()
             .map(|facade| load_facade_effective_config(facade, &self.app_data_dir))
             .unwrap_or_else(|| {
                 Config::from_data_dir_without_publish(Some(self.app_data_dir.clone()))
             });
+        preserve_runtime_broker(&mut new_config, &config);
         new_config.publish_env_vars();
         *config = new_config.clone();
         new_config
@@ -4482,12 +4498,16 @@ impl AppState {
         let mcp_config_live_health = self.mcp_config_live_health.clone();
         let transaction = tokio::spawn(async move {
             let _io = io;
-            let new_config = config_facade
+            let mut new_config = config_facade
                 .as_ref()
                 .map(|facade| load_facade_effective_config(facade, &app_data_dir))
                 .unwrap_or_else(|| {
                     Config::from_data_dir_without_publish(Some(app_data_dir.clone()))
                 });
+            {
+                let previous = config.read().await;
+                preserve_runtime_broker(&mut new_config, &previous);
+            }
             if let Err(error) = bamboo_llm::validate_provider_config(&new_config) {
                 tracing::warn!("reloaded provider config is invalid");
                 let message =
@@ -4595,7 +4615,11 @@ impl AppState {
             #[cfg(test)]
             run_reset_after_delete_test_hook(&app_data_dir);
 
-            let new_config = Config::from_data_dir_without_publish(Some(app_data_dir.clone()));
+            let mut new_config = Config::from_data_dir_without_publish(Some(app_data_dir.clone()));
+            {
+                let previous = config.read().await;
+                preserve_runtime_broker(&mut new_config, &previous);
+            }
             new_config.publish_env_vars();
             *config.write().await = new_config.clone();
             Self::apply_config_effects_owned(
@@ -4775,6 +4799,7 @@ impl AppState {
                 };
                 {
                     let mut cfg = config.write().await;
+                    preserve_runtime_broker(&mut snapshot, &cfg);
                     snapshot.publish_env_vars();
                     *cfg = snapshot.clone();
                 }
@@ -4935,7 +4960,7 @@ impl AppState {
                         "configuration watch failed: {error}"
                     )),
                 })?;
-                let (snapshot, events) = match commit {
+                let (mut snapshot, events) = match commit {
                     Some(commit) => {
                         let mut published = live_base;
                         let installed = install_credential_section_commit(commit, &mut published)
@@ -4950,6 +4975,7 @@ impl AppState {
                 };
                 {
                     let mut cfg = config.write().await;
+                    preserve_runtime_broker(&mut snapshot, &cfg);
                     snapshot.publish_env_vars();
                     *cfg = snapshot.clone();
                 }
@@ -6100,8 +6126,12 @@ impl AppState {
                     None => Vec::new(),
                 };
                 let enforcement_newly_off = !was_off && published.plugin_trust.enforcement_is_off();
-                published.publish_env_vars();
-                *config.write().await = published.clone();
+                {
+                    let mut current = config.write().await;
+                    preserve_runtime_broker(&mut published, &current);
+                    published.publish_env_vars();
+                    *current = published.clone();
+                }
                 // Same live signal as `update_config` — a full-config replace
                 // that transitions plugin_trust.enforcement into `Off` warns.
                 if enforcement_newly_off {
@@ -6579,6 +6609,63 @@ for line in sys.stdin:
                 denied_tools: vec![],
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn config_update_preserves_runtime_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let expected = state
+            .config
+            .read()
+            .await
+            .subagents()
+            .broker
+            .clone()
+            .expect("AppState embeds a runtime broker");
+
+        let updated = state
+            .update_config(
+                |config| {
+                    config.subagents_mut().max_concurrent = Some(3);
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.subagents().broker.as_ref(), Some(&expected));
+        assert_eq!(
+            state.config.read().await.subagents().broker.as_ref(),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn preserve_runtime_broker_keeps_explicit_broker() {
+        let previous_broker = bamboo_config::BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:41001".to_string(),
+            token: "previous".to_string(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: false,
+        };
+        let explicit_broker = bamboo_config::BrokerClientConfig {
+            endpoint: "wss://broker.example.test".to_string(),
+            token: "explicit".to_string(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: true,
+        };
+        let mut previous = Config::default();
+        previous.subagents_mut().broker = Some(previous_broker);
+        let mut incoming = Config::default();
+        incoming.subagents_mut().broker = Some(explicit_broker.clone());
+
+        preserve_runtime_broker(&mut incoming, &previous);
+
+        assert_eq!(incoming.subagents().broker.as_ref(), Some(&explicit_broker));
     }
 
     fn mcp_document_bytes(revision: u64, config: &McpConfig) -> Vec<u8> {
