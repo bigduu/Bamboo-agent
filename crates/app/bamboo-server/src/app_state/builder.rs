@@ -71,7 +71,9 @@ impl AppState {
                 (config, Some(facade))
             }
             Err(error) => {
-                if bamboo_config::section_layout_is_active(&bamboo_home_dir).unwrap_or(false) {
+                if bamboo_config::modular_authority_boundary_present(&bamboo_home_dir)
+                    .unwrap_or(true)
+                {
                     return Err(AppError::InternalError(anyhow::anyhow!(
                         "modular configuration authority is unavailable: {error}"
                     )));

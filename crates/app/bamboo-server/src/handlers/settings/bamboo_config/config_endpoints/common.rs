@@ -48,7 +48,9 @@ pub(super) async fn write_model_limits_file(
     value: Option<&Value>,
 ) -> Result<(), AppError> {
     let path = model_limits_file_path(app_data_dir);
-    if bamboo_config::section_layout_is_active(app_data_dir).map_err(map_config_store_error)? {
+    if bamboo_config::modular_authority_boundary_present(app_data_dir)
+        .map_err(map_config_store_error)?
+    {
         let rows = match value {
             Some(value) => {
                 let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
@@ -61,7 +63,7 @@ pub(super) async fn write_model_limits_file(
         };
         let data_dir = app_data_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let facade = bamboo_config::ConfigFacade::open(&data_dir)?;
+            let facade = bamboo_config::ConfigFacade::open_or_migrate(&data_dir)?;
             let snapshot = facade.registry().model_limits.snapshot();
             if snapshot.data.0 != rows {
                 facade

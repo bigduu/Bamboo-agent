@@ -1952,6 +1952,12 @@ fn is_internal_store_path(path: &Path) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
+    if matches!(
+        name,
+        "config.json" | "config.json.bak" | "config.json.bak.1" | "config.json.bak.2"
+    ) {
+        return false;
+    }
     name.starts_with('.')
         || name.contains(".tmp.")
         || name.ends_with(".lock")
@@ -2133,6 +2139,26 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Example {
         value: String,
+    }
+
+    #[test]
+    fn watcher_only_exposes_the_fixed_legacy_root_backup_family() {
+        for name in [
+            "config.json",
+            "config.json.bak",
+            "config.json.bak.1",
+            "config.json.bak.2",
+        ] {
+            assert!(!is_internal_store_path(Path::new(name)), "{name}");
+        }
+        for name in [
+            "config.json.bak.3",
+            "providers.json.bak",
+            "config.json.corrupt.1",
+            ".config.json.tmp",
+        ] {
+            assert!(is_internal_store_path(Path::new(name)), "{name}");
+        }
     }
 
     fn store_with_two_revisions(dir: &TempDir) -> (PathBuf, AtomicJsonStore<Example>) {

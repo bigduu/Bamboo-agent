@@ -278,14 +278,43 @@ fn migrate_legacy_document(
         return install_migrated_document(canonical, &candidate);
     }
 
-    let root_path = config_dir.join("config.json");
-    if !root_path.exists() {
+    // The modular completion marker/ledger is a one-way authority boundary.
+    // Once either artifact exists, a reappeared compatibility root is never a
+    // permission-policy source, even when the marker itself is damaged.
+    let modular_boundary =
+        bamboo_config::modular_authority_boundary_present(config_dir).map_err(|source| {
+            PermissionStorageError::StoreError {
+                path: canonical.to_path_buf(),
+                source,
+            }
+        })?;
+    let initial_extension_source = if modular_boundary {
+        bamboo_config::initial_legacy_root_extension_migration_source(config_dir).map_err(
+            |source| PermissionStorageError::StoreError {
+                path: canonical.to_path_buf(),
+                source,
+            },
+        )?
+    } else {
+        None
+    };
+    if modular_boundary && initial_extension_source.is_none() {
         return Ok(());
     }
-    let bytes = std::fs::read(&root_path).map_err(|source| PermissionStorageError::ReadError {
-        path: root_path.clone(),
-        source,
-    })?;
+
+    let root_path = config_dir.join("config.json");
+    let bytes = match initial_extension_source {
+        Some(bytes) => bytes,
+        None => {
+            if !root_path.exists() {
+                return Ok(());
+            }
+            std::fs::read(&root_path).map_err(|source| PermissionStorageError::ReadError {
+                path: root_path.clone(),
+                source,
+            })?
+        }
+    };
     let root: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|source| PermissionStorageError::ParseError {
             path: root_path.clone(),
@@ -435,6 +464,57 @@ mod tests {
                 .unwrap();
         assert_eq!(after["unknown"]["keep"], true);
         assert!(after.get("permissions").is_some());
+    }
+
+    #[test]
+    fn completed_layout_never_adopts_reappeared_root_permission() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("config.json"), b"{}").unwrap();
+        bamboo_config::migrate_config_facade_layout(temp.path()).unwrap();
+
+        let mut candidate = default_permission_document();
+        candidate.ask_rules = vec!["Bash(untrusted *)".to_string()];
+        std::fs::write(
+            temp.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"permissions": candidate})).unwrap(),
+        )
+        .unwrap();
+
+        let section = PermissionSection::open(temp.path()).unwrap();
+
+        assert_eq!(section.snapshot().revision, 0);
+        assert_eq!(section.snapshot().status, SectionStatus::Missing);
+        assert!(section.snapshot().data.ask_rules.is_empty());
+        assert!(!temp.path().join("permissions.json").exists());
+    }
+
+    #[test]
+    fn initial_facade_split_preserves_legacy_root_permission_import() {
+        let temp = tempdir().unwrap();
+        let mut candidate = default_permission_document();
+        candidate.ask_rules = vec!["Bash(initial-safe *)".to_string()];
+        std::fs::write(
+            temp.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "server": {"port": 29562},
+                "permissions": candidate,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        bamboo_config::ConfigFacade::open_or_migrate(temp.path()).unwrap();
+        assert!(
+            bamboo_config::initial_legacy_root_extension_migration_allowed(temp.path()).unwrap()
+        );
+        let section = PermissionSection::open(temp.path()).unwrap();
+
+        assert_eq!(section.snapshot().revision, 1);
+        assert_eq!(
+            section.snapshot().data.ask_rules,
+            vec!["Bash(initial-safe *)".to_string()]
+        );
+        assert!(temp.path().join("permissions.json").exists());
     }
 
     #[test]
