@@ -61,7 +61,7 @@ use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use crate::keyword_masking::KeywordMaskingConfig;
@@ -3310,6 +3310,75 @@ impl Config {
         Self::from_data_dir(None)
     }
 
+    fn from_completed_facade(data_dir: &Path, publish: bool, apply_env: bool) -> Self {
+        let mut config = match crate::ConfigFacade::open_or_migrate(data_dir) {
+            Ok(facade) => facade.effective_config(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "completed modular configuration is unavailable; refusing legacy-root fallback"
+                );
+                Self::create_default()
+            }
+        };
+
+        if let Err(error) = config.hydrate_proxy_auth_from_store(data_dir) {
+            tracing::warn!(error = %error, "proxy auth credential hydration unavailable");
+            config.proxy_auth = None;
+        }
+        if let Err(error) = config.hydrate_provider_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "provider credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_mcp_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "MCP credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_env_var_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "env credential hydration unavailable");
+            for entry in &mut config.env_vars {
+                if entry.secret {
+                    entry.value.clear();
+                }
+            }
+        }
+        if let Err(error) = config.hydrate_cluster_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "cluster credential hydration unavailable");
+            config.clear_cluster_runtime_credentials();
+        }
+        if let Err(error) = config.hydrate_notification_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "notification credential hydration unavailable");
+            config.notifications.ntfy.token = None;
+            config.notifications.bark.device_key = None;
+        }
+        if let Err(error) = config.hydrate_connect_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "connect credential hydration unavailable");
+            for platform in &mut config.connect.platforms {
+                platform.token = None;
+                platform.app_secret = None;
+            }
+        }
+        if let Err(error) = config.hydrate_access_control_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "access-control credential hydration unavailable");
+            config.clear_access_control_runtime_verifiers();
+        }
+        if let Some(broker) = config.subagents_mut().broker.as_mut() {
+            if let Err(error) = broker.hydrate_credential_from_store(data_dir) {
+                tracing::warn!(error = %error, "external broker credential hydration unavailable");
+                broker.token.clear();
+            }
+        }
+        config.normalize_tool_settings();
+        config.normalize_skill_settings();
+        config.normalize_plugin_trust_settings();
+        config.extra.remove("data_dir");
+        if apply_env {
+            config.apply_env_overrides();
+        }
+        if publish {
+            config.publish_env_vars();
+        }
+        config
+    }
+
     /// Load configuration from a specific data directory.
     ///
     /// Use [`Config::from_data_dir`] (publishes env vars to the global cache, for
@@ -3323,6 +3392,25 @@ impl Config {
         let data_dir = data_dir
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(default_data_dir);
+
+        match crate::modular_authority_boundary_present(&data_dir) {
+            Ok(true) => return Self::from_completed_facade(&data_dir, publish, apply_env),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "modular configuration marker is unavailable; refusing legacy-root fallback"
+                );
+                let mut config = Self::create_default();
+                if apply_env {
+                    config.apply_env_overrides();
+                }
+                if publish {
+                    config.publish_env_vars();
+                }
+                return config;
+            }
+        }
 
         // Finish any shared manifest-committed credential extraction before
         // reading even one member of the transaction, then plan only the
@@ -3342,6 +3430,29 @@ impl Config {
                 error
             })
             .is_ok();
+
+        // A recovery performed by either legacy credential planner may have
+        // completed the modular split. Reclassify immediately before touching
+        // config.json so a pending split cannot race this compatibility load
+        // back into legacy authority.
+        match crate::modular_authority_boundary_present(&data_dir) {
+            Ok(true) => return Self::from_completed_facade(&data_dir, publish, apply_env),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "modular configuration boundary is unavailable; refusing legacy-root fallback"
+                );
+                let mut config = Self::create_default();
+                if apply_env {
+                    config.apply_env_overrides();
+                }
+                if publish {
+                    config.publish_env_vars();
+                }
+                return config;
+            }
+        }
 
         let config_path = data_dir.join("config.json");
 
@@ -4576,6 +4687,16 @@ impl Config {
             anyhow::bail!(
                 "notification secrets require the isolated credential transaction before persistence"
             );
+        }
+
+        if crate::modular_authority_boundary_present(&data_dir)
+            .context("Failed to inspect modular configuration authority boundary")?
+        {
+            crate::ConfigFacade::open_or_migrate(&data_dir)
+                .context("Failed to recover modular configuration before persistence")?;
+            crate::persist_facade_effective_config(&data_dir, self)
+                .context("Failed to persist modular configuration sections")?;
+            return Ok(());
         }
 
         if crate::section_layout_is_active(&data_dir)

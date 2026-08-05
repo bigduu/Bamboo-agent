@@ -1077,7 +1077,7 @@ impl Config {
         data_dir: &std::path::Path,
     ) -> crate::ConfigStoreResult<()> {
         let store = crate::CredentialStore::open(data_dir);
-        let allow_legacy_runtime_value = !crate::section_layout_is_active(data_dir)?;
+        let allow_legacy_runtime_value = !crate::modular_authority_boundary_present(data_dir)?;
         self.hydrate_connect_credentials_from_resolver(&store, allow_legacy_runtime_value)
     }
 

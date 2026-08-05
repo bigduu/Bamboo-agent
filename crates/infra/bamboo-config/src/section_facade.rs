@@ -19,14 +19,14 @@ use uuid::Uuid;
 use crate::config_crypto::{access_device_credential_ref, access_password_credential_ref};
 use crate::credential_store::{CredentialDocumentLkg, CredentialMutation};
 use crate::{
-    AccessControlConfig, AnthropicModelMapping, AtomicJsonStore, BrokerClientConfig,
-    ClusterFabricConfig, Config, ConfigSectionEvent, ConfigStoreResult, ConfigValues,
-    ConnectConfig, CredentialRef, CredentialSource, CredentialStatus, CredentialStore,
-    CredentialStoreHealth, DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry, FeatureFlags,
-    GeminiModelMapping, HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig, LiveSection,
-    MemoryConfig, NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
-    RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig,
-    StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
+    AccessControlConfig, AnthropicModelMapping, AtomicFileStore, AtomicJsonStore,
+    BrokerClientConfig, ClusterFabricConfig, Config, ConfigSectionEvent, ConfigStoreResult,
+    ConfigValues, ConnectConfig, CredentialRef, CredentialSource, CredentialStatus,
+    CredentialStore, CredentialStoreHealth, DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry,
+    FeatureFlags, GeminiModelMapping, HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig,
+    LiveSection, MemoryConfig, NotificationsConfig, PluginTrustConfig, ProviderConfigs,
+    ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus,
+    ServerConfig, SkillsConfig, StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
 };
 
 pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
@@ -775,7 +775,8 @@ where
     let planning_bytes = overrides
         .and_then(|overrides| overrides.get(name))
         .cloned()
-        .unwrap_or_else(|| original.clone());
+        .unwrap_or_else(|| Some(original.clone()))
+        .unwrap_or_default();
     let (existing_revision, existing_data) = compatible_section_data(&planning_bytes)?;
     let existing_envelope = serde_json::from_slice::<Value>(&planning_bytes)
         .ok()
@@ -824,7 +825,7 @@ where
             )
         })?
     };
-    validate_ordinary_section_json(&merged_data)?;
+    validate_ordinary_section_json_for_file(name, &merged_data)?;
     let typed: T = serde_json::from_value(merged_data.clone())?;
     validate(&typed).map_err(crate::ConfigStoreError::Validation)?;
     let candidate = serde_json::to_vec_pretty(&SectionDocument {
@@ -957,27 +958,32 @@ fn deep_merge_typed_over_raw(base: &mut Value, overlay: Value) {
 }
 
 fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
-    fn walk(value: &Value, classify_object_keys: bool) -> Result<(), String> {
+    fn walk(
+        value: &Value,
+        classify_object_keys: bool,
+        credential_context: CredentialScanContext,
+    ) -> Result<(), String> {
+        if credential_context != CredentialScanContext::None
+            && is_nonliteral_runtime_template(value)
+        {
+            return Ok(());
+        }
         match value {
             Value::Object(object) => {
                 for (key, value) in object {
-                    let normalized_key = key
-                        .chars()
-                        .filter(|ch| ch.is_ascii_alphanumeric())
-                        .flat_map(char::to_lowercase)
-                        .collect::<String>();
-                    let forbidden_key = classify_object_keys
-                        && (key.to_ascii_lowercase().ends_with("_encrypted")
-                            || normalized_key.ends_with("encrypted")
-                            || normalized_key.ends_with("token")
-                            || normalized_key.ends_with("password")
-                            || normalized_key.ends_with("secret")
-                            || matches!(
-                                normalized_key.as_str(),
-                                "apikey" | "proxyauth" | "privatekey" | "passphrase" | "devicekey"
-                            ));
-                    let boolean_secret_metadata = normalized_key == "secret" && value.is_boolean();
-                    if forbidden_key && !boolean_secret_metadata && !value_is_empty(value) {
+                    let normalized_key = normalized_credential_key(key);
+                    let reference_metadata = credential_reference_metadata_key(key);
+                    if classify_object_keys && key_contains_literal_credential_material(key, value)
+                    {
+                        return Err(format!(
+                            "ordinary section contains forbidden credential material in {key}"
+                        ));
+                    }
+                    if classify_object_keys
+                        && credential_context != CredentialScanContext::None
+                        && NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES.contains(&normalized_key.as_str())
+                        && !value_is_empty(value)
+                    {
                         return Err(format!(
                             "ordinary section contains forbidden credential material in {key}"
                         ));
@@ -1031,6 +1037,30 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
                             normalized_key.as_str(),
                             "headers" | "providerinstances" | "credentialrefs"
                         ) || normalized_key.ends_with("credentialrefs"));
+                    let key_credential_context = if value.is_object() || value.is_array() {
+                        credential_context_key(key)
+                    } else {
+                        credential_literal_key(key)
+                    };
+                    let key_metadata_context = (value.is_object() || value.is_array())
+                        && credential_metadata_container_key(key);
+                    let child_credential_context = if !classify_object_keys || reference_metadata {
+                        CredentialScanContext::None
+                    } else if credential_context == CredentialScanContext::Strong
+                        && credential_public_metadata_key(key)
+                    {
+                        CredentialScanContext::Adjacent
+                    } else if credential_context == CredentialScanContext::Strong
+                        || key_credential_context
+                    {
+                        CredentialScanContext::Strong
+                    } else if credential_context == CredentialScanContext::Adjacent
+                        || key_metadata_context
+                    {
+                        CredentialScanContext::Adjacent
+                    } else {
+                        CredentialScanContext::None
+                    };
                     if child_keys_are_identifiers {
                         if normalized_key == "headers" {
                             if let Some(headers) = value.as_object() {
@@ -1049,18 +1079,36 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
                         match value {
                             Value::Object(entries) => {
                                 for entry in entries.values() {
-                                    walk(entry, true)?;
+                                    let entry_context = if reference_metadata {
+                                        if entry.is_object() || entry.is_array() {
+                                            CredentialScanContext::Adjacent
+                                        } else {
+                                            CredentialScanContext::None
+                                        }
+                                    } else {
+                                        child_credential_context
+                                    };
+                                    walk(entry, true, entry_context)?;
                                 }
                             }
                             Value::Array(entries) => {
                                 for entry in entries {
-                                    walk(entry, true)?;
+                                    let entry_context = if reference_metadata
+                                        && (entry.is_object() || entry.is_array())
+                                    {
+                                        CredentialScanContext::Adjacent
+                                    } else if reference_metadata {
+                                        CredentialScanContext::None
+                                    } else {
+                                        child_credential_context
+                                    };
+                                    walk(entry, true, entry_context)?;
                                 }
                             }
-                            _ => walk(value, true)?,
+                            _ => walk(value, true, child_credential_context)?,
                         }
                     } else {
-                        walk(value, true)?;
+                        walk(value, true, child_credential_context)?;
                     }
                 }
                 if classify_object_keys {
@@ -1069,12 +1117,23 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
                     Ok(())
                 }
             }
-            Value::Array(values) => values.iter().try_for_each(|value| walk(value, true)),
+            Value::Array(values) => values
+                .iter()
+                .try_for_each(|value| walk(value, true, credential_context)),
+            Value::String(value)
+                if credential_context == CredentialScanContext::Strong
+                    && !value.trim().is_empty() =>
+            {
+                Err("ordinary section contains forbidden credential material".to_string())
+            }
+            Value::Number(_) if credential_context == CredentialScanContext::Strong => {
+                Err("ordinary section contains forbidden credential material".to_string())
+            }
             _ => Ok(()),
         }
     }
 
-    walk(value, true).map_err(crate::ConfigStoreError::Validation)?;
+    walk(value, true, CredentialScanContext::None).map_err(crate::ConfigStoreError::Validation)?;
     validate_provider_override_credentials(value).map_err(crate::ConfigStoreError::Validation)
 }
 
@@ -1082,11 +1141,344 @@ pub(crate) fn validate_ordinary_section_raw(value: &Value) -> Result<(), String>
     validate_ordinary_section_json(value).map_err(|error| error.to_string())
 }
 
+fn validate_ordinary_mcp_section_json(value: &Value) -> ConfigStoreResult<()> {
+    let Some(servers) = value.as_object() else {
+        return validate_ordinary_section_json(value);
+    };
+    for server in servers.values() {
+        validate_ordinary_section_json(server)?;
+    }
+    Ok(())
+}
+
+fn validate_ordinary_mcp_section_raw(value: &Value) -> Result<(), String> {
+    validate_ordinary_mcp_section_json(value).map_err(|error| error.to_string())
+}
+
+fn validate_ordinary_section_json_for_file(name: &str, value: &Value) -> ConfigStoreResult<()> {
+    if name == SectionId::Mcp.descriptor().file_name {
+        validate_ordinary_mcp_section_json(value)
+    } else {
+        validate_ordinary_section_json(value)
+    }
+}
+
 fn value_is_empty(value: &Value) -> bool {
     value.is_null()
         || value.as_str().is_some_and(|value| value.trim().is_empty())
         || value.as_object().is_some_and(serde_json::Map::is_empty)
         || value.as_array().is_some_and(Vec::is_empty)
+}
+
+fn normalized_credential_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn credential_key_tokens(key: &str) -> Vec<String> {
+    let characters = key.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for (index, character) in characters.iter().copied().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let next = characters.get(index + 1);
+        let camel_boundary = character.is_ascii_uppercase()
+            && !current.is_empty()
+            && (previous.is_some_and(|previous| previous.is_ascii_lowercase())
+                || (previous.is_some_and(|previous| previous.is_ascii_uppercase())
+                    && next.is_some_and(|next| next.is_ascii_lowercase())));
+        if camel_boundary {
+            tokens.push(current.to_ascii_lowercase());
+            current.clear();
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        tokens.push(current.to_ascii_lowercase());
+    }
+    tokens
+}
+
+fn credential_reference_metadata_key(key: &str) -> bool {
+    let normalized = normalized_credential_key(key);
+    normalized == "credentialref"
+        || normalized.ends_with("credentialref")
+        || normalized == "credentialrefs"
+        || normalized.ends_with("credentialrefs")
+}
+
+const SAFE_CREDENTIAL_METADATA_SUFFIXES: &[&str] = &[
+    "mode",
+    "env",
+    "environment",
+    "ref",
+    "refs",
+    "configured",
+    "enabled",
+    "disabled",
+    "type",
+    "kind",
+    "scheme",
+    "method",
+    "source",
+    "name",
+    "id",
+    "ids",
+    "state",
+    "status",
+    "server",
+    "servers",
+    "provider",
+    "url",
+    "uri",
+    "endpoint",
+    "path",
+    "file",
+    "domain",
+    "scope",
+    "scopes",
+    "format",
+    "algorithm",
+    "version",
+    "timeout",
+    "ttl",
+    "expiry",
+    "expiration",
+    "duration",
+    "interval",
+    "usage",
+    "store",
+    "storage",
+    "backend",
+    "network",
+    "callback",
+    "control",
+    "level",
+    "policy",
+    "strategy",
+    "flow",
+    "site",
+    "model",
+];
+
+const NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES: &[&str] = &[
+    "value", "literal", "fallback", "header", "headers", "hash", "salt", "verifier", "payload",
+    "material", "data",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialScanContext {
+    None,
+    /// A credential-adjacent metadata container. Public metadata such as
+    /// `name`, `url`, and `model` remains allowed, but credential payload keys
+    /// below the container are still fail-closed.
+    Adjacent,
+    /// A direct credential container whose non-empty primitive values are
+    /// themselves treated as credential material.
+    Strong,
+}
+
+fn credential_token_is_sensitive(token: &str) -> bool {
+    matches!(
+        token,
+        "auth"
+            | "authentication"
+            | "authorization"
+            | "oauth"
+            | "oauth2"
+            | "bearer"
+            | "credential"
+            | "credentials"
+            | "secret"
+            | "token"
+            | "password"
+            | "private"
+            | "access"
+            | "ciphertext"
+            | "encrypted"
+            | "cookie"
+            | "passphrase"
+    )
+}
+
+fn credential_key_compound_is_sensitive(tokens: &[String]) -> bool {
+    tokens.windows(2).any(|tokens| {
+        matches!(
+            (tokens[0].as_str(), tokens[1].as_str()),
+            ("api", "key")
+                | ("auth", "key")
+                | ("access", "key")
+                | ("private", "key")
+                | ("device", "key")
+                | ("secret", "key")
+                | ("signing", "key")
+                | ("encryption", "key")
+        )
+    })
+}
+
+fn credential_name_has_sensitive_tokens(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| credential_token_is_sensitive(token))
+        || credential_key_compound_is_sensitive(tokens)
+}
+
+fn credential_name_has_terminal_sensitive_tokens(tokens: &[String]) -> bool {
+    tokens
+        .last()
+        .is_some_and(|token| credential_token_is_sensitive(token))
+        || (tokens.len() >= 2 && credential_key_compound_is_sensitive(&tokens[tokens.len() - 2..]))
+}
+
+fn normalized_terminal_credential_name(normalized: &str) -> bool {
+    normalized.ends_with("auth")
+        || normalized.ends_with("authentication")
+        || normalized.ends_with("authorization")
+        || normalized.ends_with("oauth")
+        || normalized.ends_with("oauth2")
+        || normalized.ends_with("bearer")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("credentials")
+        || normalized.ends_with("secret")
+        || normalized.ends_with("token")
+        || normalized.ends_with("password")
+        || normalized.ends_with("private")
+        || normalized.ends_with("access")
+        || normalized.ends_with("ciphertext")
+        || normalized.ends_with("encrypted")
+        || normalized.ends_with("cookie")
+        || normalized.ends_with("passphrase")
+        || normalized.ends_with("apikey")
+        || normalized.ends_with("accesskey")
+        || normalized.ends_with("authkey")
+        || normalized.ends_with("privatekey")
+        || normalized.ends_with("devicekey")
+        || normalized.ends_with("secretkey")
+        || normalized.ends_with("signingkey")
+        || normalized.ends_with("encryptionkey")
+        || normalized.ends_with("passwordhash")
+        || normalized.ends_with("passwordsalt")
+        || normalized.ends_with("tokenhash")
+        || normalized.ends_with("tokensalt")
+}
+
+fn normalized_credential_context_name(normalized: &str) -> bool {
+    if SAFE_CREDENTIAL_METADATA_SUFFIXES
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
+    {
+        return false;
+    }
+    let mut candidate = normalized;
+    while let Some(stripped) = NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES
+        .iter()
+        .find_map(|suffix| candidate.strip_suffix(suffix))
+    {
+        if stripped.is_empty() || stripped == candidate {
+            break;
+        }
+        candidate = stripped;
+    }
+    normalized_terminal_credential_name(candidate)
+}
+
+fn credential_metadata_container_key(key: &str) -> bool {
+    if credential_reference_metadata_key(key) {
+        return false;
+    }
+    let tokens = credential_key_tokens(key);
+    let tokenized_metadata = credential_name_has_sensitive_tokens(&tokens)
+        && tokens
+            .last()
+            .is_some_and(|suffix| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&suffix.as_str()));
+    let normalized = normalized_credential_key(key);
+    let normalized_metadata = SAFE_CREDENTIAL_METADATA_SUFFIXES.iter().any(|suffix| {
+        normalized
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| !prefix.is_empty() && normalized_terminal_credential_name(prefix))
+    });
+    tokenized_metadata || normalized_metadata
+}
+
+fn credential_public_metadata_key(key: &str) -> bool {
+    let normalized = normalized_credential_key(key);
+    SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&normalized.as_str())
+        || credential_key_tokens(key)
+            .last()
+            .is_some_and(|token| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&token.as_str()))
+}
+
+fn credential_context_key(key: &str) -> bool {
+    if credential_reference_metadata_key(key) {
+        return false;
+    }
+    let tokens = credential_key_tokens(key);
+    let tokenized_context = credential_name_has_sensitive_tokens(&tokens)
+        && !tokens
+            .last()
+            .is_some_and(|suffix| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&suffix.as_str()));
+    tokenized_context || normalized_credential_context_name(&normalized_credential_key(key))
+}
+
+fn credential_literal_key(key: &str) -> bool {
+    if credential_reference_metadata_key(key) {
+        return false;
+    }
+    let tokens = credential_key_tokens(key);
+    if tokens
+        .last()
+        .is_some_and(|suffix| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&suffix.as_str()))
+    {
+        return false;
+    }
+    let tokenized_literal = credential_name_has_terminal_sensitive_tokens(&tokens)
+        || tokens.last().is_some_and(|suffix| {
+            NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES.contains(&suffix.as_str())
+                && credential_name_has_sensitive_tokens(&tokens[..tokens.len().saturating_sub(1)])
+        });
+    tokenized_literal || normalized_credential_context_name(&normalized_credential_key(key))
+}
+
+fn key_contains_literal_credential_material(key: &str, value: &Value) -> bool {
+    let normalized = normalized_credential_key(key);
+    let credential_reference_metadata = credential_reference_metadata_key(key);
+    let contextual_literal =
+        (value.is_string() || value.is_number()) && credential_literal_key(key);
+    let credential_owned = key.to_ascii_lowercase().ends_with("_encrypted")
+        || normalized.ends_with("encrypted")
+        || normalized.ends_with("token")
+        || normalized.ends_with("password")
+        || normalized.ends_with("secret")
+        || matches!(
+            normalized.as_str(),
+            "apikey"
+                | "proxyauth"
+                | "passwordhash"
+                | "passwordsalt"
+                | "tokenhash"
+                | "tokensalt"
+                | "privatekey"
+                | "passphrase"
+                | "devicekey"
+        )
+        || contextual_literal;
+    let boolean_secret_metadata = normalized == "secret" && value.is_boolean();
+    let boolean_configured_metadata = normalized.ends_with("configured") && value.is_boolean();
+    credential_owned
+        && !credential_reference_metadata
+        && !boolean_secret_metadata
+        && !boolean_configured_metadata
+        && !value_is_empty(value)
 }
 
 fn validate_configured_reference_coherence(
@@ -2093,7 +2485,7 @@ pub(crate) fn validate_section_envelope(
 }
 
 fn validate_section_data(name: &str, data: &Value) -> ConfigStoreResult<()> {
-    validate_ordinary_section_json(data)?;
+    validate_ordinary_section_json_for_file(name, data)?;
 
     macro_rules! validate_typed {
         ($ty:ty, $validate:expr) => {{
@@ -2139,16 +2531,21 @@ fn read_optional_bytes(path: &Path) -> ConfigStoreResult<Vec<u8>> {
     }
 }
 
-fn file_hash(path: &Path) -> ConfigStoreResult<String> {
+pub(crate) fn source_state_hash(bytes: Option<&[u8]>) -> String {
     let mut digest = Sha256::new();
-    match read_existing_bytes(path)? {
+    match bytes {
         Some(bytes) => {
             digest.update([1]);
             digest.update(bytes);
         }
         None => digest.update([0]),
     }
-    Ok(hex::encode(digest.finalize()))
+    hex::encode(digest.finalize())
+}
+
+fn file_hash(path: &Path) -> ConfigStoreResult<String> {
+    let bytes = crate::credential_migration::read_section_attestation_target(path)?;
+    Ok(source_state_hash(bytes.as_deref()))
 }
 
 pub(crate) fn migration_source_hashes(data_dir: &Path) -> ConfigStoreResult<Vec<(String, String)>> {
@@ -2213,7 +2610,11 @@ struct StrictPlanningInput {
     authoritative_sidecars: BTreeSet<SectionId>,
 }
 
-type StrictSourceOverrides = BTreeMap<String, Vec<u8>>;
+/// A complete or partial view of strict planning sources. A present `None`
+/// records that the source was absent; only a missing map key falls back to
+/// disk. This distinction matters when recovery creates typed sidecars after
+/// an initial legacy-root snapshot was captured.
+type StrictSourceOverrides = BTreeMap<String, Option<Vec<u8>>>;
 
 fn read_existing_bytes(path: &Path) -> ConfigStoreResult<Option<Vec<u8>>> {
     match std::fs::read(path) {
@@ -2229,7 +2630,7 @@ fn read_planning_source(
     overrides: Option<&StrictSourceOverrides>,
 ) -> ConfigStoreResult<Option<Vec<u8>>> {
     if let Some(bytes) = overrides.and_then(|overrides| overrides.get(name)) {
-        return Ok(Some(bytes.clone()));
+        return Ok(bytes.clone());
     }
     read_existing_bytes(&data_dir.join(name))
 }
@@ -2307,10 +2708,6 @@ fn load_strict_root(
         ))
     })?;
     Ok((config, raw))
-}
-
-fn load_strict_sidecar_value(data_dir: &Path, name: &str) -> ConfigStoreResult<Option<Value>> {
-    load_strict_sidecar_value_from(data_dir, name, None)
 }
 
 fn load_strict_sidecar_value_from(
@@ -2600,6 +2997,7 @@ fn scrub_preflight_access_control_secrets(raw: &mut Value) -> ConfigStoreResult<
 fn preflight_legacy_root_sections(
     data_dir: &Path,
     input: &StrictPlanningInput,
+    overrides: Option<&StrictSourceOverrides>,
 ) -> ConfigStoreResult<()> {
     let sanitized_config = scrub_preflight_config_secrets(&input.config)?;
     let projection = SectionProjection::from_config(&sanitized_config, input.model_limits.clone())?;
@@ -2608,7 +3006,8 @@ fn preflight_legacy_root_sections(
     if let Some(providers) = sections.get(&SectionId::Providers) {
         validate_preflight_provider_secret_consistency(providers)?;
     }
-    if let Some(providers) = load_strict_sidecar_value(data_dir, "providers.json")? {
+    if let Some(providers) = load_strict_sidecar_value_from(data_dir, "providers.json", overrides)?
+    {
         validate_preflight_provider_secret_consistency(&providers)?;
     }
     let instance_native_providers = projection
@@ -2648,7 +3047,8 @@ fn preflight_legacy_root_sections(
             }
             None => typed_baseline,
         };
-        if let Some(mut existing) = load_strict_sidecar_value(data_dir, id.descriptor().file_name)?
+        if let Some(mut existing) =
+            load_strict_sidecar_value_from(data_dir, id.descriptor().file_name, overrides)?
         {
             if id == SectionId::Providers && instance_native_providers {
                 remove_instance_native_legacy_provider_fields(&mut existing);
@@ -3087,22 +3487,85 @@ fn run_facade_epoch_test_hook(data_dir: &Path) {
 /// Idempotently split the compatibility documents through the existing
 /// credential migration lock/journal/manifest. Security-sensitive preflights
 /// run after recovery-only handling and before any new migration may write.
+fn repair_completed_config_facade_layout(
+    data_dir: &Path,
+    recovered: bool,
+) -> ConfigStoreResult<crate::SectionMigrationOutcome> {
+    let broker_ready = preflight_broker_document(data_dir)?;
+    crate::credential_migration::with_migration_lock(data_dir, || {
+        let provider =
+            crate::credential_migration::migrate_active_provider_mcp_credentials_for_facade_locked(
+                data_dir,
+            )?;
+        let access =
+            crate::credential_migration::migrate_access_control_credentials_for_facade_locked(
+                data_dir,
+            )?;
+        let mut broker_resumed = false;
+        if broker_ready {
+            match crate::credential_migration::migrate_external_broker_credentials_locked(data_dir)
+            {
+                Ok(outcome) => {
+                    broker_resumed = outcome.resumed;
+                    sync_active_external_broker(data_dir)?;
+                }
+                Err(crate::ConfigStoreError::Json(_) | crate::ConfigStoreError::Validation(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(crate::SectionMigrationOutcome {
+            activated: false,
+            resumed: recovered || provider.resumed || access.resumed || broker_resumed,
+        })
+    })
+}
+
 pub fn migrate_config_facade_layout(
     data_dir: impl AsRef<Path>,
 ) -> ConfigStoreResult<crate::SectionMigrationOutcome> {
     let data_dir = data_dir.as_ref();
     let mut recovered = false;
     for _ in 0..4 {
-        recovered |= crate::recover_pending_config_transaction(data_dir)?;
-        if section_layout_is_active(data_dir)?
-            && crate::credential_migration::access_control_requires_opaque_repair(data_dir)?
-        {
-            let access = crate::credential_migration::with_migration_lock(data_dir, || {
-                crate::credential_migration::migrate_access_control_credentials_for_facade_locked(
+        let recovery =
+            crate::credential_migration::recover_pending_config_transaction_for_facade(data_dir)?;
+        let recovered_now = recovery.recovered;
+        let pre_recovery_sources = recovery.initial_layout_sources;
+        recovered |= recovered_now;
+        let authority_boundary = modular_authority_boundary_present(data_dir)?;
+        let completed_marker = has_completed_section_layout_marker(data_dir)?;
+        if authority_boundary && !completed_marker {
+            return Err(crate::ConfigStoreError::Validation(
+                "modular configuration authority evidence is incomplete; legacy fallback is forbidden"
+                    .to_string(),
+            ));
+        }
+        if completed_marker {
+            if !section_layout_is_active(data_dir)?
+                && !completed_layout_allows_legacy_root_reconciliation(data_dir)?
+            {
+                return Err(crate::ConfigStoreError::Validation(
+                    "completed modular configuration evidence is inconsistent; repair is forbidden"
+                        .to_string(),
+                ));
+            }
+            // Validate the embedded outbox/health payload before any repair
+            // can mutate a typed authority. The completion transcript alone
+            // does not make a malformed mutable record writable.
+            let _ = read_legacy_reconciliation_record(data_dir)?;
+            if let Some(pre_recovery_sources) = pre_recovery_sources.as_ref() {
+                // A committed initial split wins before any later editor
+                // bytes are interpreted. Preserve the historical strict-root
+                // preflight result for this same recovery call. Any modular
+                // evidence present at entry is a one-way boundary, even when
+                // the marker itself is missing or damaged, so established
+                // layouts never reauthorize the compatibility root here.
+                let input = load_strict_planning_input_with_overrides(
                     data_dir,
-                )
-            })?;
-            recovered |= access.resumed;
+                    Some(pre_recovery_sources),
+                )?;
+                preflight_legacy_root_sections(data_dir, &input, Some(pre_recovery_sources))?;
+            }
+            return repair_completed_config_facade_layout(data_dir, recovered);
         }
         let source_before = preflight_source_hashes(data_dir)?;
         let preflight = (|| {
@@ -3110,7 +3573,7 @@ pub fn migrate_config_facade_layout(
             // Decode every planner input now so malformed roots or sidecars
             // fail byte-for-byte unchanged when no committed recovery exists.
             let input = load_strict_planning_input(data_dir)?;
-            preflight_legacy_root_sections(data_dir, &input)?;
+            preflight_legacy_root_sections(data_dir, &input, None)?;
             crate::credential_migration::preflight_provider_mcp_credential_migration(data_dir)?;
             crate::credential_migration::preflight_cluster_credential_migration(data_dir)?;
             Ok::<bool, crate::ConfigStoreError>(broker_ready)
@@ -3140,39 +3603,6 @@ pub fn migrate_config_facade_layout(
             if preflight_source_hashes(data_dir)? != source_after {
                 return Ok(None);
             }
-            if section_layout_is_active(data_dir)? {
-                let provider = crate::credential_migration::
-                    migrate_provider_mcp_credentials_for_facade_locked(data_dir)?;
-                let cluster =
-                    crate::credential_migration::migrate_cluster_credentials_locked(data_dir)?;
-                let access = crate::credential_migration::
-                    migrate_access_control_credentials_for_facade_locked(data_dir)?;
-                let mut broker_resumed = false;
-                if broker_ready {
-                    match crate::credential_migration::migrate_external_broker_credentials_locked(
-                        data_dir,
-                    ) {
-                        Ok(outcome) => {
-                            broker_resumed = outcome.resumed;
-                            sync_active_external_broker(data_dir)?;
-                        }
-                        Err(
-                            crate::ConfigStoreError::Json(_)
-                            | crate::ConfigStoreError::Validation(_),
-                        ) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                return Ok(Some(crate::SectionMigrationOutcome {
-                    activated: false,
-                    resumed: recovered
-                        || provider.resumed
-                        || cluster.resumed
-                        || access.resumed
-                        || broker_resumed,
-                }));
-            }
-
             let source_snapshot =
                 crate::credential_migration::FacadeSourceSnapshot::capture(data_dir)?;
             let credential_plan = crate::credential_migration::plan_facade_compound_credentials(
@@ -3888,6 +4318,35 @@ impl CredentialSection {
         }
     }
 
+    /// Attach a process-local reconciliation failure to the credential
+    /// authority without changing its encrypted document, immutable LKG, or
+    /// repair permissions. A later watched reload of the same durable
+    /// revision clears this health overlay and emits `Recovered`.
+    pub fn mark_runtime_degraded(&self, message: impl Into<String>) -> ConfigSectionEvent {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.snapshot();
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(CredentialSectionSnapshot {
+                data: current.data.clone(),
+                revision: current.revision,
+                loaded_at: Utc::now(),
+                source_path: current.source_path.clone(),
+                source_kind: current.source_kind,
+                status: SectionStatus::Degraded,
+                last_error: Some(message.into()),
+            });
+        ConfigSectionEvent::Invalid {
+            section: SectionId::Credentials.descriptor().name.to_string(),
+            revision: current.revision,
+        }
+    }
+
     pub fn replace(
         &self,
         credential_ref: CredentialRef,
@@ -4184,7 +4643,19 @@ impl SectionRegistry {
                     validate_ordinary_section_raw,
                 )?)
             },
-            mcp: open!(Mcp, McpSection, validate_mcp),
+            mcp: {
+                let descriptor = SectionId::Mcp.descriptor();
+                Arc::new(LiveSection::open_with_raw_validator(
+                    descriptor.name,
+                    AtomicJsonStore::<McpSection>::new(
+                        data_dir.join(descriptor.file_name),
+                        SECTION_SCHEMA_VERSION,
+                    ),
+                    McpSection::default(),
+                    validate_mcp,
+                    validate_ordinary_mcp_section_raw,
+                )?)
+            },
             tools_skills: open!(ToolsSkills, ToolsSkillsSection, validate_tools_skills),
             memory: open!(Memory, MemorySection, validate_memory),
             subagents: open!(Subagents, SubagentsSection, validate_subagents),
@@ -4459,7 +4930,7 @@ impl SectionRegistry {
             SectionId::Hooks => Some(self.hooks.mark_runtime_degraded(message)),
             SectionId::ModelPolicy => Some(self.model_policy.mark_runtime_degraded(message)),
             SectionId::ModelLimits => Some(self.model_limits.mark_runtime_degraded(message)),
-            SectionId::Credentials => None,
+            SectionId::Credentials => Some(self.credentials.mark_runtime_degraded(message)),
         }
     }
 
@@ -4567,6 +5038,8 @@ pub(crate) fn load_durable_effective_section_snapshot_under_migration_lock(
 /// Effective compatibility facade assembled from immutable section snapshots.
 pub struct ConfigFacade {
     registry: Arc<SectionRegistry>,
+    data_dir: PathBuf,
+    startup_legacy_root: Mutex<Option<LegacyRootReconciliationOutcome>>,
 }
 
 impl ConfigFacade {
@@ -4601,13 +5074,121 @@ impl ConfigFacade {
             })?;
         Ok(Self {
             registry: Arc::new(registry),
+            data_dir: data_dir.to_path_buf(),
+            startup_legacy_root: Mutex::new(None),
         })
     }
 
     pub fn open_or_migrate(data_dir: impl AsRef<Path>) -> ConfigStoreResult<Self> {
-        migrate_config_facade_layout(data_dir.as_ref())?;
-        migrate_copilot_oauth_cache(data_dir.as_ref())?;
-        Self::open(data_dir)
+        let data_dir = data_dir.as_ref();
+        // Recovery-only pass first: a valid completed marker can coexist with
+        // a crash-window Pending manifest. Resolve that state before making
+        // the one-way initial-vs-completed authority classification.
+        for _ in 0..4 {
+            if !crate::recover_pending_config_transaction(data_dir)? {
+                break;
+            }
+        }
+        if modular_authority_boundary_present(data_dir)?
+            && !has_completed_section_layout_marker(data_dir)?
+        {
+            return Err(crate::ConfigStoreError::Validation(
+                "modular configuration authority evidence is incomplete; legacy fallback is forbidden"
+                    .to_string(),
+            ));
+        }
+        // A valid completion marker makes this call recovery/repair-only;
+        // `migrate_config_facade_layout` branches before reading any legacy
+        // root input. Without the marker it performs the one-time split.
+        migrate_config_facade_layout(data_dir)?;
+        // This migration can advance the credential section. Complete it
+        // before capturing the startup registry so the returned facade never
+        // owns a stale pre-migration credential snapshot.
+        migrate_copilot_oauth_cache(data_dir)?;
+        let completed_marker = has_completed_section_layout_marker(data_dir)?;
+        let completed = completed_layout_allows_legacy_root_reconciliation(data_dir)?;
+        let mut startup = None::<LegacyRootReconciliationOutcome>;
+        let active = section_layout_is_active(data_dir)?;
+        if completed_marker && !active && !completed {
+            return Err(crate::ConfigStoreError::Validation(
+                "completed modular configuration evidence is inconsistent; legacy fallback is forbidden"
+                    .to_string(),
+            ));
+        }
+        let startup_registry = if completed && !active {
+            let (registry, outcome) =
+                crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+                    let registry = SectionRegistry::open_configured(data_dir, true)?;
+                    let outcome =
+                        reconcile_reappeared_legacy_root_locked(data_dir, Some(&registry))?
+                            .ok_or_else(|| {
+                                crate::ConfigStoreError::Validation(
+                                    "completed modular configuration reconciliation is unavailable"
+                                        .to_string(),
+                                )
+                            })?;
+                    Ok((registry, outcome))
+                })?;
+            startup = Some(outcome);
+            Some(registry)
+        } else {
+            None
+        };
+        let facade = match startup_registry {
+            Some(registry) => Self {
+                registry: Arc::new(registry),
+                data_dir: data_dir.to_path_buf(),
+                startup_legacy_root: Mutex::new(None),
+            },
+            None => Self::open(data_dir)?,
+        };
+        let mut startup = match startup {
+            Some(startup) => Some(startup),
+            None => current_legacy_root_reconciliation_outcome(data_dir)?
+                .filter(|outcome| !outcome.committed.is_empty() || !outcome.rejected.is_empty()),
+        };
+        if let Some(outcome) = startup.as_mut() {
+            let stale = outcome
+                .committed
+                .iter()
+                .filter_map(|event| {
+                    let ConfigSectionEvent::Changed { section, revision } = event else {
+                        return None;
+                    };
+                    let id = SectionId::from_name(section)?;
+                    let envelope = facade.registry.envelope_value(id).ok()?;
+                    (envelope.revision != *revision
+                        || envelope.status != SectionStatus::Healthy
+                        || !legacy_root_publication_matches_durable(data_dir, event)
+                            .unwrap_or(false))
+                    .then(|| (id, event.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (id, event) in stale {
+                if reject_stale_legacy_root_publication(data_dir, &event)? {
+                    outcome.committed.retain(|candidate| candidate != &event);
+                    outcome.rejected.push(LegacyRootSectionRejection {
+                        section: id,
+                        reason: LegacyRootRejectionReason::RevisionConflict,
+                    });
+                    outcome.guard_advanced = false;
+                }
+            }
+            outcome.rejected.sort_by_key(|rejection| rejection.section);
+            outcome.rejected.dedup_by_key(|rejection| rejection.section);
+            for rejection in &outcome.rejected {
+                facade
+                    .registry
+                    .mark_runtime_degraded(rejection.section, rejection.reason.diagnostic());
+            }
+        }
+        if let Some(outcome) = startup {
+            *facade
+                .startup_legacy_root
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+        }
+        Ok(facade)
     }
 
     pub fn registry(&self) -> &Arc<SectionRegistry> {
@@ -4616,6 +5197,32 @@ impl ConfigFacade {
 
     pub fn effective_config(&self) -> Config {
         self.registry.projection().into_config()
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Consume the boot-time reconciliation handoff. The server publishes
+    /// these section outcomes only after the corresponding initial runtimes
+    /// have been installed.
+    pub fn take_startup_legacy_root_reconciliation(
+        &self,
+    ) -> Option<LegacyRootReconciliationOutcome> {
+        self.startup_legacy_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Reconcile a compatibility-root generation through this process's live
+    /// section registry. Successful CAS writes therefore install the exact
+    /// committed snapshot before the server builds and publishes its runtime;
+    /// a later external typed revision remains queued for the normal watcher.
+    pub fn reconcile_reappeared_legacy_root(
+        &self,
+    ) -> ConfigStoreResult<Option<LegacyRootReconciliationOutcome>> {
+        reconcile_reappeared_legacy_root_with_registry(&self.data_dir, Some(&self.registry))
     }
 
     /// Publish the exact cluster-fabric snapshot installed by the credential
@@ -5419,7 +6026,6 @@ fn capture_layout_member_states(
 fn layout_not_committed() -> crate::ConfigStoreError {
     crate::ConfigStoreError::Validation("modular configuration layout is not committed".to_string())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8012,6 +8618,100 @@ mod tests {
     }
 
     #[test]
+    fn locked_pending_split_rechecks_root_changed_after_snapshot() {
+        use crate::credential_migration::{
+            install_section_split_migration_with_fault,
+            set_facade_recovery_after_snapshot_test_hook, SectionSplitTestFault,
+        };
+
+        let _key = crate::encryption::set_test_encryption_key([74; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"server": {"port": 21_002}}),
+        );
+        let plan = plan_config_facade_layout(dir.path()).unwrap();
+        assert!(install_section_split_migration_with_fault(
+            dir.path(),
+            plan,
+            SectionSplitTestFault::Manifest,
+        )
+        .is_err());
+        let raced_root = br#"{
+            "server": {"port": 29995},
+            "connect": {"platforms": "invalid"}
+        }"#;
+        let raced_root_for_hook = raced_root.to_vec();
+        set_facade_recovery_after_snapshot_test_hook(dir.path(), move |data_dir| {
+            std::fs::write(data_dir.join("config.json"), raced_root_for_hook).unwrap();
+        });
+
+        assert!(migrate_config_facade_layout(dir.path()).is_err());
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json")).unwrap(),
+            raced_root
+        );
+        migrate_config_facade_layout(dir.path())
+            .expect("an established modular boundary must not reauthorize the raced root");
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .effective_config()
+                .server
+                .port,
+            21_002
+        );
+    }
+
+    #[test]
+    fn pending_split_with_modular_quorum_never_reopens_legacy_root() {
+        use crate::credential_migration::{
+            install_section_split_migration_with_fault, SectionSplitTestFault,
+        };
+
+        let _key = crate::encryption::set_test_encryption_key([73; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({"server": {"port": 21_001}}),
+        );
+        let plan = plan_config_facade_layout(dir.path()).unwrap();
+        assert!(install_section_split_migration_with_fault(
+            dir.path(),
+            plan,
+            SectionSplitTestFault::LayoutMarker,
+        )
+        .is_err());
+
+        std::fs::remove_file(dir.path().join(SECTION_LAYOUT_FILE)).unwrap();
+        assert!(modular_authority_boundary_present(dir.path()).unwrap());
+        assert!(!has_completed_section_layout_marker(dir.path()).unwrap());
+        let hostile_root = br#"{
+            "server": {"port": 29994},
+            "connect": {"platforms": "invalid"},
+            "oauth_client_secret_value": "must-never-be-read"
+        }"#;
+        std::fs::write(dir.path().join("config.json"), hostile_root).unwrap();
+
+        let recovered = migrate_config_facade_layout(dir.path()).unwrap();
+        assert!(recovered.resumed);
+        assert!(has_completed_section_layout_marker(dir.path()).unwrap());
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json")).unwrap(),
+            hostile_root
+        );
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .effective_config()
+                .server
+                .port,
+            21_001
+        );
+    }
+
+    #[test]
     fn connect_secret_preflight_is_zero_write_even_with_other_legacy_secrets() {
         let _key = crate::encryption::set_test_encryption_key([81; 32]);
         let dir = TempDir::new().unwrap();
@@ -10220,4 +10920,3611 @@ mod tests {
         assert_eq!(durable.registry().core.snapshot().revision, core_before);
         assert_ne!(durable.effective_config().server.port, 22_223);
     }
+
+    #[test]
+    fn reappeared_root_reconciles_independent_sections_preserves_bytes_and_deduplicates() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let root = br#"{
+  "server": { "port": 23456 },
+  "memory": { "background_model": "legacy-memory-model" },
+  "future_owner": { "opaque": "must-stay-only-in-root" }
+}
+"#;
+        std::fs::write(dir.path().join("config.json"), root).unwrap();
+        assert!(!section_layout_is_active(dir.path()).unwrap());
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .expect("completed layout uses the reconciliation path");
+        assert!(outcome.guard_advanced);
+        assert!(!outcome.duplicate);
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(
+            outcome
+                .committed
+                .iter()
+                .map(|event| match event {
+                    ConfigSectionEvent::Changed { section, .. } => section.as_str(),
+                    _ => panic!("successful reconciliation emits changed events"),
+                })
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["core", "memory"])
+        );
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        assert!(section_layout_is_active(dir.path()).unwrap());
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.effective_config().server.port, 23_456);
+        assert_eq!(
+            reopened
+                .effective_config()
+                .memory()
+                .as_ref()
+                .and_then(|memory| memory.background_model.as_deref()),
+            Some("legacy-memory-model")
+        );
+        assert!(!reopened
+            .effective_config()
+            .extra
+            .contains_key("future_owner"));
+        let status =
+            std::fs::read_to_string(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE)).unwrap();
+        assert!(!status.contains("must-stay-only-in-root"));
+        assert!(!status.contains("future_owner"));
+
+        for event in &outcome.committed {
+            assert!(acknowledge_legacy_root_publication(dir.path(), event).unwrap());
+        }
+
+        let duplicate = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .expect("the guarded root remains a recognized generation");
+        assert!(duplicate.duplicate);
+        assert!(duplicate.committed.is_empty());
+        assert!(duplicate.rejected.is_empty());
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .registry()
+                .core
+                .snapshot()
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn reappeared_root_allows_safe_core_provider_and_mcp_drift() {
+        let core_dir = TempDir::new().unwrap();
+        let core_facade = ConfigFacade::open_or_migrate(core_dir.path()).unwrap();
+        let core_snapshot = core_facade.registry().core.snapshot();
+        let mut core = core_snapshot.data.as_ref().clone();
+        core.proxy_auth_credential_ref =
+            Some(crate::CredentialRef::parse("proxy.safe.auth").unwrap());
+        core.server
+            .extra
+            .insert("vendor_api_key_configured".to_string(), json!(true));
+        core.server.extra.insert(
+            "vendor_api_key_credential_ref".to_string(),
+            json!("vendor.safe.api_key"),
+        );
+        core_facade
+            .registry()
+            .core
+            .commit(core_snapshot.revision, core)
+            .unwrap();
+        std::fs::write(
+            core_dir.path().join("config.json"),
+            br#"{"proxy_auth_credential_ref":"proxy.safe.auth","server":{"port":23458,"vendor_api_key_configured":true,"vendor_api_key_credential_ref":"vendor.safe.api_key"}}"#,
+        )
+        .unwrap();
+
+        let core_outcome = reconcile_reappeared_legacy_root(core_dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            core_outcome.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "core".to_string(),
+                revision: 2,
+            }]
+        );
+        let core_restarted = ConfigFacade::open(core_dir.path()).unwrap();
+        assert_eq!(core_restarted.effective_config().server.port, 23_458);
+        assert_eq!(
+            core_restarted.effective_config().proxy_auth_credential_ref,
+            Some(crate::CredentialRef::parse("proxy.safe.auth").unwrap())
+        );
+
+        let section_dir = TempDir::new().unwrap();
+        let section_facade = ConfigFacade::open_or_migrate(section_dir.path()).unwrap();
+        let providers = section_facade
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        let mut provider_data = providers.data;
+        provider_data["provider"] = json!("openai");
+        provider_data["provider_instances"]["token"] = json!({
+            "provider_type": "openai",
+            "model": "gpt-authoritative",
+            "credential_ref": "provider.token.api_key"
+        });
+        section_facade
+            .registry()
+            .providers
+            .commit(
+                providers.revision,
+                serde_json::from_value(provider_data).unwrap(),
+            )
+            .unwrap();
+        let mcp = section_facade
+            .registry()
+            .envelope_value(SectionId::Mcp)
+            .unwrap();
+        section_facade
+            .registry()
+            .mcp
+            .commit(
+                mcp.revision,
+                serde_json::from_value(json!({
+                    "TOKEN": {
+                        "command": "unused-safe-command",
+                        "disabled": true,
+                        "env_credential_refs": {"TOKEN": "mcp.TOKEN.env_TOKEN"}
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        std::fs::write(
+            section_dir.path().join("config.json"),
+            serde_json::to_vec(&json!({
+                "provider": "openai",
+                "provider_instances": {
+                    "token": {
+                        "provider_type": "openai",
+                        "model": "gpt-safe-drift",
+                        "credential_ref": "provider.token.api_key"
+                    }
+                },
+                "mcpServers": {
+                    "TOKEN": {
+                        "command": "unused-safe-command",
+                        "args": ["--safe-drift"],
+                        "env_credential_refs": {"TOKEN": "mcp.TOKEN.env_TOKEN"},
+                        "disabled": true
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = reconcile_reappeared_legacy_root(section_dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome
+                .committed
+                .iter()
+                .map(|event| match event {
+                    ConfigSectionEvent::Changed { section, .. } => section.as_str(),
+                    _ => panic!("safe reconciliation emits changed events"),
+                })
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["mcp", "providers"])
+        );
+        let restarted = ConfigFacade::open(section_dir.path()).unwrap();
+        assert_eq!(
+            restarted
+                .effective_config()
+                .provider_instances
+                .get("token")
+                .and_then(|provider| provider.model.as_deref()),
+            Some("gpt-safe-drift")
+        );
+        let mcp = restarted.registry().envelope_value(SectionId::Mcp).unwrap();
+        assert_eq!(mcp.data["TOKEN"]["args"], json!(["--safe-drift"]));
+        assert_eq!(
+            mcp.data["TOKEN"]["env_credential_refs"]["TOKEN"],
+            "mcp.TOKEN.env_TOKEN"
+        );
+    }
+
+    #[test]
+    fn reappeared_root_allows_exact_model_policy_mask_pattern() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let root = serde_json::to_vec(&json!({
+            "keyword_masking": {
+                "entries": [{"pattern": "***", "match_type": "exact"}]
+            }
+        }))
+        .unwrap();
+        std::fs::write(dir.path().join("config.json"), &root).unwrap();
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(
+            outcome.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "model-policy".to_string(),
+                revision: 1,
+            }]
+        );
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        let policy = ConfigFacade::open(dir.path())
+            .unwrap()
+            .registry()
+            .envelope_value(SectionId::ModelPolicy)
+            .unwrap();
+        assert_eq!(
+            policy.data["keyword_masking"]["entries"][0]["pattern"],
+            "***"
+        );
+    }
+
+    #[test]
+    fn runtime_degraded_root_publication_is_carried_until_a_clean_distinct_replacement_commits() {
+        #[derive(Clone, Copy)]
+        enum Replacement {
+            Omitted,
+            Same,
+            Invalid,
+            Distinct,
+        }
+
+        for replacement in [
+            Replacement::Omitted,
+            Replacement::Same,
+            Replacement::Invalid,
+            Replacement::Distinct,
+        ] {
+            let dir = TempDir::new().unwrap();
+            ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let first_mcp = json!({
+                "root-first": {
+                    "command": "unused-first-command",
+                    "disabled": true
+                }
+            });
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&json!({"mcpServers": first_mcp})).unwrap(),
+            )
+            .unwrap();
+            let first = reconcile_reappeared_legacy_root(dir.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                first.committed,
+                vec![ConfigSectionEvent::Changed {
+                    section: "mcp".to_string(),
+                    revision: 1,
+                }]
+            );
+            let invalid = ConfigSectionEvent::Invalid {
+                section: "mcp".to_string(),
+                revision: 1,
+            };
+            assert!(mark_legacy_root_publication_runtime_degraded(dir.path(), &invalid).unwrap());
+
+            let next_root = match replacement {
+                Replacement::Omitted => json!({"server": {"port": 24501}}),
+                Replacement::Same => json!({
+                    "server": {"port": 24502},
+                    "mcpServers": first_mcp
+                }),
+                Replacement::Invalid => json!({
+                    "server": {"port": 24503},
+                    "mcpServers": {
+                        "root-next": {
+                            "command": "unused-next-command",
+                            "disabled": true,
+                            "access_token_value": "must-not-cross"
+                        }
+                    }
+                }),
+                Replacement::Distinct => json!({
+                    "server": {"port": 24504},
+                    "mcpServers": {
+                        "root-next": {
+                            "command": "unused-next-command",
+                            "disabled": true
+                        }
+                    }
+                }),
+            };
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&next_root).unwrap(),
+            )
+            .unwrap();
+            let outcome = reconcile_reappeared_legacy_root(dir.path())
+                .unwrap()
+                .unwrap();
+            let mcp = ConfigFacade::open(dir.path())
+                .unwrap()
+                .registry()
+                .envelope_value(SectionId::Mcp)
+                .unwrap();
+
+            match replacement {
+                Replacement::Distinct => {
+                    assert_eq!(mcp.revision, 2);
+                    assert!(outcome.committed.contains(&ConfigSectionEvent::Changed {
+                        section: "mcp".to_string(),
+                        revision: 2,
+                    }));
+                    assert!(!acknowledge_legacy_root_publication(
+                        dir.path(),
+                        &ConfigSectionEvent::Recovered {
+                            section: "mcp".to_string(),
+                            revision: 2,
+                        },
+                    )
+                    .unwrap());
+                }
+                Replacement::Invalid => {
+                    assert_eq!(mcp.revision, 1);
+                    assert!(outcome.committed.iter().all(|event| !matches!(
+                        event,
+                        ConfigSectionEvent::Changed { section, revision }
+                            if section == "mcp" && *revision == 2
+                    )));
+                    assert!(outcome
+                        .rejected
+                        .iter()
+                        .any(|rejection| rejection.section == SectionId::Mcp));
+                    assert!(outcome.committed.iter().any(|event| matches!(
+                        event,
+                        ConfigSectionEvent::Changed { section, revision }
+                            if section == "core" && *revision == 1
+                    )));
+                    assert!(!acknowledge_legacy_root_publication(
+                        dir.path(),
+                        &ConfigSectionEvent::Recovered {
+                            section: "mcp".to_string(),
+                            revision: 1,
+                        },
+                    )
+                    .unwrap());
+                    assert!(has_pending_legacy_root_publications(dir.path()).unwrap());
+                    assert!(acknowledge_legacy_root_publication(
+                        dir.path(),
+                        &ConfigSectionEvent::Changed {
+                            section: "core".to_string(),
+                            revision: 1,
+                        },
+                    )
+                    .unwrap());
+
+                    std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+                    let clean = reconcile_reappeared_legacy_root(dir.path())
+                        .unwrap()
+                        .unwrap();
+                    let recovered = ConfigSectionEvent::Recovered {
+                        section: "mcp".to_string(),
+                        revision: 1,
+                    };
+                    assert!(
+                        clean.committed.contains(&recovered),
+                        "clean committed: {:?}; rejected: {:?}",
+                        clean.committed,
+                        clean.rejected
+                    );
+                    assert!(clean.rejected.is_empty());
+                    assert!(acknowledge_legacy_root_publication(dir.path(), &recovered).unwrap());
+                }
+                Replacement::Omitted | Replacement::Same => {
+                    assert_eq!(mcp.revision, 1);
+                    assert!(outcome.committed.contains(&ConfigSectionEvent::Recovered {
+                        section: "mcp".to_string(),
+                        revision: 1,
+                    }));
+                    assert!(outcome.committed.iter().any(|event| matches!(
+                        event,
+                        ConfigSectionEvent::Changed { section, revision }
+                            if section == "core" && *revision == 1
+                    )));
+                    assert!(!acknowledge_legacy_root_publication(
+                        dir.path(),
+                        &ConfigSectionEvent::Changed {
+                            section: "mcp".to_string(),
+                            revision: 1,
+                        },
+                    )
+                    .unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_credential_context_rejects_generic_payload_but_allows_model_sibling() {
+        for field in ["value", "fallback"] {
+            let dir = TempDir::new().unwrap();
+            let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let envelope = facade
+                .registry()
+                .envelope_value(SectionId::Providers)
+                .unwrap();
+            let mut providers = envelope.data;
+            providers["openai"] = json!({
+                "credential_ref": "provider.openai.api_key",
+                "model": "gpt-authoritative"
+            });
+            facade
+                .registry()
+                .providers
+                .commit(
+                    envelope.revision,
+                    serde_json::from_value(providers).unwrap(),
+                )
+                .unwrap();
+            let secret = format!("plain-{field}-secret");
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&json!({"providers": {"openai": {field: secret}}})).unwrap(),
+            )
+            .unwrap();
+
+            let outcome = reconcile_reappeared_legacy_root(dir.path())
+                .unwrap()
+                .unwrap();
+
+            assert!(outcome.committed.is_empty());
+            assert_eq!(
+                outcome.rejected,
+                vec![LegacyRootSectionRejection {
+                    section: SectionId::Providers,
+                    reason: LegacyRootRejectionReason::CredentialMaterial,
+                }]
+            );
+            let typed = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
+            let diagnostic =
+                std::fs::read_to_string(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE)).unwrap();
+            assert!(!typed.contains(&secret));
+            assert!(!diagnostic.contains(&secret));
+        }
+
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = facade
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        let mut providers = envelope.data;
+        providers["openai"] = json!({
+            "credential_ref": "provider.openai.api_key",
+            "model": "gpt-authoritative"
+        });
+        facade
+            .registry()
+            .providers
+            .commit(
+                envelope.revision,
+                serde_json::from_value(providers).unwrap(),
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&json!({
+                "providers": {"openai": {
+                    "credential_ref": "provider.openai.api_key",
+                    "model": "gpt-safe-sibling"
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(outcome.committed.len(), 1);
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .effective_config()
+                .providers()
+                .openai
+                .as_ref()
+                .and_then(|provider| provider.model.as_deref()),
+            Some("gpt-safe-sibling")
+        );
+    }
+
+    #[test]
+    fn reappeared_root_rejects_cluster_credentials_masks_and_alias_ambiguity_per_owner() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let root = br#"{
+  "server": { "port": 23457 },
+  "cluster_fabric": { "health_interval_secs": 31 },
+  "providers": { "openai": { "model": "gpt-safe", "api_key": "plaintext" } },
+  "tools": { "disabled": ["****...****"] },
+  "mcp": {},
+  "mcpServers": {}
+}
+"#;
+        std::fs::write(dir.path().join("config.json"), root).unwrap();
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome
+                .committed
+                .iter()
+                .map(|event| match event {
+                    ConfigSectionEvent::Changed { section, .. } => section.as_str(),
+                    _ => panic!("successful reconciliation emits changed events"),
+                })
+                .collect::<Vec<_>>(),
+            vec!["core"]
+        );
+        let rejected = outcome
+            .rejected
+            .iter()
+            .map(|rejection| (rejection.section, rejection.reason))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            rejected.get(&SectionId::ClusterFabric),
+            Some(&LegacyRootRejectionReason::DedicatedAuthority)
+        );
+        assert_eq!(
+            rejected.get(&SectionId::Providers),
+            Some(&LegacyRootRejectionReason::CredentialMaterial)
+        );
+        assert_eq!(
+            rejected.get(&SectionId::ToolsSkills),
+            Some(&LegacyRootRejectionReason::CredentialMaterial)
+        );
+        assert_eq!(
+            rejected.get(&SectionId::Mcp),
+            Some(&LegacyRootRejectionReason::AmbiguousAlias)
+        );
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        migrate_config_facade_layout(dir.path())
+            .expect("completed layout repair must not parse or adopt the rejected root");
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        let reopened = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(reopened.effective_config().server.port, 23_457);
+        assert!(reopened.effective_config().cluster_fabric.is_empty());
+        assert!(reopened.effective_config().providers().openai.is_none());
+        for id in [
+            SectionId::ClusterFabric,
+            SectionId::Providers,
+            SectionId::ToolsSkills,
+            SectionId::Mcp,
+        ] {
+            let envelope = reopened.registry().envelope_value(id).unwrap();
+            assert_eq!(envelope.status, SectionStatus::Degraded, "{id:?}");
+            assert_eq!(envelope.revision, 0, "{id:?}");
+        }
+        assert!(reopened.registry().credentials.statuses().is_empty());
+        let ordinary = ["providers.json", "tools-skills.json", "mcp.json"]
+            .into_iter()
+            .map(|name| std::fs::read_to_string(dir.path().join(name)).unwrap())
+            .collect::<String>();
+        for forbidden in ["plaintext", "****", "credential_ref", "api_key"] {
+            assert!(!ordinary.contains(forbidden));
+        }
+        let status =
+            std::fs::read_to_string(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE)).unwrap();
+        for forbidden in ["plaintext", "****", "gpt-safe"] {
+            assert!(!status.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn reappeared_root_rejects_secret_shaped_known_and_unknown_fragments_without_leak() {
+        let cases = [
+            json!({"server": {"vendor_api_key": "sk-known"}}),
+            json!({"vendor_api_key": "sk-unknown"}),
+            json!({"server": {"vendor_private_key": "private-known"}}),
+            json!({"server": {"vendor_secret_key": "secret-key-known"}}),
+            json!({"server": {"vendor_password_hash": "hash-known"}}),
+            json!({"server": {"vendor_token_salt": "salt-known"}}),
+            json!({"server": {"authorization": "Bearer raw-auth"}}),
+            json!({"server": {"authorization_header": "Bearer auth-header-secret"}}),
+            json!({"server": {"cookie_header": "session=cookie-header-secret"}}),
+            json!({"server": {"vendorapikey": "lower-vendor-api-key-secret"}}),
+            json!({"server": {"apikeyvalue": "lower-api-key-value-secret"}}),
+            json!({"server": {"authorizationheader": "Bearer lower-auth-header-secret"}}),
+            json!({"server": {"signingkey": "lower-signing-key-secret"}}),
+            json!({"server": {"callback_url": "https://alice:plain-secret@example.test/hook"}}),
+            json!({"server": {"auth": {"value": "nested-auth-secret"}}}),
+            json!({"server": {"basic_auth": {"literal": "nested-basic-secret"}}}),
+            json!({"server": {"authentication": {"value": "nested-authentication-secret"}}}),
+            json!({"server": {"authentication": "direct-authentication-secret"}}),
+            json!({"server": {"auth": ["array-auth-secret"]}}),
+            json!({"server": {"extra": {"oauth_client_secret_value": "oauth-secret-value"}}}),
+            json!({"server": {"extra": {"access_token_value": "access-token-secret"}}}),
+            json!({"server": {"extra": {"client_password_value": "client-password-secret"}}}),
+            json!({"server": {"extra": {"ciphertext_value": "ciphertext-secret"}}}),
+            json!({"server": {"extra": {"encrypted_value": "encrypted-secret"}}}),
+            json!({"server": {"extra": {"foo_encrypted_value": "foo-encrypted-secret"}}}),
+            json!({"server": {"extra": {"private_value": "private-value-secret"}}}),
+            json!({"server": {"extra": {"access_value": "access-value-secret"}}}),
+            json!({"server": {"extra": {"privateValue": "camel-private-secret"}}}),
+            json!({"server": {"extra": {"accessValue": "camel-access-secret"}}}),
+            json!({"server": {"extra": {"tokenValue": "camel-token-secret"}}}),
+            json!({"server": {"extra": {"authValue": "camel-auth-secret"}}}),
+            json!({"server": {"extra": {"clientTokenValue": "camel-client-token-secret"}}}),
+            json!({"server": {"extra": {"oauth": {"value": "oauth-context-secret"}}}}),
+            json!({"server": {"extra": {"bearer": {"value": "bearer-context-secret"}}}}),
+            json!({"server": {"extra": {"auth_provider": {"value": "metadata-container-secret"}}}}),
+            json!({"server": {"extra": {"credential_refs": {"work": {"value": "structured-ref-secret"}}}}}),
+        ];
+        for (index, root) in cases.into_iter().enumerate() {
+            let dir = TempDir::new().unwrap();
+            ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let root_bytes = serde_json::to_vec(&root).unwrap();
+            std::fs::write(dir.path().join("config.json"), &root_bytes).unwrap();
+
+            let outcome = reconcile_reappeared_legacy_root(dir.path())
+                .unwrap()
+                .unwrap();
+
+            assert!(outcome.committed.is_empty(), "case {index}");
+            assert_eq!(
+                outcome.rejected,
+                vec![LegacyRootSectionRejection {
+                    section: SectionId::Core,
+                    reason: LegacyRootRejectionReason::CredentialMaterial,
+                }],
+                "case {index}"
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("config.json")).unwrap(),
+                root_bytes
+            );
+            let core = std::fs::read_to_string(dir.path().join("core.json")).unwrap();
+            let status =
+                std::fs::read_to_string(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE)).unwrap();
+            for secret in [
+                "sk-known",
+                "sk-unknown",
+                "private-known",
+                "secret-key-known",
+                "hash-known",
+                "salt-known",
+                "raw-auth",
+                "auth-header-secret",
+                "cookie-header-secret",
+                "lower-vendor-api-key-secret",
+                "lower-api-key-value-secret",
+                "lower-auth-header-secret",
+                "lower-signing-key-secret",
+                "plain-secret",
+                "nested-auth-secret",
+                "nested-basic-secret",
+                "nested-authentication-secret",
+                "direct-authentication-secret",
+                "array-auth-secret",
+                "oauth-secret-value",
+                "access-token-secret",
+                "client-password-secret",
+                "ciphertext-secret",
+                "encrypted-secret",
+                "foo-encrypted-secret",
+                "private-value-secret",
+                "access-value-secret",
+                "camel-private-secret",
+                "camel-access-secret",
+                "camel-token-secret",
+                "camel-auth-secret",
+                "camel-client-token-secret",
+                "oauth-context-secret",
+                "bearer-context-secret",
+                "metadata-container-secret",
+                "structured-ref-secret",
+                "vendor_api_key",
+                "vendor_private_key",
+                "authorization_header",
+                "cookie_header",
+                "vendorapikey",
+                "apikeyvalue",
+                "authorizationheader",
+                "signingkey",
+                "oauth_client_secret_value",
+                "access_token_value",
+                "client_password_value",
+                "ciphertext_value",
+                "encrypted_value",
+                "foo_encrypted_value",
+                "private_value",
+                "access_value",
+                "privateValue",
+                "accessValue",
+                "tokenValue",
+                "authValue",
+                "clientTokenValue",
+                "auth_provider",
+            ] {
+                assert!(!core.contains(secret), "case {index}: {secret}");
+                assert!(!status.contains(secret), "case {index}: {secret}");
+            }
+            let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let core = restarted.registry().core.snapshot();
+            assert_eq!(core.revision, 0, "case {index}");
+            assert_eq!(core.status, SectionStatus::Degraded, "case {index}");
+        }
+    }
+
+    #[test]
+    fn credential_key_tokenization_preserves_safe_metadata_and_words() {
+        let safe = json!({
+            "tokenizerValue": "sentence-piece",
+            "authoredValue": "documentation",
+            "credential-server": {"command": "node"},
+            "credentialserver": {"command": "node"},
+            "auth_provider": {
+                "name": "openai",
+                "url": "https://api.example.test",
+                "model": "gpt-safe",
+                "credential_refs": {"TOKEN": "provider.safe.api_key"}
+            },
+            "authprovider": {"name": "openai", "model": "gpt-safe"},
+            "auth": {
+                "method": "password",
+                "name": "public-auth-shape",
+                "client_id": "public-client",
+                "callbackUrl": "https://auth.example.test/callback"
+            },
+            "codex_auth_mode": "custom",
+            "codexauthmode": "custom",
+            "token_env": "WORKER_TOKEN",
+            "tokenenv": "WORKER_TOKEN",
+            "private_mode": "ephemeral",
+            "codex_network_access": true,
+            "authorization_url": "https://auth.example.test",
+            "oauth_client_id": "public-client-id",
+            "auth_method": "pkce",
+            "cookie_domain": "example.test",
+            "credential_ref": "provider.work.api_key",
+            "credential_refs": {
+                "string": "provider.work.api_key",
+                "structured": {"kind": "env_ref", "path": "WORKER_TOKEN", "name": "worker"}
+            },
+            "configured": true
+        });
+        assert!(!raw_reconciliation_secret_material_is_forbidden(&safe));
+        validate_ordinary_section_json(&safe).unwrap();
+
+        for suffix in SAFE_CREDENTIAL_METADATA_SUFFIXES {
+            let key = format!("auth_{suffix}");
+            assert!(!credential_context_key(&key), "safe metadata key {key}");
+            assert!(
+                credential_metadata_container_key(&key),
+                "credential-adjacent metadata container {key}"
+            );
+        }
+        for suffix in ["header", "headers", "value", "literal", "fallback"] {
+            let key = format!("authorization_{suffix}");
+            assert!(credential_context_key(&key), "credential payload key {key}");
+        }
+
+        for forbidden in [
+            json!({"tokenValue": "plain"}),
+            json!({"AuthValue": "plain"}),
+            json!({"client-token-value": "plain"}),
+            json!({"auth": "plain"}),
+            json!({"authentication": "plain"}),
+            json!({"private": "plain"}),
+            json!({"access": "plain"}),
+            json!({"ciphertext": "plain"}),
+            json!({"encrypted": "plain"}),
+            json!({"api_key_value": "plain"}),
+            json!({"apiKeyValue": "plain"}),
+            json!({"authorizationValue": "plain"}),
+            json!({"vendorapikey": "plain"}),
+            json!({"apikeyvalue": "plain"}),
+            json!({"authorizationheader": "plain"}),
+            json!({"signingkey": "plain"}),
+            json!({"cookieValue": "plain"}),
+            json!({"passphraseValue": "plain"}),
+            json!({"signingKeyValue": "plain"}),
+            json!({"encryptionKeyValue": "plain"}),
+            json!({"deviceKeyValue": "plain"}),
+            json!({"oauth": {"value": "plain"}}),
+            json!({"Bearer": {"fallback": "plain"}}),
+            json!({"auth_provider": {"value": "plain"}}),
+            json!({"authprovider": {"nested": {"fallback": "plain"}}}),
+            json!({"auth_provider": {"data": "plain"}}),
+            json!({"auth_provider": {"header": "plain"}}),
+            json!({"auth_provider": {"material": "plain"}}),
+            json!({"auth": {"unknown": "plain"}}),
+            json!({"auth": {"invalid": "plain"}}),
+            json!({"credential_refs": {"work": {"value": "plain"}}}),
+            json!({"credential_refs": {"work": {"material": "plain"}}}),
+        ] {
+            assert!(raw_reconciliation_secret_material_is_forbidden(&forbidden));
+            assert!(validate_ordinary_section_json(&forbidden).is_err());
+        }
+    }
+
+    #[test]
+    fn credential_header_templates_allow_only_runtime_materialization() {
+        for expression in [
+            json!({"type": "env_ref", "name": "WORKER_TOKEN"}),
+            json!({"type": "generated", "generator": "uuid"}),
+            json!({"type": "format", "template": "Bearer {env:WORKER_TOKEN}"}),
+        ] {
+            let safe = json!({"headers": {
+                "Authorization": expression,
+                "X-Token-Budget": "1000"
+            }});
+            assert!(!raw_reconciliation_secret_material_is_forbidden(&safe));
+            validate_ordinary_section_json(&safe).unwrap();
+        }
+
+        for expression in [
+            json!({"type": "literal", "value": "Bearer plain"}),
+            json!({"type": "env_ref", "name": "WORKER_TOKEN", "fallback": "plain"}),
+        ] {
+            let forbidden = json!({"headers": {"Authorization": expression}});
+            assert!(raw_reconciliation_secret_material_is_forbidden(&forbidden));
+            assert!(validate_ordinary_section_json(&forbidden).is_err());
+        }
+    }
+
+    #[test]
+    fn raw_reconciliation_respects_identifier_maps_and_model_policy_mask_patterns() {
+        let safe_cases = [
+            (
+                SectionId::Providers,
+                json!({
+                    "provider": "openai",
+                    "provider_instances": {
+                        "token": {
+                            "provider_type": "openai",
+                            "model": "gpt-safe",
+                            "credential_ref": "provider.token.api_key"
+                        }
+                    }
+                }),
+            ),
+            (
+                SectionId::Mcp,
+                json!({
+                    "TOKEN": {
+                        "command": "unused-safe-command",
+                        "disabled": true,
+                        "env_credential_refs": {"TOKEN": "mcp.TOKEN.env_TOKEN"}
+                    }
+                }),
+            ),
+            (
+                SectionId::ModelPolicy,
+                json!({
+                    "keyword_masking": {
+                        "entries": [{"pattern": "***", "match_type": "exact"}]
+                    }
+                }),
+            ),
+        ];
+
+        for (section, value) in safe_cases {
+            assert!(
+                !raw_reconciliation_secret_material_is_forbidden_for_section(section, &value),
+                "safe {section:?} identifiers or metadata were rejected"
+            );
+        }
+        assert!(raw_reconciliation_secret_material_is_forbidden(&json!({
+            "keyword_masking": {
+                "entries": [{"pattern": "***", "match_type": "exact"}]
+            }
+        })));
+    }
+
+    #[test]
+    fn reappeared_root_cannot_mutate_credential_bearing_server_extra_subtrees() {
+        for (authority, delta, secret) in [
+            (
+                json!({"secret": true}),
+                json!({"value": "plain-secret"}),
+                "plain-secret",
+            ),
+            (
+                json!({"credential_ref": "vendor.safe.ref", "configured": true}),
+                json!({"fallback": "literal-fallback"}),
+                "literal-fallback",
+            ),
+            (
+                json!({"credential_ref": "vendor.safe.ref", "configured": true}),
+                json!({"foo": {"value": "nested-adjacent-secret"}}),
+                "nested-adjacent-secret",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let mut core = facade
+                .registry()
+                .envelope_value(SectionId::Core)
+                .unwrap()
+                .data;
+            core["server"]["vendor"] = authority.clone();
+            facade
+                .registry()
+                .commit_value(SectionId::Core, 0, core)
+                .unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&json!({"server": {"vendor": delta}})).unwrap(),
+            )
+            .unwrap();
+
+            let outcome = reconcile_reappeared_legacy_root(dir.path())
+                .unwrap()
+                .unwrap();
+
+            assert!(outcome.committed.is_empty());
+            assert_eq!(
+                outcome.rejected,
+                vec![LegacyRootSectionRejection {
+                    section: SectionId::Core,
+                    reason: LegacyRootRejectionReason::CredentialMaterial,
+                }]
+            );
+            let reopened = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let envelope = reopened.registry().envelope_value(SectionId::Core).unwrap();
+            assert_eq!(envelope.revision, 1);
+            assert_eq!(envelope.data["server"]["vendor"], authority);
+            assert!(!std::fs::read_to_string(dir.path().join("core.json"))
+                .unwrap()
+                .contains(secret));
+            assert!(
+                !std::fs::read_to_string(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE))
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+    }
+
+    #[test]
+    fn reappeared_root_cannot_bypass_broker_or_subagent_credential_authority() {
+        for (field, value, reason) in [
+            (
+                "external_broker",
+                json!({"endpoint": "ws://attacker.test:9600"}),
+                LegacyRootRejectionReason::DedicatedAuthority,
+            ),
+            (
+                "broker",
+                json!({"endpoint": "ws://alias-attacker.test:9600"}),
+                LegacyRootRejectionReason::DedicatedAuthority,
+            ),
+            (
+                "codex_provider_key_ref",
+                json!("attacker.secret.ref"),
+                LegacyRootRejectionReason::CredentialMaterial,
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let mut root = json!({"subagents": {}});
+            root["subagents"][field] = value;
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&root).unwrap(),
+            )
+            .unwrap();
+
+            let outcome = reconcile_reappeared_legacy_root(dir.path())
+                .unwrap()
+                .unwrap();
+
+            assert!(outcome.committed.is_empty());
+            assert_eq!(
+                outcome.rejected,
+                vec![LegacyRootSectionRejection {
+                    section: SectionId::Subagents,
+                    reason,
+                }]
+            );
+            let reopened = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let section = reopened.registry().subagents.snapshot();
+            assert_eq!(section.revision, 0);
+            assert_eq!(section.status, SectionStatus::Degraded);
+            assert!(reopened.effective_config().subagents().broker.is_none());
+            let typed = std::fs::read_to_string(dir.path().join("subagents.json")).unwrap();
+            let status =
+                std::fs::read_to_string(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE)).unwrap();
+            for forbidden in ["attacker.test", "alias-attacker", "attacker.secret.ref"] {
+                assert!(!typed.contains(forbidden));
+                assert!(!status.contains(forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_reappeared_root_is_acknowledged_without_wholesale_adoption() {
+        let dir = TempDir::new().unwrap();
+        let before = ConfigFacade::open_or_migrate(dir.path())
+            .unwrap()
+            .effective_config();
+        let root = b"{ invalid legacy root with token secret-value";
+        std::fs::write(dir.path().join("config.json"), root).unwrap();
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(outcome.committed.is_empty());
+        assert_eq!(
+            outcome.rejected,
+            vec![LegacyRootSectionRejection {
+                section: SectionId::Core,
+                reason: LegacyRootRejectionReason::InvalidDocument,
+            }]
+        );
+        assert!(outcome.guard_advanced);
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        migrate_config_facade_layout(dir.path())
+            .expect("completed repair must not strict-parse the rejected root");
+        let after = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(after.effective_config().server.port, before.server.port);
+        let core = after.registry().core.snapshot();
+        assert_eq!(core.status, SectionStatus::Degraded);
+        assert_eq!(core.revision, 0);
+        let mut typed = core.data.as_ref().clone();
+        typed.server.port = before.server.port.saturating_add(1);
+        assert_eq!(
+            after.registry().core.commit(core.revision, typed).unwrap(),
+            ConfigSectionEvent::Changed {
+                section: "core".to_string(),
+                revision: 1,
+            }
+        );
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let restarted_core = restarted.registry().core.snapshot();
+        assert_eq!(restarted_core.revision, 1);
+        assert_eq!(restarted_core.status, SectionStatus::Degraded);
+
+        let next_root = br#"{"server":{"port":24572}}"#;
+        std::fs::write(dir.path().join("config.json"), next_root).unwrap();
+        assert!(!section_layout_is_active(dir.path()).unwrap());
+        let next = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "core".to_string(),
+                revision: 2,
+            }]
+        );
+        assert!(!next.recovered.contains(&SectionId::Core));
+        assert!(next.rejected.is_empty());
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        let status =
+            std::fs::read_to_string(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE)).unwrap();
+        assert!(!status.contains("secret-value"));
+        assert!(!status.contains("token"));
+    }
+
+    #[test]
+    fn root_intent_recovers_a_commit_before_status_update_without_revision_two() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":24567}}"#,
+        )
+        .unwrap();
+        set_legacy_root_after_commit_test_hook(dir.path(), |_| {
+            panic!("simulated process death after section CAS")
+        });
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = reconcile_reappeared_legacy_root(dir.path());
+        }));
+        assert!(crashed.is_err());
+        assert!(
+            ConfigFacade::open_stable(dir.path(), |_| {})
+                .err()
+                .is_some(),
+            "the unacknowledged root guard remains inactive"
+        );
+
+        let recovered = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "core".to_string(),
+                revision: 1,
+            }]
+        );
+        assert!(recovered.guard_advanced);
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .registry()
+                .core
+                .snapshot()
+                .revision,
+            1
+        );
+        assert!(acknowledge_legacy_root_publication(dir.path(), &recovered.committed[0]).unwrap());
+    }
+
+    #[test]
+    fn typed_memory_writer_wins_root_cas_without_lost_update() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"memory":{"background_model":"root-loser"}}"#,
+        )
+        .unwrap();
+        let memory_path = dir.path().join("memory.json");
+        set_legacy_root_before_commit_test_hook(dir.path(), move |id| {
+            assert_eq!(id, SectionId::Memory);
+            let winner = MemoryConfig {
+                background_model: Some("typed-winner".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                AtomicJsonStore::<MemorySection>::new(memory_path, SECTION_SCHEMA_VERSION)
+                    .commit(0, MemorySection(Some(winner)), |_| Ok(()))
+                    .unwrap(),
+                1
+            );
+        });
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(outcome.committed.is_empty());
+        assert_eq!(
+            outcome.rejected,
+            vec![LegacyRootSectionRejection {
+                section: SectionId::Memory,
+                reason: LegacyRootRejectionReason::RevisionConflict,
+            }]
+        );
+        let durable = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(durable.registry().memory.snapshot().revision, 1);
+        assert_eq!(
+            durable
+                .effective_config()
+                .memory()
+                .as_ref()
+                .and_then(|memory| memory.background_model.as_deref()),
+            Some("typed-winner")
+        );
+    }
+
+    #[test]
+    fn atomic_root_rotation_and_deletion_keep_completed_layout_identity() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let marker = std::fs::read(dir.path().join(SECTION_LAYOUT_FILE)).unwrap();
+        let transaction_id = validate_completed_section_layout_marker(&marker)
+            .unwrap()
+            .transaction_id;
+        let root_store = AtomicFileStore::new(dir.path().join("config.json"));
+
+        for value in [
+            json!({"future_generation": "A"}),
+            json!({"future_generation": "B"}),
+        ] {
+            root_store.write_json(&value).unwrap();
+            let outcome = reconcile_reappeared_legacy_root(dir.path())
+                .unwrap()
+                .unwrap();
+            assert!(outcome.guard_advanced);
+            assert!(outcome.committed.is_empty());
+            assert!(section_layout_is_active(dir.path()).unwrap());
+        }
+        assert!(dir.path().join("config.json.bak").exists());
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        let missing = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(missing.guard_advanced);
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        let marker = std::fs::read(dir.path().join(SECTION_LAYOUT_FILE)).unwrap();
+        assert_eq!(
+            validate_completed_section_layout_marker(&marker)
+                .unwrap()
+                .transaction_id,
+            transaction_id
+        );
+    }
+
+    #[test]
+    fn full_safe_config_echo_only_commits_changed_core() {
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let reference = CredentialRef::parse("env.API_TOKEN").unwrap();
+        facade
+            .registry()
+            .env
+            .commit(
+                0,
+                EnvSection(vec![EnvVarEntry {
+                    name: "API_TOKEN".to_string(),
+                    value: String::new(),
+                    secret: true,
+                    value_encrypted: None,
+                    credential_ref: Some(reference),
+                    configured: true,
+                    description: None,
+                }]),
+            )
+            .unwrap();
+        let env_revision = facade.registry().env.snapshot().revision;
+        let mut root = serde_json::to_value(facade.effective_config()).unwrap();
+        root["server"]["port"] = json!(24_568);
+        root["cluster_fabric"] = json!({});
+        AtomicFileStore::new(dir.path().join("config.json"))
+            .write_json(&root)
+            .unwrap();
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(outcome.rejected.is_empty(), "{:?}", outcome.rejected);
+        assert_eq!(
+            outcome.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "core".to_string(),
+                revision: 1,
+            }]
+        );
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(reopened.effective_config().server.port, 24_568);
+        assert_eq!(reopened.registry().env.snapshot().revision, env_revision);
+        assert!(reopened.effective_config().cluster_fabric.is_empty());
+    }
+
+    #[test]
+    fn startup_rejects_stale_pending_revision_instead_of_mixing_runtime() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":24569}}"#,
+        )
+        .unwrap();
+        let first = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.committed.len(), 1);
+
+        let current = ConfigFacade::open(dir.path()).unwrap();
+        let mut core: CoreSection = serde_json::from_value(
+            current
+                .registry()
+                .envelope_value(SectionId::Core)
+                .unwrap()
+                .data,
+        )
+        .unwrap();
+        core.server.port = 24_570;
+        assert_eq!(
+            AtomicJsonStore::<CoreSection>::new(
+                dir.path().join("core.json"),
+                SECTION_SCHEMA_VERSION,
+            )
+            .commit(1, core, |_| Ok(()))
+            .unwrap(),
+            2
+        );
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(restarted.effective_config().server.port, 24_570);
+        let handoff = restarted.take_startup_legacy_root_reconciliation().unwrap();
+        assert!(handoff.committed.is_empty());
+        assert_eq!(
+            handoff.rejected,
+            vec![LegacyRootSectionRejection {
+                section: SectionId::Core,
+                reason: LegacyRootRejectionReason::RevisionConflict,
+            }]
+        );
+        assert!(section_layout_is_active(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn missing_root_restart_preserves_pending_publication_handoff() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":24571}}"#,
+        )
+        .unwrap();
+        let first = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.committed.len(), 1);
+        std::fs::remove_file(dir.path().join("config.json")).unwrap();
+        let missing = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing.committed, first.committed);
+        assert!(missing.guard_advanced);
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(restarted.effective_config().server.port, 24_571);
+        assert_eq!(
+            restarted
+                .take_startup_legacy_root_reconciliation()
+                .unwrap()
+                .committed,
+            first.committed
+        );
+    }
+
+    #[test]
+    fn deleting_rejection_status_cannot_reactivate_legacy_fallback() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let root = b"{ invalid root with password never-adopt";
+        std::fs::write(dir.path().join("config.json"), root).unwrap();
+        let rejected = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(!rejected.rejected.is_empty());
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        std::fs::remove_file(dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE)).unwrap();
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let handoff = restarted.take_startup_legacy_root_reconciliation().unwrap();
+        assert_eq!(handoff.rejected[0].section, SectionId::Core);
+        assert!(section_layout_is_active(dir.path()).unwrap());
+        assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+    }
+
+    #[test]
+    fn modular_section_set_keeps_legacy_boundary_after_control_evidence_loss() {
+        for remove_member in [false, true] {
+            let dir = TempDir::new().unwrap();
+            ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            std::fs::remove_file(dir.path().join(SECTION_LAYOUT_FILE)).unwrap();
+            std::fs::remove_file(
+                dir.path()
+                    .join(crate::credential_migration::SECTION_LAYOUT_COMPLETION_FILE),
+            )
+            .unwrap();
+            let member = dir.path().join("model_limits.json");
+            if remove_member {
+                std::fs::remove_file(member).unwrap();
+            } else {
+                std::fs::write(member, b"corrupt member").unwrap();
+            }
+            let root = br#"{"server":{"port":29991}}"#;
+            std::fs::write(dir.path().join("config.json"), root).unwrap();
+
+            assert!(modular_authority_boundary_present(dir.path()).unwrap());
+            assert!(ConfigFacade::open_or_migrate(dir.path()).is_err());
+            let loaded = Config::from_data_dir_without_env(Some(dir.path().to_path_buf()));
+            assert_ne!(loaded.server.port, 29_991);
+            let mut candidate = Config::default();
+            candidate.server.port = 29_992;
+            assert!(candidate.save_to_dir(dir.path().to_path_buf()).is_err());
+            assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        }
+    }
+
+    #[test]
+    fn corrupt_or_missing_marker_with_completion_ledger_never_reopens_legacy_authority() {
+        for remove_marker in [false, true] {
+            let dir = TempDir::new().unwrap();
+            ConfigFacade::open_or_migrate(dir.path()).unwrap();
+            let marker = dir.path().join(SECTION_LAYOUT_FILE);
+            if remove_marker {
+                std::fs::remove_file(&marker).unwrap();
+            } else {
+                std::fs::write(&marker, b"corrupt marker").unwrap();
+            }
+            let root = br#"{"server":{"port":29993}}"#;
+            std::fs::write(dir.path().join("config.json"), root).unwrap();
+
+            assert!(modular_authority_boundary_present(dir.path()).unwrap());
+            assert!(migrate_config_facade_layout(dir.path()).is_err());
+            assert!(ConfigFacade::open_or_migrate(dir.path()).is_err());
+            assert_ne!(
+                Config::from_data_dir_without_env(Some(dir.path().to_path_buf()))
+                    .server
+                    .port,
+                29_993
+            );
+            assert_eq!(std::fs::read(dir.path().join("config.json")).unwrap(), root);
+        }
+    }
+
+    #[test]
+    fn diagnostic_reconciliation_mirror_cannot_forge_pending_publication() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let forged = LegacyRootReconciliationRecord {
+            version: LEGACY_ROOT_RECONCILIATION_VERSION,
+            root_sha256: "0".repeat(64),
+            complete: true,
+            committed: BTreeMap::from([(
+                "core".to_string(),
+                LegacyRootCommittedPublication {
+                    revision: 99,
+                    candidate_sha256: "1".repeat(64),
+                    runtime_degraded: false,
+                },
+            )]),
+            planned: BTreeMap::new(),
+            rejected: vec![LegacyRootSectionRejection {
+                section: SectionId::Core,
+                reason: LegacyRootRejectionReason::CredentialMaterial,
+            }],
+            unknown_fields: 0,
+        };
+        std::fs::write(
+            dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE),
+            serde_json::to_vec_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+
+        let reopened = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+
+        assert!(reopened.take_startup_legacy_root_reconciliation().is_none());
+        assert!(
+            crate::credential_migration::read_embedded_legacy_root_reconciliation(dir.path())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reopened.registry().core.snapshot().revision, 0);
+        assert_eq!(
+            reopened.registry().core.snapshot().status,
+            SectionStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn unavailable_diagnostic_mirror_does_not_block_canonical_reconciliation() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mirror = dir.path().join(LEGACY_ROOT_RECONCILIATION_FILE);
+        if mirror.exists() {
+            std::fs::remove_file(&mirror).unwrap();
+        }
+        std::fs::create_dir(&mirror).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":29994}}"#,
+        )
+        .unwrap();
+
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome.committed.len(), 1);
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .effective_config()
+                .server
+                .port,
+            29_994
+        );
+        assert!(has_pending_legacy_root_publications(dir.path()).unwrap());
+        assert!(mirror.is_dir());
+    }
+
+    #[test]
+    fn same_revision_content_substitution_invalidates_root_publication() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":29995}}"#,
+        )
+        .unwrap();
+        let outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        let event = outcome.committed.first().unwrap().clone();
+        assert!(legacy_root_publication_matches_durable(dir.path(), &event).unwrap());
+
+        let fresh = SectionRegistry::open(dir.path()).unwrap();
+        let mut replacement = fresh.envelope_value(SectionId::Core).unwrap().data;
+        replacement["server"]["port"] = json!(29_996);
+        AtomicFileStore::new(dir.path().join("core.json"))
+            .write_json(&json!({
+                "schema_version": SECTION_SCHEMA_VERSION,
+                "revision": 1,
+                "data": replacement,
+            }))
+            .unwrap();
+
+        assert!(!legacy_root_publication_matches_durable(dir.path(), &event).unwrap());
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let handoff = restarted.take_startup_legacy_root_reconciliation().unwrap();
+        assert!(handoff.committed.is_empty());
+        assert_eq!(
+            handoff.rejected,
+            vec![LegacyRootSectionRejection {
+                section: SectionId::Core,
+                reason: LegacyRootRejectionReason::RevisionConflict,
+            }]
+        );
+    }
+
+    #[test]
+    fn root_family_rotation_after_guard_write_is_requeued() {
+        let dir = TempDir::new().unwrap();
+        ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let first = br#"{"server":{"port":29997}}"#;
+        let second = br#"{"server":{"port":29998}}"#.to_vec();
+        std::fs::write(dir.path().join("config.json"), first).unwrap();
+        crate::credential_migration::set_legacy_root_guard_after_write_test_hook(
+            dir.path(),
+            move |data_dir| {
+                std::fs::write(data_dir.join("config.json"), second).unwrap();
+            },
+        );
+
+        let first_outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(!first_outcome.guard_advanced);
+        assert!(first_outcome.partial);
+        assert_eq!(first_outcome.committed.len(), 1);
+        for event in &first_outcome.committed {
+            assert!(acknowledge_legacy_root_publication(dir.path(), event).unwrap());
+        }
+
+        let second_outcome = reconcile_reappeared_legacy_root(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(second_outcome.guard_advanced);
+        assert_eq!(second_outcome.committed.len(), 1);
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .effective_config()
+                .server
+                .port,
+            29_998
+        );
+    }
+}
+pub const LEGACY_ROOT_RECONCILIATION_FILE: &str = "config-legacy-root-reconciliation.json";
+const LEGACY_ROOT_RECONCILIATION_VERSION: u32 = 1;
+
+/// Secret-free reason persisted for a rejected field owner.  Deliberately do
+/// not carry serde/parser messages: those may contain user-controlled keys or
+/// values from the compatibility document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LegacyRootRejectionReason {
+    InvalidDocument,
+    AmbiguousAlias,
+    CredentialMaterial,
+    DedicatedAuthority,
+    AuthorityUnavailable,
+    RevisionConflict,
+}
+
+impl LegacyRootRejectionReason {
+    pub fn diagnostic(self) -> &'static str {
+        match self {
+            Self::InvalidDocument => "legacy config root contains invalid section data",
+            Self::AmbiguousAlias => "legacy config root contains ambiguous aliases",
+            Self::CredentialMaterial => {
+                "legacy config root contains credential-owned or masked metadata; use the dedicated revisioned API"
+            }
+            Self::DedicatedAuthority => {
+                "legacy config root targets a dedicated authority; use its revisioned API"
+            }
+            Self::AuthorityUnavailable => {
+                "legacy config root reconciliation base is unavailable"
+            }
+            Self::RevisionConflict => {
+                "legacy config root lost a section revision race; the typed writer remains authoritative"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyRootSectionRejection {
+    pub section: SectionId,
+    pub reason: LegacyRootRejectionReason,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LegacyRootReconciliationOutcome {
+    pub fingerprint: String,
+    pub committed: Vec<ConfigSectionEvent>,
+    pub rejected: Vec<LegacyRootSectionRejection>,
+    pub recovered: Vec<SectionId>,
+    pub duplicate: bool,
+    pub guard_advanced: bool,
+    pub partial: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LegacyRootReconciliationRecord {
+    version: u32,
+    root_sha256: String,
+    /// False until every section in this exact root generation was attempted
+    /// and its completion guard was durably advanced.
+    #[serde(default = "default_true")]
+    complete: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    committed: BTreeMap<String, LegacyRootCommittedPublication>,
+    /// Secret-free durable intent written before the first section CAS. A
+    /// restart can prove whether a crash-window CAS committed by comparing the
+    /// exact durable revision and canonical candidate hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    planned: BTreeMap<String, LegacyRootPlannedCommit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rejected: Vec<LegacyRootSectionRejection>,
+    /// Unknown keys remain byte-for-byte in `config.json`; only the count is
+    /// recorded so user-controlled key names cannot enter logs or events.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    unknown_fields: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRootCommittedPublication {
+    revision: u64,
+    candidate_sha256: String,
+    /// Set only after the exact runtime-failure transition for this revision
+    /// is durable in the account journal. An unchanged root keeps retrying;
+    /// a newer root generation may safely supersede this publication.
+    #[serde(default, skip_serializing_if = "is_false")]
+    runtime_degraded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRootPlannedCommit {
+    expected_revision: u64,
+    candidate_sha256: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug)]
+struct PlannedLegacyRootSection {
+    id: SectionId,
+    expected_revision: u64,
+    expected_data: Value,
+    candidate: Value,
+}
+
+#[cfg(test)]
+type LegacyRootCommitTestHook = Box<dyn FnOnce(SectionId) + Send + 'static>;
+
+#[cfg(test)]
+fn legacy_root_before_commit_test_hooks(
+) -> &'static Mutex<HashMap<PathBuf, LegacyRootCommitTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, LegacyRootCommitTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn legacy_root_after_commit_test_hooks(
+) -> &'static Mutex<HashMap<PathBuf, LegacyRootCommitTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, LegacyRootCommitTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_legacy_root_before_commit_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce(SectionId) + Send + 'static,
+) {
+    legacy_root_before_commit_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn set_legacy_root_after_commit_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce(SectionId) + Send + 'static,
+) {
+    legacy_root_after_commit_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_legacy_root_commit_test_hook(
+    hooks: &'static Mutex<HashMap<PathBuf, LegacyRootCommitTestHook>>,
+    data_dir: &Path,
+    id: SectionId,
+) {
+    if let Some(hook) = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(data_dir)
+    {
+        hook(id);
+    }
+}
+
+fn parse_legacy_root_without_duplicate_keys(bytes: &[u8]) -> Result<Value, ()> {
+    struct StrictValue(Value);
+
+    impl<'de> Deserialize<'de> for StrictValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct StrictVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+                type Value = StrictValue;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a JSON value without duplicate object keys")
+                }
+
+                fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                    Ok(StrictValue(Value::Bool(value)))
+                }
+
+                fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                    Ok(StrictValue(Value::Number(value.into())))
+                }
+
+                fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                    Ok(StrictValue(Value::Number(value.into())))
+                }
+
+                fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    serde_json::Number::from_f64(value)
+                        .map(Value::Number)
+                        .map(StrictValue)
+                        .ok_or_else(|| E::custom("JSON number is not finite"))
+                }
+
+                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                    Ok(StrictValue(Value::String(value.to_string())))
+                }
+
+                fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                    Ok(StrictValue(Value::String(value)))
+                }
+
+                fn visit_none<E>(self) -> Result<Self::Value, E> {
+                    Ok(StrictValue(Value::Null))
+                }
+
+                fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                    Ok(StrictValue(Value::Null))
+                }
+
+                fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+                where
+                    A: serde::de::SeqAccess<'de>,
+                {
+                    let mut values = Vec::new();
+                    while let Some(value) = sequence.next_element::<StrictValue>()? {
+                        values.push(value.0);
+                    }
+                    Ok(StrictValue(Value::Array(values)))
+                }
+
+                fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where
+                    A: serde::de::MapAccess<'de>,
+                {
+                    use serde::de::Error as _;
+
+                    let mut object = Map::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if object.contains_key(&key) {
+                            return Err(A::Error::custom("duplicate JSON object key"));
+                        }
+                        let value = map.next_value::<StrictValue>()?;
+                        object.insert(key, value.0);
+                    }
+                    Ok(StrictValue(Value::Object(object)))
+                }
+            }
+
+            deserializer.deserialize_any(StrictVisitor)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = StrictValue::deserialize(&mut deserializer).map_err(|_| ())?;
+    deserializer.end().map_err(|_| ())?;
+    Ok(value.0)
+}
+
+/// True only for an already-completed modular layout whose durable completion
+/// evidence is intact apart from the current `config.json` generation.
+/// Callers use this to avoid ever routing a reappeared root through the
+/// initial split migration.
+pub fn completed_layout_allows_legacy_root_reconciliation(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<bool> {
+    let data_dir = data_dir.as_ref();
+    let Some(marker) = crate::credential_migration::read_section_attestation_target(
+        &data_dir.join(SECTION_LAYOUT_FILE),
+    )?
+    else {
+        return Ok(false);
+    };
+    let completion = match validate_completed_section_layout_marker(&marker) {
+        Ok(completion) => completion,
+        Err(_) => return Ok(false),
+    };
+    if !current_members_satisfy_completion(data_dir, &completion)? {
+        return Ok(false);
+    }
+    crate::credential_migration::section_layout_allows_legacy_root_reconciliation(
+        data_dir,
+        &marker,
+        &completion,
+    )
+}
+
+/// A valid completion marker is a one-way authority boundary.  Even if later
+/// legacy-root drift makes the stronger active-layout predicate false, callers
+/// must never route this directory back through initial legacy loading.
+pub fn has_completed_section_layout_marker(data_dir: impl AsRef<Path>) -> ConfigStoreResult<bool> {
+    let Some(marker) = crate::credential_migration::read_section_attestation_target(
+        &data_dir.as_ref().join(SECTION_LAYOUT_FILE),
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(validate_completed_section_layout_marker(&marker).is_ok())
+}
+
+/// Return whether this directory has crossed the one-way modular authority
+/// boundary. Presence is deliberately broader than validity: a missing or
+/// corrupt marker must not make an intact completion ledger fall back to the
+/// legacy root, and a corrupt marker itself is still authority evidence.
+pub fn modular_authority_boundary_present(data_dir: impl AsRef<Path>) -> ConfigStoreResult<bool> {
+    let data_dir = data_dir.as_ref();
+    if crate::credential_migration::read_section_attestation_target(
+        &data_dir.join(SECTION_LAYOUT_FILE),
+    )?
+    .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(
+        crate::credential_migration::read_section_attestation_target(
+            &data_dir.join(crate::credential_migration::SECTION_LAYOUT_COMPLETION_FILE),
+        )?
+        .is_some()
+            || modular_section_authority_quorum_present(data_dir)?,
+    )
+}
+
+fn modular_section_authority_quorum_present(data_dir: &Path) -> ConfigStoreResult<bool> {
+    // These names were introduced by the modular facade and cannot be
+    // confused with the historical memory/providers/MCP sidecars. Requiring
+    // a quorum avoids reopening config.json when control evidence and one or
+    // more members are damaged, while not treating a lone unrelated file as a
+    // completed authority boundary.
+    let mut present = 0usize;
+    for name in [
+        "core.json",
+        "tools-skills.json",
+        "hooks.json",
+        "model-policy.json",
+    ] {
+        if crate::credential_migration::read_section_attestation_target(&data_dir.join(name))?
+            .is_some()
+        {
+            present += 1;
+        }
+    }
+    Ok(present >= 2)
+}
+
+fn current_legacy_root_reconciliation_outcome(
+    data_dir: &Path,
+) -> ConfigStoreResult<Option<LegacyRootReconciliationOutcome>> {
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        let Some(mut record) = read_legacy_reconciliation_record(data_dir)? else {
+            return Ok(None);
+        };
+        let durable_registry = SectionRegistry::open_configured(data_dir, true)?;
+        reject_stale_legacy_root_publications_locked(data_dir, &mut record, &durable_registry)?;
+        let root = crate::credential_migration::read_section_attestation_target(
+            &data_dir.join("config.json"),
+        )?;
+        let fingerprint = match root {
+            Some(root) => {
+                let current = hex::encode(Sha256::digest(&root));
+                if record.root_sha256 != current {
+                    return Ok(None);
+                }
+                current
+            }
+            None => record.root_sha256.clone(),
+        };
+        Ok(Some(LegacyRootReconciliationOutcome {
+            fingerprint,
+            committed: reconciliation_record_events(&record),
+            rejected: record.rejected,
+            recovered: Vec::new(),
+            duplicate: true,
+            guard_advanced: section_layout_is_active(data_dir)?,
+            partial: !record.complete,
+        }))
+    })
+}
+
+fn reconciliation_record_events(
+    record: &LegacyRootReconciliationRecord,
+) -> Vec<ConfigSectionEvent> {
+    record
+        .committed
+        .iter()
+        .filter(|(section, _)| {
+            SectionId::from_name(section).is_some_and(|id| {
+                !record
+                    .rejected
+                    .iter()
+                    .any(|rejection| rejection.section == id)
+            })
+        })
+        .map(|(section, publication)| {
+            if publication.runtime_degraded {
+                ConfigSectionEvent::Recovered {
+                    section: section.clone(),
+                    revision: publication.revision,
+                }
+            } else {
+                ConfigSectionEvent::Changed {
+                    section: section.clone(),
+                    revision: publication.revision,
+                }
+            }
+        })
+        .collect()
+}
+
+fn read_legacy_reconciliation_record(
+    data_dir: &Path,
+) -> ConfigStoreResult<Option<LegacyRootReconciliationRecord>> {
+    // The standalone file is a secret-free diagnostic mirror only. Trusting
+    // it when the completion ledger has no embedded record would let an
+    // external writer forge pending publications or health transitions.
+    let Some(record) =
+        crate::credential_migration::read_embedded_legacy_root_reconciliation(data_dir)?
+    else {
+        return Ok(None);
+    };
+    if record.version != LEGACY_ROOT_RECONCILIATION_VERSION
+        || record.root_sha256.len() != 64
+        || !record
+            .root_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || record.committed.iter().any(|(section, publication)| {
+            SectionId::from_name(section).is_none()
+                || publication.revision == 0
+                || publication.candidate_sha256.len() != 64
+                || !publication
+                    .candidate_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        || record.planned.iter().any(|(section, planned)| {
+            SectionId::from_name(section).is_none()
+                || planned.expected_revision == u64::MAX
+                || planned.candidate_sha256.len() != 64
+                || !planned
+                    .candidate_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+    {
+        return Err(crate::ConfigStoreError::Validation(
+            "legacy root reconciliation status is invalid".to_string(),
+        ));
+    }
+    Ok(Some(record))
+}
+
+pub(crate) fn validate_legacy_root_reconciliation_state(data_dir: &Path) -> ConfigStoreResult<()> {
+    let _ = read_legacy_reconciliation_record(data_dir)?;
+    Ok(())
+}
+
+fn canonical_value_sha256(value: &Value) -> ConfigStoreResult<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+fn write_legacy_reconciliation_record(
+    data_dir: &Path,
+    record: &LegacyRootReconciliationRecord,
+) -> ConfigStoreResult<()> {
+    crate::credential_migration::write_embedded_legacy_root_reconciliation_locked(
+        data_dir,
+        record.clone(),
+    )?;
+    let mirror = serde_json::to_vec_pretty(record)?;
+    if AtomicFileStore::new(data_dir.join(LEGACY_ROOT_RECONCILIATION_FILE))
+        .write_bytes_without_backup(&mirror)
+        .is_err()
+    {
+        tracing::warn!("legacy root reconciliation diagnostic mirror is unavailable");
+    }
+    Ok(())
+}
+
+fn legacy_root_publication_matches_durable_locked(
+    data_dir: &Path,
+    record: &LegacyRootReconciliationRecord,
+    section: &str,
+    revision: u64,
+) -> ConfigStoreResult<bool> {
+    let Some(publication) = record.committed.get(section) else {
+        return Ok(false);
+    };
+    if publication.revision != revision {
+        return Ok(false);
+    }
+    let id = SectionId::from_name(section).ok_or_else(|| {
+        crate::ConfigStoreError::Validation(
+            "legacy root publication section is invalid".to_string(),
+        )
+    })?;
+    let registry = SectionRegistry::open_configured(data_dir, true)?;
+    let envelope = registry.envelope_value(id)?;
+    Ok(envelope.revision == publication.revision
+        && envelope.status == SectionStatus::Healthy
+        && canonical_value_sha256(&envelope.data)? == publication.candidate_sha256)
+}
+
+/// Revalidate a root publication against its canonical outbox snapshot and a
+/// freshly opened durable section authority.
+pub fn legacy_root_publication_matches_durable(
+    data_dir: impl AsRef<Path>,
+    event: &ConfigSectionEvent,
+) -> ConfigStoreResult<bool> {
+    let (section, revision) = match event {
+        ConfigSectionEvent::Changed { section, revision } => (section.as_str(), *revision),
+        ConfigSectionEvent::Invalid { .. } | ConfigSectionEvent::Recovered { .. } => {
+            return Ok(false);
+        }
+    };
+    let data_dir = data_dir.as_ref();
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        let Some(record) = read_legacy_reconciliation_record(data_dir)? else {
+            return Ok(false);
+        };
+        legacy_root_publication_matches_durable_locked(data_dir, &record, section, revision)
+    })
+}
+
+/// Revalidate both the durable authority and the process snapshot that is
+/// about to become live against the canonical root-publication hash.
+pub fn legacy_root_publication_matches_snapshot(
+    data_dir: impl AsRef<Path>,
+    event: &ConfigSectionEvent,
+    process_data: &Value,
+) -> ConfigStoreResult<bool> {
+    let (section, revision) = match event {
+        ConfigSectionEvent::Changed { section, revision } => (section.as_str(), *revision),
+        ConfigSectionEvent::Invalid { .. } | ConfigSectionEvent::Recovered { .. } => {
+            return Ok(false);
+        }
+    };
+    let data_dir = data_dir.as_ref();
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        let Some(record) = read_legacy_reconciliation_record(data_dir)? else {
+            return Ok(false);
+        };
+        let process_matches = record.committed.get(section).is_some_and(|publication| {
+            publication.revision == revision
+                && canonical_value_sha256(process_data)
+                    .is_ok_and(|hash| hash == publication.candidate_sha256)
+        });
+        Ok(process_matches
+            && legacy_root_publication_matches_durable_locked(
+                data_dir, &record, section, revision,
+            )?)
+    })
+}
+
+/// Resolve the exact success transition for a pending root publication and
+/// the process snapshot that is about to become live. A publication whose
+/// runtime failure is already durable must recover before it can be
+/// acknowledged; an unfailed publication emits its original Changed event.
+pub fn legacy_root_publication_success_event(
+    data_dir: impl AsRef<Path>,
+    event: &ConfigSectionEvent,
+    process_data: &Value,
+) -> ConfigStoreResult<Option<ConfigSectionEvent>> {
+    let (section, revision) = match event {
+        ConfigSectionEvent::Changed { section, revision }
+        | ConfigSectionEvent::Recovered { section, revision } => (section.as_str(), *revision),
+        ConfigSectionEvent::Invalid { .. } => return Ok(None),
+    };
+    let data_dir = data_dir.as_ref();
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        let Some(record) = read_legacy_reconciliation_record(data_dir)? else {
+            return Ok(None);
+        };
+        let Some(publication) = record.committed.get(section) else {
+            return Ok(None);
+        };
+        let Some(id) = SectionId::from_name(section) else {
+            return Ok(None);
+        };
+        if record
+            .rejected
+            .iter()
+            .any(|rejection| rejection.section == id)
+        {
+            return Ok(None);
+        }
+        if publication.revision != revision
+            || canonical_value_sha256(process_data)? != publication.candidate_sha256
+            || !legacy_root_publication_matches_durable_locked(
+                data_dir, &record, section, revision,
+            )?
+        {
+            return Ok(None);
+        }
+        Ok(Some(if publication.runtime_degraded {
+            ConfigSectionEvent::Recovered {
+                section: section.to_string(),
+                revision,
+            }
+        } else {
+            ConfigSectionEvent::Changed {
+                section: section.to_string(),
+                revision,
+            }
+        }))
+    })
+}
+
+/// Return whether the canonical completion ledger still owns a root
+/// reconciliation intent, publication, or health transition that the runtime
+/// must finish.
+pub fn has_pending_legacy_root_publications(data_dir: impl AsRef<Path>) -> ConfigStoreResult<bool> {
+    let data_dir = data_dir.as_ref();
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        Ok(
+            read_legacy_reconciliation_record(data_dir)?.is_some_and(|record| {
+                !record.committed.is_empty()
+                    || !record.planned.is_empty()
+                    || !record.rejected.is_empty()
+            }),
+        )
+    })
+}
+
+/// Canonical root rejections whose process-local degraded health must remain
+/// in force until a later root generation clears them.
+pub fn legacy_root_rejected_sections(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<BTreeSet<SectionId>> {
+    let data_dir = data_dir.as_ref();
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        Ok(read_legacy_reconciliation_record(data_dir)?
+            .into_iter()
+            .flat_map(|record| record.rejected.into_iter())
+            .map(|rejection| rejection.section)
+            .collect())
+    })
+}
+
+/// Whether a non-facade legacy extension may perform its one-time import from
+/// the exact root generation guarded by the initial modular split. Any
+/// reconciliation record proves that config.json has already reappeared and
+/// is no longer an initial migration source.
+pub fn initial_legacy_root_extension_migration_allowed(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<bool> {
+    Ok(initial_legacy_root_extension_migration_source(data_dir)?.is_some())
+}
+
+/// Capture the exact root bytes guarded by the initial modular split for a
+/// non-facade extension's one-time import. Returning bytes rather than a bool
+/// prevents a raw editor from swapping a reappeared root between authority
+/// validation and parsing by the extension.
+pub fn initial_legacy_root_extension_migration_source(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<Option<Vec<u8>>> {
+    let data_dir = data_dir.as_ref();
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        if read_legacy_reconciliation_record(data_dir)?.is_some()
+            || !section_layout_is_active(data_dir)?
+        {
+            return Ok(None);
+        }
+        crate::credential_migration::read_initial_guarded_legacy_root_locked(data_dir)
+    })
+}
+
+/// Clear one durable root-reconciliation publication only after the server
+/// has accepted its post-runtime-install event for the account journal.
+///
+/// The enqueue and this status rewrite cannot be one filesystem transaction;
+/// a crash between them can replay once, while acknowledging before enqueue
+/// could lose the event entirely. Keeping the entry pending until enqueue is
+/// therefore the fail-safe side of that narrow crash window.
+pub fn acknowledge_legacy_root_publication(
+    data_dir: impl AsRef<Path>,
+    event: &ConfigSectionEvent,
+) -> ConfigStoreResult<bool> {
+    let data_dir = data_dir.as_ref();
+    let (section, revision, runtime_degraded) = match event {
+        ConfigSectionEvent::Changed { section, revision } => (section, revision, false),
+        ConfigSectionEvent::Recovered { section, revision } => (section, revision, true),
+        ConfigSectionEvent::Invalid { .. } => return Ok(false),
+    };
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        let Some(mut record) = read_legacy_reconciliation_record(data_dir)? else {
+            return Ok(false);
+        };
+        if record.committed.get(section).is_none_or(|publication| {
+            publication.revision != *revision || publication.runtime_degraded != runtime_degraded
+        }) {
+            return Ok(false);
+        }
+        let Some(id) = SectionId::from_name(section) else {
+            return Ok(false);
+        };
+        if record
+            .rejected
+            .iter()
+            .any(|rejection| rejection.section == id)
+        {
+            return Ok(false);
+        }
+        if !legacy_root_publication_matches_durable_locked(data_dir, &record, section, *revision)? {
+            return Ok(false);
+        }
+        record.committed.remove(section);
+        write_legacy_reconciliation_record(data_dir, &record)?;
+        Ok(true)
+    })
+}
+
+/// Mark one exact root publication as having failed its runtime hook only
+/// after the caller has durably confirmed the matching Invalid transition.
+///
+/// The publication remains pending while the same root bytes are present so
+/// transient dependencies can recover without another configuration edit.
+/// Reconciliation may supersede it only after a different root fingerprint is
+/// observed, at which point the durable Invalid is the handoff proof for the
+/// failed generation.
+pub fn mark_legacy_root_publication_runtime_degraded(
+    data_dir: impl AsRef<Path>,
+    event: &ConfigSectionEvent,
+) -> ConfigStoreResult<bool> {
+    let data_dir = data_dir.as_ref();
+    let (section, revision) = match event {
+        ConfigSectionEvent::Invalid { section, revision } => (section, *revision),
+        ConfigSectionEvent::Changed { .. } | ConfigSectionEvent::Recovered { .. } => {
+            return Ok(false);
+        }
+    };
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        let Some(mut record) = read_legacy_reconciliation_record(data_dir)? else {
+            return Ok(false);
+        };
+        if record
+            .committed
+            .get(section)
+            .is_none_or(|publication| publication.revision != revision)
+            || !legacy_root_publication_matches_durable_locked(
+                data_dir, &record, section, revision,
+            )?
+        {
+            return Ok(false);
+        }
+        let Some(id) = SectionId::from_name(section) else {
+            return Ok(false);
+        };
+        if record
+            .rejected
+            .iter()
+            .any(|rejection| rejection.section == id)
+        {
+            return Ok(false);
+        }
+        let publication = record
+            .committed
+            .get_mut(section)
+            .expect("matching root publication remains present");
+        if !publication.runtime_degraded {
+            publication.runtime_degraded = true;
+            write_legacy_reconciliation_record(data_dir, &record)?;
+        }
+        Ok(true)
+    })
+}
+
+fn reject_stale_legacy_root_publication(
+    data_dir: &Path,
+    event: &ConfigSectionEvent,
+) -> ConfigStoreResult<bool> {
+    let (section, revision) = match event {
+        ConfigSectionEvent::Changed { section, revision } => (section, revision),
+        ConfigSectionEvent::Invalid { .. } | ConfigSectionEvent::Recovered { .. } => {
+            return Ok(false);
+        }
+    };
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        let Some(mut record) = read_legacy_reconciliation_record(data_dir)? else {
+            return Ok(false);
+        };
+        if record
+            .committed
+            .get(section)
+            .is_none_or(|publication| publication.revision != *revision)
+        {
+            return Ok(false);
+        }
+        let id = SectionId::from_name(section).ok_or_else(|| {
+            crate::ConfigStoreError::Validation(
+                "legacy root publication section is invalid".to_string(),
+            )
+        })?;
+        record.committed.remove(section);
+        record.rejected.push(LegacyRootSectionRejection {
+            section: id,
+            reason: LegacyRootRejectionReason::RevisionConflict,
+        });
+        record.rejected.sort_by_key(|rejection| rejection.section);
+        record.rejected.dedup_by_key(|rejection| rejection.section);
+        write_legacy_reconciliation_record(data_dir, &record)?;
+        let _ = crate::credential_migration::advance_legacy_root_completion_guard_locked(
+            data_dir,
+            Some(&record.root_sha256),
+        )?;
+        Ok(true)
+    })
+}
+
+type ReconciliationRootSections = (
+    BTreeMap<SectionId, Value>,
+    usize,
+    Vec<LegacyRootSectionRejection>,
+);
+
+type ReconciliationRootSectionsResult =
+    Result<ReconciliationRootSections, Vec<LegacyRootSectionRejection>>;
+
+fn reconciliation_root_sections(root: &Value) -> ReconciliationRootSectionsResult {
+    let Some(root) = root.as_object() else {
+        return Err(vec![LegacyRootSectionRejection {
+            section: SectionId::Core,
+            reason: LegacyRootRejectionReason::InvalidDocument,
+        }]);
+    };
+    let mut sections = BTreeMap::<SectionId, Value>::new();
+    let mut object_sections = BTreeMap::<SectionId, Map<String, Value>>::new();
+    let mut unknown_fields = 0usize;
+    let mut rejected = Vec::new();
+    let ambiguous_mcp = root.contains_key("mcp") && root.contains_key("mcpServers");
+    if ambiguous_mcp {
+        rejected.push(LegacyRootSectionRejection {
+            section: SectionId::Mcp,
+            reason: LegacyRootRejectionReason::AmbiguousAlias,
+        });
+    }
+    for (key, value) in root {
+        let object =
+            |id: SectionId,
+             key: &str,
+             value: &Value,
+             object_sections: &mut BTreeMap<SectionId, Map<String, Value>>| {
+                object_sections
+                    .entry(id)
+                    .or_default()
+                    .insert(key.to_string(), value.clone());
+            };
+        match key.as_str() {
+            "http_proxy"
+            | "https_proxy"
+            | "proxy_auth"
+            | "proxy_auth_encrypted"
+            | "proxy_auth_credential_ref"
+            | "headless_auth"
+            | "server"
+            | "default_work_area"
+            | "run_budget"
+            | "stream_timeout" => object(SectionId::Core, key, value, &mut object_sections),
+            "provider"
+            | "defaults"
+            | "provider_instances"
+            | "default_provider_instance"
+            | "features" => object(SectionId::Providers, key, value, &mut object_sections),
+            "providers" => match value.as_object() {
+                Some(providers)
+                    if providers.keys().any(|key| {
+                        matches!(
+                            key.as_str(),
+                            "provider"
+                                | "defaults"
+                                | "provider_instances"
+                                | "default_provider_instance"
+                                | "features"
+                        )
+                    }) =>
+                {
+                    rejected.push(LegacyRootSectionRejection {
+                        section: SectionId::Providers,
+                        reason: LegacyRootRejectionReason::AmbiguousAlias,
+                    })
+                }
+                Some(providers) => object_sections
+                    .entry(SectionId::Providers)
+                    .or_default()
+                    .extend(providers.clone()),
+                None => rejected.push(LegacyRootSectionRejection {
+                    section: SectionId::Providers,
+                    reason: LegacyRootRejectionReason::InvalidDocument,
+                }),
+            },
+            "mcp" | "mcpServers" if !ambiguous_mcp => {
+                sections.insert(SectionId::Mcp, value.clone());
+            }
+            "mcp" | "mcpServers" => {}
+            "tools" | "skills" | "plugin_trust" => {
+                object(SectionId::ToolsSkills, key, value, &mut object_sections)
+            }
+            "memory" => {
+                sections.insert(SectionId::Memory, value.clone());
+            }
+            "subagents" => match value.as_object() {
+                Some(subagents) => {
+                    if subagents.contains_key("external_broker") || subagents.contains_key("broker")
+                    {
+                        rejected.push(LegacyRootSectionRejection {
+                            section: SectionId::Subagents,
+                            reason: LegacyRootRejectionReason::DedicatedAuthority,
+                        });
+                    }
+                    if subagents.contains_key("codex_provider_key_ref") {
+                        rejected.push(LegacyRootSectionRejection {
+                            section: SectionId::Subagents,
+                            reason: LegacyRootRejectionReason::CredentialMaterial,
+                        });
+                    }
+                    object_sections
+                        .entry(SectionId::Subagents)
+                        .or_default()
+                        .extend(subagents.clone());
+                }
+                None => rejected.push(LegacyRootSectionRejection {
+                    section: SectionId::Subagents,
+                    reason: LegacyRootRejectionReason::InvalidDocument,
+                }),
+            },
+            "notifications" => object(
+                SectionId::Notifications,
+                "notifications",
+                value,
+                &mut object_sections,
+            ),
+            "connect" => {
+                sections.insert(SectionId::Connect, value.clone());
+            }
+            "cluster_fabric" => {
+                sections.insert(SectionId::ClusterFabric, value.clone());
+            }
+            "credentials" => rejected.push(LegacyRootSectionRejection {
+                section: SectionId::Credentials,
+                reason: if raw_reconciliation_secret_material_is_forbidden_for_section(
+                    SectionId::Credentials,
+                    value,
+                ) || !server_metadata_inventory(value).is_empty()
+                {
+                    LegacyRootRejectionReason::CredentialMaterial
+                } else {
+                    LegacyRootRejectionReason::DedicatedAuthority
+                },
+            }),
+            "env_vars" => {
+                sections.insert(SectionId::Env, value.clone());
+            }
+            "access_control" => {
+                sections.insert(SectionId::AccessControl, value.clone());
+            }
+            "hooks" => match value.as_object() {
+                Some(hooks) if hooks.contains_key("lifecycle_hooks") => {
+                    rejected.push(LegacyRootSectionRejection {
+                        section: SectionId::Hooks,
+                        reason: LegacyRootRejectionReason::AmbiguousAlias,
+                    })
+                }
+                Some(hooks) => object_sections
+                    .entry(SectionId::Hooks)
+                    .or_default()
+                    .extend(hooks.clone()),
+                None => rejected.push(LegacyRootSectionRejection {
+                    section: SectionId::Hooks,
+                    reason: LegacyRootRejectionReason::InvalidDocument,
+                }),
+            },
+            "lifecycle_hooks" => object(SectionId::Hooks, key, value, &mut object_sections),
+            "keyword_masking" | "anthropic_model_mapping" | "gemini_model_mapping" => {
+                object(SectionId::ModelPolicy, key, value, &mut object_sections)
+            }
+            "model_limits" => {
+                sections.insert(SectionId::ModelLimits, value.clone());
+            }
+            _ => {
+                unknown_fields = unknown_fields.saturating_add(1);
+                let fragment = Value::Object(Map::from_iter([(key.clone(), value.clone())]));
+                if raw_reconciliation_secret_material_is_forbidden(&fragment)
+                    || !server_metadata_inventory(&fragment).is_empty()
+                {
+                    rejected.push(LegacyRootSectionRejection {
+                        // Unknown keys have no typed owner. Attribute the
+                        // generic fail-closed health to the root document
+                        // without persisting the user-controlled key or value.
+                        section: SectionId::Core,
+                        reason: LegacyRootRejectionReason::CredentialMaterial,
+                    });
+                }
+            }
+        }
+    }
+    sections.extend(
+        object_sections
+            .into_iter()
+            .map(|(id, object)| (id, Value::Object(object))),
+    );
+    rejected.sort_by_key(|rejection| rejection.section);
+    rejected.dedup_by_key(|rejection| rejection.section);
+    Ok((sections, unknown_fields, rejected))
+}
+
+fn raw_reconciliation_secret_material_is_forbidden(value: &Value) -> bool {
+    raw_reconciliation_secret_material_is_forbidden_for_section(SectionId::Core, value)
+}
+
+fn raw_reconciliation_secret_material_is_forbidden_for_section(
+    section: SectionId,
+    value: &Value,
+) -> bool {
+    raw_reconciliation_secret_material_is_forbidden_with_context(
+        section,
+        value,
+        CredentialScanContext::None,
+    )
+}
+
+fn raw_reconciliation_secret_material_is_forbidden_with_context(
+    section: SectionId,
+    value: &Value,
+    initial_context: CredentialScanContext,
+) -> bool {
+    fn is_exact_model_policy_mask_pattern(section: SectionId, path: &[String]) -> bool {
+        section == SectionId::ModelPolicy
+            && path
+                .iter()
+                .map(String::as_str)
+                .eq(["keyword_masking", "entries", "pattern"])
+    }
+
+    fn walk(
+        section: SectionId,
+        value: &Value,
+        credential_context: CredentialScanContext,
+        path: &mut Vec<String>,
+    ) -> bool {
+        if credential_context != CredentialScanContext::None
+            && is_nonliteral_runtime_template(value)
+        {
+            return false;
+        }
+        match value {
+            Value::Object(object) => {
+                if section == SectionId::Mcp && path.is_empty() {
+                    for (id, server) in object {
+                        path.push(id.clone());
+                        let forbidden = walk(section, server, credential_context, path);
+                        path.pop();
+                        if forbidden {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                for (key, value) in object {
+                    path.push(key.clone());
+                    let normalized = normalized_credential_key(key);
+                    let reference_metadata = credential_reference_metadata_key(key);
+                    let child_keys_are_identifiers = matches!(
+                        normalized.as_str(),
+                        "headers" | "providerinstances" | "credentialrefs"
+                    ) || normalized.ends_with("credentialrefs");
+                    if child_keys_are_identifiers {
+                        let identifier_context = if reference_metadata {
+                            CredentialScanContext::None
+                        } else {
+                            credential_context
+                        };
+                        let forbidden = match value {
+                            Value::Object(entries) if normalized == "headers" => {
+                                let mut forbidden = false;
+                                for (name, expression) in entries {
+                                    path.push(name.clone());
+                                    forbidden = if is_credential_header(name) {
+                                        !value_is_empty(expression)
+                                            && !is_nonliteral_runtime_template(expression)
+                                    } else {
+                                        walk(section, expression, identifier_context, path)
+                                    };
+                                    path.pop();
+                                    if forbidden {
+                                        break;
+                                    }
+                                }
+                                forbidden
+                            }
+                            Value::Object(entries) => {
+                                let mut forbidden = false;
+                                for (name, entry) in entries {
+                                    path.push(name.clone());
+                                    let entry_context = if reference_metadata
+                                        && (entry.is_object() || entry.is_array())
+                                    {
+                                        CredentialScanContext::Adjacent
+                                    } else {
+                                        identifier_context
+                                    };
+                                    forbidden = walk(section, entry, entry_context, path);
+                                    path.pop();
+                                    if forbidden {
+                                        break;
+                                    }
+                                }
+                                forbidden
+                            }
+                            Value::Array(entries) => entries.iter().any(|entry| {
+                                let entry_context = if reference_metadata
+                                    && (entry.is_object() || entry.is_array())
+                                {
+                                    CredentialScanContext::Adjacent
+                                } else {
+                                    identifier_context
+                                };
+                                walk(section, entry, entry_context, path)
+                            }),
+                            _ => walk(section, value, identifier_context, path),
+                        };
+                        path.pop();
+                        if forbidden {
+                            return true;
+                        }
+                        continue;
+                    }
+
+                    let key_context = if value.is_object() || value.is_array() {
+                        credential_context_key(key)
+                    } else {
+                        credential_literal_key(key)
+                    };
+                    let key_metadata_context = (value.is_object() || value.is_array())
+                        && credential_metadata_container_key(key);
+                    let child_context = if reference_metadata {
+                        CredentialScanContext::None
+                    } else if credential_context == CredentialScanContext::Strong
+                        && credential_public_metadata_key(key)
+                    {
+                        CredentialScanContext::Adjacent
+                    } else if credential_context == CredentialScanContext::Strong || key_context {
+                        CredentialScanContext::Strong
+                    } else if credential_context == CredentialScanContext::Adjacent
+                        || key_metadata_context
+                    {
+                        CredentialScanContext::Adjacent
+                    } else {
+                        CredentialScanContext::None
+                    };
+                    let forbidden = key_contains_literal_credential_material(key, value)
+                        || (credential_context != CredentialScanContext::None
+                            && NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES
+                                .contains(&normalized.as_str())
+                            && !value_is_empty(value))
+                        || (!reference_metadata && walk(section, value, child_context, path));
+                    path.pop();
+                    if forbidden {
+                        return true;
+                    }
+                }
+                false
+            }
+            Value::Array(values) => values
+                .iter()
+                .any(|value| walk(section, value, credential_context, path)),
+            Value::String(value) => {
+                (credential_context == CredentialScanContext::Strong && !value.trim().is_empty())
+                    || (!is_exact_model_policy_mask_pattern(section, path)
+                        && crate::patch::is_masked_api_key(value))
+                    || url::Url::parse(value)
+                        .ok()
+                        .is_some_and(|url| !url.username().is_empty() || url.password().is_some())
+            }
+            Value::Number(_) => credential_context == CredentialScanContext::Strong,
+            Value::Bool(_) | Value::Null => false,
+        }
+    }
+    walk(section, value, initial_context, &mut Vec::new())
+}
+
+fn credential_bearing_subtree_changed(authority: &Value, candidate: &Value) -> bool {
+    fn is_metadata_key(key: &str) -> bool {
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        normalized == "credentialref"
+            || normalized.ends_with("credentialref")
+            || normalized == "credentialrefs"
+            || normalized.ends_with("credentialrefs")
+            || normalized == "configured"
+            || normalized.ends_with("configured")
+            || normalized == "secret"
+    }
+
+    fn contains_metadata(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.keys().any(|key| is_metadata_key(key))
+                    || object.values().any(contains_metadata)
+            }
+            Value::Array(values) => values.iter().any(contains_metadata),
+            _ => false,
+        }
+    }
+
+    match (authority, candidate) {
+        (Value::Object(authority), Value::Object(candidate)) => {
+            let credential_context = authority.keys().any(|key| is_metadata_key(key));
+            for (key, value) in authority {
+                if is_metadata_key(key) && candidate.get(key) != Some(value) {
+                    return true;
+                }
+            }
+            if credential_context {
+                if raw_reconciliation_secret_material_is_forbidden_with_context(
+                    SectionId::Core,
+                    &Value::Object(candidate.clone()),
+                    CredentialScanContext::Adjacent,
+                ) {
+                    return true;
+                }
+                for (key, candidate_value) in candidate {
+                    let normalized = key
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric())
+                        .flat_map(char::to_lowercase)
+                        .collect::<String>();
+                    let credential_payload =
+                        matches!(normalized.as_str(), "value" | "literal" | "fallback")
+                            || key_contains_literal_credential_material(key, candidate_value);
+                    if credential_payload
+                        && !value_is_empty(candidate_value)
+                        && authority.get(key) != Some(candidate_value)
+                    {
+                        return true;
+                    }
+                }
+            }
+            authority.iter().any(|(key, value)| {
+                candidate
+                    .get(key)
+                    .is_some_and(|candidate| credential_bearing_subtree_changed(value, candidate))
+            })
+        }
+        (Value::Array(authority), Value::Array(candidate)) => {
+            (authority.len() != candidate.len() && authority.iter().any(contains_metadata))
+                || authority
+                    .iter()
+                    .zip(candidate)
+                    .any(|(authority, candidate)| {
+                        credential_bearing_subtree_changed(authority, candidate)
+                    })
+        }
+        _ => authority != candidate && contains_metadata(authority),
+    }
+}
+
+fn server_metadata_inventory(value: &Value) -> BTreeMap<String, Value> {
+    fn walk(value: &Value, path: &mut Vec<String>, result: &mut BTreeMap<String, Value>) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    path.push(key.clone());
+                    let normalized = key
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric())
+                        .flat_map(char::to_lowercase)
+                        .collect::<String>();
+                    if normalized == "credentialref"
+                        || normalized.ends_with("credentialref")
+                        || normalized == "credentialrefs"
+                        || normalized.ends_with("credentialrefs")
+                        || normalized == "configured"
+                        || normalized.ends_with("configured")
+                        || normalized == "secret"
+                    {
+                        result.insert(path.join("/"), value.clone());
+                    }
+                    walk(value, path, result);
+                    path.pop();
+                }
+            }
+            Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    path.push(index.to_string());
+                    walk(value, path, result);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut result = BTreeMap::new();
+    walk(value, &mut Vec::new(), &mut result);
+    result
+}
+
+fn commit_planned_legacy_root_section(
+    registry: &SectionRegistry,
+    plan: PlannedLegacyRootSection,
+) -> ConfigStoreResult<ConfigSectionEvent> {
+    macro_rules! commit {
+        ($field:ident, $ty:ty) => {{
+            let expected: $ty = serde_json::from_value(plan.expected_data)?;
+            let candidate: $ty = serde_json::from_value(plan.candidate)?;
+            registry
+                .$field
+                .commit_from_durable_base_with_envelope(
+                    plan.expected_revision,
+                    &expected,
+                    candidate,
+                )
+                .map(|(event, _)| event)
+        }};
+    }
+    match plan.id {
+        SectionId::Core => commit!(core, CoreSection),
+        SectionId::Providers => commit!(providers, ProvidersSection),
+        SectionId::Mcp => commit!(mcp, McpSection),
+        SectionId::ToolsSkills => commit!(tools_skills, ToolsSkillsSection),
+        SectionId::Memory => commit!(memory, MemorySection),
+        SectionId::Subagents => commit!(subagents, SubagentsSection),
+        SectionId::Notifications => commit!(notifications, NotificationsSection),
+        SectionId::Connect => commit!(connect, ConnectSection),
+        SectionId::Env => commit!(env, EnvSection),
+        SectionId::AccessControl => commit!(access_control, AccessControlSection),
+        SectionId::Hooks => commit!(hooks, HooksSection),
+        SectionId::ModelPolicy => commit!(model_policy, ModelPolicySection),
+        SectionId::ModelLimits => commit!(model_limits, ModelLimitsSection),
+        SectionId::ClusterFabric | SectionId::Credentials => {
+            Err(crate::ConfigStoreError::Validation(
+                "legacy root targets a dedicated authority".to_string(),
+            ))
+        }
+    }
+}
+
+fn canonicalize_legacy_root_candidate(id: SectionId, value: Value) -> ConfigStoreResult<Value> {
+    macro_rules! canonicalize {
+        ($ty:ty) => {{
+            let typed: $ty = serde_json::from_value(value)?;
+            serde_json::to_value(typed).map_err(Into::into)
+        }};
+    }
+    match id {
+        SectionId::Core => canonicalize!(CoreSection),
+        SectionId::Providers => canonicalize!(ProvidersSection),
+        SectionId::Mcp => canonicalize!(McpSection),
+        SectionId::ToolsSkills => canonicalize!(ToolsSkillsSection),
+        SectionId::Memory => canonicalize!(MemorySection),
+        SectionId::Subagents => canonicalize!(SubagentsSection),
+        SectionId::Notifications => canonicalize!(NotificationsSection),
+        SectionId::Connect => canonicalize!(ConnectSection),
+        SectionId::Env => canonicalize!(EnvSection),
+        SectionId::AccessControl => canonicalize!(AccessControlSection),
+        SectionId::Hooks => canonicalize!(HooksSection),
+        SectionId::ModelPolicy => canonicalize!(ModelPolicySection),
+        SectionId::ModelLimits => canonicalize!(ModelLimitsSection),
+        SectionId::ClusterFabric | SectionId::Credentials => {
+            Err(crate::ConfigStoreError::Validation(
+                "legacy root targets a dedicated authority".to_string(),
+            ))
+        }
+    }
+}
+
+fn adopt_recovered_legacy_root_section(
+    registry: &SectionRegistry,
+    id: SectionId,
+    expected_revision: u64,
+    committed_revision: u64,
+    candidate: Value,
+) -> ConfigStoreResult<ConfigSectionEvent> {
+    let current = registry.envelope_value(id)?;
+    if current.revision == committed_revision && current.data == candidate {
+        if current.status != SectionStatus::Healthy {
+            let _ = registry.reload(id);
+            let reloaded = registry.envelope_value(id)?;
+            if reloaded.revision != committed_revision
+                || reloaded.data != current.data
+                || reloaded.status != SectionStatus::Healthy
+            {
+                return Err(crate::ConfigStoreError::Validation(
+                    "legacy root committed section could not be adopted as healthy".to_string(),
+                ));
+            }
+        }
+        return Ok(ConfigSectionEvent::Changed {
+            section: id.descriptor().name.to_string(),
+            revision: committed_revision,
+        });
+    }
+    macro_rules! adopt {
+        ($field:ident, $ty:ty) => {{
+            let candidate: $ty = serde_json::from_value(candidate)?;
+            registry.$field.adopt_committed_from_durable_base(
+                expected_revision,
+                committed_revision,
+                candidate,
+            )
+        }};
+    }
+    match id {
+        SectionId::Core => adopt!(core, CoreSection),
+        SectionId::Providers => adopt!(providers, ProvidersSection),
+        SectionId::Mcp => adopt!(mcp, McpSection),
+        SectionId::ToolsSkills => adopt!(tools_skills, ToolsSkillsSection),
+        SectionId::Memory => adopt!(memory, MemorySection),
+        SectionId::Subagents => adopt!(subagents, SubagentsSection),
+        SectionId::Notifications => adopt!(notifications, NotificationsSection),
+        SectionId::Connect => adopt!(connect, ConnectSection),
+        SectionId::Env => adopt!(env, EnvSection),
+        SectionId::AccessControl => adopt!(access_control, AccessControlSection),
+        SectionId::Hooks => adopt!(hooks, HooksSection),
+        SectionId::ModelPolicy => adopt!(model_policy, ModelPolicySection),
+        SectionId::ModelLimits => adopt!(model_limits, ModelLimitsSection),
+        SectionId::ClusterFabric | SectionId::Credentials => {
+            Err(crate::ConfigStoreError::Validation(
+                "legacy root targets a dedicated authority".to_string(),
+            ))
+        }
+    }
+}
+
+fn recover_legacy_root_planned_commits(
+    data_dir: &Path,
+    record: &mut LegacyRootReconciliationRecord,
+    durable_registry: &SectionRegistry,
+    process_registry: &SectionRegistry,
+) -> ConfigStoreResult<()> {
+    let mut changed = false;
+    for (section, planned) in record.planned.clone() {
+        let Some(id) = SectionId::from_name(&section) else {
+            continue;
+        };
+        let envelope = durable_registry.envelope_value(id)?;
+        let candidate_hash = canonical_value_sha256(&envelope.data)?;
+        let committed_revision = planned.expected_revision.checked_add(1).ok_or_else(|| {
+            crate::ConfigStoreError::Validation(
+                "legacy root planned revision counter exhausted".to_string(),
+            )
+        })?;
+        if envelope.revision == committed_revision && candidate_hash == planned.candidate_sha256 {
+            adopt_recovered_legacy_root_section(
+                process_registry,
+                id,
+                planned.expected_revision,
+                committed_revision,
+                envelope.data,
+            )?;
+            record.committed.insert(
+                section.clone(),
+                LegacyRootCommittedPublication {
+                    revision: committed_revision,
+                    candidate_sha256: planned.candidate_sha256.clone(),
+                    runtime_degraded: false,
+                },
+            );
+            record.planned.remove(&section);
+            changed = true;
+        } else if envelope.revision != planned.expected_revision {
+            record.planned.remove(&section);
+            record.rejected.push(LegacyRootSectionRejection {
+                section: id,
+                reason: LegacyRootRejectionReason::RevisionConflict,
+            });
+            changed = true;
+        }
+    }
+    if changed {
+        record.rejected.sort_by_key(|rejection| rejection.section);
+        record.rejected.dedup_by_key(|rejection| rejection.section);
+        write_legacy_reconciliation_record(data_dir, record)?;
+    }
+    Ok(())
+}
+
+/// Remove publication intents that no longer name the current healthy durable
+/// envelope. A process-local registry may lag another process's commit, so
+/// only the freshly opened durable registry is authoritative for this check.
+fn reject_stale_legacy_root_publications_locked(
+    data_dir: &Path,
+    record: &mut LegacyRootReconciliationRecord,
+    durable_registry: &SectionRegistry,
+) -> ConfigStoreResult<()> {
+    let mut stale = Vec::new();
+    for (section, publication) in &record.committed {
+        let id = SectionId::from_name(section).ok_or_else(|| {
+            crate::ConfigStoreError::Validation(
+                "legacy root publication section is invalid".to_string(),
+            )
+        })?;
+        let envelope = durable_registry.envelope_value(id)?;
+        let candidate_sha256 = canonical_value_sha256(&envelope.data)?;
+        if envelope.revision != publication.revision
+            || envelope.status != SectionStatus::Healthy
+            || candidate_sha256 != publication.candidate_sha256
+        {
+            stale.push((section.clone(), id));
+        }
+    }
+    if stale.is_empty() {
+        return Ok(());
+    }
+    for (section, id) in stale {
+        record.committed.remove(&section);
+        record.rejected.retain(|rejection| rejection.section != id);
+        record.rejected.push(LegacyRootSectionRejection {
+            section: id,
+            reason: LegacyRootRejectionReason::RevisionConflict,
+        });
+    }
+    record.rejected.sort_by_key(|rejection| rejection.section);
+    write_legacy_reconciliation_record(data_dir, record)?;
+    let _ = crate::credential_migration::advance_legacy_root_completion_guard_locked(
+        data_dir,
+        Some(&record.root_sha256),
+    )?;
+    Ok(())
+}
+
+fn adopt_pending_legacy_root_publications_locked(
+    record: &LegacyRootReconciliationRecord,
+    durable_registry: &SectionRegistry,
+    process_registry: &SectionRegistry,
+) -> ConfigStoreResult<()> {
+    for (section, publication) in &record.committed {
+        let id = SectionId::from_name(section).ok_or_else(|| {
+            crate::ConfigStoreError::Validation(
+                "legacy root publication section is invalid".to_string(),
+            )
+        })?;
+        let envelope = durable_registry.envelope_value(id)?;
+        if envelope.revision != publication.revision
+            || envelope.status != SectionStatus::Healthy
+            || canonical_value_sha256(&envelope.data)? != publication.candidate_sha256
+        {
+            return Err(crate::ConfigStoreError::Validation(
+                "legacy root publication no longer names a healthy durable section".to_string(),
+            ));
+        }
+        let expected_revision = publication.revision.checked_sub(1).ok_or_else(|| {
+            crate::ConfigStoreError::Validation(
+                "legacy root publication revision is invalid".to_string(),
+            )
+        })?;
+        adopt_recovered_legacy_root_section(
+            process_registry,
+            id,
+            expected_revision,
+            publication.revision,
+            envelope.data,
+        )?;
+    }
+    Ok(())
+}
+
+/// Reconcile one stable, externally-authored `config.json` generation into
+/// independently revisioned section authorities.
+///
+/// Planning is entirely read-only.  Only after every field has an unambiguous
+/// owner, raw credential metadata has been rejected and all candidates have
+/// passed typed validation do the independent content-aware section CAS writes
+/// begin. Unknown fields stay solely in the byte-preserved legacy root.
+pub fn reconcile_reappeared_legacy_root(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<Option<LegacyRootReconciliationOutcome>> {
+    reconcile_reappeared_legacy_root_with_registry(data_dir.as_ref(), None)
+}
+
+fn reconcile_reappeared_legacy_root_with_registry(
+    data_dir: &Path,
+    process_registry: Option<&SectionRegistry>,
+) -> ConfigStoreResult<Option<LegacyRootReconciliationOutcome>> {
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        reconcile_reappeared_legacy_root_locked(data_dir, process_registry)
+    })
+}
+
+fn reconcile_reappeared_legacy_root_locked(
+    data_dir: &Path,
+    process_registry: Option<&SectionRegistry>,
+) -> ConfigStoreResult<Option<LegacyRootReconciliationOutcome>> {
+    if !completed_layout_allows_legacy_root_reconciliation(data_dir)? {
+        return Ok(None);
+    }
+    let durable_registry = SectionRegistry::open_configured(data_dir, true)?;
+    let commit_registry = process_registry.unwrap_or(&durable_registry);
+    let mut previous_record = read_legacy_reconciliation_record(data_dir)?;
+    if let Some(record) = previous_record.as_mut() {
+        recover_legacy_root_planned_commits(data_dir, record, &durable_registry, commit_registry)?;
+        reject_stale_legacy_root_publications_locked(data_dir, record, &durable_registry)?;
+        adopt_pending_legacy_root_publications_locked(record, &durable_registry, commit_registry)?;
+    }
+    let Some(root_bytes) = crate::credential_migration::read_section_attestation_target(
+        &data_dir.join("config.json"),
+    )?
+    else {
+        let mut recovered = Vec::new();
+        if let Some(record) = previous_record.as_mut() {
+            recovered = record
+                .rejected
+                .iter()
+                .map(|rejection| rejection.section)
+                .collect();
+            if !record.planned.is_empty() {
+                // Remaining intents provably did not commit and the root
+                // that authorized them is gone.
+                if !record.planned.is_empty() {
+                    record.planned.clear();
+                    record.complete = false;
+                    write_legacy_reconciliation_record(data_dir, record)?;
+                }
+            }
+            record.rejected.clear();
+            record.complete = true;
+            write_legacy_reconciliation_record(data_dir, record)?;
+        }
+        let guard_advanced =
+            crate::credential_migration::advance_legacy_root_completion_guard_locked(
+                data_dir, None,
+            )?;
+        if !guard_advanced {
+            if let Some(record) = previous_record.as_mut() {
+                record.complete = false;
+                write_legacy_reconciliation_record(data_dir, record)?;
+            }
+        }
+        return Ok(Some(LegacyRootReconciliationOutcome {
+            fingerprint: previous_record
+                .as_ref()
+                .map(|record| record.root_sha256.clone())
+                .unwrap_or_default(),
+            committed: previous_record
+                .as_ref()
+                .map(reconciliation_record_events)
+                .unwrap_or_default(),
+            recovered,
+            guard_advanced,
+            duplicate: guard_advanced,
+            partial: !guard_advanced,
+            ..LegacyRootReconciliationOutcome::default()
+        }));
+    };
+    let fingerprint = hex::encode(Sha256::digest(&root_bytes));
+    if let Some(record) = previous_record.as_mut() {
+        if record.root_sha256 != fingerprint && !record.planned.is_empty() {
+            // No planned CAS committed (recovery above would have moved it
+            // into the outbox). A newer root supersedes these uncommitted
+            // intents, so cancel them before planning the newer bytes.
+            record.planned.clear();
+            record.complete = false;
+            write_legacy_reconciliation_record(data_dir, record)?;
+        }
+        if record.root_sha256 == fingerprint && record.complete {
+            let guard_advanced =
+                crate::credential_migration::advance_legacy_root_completion_guard_locked(
+                    data_dir,
+                    Some(&fingerprint),
+                )?;
+            if !guard_advanced {
+                record.complete = false;
+                write_legacy_reconciliation_record(data_dir, record)?;
+            }
+            return Ok(Some(LegacyRootReconciliationOutcome {
+                fingerprint,
+                committed: reconciliation_record_events(record),
+                rejected: record.rejected.clone(),
+                duplicate: guard_advanced,
+                guard_advanced,
+                partial: !guard_advanced,
+                ..LegacyRootReconciliationOutcome::default()
+            }));
+        }
+        if record.root_sha256 == fingerprint && !record.complete && record.planned.is_empty() {
+            let guard_advanced =
+                crate::credential_migration::advance_legacy_root_completion_guard_locked(
+                    data_dir,
+                    Some(&fingerprint),
+                )?;
+            record.complete = guard_advanced;
+            write_legacy_reconciliation_record(data_dir, record)?;
+            return Ok(Some(LegacyRootReconciliationOutcome {
+                fingerprint,
+                committed: reconciliation_record_events(record),
+                rejected: record.rejected.clone(),
+                duplicate: false,
+                guard_advanced,
+                partial: !guard_advanced,
+                ..LegacyRootReconciliationOutcome::default()
+            }));
+        }
+    }
+
+    let retry_planned = previous_record
+        .as_ref()
+        .filter(|record| record.root_sha256 == fingerprint && !record.complete)
+        .map(|record| record.planned.clone())
+        .unwrap_or_default();
+    let mut rejected = previous_record
+        .as_ref()
+        .filter(|record| record.root_sha256 == fingerprint)
+        .map(|record| record.rejected.clone())
+        .unwrap_or_default();
+    let root = match parse_legacy_root_without_duplicate_keys(&root_bytes) {
+        Ok(root) => root,
+        Err(_) => {
+            rejected.push(LegacyRootSectionRejection {
+                section: SectionId::Core,
+                reason: LegacyRootRejectionReason::InvalidDocument,
+            });
+            Value::Object(Map::new())
+        }
+    };
+    let (raw_sections, unknown_fields, mut ownership_rejections) =
+        match reconciliation_root_sections(&root) {
+            Ok(result) => result,
+            Err(mut errors) => {
+                rejected.append(&mut errors);
+                (BTreeMap::new(), 0, Vec::new())
+            }
+        };
+    rejected.append(&mut ownership_rejections);
+
+    // Planning always observes the freshly opened durable authority. The
+    // process registry may intentionally lag; its commit-from-durable-base
+    // seam can jump over those already-durable revisions while still
+    // installing this operation's exact successful CAS snapshot.
+    let rejected_ids = rejected
+        .iter()
+        .map(|rejection| rejection.section)
+        .collect::<BTreeSet<_>>();
+    let mut plans = Vec::new();
+    for (id, raw) in raw_sections {
+        if rejected_ids.contains(&id) {
+            continue;
+        }
+        if !retry_planned.is_empty() && !retry_planned.contains_key(id.descriptor().name) {
+            continue;
+        }
+        let envelope = durable_registry.envelope_value(id)?;
+        if envelope.status != SectionStatus::Healthy
+            || envelope.source_kind != SectionSourceKind::File
+        {
+            rejected.push(LegacyRootSectionRejection {
+                section: id,
+                reason: LegacyRootRejectionReason::AuthorityUnavailable,
+            });
+            continue;
+        }
+        let raw_has_secret_material =
+            raw_reconciliation_secret_material_is_forbidden_for_section(id, &raw);
+        let mut candidate = envelope.data.clone();
+        crate::patch::deep_merge_json(&mut candidate, raw);
+        if raw_has_secret_material {
+            rejected.push(LegacyRootSectionRejection {
+                section: id,
+                reason: LegacyRootRejectionReason::CredentialMaterial,
+            });
+            continue;
+        }
+        if credential_bearing_subtree_changed(&envelope.data, &candidate) {
+            rejected.push(LegacyRootSectionRejection {
+                section: id,
+                reason: LegacyRootRejectionReason::CredentialMaterial,
+            });
+            continue;
+        }
+        // Compatibility writers commonly echo the full safe projection.
+        // An exact echo is not an attempted mutation of a dedicated or
+        // credential-owned authority and therefore needs no rejection.
+        if candidate == envelope.data {
+            continue;
+        }
+        if id == SectionId::ClusterFabric {
+            rejected.push(LegacyRootSectionRejection {
+                section: id,
+                reason: LegacyRootRejectionReason::DedicatedAuthority,
+            });
+            continue;
+        }
+        if server_metadata_inventory(&candidate) != server_metadata_inventory(&envelope.data) {
+            rejected.push(LegacyRootSectionRejection {
+                section: id,
+                reason: LegacyRootRejectionReason::CredentialMaterial,
+            });
+            continue;
+        }
+        if validate_section_data(id.descriptor().file_name, &candidate).is_err() {
+            rejected.push(LegacyRootSectionRejection {
+                section: id,
+                reason: LegacyRootRejectionReason::InvalidDocument,
+            });
+            continue;
+        }
+        let candidate = canonicalize_legacy_root_candidate(id, candidate)?;
+        // Typed deserialization may intentionally discard a forward field.
+        // Compare again after canonicalization so a byte-preserved unknown
+        // fragment cannot manufacture a revision or Changed publication.
+        if candidate == envelope.data {
+            continue;
+        }
+        if let Some(intent) = retry_planned.get(id.descriptor().name) {
+            if canonical_value_sha256(&candidate)? != intent.candidate_sha256 {
+                rejected.push(LegacyRootSectionRejection {
+                    section: id,
+                    reason: LegacyRootRejectionReason::RevisionConflict,
+                });
+                continue;
+            }
+        }
+        plans.push(PlannedLegacyRootSection {
+            id,
+            expected_revision: envelope.revision,
+            expected_data: envelope.data,
+            candidate,
+        });
+    }
+
+    // Bind the pure plan to the exact root bytes before crossing the first
+    // section CAS boundary. A newer editor generation is planned afresh.
+    if crate::credential_migration::read_section_attestation_target(&data_dir.join("config.json"))?
+        .as_deref()
+        != Some(root_bytes.as_slice())
+    {
+        return Ok(Some(LegacyRootReconciliationOutcome {
+            fingerprint,
+            ..LegacyRootReconciliationOutcome::default()
+        }));
+    }
+
+    if let Some(record) = previous_record.as_mut() {
+        if record.root_sha256 != fingerprint && !record.committed.is_empty() {
+            // A successful exact Invalid append is the only proof that lets a
+            // newer root supersede a failed runtime handoff. Even then, the
+            // newer generation must pass every ownership/secret/typed gate,
+            // and must contain a distinct replacement plan for that exact
+            // section. Omission, an identical echo, or any rejection keeps
+            // the old publication pending so transient dependencies can
+            // recover without another edit.
+            if record
+                .committed
+                .values()
+                .any(|publication| !publication.runtime_degraded)
+            {
+                // The previous generation's exact runtime/event handoff is a
+                // durable outbox. It cannot cross a root fingerprint until a
+                // Changed transition or an exact Invalid transition makes the
+                // handoff durable.
+                return Ok(Some(LegacyRootReconciliationOutcome {
+                    fingerprint: record.root_sha256.clone(),
+                    committed: reconciliation_record_events(record),
+                    rejected: record.rejected.clone(),
+                    duplicate: false,
+                    guard_advanced: false,
+                    partial: true,
+                    ..LegacyRootReconciliationOutcome::default()
+                }));
+            }
+            if !rejected.is_empty() {
+                // A malformed/ambiguous/secret-bearing generation must never
+                // supersede an old failed publication, even when one of its
+                // per-section candidates happens to deserialize. Preserve
+                // those exact publications while allowing unrelated valid
+                // section plans to retain their normal independent semantics.
+                plans.retain(|plan| !record.committed.contains_key(plan.id.descriptor().name));
+            }
+            // Carry every old degraded publication into the new generation.
+            // A successful distinct rN+1 CAS atomically overwrites the same
+            // map entry below; omission, an identical echo, a crash, root
+            // race, or CAS conflict leaves the rN retry proof intact while
+            // unrelated section plans can still commit independently.
+        }
+    }
+
+    rejected.sort_by_key(|rejection| rejection.section);
+    rejected.dedup_by_key(|rejection| rejection.section);
+    let mut committed_by_section = previous_record
+        .as_ref()
+        .map(|record| record.committed.clone())
+        .unwrap_or_default();
+    let mut planned_by_section = BTreeMap::new();
+    for plan in &plans {
+        planned_by_section.insert(
+            plan.id.descriptor().name.to_string(),
+            LegacyRootPlannedCommit {
+                expected_revision: plan.expected_revision,
+                candidate_sha256: canonical_value_sha256(&plan.candidate)?,
+            },
+        );
+    }
+    let mut record = LegacyRootReconciliationRecord {
+        version: LEGACY_ROOT_RECONCILIATION_VERSION,
+        root_sha256: fingerprint.clone(),
+        complete: false,
+        committed: committed_by_section.clone(),
+        planned: planned_by_section,
+        rejected: rejected.clone(),
+        unknown_fields,
+    };
+    // Durable intent precedes every section CAS, closing the otherwise
+    // unrecoverable commit-before-outbox crash window.
+    write_legacy_reconciliation_record(data_dir, &record)?;
+
+    let mut committed = Vec::new();
+    let mut partial = false;
+    for plan in plans {
+        let id = plan.id;
+        let section = id.descriptor().name.to_string();
+        let candidate_sha256 = record
+            .planned
+            .get(&section)
+            .map(|planned| planned.candidate_sha256.clone())
+            .ok_or_else(|| {
+                crate::ConfigStoreError::Validation(
+                    "legacy root publication intent is unavailable".to_string(),
+                )
+            })?;
+        if crate::credential_migration::read_section_attestation_target(
+            &data_dir.join("config.json"),
+        )?
+        .as_deref()
+            != Some(root_bytes.as_slice())
+        {
+            partial = true;
+            break;
+        }
+        #[cfg(test)]
+        run_legacy_root_commit_test_hook(legacy_root_before_commit_test_hooks(), data_dir, id);
+        match commit_planned_legacy_root_section(commit_registry, plan) {
+            Ok(event) => {
+                #[cfg(test)]
+                run_legacy_root_commit_test_hook(
+                    legacy_root_after_commit_test_hooks(),
+                    data_dir,
+                    id,
+                );
+                let revision = match &event {
+                    ConfigSectionEvent::Changed { revision, .. }
+                    | ConfigSectionEvent::Invalid { revision, .. }
+                    | ConfigSectionEvent::Recovered { revision, .. } => *revision,
+                };
+                let publication = LegacyRootCommittedPublication {
+                    revision,
+                    candidate_sha256,
+                    runtime_degraded: false,
+                };
+                committed_by_section.insert(section.clone(), publication.clone());
+                record.committed.insert(section.clone(), publication);
+                record.planned.remove(&section);
+                write_legacy_reconciliation_record(data_dir, &record)?;
+                committed.push(event);
+            }
+            Err(crate::ConfigStoreError::Conflict { .. }) => {
+                rejected.push(LegacyRootSectionRejection {
+                    section: id,
+                    reason: LegacyRootRejectionReason::RevisionConflict,
+                });
+                record.planned.remove(&section);
+            }
+            Err(crate::ConfigStoreError::Json(_) | crate::ConfigStoreError::Validation(_)) => {
+                rejected.push(LegacyRootSectionRejection {
+                    section: id,
+                    reason: LegacyRootRejectionReason::InvalidDocument,
+                });
+                record.planned.remove(&section);
+            }
+            Err(error) => return Err(error),
+        }
+        record.rejected = rejected.clone();
+        write_legacy_reconciliation_record(data_dir, &record)?;
+    }
+    if crate::credential_migration::read_section_attestation_target(&data_dir.join("config.json"))?
+        .as_deref()
+        != Some(root_bytes.as_slice())
+    {
+        partial = true;
+    }
+    rejected.sort_by_key(|rejection| rejection.section);
+    rejected.dedup_by_key(|rejection| rejection.section);
+    let rejected_ids = rejected
+        .iter()
+        .map(|rejection| rejection.section)
+        .collect::<BTreeSet<_>>();
+    let recovered = previous_record
+        .as_ref()
+        .into_iter()
+        .flat_map(|record| record.rejected.iter())
+        .map(|rejection| rejection.section)
+        .filter(|section| !rejected_ids.contains(section))
+        .filter(|section| !record.committed.contains_key(section.descriptor().name))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    record.rejected = rejected.clone();
+    write_legacy_reconciliation_record(data_dir, &record)?;
+    let guard_advanced = !partial
+        && crate::credential_migration::advance_legacy_root_completion_guard_locked(
+            data_dir,
+            Some(&fingerprint),
+        )?;
+    if !partial {
+        record.complete = guard_advanced;
+        write_legacy_reconciliation_record(data_dir, &record)?;
+    }
+    let pending_publications = reconciliation_record_events(&record);
+    Ok(Some(LegacyRootReconciliationOutcome {
+        fingerprint,
+        committed: pending_publications,
+        rejected,
+        recovered,
+        duplicate: false,
+        guard_advanced,
+        partial: !record.complete,
+    }))
 }

@@ -133,6 +133,11 @@ struct SectionLayoutCompletionLedger {
     legacy_cleanup: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     legacy_source_guards: BTreeMap<String, FacadeSourceBase>,
+    /// Canonical secret-free outbox/health for compatibility-root
+    /// reconciliation. The sibling status file is only a diagnostic mirror;
+    /// deleting it cannot erase a pending publication or rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_root_reconciliation: Option<crate::section_facade::LegacyRootReconciliationRecord>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,6 +425,49 @@ impl FacadeSourceSnapshot {
         })
     }
 
+    fn capture_stable(data_dir: &Path) -> ConfigStoreResult<Self> {
+        for _ in 0..4 {
+            let before = crate::section_facade::preflight_source_hashes(data_dir)?;
+            let snapshot = Self::capture(data_dir)?;
+            let captured = snapshot
+                .files
+                .iter()
+                .map(|(name, state)| {
+                    let bytes = match state {
+                        FacadeSourceState::Missing => None,
+                        FacadeSourceState::Regular(bytes) => Some(bytes.as_slice()),
+                    };
+                    (
+                        name.clone(),
+                        crate::section_facade::source_state_hash(bytes),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if captured == before
+                && crate::section_facade::preflight_source_hashes(data_dir)? == before
+            {
+                return Ok(snapshot);
+            }
+        }
+        Err(ConfigStoreError::Validation(
+            "configuration sources changed repeatedly while capturing recovery preflight"
+                .to_string(),
+        ))
+    }
+
+    fn into_strict_source_overrides(self) -> BTreeMap<String, Option<Vec<u8>>> {
+        self.files
+            .into_iter()
+            .map(|(name, state)| {
+                let bytes = match state {
+                    FacadeSourceState::Missing => None,
+                    FacadeSourceState::Regular(bytes) => Some(bytes),
+                };
+                (name, bytes)
+            })
+            .collect()
+    }
+
     fn attestation(&self) -> BTreeMap<String, FacadeSourceBase> {
         self.files
             .iter()
@@ -449,7 +497,7 @@ pub(crate) struct FacadeCredentialPlan {
     pub source_snapshot: FacadeSourceSnapshot,
     pub credential_original: FacadeSourceState,
     pub credential_candidate: Vec<u8>,
-    pub source_overrides: BTreeMap<String, Vec<u8>>,
+    pub source_overrides: BTreeMap<String, Option<Vec<u8>>>,
     pub legacy_cleanups: Vec<PlannedLegacyCleanup>,
 }
 
@@ -695,20 +743,20 @@ pub(crate) fn plan_facade_compound_credentials(
         primary_authority.providers = providers;
         primary_authority.provider_instances = owns_instances;
         if let Some(section) = plan_provider_document(original, &mut primary_extracted, 1)? {
-            source_overrides.insert(PROVIDERS_FILE.to_string(), section.bytes);
+            source_overrides.insert(PROVIDERS_FILE.to_string(), Some(section.bytes));
         }
     }
     if let Some(original) = source_snapshot.bytes(MCP_FILE)?.map(ToOwned::to_owned) {
         primary_authority.mcp = true;
         primary_authority.mcp_servers = mcp_document_server_ids(&original)?;
         if let Some(section) = plan_mcp_document(original, &mut primary_extracted, 1)? {
-            source_overrides.insert(MCP_FILE.to_string(), section.bytes);
+            source_overrides.insert(MCP_FILE.to_string(), Some(section.bytes));
         }
     }
     if let Some(original) = source_snapshot.bytes(CONNECT_FILE)?.map(ToOwned::to_owned) {
         primary_authority.connect_platforms = connect_platform_ids(&original)?;
         if let Some(section) = plan_connect_document(original, &mut primary_extracted, 1)? {
-            source_overrides.insert(CONNECT_FILE.to_string(), section.bytes);
+            source_overrides.insert(CONNECT_FILE.to_string(), Some(section.bytes));
         }
     }
     if let Some(original) = source_snapshot
@@ -719,7 +767,7 @@ pub(crate) fn plan_facade_compound_credentials(
         if let Some(section) =
             plan_access_control_document(original, &mut primary_extracted, 1, "section")?
         {
-            source_overrides.insert(ACCESS_CONTROL_FILE.to_string(), section.bytes);
+            source_overrides.insert(ACCESS_CONTROL_FILE.to_string(), Some(section.bytes));
         }
     }
 
@@ -735,7 +783,7 @@ pub(crate) fn plan_facade_compound_credentials(
         discard_shadowed_root_secrets(&mut root_extracted, &primary_authority);
         if planned.is_some() || metadata_changed {
             primary_extracted.extend(root_extracted);
-            source_overrides.insert(CONFIG_FILE.to_string(), candidate.clone());
+            source_overrides.insert(CONFIG_FILE.to_string(), Some(candidate.clone()));
             legacy_cleanups.push(PlannedLegacyCleanup {
                 name: CONFIG_FILE.to_string(),
                 original: source_snapshot.state(CONFIG_FILE)?.clone(),
@@ -752,7 +800,7 @@ pub(crate) fn plan_facade_compound_credentials(
                 plan_broker_document(data_dir, original, &mut broker_extracted, 1)?
             {
                 primary_extracted.extend(broker_extracted);
-                source_overrides.insert(BROKER_FILE.to_string(), section.bytes.clone());
+                source_overrides.insert(BROKER_FILE.to_string(), Some(section.bytes.clone()));
                 legacy_cleanups.push(PlannedLegacyCleanup {
                     name: BROKER_FILE.to_string(),
                     original: source_snapshot.state(BROKER_FILE)?.clone(),
@@ -1236,10 +1284,37 @@ fn cluster_abort_record_test_fault(data_dir: &Path) -> bool {
 pub fn migrate_provider_mcp_credentials(
     data_dir: impl AsRef<Path>,
 ) -> ConfigStoreResult<CredentialMigrationOutcome> {
+    let data_dir = data_dir.as_ref();
+    if validate_completed_modular_authority(data_dir)? {
+        return with_migration_lock(data_dir, || {
+            migrate_active_provider_mcp_credentials_for_facade_locked(data_dir)
+        });
+    }
     #[cfg(test)]
-    return migrate_with_fault(data_dir.as_ref(), MigrationFault::None);
+    return migrate_with_fault(data_dir, MigrationFault::None);
     #[cfg(not(test))]
-    migrate_inner(data_dir.as_ref(), None)
+    migrate_inner(data_dir, None)
+}
+
+fn validate_completed_modular_authority(data_dir: &Path) -> ConfigStoreResult<bool> {
+    if !crate::modular_authority_boundary_present(data_dir)? {
+        return Ok(false);
+    }
+    if !crate::has_completed_section_layout_marker(data_dir)? {
+        return Err(ConfigStoreError::Validation(
+            "modular configuration authority evidence is incomplete; legacy fallback is forbidden"
+                .to_string(),
+        ));
+    }
+    if !crate::section_layout_is_active(data_dir)?
+        && !crate::section_facade::completed_layout_allows_legacy_root_reconciliation(data_dir)?
+    {
+        return Err(ConfigStoreError::Validation(
+            "completed modular configuration evidence is inconsistent".to_string(),
+        ));
+    }
+    crate::section_facade::validate_legacy_root_reconciliation_state(data_dir)?;
+    Ok(true)
 }
 
 pub(crate) fn with_migration_lock<T>(
@@ -1249,10 +1324,13 @@ pub(crate) fn with_migration_lock<T>(
     with_provider_mcp_migration_lock(data_dir, operation)
 }
 
-pub(crate) fn migrate_provider_mcp_credentials_for_facade_locked(
+/// Repair only the typed provider and MCP authorities of an already-completed
+/// modular layout. A reappeared `config.json` belongs exclusively to section
+/// reconciliation and is never credential-migration input here.
+pub(crate) fn migrate_active_provider_mcp_credentials_for_facade_locked(
     data_dir: &Path,
 ) -> ConfigStoreResult<CredentialMigrationOutcome> {
-    migrate_inner_with_root_builtins_locked(data_dir, None, true)
+    migrate_inner_with_root_builtins_locked(data_dir, None, false, false)
 }
 
 pub(crate) fn migrate_external_broker_credentials_locked(
@@ -1261,26 +1339,10 @@ pub(crate) fn migrate_external_broker_credentials_locked(
     migrate_broker_locked(data_dir, None)
 }
 
-pub(crate) fn migrate_cluster_credentials_locked(
-    data_dir: &Path,
-) -> ConfigStoreResult<CredentialMigrationOutcome> {
-    migrate_cluster_locked(data_dir, None)
-}
-
 pub(crate) fn migrate_access_control_credentials_for_facade_locked(
     data_dir: &Path,
 ) -> ConfigStoreResult<CredentialMigrationOutcome> {
     migrate_access_control_locked(data_dir, None)
-}
-
-pub(crate) fn access_control_requires_opaque_repair(data_dir: &Path) -> ConfigStoreResult<bool> {
-    let Some(bytes) = read_optional_target(&data_dir.join(ACCESS_CONTROL_FILE))? else {
-        return Ok(false);
-    };
-    let Ok(mut document) = serde_json::from_slice::<Value>(&bytes) else {
-        return Ok(true);
-    };
-    Ok(section_data_mut(&mut document).is_err())
 }
 
 /// Run the provider/MCP/root planner and every ownership/decryption check
@@ -1364,7 +1426,24 @@ pub fn migrate_external_broker_credentials(
 pub fn migrate_cluster_credentials(
     data_dir: impl AsRef<Path>,
 ) -> ConfigStoreResult<CredentialMigrationOutcome> {
-    migrate_cluster_inner(data_dir.as_ref(), None)
+    let data_dir = data_dir.as_ref();
+    if validate_completed_modular_authority(data_dir)? {
+        return with_migration_lock(data_dir, || {
+            cleanup_orphan_transaction_dirs(data_dir)?;
+            let resumed = recover_committed(
+                data_dir,
+                #[cfg(test)]
+                None,
+            )?
+            .is_some();
+            discard_uncommitted(data_dir)?;
+            Ok(CredentialMigrationOutcome {
+                migrated_credentials: 0,
+                resumed,
+            })
+        });
+    }
+    migrate_cluster_inner(data_dir, None)
 }
 
 /// Validate the complete cluster credential migration without creating the
@@ -1516,11 +1595,22 @@ fn install_section_split_migration_locked_inner(
         Some(fault),
     )?
     .is_some();
-    if crate::section_layout_is_active(data_dir)? {
-        return Ok(SectionMigrationOutcome {
-            activated: false,
-            resumed,
-        });
+    if crate::modular_authority_boundary_present(data_dir)? {
+        if !crate::has_completed_section_layout_marker(data_dir)? {
+            return Err(ConfigStoreError::Validation(
+                "modular configuration authority evidence is incomplete; initial section migration is forbidden"
+                    .to_string(),
+            ));
+        }
+        if crate::section_layout_is_active(data_dir)? {
+            return Ok(SectionMigrationOutcome {
+                activated: false,
+                resumed,
+            });
+        }
+        return Err(ConfigStoreError::Validation(
+            "completed modular configuration cannot re-enter initial section migration".to_string(),
+        ));
     }
     discard_uncommitted(data_dir)?;
     validate_section_split_plan(data_dir, &plan)?;
@@ -1856,6 +1946,130 @@ pub(crate) fn recover_pending_config_transaction(
             None,
         )
         .map(|outcome| outcome.is_some())
+    })
+}
+
+pub(crate) struct FacadePendingConfigRecovery {
+    pub(crate) recovered: bool,
+    pub(crate) initial_layout_sources: Option<BTreeMap<String, Option<Vec<u8>>>>,
+}
+
+#[cfg(test)]
+type FacadeRecoverySnapshotTestHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(test)]
+fn facade_recovery_snapshot_test_hooks(
+) -> &'static Mutex<BTreeMap<PathBuf, FacadeRecoverySnapshotTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, FacadeRecoverySnapshotTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_facade_recovery_after_snapshot_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce(&Path) + Send + 'static,
+) {
+    facade_recovery_snapshot_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_facade_recovery_after_snapshot_test_hook(data_dir: &Path) {
+    if let Some(hook) = facade_recovery_snapshot_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(data_dir)
+    {
+        hook(data_dir);
+    }
+}
+
+/// Recover a committed layout transaction and bind its historical strict
+/// preflight to one migration-lock epoch. Established modular layouts and
+/// unrelated provider/exact manifests never capture compatibility-root bytes.
+pub(crate) fn recover_pending_config_transaction_for_facade(
+    data_dir: impl AsRef<Path>,
+) -> ConfigStoreResult<FacadePendingConfigRecovery> {
+    let data_dir = data_dir.as_ref();
+    let data_dir = if data_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        data_dir
+    };
+    // Keep the no-transaction startup path strictly read-only. Besides being
+    // unnecessary, acquiring the migration lock creates its lock file and
+    // would turn validation failures into observable writes. The manifest is
+    // read again under the lock below, so a concurrent recovery or removal is
+    // still handled safely.
+    if read_optional_migration_file(&data_dir.join(MANIFEST_FILE))?.is_none() {
+        if read_optional_migration_file(&data_dir.join(CLUSTER_ABORT_FILE))?.is_some() {
+            return Err(ConfigStoreError::Validation(
+                "cluster abort recovery metadata has no committed manifest".to_string(),
+            ));
+        }
+        return Ok(FacadePendingConfigRecovery {
+            recovered: false,
+            initial_layout_sources: None,
+        });
+    }
+    with_provider_mcp_migration_lock(data_dir, || {
+        let Some(manifest_bytes) = read_optional_migration_file(&data_dir.join(MANIFEST_FILE))?
+        else {
+            if read_optional_migration_file(&data_dir.join(CLUSTER_ABORT_FILE))?.is_some() {
+                return Err(ConfigStoreError::Validation(
+                    "cluster abort recovery metadata has no committed manifest".to_string(),
+                ));
+            }
+            return Ok(FacadePendingConfigRecovery {
+                recovered: false,
+                initial_layout_sources: None,
+            });
+        };
+        let manifest: MigrationManifest = serde_json::from_slice(&manifest_bytes)?;
+        validate_manifest(&manifest)?;
+        let capture_initial_layout = manifest.state == MigrationState::Pending
+            && is_section_layout_scope(manifest.migration_scope)
+            && !crate::modular_authority_boundary_present(data_dir)?;
+        let mut before = capture_initial_layout
+            .then(|| FacadeSourceSnapshot::capture_stable(data_dir))
+            .transpose()?;
+        #[cfg(test)]
+        if capture_initial_layout {
+            run_facade_recovery_after_snapshot_test_hook(data_dir);
+        }
+        let transaction_targets = manifest
+            .files
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<BTreeSet<_>>();
+        let recovered = recover_committed(
+            data_dir,
+            #[cfg(test)]
+            None,
+        )?
+        .is_some();
+        let initial_layout_sources = if recovered {
+            if let Some(mut before) = before.take() {
+                let after = FacadeSourceSnapshot::capture_stable(data_dir)?;
+                for (name, state) in after.files {
+                    if !transaction_targets.contains(&name) {
+                        before.files.insert(name, state);
+                    }
+                }
+                Some(before.into_strict_source_overrides())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(FacadePendingConfigRecovery {
+            recovered,
+            initial_layout_sources,
+        })
     })
 }
 
@@ -3957,6 +4171,21 @@ fn persist_exact_credential_transaction_inner(
     )?;
     discard_uncommitted(data_dir)?;
 
+    if crate::modular_authority_boundary_present(data_dir)? {
+        if !crate::has_completed_section_layout_marker(data_dir)? {
+            return Err(ConfigStoreError::Validation(
+                "modular configuration authority evidence is incomplete; credential mutation is forbidden"
+                    .to_string(),
+            ));
+        }
+        if !crate::section_layout_is_active(data_dir)? {
+            return Err(ConfigStoreError::Validation(
+                "completed modular configuration requires legacy-root reconciliation before credential mutation"
+                    .to_string(),
+            ));
+        }
+    }
+
     let exact_scope = if let Some((scope, _)) = reset_scope {
         Some(scope)
     } else if proxy_only {
@@ -5307,6 +5536,13 @@ fn migrate_cluster_locked(
     .is_some();
     discard_uncommitted(data_dir)?;
 
+    if crate::modular_authority_boundary_present(data_dir)? {
+        return Err(ConfigStoreError::Validation(
+            "modular configuration authority appeared during cluster migration; legacy root access is forbidden"
+                .to_string(),
+        ));
+    }
+
     let mut extracted = Vec::new();
     let section = plan_cluster_section(data_dir, &mut extracted, 1, true)?;
     let credential_original = read_optional_target(&data_dir.join(CREDENTIALS_FILE))?;
@@ -5502,7 +5738,7 @@ fn migrate_inner_with_root_builtins(
     include_root_builtins: bool,
 ) -> ConfigStoreResult<CredentialMigrationOutcome> {
     with_migration_lock(data_dir, || {
-        migrate_inner_with_root_builtins_locked(data_dir, fault, include_root_builtins)
+        migrate_inner_with_root_builtins_locked(data_dir, fault, include_root_builtins, true)
     })
 }
 
@@ -5510,6 +5746,7 @@ fn migrate_inner_with_root_builtins_locked(
     data_dir: &Path,
     #[cfg_attr(not(test), allow(unused_variables))] fault: Option<MigrationFault>,
     include_root_builtins: bool,
+    include_root_document: bool,
 ) -> ConfigStoreResult<CredentialMigrationOutcome> {
     cleanup_orphan_transaction_dirs(data_dir)?;
     match recover_committed(
@@ -5538,11 +5775,21 @@ fn migrate_inner_with_root_builtins_locked(
     }
     discard_uncommitted(data_dir)?;
 
+    if include_root_document && crate::modular_authority_boundary_present(data_dir)? {
+        return Err(ConfigStoreError::Validation(
+            "modular configuration authority appeared during credential migration; legacy root access is forbidden"
+                .to_string(),
+        ));
+    }
+
     let mut extracted = Vec::new();
     let providers = plan_provider_section(data_dir, &mut extracted, 1)?;
     let mcp = plan_mcp_section(data_dir, &mut extracted, 1)?;
-    let provider_instances =
-        plan_provider_instance_section(data_dir, &mut extracted, 1, true, include_root_builtins)?;
+    let provider_instances = if include_root_document {
+        plan_provider_instance_section(data_dir, &mut extracted, 1, true, include_root_builtins)?
+    } else {
+        None
+    };
     let provider_facade_scope = include_root_builtins && provider_instances.is_some();
     let credential_original = read_optional_target(&data_dir.join(CREDENTIALS_FILE))?;
     let credential_store = CredentialStore::open(data_dir);
@@ -5559,14 +5806,18 @@ fn migrate_inner_with_root_builtins_locked(
         &extracted,
         &prospective_documents,
     )?;
-    ensure_backup_legacy_proxy_extractions_are_safe(data_dir, &credential_store)?;
+    if include_root_document {
+        ensure_backup_legacy_proxy_extractions_are_safe(data_dir, &credential_store)?;
+    }
     if providers.is_none() && mcp.is_none() && provider_instances.is_none() {
-        scrub_provider_instance_credentials_from_backups(
-            data_dir,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-        )?;
+        if include_root_document {
+            scrub_provider_instance_credentials_from_backups(
+                data_dir,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )?;
+        }
         return Ok(CredentialMigrationOutcome {
             migrated_credentials: 0,
             resumed: false,
@@ -11077,15 +11328,62 @@ fn persist_section_layout_completion_ledger(
                 (file.name.clone(), base)
             })
             .collect(),
+        legacy_root_reconciliation: None,
     };
-    let bytes = serde_json::to_vec_pretty(&ledger)?;
-    if read_optional_migration_file(&data_dir.join(SECTION_LAYOUT_COMPLETION_FILE))?
-        .is_some_and(|current| current == bytes)
-    {
+    let path = data_dir.join(SECTION_LAYOUT_COMPLETION_FILE);
+    if let Some(current) = read_optional_migration_file(&path)? {
+        let current: SectionLayoutCompletionLedger =
+            serde_json::from_slice(&current).map_err(|_| {
+                ConfigStoreError::Validation(
+                    "section layout completion ledger is invalid".to_string(),
+                )
+            })?;
+        let immutable_matches = current.version == ledger.version
+            && current.state == ledger.state
+            && current.facade_compound == ledger.facade_compound
+            && current.marker_sha256 == ledger.marker_sha256
+            && current.completion == ledger.completion;
+        let evidence_names = current
+            .legacy_cleanup
+            .keys()
+            .chain(current.legacy_source_guards.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let expected_names = if current.facade_compound {
+            durable_legacy_authority_names()
+        } else {
+            BTreeSet::new()
+        };
+        let mutable_shape_valid = evidence_names == expected_names
+            && current
+                .legacy_cleanup
+                .keys()
+                .all(|name| !current.legacy_source_guards.contains_key(name))
+            && current
+                .legacy_cleanup
+                .values()
+                .all(|hash| is_sha256_hex(hash))
+            && current
+                .legacy_source_guards
+                .values()
+                .all(|base| match base {
+                    FacadeSourceBase::Missing => true,
+                    FacadeSourceBase::Regular { sha256 } => is_sha256_hex(sha256),
+                });
+        if !immutable_matches || !mutable_shape_valid {
+            return Err(ConfigStoreError::Validation(
+                "section layout completion ledger does not match its immutable transaction"
+                    .to_string(),
+            ));
+        }
+        // Root reconciliation legitimately advances the guard maps and owns a
+        // canonical publication outbox in this ledger. A completed manifest
+        // recovery must preserve that mutable state rather than reconstructing
+        // the original post-split bytes.
         return Ok(());
     }
-    AtomicFileStore::new(data_dir.join(SECTION_LAYOUT_COMPLETION_FILE))
-        .write_bytes_without_backup(&bytes)
+    let bytes = serde_json::to_vec_pretty(&ledger)?;
+    AtomicFileStore::new(path).write_bytes_without_backup(&bytes)
 }
 
 pub(crate) fn section_layout_completion_evidence_matches(
@@ -11164,6 +11462,261 @@ pub(crate) fn section_layout_completion_evidence_matches(
                 _ => false,
             }
         }))
+}
+
+pub(crate) fn read_embedded_legacy_root_reconciliation(
+    data_dir: &Path,
+) -> ConfigStoreResult<Option<crate::section_facade::LegacyRootReconciliationRecord>> {
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(SECTION_LAYOUT_COMPLETION_FILE))?
+    else {
+        return Ok(None);
+    };
+    let ledger: SectionLayoutCompletionLedger = serde_json::from_slice(&bytes)?;
+    Ok(ledger.legacy_root_reconciliation)
+}
+
+/// Read config.json only when the returned bytes themselves match the exact
+/// initial-split guard embedded in the canonical completion ledger. The
+/// caller holds the migration lock and has already validated the completed
+/// layout; comparing the captured bytes closes swap-and-restore races that a
+/// second path-based active-layout check cannot detect.
+pub(crate) fn read_initial_guarded_legacy_root_locked(
+    data_dir: &Path,
+) -> ConfigStoreResult<Option<Vec<u8>>> {
+    let Some(ledger_bytes) =
+        read_optional_migration_file(&data_dir.join(SECTION_LAYOUT_COMPLETION_FILE))?
+    else {
+        return Ok(None);
+    };
+    let ledger: SectionLayoutCompletionLedger = serde_json::from_slice(&ledger_bytes)?;
+    let Some(guard) = ledger.legacy_source_guards.get(CONFIG_FILE) else {
+        return Ok(None);
+    };
+    match guard {
+        FacadeSourceBase::Missing => Ok(None),
+        FacadeSourceBase::Regular { sha256: expected } if is_sha256_hex(expected) => {
+            let Some(bytes) = read_optional_target(&data_dir.join(CONFIG_FILE))? else {
+                return Ok(None);
+            };
+            Ok((sha256(&bytes) == *expected).then_some(bytes))
+        }
+        FacadeSourceBase::Regular { .. } => Ok(None),
+    }
+}
+
+/// Update the canonical reconciliation outbox inside the completion ledger.
+/// The caller holds the shared migration lock, so guard and outbox rewrites
+/// are serialized as one authority stream even though each file replacement
+/// remains independently atomic.
+pub(crate) fn write_embedded_legacy_root_reconciliation_locked(
+    data_dir: &Path,
+    record: crate::section_facade::LegacyRootReconciliationRecord,
+) -> ConfigStoreResult<()> {
+    let path = data_dir.join(SECTION_LAYOUT_COMPLETION_FILE);
+    let bytes = read_optional_migration_file(&path)?.ok_or_else(|| {
+        ConfigStoreError::Validation("section layout completion ledger is unavailable".to_string())
+    })?;
+    let mut ledger: SectionLayoutCompletionLedger = serde_json::from_slice(&bytes)?;
+    ledger.legacy_root_reconciliation = Some(record);
+    AtomicFileStore::new(path).write_bytes_without_backup(&serde_json::to_vec_pretty(&ledger)?)
+}
+
+/// Return whether the durable modular layout was completed and every piece of
+/// completion evidence except the legacy `config.json` generation still
+/// matches.  A reappeared compatibility root is deliberately *not* an initial
+/// migration input: callers use this seam to enter the revisioned
+/// reconciliation path while the ordinary active-layout predicate is false.
+pub(crate) fn section_layout_allows_legacy_root_reconciliation(
+    data_dir: &Path,
+    marker: &[u8],
+    completion: &crate::section_facade::SectionLayoutCompletion,
+) -> ConfigStoreResult<bool> {
+    let marker_sha256 = sha256(marker);
+    let manifest_scope = if let Some(manifest_bytes) =
+        read_optional_migration_file(&data_dir.join(MANIFEST_FILE))?
+    {
+        let manifest: MigrationManifest = match serde_json::from_slice(&manifest_bytes) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(false),
+        };
+        if validate_manifest(&manifest).is_err() || manifest.state != MigrationState::Complete {
+            return Ok(false);
+        }
+        if is_section_layout_scope(manifest.migration_scope)
+            && !section_split_manifest_matches_completion(&manifest, &marker_sha256, completion)?
+        {
+            return Ok(false);
+        }
+        manifest.migration_scope
+    } else {
+        None
+    };
+
+    let Some(bytes) = read_optional_migration_file(&data_dir.join(SECTION_LAYOUT_COMPLETION_FILE))?
+    else {
+        return Ok(false);
+    };
+    let ledger: SectionLayoutCompletionLedger = match serde_json::from_slice(&bytes) {
+        Ok(ledger) => ledger,
+        Err(_) => return Ok(false),
+    };
+    let durable_evidence_names = ledger
+        .legacy_cleanup
+        .keys()
+        .chain(ledger.legacy_source_guards.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_durable_names = durable_legacy_authority_names();
+    let durable_evidence_shape_valid = ledger.facade_compound
+        && durable_evidence_names == expected_durable_names
+        && ledger
+            .legacy_cleanup
+            .keys()
+            .all(|name| !ledger.legacy_source_guards.contains_key(name))
+        && manifest_scope.is_none_or(|scope| scope == MigrationScope::FacadeCompound);
+    if ledger.version != SECTION_LAYOUT_COMPLETION_LEDGER_VERSION
+        || ledger.state != MigrationState::Complete
+        || ledger.marker_sha256 != marker_sha256
+        || &ledger.completion != completion
+        || !durable_evidence_shape_valid
+    {
+        return Ok(false);
+    }
+
+    let cleanups_match = ledger
+        .legacy_cleanup
+        .iter()
+        .filter(|(name, _)| !is_durable_legacy_authority(name))
+        .all(|(name, expected)| {
+            is_sha256_hex(expected)
+                && read_target_or_empty(&data_dir.join(name))
+                    .map(|bytes| sha256(&bytes) == *expected)
+                    .unwrap_or(false)
+        });
+    let guards_match = ledger
+        .legacy_source_guards
+        .iter()
+        .filter(|(name, _)| !is_durable_legacy_authority(name))
+        .all(|(name, expected)| {
+            let current = read_optional_target(&data_dir.join(name));
+            match (expected, current) {
+                (FacadeSourceBase::Missing, Ok(None)) => true,
+                (
+                    FacadeSourceBase::Regular {
+                        sha256: expected_hash,
+                    },
+                    Ok(Some(bytes)),
+                ) => is_sha256_hex(expected_hash) && sha256(&bytes) == *expected_hash,
+                _ => false,
+            }
+        });
+    Ok(cleanups_match && guards_match)
+}
+
+/// Bind one already-reconciled compatibility-root generation (and the backup
+/// generations rotated by compatibility writers) into the durable completion
+/// ledger without rewriting any of those bytes.
+///
+/// The caller holds the provider/MCP migration lock.  Returning `false` means
+/// an external writer changed or removed `config.json` before the guard could
+/// be advanced; the newer generation remains inactive and must be planned
+/// again rather than being acknowledged under the stale hash.
+pub(crate) fn advance_legacy_root_completion_guard_locked(
+    data_dir: &Path,
+    expected_sha256: Option<&str>,
+) -> ConfigStoreResult<bool> {
+    if expected_sha256.is_some_and(|expected| !is_sha256_hex(expected)) {
+        return Err(ConfigStoreError::Validation(
+            "legacy root reconciliation fingerprint is invalid".to_string(),
+        ));
+    }
+    let marker = match read_optional_target(&data_dir.join(crate::SECTION_LAYOUT_FILE))? {
+        Some(marker) => marker,
+        None => return Ok(false),
+    };
+    let completion = match crate::section_facade::validate_completed_section_layout_marker(&marker)
+    {
+        Ok(completion) => completion,
+        Err(_) => return Ok(false),
+    };
+    if !section_layout_allows_legacy_root_reconciliation(data_dir, &marker, &completion)? {
+        return Ok(false);
+    }
+    let root = read_optional_target(&data_dir.join(CONFIG_FILE))?;
+    let root_matches = match (expected_sha256, root.as_deref()) {
+        (Some(expected), Some(root)) => sha256(root) == expected,
+        (None, None) => true,
+        _ => false,
+    };
+    if !root_matches {
+        return Ok(false);
+    }
+
+    let path = data_dir.join(SECTION_LAYOUT_COMPLETION_FILE);
+    let bytes = read_optional_migration_file(&path)?.ok_or_else(|| {
+        ConfigStoreError::Validation("section layout completion ledger is unavailable".to_string())
+    })?;
+    let mut ledger: SectionLayoutCompletionLedger = serde_json::from_slice(&bytes)?;
+    for name in durable_legacy_authority_names() {
+        ledger.legacy_cleanup.remove(&name);
+        let guard = if name == CONFIG_FILE {
+            match expected_sha256 {
+                Some(expected) => FacadeSourceBase::Regular {
+                    sha256: expected.to_string(),
+                },
+                None => FacadeSourceBase::Missing,
+            }
+        } else {
+            match read_optional_target(&data_dir.join(&name))? {
+                Some(bytes) => FacadeSourceBase::Regular {
+                    sha256: sha256(&bytes),
+                },
+                None => FacadeSourceBase::Missing,
+            }
+        };
+        ledger.legacy_source_guards.insert(name, guard);
+    }
+    AtomicFileStore::new(path).write_bytes_without_backup(&serde_json::to_vec_pretty(&ledger)?)?;
+    #[cfg(test)]
+    run_legacy_root_guard_after_write_test_hook(data_dir);
+    // A compatibility writer can rotate root/backups while the family is
+    // sampled. Revalidate the fully written ledger so a mixed generation is
+    // never reported complete; the watcher will requeue the newer family.
+    crate::section_facade::section_layout_is_active(data_dir)
+}
+
+#[cfg(test)]
+type LegacyRootGuardTestHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(test)]
+fn legacy_root_guard_after_write_test_hooks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, LegacyRootGuardTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, LegacyRootGuardTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_legacy_root_guard_after_write_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce(&Path) + Send + 'static,
+) {
+    legacy_root_guard_after_write_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_legacy_root_guard_after_write_test_hook(data_dir: &Path) {
+    if let Some(hook) = legacy_root_guard_after_write_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(data_dir)
+    {
+        hook(data_dir);
+    }
 }
 
 fn capture_durable_section_split_credentials(
