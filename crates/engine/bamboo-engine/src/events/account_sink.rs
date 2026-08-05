@@ -6,10 +6,10 @@
 //! also hand their events to this sink via [`AccountEventSink::record`] (or
 //! [`AccountEventSink::inbox`] for the dependency-free engine path).
 //!
-//! A **single writer task** owns sequence allocation, journal append, and the
-//! live broadcast — in that order, per event — so "journal order == broadcast
-//! order == seq order" holds trivially without scattering the invariant across
-//! concurrent callers.
+//! A **single writer task per sink** owns its live broadcast ordering. Durable
+//! sequence allocation and append are additionally serialized by one fixed
+//! account-journal file claim, so rolling Bamboo processes cannot allocate the
+//! same sequence or duplicate a confirmed transition.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use bamboo_agent_core::AgentEvent;
 use chrono::Utc;
+use fs2::FileExt;
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc};
 
@@ -39,6 +40,8 @@ const BROADCAST_CAPACITY: usize = 4096;
 /// disk stays bounded (~512 MiB) without semantic compaction. Clients whose
 /// cursor falls below the retained window full-resync via `feed_reset`.
 const RETAINED_FILES: usize = 64;
+const JOURNAL_LOCK_FILE: &str = ".account-journal.lock";
+const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An event accepted by the sink before seq/ts assignment: `(session_id,
 /// event)`. The session id is the caller's known routing context.
@@ -76,14 +79,13 @@ pub struct AccountEventSink {
 impl AccountEventSink {
     /// Open the journal (recovering the max seq) and spawn the writer task.
     pub fn new(events_dir: PathBuf) -> std::io::Result<Arc<Self>> {
-        // Boot-time retention pruning before opening the writer.
-        if let Err(e) = super::journal::prune(&events_dir, RETAINED_FILES) {
-            tracing::warn!("change-feed journal prune failed: {e}");
-        }
-        let durable_events = super::journal::read_since(&events_dir, 0).unwrap_or_default();
+        // Build the boot snapshot under the same fixed claim used by appends.
+        // Otherwise a rolling process could observe the new max sequence but
+        // miss the corresponding confirmation id and later duplicate it.
+        let (durable_events, max_seq) = load_durable_snapshot(&events_dir)?;
         let delivered_lifecycle_ids = durable_events
             .iter()
-            .filter_map(|change| lifecycle_event_id(&change.event).map(str::to_string))
+            .filter_map(|change| lifecycle_event_id(&change.event))
             .collect::<HashSet<_>>();
         let mut durable_config_states = HashMap::new();
         for change in &durable_events {
@@ -95,13 +97,13 @@ impl AccountEventSink {
             .iter()
             .filter_map(|change| config_event_id(&change.event))
             .collect::<HashSet<_>>();
-        let (journal, max_seq) = EventJournal::open(events_dir.clone())?;
         let seq = Arc::new(AtomicU64::new(max_seq));
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
         let (btx, _brx) = broadcast::channel(BROADCAST_CAPACITY);
         let confirmation_waiters = Arc::new(Mutex::new(HashMap::new()));
         let latest_config_states = Arc::new(Mutex::new(durable_config_states));
 
+        let writer_events_dir = events_dir.clone();
         let sink = Arc::new(Self {
             seq: seq.clone(),
             tx,
@@ -115,7 +117,7 @@ impl AccountEventSink {
 
         tokio::spawn(writer_loop(
             rx,
-            journal,
+            writer_events_dir,
             seq,
             btx,
             WriterDedupState {
@@ -149,11 +151,22 @@ impl AccountEventSink {
     }
 
     /// Enqueue one event and wait until the single writer has either appended
-    /// it durably or confirmed that the same configuration transition already
-    /// exists in the journal. `false` is returned on queue/append failure, so
-    /// callers must retain their durable outbox entry for a later retry.
+    /// it durably or confirmed that the same idempotent lifecycle/configuration
+    /// transition already exists in the journal. `false` is returned on
+    /// queue/append failure, so callers must retain their durable outbox entry
+    /// for a later retry.
     pub async fn record_confirmed(&self, session_id: Option<&str>, event: &AgentEvent) -> bool {
-        let Some(confirmation_id) = config_confirmation_id(event) else {
+        self.record_confirmed_with_timeout(session_id, event, CONFIRMATION_TIMEOUT)
+            .await
+    }
+
+    async fn record_confirmed_with_timeout(
+        &self,
+        session_id: Option<&str>,
+        event: &AgentEvent,
+        timeout: Duration,
+    ) -> bool {
+        let Some(confirmation_id) = event_confirmation_id(event) else {
             return false;
         };
         let sid = session_id
@@ -167,18 +180,22 @@ impl AccountEventSink {
             .entry(confirmation_id.clone())
             .or_default()
             .push((waiter_id, receipt));
-        if self.tx.send((sid, event.clone())).await.is_err() {
-            remove_confirmation_waiter(&self.confirmation_waiters, &confirmation_id, waiter_id);
-            return false;
-        }
-        match tokio::time::timeout(Duration::from_secs(30), confirmation).await {
-            Ok(Ok(durable)) => durable,
-            Ok(Err(_)) => false,
-            Err(_) => {
-                remove_confirmation_waiter(&self.confirmation_waiters, &confirmation_id, waiter_id);
-                false
+        // One deadline bounds both queue admission and journal confirmation.
+        // A full inbox must not hold a session-create idempotency claim forever.
+        let durable = tokio::time::timeout(timeout, async {
+            if self.tx.send((sid, event.clone())).await.is_err() {
+                return false;
             }
-        }
+            confirmation.await.unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        // Success normally removed the whole confirmation group in the writer;
+        // send failure/timeout removes this waiter explicitly. If the event was
+        // enqueued just before timeout, a late append remains safe and recovery
+        // confirms it through durable dedupe.
+        remove_confirmation_waiter(&self.confirmation_waiters, &confirmation_id, waiter_id);
+        durable
     }
 
     /// Clone of the writer inbox, for dependency-free callers (the engine
@@ -222,10 +239,13 @@ impl AccountEventSink {
     }
 }
 
-fn lifecycle_event_id(event: &AgentEvent) -> Option<&str> {
+fn lifecycle_event_id(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::WorkflowActivated { event_id, .. }
-        | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(event_id),
+        | AgentEvent::WorkflowDeactivated { event_id, .. } => Some(format!("workflow:{event_id}")),
+        AgentEvent::SessionCreated { session_id, .. } => {
+            Some(format!("session-created:{session_id}"))
+        }
         _ => None,
     }
 }
@@ -271,6 +291,10 @@ fn config_confirmation_id(event: &AgentEvent) -> Option<String> {
     Some(format!("{kind}:{key}"))
 }
 
+fn event_confirmation_id(event: &AgentEvent) -> Option<String> {
+    config_confirmation_id(event).or_else(|| lifecycle_event_id(event))
+}
+
 fn complete_confirmation_waiters(waiters: &ConfirmationWaiters, config_id: &str, durable: bool) {
     let pending = waiters
         .lock()
@@ -296,9 +320,157 @@ fn remove_confirmation_waiter(waiters: &ConfirmationWaiters, config_id: &str, wa
     }
 }
 
+enum GlobalAppend {
+    Existing {
+        max_seq: u64,
+        observed_events: Vec<ChangeEvent>,
+    },
+    Appended {
+        event: Box<ChangeEvent>,
+        observed_events: Vec<ChangeEvent>,
+    },
+}
+
+fn exact_once_event_id(event: &AgentEvent) -> Option<String> {
+    lifecycle_event_id(event).or_else(|| config_event_id(event))
+}
+
+fn duplicate_after_observed_delta(
+    event: &AgentEvent,
+    known_config_state: Option<ConfigEventKind>,
+    observed_events: &[ChangeEvent],
+) -> bool {
+    if let Some(exact_id) = exact_once_event_id(event) {
+        return observed_events.iter().any(|change| {
+            exact_once_event_id(&change.event).as_deref() == Some(exact_id.as_str())
+        });
+    }
+    let Some((key, desired_kind)) = config_event_state(event) else {
+        return false;
+    };
+    observed_events
+        .iter()
+        .filter_map(|change| config_event_state(&change.event))
+        .filter_map(|(observed_key, kind)| (observed_key == key).then_some(kind))
+        .next_back()
+        .or(known_config_state)
+        == Some(desired_kind)
+}
+
+fn publish_observed_events(
+    observed_events: Vec<ChangeEvent>,
+    seq: &AtomicU64,
+    broadcast: &broadcast::Sender<Arc<ChangeEvent>>,
+    delivered_lifecycle_ids: &mut HashSet<String>,
+    latest_config_states: &LatestConfigStates,
+    delivered_changed_ids: &mut HashSet<String>,
+) {
+    let mut config_states = latest_config_states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for change in observed_events {
+        if let Some(id) = lifecycle_event_id(&change.event) {
+            delivered_lifecycle_ids.insert(id);
+        }
+        if let Some((key, kind)) = config_event_state(&change.event) {
+            config_states.insert(key, kind);
+        }
+        if let Some(id) = config_event_id(&change.event) {
+            delivered_changed_ids.insert(id);
+        }
+        // A rolling sibling may have appended this event since this sink's
+        // last known sequence. Forward that durable delta into the local live
+        // tail before publishing the event owned by this sink. This preserves
+        // per-sink monotonic live ordering and lets a stale AppState observe an
+        // exact transition that global dedupe found in the shared journal.
+        seq.fetch_max(change.seq, Ordering::SeqCst);
+        let _ = broadcast.send(Arc::new(change));
+    }
+}
+
+fn load_durable_snapshot(events_dir: &std::path::Path) -> std::io::Result<(Vec<ChangeEvent>, u64)> {
+    std::fs::create_dir_all(events_dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(events_dir.join(JOURNAL_LOCK_FILE))?;
+    FileExt::lock_exclusive(&lock)?;
+    let result = (|| {
+        if let Err(error) = super::journal::prune(events_dir, RETAINED_FILES) {
+            tracing::warn!("change-feed journal prune failed: {error}");
+        }
+        // Writable recovery truncates a torn/invalid UTF-8 crash tail before
+        // the snapshot reader walks complete durable lines.
+        let (_, max_seq) = EventJournal::open_for_locked_append(events_dir.to_path_buf())?;
+        let durable_events = super::journal::read_since(events_dir, 0)?;
+        Ok((durable_events, max_seq))
+    })();
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
+/// Serialize durable journal publication across rolling Bamboo processes.
+/// Confirmation-bearing events are re-checked from disk while the claim is
+/// held, then a fresh disk-derived sequence is appended, flushed, and synced.
+/// Events without a confirmation id share the append/sequence boundary but do
+/// not gain semantic deduplication.
+async fn append_with_global_claim(
+    events_dir: PathBuf,
+    session_id: Option<String>,
+    event: AgentEvent,
+    known_max_seq: u64,
+    known_config_state: Option<ConfigEventKind>,
+) -> std::io::Result<GlobalAppend> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&events_dir)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(events_dir.join(JOURNAL_LOCK_FILE))?;
+        FileExt::lock_exclusive(&lock)?;
+
+        let result = (|| {
+            let (mut journal, max_seq) = EventJournal::open_for_locked_append(events_dir.clone())?;
+            let observed_events = if max_seq > known_max_seq {
+                super::journal::read_since(&events_dir, known_max_seq)?
+            } else {
+                Vec::new()
+            };
+            if duplicate_after_observed_delta(&event, known_config_state, &observed_events) {
+                return Ok(GlobalAppend::Existing {
+                    max_seq,
+                    observed_events,
+                });
+            }
+
+            let ce = ChangeEvent {
+                seq: max_seq
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("account journal sequence exhausted"))?,
+                ts: Utc::now(),
+                session_id,
+                event,
+            };
+            journal.append_synced(&ce)?;
+            Ok(GlobalAppend::Appended {
+                event: Box::new(ce),
+                observed_events,
+            })
+        })();
+        let _ = FileExt::unlock(&lock);
+        result
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("join account journal task: {error}")))?
+}
+
 async fn writer_loop(
     mut rx: mpsc::Receiver<PendingEvent>,
-    mut journal: EventJournal,
+    events_dir: PathBuf,
     seq: Arc<AtomicU64>,
     broadcast: broadcast::Sender<Arc<ChangeEvent>>,
     state: WriterDedupState,
@@ -310,23 +482,16 @@ async fn writer_loop(
         confirmation_waiters,
     } = state;
     while let Some((session_id, event)) = rx.recv().await {
-        let lifecycle_id = lifecycle_event_id(&event).map(str::to_string);
+        let lifecycle_id = lifecycle_event_id(&event);
         let config_id = config_event_id(&event);
         let config_state = config_event_state(&event);
-        let confirmation_id = config_confirmation_id(&event);
+        let confirmation_id = event_confirmation_id(&event);
         if lifecycle_id
             .as_ref()
             .is_some_and(|id| delivered_lifecycle_ids.contains(id))
             || config_id
                 .as_ref()
                 .is_some_and(|id| delivered_changed_ids.contains(id))
-            || config_state.as_ref().is_some_and(|(key, kind)| {
-                latest_config_states
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(key)
-                    == Some(kind)
-            })
         {
             tracing::debug!("duplicate durable change event suppressed");
             if let Some(confirmation_id) = confirmation_id.as_deref() {
@@ -334,21 +499,62 @@ async fn writer_loop(
             }
             continue;
         }
-        // Single writer → fetch_add is the seq allocator. 1-based.
-        let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let ce = ChangeEvent {
-            seq: next,
-            ts: Utc::now(),
+        let append = append_with_global_claim(
+            events_dir.clone(),
             session_id,
             event,
-        };
-        if let Err(e) = journal.append(&ce) {
-            tracing::error!("failed to append change event {} to journal: {e}", ce.seq);
-            if let Some(confirmation_id) = confirmation_id.as_deref() {
-                complete_confirmation_waiters(&confirmation_waiters, confirmation_id, false);
+            seq.load(Ordering::SeqCst),
+            config_state.as_ref().and_then(|(key, _)| {
+                latest_config_states
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(key)
+                    .copied()
+            }),
+        )
+        .await;
+        let ce = match append {
+            Ok(GlobalAppend::Existing {
+                max_seq,
+                observed_events,
+            }) => {
+                publish_observed_events(
+                    observed_events,
+                    seq.as_ref(),
+                    &broadcast,
+                    &mut delivered_lifecycle_ids,
+                    &latest_config_states,
+                    &mut delivered_changed_ids,
+                );
+                seq.fetch_max(max_seq, Ordering::SeqCst);
+                if let Some(confirmation_id) = confirmation_id.as_deref() {
+                    complete_confirmation_waiters(&confirmation_waiters, confirmation_id, true);
+                }
+                continue;
             }
-            continue;
-        }
+            Ok(GlobalAppend::Appended {
+                event,
+                observed_events,
+            }) => {
+                publish_observed_events(
+                    observed_events,
+                    seq.as_ref(),
+                    &broadcast,
+                    &mut delivered_lifecycle_ids,
+                    &latest_config_states,
+                    &mut delivered_changed_ids,
+                );
+                seq.fetch_max(event.seq, Ordering::SeqCst);
+                *event
+            }
+            Err(e) => {
+                tracing::error!("failed to append durable change event to journal: {e}");
+                if let Some(confirmation_id) = confirmation_id.as_deref() {
+                    complete_confirmation_waiters(&confirmation_waiters, confirmation_id, false);
+                }
+                continue;
+            }
+        };
         if let Some(id) = lifecycle_id {
             delivered_lifecycle_ids.insert(id);
         }
@@ -391,6 +597,16 @@ mod tests {
         }
     }
 
+    fn session_created(session_id: &str) -> AgentEvent {
+        AgentEvent::SessionCreated {
+            session_id: session_id.to_string(),
+            project_id: None,
+            title: "New Session".to_string(),
+            kind: bamboo_agent_core::SessionKind::Root,
+            created_at: Utc::now(),
+        }
+    }
+
     fn config_changed(section: &str, revision: u64) -> AgentEvent {
         AgentEvent::ConfigChanged {
             section: section.to_string(),
@@ -426,7 +642,7 @@ mod tests {
             .expect("broadcast");
         assert_eq!(
             lifecycle_event_id(&first.event),
-            Some("stable-activation-id")
+            Some("workflow:stable-activation-id".to_string())
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
@@ -466,6 +682,253 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_session_created_is_deduped_by_session_id_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let event = session_created("stable-session-id");
+        let sink = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        assert!(
+            sink.record_confirmed(Some("stable-session-id"), &event)
+                .await
+        );
+        assert!(
+            sink.record_confirmed(Some("stable-session-id"), &event)
+                .await
+        );
+        assert_eq!(journal::read_since(sink.events_dir(), 0).unwrap().len(), 1);
+        drop(sink);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let restarted = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        assert!(
+            restarted
+                .record_confirmed(Some("stable-session-id"), &event)
+                .await
+        );
+        assert_eq!(
+            journal::read_since(restarted.events_dir(), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrently_confirmed_stale_sinks_share_dedupe_and_sequence_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both snapshots are intentionally constructed before either append.
+        let first = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let second = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let same = session_created("rolling-stable-session");
+        let (first_ok, second_ok) = tokio::join!(
+            first.record_confirmed(Some("rolling-stable-session"), &same),
+            second.record_confirmed(Some("rolling-stable-session"), &same),
+        );
+        assert!(first_ok && second_ok);
+        let events = journal::read_since(dir.path(), 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 1);
+
+        // Different confirmed events from those same stale sinks still derive
+        // unique sequences from disk while holding the global append claim.
+        let left = session_created("rolling-left");
+        let right = session_created("rolling-right");
+        let (left_ok, right_ok) = tokio::join!(
+            first.record_confirmed(Some("rolling-left"), &left),
+            second.record_confirmed(Some("rolling-right"), &right),
+        );
+        assert!(left_ok && right_ok);
+        let events = journal::read_since(dir.path(), 0).unwrap();
+        assert_eq!(events.len(), 3);
+        let mut sequences = events.iter().map(|event| event.seq).collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn stale_sink_forwards_an_existing_remote_event_to_its_local_live_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let stale = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let event = session_created("rolling-existing-session");
+        let mut live = stale.subscribe();
+
+        assert!(
+            remote
+                .record_confirmed(Some("rolling-existing-session"), &event)
+                .await
+        );
+        assert!(
+            stale
+                .record_confirmed(Some("rolling-existing-session"), &event)
+                .await
+        );
+
+        let observed = tokio::time::timeout(Duration::from_secs(1), live.recv())
+            .await
+            .expect("stale sink forwards the durable remote delta")
+            .expect("local live tail remains open");
+        assert_eq!(observed.seq, 1);
+        assert!(matches!(
+            &observed.event,
+            AgentEvent::SessionCreated { session_id, .. }
+                if session_id == "rolling-existing-session"
+        ));
+        assert_eq!(journal::read_since(dir.path(), 0).unwrap().len(), 1);
+        assert!(tokio::time::timeout(Duration::from_millis(50), live.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_sink_forwards_remote_delta_before_its_own_appended_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let stale = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let mut live = stale.subscribe();
+
+        assert!(
+            remote
+                .record_confirmed(
+                    Some("rolling-remote-session"),
+                    &session_created("rolling-remote-session"),
+                )
+                .await
+        );
+        assert!(
+            stale
+                .record_confirmed(
+                    Some("rolling-local-session"),
+                    &session_created("rolling-local-session"),
+                )
+                .await
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(1), live.recv())
+            .await
+            .expect("remote delta")
+            .expect("local live tail remains open");
+        let second = tokio::time::timeout(Duration::from_secs(1), live.recv())
+            .await
+            .expect("locally appended event")
+            .expect("local live tail remains open");
+        assert_eq!((first.seq, second.seq), (1, 2));
+        assert!(matches!(
+            &first.event,
+            AgentEvent::SessionCreated { session_id, .. }
+                if session_id == "rolling-remote-session"
+        ));
+        assert!(matches!(
+            &second.event,
+            AgentEvent::SessionCreated { session_id, .. }
+                if session_id == "rolling-local-session"
+        ));
+        assert_eq!(
+            journal::read_since(dir.path(), 0)
+                .unwrap()
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_sinks_fold_config_health_deltas_before_consecutive_dedupe() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let second = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let invalid = config_invalid("mcp", 19);
+        let recovered = config_recovered("mcp", 19);
+
+        assert!(first.record_confirmed(None, &invalid).await);
+        assert!(second.record_confirmed(None, &recovered).await);
+        // `first` still remembers Invalid locally. It must observe the other
+        // process's Recovered transition under the journal claim and append the
+        // new Invalid rather than pre-suppressing from stale state.
+        assert!(first.record_confirmed(None, &invalid).await);
+
+        let events = journal::read_since(dir.path(), 0).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0].event, AgentEvent::ConfigInvalid { .. }));
+        assert!(matches!(
+            events[1].event,
+            AgentEvent::ConfigRecovered { .. }
+        ));
+        assert!(matches!(events[2].event, AgentEvent::ConfigInvalid { .. }));
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_append_reuses_rotating_files_and_restart_retains_more_than_64_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        for index in 0..70 {
+            let session_id = format!("retained-session-{index}");
+            assert!(
+                sink.record_confirmed(Some(&session_id), &session_created(&session_id))
+                    .await
+            );
+        }
+        assert_eq!(journal::read_since(dir.path(), 0).unwrap().len(), 70);
+        drop(sink);
+
+        let restarted = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        let retained = journal::read_since(restarted.events_dir(), 0).unwrap();
+        assert_eq!(retained.len(), 70);
+        let files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("events-"))
+            .count();
+        assert!(files < 64, "70 small events must not become 70 files");
+    }
+
+    #[tokio::test]
+    async fn restart_truncates_invalid_utf8_tail_and_preserves_monotonic_sequence() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        assert!(
+            first
+                .record_confirmed(Some("utf8-first"), &session_created("utf8-first"))
+                .await
+        );
+        drop(first);
+        let journal_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("events-"))
+            })
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        file.write_all(&[0xf0, 0x9f, 0x92]).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let restarted = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(journal::read_since(dir.path(), 0).unwrap().len(), 1);
+        assert!(
+            restarted
+                .record_confirmed(Some("utf8-second"), &session_created("utf8-second"))
+                .await
+        );
+        let events = journal::read_since(dir.path(), 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 1);
+        assert_eq!(events[1].seq, 2);
     }
 
     #[tokio::test]
@@ -584,6 +1047,39 @@ mod tests {
             .insert("core:1".to_string(), vec![(9, sender)]);
         remove_confirmation_waiter(&waiters, "core:1", 9);
         assert!(waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmed_record_bounds_full_inbox_wait_and_cleans_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _paused_rx) = mpsc::channel(1);
+        tx.try_send((None, session_created("inbox-filler")))
+            .unwrap();
+        let (broadcast, _receiver) = broadcast::channel(1);
+        let confirmation_waiters = Arc::new(Mutex::new(HashMap::new()));
+        let sink = AccountEventSink {
+            seq: Arc::new(AtomicU64::new(0)),
+            tx,
+            broadcast,
+            events_dir: dir.path().to_path_buf(),
+            dropped: Arc::new(AtomicU64::new(0)),
+            confirmation_waiters: Arc::clone(&confirmation_waiters),
+            latest_config_states: Arc::new(Mutex::new(HashMap::new())),
+            next_waiter_id: AtomicU64::new(1),
+        };
+
+        let started = std::time::Instant::now();
+        assert!(
+            !sink
+                .record_confirmed_with_timeout(
+                    Some("blocked-confirmation"),
+                    &session_created("blocked-confirmation"),
+                    Duration::from_millis(20),
+                )
+                .await
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(confirmation_waiters.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

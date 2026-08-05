@@ -10,7 +10,7 @@ mod system_prompt;
 #[cfg(test)]
 mod tests;
 
-pub use create::create_session;
+pub use create::{create_session, get_session_create_operation};
 pub use discoverable_tools::{
     activate_discoverable_tools, deactivate_discoverable_tools, list_discoverable_tools,
 };

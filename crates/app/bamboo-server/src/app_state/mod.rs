@@ -235,6 +235,12 @@ pub struct AppState {
     /// Concrete session store implementation (for index/list/cleanup APIs).
     pub session_store: Arc<SessionStoreV2>,
 
+    /// Durable, Bamboo-home-scoped idempotency receipts for root-session
+    /// creation. Kept outside each target session directory so deleting a
+    /// session cannot erase retry truth during the retention window.
+    pub(crate) session_create_operations:
+        Arc<session_create_operations::SessionCreateOperationStore>,
+
     /// Authoritative first-class Project registry and shared-resource paths.
     pub project_store: Arc<bamboo_projects::ProjectStore>,
 
@@ -509,6 +515,7 @@ pub mod runner_lifecycle;
 // field of the public `schedule_app::ScheduleContext`) is typed
 // `session_events::NotificationRelayDeps`, so external callers that build a
 // `ScheduleContext` by hand (e.g. integration tests) need to name it.
+pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
 mod tools;

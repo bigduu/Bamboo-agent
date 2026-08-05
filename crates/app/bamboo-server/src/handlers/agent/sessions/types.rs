@@ -233,7 +233,7 @@ pub struct RunningSessionsResponse {
     pub sessions: Vec<RunningSessionEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
     /// Stable first-class Project membership for the new root session.
     #[serde(default)]
@@ -267,6 +267,31 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateSessionResponse {
     pub session: SessionSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCreateOperationStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Expired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCreateOperationError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionCreateOperationResponse {
+    pub status: SessionCreateOperationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<SessionCreateOperationError>,
 }
 
 #[derive(Debug, Serialize)]

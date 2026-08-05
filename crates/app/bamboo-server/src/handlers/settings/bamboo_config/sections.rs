@@ -1877,7 +1877,7 @@ mod tests {
         HeaderConfig, McpConfig, McpServerConfig, ReconnectConfig, StdioConfig,
         StreamableHttpConfig, TransportConfig,
     };
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::time::Duration;
 
     fn server(id: &str, transport: TransportConfig) -> McpServerConfig {
@@ -4235,6 +4235,29 @@ mod tests {
             Some("external-user")
         );
         drop(live);
+        let caught_up_event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "core"
+                ) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("caught-up Core event");
+        assert!(matches!(
+            caught_up_event.event,
+            bamboo_agent_core::AgentEvent::ConfigChanged {
+                ref section,
+                revision: 1
+            } if section == "core"
+        ));
         let committed_event = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = feed.recv().await.unwrap();
@@ -4258,6 +4281,10 @@ mod tests {
                 revision: 2
             } if section == "core"
         ));
+        assert!(
+            caught_up_event.seq < committed_event.seq,
+            "bridged r1 must precede locally committed r2"
+        );
         let duplicate = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
                 let event = feed.recv().await.unwrap();
@@ -4275,7 +4302,30 @@ mod tests {
         .await;
         assert!(
             duplicate.is_err(),
-            "stale-local success must publish only committed r2"
+            "stale-local success must publish durable catch-up r1 then committed r2 exactly once"
+        );
+        let journaled =
+            bamboo_engine::events::journal::read_since(stale.account_sink.events_dir(), 0).unwrap();
+        let core_revisions = journaled
+            .iter()
+            .filter_map(|change| match &change.event {
+                bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                    if section == "core" =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(core_revisions, vec![1, 2]);
+        assert_eq!(
+            journaled
+                .iter()
+                .map(|change| change.seq)
+                .collect::<HashSet<_>>()
+                .len(),
+            journaled.len(),
+            "shared journal sequence numbers must be globally unique"
         );
     }
 
