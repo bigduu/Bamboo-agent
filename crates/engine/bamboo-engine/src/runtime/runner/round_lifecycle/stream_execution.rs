@@ -33,6 +33,7 @@ use bamboo_llm::{
     SegmentRole,
 };
 use bamboo_tools::exposure::activated_discoverable_tools;
+use sha2::{Digest, Sha256};
 
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
@@ -52,6 +53,8 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
+const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
+const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 
 fn interruption_kind(error: &AgentError) -> &'static str {
     match error {
@@ -151,6 +154,26 @@ fn engine_responses_policy() -> ResponsesRequestOptions {
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
         ..Default::default()
     }
+}
+
+/// Derive the privacy-preserving OpenAI Responses cache-affinity hint for an
+/// agent-loop session. This is a routing hint only, not a cache-hit guarantee.
+/// Length-prefixing the purpose and session beneath a versioned protocol domain
+/// prevents concatenation ambiguity and cross-purpose reuse.
+fn agent_loop_prompt_cache_key(
+    session_id: Option<&str>,
+    request_purpose: Option<&str>,
+) -> Option<String> {
+    let purpose = request_purpose.filter(|purpose| *purpose == AGENT_LOOP_REQUEST_PURPOSE)?;
+    let session_id = session_id.filter(|session_id| !session_id.trim().is_empty())?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(PROMPT_CACHE_KEY_DOMAIN);
+    for component in [purpose.as_bytes(), session_id.as_bytes()] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Whether the stateful Responses continuation (`previous_response_id`) may be
@@ -718,7 +741,9 @@ fn plan_llm_request(
     // The engine sets request POLICY only. The Responses prompt wire view
     // (instructions / input_messages / previous_response_id) is derived by the
     // OpenAI/Copilot adapter from the IR via `responses_request_options`.
-    let responses_options = engine_responses_policy();
+    let mut responses_options = engine_responses_policy();
+    responses_options.prompt_cache_key =
+        agent_loop_prompt_cache_key(Some(session_id), Some(AGENT_LOOP_REQUEST_PURPOSE));
 
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
@@ -726,7 +751,7 @@ fn plan_llm_request(
         parallel_tool_calls: Some(required_tool.is_none()),
         required_tool: required_tool.map(str::to_string),
         responses: Some(responses_options),
-        request_purpose: Some("agent_loop".to_string()),
+        request_purpose: Some(AGENT_LOOP_REQUEST_PURPOSE.to_string()),
         cache: Some(envelope.ir.cache.clone()),
     };
 
