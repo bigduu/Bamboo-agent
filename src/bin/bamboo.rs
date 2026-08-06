@@ -6,6 +6,9 @@ use bamboo_llm::Config;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[path = "bamboo/nofile_limit.rs"]
+mod nofile_limit;
+
 #[derive(Parser)]
 #[command(name = "bamboo")]
 #[command(version)]
@@ -1189,8 +1192,16 @@ fn log_level_to_seed(rust_log_is_set: bool, requested_level: Option<&str>) -> Op
     }
 }
 
+fn main() {
+    // Do this before Tokio constructs its runtime (and therefore before Bamboo
+    // opens any application sockets/files). The adjustment is best-effort and
+    // reports failures directly to stderr because logging is not initialized yet.
+    nofile_limit::raise_nofile_limit_best_effort();
+    run();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run() {
     let cli = Cli::parse();
 
     // `--config <path>` seeds `BAMBOO_DATA_DIR` (only when unset) with the data
