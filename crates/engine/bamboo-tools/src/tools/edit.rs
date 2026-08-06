@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::path::Path;
 
-use super::read_tracker::ReadState;
+use super::read_tracker::{BaselineAdvance, ReadState};
 use super::{content_diagnostics, file_change, read_tracker};
 
 const MAX_PATCH_BYTES: usize = 256 * 1024;
@@ -562,26 +562,35 @@ impl Tool for EditTool {
             ));
         }
 
-        if let Some(session_id) = ctx.session_id() {
-            match read_tracker::read_state(session_id, file_path).await {
-                ReadState::Unread => {
+        let session_id = ctx.session_id().map(str::to_owned);
+        let validated_read = if let Some(session_id) = session_id.as_deref() {
+            match read_tracker::read_if_fresh(session_id, file_path).await {
+                Ok(validated) => Some(validated),
+                Err(ReadState::Unread) => {
                     return Err(ToolError::Execution(
                         "Edit requires reading the target file first via Read".to_string(),
                     ));
                 }
-                ReadState::Stale => {
+                Err(ReadState::Stale) => {
                     return Err(ToolError::Execution(
                         "Target file changed after last Read; call Read again before Edit"
                             .to_string(),
                     ));
                 }
-                ReadState::Fresh => {}
+                Err(ReadState::Fresh) => unreachable!("Fresh is returned as a validated read"),
             }
-        }
+        } else {
+            None
+        };
 
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?;
+        let content = if let Some(validated) = validated_read.as_ref() {
+            String::from_utf8(validated.bytes().to_vec())
+                .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?
+        } else {
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?
+        };
 
         let patch = parsed
             .patch
@@ -635,7 +644,30 @@ impl Tool for EditTool {
 
         let checkpoint = file_change::create_checkpoint(path, Some(content.as_bytes())).await?;
 
-        file_change::atomic_write_text(path, &updated).await?;
+        let write_expectation = validated_read.as_ref().map_or(
+            file_change::AtomicWriteExpectation::Unchecked,
+            |validated| file_change::AtomicWriteExpectation::Exact(validated.bytes()),
+        );
+        file_change::atomic_write_text_with_expectation(path, &updated, write_expectation).await?;
+
+        if session_id.is_some() {
+            let validated = validated_read
+                .as_ref()
+                .expect("a session-scoped Edit always has a validated Read");
+            if read_tracker::advance_after_verified_write(
+                file_path,
+                validated.slot(),
+                updated.as_bytes(),
+            )
+            .await
+                == BaselineAdvance::Conflict
+            {
+                return Err(ToolError::Execution(
+                    "Edit committed, but the target changed before it could be verified; call Read again"
+                        .to_string(),
+                ));
+            }
+        }
 
         let changed_bytes = updated.len().abs_diff(content.len());
         let changed_lines = updated.lines().count().abs_diff(content.lines().count());
@@ -680,6 +712,21 @@ mod tests {
     use super::*;
     use crate::tools::ReadTool;
     use serde_json::json;
+
+    fn ctx(session_id: &str) -> ToolCtx {
+        ToolCtx {
+            session_id: Some(std::sync::Arc::from(session_id)),
+            tool_call_id: std::sync::Arc::from("call_1"),
+            event_tx: None,
+            available_tool_schemas: std::sync::Arc::from(Vec::new()),
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            async_completion_sink: None,
+            bash_completion_sink: None,
+        }
+    }
 
     async fn run(tool: &EditTool, args: serde_json::Value) -> Result<ToolResult, ToolError> {
         match tool.invoke(args, ToolCtx::none("t")).await? {
@@ -905,6 +952,207 @@ mod tests {
         };
 
         assert!(allowed.success);
+    }
+
+    #[tokio::test]
+    async fn read_edit_edit_succeeds_without_an_external_change() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\ngamma\n")
+            .await
+            .unwrap();
+        let session = format!("edit-twice-{}", uuid::Uuid::new_v4());
+        let read_tool = ReadTool::new();
+        let edit_tool = EditTool::new();
+
+        read_tool
+            .invoke(json!({"file_path": file.path()}), ctx(&session))
+            .await
+            .unwrap();
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "alpha",
+                    "new_string": "alpha-one"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "beta",
+                    "new_string": "beta-two"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(file.path()).await.unwrap(),
+            "alpha-one\nbeta-two\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_of_edited_version_is_idempotent() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let path = file.path().to_path_buf();
+        let path_str = path.to_string_lossy().into_owned();
+        let session = format!("edit-concurrent-read-{}", uuid::Uuid::new_v4());
+
+        ReadTool::new()
+            .invoke(json!({"file_path": path}), ctx(&session))
+            .await
+            .unwrap();
+        let (advance_reached, resume_advance) =
+            read_tracker::pause_next_advance_for_test(&session, &path_str).await;
+
+        let edit_path = path.clone();
+        let edit_session = session.clone();
+        let editor = tokio::spawn(async move {
+            EditTool::new()
+                .invoke(
+                    json!({
+                        "file_path": edit_path,
+                        "old_string": "alpha",
+                        "new_string": "ALPHA"
+                    }),
+                    ctx(&edit_session),
+                )
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            advance_reached.notified(),
+        )
+        .await
+        .expect("Edit did not reach post-write baseline advancement");
+        ReadTool::new()
+            .invoke(json!({"file_path": path}), ctx(&session))
+            .await
+            .unwrap();
+        resume_advance.notify_one();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), editor)
+            .await
+            .expect("Edit did not resume")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, ToolOutcome::Completed(result) if result.success));
+
+        EditTool::new()
+            .invoke(
+                json!({
+                    "file_path": path,
+                    "old_string": "beta",
+                    "new_string": "BETA"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(path).await.unwrap(),
+            "ALPHA\nBETA\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_external_change_after_a_successful_edit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let session = format!("edit-external-{}", uuid::Uuid::new_v4());
+        let read_tool = ReadTool::new();
+        let edit_tool = EditTool::new();
+
+        read_tool
+            .invoke(json!({"file_path": file.path()}), ctx(&session))
+            .await
+            .unwrap();
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "alpha",
+                    "new_string": "ALPHA"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+
+        tokio::fs::write(file.path(), "ALPHA\nBETA\n")
+            .await
+            .unwrap();
+        let stale = edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "ALPHA",
+                    "new_string": "alpha-two"
+                }),
+                ctx(&session),
+            )
+            .await;
+
+        assert!(matches!(stale, Err(ToolError::Execution(message)) if message.contains("changed")));
+        assert_eq!(
+            tokio::fs::read_to_string(file.path()).await.unwrap(),
+            "ALPHA\nBETA\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_edit_does_not_break_the_existing_fresh_baseline() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let session = format!("edit-failure-{}", uuid::Uuid::new_v4());
+        let read_tool = ReadTool::new();
+        let edit_tool = EditTool::new();
+
+        read_tool
+            .invoke(json!({"file_path": file.path()}), ctx(&session))
+            .await
+            .unwrap();
+        let failed = edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "not-present",
+                    "new_string": "replacement"
+                }),
+                ctx(&session),
+            )
+            .await;
+        assert!(failed.is_err());
+
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "beta",
+                    "new_string": "beta-two"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(file.path()).await.unwrap(),
+            "alpha\nbeta-two\n"
+        );
     }
 
     #[tokio::test]
