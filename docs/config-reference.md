@@ -127,6 +127,14 @@ openai/anthropic/gemini the Bodhi proxy should present as). `CopilotConfig`
 has no `api_key` at all — it authenticates via a cached OAuth token
 (`headless_auth` for headless/CI login).
 
+For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
+stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.
+The raw session identifier is never serialized into the provider request, and
+non-agent requests do not receive a generated key. The key is only a cache
+affinity hint that can improve routing to a matching prefix; it does not
+guarantee a cache hit. `request_overrides` body patches run afterward, so an
+operator may replace the generated key or remove `prompt_cache_key` entirely.
+
 For more than one instance of a provider type (e.g. two separate Anthropic
 keys/workspaces), use `provider_instances` instead:
 

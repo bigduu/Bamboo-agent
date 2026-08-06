@@ -1142,6 +1142,38 @@ fn zero_tools_fallback_keeps_merged_system_string_and_no_blocks() {
 }
 
 #[test]
+fn agent_loop_prompt_cache_key_is_stable_isolated_and_private() {
+    let raw_session_id = "session-secret-alpha";
+    let first = super::agent_loop_prompt_cache_key(Some(raw_session_id), Some("agent_loop"))
+        .expect("agent-loop session gets an affinity key");
+    let resumed = super::agent_loop_prompt_cache_key(Some(raw_session_id), Some("agent_loop"))
+        .expect("resumed session gets the same affinity key");
+    let other_session =
+        super::agent_loop_prompt_cache_key(Some("session-secret-beta"), Some("agent_loop"))
+            .expect("different session gets an affinity key");
+
+    assert_eq!(first, resumed);
+    assert_eq!(
+        first,
+        "29665ec5c5f0fc1c3f89fb420c578cf217757f6a3d4f52b57ca711c94f15e599"
+    );
+    assert_eq!(first.len(), 64);
+    assert!(first
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert_ne!(first, other_session);
+    assert!(!first.contains(raw_session_id));
+    assert!(super::agent_loop_prompt_cache_key(None, Some("agent_loop")).is_none());
+    assert!(super::agent_loop_prompt_cache_key(Some(""), Some("agent_loop")).is_none());
+    assert!(super::agent_loop_prompt_cache_key(Some("   "), Some("agent_loop")).is_none());
+    assert!(super::agent_loop_prompt_cache_key(Some(raw_session_id), None).is_none());
+    assert!(
+        super::agent_loop_prompt_cache_key(Some(raw_session_id), Some("title_generation"))
+            .is_none()
+    );
+}
+
+#[test]
 fn plan_llm_request_lanes_path_records_observability() {
     // The single request-planning seam: a normal request takes the canonical
     // lanes path and the render descriptor captures the system shape + cache plan.
@@ -1172,7 +1204,17 @@ fn plan_llm_request_lanes_path_records_observability() {
     assert!(planned.render.cache_system);
     assert_eq!(planned.render.cache_ttl, "1h");
     assert!(planned.request_options.cache.is_some());
-    assert!(planned.request_options.responses.is_some());
+    let responses = planned
+        .request_options
+        .responses
+        .as_ref()
+        .expect("agent loop carries Responses policy");
+    let cache_key = responses
+        .prompt_cache_key
+        .as_deref()
+        .expect("agent loop carries a session-scoped cache-affinity key");
+    assert_eq!(cache_key.len(), 64);
+    assert!(!cache_key.contains("session-plan"));
 }
 
 #[test]

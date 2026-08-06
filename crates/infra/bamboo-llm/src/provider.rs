@@ -100,8 +100,8 @@ pub struct ResponsesRequestOptions {
     /// (e.g. "low", "medium", "high").
     pub text_verbosity: Option<String>,
     /// Stable affinity key for OpenAI prompt caching. Callers should provide a
-    /// privacy-preserving value; Bamboo never derives one from raw session
-    /// identity in this generic request DTO.
+    /// privacy-preserving value. The agent loop supplies a domain-separated hash,
+    /// never its raw session identity, through this generic request DTO.
     pub prompt_cache_key: Option<String>,
     /// OpenAI request-wide cache policy (currently `mode` and optional `ttl`).
     /// Kept as JSON so newly added official policy keys survive proxying.

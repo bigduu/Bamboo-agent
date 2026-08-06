@@ -372,6 +372,7 @@ mod tests {
         let base = ResponsesRequestOptions {
             store: Some(false),
             text_verbosity: Some("high".to_string()),
+            prompt_cache_key: Some("session-affinity-hash".to_string()),
             ..Default::default()
         };
         let ir = PromptIR {
@@ -386,6 +387,10 @@ mod tests {
         // Policy preserved.
         assert_eq!(options.store, Some(false));
         assert_eq!(options.text_verbosity.as_deref(), Some("high"));
+        assert_eq!(
+            options.prompt_cache_key.as_deref(),
+            Some("session-affinity-hash")
+        );
         // Prompt wire view derived from the IR.
         assert_eq!(options.instructions.as_deref(), Some("SYSTEM"));
         assert_eq!(
