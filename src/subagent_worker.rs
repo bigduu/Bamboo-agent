@@ -49,6 +49,13 @@ use crate::codex_cli_executor::CodexExecutor;
 const STORAGE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Worker entry point: provision from stdin, build the executor, serve one run, clean up.
+fn bus_idle_timeout(spec: &ProvisionSpec) -> Option<std::time::Duration> {
+    spec.limits
+        .idle_timeout_secs
+        .map(std::time::Duration::from_secs)
+        .or_else(|| spec.reusable.then(|| std::time::Duration::from_secs(300)))
+}
+
 pub async fn run() -> std::result::Result<(), String> {
     let worker_started = std::time::Instant::now();
     // Stage 1: provision (one JSON document on stdin; the parent closes the pipe).
@@ -251,11 +258,7 @@ pub async fn run() -> std::result::Result<(), String> {
             session_id: spec.identity.child_id.clone(),
             role: Some(spec.identity.role.clone()),
         };
-        let idle_timeout = spec
-            .limits
-            .idle_timeout_secs
-            .map(std::time::Duration::from_secs)
-            .or_else(|| spec.reusable.then(|| std::time::Duration::from_secs(300)));
+        let idle_timeout = bus_idle_timeout(&spec);
         let reason = bamboo_broker::serve_executor_with_lifecycle(
             &bus.endpoint,
             me,
@@ -2265,6 +2268,37 @@ mod tests {
             model: m.into(),
         });
         s
+    }
+
+    #[test]
+    fn bus_idle_timeout_uses_provisioned_limit_for_one_shot_and_reusable_workers() {
+        let mut one_shot = spec_with("openai", "sk-test", None);
+        one_shot.limits.idle_timeout_secs = Some(17);
+        assert_eq!(
+            bus_idle_timeout(&one_shot),
+            Some(std::time::Duration::from_secs(17))
+        );
+
+        let mut reusable = spec_with("openai", "sk-test", None);
+        reusable.reusable = true;
+        reusable.limits.idle_timeout_secs = Some(23);
+        assert_eq!(
+            bus_idle_timeout(&reusable),
+            Some(std::time::Duration::from_secs(23))
+        );
+    }
+
+    #[test]
+    fn bus_idle_timeout_preserves_reusable_default_only_when_limit_is_absent() {
+        let one_shot = spec_with("openai", "sk-test", None);
+        assert_eq!(bus_idle_timeout(&one_shot), None);
+
+        let mut reusable = spec_with("openai", "sk-test", None);
+        reusable.reusable = true;
+        assert_eq!(
+            bus_idle_timeout(&reusable),
+            Some(std::time::Duration::from_secs(300))
+        );
     }
 
     #[test]

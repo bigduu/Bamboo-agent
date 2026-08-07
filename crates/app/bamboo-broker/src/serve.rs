@@ -12,12 +12,27 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, MsgId, ReplyBody};
+use bamboo_subagent::{AdmittedSet, AgentRef, InboxKind, InboxMessage, MsgId, ReplyBody};
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::BrokerClient;
-use crate::error::BrokerResult;
+use crate::error::{BrokerError, BrokerResult};
+
+/// Connection loss is not a graceful shutdown: the owner can no longer receive
+/// results, so cancel admitted work and give cancellation-aware handlers a short
+/// bounded window to clean up before force-aborting them.
+const DEFAULT_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `JoinHandle::abort` is cooperative: a future doing synchronous work cannot
+/// observe it until that poll returns. Keep the library bounded anyway; the
+/// dedicated `subagent-worker` process hard-exits on this returned error.
+const DEFAULT_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Approval is intentionally human-scale while the owner is alive. Owner loss
+/// cancels this wait immediately; this deadline is the fail-closed backstop for
+/// a live but non-responsive owner.
+const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// What a handler decides to do with one inbound message.
 pub enum Handled {
@@ -63,10 +78,11 @@ where
 
 /// Like [`serve_mailbox`], but stops pulling NEW inbound messages once
 /// `shutdown` is cancelled — any handlers already in flight still run to
-/// completion and their replies are still delivered + acked (via the same
-/// drain [`serve_loop`] performs on connection close) before this returns.
-/// This is the hook a process-level signal handler (SIGTERM/ctrl_c) wires
-/// into, so stopping a worker doesn't have to hard-kill it mid-Ask. #49.
+/// completion and their replies are still delivered + acked before this
+/// returns. This graceful path is intentionally different from unexpected
+/// connection loss, which cancels admitted handlers and bounds their cleanup
+/// because no reply or ack can reach the owner. This is the hook a process-level
+/// signal handler (SIGTERM/ctrl_c) wires into. #49/#742.
 pub async fn serve_mailbox_with_shutdown<H, Fut>(
     endpoint: &str,
     me: AgentRef,
@@ -145,6 +161,39 @@ struct Completion {
     handled: Handled,
 }
 
+struct InflightHandler {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    /// Number of mailbox deliveries with this id observed while the one active
+    /// admission runs. None is acked until that admission completes successfully.
+    deliveries: usize,
+}
+
+/// A spawned helper owned by its parent future. Tokio detaches a task when a
+/// plain `JoinHandle` is dropped; this wrapper instead aborts it, so aborting a
+/// stuck top-level handler cannot orphan its forwarding/approval descendants.
+struct AbortOnDropTask<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDropTask<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self.0.as_mut().expect("task handle present").await;
+        self.0.take();
+        result
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 /// The serve loop against an already-connected, already-subscribed client.
 /// Separated so tests can drive it over an in-process client.
 ///
@@ -160,11 +209,11 @@ struct Completion {
 /// can find it after we've moved on to the next message), and ack still happens
 /// only AFTER the reply is delivered. #45.
 ///
-/// `shutdown`: once cancelled, the loop stops pulling new inbound messages
-/// (same as a closed connection) but keeps draining in-flight handlers through
-/// arm A until they've all completed, THEN returns — so a graceful stop lets
-/// the current Ask finish and its reply get delivered+acked instead of being
-/// abandoned. #49.
+/// `shutdown`: once cancelled, the loop stops pulling new inbound messages but
+/// leaves admitted handlers uncancelled until they finish, then delivers and
+/// acks their results. Unexpected connection loss is a separate cancel-only,
+/// bounded drain: handlers are cancelled immediately, completions are joined
+/// without dead-socket I/O, and stuck work is aborted at the deadline. #49/#742.
 pub async fn serve_loop<H, Fut>(
     client: &mut BrokerClient,
     me: &AgentRef,
@@ -194,13 +243,42 @@ where
     H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Handled> + Send + 'static,
 {
+    serve_loop_with_timeouts(
+        client,
+        me,
+        handler,
+        shutdown,
+        idle_timeout,
+        DEFAULT_CONNECTION_DRAIN_TIMEOUT,
+        DEFAULT_ABORT_JOIN_TIMEOUT,
+    )
+    .await
+}
+
+async fn serve_loop_with_timeouts<H, Fut>(
+    client: &mut BrokerClient,
+    me: &AgentRef,
+    handler: H,
+    shutdown: CancellationToken,
+    idle_timeout: Option<Duration>,
+    connection_drain_timeout: Duration,
+    abort_join_timeout: Duration,
+) -> BrokerResult<ServeExitReason>
+where
+    H: Fn(InboxMessage, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Handled> + Send + 'static,
+{
     let handler = Arc::new(handler);
 
     // Live cancel tokens for runs still in flight, keyed by the run (message) id.
     // A cancel naming an id present here trips its token (the executor honors it
     // mid-LLM-call); a cancel for an unknown id (already finished / never started)
     // is a no-op, exactly as before. An entry is removed when its run completes.
-    let mut inflight: HashMap<MsgId, CancellationToken> = HashMap::new();
+    let mut inflight: HashMap<MsgId, InflightHandler> = HashMap::new();
+    // Connection-local successful admissions. A late duplicate can be acked
+    // without re-running the handler, while Leave/crash remains redeliverable.
+    // AdmittedSet bounds this memory for long-lived reusable workers.
+    let mut completed_admissions = AdmittedSet::default();
 
     // Finished handlers flow back here to the single owner for delivery+ack.
     // KEEP-ALIVE: this original `done_tx` stays in scope for the whole loop (each
@@ -214,6 +292,10 @@ where
     let idle_sleep =
         tokio::time::sleep(idle_timeout.unwrap_or_else(|| Duration::from_secs(365 * 24 * 60 * 60)));
     tokio::pin!(idle_sleep);
+    let connection_drain_sleep = tokio::time::sleep(Duration::from_secs(365 * 24 * 60 * 60));
+    tokio::pin!(connection_drain_sleep);
+    let mut connection_lost = false;
+    let mut connection_failure = None;
     loop {
         tokio::select! {
             // `biased`: drain finished handlers (arm A) ahead of a graceful-stop
@@ -231,24 +313,79 @@ where
             //    Biased first so completions (which let us exit on teardown) and
             //    their acks don't starve behind a steady inbound stream.
             Some(done) = done_rx.recv() => {
-                inflight.remove(&done.id);
                 let Completion { id, reply_to, handled } = done;
-                match handled {
-                    Handled::Reply(answer) => {
-                        let reply = InboxMessage {
-                            id: MsgId::new(),
-                            from: me.clone(),
-                            kind: InboxKind::Reply,
-                            body: serde_json::to_value(ReplyBody { answer })
-                                .unwrap_or_else(|_| serde_json::json!({})),
-                            created_at: Utc::now(),
-                            correlation_id: Some(id.clone()),
-                        };
-                        client.deliver(&reply_to, reply).await?;
-                        client.ack(id).await?;
+                let Some(completed) = inflight.remove(&id) else {
+                    // A completion must belong to the one active admission for
+                    // this id. Never let a stale/duplicate completion ack a
+                    // later generation that happens to reuse the same MsgId.
+                    tracing::warn!(message_id = %id.as_str(), "ignoring completion without matching in-flight admission");
+                    continue;
+                };
+                let delivery_count = completed.deliveries;
+                let remember_completion = !matches!(handled, Handled::Leave);
+                // The reader marks death before closing its event lanes. This
+                // closes the completion-vs-close select race: even if this
+                // biased arm wins first, it must not write to the dead socket
+                // or return early while other handlers remain detached.
+                if !connection_lost && !client.reader_alive() {
+                    messages_open = false;
+                    exit_reason = ServeExitReason::ConnectionClosed;
+                    connection_lost = true;
+                    for handler in inflight.values() {
+                        handler.cancel.cancel();
                     }
-                    Handled::Ack => client.ack(id).await?,
-                    Handled::Leave => {}
+                    connection_drain_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + connection_drain_timeout,
+                    );
+                }
+                // Once the connection is known dead, no reply or ack can reach
+                // the broker. Still consume completions so cooperative handlers
+                // are joined and the bounded drain can finish cleanly.
+                let wire_result = if !connection_lost {
+                    async {
+                        match handled {
+                        Handled::Reply(answer) => {
+                            let reply = InboxMessage {
+                                id: MsgId::new(),
+                                from: me.clone(),
+                                kind: InboxKind::Reply,
+                                body: serde_json::to_value(ReplyBody { answer })
+                                    .unwrap_or_else(|_| serde_json::json!({})),
+                                created_at: Utc::now(),
+                                correlation_id: Some(id.clone()),
+                            };
+                            client.deliver(&reply_to, reply).await?;
+                            for _ in 0..delivery_count {
+                                client.ack(id.clone()).await?;
+                            }
+                        }
+                        Handled::Ack => {
+                            for _ in 0..delivery_count {
+                                client.ack(id.clone()).await?;
+                            }
+                        }
+                        Handled::Leave => {}
+                        }
+                        Ok::<(), BrokerError>(())
+                    }
+                    .await
+                } else {
+                    Ok(())
+                };
+                let _ = completed.task.await;
+                if let Err(error) = wire_result {
+                    tracing::warn!(%error, "broker worker completion delivery failed; cancelling remaining handlers");
+                    messages_open = false;
+                    connection_lost = true;
+                    connection_failure = Some(error);
+                    for handler in inflight.values() {
+                        handler.cancel.cancel();
+                    }
+                    connection_drain_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + connection_drain_timeout,
+                    );
+                } else if !connection_lost && remember_completion {
+                    completed_admissions.insert(id);
                 }
                 if let Some(timeout) = idle_timeout {
                     idle_sleep
@@ -256,10 +393,10 @@ where
                         .reset(tokio::time::Instant::now() + timeout);
                 }
             }
-            // B. Graceful stop requested (#49): stop pulling new work — mirrors
-            //    the `Message(None)` connection-closed case below — but leave
-            //    the connection open so arm A can keep delivering+acking
-            //    replies for handlers already in flight. Guarded on
+            // B. Graceful stop requested (#49): stop pulling new work but keep
+            //    admitted handlers uncancelled and the connection open so arm A
+            //    can keep delivering+acking their replies. Unlike the disconnect
+            //    arms below, this path has no forced drain deadline. Guarded on
             //    `messages_open` so a signal that fires more than once (or
             //    after we've already stopped pulling) doesn't re-trigger.
             _ = shutdown.cancelled(), if messages_open => {
@@ -272,48 +409,100 @@ where
             //    token (#50); a new message registers a fresh token and spawns the
             //    handler on its own task — so concurrent Asks overlap their work and
             //    only the (cheap) wire I/O stays serialized through this owner. #45.
-            event = client.next_message_or_cancel(), if messages_open => match event {
+            // Keep observing the transport while a graceful shutdown drains.
+            // Admission is closed below, but a subsequent real disconnect must
+            // still upgrade the drain to cancel+deadline semantics.
+            event = client.next_message_or_cancel(), if !connection_lost => match event {
                 crate::client::ServeEvent::Cancel(Some(cid)) => {
                     if let Some(timeout) = idle_timeout {
                         idle_sleep
                             .as_mut()
                             .reset(tokio::time::Instant::now() + timeout);
                     }
-                    if let Some(tok) = inflight.get(&cid) {
-                        tok.cancel();
+                    if let Some(handler) = inflight.get(&cid) {
+                        handler.cancel.cancel();
                     }
                 }
                 // Cancel lane closed (reader gone). The message lane is fed by the
-                // same reader, so treat it as connection teardown: stop pulling and
-                // drain the in-flight handlers through arm A.
+                // same reader, so cancel every admitted handler and join cooperative
+                // completions without dead-socket I/O, bounded by the drain timer.
                 crate::client::ServeEvent::Cancel(None) => {
                     messages_open = false;
                     exit_reason = ServeExitReason::ConnectionClosed;
+                    connection_lost = true;
+                    for handler in inflight.values() {
+                        handler.cancel.cancel();
+                    }
+                    connection_drain_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + connection_drain_timeout,
+                    );
                 }
-                crate::client::ServeEvent::Message(Some(msg)) => {
+                crate::client::ServeEvent::Message(Some(msg)) if messages_open => {
                     if let Some(timeout) = idle_timeout {
                         idle_sleep
                             .as_mut()
                             .reset(tokio::time::Instant::now() + timeout);
                     }
                     let id = msg.id.clone();
-                    let reply_to = msg.from.session_id.clone();
-                    let token = CancellationToken::new();
-                    inflight.insert(id.clone(), token.clone());
-
-                    let handler = Arc::clone(&handler);
-                    let done_tx = done_tx.clone();
-                    tokio::spawn(async move {
-                        let handled = handler(msg, token).await;
-                        // Receiver gone == owner loop exited (conn dropped) -> drop.
-                        let _ = done_tx.send(Completion { id, reply_to, handled });
-                    });
+                    if completed_admissions.contains(&id) {
+                        // This id already completed successfully on this
+                        // connection. Ack this newly observed durable copy, but
+                        // never run the handler or emit a duplicate reply.
+                        if let Err(error) = client.ack(id).await {
+                            tracing::warn!(%error, "broker worker duplicate ack failed; cancelling remaining handlers");
+                            messages_open = false;
+                            connection_lost = true;
+                            connection_failure = Some(error);
+                            for handler in inflight.values() {
+                                handler.cancel.cancel();
+                            }
+                            connection_drain_sleep.as_mut().reset(
+                                tokio::time::Instant::now() + connection_drain_timeout,
+                            );
+                        }
+                    } else if let Some(active) = inflight.get_mut(&id) {
+                        // Coalesce an at-least-once duplicate into the active
+                        // admission. It remains unacked until that handler
+                        // succeeds, so a crash/Leave cannot lose the message.
+                        active.deliveries = active.deliveries.saturating_add(1);
+                    } else {
+                        let reply_to = msg.from.session_id.clone();
+                        let token = CancellationToken::new();
+                        let inflight_id = id.clone();
+                        let inflight_cancel = token.clone();
+                        let handler = Arc::clone(&handler);
+                        let done_tx = done_tx.clone();
+                        let task = tokio::spawn(async move {
+                            let handled = handler(msg, token).await;
+                            // Receiver gone == owner loop exited (conn dropped) -> drop.
+                            let _ = done_tx.send(Completion { id, reply_to, handled });
+                        });
+                        inflight.insert(
+                            inflight_id,
+                            InflightHandler {
+                                cancel: inflight_cancel,
+                                task,
+                                deliveries: 1,
+                            },
+                        );
+                    }
                 }
-                // Connection closed: stop pulling new messages and let the remaining
-                // in-flight handlers drain through arm A before we exit.
+                // A message already in the reader queue when graceful shutdown
+                // closed admission stays unacked for a future worker; do not
+                // start new work while we merely observe the transport.
+                crate::client::ServeEvent::Message(Some(_)) => {}
+                // Connection closed: cancel every admitted handler and join
+                // cooperative completions, bounded by the drain timer.
                 crate::client::ServeEvent::Message(None) => {
                     messages_open = false;
                     exit_reason = ServeExitReason::ConnectionClosed;
+                    connection_lost = true;
+                    for handler in inflight.values() {
+                        handler.cancel.cancel();
+                    }
+                    connection_drain_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + connection_drain_timeout,
+                    );
                 }
             },
             _ = &mut idle_sleep,
@@ -327,11 +516,54 @@ where
                 messages_open = false;
                 exit_reason = ServeExitReason::IdleTimeout;
             }
+            _ = &mut connection_drain_sleep,
+                if connection_lost && !inflight.is_empty() =>
+            {
+                let mut stuck_ids = inflight
+                    .keys()
+                    .map(|id| id.as_str().to_string())
+                    .collect::<Vec<_>>();
+                stuck_ids.sort();
+                tracing::error!(
+                    drain_timeout_ms = connection_drain_timeout.as_millis() as u64,
+                    stuck_ids = ?stuck_ids,
+                    "broker worker connection-loss drain timed out; aborting stuck handlers"
+                );
+                let stuck = std::mem::take(&mut inflight);
+                for handler in stuck.values() {
+                    handler.cancel.cancel();
+                    handler.task.abort();
+                }
+                let join_aborted = async move {
+                    for (_, handler) in stuck {
+                        let _ = handler.task.await;
+                    }
+                };
+                let abort_join_timed_out =
+                    tokio::time::timeout(abort_join_timeout, join_aborted)
+                        .await
+                        .is_err();
+                if abort_join_timed_out {
+                    tracing::error!(
+                        abort_join_timeout_ms = abort_join_timeout.as_millis() as u64,
+                        "aborted broker handlers did not yield within the bounded join window; dedicated worker must hard-exit"
+                    );
+                }
+                return Err(BrokerError::ConnectionDrainTimeout {
+                    timeout_ms: connection_drain_timeout.as_millis() as u64,
+                    stuck_ids,
+                    abort_join_timeout_ms: abort_join_timeout.as_millis() as u64,
+                    abort_join_timed_out,
+                });
+            }
         }
 
-        // Once the message stream is closed, exit as soon as every in-flight run
-        // has drained — replies for them have been delivered+acked above.
+        // Graceful shutdown reaches here after normal delivered+acked completion;
+        // disconnect reaches here after cancellation and join without wire I/O.
         if !messages_open && inflight.is_empty() {
+            if let Some(error) = connection_failure {
+                return Err(error);
+            }
             break;
         }
     }
@@ -472,11 +704,12 @@ where
     // reach the channels of the Run it belongs to (the Run + its control messages
     // arrive as independent messages handled by independent tasks).
     let coords: RunCoords = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let waiters: ApprovalWaiters = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let endpoint_owned = endpoint.to_string();
     let token_owned = token.to_string();
     let me_owned = me.clone();
     let tls_owned = tls_config.clone();
+    let approval_timeout = DEFAULT_APPROVAL_TIMEOUT;
     serve_mailbox_full_with_lifecycle(
         endpoint,
         me,
@@ -505,6 +738,7 @@ where
                             &coords,
                             &waiters,
                             tls_config,
+                            approval_timeout,
                         )
                         .await
                     }
@@ -535,7 +769,7 @@ where
                             .get("approved")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        if let Some(tx) = waiters.lock().await.remove(&id) {
+                        if let Some(tx) = approval_waiters_lock(&waiters).remove(&id) {
                             let _ = tx.send(approved);
                         }
                         Handled::Ack
@@ -560,7 +794,95 @@ struct RunCoord {
 type RunCoords = Arc<tokio::sync::Mutex<HashMap<MsgId, RunCoord>>>;
 /// Pending gated-tool approvals a Run proxied up, keyed by approval-request id;
 /// an [`InboxKind::ApprovalReply`] fulfils the matching one.
-type ApprovalWaiters = Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+type ApprovalWaiters = Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+
+fn approval_waiters_lock(
+    waiters: &ApprovalWaiters,
+) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::oneshot::Sender<bool>>> {
+    waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Synchronous drop cleanup is important here: if the approval task itself is
+/// aborted while awaiting a decision, its future never gets another async poll
+/// in which to remove the registered sender.
+struct ApprovalWaiterRegistration {
+    waiters: ApprovalWaiters,
+    approval_id: String,
+}
+
+impl ApprovalWaiterRegistration {
+    fn new(waiters: &ApprovalWaiters, approval_id: &str) -> Self {
+        Self {
+            waiters: Arc::clone(waiters),
+            approval_id: approval_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ApprovalWaiterRegistration {
+    fn drop(&mut self) {
+        approval_waiters_lock(&self.waiters).remove(&self.approval_id);
+    }
+}
+
+async fn deliver_approval_request(
+    deliver: &mut BrokerClient,
+    parent: &str,
+    message: InboxMessage,
+    waiters: &ApprovalWaiters,
+    approval_id: &str,
+    owner_cancel: &CancellationToken,
+) -> bool {
+    let result = tokio::select! {
+        biased;
+        _ = owner_cancel.cancelled() => None,
+        result = deliver.deliver(parent, message) => Some(result),
+    };
+    match result {
+        Some(Ok(_)) => true,
+        Some(Err(error)) => {
+            tracing::warn!(approval_id, %error, "approval request delivery failed; denying fail-closed");
+            approval_waiters_lock(waiters).remove(approval_id);
+            false
+        }
+        None => {
+            approval_waiters_lock(waiters).remove(approval_id);
+            false
+        }
+    }
+}
+
+/// Wait for one approval decision without retaining the sender forever. Every
+/// terminal path removes the map entry: normal reply may have removed it first,
+/// while timeout, owner cancellation, and sender loss clean it up here.
+async fn await_approval_decision(
+    waiters: &ApprovalWaiters,
+    approval_id: &str,
+    receiver: tokio::sync::oneshot::Receiver<bool>,
+    owner_cancel: &CancellationToken,
+    timeout: Duration,
+) -> bool {
+    let _registration = ApprovalWaiterRegistration::new(waiters, approval_id);
+    let approved = tokio::select! {
+        biased;
+        _ = owner_cancel.cancelled() => {
+            tracing::warn!(approval_id, "approval denied because the owner connection was lost");
+            false
+        }
+        decision = receiver => decision.unwrap_or(false),
+        _ = tokio::time::sleep(timeout) => {
+            tracing::warn!(
+                approval_id,
+                approval_timeout_ms = timeout.as_millis() as u64,
+                "approval timed out; denying fail-closed"
+            );
+            false
+        }
+    };
+    approved
+}
 
 /// Drive a full child session ([`InboxKind::Run`]) over the bus: parse the
 /// `RunSpec`, run the executor, and forward its streamed events + terminal
@@ -581,6 +903,7 @@ async fn handle_run<E>(
     coords: &RunCoords,
     waiters: &ApprovalWaiters,
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    approval_timeout: Duration,
 ) -> Handled
 where
     E: bamboo_subagent::ChildExecutor + ?Sized,
@@ -612,6 +935,8 @@ where
     let endpoint = endpoint.to_string();
     let token = token.to_string();
     let me = me.clone();
+    let forward_cancel = cancel.clone();
+    let approval_cancel = cancel.clone();
 
     // Forward task: own one deliver connection; stream Events live, then the
     // Outcome once the run finishes (sink dropped ⇒ `events` closes).
@@ -620,15 +945,18 @@ where
     let parent_fwd = parent.clone();
     let (ep_fwd, tok_fwd) = (endpoint.clone(), token.clone());
     let tls_fwd = tls_config.clone();
-    let forward = tokio::spawn(async move {
-        let mut deliver = match BrokerClient::connect_with_tls(
+    let mut forward = AbortOnDropTask::new(tokio::spawn(async move {
+        let connect = BrokerClient::connect_with_tls(
             &ep_fwd,
             me_fwd.clone(),
             &tok_fwd,
             tls_fwd.as_deref().cloned(),
-        )
-        .await
-        {
+        );
+        let mut deliver = match tokio::select! {
+            biased;
+            _ = forward_cancel.cancelled() => return,
+            result = connect => result,
+        } {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("run {run_id_fwd:?}: event deliver connect failed: {e}");
@@ -647,6 +975,8 @@ where
         let mut controls_open = true;
         while events_open || controls_open {
             tokio::select! {
+                biased;
+                _ = forward_cancel.cancelled() => return,
                 event = events.recv(), if events_open => match event {
                     Some(event) => {
                         if deliver
@@ -684,7 +1014,7 @@ where
                 .deliver(&parent_fwd, emit(InboxKind::Outcome, body))
                 .await;
         }
-    });
+    }));
 
     // Approval drain: each gated-tool approval the executor raises is delivered to
     // the parent as an ApprovalRequest (correlated to the run); the matching
@@ -692,15 +1022,18 @@ where
     // Ends when the run drops the sink ⇒ the host bridge ⇒ `host_rx` closes.
     let waiters_drain = Arc::clone(waiters);
     let run_id_appr = run_id.clone();
-    let approval = tokio::spawn(async move {
-        let mut deliver = match BrokerClient::connect_with_tls(
+    let mut approval = AbortOnDropTask::new(tokio::spawn(async move {
+        let connect = BrokerClient::connect_with_tls(
             &endpoint,
             me.clone(),
             &token,
             tls_config.as_deref().cloned(),
-        )
-        .await
-        {
+        );
+        let mut deliver = match tokio::select! {
+            biased;
+            _ = approval_cancel.cancelled() => return,
+            result = connect => result,
+        } {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("run {run_id_appr:?}: approval deliver connect failed: {e}");
@@ -711,14 +1044,23 @@ where
                 return;
             }
         };
-        while let Some(req) = host_rx.recv().await {
+        loop {
+            let req = tokio::select! {
+                biased;
+                _ = approval_cancel.cancelled() => break,
+                req = host_rx.recv() => match req {
+                    Some(req) => req,
+                    None => break,
+                },
+            };
             let approval_id = MsgId::new();
             let approval_id_str = format!("{approval_id:?}");
             let (atx, arx) = tokio::sync::oneshot::channel::<bool>();
-            waiters_drain
-                .lock()
-                .await
-                .insert(approval_id_str.clone(), atx);
+            approval_waiters_lock(&waiters_drain).insert(approval_id_str.clone(), atx);
+            // Own the registration before the first fallible/awaiting delivery
+            // operation. If this whole approval task is aborted while delivery
+            // is waiting for its broker receipt, Drop still removes the sender.
+            let _registration = ApprovalWaiterRegistration::new(&waiters_drain, &approval_id_str);
             let m = InboxMessage {
                 id: MsgId::new(),
                 from: me.clone(),
@@ -727,23 +1069,38 @@ where
                 created_at: Utc::now(),
                 correlation_id: Some(run_id_appr.clone()),
             };
-            if deliver.deliver(&parent, m).await.is_err() {
+            let delivered = deliver_approval_request(
+                &mut deliver,
+                &parent,
+                m,
+                &waiters_drain,
+                &approval_id_str,
+                &approval_cancel,
+            )
+            .await;
+            if !delivered {
                 let _ = req.reply.send(serde_json::json!({ "approved": false }));
                 continue;
             }
-            // Await the parent's decision; a dropped reply (link gone) fail-closes.
-            let approved = arx.await.unwrap_or(false);
+            let approved = await_approval_decision(
+                &waiters_drain,
+                &approval_id_str,
+                arx,
+                &approval_cancel,
+                approval_timeout,
+            )
+            .await;
             let _ = req.reply.send(serde_json::json!({ "approved": approved }));
         }
-    });
+    }));
 
     // Run to completion (events stream into `sink`); dropping `sink` closes the
     // forward loop's `events` (→ outcome) and the approval drain's `host_rx`.
     let outcome = executor.run(spec, sink, steer_inbox, cancel).await;
     coords.lock().await.remove(&run_id);
     let _ = outcome_tx.send(outcome);
-    let _ = forward.await;
-    let _ = approval.await;
+    let _ = forward.join().await;
+    let _ = approval.join().await;
     Handled::Ack
 }
 
@@ -872,13 +1229,24 @@ fn decode_steer_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::BrokerCore;
+    use crate::core::{BrokerCore, PushItem};
+    use crate::proto::{BrokerFrame, ClientFrame};
     use crate::server::BrokerServer;
     use bamboo_subagent::{AskBody, AskMode};
+    use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
     use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     const TOKEN: &str = "t";
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     async fn start() -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -926,6 +1294,43 @@ mod tests {
             created_at: Utc::now(),
             correlation_id: None,
         }
+    }
+
+    fn duplicate_ask_pair(from: &str, question: &str) -> (InboxMessage, InboxMessage) {
+        let first = ask(from, question);
+        let mut second = first.clone();
+        second.created_at = first.created_at + chrono::Duration::microseconds(1);
+        (first, second)
+    }
+
+    async fn mailbox_pending_files(dir: &tempfile::TempDir, session_id: &str) -> usize {
+        let mut total = 0;
+        for lane in ["new", "cur"] {
+            let path = dir.path().join("mailboxes").join(session_id).join(lane);
+            let Ok(mut entries) = tokio::fs::read_dir(path).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_name().to_string_lossy().ends_with(".json") {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    async fn wait_for_empty_mailbox(dir: &tempfile::TempDir, session_id: &str) {
+        wait_for_mailbox_count(dir, session_id, 0).await;
+    }
+
+    async fn wait_for_mailbox_count(dir: &tempfile::TempDir, session_id: &str, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mailbox_pending_files(dir, session_id).await != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("mailbox reaches {expected} pending file(s)"));
     }
 
     #[test]
@@ -1674,6 +2079,929 @@ mod tests {
             .expect("worker task")
             .expect("clean connection-close lifecycle exit");
         assert_eq!(reason, ServeExitReason::ConnectionClosed);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_does_not_cancel_but_subsequent_connection_loss_does() {
+        let (endpoint, _dir, core, connection) = start_single_connection().await;
+        let request = ask("gone-parent", "wait for cancellation");
+        core.deliver("cancel-worker", &request).await.unwrap();
+
+        let me = AgentRef {
+            session_id: "cancel-worker".into(),
+            role: Some("disconnect-cancel-test".into()),
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn({
+            let started = started.clone();
+            let cancelled = cancelled.clone();
+            let worker_shutdown = shutdown.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |_msg, cancel| {
+                        let started = started.clone();
+                        let cancelled = cancelled.clone();
+                        async move {
+                            started.notify_one();
+                            cancel.cancelled().await;
+                            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Handled::Leave
+                        }
+                    },
+                    worker_shutdown,
+                    None,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("handler starts");
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "explicit graceful shutdown must leave admitted work uncancelled"
+        );
+        assert!(!worker.is_finished(), "graceful drain still awaits handler");
+
+        connection.abort();
+        let _ = connection.await;
+        let result = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("connection-loss drain is bounded")
+            .expect("serve task does not panic")
+            .expect("cooperative handler drains cleanly");
+        assert_eq!(result, ServeExitReason::ConnectionClosed);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn connection_loss_aborts_and_joins_handler_that_ignores_cancellation() {
+        let (endpoint, _dir, core, connection) = start_single_connection().await;
+        let request = ask("gone-parent", "ignore cancellation");
+        let request_id = request.id.clone();
+        core.deliver("stuck-worker", &request).await.unwrap();
+
+        let me = AgentRef {
+            session_id: "stuck-worker".into(),
+            role: Some("disconnect-stuck-test".into()),
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = tokio::spawn({
+            let started = started.clone();
+            let dropped = dropped.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |_msg, _cancel| {
+                        let started = started.clone();
+                        let dropped = dropped.clone();
+                        async move {
+                            let _drop_flag = DropFlag(dropped);
+                            started.notify_one();
+                            std::future::pending::<Handled>().await
+                        }
+                    },
+                    CancellationToken::new(),
+                    None,
+                    Duration::from_millis(50),
+                    Duration::from_millis(500),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("handler starts");
+
+        connection.abort();
+        let _ = connection.await;
+        let error = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("stuck handler is bounded")
+            .expect("serve task does not panic")
+            .expect_err("stuck drain returns non-success");
+        match error {
+            BrokerError::ConnectionDrainTimeout {
+                timeout_ms,
+                stuck_ids,
+                ..
+            } => {
+                assert_eq!(timeout_ms, 50);
+                assert_eq!(stuck_ids, vec![request_id.as_str().to_string()]);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "timed-out handler must be aborted and joined before return"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synchronous_non_yielding_handler_cannot_unbound_abort_join() {
+        let (endpoint, _dir, core, connection) = start_single_connection().await;
+        let request = ask("gone-parent", "block a runtime thread");
+        let request_id = request.id.clone();
+        core.deliver("sync-block-worker", &request).await.unwrap();
+
+        let me = AgentRef {
+            session_id: "sync-block-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = tokio::spawn({
+            let started = started.clone();
+            let finished = finished.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |_msg, _cancel| {
+                        let started = started.clone();
+                        let finished = finished.clone();
+                        async move {
+                            started.notify_one();
+                            std::thread::sleep(Duration::from_millis(300));
+                            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Handled::Leave
+                        }
+                    },
+                    CancellationToken::new(),
+                    None,
+                    Duration::from_millis(20),
+                    Duration::from_millis(20),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("synchronous handler starts");
+
+        let disconnect_started = tokio::time::Instant::now();
+        connection.abort();
+        let _ = connection.await;
+        let error = tokio::time::timeout(Duration::from_millis(180), worker)
+            .await
+            .expect("serve returns before synchronous work yields")
+            .expect("serve task")
+            .expect_err("stuck synchronous handler is non-successful");
+        assert!(
+            disconnect_started.elapsed() < Duration::from_millis(180),
+            "disconnect + abort join must remain bounded"
+        );
+        match error {
+            BrokerError::ConnectionDrainTimeout {
+                timeout_ms,
+                stuck_ids,
+                abort_join_timeout_ms,
+                abort_join_timed_out,
+            } => {
+                assert_eq!(timeout_ms, 20);
+                assert_eq!(stuck_ids, vec![request_id.as_str().to_string()]);
+                assert_eq!(abort_join_timeout_ms, 20);
+                assert!(abort_join_timed_out);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "library returned while the non-yielding task was still running"
+        );
+
+        // Let the synthetic blocker leave its synchronous section so the test
+        // runtime itself can shut down; a real subagent-worker process exits(1).
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synthetic synchronous blocker eventually returns");
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_runs_once_then_acks_active_and_late_durable_copies() {
+        let (endpoint, dir, core, connection) = start_single_connection().await;
+        let (first, second) = duplicate_ask_pair("duplicate-parent", "dedupe me");
+        core.deliver("dedupe-worker", &first).await.unwrap();
+        core.deliver("dedupe-worker", &second).await.unwrap();
+
+        let me = AgentRef {
+            session_id: "dedupe-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn({
+            let invocations = invocations.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let worker_shutdown = shutdown.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |_msg, _cancel| {
+                        let invocations = invocations.clone();
+                        let started = started.clone();
+                        let release = release.clone();
+                        async move {
+                            invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            started.notify_one();
+                            release.notified().await;
+                            Handled::Ack
+                        }
+                    },
+                    worker_shutdown,
+                    None,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("first duplicate starts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an active duplicate must coalesce into the original admission"
+        );
+        release.notify_waiters();
+        wait_for_empty_mailbox(&dir, "dedupe-worker").await;
+
+        let mut late = second;
+        late.created_at += chrono::Duration::microseconds(1);
+        core.deliver("dedupe-worker", &late).await.unwrap();
+        wait_for_empty_mailbox(&dir, "dedupe-worker").await;
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a late duplicate after successful completion must only be acked"
+        );
+
+        shutdown.cancel();
+        let reason = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("dedupe worker exits")
+            .expect("serve task")
+            .expect("clean shutdown");
+        assert_eq!(reason, ServeExitReason::ShutdownRequested);
+        let _ = tokio::time::timeout(Duration::from_secs(1), connection).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_stays_unacked_and_has_no_detached_task_on_disconnect() {
+        let (endpoint, _dir, core, connection) = start_single_connection().await;
+        let (first, second) = duplicate_ask_pair("duplicate-parent", "disconnect me");
+        let duplicate_id = first.id.clone();
+        core.deliver("duplicate-disconnect-worker", &first)
+            .await
+            .unwrap();
+        core.deliver("duplicate-disconnect-worker", &second)
+            .await
+            .unwrap();
+
+        let me = AgentRef {
+            session_id: "duplicate-disconnect-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = tokio::spawn({
+            let invocations = invocations.clone();
+            let started = started.clone();
+            let dropped = dropped.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |_msg, cancel| {
+                        let invocations = invocations.clone();
+                        let started = started.clone();
+                        let dropped = dropped.clone();
+                        async move {
+                            let _drop_flag = DropFlag(dropped);
+                            invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            started.notify_one();
+                            cancel.cancelled().await;
+                            Handled::Leave
+                        }
+                    },
+                    CancellationToken::new(),
+                    None,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("duplicate admission starts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        connection.abort();
+        let _ = connection.await;
+        let reason = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("disconnect drain is bounded")
+            .expect("serve task")
+            .expect("cooperative cancellation drains");
+        assert_eq!(reason, ServeExitReason::ConnectionClosed);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        core.unsubscribe("duplicate-disconnect-worker").await;
+        let (mut replay, _lease) = core
+            .subscribe_with_lease("duplicate-disconnect-worker", None)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let PushItem::Message(message) = replay.try_recv().expect("duplicate remains durable")
+            else {
+                panic!("expected durable duplicate message");
+            };
+            assert_eq!(message.id, duplicate_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn late_duplicate_ack_failure_cancels_and_joins_other_inflight_handlers() {
+        let (endpoint, dir, core, connection) = start_single_connection().await;
+        let original = ask("duplicate-parent", "complete first");
+        let blocker = ask("duplicate-parent", "wait for cancellation");
+        core.deliver("duplicate-ack-failure-worker", &original)
+            .await
+            .unwrap();
+        core.deliver("duplicate-ack-failure-worker", &blocker)
+            .await
+            .unwrap();
+
+        let me = AgentRef {
+            session_id: "duplicate-ack-failure-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let fail_next_ack = client.fail_next_ack_handle();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = tokio::spawn({
+            let release = release.clone();
+            let cancelled = cancelled.clone();
+            let invocations = invocations.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |msg, cancel| {
+                        let started_tx = started_tx.clone();
+                        let release = release.clone();
+                        let cancelled = cancelled.clone();
+                        let invocations = invocations.clone();
+                        async move {
+                            let body: AskBody = serde_json::from_value(msg.body).unwrap();
+                            started_tx.send(body.question.clone()).unwrap();
+                            if body.question == "complete first" {
+                                invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                release.notified().await;
+                                Handled::Ack
+                            } else {
+                                cancel.cancelled().await;
+                                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Handled::Leave
+                            }
+                        }
+                    },
+                    CancellationToken::new(),
+                    None,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                )
+                .await
+            }
+        });
+
+        let mut started = std::collections::HashSet::new();
+        for _ in 0..2 {
+            started.insert(
+                tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+                    .await
+                    .expect("both handlers start")
+                    .expect("start signal"),
+            );
+        }
+        assert!(started.contains("complete first"));
+        assert!(started.contains("wait for cancellation"));
+        release.notify_one();
+        wait_for_mailbox_count(&dir, "duplicate-ack-failure-worker", 1).await;
+
+        fail_next_ack.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut late = original;
+        late.created_at += chrono::Duration::microseconds(1);
+        core.deliver("duplicate-ack-failure-worker", &late)
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("duplicate ack failure teardown is bounded")
+            .expect("serve task does not panic")
+            .expect_err("duplicate ack failure remains non-successful");
+        assert!(
+            matches!(error, BrokerError::Transport(ref message) if message == "injected broker ack failure"),
+            "{error}"
+        );
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the late duplicate must never execute after its original completed"
+        );
+        assert_eq!(
+            mailbox_pending_files(&dir, "duplicate-ack-failure-worker").await,
+            2,
+            "failed duplicate ack and cancelled work must remain durable"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), connection).await;
+    }
+
+    #[tokio::test]
+    async fn leave_does_not_permanently_dedupe_same_id() {
+        let (endpoint, _dir, core, connection) = start_single_connection().await;
+        let (first, second) = duplicate_ask_pair("leave-parent", "leave twice");
+        core.deliver("leave-worker", &first).await.unwrap();
+
+        let me = AgentRef {
+            session_id: "leave-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let (invoked_tx, mut invoked_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn({
+            let worker_shutdown = shutdown.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |_msg, _cancel| {
+                        let invoked_tx = invoked_tx.clone();
+                        async move {
+                            invoked_tx.send(()).unwrap();
+                            Handled::Leave
+                        }
+                    },
+                    worker_shutdown,
+                    None,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), invoked_rx.recv())
+            .await
+            .expect("first Leave runs")
+            .expect("first invocation");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        core.deliver("leave-worker", &second).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), invoked_rx.recv())
+            .await
+            .expect("same id runs again after Leave")
+            .expect("second invocation");
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("Leave worker exits")
+            .expect("serve task")
+            .expect("clean shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(1), connection).await;
+    }
+
+    #[tokio::test]
+    async fn completion_wire_failure_cancels_and_joins_other_inflight_handlers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let complete = ask("gone-parent", "complete first");
+        let waiting = ask("gone-parent", "wait for cancellation");
+        let fake_broker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("worker connection");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket upgrade");
+            let hello = ws.next().await.expect("hello frame").expect("hello read");
+            assert!(matches!(
+                ClientFrame::from_text(hello.to_text().unwrap()).unwrap(),
+                ClientFrame::Hello { .. }
+            ));
+            ws.send(WsMessage::text(BrokerFrame::Welcome.to_text()))
+                .await
+                .unwrap();
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe read");
+            assert_eq!(
+                ClientFrame::from_text(subscribe.to_text().unwrap()).unwrap(),
+                ClientFrame::Subscribe
+            );
+            ws.send(WsMessage::text(
+                BrokerFrame::Message { message: complete }.to_text(),
+            ))
+            .await
+            .unwrap();
+            ws.send(WsMessage::text(
+                BrokerFrame::Message { message: waiting }.to_text(),
+            ))
+            .await
+            .unwrap();
+
+            loop {
+                let frame = ws
+                    .next()
+                    .await
+                    .expect("completion writes a reply")
+                    .expect("completion frame");
+                let frame = ClientFrame::from_text(frame.to_text().unwrap()).unwrap();
+                if matches!(frame, ClientFrame::Deliver { .. }) {
+                    // Drop the connection without a delivery receipt. The
+                    // completion arm is already awaiting this exact receipt,
+                    // so its wire-error path deterministically wins before the
+                    // reader-close event can drive the outer select.
+                    break;
+                }
+            }
+        });
+
+        let me = AgentRef {
+            session_id: "wire-failure-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = tokio::spawn({
+            let release = release.clone();
+            let cancelled = cancelled.clone();
+            async move {
+                serve_loop_with_timeouts(
+                    &mut client,
+                    &me,
+                    move |msg, cancel| {
+                        let started_tx = started_tx.clone();
+                        let release = release.clone();
+                        let cancelled = cancelled.clone();
+                        async move {
+                            let body: AskBody = serde_json::from_value(msg.body).unwrap();
+                            started_tx.send(()).unwrap();
+                            if body.question == "complete first" {
+                                release.notified().await;
+                                Handled::Reply("done".into())
+                            } else {
+                                cancel.cancelled().await;
+                                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                                Handled::Leave
+                            }
+                        }
+                    },
+                    CancellationToken::new(),
+                    None,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                )
+                .await
+            }
+        });
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+                .await
+                .expect("both handlers start")
+                .expect("start signal");
+        }
+        release.notify_one();
+
+        let error = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("wire failure teardown is bounded")
+            .expect("serve task does not panic")
+            .expect_err("delivery failure remains non-successful");
+        assert!(matches!(error, BrokerError::Transport(_)), "{error}");
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        fake_broker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_and_owner_loss_fail_closed_without_waiter_leaks() {
+        let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel();
+        approval_waiters_lock(&waiters).insert("timeout".to_string(), timeout_tx);
+        assert!(
+            !await_approval_decision(
+                &waiters,
+                "timeout",
+                timeout_rx,
+                &CancellationToken::new(),
+                Duration::from_millis(20),
+            )
+            .await
+        );
+        assert!(approval_waiters_lock(&waiters).is_empty());
+
+        let owner_cancel = CancellationToken::new();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        approval_waiters_lock(&waiters).insert("owner-lost".to_string(), cancel_tx);
+        owner_cancel.cancel();
+        assert!(
+            !await_approval_decision(
+                &waiters,
+                "owner-lost",
+                cancel_rx,
+                &owner_cancel,
+                Duration::from_secs(30),
+            )
+            .await
+        );
+        assert!(approval_waiters_lock(&waiters).is_empty());
+
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
+        approval_waiters_lock(&waiters).insert("task-aborted".to_string(), abort_tx);
+        let aborted_wait = tokio::spawn({
+            let waiters = Arc::clone(&waiters);
+            async move {
+                await_approval_decision(
+                    &waiters,
+                    "task-aborted",
+                    abort_rx,
+                    &CancellationToken::new(),
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        aborted_wait.abort();
+        let _ = aborted_wait.await;
+        assert!(
+            approval_waiters_lock(&waiters).is_empty(),
+            "aborting the approval future must synchronously drop its registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_reply_and_sender_loss_both_cleanup_waiters() {
+        let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let owner_cancel = CancellationToken::new();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        approval_waiters_lock(&waiters).insert("reply".to_string(), reply_tx);
+        approval_waiters_lock(&waiters)
+            .remove("reply")
+            .expect("registered reply waiter")
+            .send(true)
+            .unwrap();
+        assert!(
+            await_approval_decision(
+                &waiters,
+                "reply",
+                reply_rx,
+                &owner_cancel,
+                Duration::from_secs(1),
+            )
+            .await
+        );
+        assert!(approval_waiters_lock(&waiters).is_empty());
+
+        let (lost_tx, lost_rx) = tokio::sync::oneshot::channel();
+        approval_waiters_lock(&waiters).insert("sender-lost".to_string(), lost_tx);
+        drop(
+            approval_waiters_lock(&waiters)
+                .remove("sender-lost")
+                .expect("registered sender-loss waiter"),
+        );
+        assert!(
+            !await_approval_decision(
+                &waiters,
+                "sender-lost",
+                lost_rx,
+                &owner_cancel,
+                Duration::from_secs(1),
+            )
+            .await
+        );
+        assert!(approval_waiters_lock(&waiters).is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_delivery_rejection_removes_registered_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Arc::new(BrokerCore::new(dir.path()).with_max_pending_per_mailbox(0));
+        let server = Arc::new(BrokerServer::new(core, TOKEN));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        let me = AgentRef {
+            session_id: "approval-worker".into(),
+            role: None,
+        };
+        let mut deliver = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
+        approval_waiters_lock(&waiters).insert("rejected".to_string(), waiter_tx);
+        let message = InboxMessage {
+            id: MsgId::new(),
+            from: me,
+            kind: InboxKind::ApprovalRequest,
+            body: serde_json::json!({ "id": "rejected", "request": {} }),
+            created_at: Utc::now(),
+            correlation_id: None,
+        };
+        assert!(
+            !deliver_approval_request(
+                &mut deliver,
+                "full-parent",
+                message,
+                &waiters,
+                "rejected",
+                &CancellationToken::new(),
+            )
+            .await
+        );
+        assert!(approval_waiters_lock(&waiters).is_empty());
+        assert!(waiter_rx.await.is_err(), "removed sender must be dropped");
+    }
+
+    #[tokio::test]
+    async fn abort_during_approval_delivery_wait_removes_registered_waiter() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (deliver_seen_tx, deliver_seen_rx) = tokio::sync::oneshot::channel();
+        let fake_broker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("approval connection");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket upgrade");
+            let hello = ws.next().await.expect("hello frame").expect("hello read");
+            assert!(matches!(
+                ClientFrame::from_text(hello.to_text().unwrap()).unwrap(),
+                ClientFrame::Hello { .. }
+            ));
+            ws.send(WsMessage::text(BrokerFrame::Welcome.to_text()))
+                .await
+                .unwrap();
+            loop {
+                let frame = ws
+                    .next()
+                    .await
+                    .expect("approval delivery")
+                    .expect("approval frame");
+                if matches!(
+                    ClientFrame::from_text(frame.to_text().unwrap()).unwrap(),
+                    ClientFrame::Deliver { .. }
+                ) {
+                    let _ = deliver_seen_tx.send(());
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let me = AgentRef {
+            session_id: "approval-abort-worker".into(),
+            role: None,
+        };
+        let deliver = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (waiter_tx, _waiter_rx) = tokio::sync::oneshot::channel();
+        approval_waiters_lock(&waiters).insert("delivery-wait".to_string(), waiter_tx);
+        let delivery = tokio::spawn({
+            let waiters = Arc::clone(&waiters);
+            async move {
+                let mut deliver = deliver;
+                let _registration = ApprovalWaiterRegistration::new(&waiters, "delivery-wait");
+                let message = InboxMessage {
+                    id: MsgId::new(),
+                    from: me,
+                    kind: InboxKind::ApprovalRequest,
+                    body: serde_json::json!({ "id": "delivery-wait", "request": {} }),
+                    created_at: Utc::now(),
+                    correlation_id: None,
+                };
+                deliver_approval_request(
+                    &mut deliver,
+                    "silent-parent",
+                    message,
+                    &waiters,
+                    "delivery-wait",
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), deliver_seen_rx)
+            .await
+            .expect("deliver reaches broker")
+            .expect("delivery signal");
+        assert!(approval_waiters_lock(&waiters).contains_key("delivery-wait"));
+        delivery.abort();
+        let _ = delivery.await;
+        assert!(
+            approval_waiters_lock(&waiters).is_empty(),
+            "aborting during delivery receipt wait must drop registration"
+        );
+        fake_broker.abort();
+        let _ = fake_broker.await;
+    }
+
+    #[tokio::test]
+    async fn aborting_parent_during_join_does_not_detach_child() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parent = tokio::spawn({
+            let started = started.clone();
+            let dropped = dropped.clone();
+            async move {
+                let mut task = AbortOnDropTask::new(tokio::spawn(async move {
+                    let _drop_flag = DropFlag(dropped);
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                }));
+                let _ = task.join().await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("child starts");
+        parent.abort();
+        let _ = parent.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping owner aborts child");
     }
 
     /// Graceful shutdown (#49): tripping the shutdown token while an Ask is in

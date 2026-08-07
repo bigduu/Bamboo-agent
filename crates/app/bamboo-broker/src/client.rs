@@ -194,6 +194,10 @@ pub struct BrokerClient {
     /// right now" (`next_message() -> None` but still alive) apart from "the
     /// connection died". See [`BrokerClient::reader_alive`].
     reader_alive: Arc<AtomicBool>,
+    /// Deterministic unit-test seam for exercising callers' ack-failure paths.
+    /// Compiled out of production clients entirely.
+    #[cfg(test)]
+    fail_next_ack: Arc<AtomicBool>,
 }
 
 impl BrokerClient {
@@ -348,6 +352,8 @@ impl BrokerClient {
             cancels,
             connected,
             reader_alive,
+            #[cfg(test)]
+            fail_next_ack: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -531,7 +537,17 @@ impl BrokerClient {
 
     /// Acknowledge a processed message so the broker deletes it.
     pub async fn ack(&mut self, id: MsgId) -> BrokerResult<()> {
+        #[cfg(test)]
+        if self.fail_next_ack.swap(false, Ordering::SeqCst) {
+            return Err(BrokerError::Transport("injected broker ack failure".into()));
+        }
         self.send(ClientFrame::Ack { id }).await
+    }
+
+    /// Arm one synthetic ack failure without perturbing production behavior.
+    #[cfg(test)]
+    pub(crate) fn fail_next_ack_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fail_next_ack)
     }
 
     /// Consume this (already connected + subscribed) client into a multiplexed
