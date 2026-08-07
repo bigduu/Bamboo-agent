@@ -1908,6 +1908,40 @@ mod tests {
     }
 
     #[test]
+    fn build_responses_body_preserves_max_reasoning_effort() {
+        let body = build_responses_body(
+            "gpt-5.6-sol",
+            &[],
+            &[],
+            Some(32_000),
+            Some(ReasoningEffort::Max),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["max_output_tokens"], 32_000);
+    }
+
+    #[test]
+    fn build_responses_body_keeps_legacy_models_on_xhigh() {
+        let body = build_responses_body(
+            "gpt-4o",
+            &[],
+            &[],
+            Some(16_384),
+            Some(ReasoningEffort::Max),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["max_output_tokens"], 16_384);
+    }
+
+    #[test]
     fn build_responses_body_with_parallel_tool_calls() {
         let body = build_responses_body("gpt-5.4", &[], &[], None, None, None, Some(false), None);
         assert_eq!(body["parallel_tool_calls"], false);

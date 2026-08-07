@@ -31,6 +31,32 @@ pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option
         });
     }
 }
+
+pub(crate) fn apply_generation_config(
+    request: &mut GeminiRequest,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Option<u32> {
+    let thinking_budget = reasoning_effort.and_then(|effort| {
+        crate::providers::common::bounded_thinking_budget(effort, max_output_tokens)
+    });
+    if max_output_tokens.is_none() && thinking_budget.is_none() {
+        return None;
+    }
+
+    let mut generation_config = serde_json::Map::new();
+    if let Some(max_tokens) = max_output_tokens {
+        generation_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
+    }
+    if let Some(thinking_budget) = thinking_budget {
+        generation_config.insert(
+            "thinkingConfig".to_string(),
+            json!({ "thinkingBudget": thinking_budget }),
+        );
+    }
+    request.generation_config = Some(Value::Object(generation_config));
+    thinking_budget
+}
 use bamboo_domain::ToolSchema;
 
 /// Google Gemini API provider.
@@ -132,13 +158,11 @@ impl GeminiProvider {
         format!("{}/models", self.base_url.trim_end_matches('/'))
     }
 
-    fn thinking_budget_for_effort(effort: ReasoningEffort) -> Option<u32> {
-        match effort {
-            ReasoningEffort::Low => None,
-            ReasoningEffort::Medium => Some(1024),
-            ReasoningEffort::High => Some(4096),
-            ReasoningEffort::Xhigh | ReasoningEffort::Max => Some(8192),
-        }
+    fn thinking_budget_for_effort(
+        effort: ReasoningEffort,
+        max_output_tokens: Option<u32>,
+    ) -> Option<u32> {
+        crate::providers::common::bounded_thinking_budget(effort, max_output_tokens)
     }
 
     fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
@@ -173,6 +197,10 @@ impl LLMProvider for GeminiProvider {
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
+        crate::providers::common::validate_max_thinking_budget(
+            reasoning_effort,
+            max_output_tokens,
+        )?;
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let required_tool = crate::provider::required_tool_from_options(options, tools)?;
         let reasoning_source = if request_reasoning_effort.is_some() {
@@ -189,8 +217,8 @@ impl LLMProvider for GeminiProvider {
             .and_then(|o| o.session_id.as_deref())
             .unwrap_or("unknown-session");
         let mut applied_reasoning_effort = reasoning_effort;
-        let mut applied_thinking_budget =
-            reasoning_effort.and_then(Self::thinking_budget_for_effort);
+        let mut applied_thinking_budget = reasoning_effort
+            .and_then(|effort| Self::thinking_budget_for_effort(effort, max_output_tokens));
 
         // Auth is supplied via the x-goog-api-key header (see build_headers).
         let url = self.stream_url(model);
@@ -206,21 +234,7 @@ impl LLMProvider for GeminiProvider {
                 request.tools = Some(tools_vec.to_provider()?);
             }
 
-            // Add generation config if max_output_tokens or reasoning effort is specified.
-            let thinking_budget = effort.and_then(Self::thinking_budget_for_effort);
-            if max_output_tokens.is_some() || thinking_budget.is_some() {
-                let mut generation_config = serde_json::Map::new();
-                if let Some(max_tokens) = max_output_tokens {
-                    generation_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
-                }
-                if let Some(thinking_budget) = thinking_budget {
-                    generation_config.insert(
-                        "thinkingConfig".to_string(),
-                        json!({ "thinkingBudget": thinking_budget }),
-                    );
-                }
-                request.generation_config = Some(serde_json::Value::Object(generation_config));
-            }
+            apply_generation_config(&mut request, max_output_tokens, effort);
 
             Ok(request)
         };
@@ -411,6 +425,69 @@ impl LLMProvider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_reasoning_uses_a_distinct_larger_thinking_budget() {
+        assert_eq!(
+            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, None),
+            Some(8_192)
+        );
+        assert_eq!(
+            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, None),
+            Some(16_384)
+        );
+        assert_eq!(
+            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(16_384)),
+            Some(8_192)
+        );
+        assert_eq!(
+            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(16_384)),
+            Some(12_288)
+        );
+        assert_eq!(
+            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(8_320)),
+            Some(4_160)
+        );
+        assert_eq!(
+            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(8_320)),
+            Some(6_240)
+        );
+        assert_eq!(
+            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(1_024)),
+            None
+        );
+    }
+
+    #[test]
+    fn max_reasoning_request_reserves_visible_output_at_the_wire() {
+        let mut request: GeminiRequest = vec![Message::user("hello")]
+            .to_provider()
+            .expect("Gemini request");
+        let applied =
+            apply_generation_config(&mut request, Some(16_384), Some(ReasoningEffort::Max));
+        let body = serde_json::to_value(request).expect("serialized Gemini request");
+
+        assert_eq!(applied, Some(12_288));
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 16_384);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            12_288
+        );
+    }
+
+    #[test]
+    fn impossible_max_reasoning_limit_omits_numeric_budget_at_the_wire() {
+        let mut request: GeminiRequest = vec![Message::user("hello")]
+            .to_provider()
+            .expect("Gemini request");
+        let applied =
+            apply_generation_config(&mut request, Some(1_024), Some(ReasoningEffort::Max));
+        let body = serde_json::to_value(request).expect("serialized Gemini request");
+
+        assert_eq!(applied, None);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1_024);
+        assert!(body["generationConfig"].get("thinkingConfig").is_none());
+    }
 
     #[test]
     fn required_tool_choice_uses_gemini_any_allowlist_shape() {

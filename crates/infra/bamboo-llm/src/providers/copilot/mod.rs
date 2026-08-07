@@ -20,7 +20,8 @@ use bamboo_domain::ToolSchema;
 
 use super::common::openai_compat::{
     messages_to_openai_compat_json, openai_compat_chat_stream_from_sse,
-    parse_openai_compat_sse_data_lenient_multi, tools_to_openai_compat_json,
+    parse_openai_compat_sse_data_lenient_multi, set_openai_compat_token_limit,
+    tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
     build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
@@ -1199,9 +1200,7 @@ impl LLMProvider for CopilotProvider {
             body["parallel_tool_calls"] = json!(parallel_tool_calls);
         }
 
-        if let Some(max_tokens) = max_output_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
+        set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
         if let Some(reasoning_effort) = reasoning_effort {
             body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(upstream_model));

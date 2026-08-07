@@ -123,6 +123,27 @@ pub fn tools_to_openai_compat_json(tools: &[ToolSchema]) -> Vec<Value> {
         .collect()
 }
 
+pub(crate) fn set_openai_compat_token_limit(
+    body: &mut Value,
+    max_output_tokens: Option<u32>,
+    reasoning_enabled: bool,
+) {
+    let Some(max_tokens) = max_output_tokens else {
+        return;
+    };
+
+    // Reasoning models count hidden reasoning and visible answer tokens in the
+    // Chat Completions `max_completion_tokens` limit. The legacy `max_tokens`
+    // field is incompatible with o-series models, but remains the
+    // broadest-compatible field for ordinary chat requests.
+    let field = if reasoning_enabled {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    body[field] = json!(max_tokens);
+}
+
 /// Build a standard OpenAI-compatible streaming chat request body.
 pub fn build_openai_compat_body(
     model: &str,
@@ -148,9 +169,7 @@ pub fn build_openai_compat_body(
         body["tool_choice"] = tool_choice;
     }
 
-    if let Some(max_tokens) = max_output_tokens {
-        body["max_tokens"] = json!(max_tokens);
-    }
+    set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
     if let Some(reasoning_effort) = reasoning_effort {
         body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(model));
@@ -524,6 +543,40 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn build_openai_compat_body_preserves_max_reasoning_effort() {
+        let body = super::build_openai_compat_body(
+            "gpt-5.6-sol",
+            &[],
+            &[],
+            None,
+            Some(32_000),
+            Some(bamboo_domain::ReasoningEffort::Max),
+            None,
+        );
+
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["max_completion_tokens"], 32_000);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn build_openai_compat_body_keeps_legacy_models_on_xhigh() {
+        let body = super::build_openai_compat_body(
+            "gpt-4o",
+            &[],
+            &[],
+            None,
+            Some(16_384),
+            Some(bamboo_domain::ReasoningEffort::Max),
+            None,
+        );
+
+        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["max_completion_tokens"], 16_384);
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]
