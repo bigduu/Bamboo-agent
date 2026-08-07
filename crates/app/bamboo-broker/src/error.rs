@@ -43,15 +43,18 @@ pub enum BrokerError {
     Rejected(String),
     /// The broker connection disappeared while handlers were still running,
     /// and at least one handler ignored cancellation past the bounded drain
-    /// deadline. The serve loop aborts and joins the listed handlers before
-    /// returning this error, so callers fail non-successfully without leaving
-    /// detached work behind.
+    /// deadline. The serve loop aborts the listed handlers and gives them one
+    /// additional bounded join window. A synchronous/non-yielding future may
+    /// outlive the library call; dedicated worker processes must hard-exit on
+    /// this error rather than waiting for runtime teardown.
     #[error(
-        "connection-loss drain timed out after {timeout_ms} ms; stuck handlers: {stuck_ids:?}"
+        "connection-loss drain timed out after {timeout_ms} ms; stuck handlers: {stuck_ids:?}; abort join timed out after {abort_join_timeout_ms} ms: {abort_join_timed_out}"
     )]
     ConnectionDrainTimeout {
         timeout_ms: u64,
         stuck_ids: Vec<String>,
+        abort_join_timeout_ms: u64,
+        abort_join_timed_out: bool,
     },
 }
 

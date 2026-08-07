@@ -1192,6 +1192,27 @@ fn log_level_to_seed(rust_log_is_set: bool, requested_level: Option<&str>) -> Op
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentWorkerProcessAction {
+    Return,
+    HardExit(i32),
+}
+
+/// A dedicated subagent worker must not fall through `#[tokio::main]` runtime
+/// teardown after a fatal serve error: an async handler may still be inside
+/// synchronous, non-yielding code that `JoinHandle::abort` cannot interrupt.
+/// `process::exit` bypasses runtime Drop and is deliberately confined to this
+/// hidden worker subcommand, never the reusable broker library.
+fn subagent_worker_process_action(
+    result: &std::result::Result<(), String>,
+) -> SubagentWorkerProcessAction {
+    if result.is_ok() {
+        SubagentWorkerProcessAction::Return
+    } else {
+        SubagentWorkerProcessAction::HardExit(1)
+    }
+}
+
 fn main() {
     // Do this before Tokio constructs its runtime (and therefore before Bamboo
     // opens any application sockets/files). The adjustment is best-effort and
@@ -1530,9 +1551,14 @@ async fn run() {
         }
 
         Commands::SubagentWorker => {
-            if let Err(e) = bamboo_agent::subagent_worker::run().await {
+            let result = bamboo_agent::subagent_worker::run().await;
+            if let Err(e) = &result {
                 eprintln!("subagent-worker failed: {e}");
-                std::process::exit(1);
+            }
+            if let SubagentWorkerProcessAction::HardExit(code) =
+                subagent_worker_process_action(&result)
+            {
+                std::process::exit(code);
             }
         }
 
@@ -2077,11 +2103,24 @@ fn serialize_config_for_cli(
 mod tests {
     use super::{
         log_level_to_seed, requested_log_level, resolve_config_data_dir, serialize_config_for_cli,
+        subagent_worker_process_action, SubagentWorkerProcessAction,
     };
     use bamboo_config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
     use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn subagent_worker_errors_require_process_level_hard_exit() {
+        assert_eq!(
+            subagent_worker_process_action(&Ok(())),
+            SubagentWorkerProcessAction::Return
+        );
+        assert_eq!(
+            subagent_worker_process_action(&Err("connection-loss drain timed out".to_string())),
+            SubagentWorkerProcessAction::HardExit(1)
+        );
+    }
 
     #[test]
     fn requested_log_level_prefers_explicit_level_then_verbose_count() {
