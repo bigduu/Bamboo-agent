@@ -41,6 +41,18 @@ pub enum BrokerError {
     /// variant on the broker doesn't cross the wire, only its `Display`).
     #[error("broker rejected the request: {0}")]
     Rejected(String),
+    /// The broker connection disappeared while handlers were still running,
+    /// and at least one handler ignored cancellation past the bounded drain
+    /// deadline. The serve loop aborts and joins the listed handlers before
+    /// returning this error, so callers fail non-successfully without leaving
+    /// detached work behind.
+    #[error(
+        "connection-loss drain timed out after {timeout_ms} ms; stuck handlers: {stuck_ids:?}"
+    )]
+    ConnectionDrainTimeout {
+        timeout_ms: u64,
+        stuck_ids: Vec<String>,
+    },
 }
 
 pub type BrokerResult<T> = Result<T, BrokerError>;
