@@ -190,7 +190,7 @@ Arguments supported by `bamboo serve` (all override the config file):
 
 The admin commands (`health` / `status` / `sessions` / `stop` / `history` / `respond` / `session` / `schedules`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`); the other `mcp` verbs are server-backed and take the same connection flags. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
-A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present). `bamboo serve` defaults to `info` in every build profile; use `--log-level debug`, `-v`, or `RUST_LOG` to opt into more verbose server logs.
+A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present). `bamboo serve` defaults to `info` in every build profile. Embedded debug builds keep `debug` on stdout while date-rotated files default to `info`; at startup, strictly matching historical files are retained by both count and a 128 MiB total byte budget. Daily rotation continues during long-running processes, and startup limits are enforced again on the next process start. Use `--log-level debug`, `-v`, or `RUST_LOG` to opt into more detail; target-specific directives such as `RUST_LOG=h2=debug` override the dependency-noise defaults while leaving each sink's root default unchanged.
 
 **Defaults** (verified against code):
 
