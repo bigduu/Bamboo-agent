@@ -15,8 +15,10 @@ pub use stream::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use async_trait::async_trait;
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePart, PromptBlock, Role};
 use reqwest::{header::HeaderMap, Client};
@@ -31,6 +33,9 @@ use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::ReasoningEffort;
+
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
 pub(crate) fn reasoning_effort_for_required_tool(
     configured: Option<ReasoningEffort>,
@@ -686,11 +691,21 @@ pub fn build_anthropic_request_with_cache_blocks(
         && !thinking_replay_always
         && must_downgrade_thinking_for_unsigned_tool_turn(messages);
     if thinking_downgraded {
-        tracing::warn!(
-            "Anthropic request: disabling extended thinking for this request — the final \
-             assistant tool_use turn has no signed thinking block to replay (e.g. it was \
-             minted by another provider before a mid-session model switch, #520)"
-        );
+        let key = ("unsigned-tool-turn-thinking-downgrade", model);
+        let error = "final assistant tool_use turn lacks a signed thinking block";
+        if STATIC_WARNINGS.insert_if_new(&key, error) {
+            tracing::warn!(
+                "Anthropic request: disabling extended thinking for this request — the final \
+                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
+                 minted by another provider before a mid-session model switch, #520)"
+            );
+        } else {
+            tracing::debug!(
+                "Anthropic request: disabling extended thinking for this request — the final \
+                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
+                 minted by another provider before a mid-session model switch, #520)"
+            );
+        }
     }
     let thinking_enabled = requested_thinking.is_some() && !thinking_downgraded;
 

@@ -1,11 +1,16 @@
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
 use crate::types::{SkillDefinition, SkillError, SkillResult};
+
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
 fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
@@ -183,10 +188,19 @@ async fn find_skill_files(dir: &Path, max_candidates: usize) -> Vec<PathBuf> {
                             break;
                         }
                     } else {
-                        warn!(
-                            "Ignoring symlinked or non-regular skill file: {:?}",
-                            skill_file
-                        );
+                        let key = ("non-regular-skill-file", &skill_file);
+                        let error = "symlink or non-regular file";
+                        if STATIC_WARNINGS.insert_if_new(&key, error) {
+                            warn!(
+                                "Ignoring symlinked or non-regular skill file: {:?}",
+                                skill_file
+                            );
+                        } else {
+                            debug!(
+                                "Ignoring symlinked or non-regular skill file: {:?}",
+                                skill_file
+                            );
+                        }
                     }
                     continue; // Don't recurse into skill directories
                 }
@@ -327,7 +341,13 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                         });
                     }
                     Err(error) => {
-                        warn!("Failed to parse skill file {:?}: {}", skill_file, error);
+                        let error_fingerprint = error.to_string();
+                        let key = ("parse-skill-file", &skill_file);
+                        if STATIC_WARNINGS.insert_if_new(&key, &error_fingerprint) {
+                            warn!("Failed to parse skill file {:?}: {}", skill_file, error);
+                        } else {
+                            debug!("Failed to parse skill file {:?}: {}", skill_file, error);
+                        }
                         let skill_root = skill_file
                             .parent()
                             .map(Path::to_path_buf)
@@ -346,7 +366,13 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                     }
                 },
                 Err(error) => {
-                    warn!("Failed to read skill file {:?}: {}", skill_file, error);
+                    let error_fingerprint = error.to_string();
+                    let key = ("decode-skill-file", &skill_file);
+                    if STATIC_WARNINGS.insert_if_new(&key, &error_fingerprint) {
+                        warn!("Failed to read skill file {:?}: {}", skill_file, error);
+                    } else {
+                        debug!("Failed to read skill file {:?}: {}", skill_file, error);
+                    }
                     let skill_root = skill_file
                         .parent()
                         .map(Path::to_path_buf)

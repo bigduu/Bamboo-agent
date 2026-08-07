@@ -295,9 +295,9 @@ impl BambooBuilder {
     ///
     /// When enabled, [`build`](Self::build) installs file + stdout logging rooted
     /// at the builder's `data_dir` (daily-rotating files under `{data_dir}/logs`,
-    /// date-based retention, `RUST_LOG`-overridable level). Pass `debug = true`
-    /// (typically `cfg!(debug_assertions)`) to default to the `debug` level;
-    /// otherwise `info`.
+    /// count- and byte-bounded historical retention, `RUST_LOG`-overridable
+    /// filters). Pass `debug = true` (typically `cfg!(debug_assertions)`) to
+    /// default stdout to `debug`; files remain `info` unless explicitly raised.
     ///
     /// This is **opt-in**: by default a `BambooBuilder` never installs a global
     /// subscriber, so embedding applications keep full control of their own

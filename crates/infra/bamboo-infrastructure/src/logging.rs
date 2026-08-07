@@ -11,10 +11,15 @@
 //! - **Rotation is by date, not size.** Files roll once per day (`Rotation::DAILY`),
 //!   so a single run's logs are never split mid-stream on a byte threshold.
 //! - **Old files are purged.** At most [`DEFAULT_MAX_LOG_FILES`] dated files are
-//!   kept; the appender deletes the oldest beyond that on rollover.
+//!   kept, and startup pruning bounds historical files by
+//!   [`DEFAULT_MAX_LOG_BYTES`]. The active UTC-day file is never removed.
 //! - **Server logs are quiet by default.** `bamboo serve` defaults to `info` in
 //!   every build profile. Explicit `RUST_LOG` directives still override that
 //!   policy, while embedding APIs may opt into a build-profile-derived level.
+//! - **File and stdout filters are independent.** Embedded debug builds can keep
+//!   Bamboo `debug` output on stdout while files remain `info` by default.
+//!   Dependency-specific noise defaults keep frame-level traces out of both
+//!   sinks unless an operator explicitly overrides the matching target.
 //!
 //! All initializers are best-effort and idempotent: they use `try_init`, so a
 //! second call (or a call after some other subscriber is installed) is a no-op
@@ -25,14 +30,32 @@
 //! `tracing` bridge as part of `try_init`, so existing `log::info!`-style calls
 //! (which Bodhi uses heavily) are captured without any code changes.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
+use chrono::{NaiveDate, Utc};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Number of dated log files to retain before the oldest are purged on rollover.
 /// With daily rotation this is roughly two weeks of history.
 pub const DEFAULT_MAX_LOG_FILES: usize = 14;
+
+/// Total byte budget for date-stamped logs sharing one prefix.
+///
+/// The active UTC-day file is exempt because unlinking an open file would not
+/// reclaim its space and would make the current process's logs disappear from
+/// the directory. File-level `info` defaults keep that active-file exception
+/// small under normal operation; the budget bounds retained history at startup.
+pub const DEFAULT_MAX_LOG_BYTES: u64 = 128 * 1024 * 1024;
+
+const NOISY_DEPENDENCY_DEFAULTS: &[(&str, &str)] = &[
+    ("h2", "warn"),
+    ("hyper", "info"),
+    ("hyper_util", "info"),
+    ("tungstenite", "info"),
+    ("rustls", "info"),
+];
 
 /// Tuning knobs for [`init_logging_with_options`].
 #[derive(Debug, Clone)]
@@ -44,19 +67,27 @@ pub struct LogOptions {
     pub file_name_prefix: String,
     /// Maximum number of dated files to keep; older ones are deleted on rollover.
     pub max_files: usize,
-    /// Level filter used when `RUST_LOG` is not set (e.g. `"info"` or `"debug"`).
+    /// Maximum total bytes across matching dated files at startup. Historical
+    /// files are deleted oldest-first; today's active file is never deleted.
+    pub max_total_bytes: u64,
+    /// Stdout level used when `RUST_LOG` is not set (e.g. `"info"` or `"debug"`).
     pub default_level: String,
+    /// File level used when `RUST_LOG` is not set. This defaults to `info` even
+    /// when an embedding debug build selects `debug` for stdout.
+    pub file_default_level: String,
 }
 
 impl LogOptions {
     /// Options writing to `dir` with the shared defaults (`bamboo` prefix,
-    /// [`DEFAULT_MAX_LOG_FILES`] retention, `info` level).
+    /// count- and byte-bounded retention, and `info` for both sinks).
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
             file_name_prefix: "bamboo".to_string(),
             max_files: DEFAULT_MAX_LOG_FILES,
+            max_total_bytes: DEFAULT_MAX_LOG_BYTES,
             default_level: "info".to_string(),
+            file_default_level: "info".to_string(),
         }
     }
 }
@@ -64,8 +95,9 @@ impl LogOptions {
 /// Initialize file + stdout logging for a process rooted at `home`.
 ///
 /// Logs are written under `{home}/logs`. Pass `debug = true` (typically
-/// `cfg!(debug_assertions)`) to default to the `debug` level; otherwise `info`.
-/// This is the entry point both the `bamboo` binary and the Bodhi app call.
+/// `cfg!(debug_assertions)`) to default stdout to `debug`; otherwise stdout is
+/// `info`. Files default to `info` in either case. This is the entry point both
+/// the `bamboo` binary and the Bodhi app call.
 pub fn init_logging_with_home(home: &Path, debug: bool) {
     init_logging_with_options(options_for_home(home, debug));
 }
@@ -87,7 +119,7 @@ enum LogContext {
 }
 
 /// Build the [`LogOptions`] used by [`init_logging_with_home`]: logs under
-/// `{home}/logs`, level by build profile, shared defaults otherwise.
+/// `{home}/logs`, stdout level by build profile, shared defaults otherwise.
 ///
 /// Split out from the initializer so the path/level composition can be unit
 /// tested without installing a process-global subscriber.
@@ -123,6 +155,15 @@ fn build_appender(
         );
     }
 
+    // tracing-appender's daily rotation uses UTC. Use the same date boundary
+    // so startup pruning can never unlink the file this appender will open.
+    if let Err(error) = prune_logs_to_budget(opts, Utc::now().date_naive()) {
+        eprintln!(
+            "warning: could not prune log directory {}: {error}",
+            opts.dir.display()
+        );
+    }
+
     RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(&opts.file_name_prefix)
@@ -131,13 +172,162 @@ fn build_appender(
         .build(&opts.dir)
 }
 
+#[derive(Debug)]
+struct DatedLogFile {
+    date: NaiveDate,
+    path: PathBuf,
+    bytes: u64,
+}
+
+/// Prune matching historical logs oldest-first until the total fits the budget.
+///
+/// Only regular files named exactly `<prefix>.<YYYY-MM-DD>.log` participate.
+/// Symlinks, directories, non-UTF-8 names, and co-located unrelated files are
+/// ignored. Per-entry metadata and deletion failures are best-effort so a stale
+/// unreadable file cannot disable logging at startup.
+fn prune_logs_to_budget(opts: &LogOptions, active_date: NaiveDate) -> io::Result<usize> {
+    let entries = std::fs::read_dir(&opts.dir)?;
+    let mut matching = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!(
+                    "warning: could not inspect an entry in {}: {error}",
+                    opts.dir.display()
+                );
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                eprintln!(
+                    "warning: could not inspect log candidate {}: {error}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(date) = dated_log_name(&opts.file_name_prefix, &name) else {
+            continue;
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!(
+                    "warning: could not measure log candidate {}: {error}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        matching.push(DatedLogFile {
+            date,
+            path: entry.path(),
+            bytes: metadata.len(),
+        });
+    }
+
+    let mut total_bytes = total_log_bytes(&matching);
+    if total_bytes <= opts.max_total_bytes {
+        return Ok(0);
+    }
+
+    matching.sort_by(|left, right| {
+        left.date
+            .cmp(&right.date)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let mut deleted = 0;
+    for file in matching {
+        if total_bytes <= opts.max_total_bytes {
+            break;
+        }
+        if file.date == active_date {
+            continue;
+        }
+
+        // Recheck without following links immediately before deletion. A
+        // concurrent replacement can therefore at worst make deletion fail or
+        // remove the replacement directory entry, never follow a symlink target.
+        let still_regular = std::fs::symlink_metadata(&file.path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false);
+        if !still_regular {
+            continue;
+        }
+        match std::fs::remove_file(&file.path) {
+            Ok(()) => {
+                total_bytes = total_bytes.saturating_sub(file.bytes);
+                deleted += 1;
+            }
+            Err(error) => eprintln!(
+                "warning: could not prune historical log {}: {error}",
+                file.path.display()
+            ),
+        }
+    }
+
+    Ok(deleted)
+}
+
+fn total_log_bytes(files: &[DatedLogFile]) -> u64 {
+    files
+        .iter()
+        .fold(0_u64, |total, file| total.saturating_add(file.bytes))
+}
+
+fn dated_log_name(prefix: &str, name: &str) -> Option<NaiveDate> {
+    let date = name
+        .strip_prefix(prefix)?
+        .strip_prefix('.')?
+        .strip_suffix(".log")?;
+    if date.len() != "YYYY-MM-DD".len() {
+        return None;
+    }
+    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    (parsed.format("%Y-%m-%d").to_string() == date).then_some(parsed)
+}
+
+fn filter_directives(default_level: &str, explicit: Option<&str>) -> String {
+    // Always seed a root directive for this sink. A target-only RUST_LOG such
+    // as `h2=debug` raises that dependency without accidentally changing the
+    // default for every other target (stdout and file may seed different roots).
+    let mut directives = String::from(default_level);
+    for (target, level) in NOISY_DEPENDENCY_DEFAULTS {
+        directives.push(',');
+        directives.push_str(target);
+        directives.push('=');
+        directives.push_str(level);
+    }
+    if let Some(explicit) = explicit.filter(|value| !value.trim().is_empty()) {
+        directives.push(',');
+        // Explicit directives come last. EnvFilter replaces a prior directive
+        // with the same target/matcher, so `h2=debug` overrides our `h2=warn`.
+        directives.push_str(explicit);
+    }
+    directives
+}
+
+fn make_filter(default_level: &str, explicit: Option<&str>) -> EnvFilter {
+    let defaults = filter_directives(default_level, None);
+    EnvFilter::try_new(filter_directives(default_level, explicit))
+        .unwrap_or_else(|_| EnvFilter::new(defaults))
+}
+
 /// Initialize file + stdout logging from explicit [`LogOptions`].
 pub fn init_logging_with_options(opts: LogOptions) {
-    // EnvFilter is not `Clone`, so build a fresh one wherever it's needed.
-    let default_level = opts.default_level.clone();
-    let make_filter = move || {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level.clone()))
-    };
+    let explicit = std::env::var(EnvFilter::DEFAULT_ENV).ok();
 
     match build_appender(&opts) {
         Ok(file_writer) => {
@@ -149,16 +339,20 @@ pub fn init_logging_with_options(opts: LogOptions) {
                 .with_ansi(false)
                 .with_writer(file_writer);
             let _ = tracing_subscriber::registry()
-                .with(make_filter())
-                .with(stdout_layer)
-                .with(file_layer)
+                .with(
+                    stdout_layer.with_filter(make_filter(&opts.default_level, explicit.as_deref())),
+                )
+                .with(
+                    file_layer
+                        .with_filter(make_filter(&opts.file_default_level, explicit.as_deref())),
+                )
                 .try_init();
         }
         Err(e) => {
             eprintln!("warning: file logging disabled ({e}); using stdout only");
             let _ = fmt()
                 .with_target(true)
-                .with_env_filter(make_filter())
+                .with_env_filter(make_filter(&opts.default_level, explicit.as_deref()))
                 .try_init();
         }
     }
@@ -169,12 +363,13 @@ pub fn init_logging_with_options(opts: LogOptions) {
 /// For contexts without a stable data directory (e.g. the `bamboo config`
 /// subcommand). Prefer [`init_logging_with_home`] when a `{home}/logs` dir exists.
 pub fn init_logging(debug: bool) {
+    let explicit = std::env::var(EnvFilter::DEFAULT_ENV).ok();
     let _ = fmt()
         .with_target(true)
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(level_for(LogContext::BuildProfile, debug))),
-        )
+        .with_env_filter(make_filter(
+            level_for(LogContext::BuildProfile, debug),
+            explicit.as_deref(),
+        ))
         .try_init();
 }
 
@@ -190,8 +385,30 @@ fn level_for(context: LogContext, debug_build: bool) -> &'static str {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tracing::{Event, Subscriber};
     use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::{Context, Layer};
+
+    #[derive(Clone)]
+    struct EventCounter(Arc<AtomicUsize>);
+
+    impl<S> Layer<S> for EventCounter
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn dated_file(dir: &Path, name: &str, bytes: usize) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; bytes]).expect("write dated log fixture");
+        path
+    }
 
     #[test]
     fn level_for_maps_build_profile_for_embedding_apis() {
@@ -211,7 +428,9 @@ mod tests {
         assert_eq!(opts.dir, PathBuf::from("/tmp/example"));
         assert_eq!(opts.file_name_prefix, "bamboo");
         assert_eq!(opts.max_files, DEFAULT_MAX_LOG_FILES);
+        assert_eq!(opts.max_total_bytes, DEFAULT_MAX_LOG_BYTES);
         assert_eq!(opts.default_level, "info");
+        assert_eq!(opts.file_default_level, "info");
     }
 
     #[test]
@@ -219,6 +438,7 @@ mod tests {
         let debug = options_for_home(Path::new("/srv/data"), true);
         assert_eq!(debug.dir, PathBuf::from("/srv/data/logs"));
         assert_eq!(debug.default_level, "debug");
+        assert_eq!(debug.file_default_level, "info");
 
         let release = options_for_home(Path::new("/srv/data"), false);
         assert_eq!(release.default_level, "info");
@@ -230,7 +450,234 @@ mod tests {
             let opts = options_for_server_home(Path::new("/srv/data"), debug_build);
             assert_eq!(opts.dir, PathBuf::from("/srv/data/logs"));
             assert_eq!(opts.default_level, "info");
+            assert_eq!(opts.file_default_level, "info");
         }
+    }
+
+    #[test]
+    fn stdout_and_file_filters_have_independent_defaults() {
+        let stdout_events = Arc::new(AtomicUsize::new(0));
+        let file_events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(EventCounter(stdout_events.clone()).with_filter(make_filter("debug", None)))
+            .with(EventCounter(file_events.clone()).with_filter(make_filter("info", None)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "bamboo_filter_default_test", "stdout only");
+            tracing::info!(target: "bamboo_filter_default_test", "both sinks");
+        });
+
+        assert_eq!(stdout_events.load(Ordering::Relaxed), 2);
+        assert_eq!(file_events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn noisy_targets_default_low_but_explicit_target_directive_wins() {
+        let defaults = make_filter("debug", None).to_string();
+        for expected in [
+            "h2=warn",
+            "hyper=info",
+            "hyper_util=info",
+            "tungstenite=info",
+            "rustls=info",
+        ] {
+            assert!(
+                defaults.split(',').any(|directive| directive == expected),
+                "missing {expected} in {defaults}"
+            );
+        }
+
+        let default_events = Arc::new(AtomicUsize::new(0));
+        let override_events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(EventCounter(default_events.clone()).with_filter(make_filter("debug", None)))
+            .with(
+                EventCounter(override_events.clone())
+                    .with_filter(make_filter("info", Some("bamboo_engine=trace,h2=debug"))),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "h2", "explicitly requested frame detail");
+        });
+
+        assert_eq!(default_events.load(Ordering::Relaxed), 0);
+        assert_eq!(override_events.load(Ordering::Relaxed), 1);
+        let overridden = make_filter("info", Some("h2=debug")).to_string();
+        assert!(overridden
+            .split(',')
+            .any(|directive| directive == "h2=debug"));
+        assert!(!overridden
+            .split(',')
+            .any(|directive| directive == "h2=warn"));
+    }
+
+    #[test]
+    fn target_only_explicit_filter_preserves_each_sink_root_default() {
+        let stdout_events = Arc::new(AtomicUsize::new(0));
+        let file_events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                EventCounter(stdout_events.clone())
+                    .with_filter(make_filter("debug", Some("h2=trace"))),
+            )
+            .with(
+                EventCounter(file_events.clone())
+                    .with_filter(make_filter("info", Some("h2=trace"))),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "bamboo_target_only_root_test", "stdout root");
+            tracing::info!(target: "bamboo_target_only_root_test", "both roots");
+        });
+
+        assert_eq!(stdout_events.load(Ordering::Relaxed), 2);
+        assert_eq!(file_events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_root_directive_raises_the_file_filter() {
+        let file_events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(
+            EventCounter(file_events.clone()).with_filter(make_filter("info", Some("debug"))),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "bamboo_explicit_root_test", "explicit file debug");
+        });
+
+        assert_eq!(file_events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn invalid_explicit_filter_falls_back_to_safe_defaults() {
+        let filter = make_filter("info", Some("h2=debug,[broken"));
+        let rendered = filter.to_string();
+        assert!(rendered.split(',').any(|directive| directive == "info"));
+        assert!(rendered.split(',').any(|directive| directive == "h2=warn"));
+        assert!(!rendered.split(',').any(|directive| directive == "h2=debug"));
+    }
+
+    #[test]
+    fn dated_log_name_requires_exact_prefix_date_and_suffix() {
+        assert_eq!(
+            dated_log_name("bamboo", "bamboo.2026-08-07.log"),
+            NaiveDate::from_ymd_opt(2026, 8, 7)
+        );
+        for unrelated in [
+            "other.2026-08-07.log",
+            "bamboo-extra.2026-08-07.log",
+            "bamboo.2026-8-7.log",
+            "bamboo.2026-08-07.log.bak",
+            "bamboo.latest.log",
+        ] {
+            assert_eq!(dated_log_name("bamboo", unrelated), None, "{unrelated}");
+        }
+    }
+
+    #[test]
+    fn budget_pruning_is_oldest_first_and_counts_active_file() {
+        let tmp = tempdir().expect("tempdir");
+        let oldest = dated_file(tmp.path(), "bamboo.2026-08-01.log", 4);
+        let newer = dated_file(tmp.path(), "bamboo.2026-08-02.log", 5);
+        let active = dated_file(tmp.path(), "bamboo.2026-08-07.log", 6);
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_total_bytes = 11;
+
+        let deleted = prune_logs_to_budget(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 1);
+        assert!(!oldest.exists());
+        assert!(newer.exists());
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn budget_pruning_never_removes_active_file_even_when_it_exceeds_budget() {
+        let tmp = tempdir().expect("tempdir");
+        let active = dated_file(tmp.path(), "bamboo.2026-08-07.log", 32);
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_total_bytes = 0;
+
+        let deleted = prune_logs_to_budget(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 0);
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn budget_pruning_leaves_unrelated_and_non_file_entries_untouched() {
+        let tmp = tempdir().expect("tempdir");
+        let matching = dated_file(tmp.path(), "bamboo.2026-08-01.log", 4);
+        let unrelated = [
+            dated_file(tmp.path(), "other.2026-08-01.log", 8),
+            dated_file(tmp.path(), "bamboo-extra.2026-08-01.log", 8),
+            dated_file(tmp.path(), "bamboo.2026-08-01.log.bak", 8),
+            dated_file(tmp.path(), "bamboo.latest.log", 8),
+        ];
+        let matching_directory = tmp.path().join("bamboo.2026-08-02.log");
+        std::fs::create_dir(&matching_directory).expect("matching-name directory");
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_total_bytes = 0;
+
+        let deleted = prune_logs_to_budget(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 1);
+        assert!(!matching.exists());
+        assert!(unrelated.iter().all(|path| path.exists()));
+        assert!(matching_directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn budget_pruning_never_follows_or_deletes_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().expect("tempdir");
+        let target = dated_file(tmp.path(), "outside.log", 16);
+        let link = tmp.path().join("bamboo.2026-08-01.log");
+        symlink(&target, &link).expect("symlink fixture");
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_total_bytes = 0;
+
+        let deleted = prune_logs_to_budget(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 0);
+        assert!(link.symlink_metadata().is_ok());
+        assert_eq!(std::fs::read(&target).expect("target remains").len(), 16);
+    }
+
+    #[test]
+    fn total_log_bytes_saturates_on_overflow() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 1).expect("valid date");
+        let files = [
+            DatedLogFile {
+                date,
+                path: PathBuf::from("first"),
+                bytes: u64::MAX,
+            },
+            DatedLogFile {
+                date,
+                path: PathBuf::from("second"),
+                bytes: 1,
+            },
+        ];
+        assert_eq!(total_log_bytes(&files), u64::MAX);
     }
 
     #[test]
@@ -242,7 +689,9 @@ mod tests {
             dir: dir.clone(),
             file_name_prefix: "unit-test".to_string(),
             max_files: 5,
+            max_total_bytes: DEFAULT_MAX_LOG_BYTES,
             default_level: "info".to_string(),
+            file_default_level: "info".to_string(),
         };
 
         let appender = build_appender(&opts).expect("appender builds");
@@ -288,7 +737,9 @@ mod tests {
             dir: dir.clone(),
             file_name_prefix: "idem".to_string(),
             max_files: 2,
+            max_total_bytes: DEFAULT_MAX_LOG_BYTES,
             default_level: "info".to_string(),
+            file_default_level: "info".to_string(),
         };
 
         init_logging_with_options(opts.clone());

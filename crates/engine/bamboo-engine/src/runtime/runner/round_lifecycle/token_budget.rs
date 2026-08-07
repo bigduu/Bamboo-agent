@@ -2,12 +2,17 @@ use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::Session;
 use bamboo_compression::limits::{load_model_limits_from_unified_config, ModelLimit};
 use bamboo_compression::{ModelLimitsRegistry, TokenBudget};
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_llm::provider::LLMProvider;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 const CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS: u32 = 32_000;
 const CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS: u32 = 8_000;
 const CONSERVATIVE_SUMMARIZER_SAFETY_MARGIN: u32 = 1_000;
+
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
 fn model_limits_path(config: &AgentLoopConfig) -> PathBuf {
     let data_dir = config
@@ -62,12 +67,23 @@ pub(super) async fn resolve_auxiliary_token_budget(
     let model_limit = match configured_limit.or(provider_limit) {
         Some(limit) => limit,
         None => {
-            tracing::warn!(
-                model = model_name,
-                context_tokens = CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
-                output_tokens = CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
-                "No summarization-model limit is known; using conservative bounded fallback"
-            );
+            let key = ("unknown-summarization-model-limit", model_name);
+            let error = "no configured or provider-reported limit";
+            if STATIC_WARNINGS.insert_if_new(&key, error) {
+                tracing::warn!(
+                    model = model_name,
+                    context_tokens = CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
+                    output_tokens = CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
+                    "No summarization-model limit is known; using conservative bounded fallback"
+                );
+            } else {
+                tracing::debug!(
+                    model = model_name,
+                    context_tokens = CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
+                    output_tokens = CONSERVATIVE_SUMMARIZER_OUTPUT_TOKENS,
+                    "No summarization-model limit is known; using conservative bounded fallback"
+                );
+            }
             let mut fallback = ModelLimit::new(
                 model_name.to_string(),
                 CONSERVATIVE_SUMMARIZER_CONTEXT_TOKENS,
@@ -188,13 +204,25 @@ async fn resolve_configured_model_limit(
 ) -> Option<ModelLimit> {
     let mut dedicated_registry = ModelLimitsRegistry::with_config_path(model_limits_path);
     if let Err(error) = dedicated_registry.load_user_config().await {
-        tracing::warn!(
-            model = model_name,
-            purpose,
-            error = %error,
-            path = ?model_limits_path,
-            "Failed to load model_limits.json; checking legacy configured limits"
-        );
+        let error_fingerprint = error.to_string();
+        let key = ("model-limits-file", model_limits_path);
+        if STATIC_WARNINGS.insert_if_new(&key, &error_fingerprint) {
+            tracing::warn!(
+                model = model_name,
+                purpose,
+                error = %error,
+                path = ?model_limits_path,
+                "Failed to load model_limits.json; checking legacy configured limits"
+            );
+        } else {
+            tracing::debug!(
+                model = model_name,
+                purpose,
+                error = %error,
+                path = ?model_limits_path,
+                "Failed to load model_limits.json; checking legacy configured limits"
+            );
+        }
     } else if let Some(limit) = dedicated_registry.get(model_name) {
         return Some(limit);
     }
@@ -223,10 +251,18 @@ fn apply_legacy_model_limits(
         }
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(
-                "Failed to parse legacy model limits from config.json key 'model_limits': {}.",
-                error
-            );
+            let error_fingerprint = error.to_string();
+            if STATIC_WARNINGS.insert_if_new("legacy-model-limits", &error_fingerprint) {
+                tracing::warn!(
+                    "Failed to parse legacy model limits from config.json key 'model_limits': {}.",
+                    error
+                );
+            } else {
+                tracing::debug!(
+                    "Failed to parse legacy model limits from config.json key 'model_limits': {}.",
+                    error
+                );
+            }
         }
     }
 }

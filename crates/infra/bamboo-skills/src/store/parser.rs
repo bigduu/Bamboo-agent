@@ -1,10 +1,15 @@
 use std::path::Path;
+use std::sync::LazyLock;
 
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_domain::normalize_tool_ref;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::types::{SkillDefinition, SkillError, SkillResult};
+
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,10 +107,18 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         match normalize_tool_ref(trimmed) {
             Some(normalized) => tool_refs.push(normalized),
             None => {
-                warn!(
-                    "Unrecognized allowed-tool '{}' in {:?}; preserving raw value",
-                    trimmed, path
-                );
+                let key = ("unrecognized-allowed-tool", path);
+                if STATIC_WARNINGS.insert_if_new(&key, trimmed) {
+                    warn!(
+                        "Unrecognized allowed-tool '{}' in {:?}; preserving raw value",
+                        trimmed, path
+                    );
+                } else {
+                    debug!(
+                        "Unrecognized allowed-tool '{}' in {:?}; preserving raw value",
+                        trimmed, path
+                    );
+                }
                 tool_refs.push(trimmed.to_string());
             }
         }
@@ -274,8 +287,38 @@ pub(crate) fn is_valid_skill_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     use super::{is_valid_skill_id, parse_markdown_skill};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    struct LevelSubscriber(Arc<Mutex<Vec<Level>>>);
+
+    impl Subscriber for LevelSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*event.metadata().level());
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
 
     #[test]
     fn valid_skill_ids() {
@@ -312,6 +355,34 @@ Use this skill when users want to create skills.
         assert_eq!(parsed.name, "skill-creator");
         assert_eq!(parsed.description, "Helps create and improve skills.");
         assert!(parsed.tool_refs.is_empty());
+    }
+
+    #[test]
+    fn repeated_static_warning_for_same_key_and_error_downgrades_to_debug() {
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = LevelSubscriber(levels.clone());
+        let content = r#"---
+name: issue-741-warn-dedup
+description: Exercises static warning de-duplication.
+allowed-tools:
+  - default::search
+---
+Test body.
+"#;
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..2 {
+                parse_markdown_skill(Path::new("issue-741-warn-dedup/SKILL.md"), content)
+                    .expect("unknown tool is preserved, not rejected");
+            }
+        });
+
+        assert_eq!(
+            *levels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            [Level::WARN, Level::DEBUG]
+        );
     }
 
     #[test]
