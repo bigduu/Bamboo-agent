@@ -49,12 +49,14 @@ pub(in crate::runtime::runner) fn record_round_completed(
     metrics.session_message_count(session_id.to_string(), message_count, Utc::now());
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::runtime::runner) fn record_round_and_session_error(
     metrics_collector: Option<&MetricsCollector>,
     round_id: &str,
     session_id: &str,
     message_count: u32,
     round_status: MetricsRoundStatus,
+    round_usage: MetricsTokenUsage,
     round_error: Option<String>,
     session_status: MetricsSessionStatus,
 ) {
@@ -66,7 +68,7 @@ pub(in crate::runtime::runner) fn record_round_and_session_error(
         round_id.to_string(),
         Utc::now(),
         round_status,
-        MetricsTokenUsage::default(),
+        round_usage,
         0,
         0,
         round_error,
