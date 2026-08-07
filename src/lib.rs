@@ -295,7 +295,7 @@ impl BambooBuilder {
     ///
     /// When enabled, [`build`](Self::build) installs file + stdout logging rooted
     /// at the builder's `data_dir` (daily-rotating files under `{data_dir}/logs`,
-    /// count- and byte-bounded historical retention, `RUST_LOG`-overridable
+    /// startup count- and byte-bounded historical retention, `RUST_LOG`-overridable
     /// filters). Pass `debug = true` (typically `cfg!(debug_assertions)`) to
     /// default stdout to `debug`; files remain `info` unless explicitly raised.
     ///

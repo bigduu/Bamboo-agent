@@ -10,9 +10,12 @@
 //!   day continues the same file and earlier days are left intact.
 //! - **Rotation is by date, not size.** Files roll once per day (`Rotation::DAILY`),
 //!   so a single run's logs are never split mid-stream on a byte threshold.
-//! - **Old files are purged.** At most [`DEFAULT_MAX_LOG_FILES`] dated files are
-//!   kept, and startup pruning bounds historical files by
-//!   [`DEFAULT_MAX_LOG_BYTES`]. The active UTC-day file is never removed.
+//!   Count and byte limits are enforced at process startup; a process that runs
+//!   across later UTC rollovers may temporarily exceed them until its next start.
+//! - **Old files are purged.** Startup pruning keeps at most
+//!   [`DEFAULT_MAX_LOG_FILES`] strictly matching dated files and bounds their
+//!   total size by [`DEFAULT_MAX_LOG_BYTES`]. The captured UTC-day file and any
+//!   future-dated files are never removed.
 //! - **Server logs are quiet by default.** `bamboo serve` defaults to `info` in
 //!   every build profile. Explicit `RUST_LOG` directives still override that
 //!   policy, while embedding APIs may opt into a build-profile-derived level.
@@ -37,8 +40,9 @@ use chrono::{NaiveDate, Utc};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-/// Number of dated log files to retain before the oldest are purged on rollover.
-/// With daily rotation this is roughly two weeks of history.
+/// Number of strictly matching dated log files to retain at process startup.
+/// With daily rotation this is roughly two weeks of history. A value of zero in
+/// [`LogOptions::max_files`] disables count pruning.
 pub const DEFAULT_MAX_LOG_FILES: usize = 14;
 
 /// Total byte budget for date-stamped logs sharing one prefix.
@@ -48,6 +52,8 @@ pub const DEFAULT_MAX_LOG_FILES: usize = 14;
 /// the directory. File-level `info` defaults keep that active-file exception
 /// small under normal operation; the budget bounds retained history at startup.
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 128 * 1024 * 1024;
+
+const DEFAULT_FILE_LOG_LEVEL: &str = "info";
 
 const NOISY_DEPENDENCY_DEFAULTS: &[(&str, &str)] = &[
     ("h2", "warn"),
@@ -65,16 +71,11 @@ pub struct LogOptions {
     /// Filename prefix; the date and a `.log` suffix are appended by the appender
     /// (e.g. `bamboo.2026-05-31.log`). Lets co-located apps keep separate files.
     pub file_name_prefix: String,
-    /// Maximum number of dated files to keep; older ones are deleted on rollover.
+    /// Maximum number of strictly matching dated files to keep at startup.
+    /// A value of zero disables count pruning; byte-budget pruning remains active.
     pub max_files: usize,
-    /// Maximum total bytes across matching dated files at startup. Historical
-    /// files are deleted oldest-first; today's active file is never deleted.
-    pub max_total_bytes: u64,
     /// Stdout level used when `RUST_LOG` is not set (e.g. `"info"` or `"debug"`).
     pub default_level: String,
-    /// File level used when `RUST_LOG` is not set. This defaults to `info` even
-    /// when an embedding debug build selects `debug` for stdout.
-    pub file_default_level: String,
 }
 
 impl LogOptions {
@@ -85,9 +86,7 @@ impl LogOptions {
             dir: dir.into(),
             file_name_prefix: "bamboo".to_string(),
             max_files: DEFAULT_MAX_LOG_FILES,
-            max_total_bytes: DEFAULT_MAX_LOG_BYTES,
             default_level: "info".to_string(),
-            file_default_level: "info".to_string(),
         }
     }
 }
@@ -157,7 +156,8 @@ fn build_appender(
 
     // tracing-appender's daily rotation uses UTC. Use the same date boundary
     // so startup pruning can never unlink the file this appender will open.
-    if let Err(error) = prune_logs_to_budget(opts, Utc::now().date_naive()) {
+    if let Err(error) = prune_logs_at_startup(opts, Utc::now().date_naive(), DEFAULT_MAX_LOG_BYTES)
+    {
         eprintln!(
             "warning: could not prune log directory {}: {error}",
             opts.dir.display()
@@ -168,7 +168,6 @@ fn build_appender(
         .rotation(Rotation::DAILY)
         .filename_prefix(&opts.file_name_prefix)
         .filename_suffix("log")
-        .max_log_files(opts.max_files)
         .build(&opts.dir)
 }
 
@@ -179,13 +178,18 @@ struct DatedLogFile {
     bytes: u64,
 }
 
-/// Prune matching historical logs oldest-first until the total fits the budget.
+/// Prune matching historical logs oldest-first until both startup limits hold.
 ///
 /// Only regular files named exactly `<prefix>.<YYYY-MM-DD>.log` participate.
 /// Symlinks, directories, non-UTF-8 names, and co-located unrelated files are
-/// ignored. Per-entry metadata and deletion failures are best-effort so a stale
-/// unreadable file cannot disable logging at startup.
-fn prune_logs_to_budget(opts: &LogOptions, active_date: NaiveDate) -> io::Result<usize> {
+/// ignored. The captured active date and future dates are protected. Per-entry
+/// metadata and deletion failures are best-effort so a stale unreadable file
+/// cannot disable logging at startup.
+fn prune_logs_at_startup(
+    opts: &LogOptions,
+    active_date: NaiveDate,
+    max_total_bytes: u64,
+) -> io::Result<usize> {
     let entries = std::fs::read_dir(&opts.dir)?;
     let mut matching = Vec::new();
 
@@ -237,8 +241,17 @@ fn prune_logs_to_budget(opts: &LogOptions, active_date: NaiveDate) -> io::Result
         });
     }
 
+    let active_exists = matching.iter().any(|file| file.date == active_date);
+    let reserved_active_slot = usize::from(!active_exists);
+    let mut matching_count = matching.len();
     let mut total_bytes = total_log_bytes(&matching);
-    if total_bytes <= opts.max_total_bytes {
+    if !startup_limits_exceeded(
+        opts.max_files,
+        max_total_bytes,
+        matching_count,
+        reserved_active_slot,
+        total_bytes,
+    ) {
         return Ok(0);
     }
 
@@ -250,25 +263,46 @@ fn prune_logs_to_budget(opts: &LogOptions, active_date: NaiveDate) -> io::Result
 
     let mut deleted = 0;
     for file in matching {
-        if total_bytes <= opts.max_total_bytes {
+        if !startup_limits_exceeded(
+            opts.max_files,
+            max_total_bytes,
+            matching_count,
+            reserved_active_slot,
+            total_bytes,
+        ) {
             break;
         }
-        if file.date == active_date {
+        if file.date >= active_date {
             continue;
         }
 
         // Recheck without following links immediately before deletion. A
         // concurrent replacement can therefore at worst make deletion fail or
         // remove the replacement directory entry, never follow a symlink target.
-        let still_regular = std::fs::symlink_metadata(&file.path)
-            .map(|metadata| metadata.file_type().is_file())
-            .unwrap_or(false);
-        if !still_regular {
+        let metadata = match std::fs::symlink_metadata(&file.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                total_bytes = total_bytes.saturating_sub(file.bytes);
+                matching_count = matching_count.saturating_sub(1);
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: could not recheck historical log {}: {error}",
+                    file.path.display()
+                );
+                continue;
+            }
+        };
+        if !metadata.file_type().is_file() {
+            total_bytes = total_bytes.saturating_sub(file.bytes);
+            matching_count = matching_count.saturating_sub(1);
             continue;
         }
         match std::fs::remove_file(&file.path) {
             Ok(()) => {
                 total_bytes = total_bytes.saturating_sub(file.bytes);
+                matching_count = matching_count.saturating_sub(1);
                 deleted += 1;
             }
             Err(error) => eprintln!(
@@ -279,6 +313,18 @@ fn prune_logs_to_budget(opts: &LogOptions, active_date: NaiveDate) -> io::Result
     }
 
     Ok(deleted)
+}
+
+fn startup_limits_exceeded(
+    max_files: usize,
+    max_total_bytes: u64,
+    matching_count: usize,
+    reserved_active_slot: usize,
+    total_bytes: u64,
+) -> bool {
+    let exceeds_count =
+        max_files != 0 && matching_count.saturating_add(reserved_active_slot) > max_files;
+    exceeds_count || total_bytes > max_total_bytes
 }
 
 fn total_log_bytes(files: &[DatedLogFile]) -> u64 {
@@ -299,12 +345,51 @@ fn dated_log_name(prefix: &str, name: &str) -> Option<NaiveDate> {
     (parsed.format("%Y-%m-%d").to_string() == date).then_some(parsed)
 }
 
+fn level_verbosity(level: &str) -> Option<u8> {
+    if level.eq_ignore_ascii_case("off") {
+        Some(0)
+    } else if level.eq_ignore_ascii_case("error") {
+        Some(1)
+    } else if level.eq_ignore_ascii_case("warn") {
+        Some(2)
+    } else if level.eq_ignore_ascii_case("info") {
+        Some(3)
+    } else if level.eq_ignore_ascii_case("debug") {
+        Some(4)
+    } else if level.eq_ignore_ascii_case("trace") {
+        Some(5)
+    } else {
+        None
+    }
+}
+
+fn effective_root_verbosity(default_level: &str, explicit: Option<&str>) -> Option<u8> {
+    explicit
+        .and_then(|directives| {
+            directives
+                .split(',')
+                .filter_map(|directive| level_verbosity(directive.trim()))
+                .next_back()
+        })
+        .or_else(|| level_verbosity(default_level.trim()))
+}
+
 fn filter_directives(default_level: &str, explicit: Option<&str>) -> String {
     // Always seed a root directive for this sink. A target-only RUST_LOG such
     // as `h2=debug` raises that dependency without accidentally changing the
     // default for every other target (stdout and file may seed different roots).
     let mut directives = String::from(default_level);
+    let effective_root = effective_root_verbosity(default_level, explicit);
     for (target, level) in NOISY_DEPENDENCY_DEFAULTS {
+        // Target defaults exist only to lower noisy dependencies. A more
+        // restrictive explicit root such as `error` or `off` must never be
+        // widened by a more specific default target directive.
+        if !level_verbosity(level)
+            .zip(effective_root)
+            .is_some_and(|(target_level, root_level)| target_level <= root_level)
+        {
+            continue;
+        }
         directives.push(',');
         directives.push_str(target);
         directives.push('=');
@@ -344,7 +429,7 @@ pub fn init_logging_with_options(opts: LogOptions) {
                 )
                 .with(
                     file_layer
-                        .with_filter(make_filter(&opts.file_default_level, explicit.as_deref())),
+                        .with_filter(make_filter(DEFAULT_FILE_LOG_LEVEL, explicit.as_deref())),
                 )
                 .try_init();
         }
@@ -428,9 +513,7 @@ mod tests {
         assert_eq!(opts.dir, PathBuf::from("/tmp/example"));
         assert_eq!(opts.file_name_prefix, "bamboo");
         assert_eq!(opts.max_files, DEFAULT_MAX_LOG_FILES);
-        assert_eq!(opts.max_total_bytes, DEFAULT_MAX_LOG_BYTES);
         assert_eq!(opts.default_level, "info");
-        assert_eq!(opts.file_default_level, "info");
     }
 
     #[test]
@@ -438,7 +521,6 @@ mod tests {
         let debug = options_for_home(Path::new("/srv/data"), true);
         assert_eq!(debug.dir, PathBuf::from("/srv/data/logs"));
         assert_eq!(debug.default_level, "debug");
-        assert_eq!(debug.file_default_level, "info");
 
         let release = options_for_home(Path::new("/srv/data"), false);
         assert_eq!(release.default_level, "info");
@@ -450,7 +532,6 @@ mod tests {
             let opts = options_for_server_home(Path::new("/srv/data"), debug_build);
             assert_eq!(opts.dir, PathBuf::from("/srv/data/logs"));
             assert_eq!(opts.default_level, "info");
-            assert_eq!(opts.file_default_level, "info");
         }
     }
 
@@ -549,6 +630,46 @@ mod tests {
     }
 
     #[test]
+    fn restrictive_explicit_roots_are_never_widened_by_noise_defaults() {
+        for root in ["error", "off"] {
+            let events = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry()
+                .with(EventCounter(events.clone()).with_filter(make_filter("debug", Some(root))));
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!(target: "h2", "must remain blocked by restrictive root");
+                tracing::info!(target: "hyper", "must remain blocked by restrictive root");
+            });
+
+            assert_eq!(events.load(Ordering::Relaxed), 0, "root={root}");
+            let rendered = make_filter("debug", Some(root)).to_string();
+            assert!(!rendered.split(',').any(|directive| directive == "h2=warn"));
+            assert!(!rendered
+                .split(',')
+                .any(|directive| directive == "hyper=info"));
+        }
+        assert_eq!(
+            effective_root_verbosity("debug", Some("off,trace,error")),
+            level_verbosity("error")
+        );
+    }
+
+    #[test]
+    fn restrictive_root_still_allows_an_explicit_target_override() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(
+            EventCounter(events.clone()).with_filter(make_filter("info", Some("error,h2=debug"))),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "h2", "explicit target override");
+            tracing::info!(target: "hyper", "still blocked by root error");
+        });
+
+        assert_eq!(events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn invalid_explicit_filter_falls_back_to_safe_defaults() {
         let filter = make_filter("info", Some("h2=debug,[broken"));
         let rendered = filter.to_string();
@@ -575,17 +696,18 @@ mod tests {
     }
 
     #[test]
-    fn budget_pruning_is_oldest_first_and_counts_active_file() {
+    fn byte_pruning_is_oldest_first_and_counts_active_file() {
         let tmp = tempdir().expect("tempdir");
         let oldest = dated_file(tmp.path(), "bamboo.2026-08-01.log", 4);
         let newer = dated_file(tmp.path(), "bamboo.2026-08-02.log", 5);
         let active = dated_file(tmp.path(), "bamboo.2026-08-07.log", 6);
         let mut opts = LogOptions::new(tmp.path());
-        opts.max_total_bytes = 11;
+        opts.max_files = 0;
 
-        let deleted = prune_logs_to_budget(
+        let deleted = prune_logs_at_startup(
             &opts,
             NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            11,
         )
         .expect("prune succeeds");
 
@@ -596,15 +718,16 @@ mod tests {
     }
 
     #[test]
-    fn budget_pruning_never_removes_active_file_even_when_it_exceeds_budget() {
+    fn byte_pruning_never_removes_active_file_even_when_it_exceeds_budget() {
         let tmp = tempdir().expect("tempdir");
         let active = dated_file(tmp.path(), "bamboo.2026-08-07.log", 32);
         let mut opts = LogOptions::new(tmp.path());
-        opts.max_total_bytes = 0;
+        opts.max_files = 0;
 
-        let deleted = prune_logs_to_budget(
+        let deleted = prune_logs_at_startup(
             &opts,
             NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            0,
         )
         .expect("prune succeeds");
 
@@ -613,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_pruning_leaves_unrelated_and_non_file_entries_untouched() {
+    fn startup_pruning_leaves_unrelated_and_non_file_entries_untouched() {
         let tmp = tempdir().expect("tempdir");
         let matching = dated_file(tmp.path(), "bamboo.2026-08-01.log", 4);
         let unrelated = [
@@ -624,12 +747,12 @@ mod tests {
         ];
         let matching_directory = tmp.path().join("bamboo.2026-08-02.log");
         std::fs::create_dir(&matching_directory).expect("matching-name directory");
-        let mut opts = LogOptions::new(tmp.path());
-        opts.max_total_bytes = 0;
+        let opts = LogOptions::new(tmp.path());
 
-        let deleted = prune_logs_to_budget(
+        let deleted = prune_logs_at_startup(
             &opts,
             NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            0,
         )
         .expect("prune succeeds");
 
@@ -641,25 +764,158 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn budget_pruning_never_follows_or_deletes_symlinks() {
+    fn startup_pruning_never_follows_or_deletes_symlinks() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempdir().expect("tempdir");
         let target = dated_file(tmp.path(), "outside.log", 16);
         let link = tmp.path().join("bamboo.2026-08-01.log");
         symlink(&target, &link).expect("symlink fixture");
-        let mut opts = LogOptions::new(tmp.path());
-        opts.max_total_bytes = 0;
+        let opts = LogOptions::new(tmp.path());
 
-        let deleted = prune_logs_to_budget(
+        let deleted = prune_logs_at_startup(
             &opts,
             NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            0,
         )
         .expect("prune succeeds");
 
         assert_eq!(deleted, 0);
         assert!(link.symlink_metadata().is_ok());
         assert_eq!(std::fs::read(&target).expect("target remains").len(), 16);
+    }
+
+    #[test]
+    fn appender_never_count_prunes_lookalike_files_at_or_above_the_threshold() {
+        let tmp = tempdir().expect("tempdir");
+        let lookalikes = [
+            dated_file(tmp.path(), "bamboo-not-a-date.log", 1),
+            dated_file(tmp.path(), "bamboo.2026-8-1.log", 1),
+            dated_file(tmp.path(), "bamboo.2026-08-01-extra.log", 1),
+        ];
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_files = 2;
+
+        let appender = build_appender(&opts).expect("appender builds");
+        drop(appender);
+
+        assert!(lookalikes.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn count_pruning_never_removes_the_active_file_even_when_created_first() {
+        let tmp = tempdir().expect("tempdir");
+        // Create the active file first to ensure filesystem creation order is
+        // irrelevant; retention is based only on strict parsed dates.
+        let active = dated_file(tmp.path(), "bamboo.2026-08-07.log", 1);
+        let oldest = dated_file(tmp.path(), "bamboo.2026-08-01.log", 1);
+        let newer = dated_file(tmp.path(), "bamboo.2026-08-02.log", 1);
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_files = 2;
+
+        let deleted = prune_logs_at_startup(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            u64::MAX,
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 1);
+        assert!(!oldest.exists());
+        assert!(newer.exists());
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn count_pruning_reserves_a_slot_when_the_active_file_does_not_exist_yet() {
+        let tmp = tempdir().expect("tempdir");
+        let oldest = dated_file(tmp.path(), "bamboo.2026-08-01.log", 1);
+        let newer = dated_file(tmp.path(), "bamboo.2026-08-02.log", 1);
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_files = 2;
+
+        let deleted = prune_logs_at_startup(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            u64::MAX,
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 1);
+        assert!(!oldest.exists());
+        assert!(newer.exists());
+    }
+
+    #[test]
+    fn zero_max_files_disables_count_pruning_but_not_byte_pruning() {
+        let tmp = tempdir().expect("tempdir");
+        let oldest = dated_file(tmp.path(), "bamboo.2026-08-01.log", 4);
+        let newer = dated_file(tmp.path(), "bamboo.2026-08-02.log", 4);
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_files = 0;
+
+        let count_only = prune_logs_at_startup(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            u64::MAX,
+        )
+        .expect("count pruning disabled");
+        assert_eq!(count_only, 0);
+        assert!(oldest.exists() && newer.exists());
+
+        let byte_limited = prune_logs_at_startup(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            4,
+        )
+        .expect("byte pruning remains active");
+        assert_eq!(byte_limited, 1);
+        assert!(!oldest.exists());
+        assert!(newer.exists());
+    }
+
+    #[test]
+    fn count_and_byte_limits_are_enforced_together_oldest_first() {
+        let tmp = tempdir().expect("tempdir");
+        let oldest = dated_file(tmp.path(), "bamboo.2026-08-01.log", 4);
+        let middle = dated_file(tmp.path(), "bamboo.2026-08-02.log", 4);
+        let newest = dated_file(tmp.path(), "bamboo.2026-08-03.log", 4);
+        let active = dated_file(tmp.path(), "bamboo.2026-08-07.log", 4);
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_files = 3;
+
+        let deleted = prune_logs_at_startup(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            8,
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 2);
+        assert!(!oldest.exists());
+        assert!(!middle.exists());
+        assert!(newest.exists());
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn startup_pruning_never_removes_future_dated_files() {
+        let tmp = tempdir().expect("tempdir");
+        let historical = dated_file(tmp.path(), "bamboo.2026-08-01.log", 4);
+        let future = dated_file(tmp.path(), "bamboo.2026-08-08.log", 4);
+        let mut opts = LogOptions::new(tmp.path());
+        opts.max_files = 1;
+
+        let deleted = prune_logs_at_startup(
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 8, 7).expect("valid date"),
+            0,
+        )
+        .expect("prune succeeds");
+
+        assert_eq!(deleted, 1);
+        assert!(!historical.exists());
+        assert!(future.exists());
     }
 
     #[test]
@@ -689,9 +945,7 @@ mod tests {
             dir: dir.clone(),
             file_name_prefix: "unit-test".to_string(),
             max_files: 5,
-            max_total_bytes: DEFAULT_MAX_LOG_BYTES,
             default_level: "info".to_string(),
-            file_default_level: "info".to_string(),
         };
 
         let appender = build_appender(&opts).expect("appender builds");
@@ -737,9 +991,7 @@ mod tests {
             dir: dir.clone(),
             file_name_prefix: "idem".to_string(),
             max_files: 2,
-            max_total_bytes: DEFAULT_MAX_LOG_BYTES,
             default_level: "info".to_string(),
-            file_default_level: "info".to_string(),
         };
 
         init_logging_with_options(opts.clone());

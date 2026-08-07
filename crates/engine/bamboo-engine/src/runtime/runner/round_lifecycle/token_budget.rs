@@ -204,25 +204,13 @@ async fn resolve_configured_model_limit(
 ) -> Option<ModelLimit> {
     let mut dedicated_registry = ModelLimitsRegistry::with_config_path(model_limits_path);
     if let Err(error) = dedicated_registry.load_user_config().await {
-        let error_fingerprint = error.to_string();
-        let key = ("model-limits-file", model_limits_path);
-        if STATIC_WARNINGS.insert_if_new(&key, &error_fingerprint) {
-            tracing::warn!(
-                model = model_name,
-                purpose,
-                error = %error,
-                path = ?model_limits_path,
-                "Failed to load model_limits.json; checking legacy configured limits"
-            );
-        } else {
-            tracing::debug!(
-                model = model_name,
-                purpose,
-                error = %error,
-                path = ?model_limits_path,
-                "Failed to load model_limits.json; checking legacy configured limits"
-            );
-        }
+        tracing::warn!(
+            model = model_name,
+            purpose,
+            error = %error,
+            path = ?model_limits_path,
+            "Failed to load model_limits.json; checking legacy configured limits"
+        );
     } else if let Some(limit) = dedicated_registry.get(model_name) {
         return Some(limit);
     }
@@ -309,14 +297,39 @@ async fn resolve_provider_runtime_limit(
 mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use futures::{stream, Stream};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
 
     use super::*;
     use bamboo_agent_core::{tools::ToolSchema, Message};
     use bamboo_llm::provider::{LLMError, ProviderModelInfo, Result};
     use bamboo_llm::types::LLMChunk;
+
+    #[derive(Clone)]
+    struct TokenBudgetLevelCollector(Arc<Mutex<Vec<Level>>>);
+
+    impl<S> Layer<S> for TokenBudgetLevelCollector
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if event
+                .metadata()
+                .target()
+                .ends_with("round_lifecycle::token_budget")
+            {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(*event.metadata().level());
+            }
+        }
+    }
 
     #[test]
     fn apply_legacy_model_limits_adds_parsed_limits_to_registry() {
@@ -343,6 +356,38 @@ mod tests {
         let bad = serde_json::json!({ "not": "an array" });
         apply_legacy_model_limits(&mut registry, Some(&bad));
         assert!(registry.get("legacy-model").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_limits_io_failure_warns_on_every_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model_limits.json");
+        tokio::fs::create_dir(&path)
+            .await
+            .expect("directory forces a read error");
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(TokenBudgetLevelCollector(levels.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let config = AgentLoopConfig::default();
+
+        for _ in 0..2 {
+            assert!(resolve_configured_model_limit(
+                &config,
+                "dynamic-io-error-model",
+                &path,
+                "chat",
+            )
+            .await
+            .is_none());
+        }
+
+        assert_eq!(
+            *levels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            [Level::WARN, Level::WARN]
+        );
     }
 
     // Issue #20 bug 1: `resolve_token_budget` must publish the resolved budget so
