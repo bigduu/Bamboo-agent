@@ -69,7 +69,8 @@ pub struct LogOptions {
     /// Directory the log files are written to (created if missing).
     pub dir: PathBuf,
     /// Filename prefix; the date and a `.log` suffix are appended by the appender
-    /// (e.g. `bamboo.2026-05-31.log`). Lets co-located apps keep separate files.
+    /// (e.g. `bamboo.2026-05-31.log`). An empty prefix produces
+    /// `2026-05-31.log`. Lets co-located apps keep separate files.
     pub file_name_prefix: String,
     /// Maximum number of strictly matching dated files to keep at startup.
     /// A value of zero disables count pruning; byte-budget pruning remains active.
@@ -334,10 +335,12 @@ fn total_log_bytes(files: &[DatedLogFile]) -> u64 {
 }
 
 fn dated_log_name(prefix: &str, name: &str) -> Option<NaiveDate> {
-    let date = name
-        .strip_prefix(prefix)?
-        .strip_prefix('.')?
-        .strip_suffix(".log")?;
+    let stem = name.strip_suffix(".log")?;
+    let date = if prefix.is_empty() {
+        stem
+    } else {
+        stem.strip_prefix(prefix)?.strip_prefix('.')?
+    };
     if date.len() != "YYYY-MM-DD".len() {
         return None;
     }
@@ -406,6 +409,12 @@ fn filter_directives(default_level: &str, explicit: Option<&str>) -> String {
 
 fn make_filter(default_level: &str, explicit: Option<&str>) -> EnvFilter {
     let defaults = filter_directives(default_level, None);
+    if let Some(explicit) = explicit.filter(|value| value.trim().is_empty()) {
+        // Preserve EnvFilter's raw environment semantics. An exactly empty
+        // string parses successfully to an OFF filter, while whitespace-only
+        // input is invalid and therefore falls back to this sink's defaults.
+        return EnvFilter::try_new(explicit).unwrap_or_else(|_| EnvFilter::new(defaults));
+    }
     EnvFilter::try_new(filter_directives(default_level, explicit))
         .unwrap_or_else(|_| EnvFilter::new(defaults))
 }
@@ -616,6 +625,42 @@ mod tests {
     }
 
     #[test]
+    fn exactly_empty_explicit_filter_is_off_while_none_uses_sink_defaults() {
+        let raw_empty = EnvFilter::try_new("").expect("raw empty filter parses");
+        let composed_empty = make_filter("info", Some(""));
+        assert_eq!(composed_empty.to_string(), raw_empty.to_string());
+
+        let empty_events = Arc::new(AtomicUsize::new(0));
+        let empty_subscriber = tracing_subscriber::registry()
+            .with(EventCounter(empty_events.clone()).with_filter(composed_empty));
+        tracing::subscriber::with_default(empty_subscriber, || {
+            tracing::error!(target: "bamboo_empty_filter_test", "root stays off");
+            tracing::error!(target: "h2", "noise target stays off");
+        });
+        assert_eq!(empty_events.load(Ordering::Relaxed), 0);
+
+        let default_events = Arc::new(AtomicUsize::new(0));
+        let default_subscriber = tracing_subscriber::registry()
+            .with(EventCounter(default_events.clone()).with_filter(make_filter("info", None)));
+        tracing::subscriber::with_default(default_subscriber, || {
+            tracing::info!(target: "bamboo_empty_filter_test", "root default");
+            tracing::warn!(target: "h2", "noise default");
+        });
+        assert_eq!(default_events.load(Ordering::Relaxed), 2);
+
+        let whitespace = " \t ";
+        assert!(
+            EnvFilter::try_new(whitespace).is_err(),
+            "raw whitespace-only input is invalid in tracing-subscriber 0.3.23"
+        );
+        assert_eq!(
+            make_filter("info", Some(whitespace)).to_string(),
+            make_filter("info", None).to_string(),
+            "invalid raw whitespace retains the existing sink-default fallback"
+        );
+    }
+
+    #[test]
     fn explicit_root_directive_raises_the_file_filter() {
         let file_events = Arc::new(AtomicUsize::new(0));
         let subscriber = tracing_subscriber::registry().with(
@@ -692,6 +737,23 @@ mod tests {
             "bamboo.latest.log",
         ] {
             assert_eq!(dated_log_name("bamboo", unrelated), None, "{unrelated}");
+        }
+    }
+
+    #[test]
+    fn dated_log_name_supports_an_empty_prefix_without_matching_lookalikes() {
+        assert_eq!(
+            dated_log_name("", "2026-08-07.log"),
+            NaiveDate::from_ymd_opt(2026, 8, 7)
+        );
+        for unrelated in [
+            ".2026-08-07.log",
+            "bamboo.2026-08-07.log",
+            "2026-8-7.log",
+            "2026-08-07.log.bak",
+            "not-a-date.log",
+        ] {
+            assert_eq!(dated_log_name("", unrelated), None, "{unrelated}");
         }
     }
 
@@ -800,6 +862,41 @@ mod tests {
         drop(appender);
 
         assert!(lookalikes.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn empty_prefix_appender_and_pruner_share_the_strict_filename_contract() {
+        let tmp = tempdir().expect("tempdir");
+        let historical = dated_file(tmp.path(), "2000-01-01.log", 1);
+        let lookalikes = [
+            dated_file(tmp.path(), ".2000-01-01.log", 1),
+            dated_file(tmp.path(), "bamboo.2000-01-01.log", 1),
+            dated_file(tmp.path(), "2000-1-1.log", 1),
+            dated_file(tmp.path(), "2000-01-01.log.bak", 1),
+            dated_file(tmp.path(), "not-a-date.log", 1),
+        ];
+        let mut opts = LogOptions::new(tmp.path());
+        opts.file_name_prefix.clear();
+        opts.max_files = 1;
+
+        let appender = build_appender(&opts).expect("empty-prefix appender builds");
+        assert!(!historical.exists(), "strict historical file was pruned");
+        assert!(lookalikes.iter().all(|path| path.exists()));
+
+        {
+            let mut writer = appender.make_writer();
+            writeln!(writer, "empty-prefix-current-log").expect("write current log");
+            writer.flush().expect("flush current log");
+        }
+        drop(appender);
+
+        let canonical_logs: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read log directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| dated_log_name("", name).is_some())
+            .collect();
+        assert_eq!(canonical_logs.len(), 1, "{canonical_logs:?}");
     }
 
     #[test]

@@ -204,13 +204,35 @@ async fn resolve_configured_model_limit(
 ) -> Option<ModelLimit> {
     let mut dedicated_registry = ModelLimitsRegistry::with_config_path(model_limits_path);
     if let Err(error) = dedicated_registry.load_user_config().await {
-        tracing::warn!(
-            model = model_name,
-            purpose,
-            error = %error,
-            path = ?model_limits_path,
-            "Failed to load model_limits.json; checking legacy configured limits"
-        );
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            let error_fingerprint = error.to_string();
+            let key = ("invalid-model-limits-file", model_limits_path);
+            if STATIC_WARNINGS.insert_if_new(&key, &error_fingerprint) {
+                tracing::warn!(
+                    model = model_name,
+                    purpose,
+                    error = %error,
+                    path = ?model_limits_path,
+                    "Failed to load model_limits.json; checking legacy configured limits"
+                );
+            } else {
+                tracing::debug!(
+                    model = model_name,
+                    purpose,
+                    error = %error,
+                    path = ?model_limits_path,
+                    "Failed to load model_limits.json; checking legacy configured limits"
+                );
+            }
+        } else {
+            tracing::warn!(
+                model = model_name,
+                purpose,
+                error = %error,
+                path = ?model_limits_path,
+                "Failed to load model_limits.json; checking legacy configured limits"
+            );
+        }
     } else if let Some(limit) = dedicated_registry.get(model_name) {
         return Some(limit);
     }
@@ -387,6 +409,38 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             [Level::WARN, Level::WARN]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_model_limits_warns_once_then_downgrades_to_debug() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("malformed-model-limits.json");
+        tokio::fs::write(&path, b"{not valid json")
+            .await
+            .expect("write malformed fixture");
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(TokenBudgetLevelCollector(levels.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let config = AgentLoopConfig::default();
+
+        for _ in 0..2 {
+            assert!(resolve_configured_model_limit(
+                &config,
+                "stable-invalid-data-model",
+                &path,
+                "chat",
+            )
+            .await
+            .is_none());
+        }
+
+        assert_eq!(
+            *levels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            [Level::WARN, Level::DEBUG]
         );
     }
 
