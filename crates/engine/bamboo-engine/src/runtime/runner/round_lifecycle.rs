@@ -27,7 +27,46 @@ pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    pub round_usage: MetricsTokenUsage,
+    /// Canonical usage for this single billed provider attempt.
+    pub attempt_usage: MetricsTokenUsage,
+    /// Validation that can only run after a provider stream has completed.
+    ///
+    /// The pipeline must absorb `attempt_usage` before surfacing this error so
+    /// a billed response is not turned into a zero-usage terminal round.
+    pub terminal_validation_error: Option<AgentError>,
+}
+
+/// Resolve one billed attempt's canonical token usage.
+///
+/// Availability is decided independently for prompt and completion tokens:
+/// an authoritative provider snapshot wins (including an explicit zero), a
+/// non-zero legacy provider counter is the compatibility fallback, and the
+/// local tokenizer estimate is used only when that component was not reported.
+/// The total is always recomputed from the selected components so runtime
+/// budgets and durable metrics cannot disagree with an inconsistent provider
+/// `total_tokens` field.
+pub(crate) fn canonical_attempt_usage(
+    stream_output: &StreamHandlingOutput,
+    estimated_prompt_tokens: u64,
+    estimated_completion_tokens: u64,
+) -> MetricsTokenUsage {
+    let prompt_tokens = stream_output
+        .provider_usage
+        .and_then(|usage| usage.input_tokens)
+        .or_else(|| (stream_output.input_tokens > 0).then_some(stream_output.input_tokens))
+        .unwrap_or(estimated_prompt_tokens);
+    let completion_tokens = stream_output
+        .provider_usage
+        .and_then(|usage| usage.output_tokens)
+        .or_else(|| (stream_output.output_tokens > 0).then_some(stream_output.output_tokens))
+        .unwrap_or(estimated_completion_tokens);
+
+    MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+    .clamped_for_durable_metrics()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,35 +119,36 @@ pub(crate) async fn execute_llm_round(
     )
     .await?;
 
-    if stream_output.tool_calls.is_empty() && stream_output.content.trim().is_empty() {
-        return Err(AgentError::EmptyAssistantResponse {
-            response_id: stream_output.response_id.clone(),
-        });
-    }
+    // This is a terminal validation error, but the completed stream was still
+    // billed. Return it alongside the canonical attempt usage so the runner can
+    // account for the attempt before ending the round.
+    let terminal_validation_error = (stream_output.tool_calls.is_empty()
+        && stream_output.content.trim().is_empty())
+    .then(|| AgentError::EmptyAssistantResponse {
+        response_id: stream_output.response_id.clone(),
+    });
 
     let prompt_tokens = estimate_prompt_tokens(&prepared.prepared_context.messages);
     let completion_tokens =
         estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
-    let round_usage = MetricsTokenUsage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens.saturating_add(completion_tokens),
-    };
+    let attempt_usage = canonical_attempt_usage(&stream_output, prompt_tokens, completion_tokens);
 
     tracing::debug!(
-        "[{}] LLM response completed in {}ms, answer_chars={}, reasoning_chars={}, {} estimated tokens",
+        "[{}] LLM response completed in {}ms, answer_chars={}, reasoning_chars={}, estimated_tokens={}, canonical_tokens={}",
         session_id,
         llm_duration,
         stream_output.token_count,
         stream_output.reasoning_content.len(),
-        round_usage.total_tokens
+        prompt_tokens.saturating_add(completion_tokens),
+        attempt_usage.total_tokens,
     );
 
     Ok(RoundLlmExecutionOutput {
         stream_output,
         prompt_tokens,
         completion_tokens,
-        round_usage,
+        attempt_usage,
+        terminal_validation_error,
     })
 }
 

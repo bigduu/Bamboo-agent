@@ -1065,12 +1065,14 @@ impl MetricsStorage for SqliteMetricsStorage {
         let completed_at_str = format_timestamp(completed_at);
 
         self.with_connection(move |connection| {
-            refresh_session_aggregates(connection, &session_id, completed_at)?;
-            connection.execute(
-                "UPDATE session_metrics SET status = ?1, completed_at = ?2, updated_at = ?2 WHERE session_id = ?3",
-                params![status.as_str(), completed_at_str, session_id],
-            )?;
-            Ok(())
+            with_immediate_transaction(connection, || {
+                refresh_session_aggregates(connection, &session_id, completed_at)?;
+                connection.execute(
+                    "UPDATE session_metrics SET status = ?1, completed_at = ?2, updated_at = ?2 WHERE session_id = ?3",
+                    params![status.as_str(), completed_at_str, session_id],
+                )?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1088,17 +1090,19 @@ impl MetricsStorage for SqliteMetricsStorage {
         let started_at_str = format_timestamp(started_at);
 
         self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO round_metrics (
-                    round_id, session_id, model, started_at, status
-                ) VALUES (?1, ?2, ?3, ?4, 'running')
-                ON CONFLICT(round_id) DO NOTHING
-                "#,
-                params![round_id, session_id, model, started_at_str],
-            )?;
-            refresh_session_aggregates(connection, &session_id, started_at)?;
-            Ok(())
+            with_immediate_transaction(connection, || {
+                connection.execute(
+                    r#"
+                    INSERT INTO round_metrics (
+                        round_id, session_id, model, started_at, status
+                    ) VALUES (?1, ?2, ?3, ?4, 'running')
+                    ON CONFLICT(round_id) DO NOTHING
+                    "#,
+                    params![round_id, session_id, model, started_at_str],
+                )?;
+                refresh_session_aggregates(connection, &session_id, started_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1115,44 +1119,55 @@ impl MetricsStorage for SqliteMetricsStorage {
     ) -> MetricsResult<()> {
         let round_id = round_id.to_string();
         let completed_at_str = format_timestamp(completed_at);
+        // SQLite INTEGER is signed 64-bit. Normalize before conversion so
+        // extreme provider values saturate instead of wrapping negative.
+        let usage = usage.clamped_for_durable_metrics();
+        let prompt_tokens = durable_token_to_i64(usage.prompt_tokens);
+        let completion_tokens = durable_token_to_i64(usage.completion_tokens);
+        let total_tokens = durable_token_to_i64(usage.total_tokens);
 
         self.with_connection(move |connection| {
-            let session_id: String = connection.query_row(
-                "SELECT session_id FROM round_metrics WHERE round_id = ?1",
-                params![round_id],
-                |row| row.get(0),
-            )?;
+            with_immediate_transaction(connection, || {
+                #[cfg(test)]
+                signal_complete_round_transaction_entered(&round_id);
 
-            connection.execute(
-                r#"
-                UPDATE round_metrics
-                SET completed_at = ?1,
-                    status = ?2,
-                    prompt_tokens = ?3,
-                    completion_tokens = ?4,
-                    total_tokens = ?5,
-                    prompt_cached_tool_outputs = ?6,
-                    prompt_cached_tool_tokens_saved = COALESCE(prompt_cached_tool_tokens_saved, 0) + ?7,
-                    tokens_saved = COALESCE(tokens_saved, 0) + ?8,
-                    error = ?9
-                WHERE round_id = ?10
-                "#,
-                params![
-                    completed_at_str,
-                    status.as_str(),
-                    usage.prompt_tokens as i64,
-                    usage.completion_tokens as i64,
-                    usage.total_tokens as i64,
-                    i64::from(prompt_cached_tool_outputs),
-                    i64::from(prompt_cached_tool_tokens_saved),
-                    i64::from(prompt_cached_tool_tokens_saved),
-                    error,
-                    round_id,
-                ],
-            )?;
+                let session_id: String = connection.query_row(
+                    "SELECT session_id FROM round_metrics WHERE round_id = ?1",
+                    params![round_id],
+                    |row| row.get(0),
+                )?;
 
-            refresh_session_aggregates(connection, &session_id, completed_at)?;
-            Ok(())
+                connection.execute(
+                    r#"
+                    UPDATE round_metrics
+                    SET completed_at = ?1,
+                        status = ?2,
+                        prompt_tokens = ?3,
+                        completion_tokens = ?4,
+                        total_tokens = ?5,
+                        prompt_cached_tool_outputs = ?6,
+                        prompt_cached_tool_tokens_saved = COALESCE(prompt_cached_tool_tokens_saved, 0) + ?7,
+                        tokens_saved = COALESCE(tokens_saved, 0) + ?8,
+                        error = ?9
+                    WHERE round_id = ?10
+                    "#,
+                    params![
+                        completed_at_str,
+                        status.as_str(),
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        i64::from(prompt_cached_tool_outputs),
+                        i64::from(prompt_cached_tool_tokens_saved),
+                        i64::from(prompt_cached_tool_tokens_saved),
+                        error,
+                        round_id,
+                    ],
+                )?;
+
+                refresh_session_aggregates(connection, &session_id, completed_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1166,24 +1181,26 @@ impl MetricsStorage for SqliteMetricsStorage {
         let round_id = round_id.to_string();
 
         self.with_connection(move |connection| {
-            let session_id: String = connection.query_row(
-                "SELECT session_id FROM round_metrics WHERE round_id = ?1",
-                params![round_id],
-                |row| row.get(0),
-            )?;
+            with_immediate_transaction(connection, || {
+                let session_id: String = connection.query_row(
+                    "SELECT session_id FROM round_metrics WHERE round_id = ?1",
+                    params![round_id],
+                    |row| row.get(0),
+                )?;
 
-            connection.execute(
-                r#"
-                UPDATE round_metrics
-                SET compression_count = COALESCE(compression_count, 0) + 1,
-                    tokens_saved = COALESCE(tokens_saved, 0) + ?1
-                WHERE round_id = ?2
-                "#,
-                params![i64::from(tokens_saved), round_id],
-            )?;
+                connection.execute(
+                    r#"
+                    UPDATE round_metrics
+                    SET compression_count = COALESCE(compression_count, 0) + 1,
+                        tokens_saved = COALESCE(tokens_saved, 0) + ?1
+                    WHERE round_id = ?2
+                    "#,
+                    params![i64::from(tokens_saved), round_id],
+                )?;
 
-            refresh_session_aggregates(connection, &session_id, compressed_at)?;
-            Ok(())
+                refresh_session_aggregates(connection, &session_id, compressed_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1238,19 +1255,21 @@ impl MetricsStorage for SqliteMetricsStorage {
         let error = completion.error;
 
         self.with_connection(move |connection| {
-            let session_id: String = connection.query_row(
-                "SELECT session_id FROM tool_call_metrics WHERE tool_call_id = ?1",
-                params![tool_call_id],
-                |row| row.get(0),
-            )?;
+            with_immediate_transaction(connection, || {
+                let session_id: String = connection.query_row(
+                    "SELECT session_id FROM tool_call_metrics WHERE tool_call_id = ?1",
+                    params![tool_call_id],
+                    |row| row.get(0),
+                )?;
 
-            connection.execute(
-                "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 WHERE tool_call_id = ?4",
-                params![completed_at, success, error, tool_call_id],
-            )?;
+                connection.execute(
+                    "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 WHERE tool_call_id = ?4",
+                    params![completed_at, success, error, tool_call_id],
+                )?;
 
-            refresh_session_aggregates(connection, &session_id, completion.completed_at)?;
-            Ok(())
+                refresh_session_aggregates(connection, &session_id, completion.completed_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -2023,8 +2042,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             // SELECT and the DELETE (backfill/replay/clock skew) would be deleted
             // yet miss re-aggregation, leaving session_metrics overcounting. Wrap
             // the whole select→delete→refresh in a single IMMEDIATE transaction.
-            connection.execute_batch("BEGIN IMMEDIATE")?;
-            let outcome = (|| -> MetricsResult<u64> {
+            with_immediate_transaction(connection, || {
                 // Only sessions that actually lose rounds need re-aggregation
                 // (was nine correlated subqueries × ALL sessions per pass).
                 let affected_sessions: Vec<String> = {
@@ -2047,18 +2065,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                 }
 
                 Ok(deleted as u64)
-            })();
-
-            match outcome {
-                Ok(deleted) => {
-                    connection.execute_batch("COMMIT")?;
-                    Ok(deleted)
-                }
-                Err(error) => {
-                    let _ = connection.execute_batch("ROLLBACK");
-                    Err(error)
-                }
-            }
+            })
         })
         .await
     }
@@ -2072,47 +2079,52 @@ impl MetricsStorage for SqliteMetricsStorage {
         let awaiting_response_session_ids = awaiting_response_session_ids.to_vec();
 
         self.with_connection(move |connection| {
-            let reconciled_at = Utc::now();
-            let reconciled_at_str = format_timestamp(reconciled_at);
+            with_immediate_transaction(connection, || {
+                let reconciled_at = Utc::now();
+                let reconciled_at_str = format_timestamp(reconciled_at);
 
-            let mut stmt = connection.prepare(
-                "SELECT session_id FROM session_metrics WHERE status = 'running'",
-            )?;
-            let running_session_ids: Vec<String> = stmt
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<String>, _>>()?;
-
-            for session_id in running_session_ids {
-                if active_session_ids.iter().any(|id| id == &session_id) {
-                    continue;
-                }
-
-                let status = if awaiting_response_session_ids
-                    .iter()
-                    .any(|id| id == &session_id)
-                {
-                    SessionStatus::AwaitingResponse
-                } else {
-                    SessionStatus::Completed
+                let running_session_ids: Vec<String> = {
+                    let mut stmt = connection.prepare(
+                        "SELECT session_id FROM session_metrics WHERE status = 'running'",
+                    )?;
+                    let ids = stmt
+                        .query_map([], |row| row.get(0))?
+                        .collect::<Result<Vec<String>, _>>()?;
+                    ids
                 };
 
+                for session_id in running_session_ids {
+                    if active_session_ids.iter().any(|id| id == &session_id) {
+                        continue;
+                    }
+
+                    let status = if awaiting_response_session_ids
+                        .iter()
+                        .any(|id| id == &session_id)
+                    {
+                        SessionStatus::AwaitingResponse
+                    } else {
+                        SessionStatus::Completed
+                    };
+
+                    connection.execute(
+                        "UPDATE session_metrics SET status = ?1, completed_at = COALESCE(completed_at, ?2), updated_at = ?2 WHERE session_id = ?3",
+                        params![status.as_str(), reconciled_at_str, session_id],
+                    )?;
+                    refresh_session_aggregates(connection, &session_id, reconciled_at)?;
+                }
+
                 connection.execute(
-                    "UPDATE session_metrics SET status = ?1, completed_at = COALESCE(completed_at, ?2), updated_at = ?2 WHERE session_id = ?3",
-                    params![status.as_str(), reconciled_at_str, session_id],
+                    "UPDATE round_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_round') WHERE status = 'running'",
+                    params![reconciled_at_str],
                 )?;
-                refresh_session_aggregates(connection, &session_id, reconciled_at)?;
-            }
+                connection.execute(
+                    "UPDATE forward_request_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_forward'), updated_at = ?1 WHERE status = 'pending' AND completed_at IS NULL",
+                    params![reconciled_at_str],
+                )?;
 
-            connection.execute(
-                "UPDATE round_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_round') WHERE status = 'running'",
-                params![reconciled_at_str],
-            )?;
-            connection.execute(
-                "UPDATE forward_request_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_forward'), updated_at = ?1 WHERE status = 'pending' AND completed_at IS NULL",
-                params![reconciled_at_str],
-            )?;
-
-            Ok(())
+                Ok(())
+            })
         })
         .await
     }
@@ -2403,6 +2415,141 @@ fn ensure_nullable_integer_column(
     Ok(())
 }
 
+#[cfg(test)]
+struct SessionTokenFoldPause {
+    session_id: String,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static SESSION_TOKEN_FOLD_PAUSE: std::sync::OnceLock<
+    std::sync::Mutex<Option<SessionTokenFoldPause>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_session_token_fold_pause(
+    session_id: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut slot = SESSION_TOKEN_FOLD_PAUSE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("session token fold test hook lock");
+    assert!(slot.is_none(), "session token fold test hook already set");
+    *slot = Some(SessionTokenFoldPause {
+        session_id: session_id.to_string(),
+        entered: entered_tx,
+        release: release_rx,
+    });
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn pause_after_session_token_fold(session_id: &str) {
+    let pause = {
+        let mut slot = SESSION_TOKEN_FOLD_PAUSE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("session token fold test hook lock");
+        if slot
+            .as_ref()
+            .is_some_and(|pause| pause.session_id == session_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.recv();
+    }
+}
+
+#[cfg(test)]
+struct CompleteRoundTransactionEnteredHook {
+    round_id: String,
+    entered: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+static COMPLETE_ROUND_TRANSACTION_ENTERED_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<CompleteRoundTransactionEnteredHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_complete_round_transaction_entered_hook(
+    round_id: &str,
+) -> std::sync::mpsc::Receiver<()> {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let mut slot = COMPLETE_ROUND_TRANSACTION_ENTERED_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("complete round transaction test hook lock");
+    assert!(
+        slot.is_none(),
+        "complete round transaction test hook already set"
+    );
+    *slot = Some(CompleteRoundTransactionEnteredHook {
+        round_id: round_id.to_string(),
+        entered: entered_tx,
+    });
+    entered_rx
+}
+
+#[cfg(test)]
+fn signal_complete_round_transaction_entered(round_id: &str) {
+    let hook = {
+        let mut slot = COMPLETE_ROUND_TRANSACTION_ENTERED_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("complete round transaction test hook lock");
+        if slot.as_ref().is_some_and(|hook| hook.round_id == round_id) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(hook) = hook {
+        let _ = hook.entered.send(());
+    }
+}
+
+/// Runs a metrics mutation under the SQLite write lock unless the caller
+/// already owns a transaction.
+///
+/// Aggregate refreshes read child rows and then update their cached parent
+/// row. `BEGIN IMMEDIATE` serializes that read-modify-write sequence across
+/// independent connections, while the autocommit check lets larger operations
+/// such as pruning reuse their existing transaction.
+fn with_immediate_transaction<T>(
+    connection: &Connection,
+    operation: impl FnOnce() -> MetricsResult<T>,
+) -> MetricsResult<T> {
+    if !connection.is_autocommit() {
+        return operation();
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    match operation() {
+        Ok(value) => match connection.execute_batch("COMMIT") {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            }
+        },
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Refreshes aggregated metrics for a session by recalculating from child entities.
 ///
 /// This function updates the session's aggregate columns by summing values
@@ -2435,26 +2582,83 @@ fn refresh_session_aggregates(
     session_id: &str,
     updated_at: DateTime<Utc>,
 ) -> MetricsResult<()> {
+    with_immediate_transaction(connection, || {
+        refresh_session_aggregates_in_transaction(connection, session_id, updated_at)
+    })
+}
+
+fn refresh_session_aggregates_in_transaction(
+    connection: &Connection,
+    session_id: &str,
+    updated_at: DateTime<Utc>,
+) -> MetricsResult<()> {
+    // Do not use SQLite SUM for token counters: summing otherwise-valid i64
+    // round rows can overflow before an outer MIN/CASE can clamp it. Fold in
+    // Rust with the same signed-64 saturation policy used by the runtime.
+    let token_usage = load_session_token_aggregate(connection, session_id)?;
+    #[cfg(test)]
+    pause_after_session_token_fold(session_id);
     let updated_at = format_timestamp(updated_at);
     connection.execute(
         r#"
         UPDATE session_metrics
         SET
             total_rounds = COALESCE((SELECT COUNT(*) FROM round_metrics WHERE session_id = ?1), 0),
-            prompt_tokens = COALESCE((SELECT SUM(prompt_tokens) FROM round_metrics WHERE session_id = ?1), 0),
-            completion_tokens = COALESCE((SELECT SUM(completion_tokens) FROM round_metrics WHERE session_id = ?1), 0),
-            total_tokens = COALESCE((SELECT SUM(total_tokens) FROM round_metrics WHERE session_id = ?1), 0),
+            prompt_tokens = ?2,
+            completion_tokens = ?3,
+            total_tokens = ?4,
             prompt_cached_tool_outputs = COALESCE((SELECT SUM(prompt_cached_tool_outputs) FROM round_metrics WHERE session_id = ?1), 0),
             prompt_cached_tool_tokens_saved = COALESCE((SELECT SUM(prompt_cached_tool_tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
             total_compression_events = COALESCE((SELECT SUM(compression_count) FROM round_metrics WHERE session_id = ?1), 0),
             total_tokens_saved = COALESCE((SELECT SUM(tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
             tool_call_count = COALESCE((SELECT COUNT(*) FROM tool_call_metrics WHERE session_id = ?1), 0),
-            updated_at = ?2
+            updated_at = ?5
         WHERE session_id = ?1
         "#,
-        params![session_id, updated_at],
+        params![
+            session_id,
+            durable_token_to_i64(token_usage.prompt_tokens),
+            durable_token_to_i64(token_usage.completion_tokens),
+            durable_token_to_i64(token_usage.total_tokens),
+            updated_at,
+        ],
     )?;
     Ok(())
+}
+
+fn durable_token_to_i64(value: u64) -> i64 {
+    i64::try_from(value.min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT))
+        .expect("durable token count is clamped to i64::MAX")
+}
+
+fn durable_token_from_i64(column: &str, value: i64) -> MetricsResult<u64> {
+    u64::try_from(value).map_err(|_| {
+        MetricsError::InvalidData(format!(
+            "negative durable token counter in {column}: {value}"
+        ))
+    })
+}
+
+fn load_session_token_aggregate(
+    connection: &Connection,
+    session_id: &str,
+) -> MetricsResult<TokenUsage> {
+    let mut stmt = connection.prepare(
+        "SELECT prompt_tokens, completion_tokens, total_tokens FROM round_metrics WHERE session_id = ?1",
+    )?;
+    let mut rows = stmt.query(params![session_id])?;
+    let mut aggregate = TokenUsage::default();
+    while let Some(row) = rows.next()? {
+        let prompt = durable_token_from_i64("round_metrics.prompt_tokens", row.get(0)?)?;
+        let completion = durable_token_from_i64("round_metrics.completion_tokens", row.get(1)?)?;
+        let total = durable_token_from_i64("round_metrics.total_tokens", row.get(2)?)?;
+        aggregate.add_assign_durable(TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+        });
+    }
+    Ok(aggregate)
 }
 
 /// Loads tool call breakdown (tool_name -> count) for a session.
@@ -2811,6 +3015,273 @@ mod tests {
         assert_eq!(detail.session.prompt_cached_tool_outputs, 3);
         assert_eq!(detail.rounds.len(), 1);
         assert_eq!(detail.rounds[0].prompt_cached_tool_outputs, 3);
+    }
+
+    #[tokio::test]
+    async fn durable_round_write_and_session_sum_saturate_at_signed_storage_boundary() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+        let now = Utc::now();
+
+        storage
+            .upsert_session_start("overflow-session", "model", now)
+            .await
+            .expect("session start");
+        storage
+            .insert_round_start("overflow-r1", "overflow-session", "model", now)
+            .await
+            .expect("round 1 start");
+        storage
+            .complete_round(
+                "overflow-r1",
+                now,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: u64::MAX,
+                    completion_tokens: 3,
+                    total_tokens: 1,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("round 1 clamps instead of wrapping");
+        storage
+            .insert_round_start("overflow-r2", "overflow-session", "model", now)
+            .await
+            .expect("round 2 start");
+        storage
+            .complete_round(
+                "overflow-r2",
+                now,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 7,
+                    completion_tokens: 11,
+                    total_tokens: 18,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("session aggregate saturates instead of SQL SUM overflow");
+
+        let detail = storage
+            .session_detail("overflow-session")
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        let max = bamboo_domain::MAX_DURABLE_TOKEN_COUNT;
+        assert_eq!(detail.rounds.len(), 2);
+        assert_eq!(
+            detail.rounds[0].token_usage,
+            TokenUsage {
+                prompt_tokens: max,
+                completion_tokens: 3,
+                total_tokens: max,
+            },
+            "u64 values clamp before the checked SQLite conversion"
+        );
+        assert_eq!(
+            detail.session.total_token_usage,
+            TokenUsage {
+                prompt_tokens: max,
+                completion_tokens: 14,
+                total_tokens: max,
+            },
+            "multi-row aggregation uses the same saturation policy without SQLite SUM overflow"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_round_completions_serialize_fold_and_session_update() {
+        let dir = tempdir().expect("temp dir");
+        let database_path = dir.path().join("metrics.db");
+        let storage_a = SqliteMetricsStorage::new(&database_path);
+        let storage_b = SqliteMetricsStorage::new(&database_path);
+        storage_a.init().await.expect("init storage");
+        let now = Utc::now();
+
+        storage_a
+            .upsert_session_start("concurrent-session", "model", now)
+            .await
+            .expect("session start");
+        storage_a
+            .insert_round_start("concurrent-r1", "concurrent-session", "model", now)
+            .await
+            .expect("round 1 start");
+        storage_a
+            .insert_round_start("concurrent-r2", "concurrent-session", "model", now)
+            .await
+            .expect("round 2 start");
+
+        // Hold the first writer after it has folded round rows but before it
+        // updates session_metrics. A second independent storage/connection must
+        // not enter its complete_round transaction until the first commits.
+        let (first_folded, release_first) =
+            super::install_session_token_fold_pause("concurrent-session");
+        let first_storage = storage_a.clone();
+        let first = tokio::spawn(async move {
+            first_storage
+                .complete_round(
+                    "concurrent-r1",
+                    now,
+                    RoundStatus::Success,
+                    TokenUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 1,
+                        total_tokens: 11,
+                    },
+                    0,
+                    0,
+                    None,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            first_folded.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .expect("wait for first fold task")
+        .expect("first completion reached aggregate fold");
+
+        let second_entered =
+            super::install_complete_round_transaction_entered_hook("concurrent-r2");
+        let second = tokio::spawn(async move {
+            storage_b
+                .complete_round(
+                    "concurrent-r2",
+                    now,
+                    RoundStatus::Success,
+                    TokenUsage {
+                        prompt_tokens: 20,
+                        completion_tokens: 2,
+                        total_tokens: 22,
+                    },
+                    0,
+                    0,
+                    None,
+                )
+                .await
+        });
+
+        let (entry_while_first_locked, second_entered) = tokio::task::spawn_blocking(move || {
+            let result = second_entered.recv_timeout(std::time::Duration::from_millis(250));
+            (result, second_entered)
+        })
+        .await
+        .expect("wait for second transaction attempt");
+        let was_serialized = matches!(
+            entry_while_first_locked,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_first.send(()).expect("release first completion");
+        first
+            .await
+            .expect("first completion task")
+            .expect("first completion");
+        second
+            .await
+            .expect("second completion task")
+            .expect("second completion");
+
+        if was_serialized {
+            tokio::task::spawn_blocking(move || {
+                second_entered.recv_timeout(std::time::Duration::from_secs(2))
+            })
+            .await
+            .expect("wait for serialized second transaction")
+            .expect("second transaction entered after first committed");
+        }
+        assert!(
+            was_serialized,
+            "a competing connection entered between aggregate fold and parent update"
+        );
+
+        let detail = storage_a
+            .session_detail("concurrent-session")
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        assert_eq!(
+            detail.session.total_token_usage,
+            TokenUsage {
+                prompt_tokens: 30,
+                completion_tokens: 3,
+                total_tokens: 33,
+            },
+            "the last session writer must include both completed rounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_round_rolls_back_child_update_when_aggregate_refresh_fails() {
+        let dir = tempdir().expect("temp dir");
+        let database_path = dir.path().join("metrics.db");
+        let storage = SqliteMetricsStorage::new(&database_path);
+        storage.init().await.expect("init storage");
+        let now = Utc::now();
+
+        storage
+            .upsert_session_start("rollback-session", "model", now)
+            .await
+            .expect("session start");
+        storage
+            .insert_round_start("rollback-target", "rollback-session", "model", now)
+            .await
+            .expect("target round start");
+        storage
+            .insert_round_start("rollback-corrupt", "rollback-session", "model", now)
+            .await
+            .expect("corrupt round start");
+
+        let connection = super::open_connection(&database_path).expect("open database");
+        connection
+            .execute(
+                "UPDATE round_metrics SET prompt_tokens = -1 WHERE round_id = 'rollback-corrupt'",
+                [],
+            )
+            .expect("inject invalid durable counter");
+        drop(connection);
+
+        let error = storage
+            .complete_round(
+                "rollback-target",
+                now,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 7,
+                    total_tokens: 12,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect_err("aggregate validation should fail");
+        assert!(
+            matches!(error, super::MetricsError::InvalidData(_)),
+            "unexpected completion error: {error}"
+        );
+
+        let connection = super::open_connection(&database_path).expect("reopen database");
+        let target: (String, Option<String>, i64, i64, i64) = connection
+            .query_row(
+                "SELECT status, completed_at, prompt_tokens, completion_tokens, total_tokens FROM round_metrics WHERE round_id = 'rollback-target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read rolled-back target round");
+        assert_eq!(
+            target,
+            (String::from("running"), None, 0, 0, 0),
+            "the round mutation must roll back with the failed parent refresh"
+        );
     }
 
     #[tokio::test]

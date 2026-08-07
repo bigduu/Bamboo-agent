@@ -47,6 +47,32 @@ use crate::runtime::runner::state_bridge;
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
 
+#[cfg(test)]
+const TEST_POST_LLM_RETRY_FAILURES_KEY: &str = "test.pipeline.post_llm_retry_failures";
+
+#[cfg(test)]
+fn take_test_post_llm_retry_failure(session: &mut Session) -> Option<AgentError> {
+    let remaining = session
+        .metadata
+        .get(TEST_POST_LLM_RETRY_FAILURES_KEY)?
+        .parse::<usize>()
+        .ok()?;
+    if remaining == 0 {
+        return None;
+    }
+    if remaining == 1 {
+        session.metadata.remove(TEST_POST_LLM_RETRY_FAILURES_KEY);
+    } else {
+        session.metadata.insert(
+            TEST_POST_LLM_RETRY_FAILURES_KEY.to_string(),
+            (remaining - 1).to_string(),
+        );
+    }
+    Some(AgentError::LLM(
+        "transient test-injected post-LLM handler failure".to_string(),
+    ))
+}
+
 // ---- Error classification (from rounds.rs) ----
 
 fn should_retry_turn_error(error: &AgentError) -> bool {
@@ -124,7 +150,7 @@ struct RunBudgetExceeded {
     actual: u64,
 }
 
-/// One round's ACTUAL (provider-reported) usage + activity, accumulated
+/// One round's canonical usage + activity, accumulated
 /// across the round's retry attempts for the per-run budget guardrails
 /// (issue #221).
 ///
@@ -149,13 +175,15 @@ impl RoundActivity {
     /// totals. Called once per successful `execute_llm_round` return, the
     /// moment `stream_output` becomes available — before it is consumed by
     /// `handle_no_tool_calls`/`handle_tool_calls_path`.
-    fn absorb_attempt(&mut self, stream_output: &StreamHandlingOutput) {
-        self.prompt_tokens = self
-            .prompt_tokens
-            .saturating_add(stream_output.prompt_tokens_for_runtime_budget());
-        self.completion_tokens = self
-            .completion_tokens
-            .saturating_add(stream_output.completion_tokens_for_runtime_budget());
+    fn absorb_attempt(
+        &mut self,
+        stream_output: &StreamHandlingOutput,
+        attempt_usage: MetricsTokenUsage,
+    ) {
+        let mut accumulated = self.token_usage();
+        accumulated.add_assign_durable(attempt_usage);
+        self.prompt_tokens = accumulated.prompt_tokens;
+        self.completion_tokens = accumulated.completion_tokens;
         self.tool_call_count = self
             .tool_call_count
             .saturating_add(stream_output.tool_calls.len() as u32);
@@ -166,6 +194,41 @@ impl RoundActivity {
                 .filter(|call| is_subagent_create_call(call))
                 .count() as u32,
         );
+    }
+
+    /// The exact token value persisted for this round. Runtime budget totals
+    /// consume these same two components via `commit_to_runtime`, making the
+    /// canonical policy impossible to fork between the two consumers.
+    fn token_usage(&self) -> MetricsTokenUsage {
+        MetricsTokenUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.prompt_tokens.saturating_add(self.completion_tokens),
+        }
+        .clamped_for_durable_metrics()
+    }
+
+    /// Commit a round exactly once, including terminal rounds. A billed stream
+    /// followed by validation or post-LLM failure must still affect the runtime
+    /// budget just as it affects durable metrics.
+    fn commit_to_runtime(&self, runtime_state: &mut AgentRuntimeState) {
+        let mut accumulated = MetricsTokenUsage {
+            prompt_tokens: runtime_state.round.total_prompt_tokens,
+            completion_tokens: runtime_state.round.total_completion_tokens,
+            total_tokens: 0,
+        }
+        .clamped_for_durable_metrics();
+        accumulated.add_assign_durable(self.token_usage());
+        runtime_state.round.total_prompt_tokens = accumulated.prompt_tokens;
+        runtime_state.round.total_completion_tokens = accumulated.completion_tokens;
+        runtime_state.round.total_tool_calls = runtime_state
+            .round
+            .total_tool_calls
+            .saturating_add(self.tool_call_count);
+        runtime_state.round.total_subagents_spawned = runtime_state
+            .round
+            .total_subagents_spawned
+            .saturating_add(self.subagent_spawn_count);
     }
 }
 
@@ -181,7 +244,8 @@ fn check_run_budget_exceeded(
 ) -> Option<RunBudgetExceeded> {
     let total_tokens = round
         .total_prompt_tokens
-        .saturating_add(round.total_completion_tokens);
+        .saturating_add(round.total_completion_tokens)
+        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT);
     if let Some(limit) = budget.max_total_tokens {
         if total_tokens >= limit {
             return Some(RunBudgetExceeded {
@@ -664,6 +728,7 @@ fn record_turn_failure(
     round_id: &str,
     session_id: &str,
     message_count: u32,
+    round_usage: MetricsTokenUsage,
     error: &AgentError,
 ) {
     let (round_status, session_status) = map_turn_error_status(error);
@@ -673,6 +738,7 @@ fn record_turn_failure(
         session_id,
         message_count,
         round_status,
+        round_usage,
         Some(error.to_string()),
         session_status,
     );
@@ -1728,11 +1794,11 @@ pub(super) async fn run_pipeline(
         let mut overflow_recovery_attempted = false;
         let mut turn_outcome: Option<TurnOutcome> = None;
         let mut terminal_error: Option<AgentError> = None;
+        let mut hook_suspension: Option<AgentError> = None;
 
-        // Actual (provider-reported) usage + activity for THIS round for the
-        // per-run budget guardrails (issue #221) — real numbers, not the
-        // heuristic `round_usage` estimate used for metrics. Reset every
-        // round; accumulated across the retry attempts below (see
+        // Canonical usage + activity for THIS round, shared by runtime budget
+        // totals and durable metrics. Reset every round; accumulated across
+        // the retry attempts below (see
         // `RoundActivity` for why it must sum, never overwrite); an attempt
         // that errors before streaming contributes 0.
         let mut round_activity = RoundActivity::default();
@@ -1796,16 +1862,11 @@ pub(super) async fn run_pipeline(
                             {
                                 Ok(recovered) => recovered,
                                 Err(error) => {
-                                    // Early exit before the post-loop drain — abort
-                                    // any in-flight eval so it does not detach and
-                                    // keep spending (issue #347).
-                                    abort_in_flight_evaluations(
-                                        state,
-                                        event_tx,
-                                        "terminal_error",
-                                    )
-                                    .await;
-                                    return Err(error);
+                                    // Route through the shared terminal path so
+                                    // any earlier billed retry attempt is retained
+                                    // in both runtime and durable usage.
+                                    terminal_error = Some(error);
+                                    break;
                                 }
                             };
                         if recovered {
@@ -1900,7 +1961,11 @@ pub(super) async fn run_pipeline(
             let stream_output = llm_output.stream_output;
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
-            round_activity.absorb_attempt(&stream_output);
+            round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
+            if let Some(error) = llm_output.terminal_validation_error {
+                terminal_error = Some(error);
+                break;
+            }
             let activation_attempt =
                 match validate_explicit_activation_first_step(session, &stream_output.tool_calls) {
                     Ok(attempt) => attempt,
@@ -1949,28 +2014,44 @@ pub(super) async fn run_pipeline(
                     .fast_model_name
                     .clone()
                     .unwrap_or_else(|| state.model_name.clone());
-                turn_outcome = Some(
-                    handle_no_tool_calls(
-                        stream_output.content,
-                        reasoning,
-                        reasoning_signature,
-                        llm_output.prompt_tokens,
-                        llm_output.completion_tokens,
-                        llm_output.round_usage,
-                        session,
-                        &mut state.runtime_state,
-                        event_tx,
-                        state.metrics_collector.as_ref(),
-                        &round_id,
-                        &state.session_id,
-                        config,
-                        &state.task_context,
-                        &eval_model,
-                        turn_counter + 1,
-                        llm.clone(),
-                    )
-                    .await?,
-                );
+                match handle_no_tool_calls(
+                    stream_output.content,
+                    reasoning,
+                    reasoning_signature,
+                    llm_output.prompt_tokens,
+                    llm_output.completion_tokens,
+                    round_activity.token_usage(),
+                    session,
+                    &mut state.runtime_state,
+                    event_tx,
+                    state.metrics_collector.as_ref(),
+                    &round_id,
+                    &state.session_id,
+                    config,
+                    &state.task_context,
+                    &eval_model,
+                    turn_counter + 1,
+                    llm.clone(),
+                )
+                .await
+                {
+                    Ok(outcome) => turn_outcome = Some(outcome),
+                    Err(error) if error.is_hook_suspended() => {
+                        // Preserve the control-flow contract consumed by the
+                        // outer loop finalizer. The provider round itself
+                        // completed successfully, so retain its usage without
+                        // misclassifying the intentional suspension as Error.
+                        record_no_tool_calls_round_completed(
+                            state.metrics_collector.as_ref(),
+                            &round_id,
+                            &state.session_id,
+                            session,
+                            round_activity.token_usage(),
+                        );
+                        hook_suspension = Some(error);
+                    }
+                    Err(error) => terminal_error = Some(error),
+                }
                 break;
             }
 
@@ -1986,19 +2067,29 @@ pub(super) async fn run_pipeline(
                 tools: &tools,
             };
 
-            match handle_tool_calls_path(
-                &frame,
-                stream_output,
-                llm_output.round_usage,
-                session,
-                &mut state.runtime_state,
-                &state.auxiliary_models,
-                &state.model_name,
-                &mut state.task_context,
-                cancel_token,
-            )
-            .await
-            {
+            #[cfg(test)]
+            let injected_handler_error = take_test_post_llm_retry_failure(session);
+            #[cfg(not(test))]
+            let injected_handler_error: Option<AgentError> = None;
+            let handler_result = match injected_handler_error {
+                Some(error) => Err(error),
+                None => {
+                    handle_tool_calls_path(
+                        &frame,
+                        stream_output,
+                        round_activity.token_usage(),
+                        session,
+                        &mut state.runtime_state,
+                        &state.auxiliary_models,
+                        &state.model_name,
+                        &mut state.task_context,
+                        cancel_token,
+                    )
+                    .await
+                }
+            };
+
+            match handler_result {
                 Ok(outcome) => {
                     if let Some(attempt) = activation_attempt.as_ref() {
                         if !outcome.should_break {
@@ -2047,13 +2138,27 @@ pub(super) async fn run_pipeline(
             }
         }
 
+        // Commit once for every exit from the attempt loop. In particular, a
+        // terminal validation/post-LLM failure must retain the same accumulated
+        // usage that its durable round record receives below.
+        round_activity.commit_to_runtime(&mut state.runtime_state);
+
+        if let Some(error) = hook_suspension {
+            return Err(error);
+        }
+
         // --- Handle terminal error ---
         if let Some(error) = terminal_error {
+            // Terminal activations skip normal finalization, so mirror the
+            // just-committed runtime usage onto the Session before the outer
+            // execute boundary checkpoints it.
+            state_bridge::write_runtime_state(session, &state.runtime_state);
             record_turn_failure(
                 state.metrics_collector.as_ref(),
                 &round_id,
                 &state.session_id,
                 session.messages.len() as u32,
+                round_activity.token_usage(),
                 &error,
             );
             // Early exit before the post-loop drain — abort in-flight evals so a
@@ -2068,11 +2173,13 @@ pub(super) async fn run_pipeline(
                 state.session_id,
                 turn_counter + 1
             ));
+            state_bridge::write_runtime_state(session, &state.runtime_state);
             record_turn_failure(
                 state.metrics_collector.as_ref(),
                 &round_id,
                 &state.session_id,
                 session.messages.len() as u32,
+                round_activity.token_usage(),
                 &error,
             );
             // Early exit before the post-loop drain — abort in-flight evals (#347).
@@ -2242,32 +2349,6 @@ pub(super) async fn run_pipeline(
             }
             _ => {}
         }
-
-        // Accumulate this round's actual usage/activity into the run-level
-        // totals BEFORE persisting the runtime state snapshot below, so the
-        // per-run budget guardrails (issue #221) — checked further down — see
-        // up-to-date numbers, and a resumed/inspected session's runtime state
-        // reflects them immediately.
-        state.runtime_state.round.total_prompt_tokens = state
-            .runtime_state
-            .round
-            .total_prompt_tokens
-            .saturating_add(round_activity.prompt_tokens);
-        state.runtime_state.round.total_completion_tokens = state
-            .runtime_state
-            .round
-            .total_completion_tokens
-            .saturating_add(round_activity.completion_tokens);
-        state.runtime_state.round.total_tool_calls = state
-            .runtime_state
-            .round
-            .total_tool_calls
-            .saturating_add(round_activity.tool_call_count);
-        state.runtime_state.round.total_subagents_spawned = state
-            .runtime_state
-            .round
-            .total_subagents_spawned
-            .saturating_add(round_activity.subagent_spawn_count);
 
         if !config.hook_runner.is_empty() {
             crate::runtime::hooks::merge_session_hook_checkpoints(
@@ -3966,6 +4047,584 @@ mod tests {
         }
     }
 
+    /// One completed provider stream whose authoritative usage deliberately
+    /// differs from the local tokenizer estimate. `content=None` produces the
+    /// billed empty-response validation failure path.
+    struct CanonicalUsageProvider {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        content: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for CanonicalUsageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let mut chunks = vec![
+                Ok(LLMChunk::ProviderUsage {
+                    input_tokens: Some(self.prompt_tokens),
+                    output_tokens: Some(self.completion_tokens),
+                    // Deliberately inconsistent: canonical totals are derived
+                    // from the selected components, not this wire convenience.
+                    total_tokens: Some(9_999),
+                    reasoning_tokens: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                }),
+                Ok(LLMChunk::ResponseId("canonical-usage-response".to_string())),
+            ];
+            if let Some(content) = self.content {
+                chunks.push(Ok(LLMChunk::Token(content.to_string())));
+            }
+            chunks.push(Ok(LLMChunk::Done));
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct IntentionalFinalizeSuspendHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for IntentionalFinalizeSuspendHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeFinalize
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            HookResult::Suspend {
+                reason: "wait for external approval".to_string(),
+            }
+        }
+    }
+
+    struct AbortFinalizeHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for AbortFinalizeHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeFinalize
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            HookResult::Abort {
+                reason: "injected terminal policy failure".to_string(),
+            }
+        }
+    }
+
+    struct BilledRetryProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for BilledRetryProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let usage = match attempt {
+                0 => LLMChunk::ProviderUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(3),
+                    total_tokens: Some(13),
+                    reasoning_tokens: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                },
+                1 => LLMChunk::ProviderUsage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(5),
+                    total_tokens: Some(25),
+                    reasoning_tokens: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                },
+                other => panic!("unexpected provider attempt {other}"),
+            };
+            let mut chunks = vec![Ok(usage)];
+            if attempt == 0 {
+                chunks.push(Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: "retry-tool-attempt-1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "noop".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                ])));
+            } else {
+                chunks.push(Ok(LLMChunk::Token(
+                    "second billed attempt completed".to_string(),
+                )));
+            }
+            chunks.push(Ok(LLMChunk::Done));
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct FailBeforeUsageProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for FailBeforeUsageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api(
+                "authentication error before a stream was created".to_string(),
+            ))
+        }
+    }
+
+    async fn create_pipeline_metrics() -> (
+        tempfile::TempDir,
+        bamboo_metrics::MetricsCollector,
+        Arc<bamboo_metrics::SqliteMetricsStorage>,
+    ) {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        let dir = tempfile::tempdir().expect("temp metrics dir");
+        let storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+            dir.path().join("metrics.db"),
+        ));
+        storage.init().await.expect("init metrics storage");
+        let collector = bamboo_metrics::MetricsCollector::spawn(storage.clone(), 7);
+        (dir, collector, storage)
+    }
+
+    async fn wait_for_pipeline_metrics(
+        storage: &bamboo_metrics::SqliteMetricsStorage,
+        session_id: &str,
+        expected_status: MetricsRoundStatus,
+        expected_usage: MetricsTokenUsage,
+    ) -> bamboo_metrics::types::SessionDetail {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        for _ in 0..100 {
+            if let Some(detail) = storage
+                .session_detail(session_id)
+                .await
+                .expect("session detail query")
+            {
+                if detail.rounds.first().is_some_and(|round| {
+                    round.status == expected_status && round.token_usage == expected_usage
+                }) && detail.session.total_token_usage == expected_usage
+                {
+                    return detail;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "session {session_id} did not persist a {expected_status:?} round with usage {expected_usage:?}"
+        );
+    }
+
+    fn canonical_usage_pipeline_config() -> AgentLoopConfig {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        AgentLoopConfig {
+            model_name: Some("model".to_string()),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            ..AgentLoopConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_success_clamps_overflow_and_reconciles_runtime_round_and_session() {
+        let session_id = "canonical-success";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user(
+            "provider reports values beyond the durable signed range",
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: u64::MAX,
+            completion_tokens: u64::MAX,
+            content: Some("provider-backed answer"),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect("successful pipeline");
+        drop(tx);
+        drain(&mut rx).await;
+
+        let max = bamboo_domain::MAX_DURABLE_TOKEN_COUNT;
+        let expected = MetricsTokenUsage {
+            prompt_tokens: max,
+            completion_tokens: max,
+            total_tokens: max,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Success,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds.len(), 1);
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, max);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, max);
+    }
+
+    #[tokio::test]
+    async fn pipeline_billed_retry_attempts_persist_exactly_once_across_all_consumers() {
+        let session_id = "canonical-billed-retry";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("retry after post-LLM handler failure"));
+        session.metadata.insert(
+            super::TEST_POST_LLM_RETRY_FAILURES_KEY.to_string(),
+            "1".to_string(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(BilledRetryProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect("second billed attempt completes the same round");
+        drop(tx);
+        drain(&mut rx).await;
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one completed attempt fails in post-LLM handling and exactly one retry is billed"
+        );
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 8,
+            total_tokens: 38,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Success,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds.len(), 1, "both attempts belong to one round");
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 30);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn pipeline_terminal_validation_retains_billed_usage_in_runtime_and_metrics() {
+        let session_id = "canonical-terminal";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("returning no answer is terminal"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: 31,
+            completion_tokens: 7,
+            content: None,
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect_err("empty assistant response is terminal");
+        assert!(matches!(error, AgentError::EmptyAssistantResponse { .. }));
+        drop(tx);
+        drain(&mut rx).await;
+
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 31,
+            completion_tokens: 7,
+            total_tokens: 38,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Error,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds.len(), 1);
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 31);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 7);
+        let persisted_runtime = session
+            .agent_runtime_state
+            .as_ref()
+            .expect("terminal runtime state mirrored to session");
+        assert_eq!(persisted_runtime.round.total_prompt_tokens, 31);
+        assert_eq!(persisted_runtime.round.total_completion_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn pipeline_post_llm_hook_abort_retains_usage_in_terminal_metrics_and_runtime() {
+        let session_id = "canonical-post-llm-abort";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("abort only after the stream completes"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: 23,
+            completion_tokens: 6,
+            content: Some("completed provider response"),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+        let mut config = canonical_usage_pipeline_config();
+        let mut hook_runner = crate::runtime::hooks::HookRunner::new();
+        hook_runner.register(Arc::new(AbortFinalizeHook));
+        config.hook_runner = Arc::new(hook_runner);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect_err("finalize hook aborts after the completed stream");
+        assert!(matches!(error, AgentError::Tool(message) if message.contains("hook aborted")));
+        drop(tx);
+        drain(&mut rx).await;
+
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 23,
+            completion_tokens: 6,
+            total_tokens: 29,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Error,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 23);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 6);
+    }
+
+    #[tokio::test]
+    async fn pipeline_hook_suspension_keeps_success_usage_without_error_status() {
+        let session_id = "canonical-hook-suspend";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("pause before finalizing"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: 19,
+            completion_tokens: 4,
+            content: Some("ready, pending approval"),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+        let mut config = canonical_usage_pipeline_config();
+        let mut hook_runner = crate::runtime::hooks::HookRunner::new();
+        hook_runner.register(Arc::new(IntentionalFinalizeSuspendHook));
+        config.hook_runner = Arc::new(hook_runner);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect_err("hook suspension remains a control-flow signal");
+        assert!(error.is_hook_suspended());
+        drop(tx);
+        drain(&mut rx).await;
+
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 19,
+            completion_tokens: 4,
+            total_tokens: 23,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Success,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(
+            detail.session.status,
+            MetricsSessionStatus::Running,
+            "the outer finalizer, not terminal-error metrics, owns suspension status"
+        );
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 19);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn pipeline_failure_before_provider_usage_remains_zero_everywhere() {
+        let session_id = "canonical-pre-stream-error";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("this request fails before streaming"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(FailBeforeUsageProvider),
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect_err("provider authentication error is terminal");
+        drop(tx);
+        drain(&mut rx).await;
+
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Error,
+            MetricsTokenUsage::default(),
+        )
+        .await;
+        assert_eq!(detail.rounds[0].token_usage, MetricsTokenUsage::default());
+        assert_eq!(
+            detail.session.total_token_usage,
+            MetricsTokenUsage::default()
+        );
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 0);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 0);
+    }
+
     #[tokio::test]
     async fn run_budget_token_limit_stops_run_gracefully() {
         use crate::runtime::config::PromptMemoryFlags;
@@ -4269,7 +4928,10 @@ mod tests {
         let mut activity = super::RoundActivity::default();
 
         // Attempt 1: billed 100 in / 50 out, one Bash + one SubAgent create.
-        activity.absorb_attempt(&attempt(100, 50, vec!["Bash", "SubAgent"]));
+        let attempt_1 = attempt(100, 50, vec!["Bash", "SubAgent"]);
+        let attempt_1_usage =
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&attempt_1, 999, 999);
+        activity.absorb_attempt(&attempt_1, attempt_1_usage);
         assert_eq!(activity.prompt_tokens, 100);
         assert_eq!(activity.completion_tokens, 50);
         assert_eq!(activity.tool_call_count, 2);
@@ -4277,19 +4939,43 @@ mod tests {
 
         // Post-LLM handling fails retryably; attempt 2 is billed too. Totals
         // must be the SUM of both attempts, not attempt 2's numbers alone.
-        activity.absorb_attempt(&attempt(120, 30, vec!["Bash"]));
+        let attempt_2 = attempt(120, 30, vec!["Bash"]);
+        let attempt_2_usage =
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&attempt_2, 999, 999);
+        activity.absorb_attempt(&attempt_2, attempt_2_usage);
         assert_eq!(
             activity.prompt_tokens, 220,
             "attempt 1's billed prompt tokens must not be dropped on retry"
         );
         assert_eq!(activity.completion_tokens, 80);
+        assert_eq!(
+            activity.token_usage(),
+            MetricsTokenUsage {
+                prompt_tokens: 220,
+                completion_tokens: 80,
+                total_tokens: 300,
+            },
+            "durable usage must contain every billed retry attempt exactly once"
+        );
         assert_eq!(activity.tool_call_count, 3);
         assert_eq!(activity.subagent_spawn_count, 1);
 
         // Saturates rather than wrapping on absurd totals.
-        activity.absorb_attempt(&attempt(u64::MAX, u64::MAX, vec![]));
-        assert_eq!(activity.prompt_tokens, u64::MAX);
-        assert_eq!(activity.completion_tokens, u64::MAX);
+        let saturating_attempt = attempt(u64::MAX, u64::MAX, vec![]);
+        let saturating_usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(
+            &saturating_attempt,
+            1,
+            1,
+        );
+        activity.absorb_attempt(&saturating_attempt, saturating_usage);
+        assert_eq!(
+            activity.prompt_tokens,
+            bamboo_domain::MAX_DURABLE_TOKEN_COUNT
+        );
+        assert_eq!(
+            activity.completion_tokens,
+            bamboo_domain::MAX_DURABLE_TOKEN_COUNT
+        );
     }
 
     #[test]
@@ -4322,7 +5008,8 @@ mod tests {
         };
 
         let mut activity = super::RoundActivity::default();
-        activity.absorb_attempt(&output);
+        let usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 7, 9);
+        activity.absorb_attempt(&output, usage);
 
         assert_eq!(activity.prompt_tokens, 1000);
         assert_eq!(
@@ -4336,10 +5023,50 @@ mod tests {
             .expect("provider usage")
             .output_tokens = Some(0);
         let mut zero_activity = super::RoundActivity::default();
-        zero_activity.absorb_attempt(&output);
+        let zero_usage =
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 7, 9);
+        zero_activity.absorb_attempt(&output, zero_usage);
         assert_eq!(
             zero_activity.completion_tokens, 0,
             "explicit provider zero must beat a nonzero legacy flat value"
+        );
+    }
+
+    #[test]
+    fn canonical_attempt_usage_falls_back_per_component_only_when_unreported() {
+        use crate::runtime::stream::handler::{ProviderUsageSnapshot, StreamHandlingOutput};
+
+        let output = StreamHandlingOutput {
+            response_id: None,
+            content: "answer".to_string(),
+            reasoning_content: String::new(),
+            reasoning_signature: None,
+            token_count: 6,
+            tool_calls: Vec::new(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_usage: Some(ProviderUsageSnapshot {
+                input_tokens: Some(41),
+                output_tokens: None,
+                total_tokens: Some(999),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+            }),
+            input_tokens: 0,
+        };
+
+        assert_eq!(
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 3, 5),
+            MetricsTokenUsage {
+                prompt_tokens: 41,
+                completion_tokens: 5,
+                total_tokens: 46,
+            },
+            "reported prompt wins, missing completion estimates, and provider total is not trusted"
         );
     }
 

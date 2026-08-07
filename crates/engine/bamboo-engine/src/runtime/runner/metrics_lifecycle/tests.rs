@@ -121,6 +121,11 @@ async fn record_round_and_session_error_marks_round_and_session_as_error() {
         "metrics-s2",
         5,
         RoundStatus::Error,
+        TokenUsage {
+            prompt_tokens: 21,
+            completion_tokens: 8,
+            total_tokens: 29,
+        },
         Some("boom".to_string()),
         SessionStatus::Error,
     );
@@ -135,7 +140,50 @@ async fn record_round_and_session_error_marks_round_and_session_as_error() {
     assert_eq!(detail.rounds.len(), 1);
     assert_eq!(detail.rounds[0].status, RoundStatus::Error);
     assert_eq!(detail.rounds[0].error.as_deref(), Some("boom"));
+    let expected_usage = TokenUsage {
+        prompt_tokens: 21,
+        completion_tokens: 8,
+        total_tokens: 29,
+    };
+    assert_eq!(detail.rounds[0].token_usage, expected_usage);
+    assert_eq!(
+        detail.session.total_token_usage, expected_usage,
+        "the durable session aggregate must reconcile to its terminal round"
+    );
+}
+
+#[tokio::test]
+async fn record_pre_stream_error_keeps_zero_usage() {
+    let (_dir, collector, storage) = create_collector_with_storage().await;
+    let started_at = Utc::now();
+
+    record_session_started(
+        Some(&collector),
+        "metrics-s-zero",
+        "test-model",
+        started_at,
+        1,
+    );
+    record_round_started(
+        Some(&collector),
+        "metrics-r-zero",
+        "metrics-s-zero",
+        "test-model",
+    );
+    record_round_and_session_error(
+        Some(&collector),
+        "metrics-r-zero",
+        "metrics-s-zero",
+        1,
+        RoundStatus::Error,
+        TokenUsage::default(),
+        Some("provider failed before usage".to_string()),
+        SessionStatus::Error,
+    );
+
+    let detail = wait_for_session_detail(storage.as_ref(), "metrics-s-zero").await;
     assert_eq!(detail.rounds[0].token_usage, TokenUsage::default());
+    assert_eq!(detail.session.total_token_usage, TokenUsage::default());
 }
 
 #[tokio::test]

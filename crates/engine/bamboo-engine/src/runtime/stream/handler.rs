@@ -188,28 +188,6 @@ pub struct StreamHandlingOutput {
     pub input_tokens: u64,
 }
 
-impl StreamHandlingOutput {
-    /// Prompt usage for runtime budget enforcement.
-    ///
-    /// Provider-reported totals are authoritative when present. Legacy streams
-    /// retain their historical fallback to the flat fresh-input counter.
-    pub(crate) fn prompt_tokens_for_runtime_budget(&self) -> u64 {
-        self.provider_usage
-            .and_then(|usage| usage.input_tokens)
-            .unwrap_or(self.input_tokens)
-    }
-
-    /// Completion usage for runtime budget enforcement.
-    ///
-    /// A provider-reported output total (including explicit zero) wins over
-    /// legacy summaries. Reasoning is a subset breakdown and is never added.
-    pub(crate) fn completion_tokens_for_runtime_budget(&self) -> u64 {
-        self.provider_usage
-            .and_then(|usage| usage.output_tokens)
-            .unwrap_or(self.output_tokens)
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct PartialToolCallSnapshot {
     pub id: String,
