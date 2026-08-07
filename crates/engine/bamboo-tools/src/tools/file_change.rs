@@ -2,7 +2,7 @@ use bamboo_agent_core::ToolError;
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CONTEXT_LINES: usize = 3;
 const MAX_DIFF_LINES: usize = 400;
@@ -16,6 +16,19 @@ pub async fn read_existing_bytes(path: &Path) -> Result<Option<Vec<u8>>, ToolErr
             "Failed to read file before checkpoint: {error}"
         ))),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AtomicWriteExpectation<'a> {
+    /// Preserve the historical behavior for callers without a read-before-write
+    /// baseline (for example NotebookEdit).
+    Unchecked,
+    /// Refuse to replace a path that appeared after the caller observed it as
+    /// missing.
+    Missing,
+    /// Refuse to replace a path unless its bytes still exactly match the version
+    /// used to compute the mutation.
+    Exact(&'a [u8]),
 }
 
 pub fn ensure_no_symlink_components(path: &Path) -> Result<(), ToolError> {
@@ -57,6 +70,14 @@ pub fn ensure_no_symlink_components(path: &Path) -> Result<(), ToolError> {
 }
 
 pub async fn atomic_write_text(path: &Path, content: &str) -> Result<(), ToolError> {
+    atomic_write_text_with_expectation(path, content, AtomicWriteExpectation::Unchecked).await
+}
+
+pub(crate) async fn atomic_write_text_with_expectation(
+    path: &Path,
+    content: &str,
+    expectation: AtomicWriteExpectation<'_>,
+) -> Result<(), ToolError> {
     if !path.is_absolute() {
         return Err(ToolError::InvalidArguments(
             "file path must be absolute".to_string(),
@@ -117,10 +138,60 @@ pub async fn atomic_write_text(path: &Path, content: &str) -> Result<(), ToolErr
             }
         }
 
+        // Validate as late as the portable temp-file + rename strategy allows:
+        // after the replacement is fully written and synced, immediately before
+        // rename. This closes the larger validation -> temp-write/fsync window.
+        // The Exact check still has an unavoidable check -> rename race: an
+        // external write in that interval can be overwritten. Post-write
+        // verification only controls tracker advancement; it cannot detect or
+        // recover an external version that our rename replaced.
+        match expectation {
+            AtomicWriteExpectation::Unchecked => {}
+            AtomicWriteExpectation::Missing => {
+                match tokio::fs::symlink_metadata(path).await {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(ToolError::Execution(
+                            "Target file was created concurrently; call Read before Write"
+                                .to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(ToolError::Execution(format!(
+                            "Failed to verify that the target is still missing: {error}"
+                        )));
+                    }
+                }
+            }
+            AtomicWriteExpectation::Exact(expected) => {
+                let file = tokio::fs::File::open(path).await.map_err(|error| {
+                    ToolError::Execution(format!(
+                        "Target file changed before atomic replacement; call Read again: {error}"
+                    ))
+                })?;
+                let max_bytes = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+                let mut reader = file.take(max_bytes.saturating_add(1));
+                let mut current = Vec::new();
+                reader.read_to_end(&mut current).await.map_err(|error| {
+                    ToolError::Execution(format!(
+                        "Target file changed before atomic replacement; call Read again: {error}"
+                    ))
+                })?;
+                if current != expected {
+                    return Err(ToolError::Execution(
+                        "Target file changed before atomic replacement; call Read again"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
         match tokio::fs::rename(&tmp_path, path).await {
             Ok(()) => Ok(()),
             #[cfg(windows)]
             Err(error) if std::fs::metadata(path).is_ok() => {
+                // This inherited remove+rename fallback is not atomic and has
+                // the same check -> replacement race described above.
                 tokio::fs::remove_file(path).await.map_err(|remove_error| {
                     ToolError::Execution(format!(
                         "Failed to replace target file (rename failed with {error}; remove failed with {remove_error})"
@@ -412,5 +483,43 @@ mod tests {
     fn touched_line_count_reports_added_plus_removed_lines() {
         assert_eq!(touched_line_count("a\nb\nc\n", "a\nx\ny\nc\n"), 3);
         assert_eq!(touched_line_count("same\n", "same\n"), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_atomic_write_rejects_unexpected_existing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guarded.txt");
+        tokio::fs::write(&path, "external").await.unwrap();
+
+        let result = atomic_write_text_with_expectation(
+            &path,
+            "replacement",
+            AtomicWriteExpectation::Exact(b"expected"),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(message)) if message.contains("changed"))
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "external");
+    }
+
+    #[tokio::test]
+    async fn guarded_atomic_write_rejects_a_concurrently_created_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created.txt");
+        tokio::fs::write(&path, "external").await.unwrap();
+
+        let result = atomic_write_text_with_expectation(
+            &path,
+            "replacement",
+            AtomicWriteExpectation::Missing,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(message)) if message.contains("created concurrently"))
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "external");
     }
 }
