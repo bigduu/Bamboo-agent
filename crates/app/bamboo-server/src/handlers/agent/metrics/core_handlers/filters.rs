@@ -1,7 +1,7 @@
 use super::super::{ForwardMetricsQuery, MetricsSessionsQuery};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TimelineGranularity {
+pub(in crate::handlers::agent::metrics) enum TimelineGranularity {
     Daily,
     Weekly,
     Monthly,
@@ -42,7 +42,7 @@ pub(super) fn build_forward_grouped_filter(
     }
 }
 
-pub(super) fn normalize_days(days: Option<u32>) -> u32 {
+pub(in crate::handlers::agent::metrics) fn normalize_days(days: Option<u32>) -> u32 {
     days.unwrap_or(30).clamp(1, 365)
 }
 
@@ -60,7 +60,9 @@ pub(super) fn normalize_limit(limit: Option<u32>) -> Option<u32> {
     )
 }
 
-pub(super) fn resolve_timeline_granularity(value: Option<&str>) -> TimelineGranularity {
+pub(in crate::handlers::agent::metrics) fn resolve_timeline_granularity(
+    value: Option<&str>,
+) -> TimelineGranularity {
     match value.unwrap_or("daily") {
         "weekly" => TimelineGranularity::Weekly,
         "monthly" => TimelineGranularity::Monthly,

@@ -1,6 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use actix_web::{web, HttpResponse, Responder};
+use bamboo_metrics::{DailyMetrics, PeriodMetrics, TokenUsage};
 
 use super::{
+    core_handlers::filters::{normalize_days, resolve_timeline_granularity, TimelineGranularity},
     internal_error, CombinedSummary, MemoryMetricsQuery, MetricsDailyQuery, MetricsSummaryQuery,
     UnifiedSummary, UnifiedTimelinePoint,
 };
@@ -97,7 +101,8 @@ pub async fn v2_unified_timeline(
     state: web::Data<AppState>,
     query: web::Query<MetricsDailyQuery>,
 ) -> impl Responder {
-    let days = query.days.unwrap_or(30).clamp(1, 365);
+    let days = normalize_days(query.days);
+    let granularity = resolve_timeline_granularity(query.granularity.as_deref());
 
     let chat_result = state.metrics_service.daily(days, query.end_date).await;
     let forward_result = state
@@ -112,55 +117,212 @@ pub async fn v2_unified_timeline(
         .await;
 
     match (chat_result, forward_result) {
-        (Ok(chat_daily), Ok(forward_daily)) => {
-            // Build maps for efficient lookup.
-            let chat_map: std::collections::HashMap<String, &bamboo_metrics::DailyMetrics> =
-                chat_daily.iter().map(|d| (d.date.to_string(), d)).collect();
-
-            let forward_map: std::collections::HashMap<String, &bamboo_metrics::DailyMetrics> =
-                forward_daily
-                    .iter()
-                    .map(|d| (d.date.to_string(), d))
-                    .collect();
-
-            // Get all unique dates.
-            let mut dates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for date in chat_map.keys() {
-                dates.insert(date.clone());
-            }
-            for date in forward_map.keys() {
-                dates.insert(date.clone());
-            }
-
-            let timeline: Vec<UnifiedTimelinePoint> = dates
-                .into_iter()
-                .map(|date| {
-                    let chat = chat_map.get(&date);
-                    let forward = forward_map.get(&date);
-
-                    let chat_tokens = chat.map(|d| d.total_token_usage.total_tokens).unwrap_or(0);
-                    let chat_sessions = chat.map(|d| d.total_sessions).unwrap_or(0);
-                    let forward_tokens = forward
-                        .map(|d| d.total_token_usage.total_tokens)
-                        .unwrap_or(0);
-                    let forward_requests = forward.map(|d| d.total_sessions).unwrap_or(0);
-
-                    UnifiedTimelinePoint {
-                        date: date.clone(),
-                        chat_tokens,
-                        chat_sessions,
-                        forward_tokens,
-                        forward_requests,
-                        total_tokens: chat_tokens + forward_tokens,
-                        prompt_cached_tool_outputs: chat
-                            .map(|d| d.prompt_cached_tool_outputs)
-                            .unwrap_or(0),
-                    }
-                })
-                .collect();
-
-            HttpResponse::Ok().json(timeline)
-        }
+        (Ok(chat_daily), Ok(forward_daily)) => HttpResponse::Ok().json(build_unified_timeline(
+            chat_daily,
+            forward_daily,
+            granularity,
+        )),
         (Err(e), _) | (_, Err(e)) => internal_error(e),
+    }
+}
+
+fn build_unified_timeline(
+    chat_daily: Vec<DailyMetrics>,
+    forward_daily: Vec<DailyMetrics>,
+    granularity: TimelineGranularity,
+) -> Vec<UnifiedTimelinePoint> {
+    let (chat_daily, forward_daily) = align_daily_inputs(chat_daily, forward_daily);
+
+    match granularity {
+        TimelineGranularity::Daily => chat_daily
+            .into_iter()
+            .zip(forward_daily)
+            .map(|(chat, forward)| unified_point(chat.date.to_string(), None, chat, forward))
+            .collect(),
+        TimelineGranularity::Weekly => merge_periods(
+            bamboo_metrics::aggregate_weekly(&chat_daily),
+            bamboo_metrics::aggregate_weekly(&forward_daily),
+        ),
+        TimelineGranularity::Monthly => merge_periods(
+            bamboo_metrics::aggregate_monthly(&chat_daily),
+            bamboo_metrics::aggregate_monthly(&forward_daily),
+        ),
+    }
+}
+
+/// Give both sources the same ordered date domain before aggregation.
+///
+/// Filling a missing source with a zero-valued day makes the existing metrics
+/// period aggregator the single boundary authority for both chat and forward.
+/// In particular, sparse activity on different dates can no longer produce
+/// different `period_end` values for the two sides of one unified bucket.
+fn align_daily_inputs(
+    chat_daily: Vec<DailyMetrics>,
+    forward_daily: Vec<DailyMetrics>,
+) -> (Vec<DailyMetrics>, Vec<DailyMetrics>) {
+    let mut chat_by_date = chat_daily
+        .into_iter()
+        .map(|metrics| (metrics.date, metrics))
+        .collect::<BTreeMap<_, _>>();
+    let mut forward_by_date = forward_daily
+        .into_iter()
+        .map(|metrics| (metrics.date, metrics))
+        .collect::<BTreeMap<_, _>>();
+    let dates = chat_by_date
+        .keys()
+        .chain(forward_by_date.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    dates
+        .into_iter()
+        .map(|date| {
+            (
+                chat_by_date
+                    .remove(&date)
+                    .unwrap_or_else(|| empty_daily_metrics(date)),
+                forward_by_date
+                    .remove(&date)
+                    .unwrap_or_else(|| empty_daily_metrics(date)),
+            )
+        })
+        .unzip()
+}
+
+fn merge_periods(
+    chat_periods: Vec<PeriodMetrics>,
+    forward_periods: Vec<PeriodMetrics>,
+) -> Vec<UnifiedTimelinePoint> {
+    chat_periods
+        .into_iter()
+        .zip(forward_periods)
+        .map(|(chat, forward)| {
+            debug_assert_eq!(chat.period_start, forward.period_start);
+            debug_assert_eq!(chat.period_end, forward.period_end);
+
+            let period_start = chat.period_start.to_string();
+            let period_end = chat.period_end.to_string();
+            unified_point(
+                chat.label.clone(),
+                Some((period_start, period_end)),
+                period_as_daily(chat),
+                period_as_daily(forward),
+            )
+        })
+        .collect()
+}
+
+fn unified_point(
+    date: String,
+    period: Option<(String, String)>,
+    chat: DailyMetrics,
+    forward: DailyMetrics,
+) -> UnifiedTimelinePoint {
+    let chat_tokens = chat.total_token_usage.total_tokens;
+    let forward_tokens = forward.total_token_usage.total_tokens;
+    let (period_start, period_end) = period
+        .map(|(start, end)| (Some(start), Some(end)))
+        .unwrap_or((None, None));
+
+    UnifiedTimelinePoint {
+        date,
+        period_start,
+        period_end,
+        chat_tokens,
+        chat_sessions: chat.total_sessions,
+        forward_tokens,
+        forward_requests: forward.total_sessions,
+        total_tokens: chat_tokens + forward_tokens,
+        prompt_cached_tool_outputs: chat.prompt_cached_tool_outputs,
+    }
+}
+
+fn period_as_daily(period: PeriodMetrics) -> DailyMetrics {
+    DailyMetrics {
+        date: period.period_start,
+        total_sessions: period.total_sessions,
+        total_rounds: period.total_rounds,
+        total_token_usage: period.total_token_usage,
+        total_tool_calls: period.total_tool_calls,
+        prompt_cached_tool_outputs: period.prompt_cached_tool_outputs,
+        model_breakdown: period.model_breakdown,
+        tool_breakdown: period.tool_breakdown,
+    }
+}
+
+fn empty_daily_metrics(date: chrono::NaiveDate) -> DailyMetrics {
+    DailyMetrics {
+        date,
+        total_sessions: 0,
+        total_rounds: 0,
+        total_token_usage: TokenUsage::default(),
+        total_tool_calls: 0,
+        prompt_cached_tool_outputs: 0,
+        model_breakdown: Default::default(),
+        tool_breakdown: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDate;
+
+    use super::*;
+
+    fn daily(date: (i32, u32, u32), requests: u32, tokens: u64) -> DailyMetrics {
+        DailyMetrics {
+            date: NaiveDate::from_ymd_opt(date.0, date.1, date.2).expect("valid fixture date"),
+            total_sessions: requests,
+            total_rounds: requests,
+            total_token_usage: TokenUsage {
+                prompt_tokens: tokens,
+                completion_tokens: 0,
+                total_tokens: tokens,
+            },
+            total_tool_calls: 0,
+            prompt_cached_tool_outputs: requests.into(),
+            model_breakdown: Default::default(),
+            tool_breakdown: Default::default(),
+        }
+    }
+
+    #[test]
+    fn daily_timeline_preserves_schema_and_combines_sources_by_date() {
+        let timeline = build_unified_timeline(
+            vec![daily((2099, 2, 1), 1, 10)],
+            vec![daily((2099, 2, 2), 2, 20)],
+            TimelineGranularity::Daily,
+        );
+
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].date, "2099-02-01");
+        assert_eq!(timeline[0].chat_tokens, 10);
+        assert_eq!(timeline[0].forward_tokens, 0);
+        assert_eq!(timeline[1].chat_tokens, 0);
+        assert_eq!(timeline[1].forward_tokens, 20);
+        assert!(timeline.iter().all(|point| point.period_start.is_none()));
+        assert!(timeline.iter().all(|point| point.period_end.is_none()));
+
+        let json = serde_json::to_value(&timeline[0]).expect("serialize daily point");
+        assert!(json.get("period_start").is_none());
+        assert!(json.get("period_end").is_none());
+    }
+
+    #[test]
+    fn weekly_timeline_uses_one_boundary_contract_for_sparse_sources() {
+        // These dates are Saturday and Sunday in the same Monday-based week.
+        let timeline = build_unified_timeline(
+            vec![daily((2099, 1, 31), 1, 10)],
+            vec![daily((2099, 2, 1), 2, 20)],
+            TimelineGranularity::Weekly,
+        );
+
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].date, "2099-01-26..2099-02-01");
+        assert_eq!(timeline[0].period_start.as_deref(), Some("2099-01-26"));
+        assert_eq!(timeline[0].period_end.as_deref(), Some("2099-02-01"));
+        assert_eq!(timeline[0].chat_sessions, 1);
+        assert_eq!(timeline[0].forward_requests, 2);
+        assert_eq!(timeline[0].total_tokens, 30);
     }
 }
