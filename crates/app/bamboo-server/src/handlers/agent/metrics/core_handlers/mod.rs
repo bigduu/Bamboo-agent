@@ -1,5 +1,5 @@
 mod chat;
-mod filters;
+pub(super) mod filters;
 mod forward;
 pub(crate) mod memory;
 mod usage;

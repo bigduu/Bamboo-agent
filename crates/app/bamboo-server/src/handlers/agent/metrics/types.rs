@@ -34,7 +34,8 @@ pub struct MetricsDailyQuery {
     pub days: Option<u32>,
     /// End date for the range
     pub end_date: Option<NaiveDate>,
-    /// Granularity: "daily", "weekly", or "monthly" (default: "daily")
+    /// Granularity: "daily", "weekly", or "monthly" (default: "daily").
+    /// Unknown values follow the existing timeline policy and fall back to daily.
     pub granularity: Option<String>,
 }
 
@@ -398,10 +399,20 @@ pub struct CombinedSummary {
 }
 
 /// Unified timeline point combining chat and forward metrics
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnifiedTimelinePoint {
-    /// Date in YYYY-MM-DD format
+    /// Daily date or backward-compatible period label.
     pub date: String,
+    /// Explicit period start for weekly/monthly responses.
+    ///
+    /// Omitted for daily responses so their existing schema remains unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_start: Option<String>,
+    /// Explicit period end for weekly/monthly responses.
+    ///
+    /// Omitted for daily responses so their existing schema remains unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_end: Option<String>,
     /// Tokens used in chat sessions
     pub chat_tokens: u64,
     /// Number of chat sessions
