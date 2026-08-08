@@ -1146,8 +1146,15 @@ impl MetricsStorage for SqliteMetricsStorage {
                         completion_tokens = ?4,
                         total_tokens = ?5,
                         prompt_cached_tool_outputs = ?6,
-                        prompt_cached_tool_tokens_saved = COALESCE(prompt_cached_tool_tokens_saved, 0) + ?7,
-                        tokens_saved = COALESCE(tokens_saved, 0) + ?8,
+                        prompt_cached_tool_tokens_saved = ?7,
+                        -- `RoundCompleted` may be replayed. Replace its prompt-
+                        -- cache contribution while preserving tokens recorded by
+                        -- separate compression events, rather than adding the
+                        -- same completion payload again.
+                        tokens_saved = MAX(
+                            COALESCE(tokens_saved, 0) - COALESCE(prompt_cached_tool_tokens_saved, 0),
+                            0
+                        ) + ?8,
                         error = ?9
                     WHERE round_id = ?10
                     "#,
@@ -3015,6 +3022,170 @@ mod tests {
         assert_eq!(detail.session.prompt_cached_tool_outputs, 3);
         assert_eq!(detail.rounds.len(), 1);
         assert_eq!(detail.rounds[0].prompt_cached_tool_outputs, 3);
+    }
+
+    #[tokio::test]
+    async fn distinct_rounds_aggregate_and_same_event_replay_is_idempotent() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+
+        let session_id = "resumed-session";
+        let first_started = Utc
+            .with_ymd_and_hms(2026, 8, 8, 10, 0, 0)
+            .single()
+            .expect("valid first timestamp");
+        let first_completed = first_started + chrono::Duration::seconds(2);
+        let second_started = first_started + chrono::Duration::minutes(1);
+        let second_completed = second_started + chrono::Duration::seconds(3);
+        let first_round = "resumed-session-run-exec-a-round-1";
+        let second_round = "resumed-session-run-exec-b-round-1";
+
+        storage
+            .upsert_session_start(session_id, "model-a", first_started)
+            .await
+            .expect("session start");
+        storage
+            .insert_round_start(first_round, session_id, "model-a", first_started)
+            .await
+            .expect("first round start");
+        storage
+            .insert_tool_start("tool-first", first_round, session_id, "Read", first_started)
+            .await
+            .expect("first tool start");
+        storage
+            .complete_tool_call(
+                "tool-first",
+                ToolCallCompletion {
+                    completed_at: first_completed,
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("first tool completion");
+        storage
+            .record_round_compression(first_round, first_completed, 5)
+            .await
+            .expect("compression");
+
+        let first_usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        };
+        storage
+            .complete_round(
+                first_round,
+                first_completed,
+                RoundStatus::Error,
+                first_usage,
+                1,
+                7,
+                Some("first failure".to_string()),
+            )
+            .await
+            .expect("first completion");
+
+        // Replay the exact same metrics events. Starts must remain insert-only,
+        // completion values must remain replacements (not additive), and the
+        // tool must stay linked to this same logical round.
+        storage
+            .insert_round_start(first_round, session_id, "model-a", first_started)
+            .await
+            .expect("replayed round start");
+        storage
+            .insert_tool_start("tool-first", first_round, session_id, "Read", first_started)
+            .await
+            .expect("replayed tool start");
+        storage
+            .complete_tool_call(
+                "tool-first",
+                ToolCallCompletion {
+                    completed_at: first_completed,
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("replayed tool completion");
+        storage
+            .complete_round(
+                first_round,
+                first_completed,
+                RoundStatus::Error,
+                first_usage,
+                1,
+                7,
+                Some("first failure".to_string()),
+            )
+            .await
+            .expect("replayed round completion");
+
+        let second_usage = TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 3,
+            total_tokens: 23,
+        };
+        storage
+            .insert_round_start(second_round, session_id, "model-b", second_started)
+            .await
+            .expect("second round start");
+        storage
+            .complete_round(
+                second_round,
+                second_completed,
+                RoundStatus::Success,
+                second_usage,
+                2,
+                11,
+                None,
+            )
+            .await
+            .expect("second completion");
+
+        let detail = storage
+            .session_detail(session_id)
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        assert_eq!(detail.rounds.len(), 2);
+        assert_eq!(detail.session.total_rounds, 2);
+        assert_eq!(
+            detail.session.total_token_usage,
+            TokenUsage {
+                prompt_tokens: 30,
+                completion_tokens: 5,
+                total_tokens: 35,
+            }
+        );
+        assert_eq!(detail.session.prompt_cached_tool_outputs, 3);
+        assert_eq!(detail.session.prompt_cached_tool_tokens_saved, 18);
+        assert_eq!(detail.session.total_tokens_saved, 23);
+        assert_eq!(detail.session.tool_call_count, 1);
+
+        let first = detail
+            .rounds
+            .iter()
+            .find(|round| round.round_id == first_round)
+            .expect("first round remains present");
+        assert_eq!(first.status, RoundStatus::Error);
+        assert_eq!(first.token_usage, first_usage);
+        assert_eq!(first.error.as_deref(), Some("first failure"));
+        assert_eq!(first.prompt_cached_tool_tokens_saved, 7);
+        assert_eq!(first.compression_count, 1);
+        assert_eq!(first.tokens_saved, 12);
+        assert_eq!(first.tool_calls.len(), 1);
+        assert_eq!(first.tool_calls[0].tool_call_id, "tool-first");
+
+        let second = detail
+            .rounds
+            .iter()
+            .find(|round| round.round_id == second_round)
+            .expect("second round remains present");
+        assert_eq!(second.status, RoundStatus::Success);
+        assert_eq!(second.token_usage, second_usage);
+        assert!(second.tool_calls.is_empty());
     }
 
     #[tokio::test]

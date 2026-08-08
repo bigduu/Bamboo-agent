@@ -800,9 +800,11 @@ async fn apply_completed_task_evaluation(
         result.clone(),
     );
 
-    let synthetic_round_id = format!(
-        "{}-task-evaluation-round-{}",
-        state.session_id, result.round_number
+    let synthetic_round_id = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+        &state.session_id,
+        &state.execution_id,
+        "task-evaluation",
+        result.round_number,
     );
     crate::runtime::runner::metrics_lifecycle::record_round_started(
         state.metrics_collector.as_ref(),
@@ -1649,7 +1651,11 @@ pub(super) async fn run_pipeline(
 
         state.runtime_state.round.current_round = turn_counter;
 
-        let round_id = format!("{}-round-{}", state.session_id, turn_counter + 1);
+        let round_id = crate::runtime::runner::round_prelude::build_round_id(
+            &state.session_id,
+            &state.execution_id,
+            turn_counter as usize,
+        );
         state.runtime_state.round.last_round_id = Some(round_id.clone());
 
         if config
@@ -3733,6 +3739,7 @@ mod tests {
         };
         LoopRunState {
             session_id: session_id.to_string(),
+            execution_id: "test-execution".to_string(),
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
@@ -5636,6 +5643,7 @@ mod tests {
 
         let mut state = super::super::startup::LoopRunState {
             session_id: "session-task-eval".to_string(),
+            execution_id: "task-eval-execution".to_string(),
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
@@ -5704,11 +5712,43 @@ mod tests {
 
     #[test]
     fn test_build_round_id() {
-        let id = format!("{}-round-{}", "session-123", 1);
-        assert_eq!(id, "session-123-round-1");
+        let id =
+            crate::runtime::runner::round_prelude::build_round_id("session-123", "execution-a", 0);
+        assert_eq!(id, "session-123-run-execution-a-round-1");
 
-        let id = format!("{}-round-{}", "test", 4 + 1);
-        assert_eq!(id, "test-round-5");
+        let id = crate::runtime::runner::round_prelude::build_round_id("test", "execution-b", 4);
+        assert_eq!(id, "test-run-execution-b-round-5");
+
+        assert_ne!(
+            crate::runtime::runner::round_prelude::build_round_id("session-123", "execution-a", 0,),
+            crate::runtime::runner::round_prelude::build_round_id("session-123", "execution-b", 0,),
+            "the per-run round counter may reset, but the execution namespace must not"
+        );
+
+        let task_a = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+            "session-123",
+            "execution-a",
+            "task-evaluation",
+            1,
+        );
+        let task_b = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+            "session-123",
+            "execution-b",
+            "task-evaluation",
+            1,
+        );
+        let gold_a = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+            "session-123",
+            "execution-a",
+            "gold-evaluation",
+            1,
+        );
+        assert_eq!(
+            task_a,
+            "session-123-run-execution-a-task-evaluation-round-1"
+        );
+        assert_ne!(task_a, task_b);
+        assert_ne!(task_a, gold_a);
     }
 
     // --- Tests from round_prelude/cancellation.rs ---

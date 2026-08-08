@@ -69,6 +69,10 @@ pub(super) struct GoldEvaluationState {
 
 pub(super) struct LoopRunState {
     pub(super) session_id: String,
+    /// Collision-resistant namespace for metrics emitted by this logical
+    /// pipeline execution. Round counters restart on resume/re-execution, so
+    /// they are only unique within this private run scope.
+    pub(super) execution_id: String,
     pub(super) model_name: String,
     pub(super) metrics_collector: Option<MetricsCollector>,
     pub(super) debug_logger: DebugLogger,
@@ -194,6 +198,7 @@ pub(super) async fn initialize_loop_state(
 
     Ok(LoopRunState {
         session_id,
+        execution_id: crate::runtime::runner::round_prelude::new_execution_id(),
         model_name,
         metrics_collector,
         debug_logger,
