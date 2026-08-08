@@ -35,6 +35,7 @@ mod transforms;
 
 const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
 const MODEL_CONTEXT_RETENTION_PERCENT: u32 = 25;
+const MAX_PROJECTED_REQUEST_REFIT_PASSES: usize = 3;
 
 /// Session-metadata key holding the last emitted context-pressure level, so
 /// `ContextPressureNotification` is deduplicated across rounds on a per-level-
@@ -784,7 +785,7 @@ pub(super) async fn prepare_round_context(
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
-    _tool_schemas: &[ToolSchema],
+    tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<PreparedRoundContext, AgentError> {
@@ -810,11 +811,66 @@ pub(super) async fn prepare_round_context(
     // the exact fitting boundary. Historical context is a fixed part of the
     // provider-visible transcript and must reduce the ordinary message window.
     let ledger_usage = enforce_model_context_ledger_retention(session, &budget, &counter);
-    let mut prepared_context =
-        prepare_hybrid_context_with_fixed_tokens(session, &budget, &counter, ledger_usage.tokens)
-            .map_err(|error| AgentError::Budget(error.to_string()))?;
+    let mut additional_fixed_tokens = ledger_usage.tokens;
+    let mut refit_pass = 0usize;
+    let prepared_context = loop {
+        let mut candidate = prepare_hybrid_context_with_fixed_tokens(
+            session,
+            &budget,
+            &counter,
+            additional_fixed_tokens,
+        )
+        .map_err(|error| AgentError::Budget(error.to_string()))?;
+        transforms::apply_message_transforms(config, &mut candidate, llm, session_id).await?;
 
-    transforms::apply_message_transforms(config, &mut prepared_context, llm, session_id).await?;
+        // Reconciliation may append snapshots that did not exist when the
+        // durable ledger was measured above, especially after retention or
+        // hard-truncation starts a fresh epoch. Project the exact final IR on a
+        // shadow session and feed any deficit back into message fitting before
+        // the provider-bound reconciliation mutates or checkpoints live state.
+        let projected = super::stream_execution::project_request_usage(
+            session,
+            &candidate,
+            config,
+            tool_schemas,
+            model_name,
+        );
+        if projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES {
+            return Err(AgentError::Budget(format!(
+                "projected model-context ledger exceeds byte limit: ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                projected.ledger_rendered_bytes,
+            )));
+        }
+
+        // The ordinary fitter already owns system/conversation budgeting. Feed
+        // back only ledger tokens created by the shadow reconciliation; using
+        // the full PromptIR delta here would double-count stable prompt material
+        // that has its own existing budget path.
+        if projected.ledger_tokens <= additional_fixed_tokens {
+            break candidate;
+        }
+        if refit_pass >= MAX_PROJECTED_REQUEST_REFIT_PASSES {
+            return Err(AgentError::Budget(format!(
+                "projected model-context ledger remains under-reserved after {refit_pass} refit passes: ledger_tokens={}, reserved_tokens={additional_fixed_tokens}",
+                projected.ledger_tokens,
+            )));
+        }
+
+        let missing_ledger_tokens = projected
+            .ledger_tokens
+            .saturating_sub(additional_fixed_tokens);
+        additional_fixed_tokens = additional_fixed_tokens.saturating_add(missing_ledger_tokens);
+        refit_pass += 1;
+        tracing::info!(
+            session_id = %session.id,
+            refit_pass,
+            projected_ledger_tokens = projected.ledger_tokens,
+            missing_ledger_tokens,
+            additional_fixed_tokens,
+            "projected model-context snapshots were not reserved during fitting; refitting transcript"
+        );
+    };
+
     logging::log_context_truncation(session_id, &prepared_context);
 
     // Dedup state for pressure notifications lives in session.metadata so it

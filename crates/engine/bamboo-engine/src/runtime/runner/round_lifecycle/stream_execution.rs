@@ -372,6 +372,65 @@ struct PreparedRequestEnvelope {
     prefix_reset_reason: Option<bamboo_domain::ModelContextResetReason>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ProjectedRequestUsage {
+    pub input_tokens: u32,
+    pub ledger_tokens: u32,
+    pub ledger_rendered_bytes: usize,
+}
+
+fn measure_request_usage(
+    session: &Session,
+    envelope: &PreparedRequestEnvelope,
+) -> ProjectedRequestUsage {
+    let input_tokens = TiktokenTokenCounter::default().count_messages(&envelope.ir.flatten());
+    let (ledger_tokens, ledger_rendered_bytes) = session
+        .model_context_state
+        .as_ref()
+        .map(|state| {
+            let messages = state
+                .events
+                .iter()
+                .map(bamboo_domain::ModelContextEvent::render_message)
+                .collect::<Vec<_>>();
+            let rendered_bytes = state.events.iter().fold(0usize, |total, event| {
+                total.saturating_add(event.rendered_text.len())
+            });
+            (
+                TiktokenTokenCounter::default().count_messages(&messages),
+                rendered_bytes,
+            )
+        })
+        .unwrap_or((0, 0));
+    ProjectedRequestUsage {
+        input_tokens,
+        ledger_tokens,
+        ledger_rendered_bytes,
+    }
+}
+
+/// Project the exact PromptIR message input after ledger reconciliation without
+/// mutating the live session. Context preparation uses this shadow pass to
+/// reserve space for snapshots that are created only after ordinary message
+/// fitting (notably when a retention reset seeds a fresh prefix epoch).
+pub(super) fn project_request_usage(
+    session: &Session,
+    prepared_context: &PreparedContext,
+    config: &AgentLoopConfig,
+    tool_schemas: &[ToolSchema],
+    model: &str,
+) -> ProjectedRequestUsage {
+    let mut shadow = session.clone();
+    let envelope = build_request_envelope_reconciled(
+        &mut shadow,
+        prepared_context,
+        config,
+        tool_schemas,
+        model,
+    );
+    measure_request_usage(&shadow, &envelope)
+}
+
 fn build_request_envelope_reconciled(
     session: &mut Session,
     prepared_context: &PreparedContext,
@@ -873,24 +932,15 @@ pub(super) async fn execute_llm_stream(
     // exact final IR again before checkpoint/provider dispatch. Failing closed
     // preserves the context-window contract without committing an unsendable
     // ledger candidate.
-    let final_input_tokens =
-        TiktokenTokenCounter::default().count_messages(&prepared_envelope.ir.flatten());
+    let final_usage = measure_request_usage(session, &prepared_envelope);
     let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
-    let ledger_rendered_bytes = session
-        .model_context_state
-        .as_ref()
-        .map(|state| {
-            state.events.iter().fold(0usize, |total, event| {
-                total.saturating_add(event.rendered_text.len())
-            })
-        })
-        .unwrap_or(0);
-    if final_input_tokens > request_input_limit
-        || ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+    if final_usage.input_tokens > request_input_limit
+        || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
     {
         session.model_context_state = previous_model_context_state;
         return Err(AgentError::Budget(format!(
-            "final model input exceeds ledger-safe limits: input_tokens={final_input_tokens}, input_limit={request_input_limit}, ledger_bytes={ledger_rendered_bytes}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}"
+            "final PromptIR message input exceeds ledger-safe limits: input_tokens={}, input_limit={request_input_limit}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+            final_usage.input_tokens, final_usage.ledger_rendered_bytes,
         )));
     }
     // Reconciliation changes the next outbound model transcript. It must become

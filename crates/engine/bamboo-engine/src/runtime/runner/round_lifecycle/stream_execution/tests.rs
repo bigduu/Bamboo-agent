@@ -12,7 +12,7 @@ use super::execute_llm_stream;
 use super::LlmStreamFrame;
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
-use bamboo_compression::{PreparedContext, TokenUsageBreakdown};
+use bamboo_compression::{BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown};
 use bamboo_llm::{Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream};
 use chrono::Utc;
 
@@ -39,6 +39,7 @@ struct MockLlmProvider {
     /// Set when the engine routed this request through the canonical
     /// `chat_stream_ir` entry point.
     ir_invoked: Mutex<bool>,
+    ir_call_count: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait]
@@ -62,6 +63,8 @@ impl LLMProvider for MockLlmProvider {
         options: Option<&LLMRequestOptions>,
     ) -> bamboo_llm::provider::Result<LLMStream> {
         *self.ir_invoked.lock().expect("ir_invoked lock") = true;
+        self.ir_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Faithful Responses-provider adapter: derive the flat messages AND the
         // Responses wire options (instructions / input_messages / previous_response_id)
         // from the IR, exactly like the OpenAI/Copilot overrides — so the captured
@@ -163,6 +166,7 @@ fn mock_llm(chunks: Vec<LLMChunk>) -> Arc<MockLlmProvider> {
         requested_parallel_tool_calls: Mutex::new(None),
         requested_tool_names: Mutex::new(Vec::new()),
         ir_invoked: Mutex::new(false),
+        ir_call_count: std::sync::atomic::AtomicUsize::new(0),
     })
 }
 
@@ -997,6 +1001,179 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
         .expect("messages lock")
         .is_empty());
     assert_eq!(session.model_context_state, inflated_state);
+}
+
+#[tokio::test]
+async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
+    struct CountingCheckpointPersistence(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for CountingCheckpointPersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ledger-reseed-refit", "test-model");
+    session
+        .messages
+        .push(Message::system(expected_system_field("system")));
+    for index in 0..20 {
+        session.messages.push(Message::user(format!(
+            "conversation-{index} {}",
+            "bounded transcript payload ".repeat(40)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "answer-{index} {}",
+                "implementation evidence and verification ".repeat(40)
+            ),
+            None,
+        ));
+    }
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Active ledger context".to_string(),
+        items: vec![TaskItem {
+            id: "task-reseed".to_string(),
+            description: "current task state must survive the epoch reseed ".repeat(120),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    session.model_context_state = Some(bamboo_domain::ModelContextState {
+        state_revision: 5,
+        prefix_epoch: 3,
+        last_reset_reason: Some(bamboo_domain::ModelContextResetReason::RetentionLimit),
+        ..bamboo_domain::ModelContextState::default()
+    });
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        4_000,
+        256,
+        BudgetStrategy::default(),
+        0,
+    ));
+
+    let persistence = Arc::new(CountingCheckpointPersistence(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    let mut config = test_config("system");
+    config.persistence = Some(persistence.clone());
+    let budget = session.token_budget.as_ref().unwrap();
+    let naive = bamboo_compression::prepare_hybrid_context_with_fixed_tokens(
+        &session,
+        budget,
+        &bamboo_compression::TiktokenTokenCounter::default(),
+        0,
+    )
+    .expect("the legacy zero-reservation fit should succeed");
+    let naive_projection =
+        super::project_request_usage(&session, &naive, &config, &[], "test-model");
+    assert!(
+        naive_projection.input_tokens > budget.max_request_input_tokens(),
+        "without projected snapshots the prepared transcript must reproduce the old overflow"
+    );
+    let naive_message_count = naive.messages.len();
+
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let prepared = super::super::context_preparation::prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-ledger-reseed-refit",
+        &[],
+        &llm_dyn,
+        None,
+    )
+    .await
+    .expect("projected reseed should be absorbed by bounded transcript fitting");
+    assert!(prepared.prepared_context.truncation_occurred);
+    assert!(prepared.prepared_context.messages.len() < naive_message_count);
+    let projected = super::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(projected.input_tokens <= prepared.budget.max_request_input_tokens());
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let frame = LlmStreamFrame {
+        event_tx: &event_tx,
+        cancel_token: &CancellationToken::new(),
+        session_id: "session-ledger-reseed-refit",
+        model: "test-model",
+        provider_name: Some("openai"),
+        provider_type: Some("openai"),
+        reasoning_effort: None,
+        max_context_tokens: prepared.budget.max_context_tokens,
+        max_output_tokens: prepared.budget.max_output_tokens,
+    };
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared.prepared_context,
+        &[],
+        &frame,
+    )
+    .await
+    .expect("refitted request should dispatch");
+    let request_shape = |messages: &[Message]| {
+        messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role,
+                    "content": message.content,
+                    "tool_calls": message.tool_calls,
+                    "tool_call_id": message.tool_call_id,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_messages = request_shape(&llm.requested_messages.lock().unwrap());
+    let first_state = session.model_context_state.clone();
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        persistence.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the seeded ledger must checkpoint exactly once before dispatch"
+    );
+
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared.prepared_context,
+        &[],
+        &frame,
+    )
+    .await
+    .expect("identical retry should dispatch without a duplicate ledger event");
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        persistence.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "identical retry must not checkpoint an unchanged ledger"
+    );
+    assert_eq!(
+        request_shape(&llm.requested_messages.lock().unwrap()),
+        first_messages
+    );
+    assert_eq!(session.model_context_state, first_state);
 }
 
 #[test]
