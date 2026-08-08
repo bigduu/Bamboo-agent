@@ -80,7 +80,7 @@
 //! async tasks concurrently. SQLite connections are opened per-operation
 //! to avoid blocking the async runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -545,8 +545,10 @@ pub trait MetricsStorage: Send + Sync {
 
     /// Retrieves aggregated summary statistics for chat sessions.
     ///
-    /// Returns total sessions, token usage, tool call counts, and
-    /// active session count for sessions matching the filter.
+    /// Session/status counts are filtered by session start. Token/cache/
+    /// compression usage is filtered by each round's start, and tool counts by
+    /// each tool call's start. This intentionally keeps session lifecycle
+    /// dimensions separate from usage occurrence dimensions.
     ///
     /// # Arguments
     ///
@@ -570,8 +572,10 @@ pub trait MetricsStorage: Send + Sync {
 
     /// Retrieves metrics grouped by AI model.
     ///
-    /// Returns per-model statistics including session counts,
-    /// rounds, token usage, and tool calls.
+    /// Session counts use the session row's model and start date. Rounds and
+    /// token/cache usage use each round's own model and start date; tool calls
+    /// use their own start date and the model of their owning round. Models
+    /// present in only one side are retained.
     ///
     /// # Arguments
     ///
@@ -660,8 +664,10 @@ pub trait MetricsStorage: Send + Sync {
 
     /// Retrieves daily aggregated metrics for chat sessions.
     ///
-    /// Returns per-day statistics including session counts, token usage,
-    /// model breakdown, and tool breakdown for trend analysis.
+    /// Session counts are attributed to the session start date. Round usage and
+    /// model breakdown are attributed to each round's start date, including
+    /// still-running rounds; tool totals/breakdown use each tool call's start
+    /// date. A day with later activity can therefore have zero new sessions.
     ///
     /// # Arguments
     ///
@@ -922,6 +928,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                 CREATE INDEX IF NOT EXISTS idx_session_started_at ON session_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_session_model ON session_metrics(model);
                 CREATE INDEX IF NOT EXISTS idx_round_session ON round_metrics(session_id);
+                CREATE INDEX IF NOT EXISTS idx_round_started_at ON round_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_call_metrics(session_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_started_at ON tool_call_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_call_metrics(tool_name);
@@ -1671,43 +1678,101 @@ impl MetricsStorage for SqliteMetricsStorage {
 
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary> {
         self.with_connection(move |connection| {
-            let mut params_vec = Vec::new();
-            let where_clause = build_session_where_clause(
+            // Lifecycle dimensions belong to the session start date. Do not
+            // infer status/counts from rounds: a session may have no rounds, or
+            // may continue producing rounds on later days.
+            let mut session_params = Vec::new();
+            let session_clause = build_session_where_clause(
                 filter.start_date,
                 filter.end_date,
                 None,
-                &mut params_vec,
+                &mut session_params,
             );
-
-            let summary_sql = format!(
-                "SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0), COALESCE(SUM(prompt_cached_tool_tokens_saved), 0), COALESCE(SUM(total_compression_events), 0), COALESCE(SUM(total_tokens_saved), 0), COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'awaiting_response' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) FROM session_metrics {}",
-                where_clause
+            let session_sql = format!(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'awaiting_response' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) FROM session_metrics {}",
+                session_clause
             );
+            let session_stats = connection.query_row(
+                &session_sql,
+                params_from_iter(session_params.iter()),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )?;
 
-            let mut stmt = connection.prepare(&summary_sql)?;
-            let mut summary = stmt.query_row(params_from_iter(params_vec.iter()), |row| {
-                Ok(MetricsSummary {
-                    total_sessions: row.get::<_, i64>(0)? as u64,
-                    total_tokens: TokenUsage {
-                        prompt_tokens: row.get::<_, i64>(1)? as u64,
-                        completion_tokens: row.get::<_, i64>(2)? as u64,
-                        total_tokens: row.get::<_, i64>(3)? as u64,
-                    },
-                    total_tool_calls: row.get::<_, i64>(4)? as u64,
-                    prompt_cached_tool_outputs: row.get::<_, i64>(5)? as u64,
-                    tool_context_tokens_saved: row.get::<_, i64>(6)? as u64,
-                    total_compression_events: row.get::<_, i64>(7)? as u64,
-                    total_tokens_saved: row.get::<_, i64>(8)? as u64,
-                    non_tool_compression_tokens_saved: (row.get::<_, i64>(8)? - row.get::<_, i64>(6)?).max(0) as u64,
-                    completed_sessions: row.get::<_, i64>(9)? as u64,
-                    awaiting_response_sessions: row.get::<_, i64>(10)? as u64,
-                    error_sessions: row.get::<_, i64>(11)? as u64,
-                    cancelled_sessions: row.get::<_, i64>(12)? as u64,
-                    total_sync_mismatches: 0,
-                    sync_mismatch_breakdown: HashMap::new(),
-                    active_sessions: 0,
-                })
-            })?;
+            // Usage dimensions belong to the round occurrence. `started_at`
+            // is non-null for both running and completed rows and records when
+            // the billed model turn began; nullable `completed_at` is therefore
+            // intentionally not used as the attribution key.
+            let mut round_params = Vec::new();
+            let round_clause = build_started_at_where_clause(
+                "started_at",
+                filter.start_date,
+                filter.end_date,
+                &mut round_params,
+            );
+            let round_sql = format!(
+                "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0), COALESCE(SUM(prompt_cached_tool_tokens_saved), 0), COALESCE(SUM(compression_count), 0), COALESCE(SUM(tokens_saved), 0) FROM round_metrics {}",
+                round_clause
+            );
+            let round_stats = connection.query_row(
+                &round_sql,
+                params_from_iter(round_params.iter()),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )?;
+
+            let mut tool_params = Vec::new();
+            let tool_clause = build_started_at_where_clause(
+                "started_at",
+                filter.start_date,
+                filter.end_date,
+                &mut tool_params,
+            );
+            let tool_sql = format!("SELECT COUNT(*) FROM tool_call_metrics {}", tool_clause);
+            let total_tool_calls = connection.query_row(
+                &tool_sql,
+                params_from_iter(tool_params.iter()),
+                |row| row.get::<_, i64>(0),
+            )?;
+
+            let mut summary = MetricsSummary {
+                total_sessions: session_stats.0 as u64,
+                total_tokens: TokenUsage {
+                    prompt_tokens: round_stats.0 as u64,
+                    completion_tokens: round_stats.1 as u64,
+                    total_tokens: round_stats.2 as u64,
+                },
+                total_tool_calls: total_tool_calls as u64,
+                active_sessions: session_stats.5 as u64,
+                prompt_cached_tool_outputs: round_stats.3 as u64,
+                tool_context_tokens_saved: round_stats.4 as u64,
+                total_compression_events: round_stats.5 as u64,
+                total_tokens_saved: round_stats.6 as u64,
+                non_tool_compression_tokens_saved: (round_stats.6 - round_stats.4).max(0) as u64,
+                completed_sessions: session_stats.1 as u64,
+                awaiting_response_sessions: session_stats.2 as u64,
+                error_sessions: session_stats.3 as u64,
+                cancelled_sessions: session_stats.4 as u64,
+                total_sync_mismatches: 0,
+                sync_mismatch_breakdown: HashMap::new(),
+            };
 
             let mut mismatch_params = Vec::new();
             let mismatch_clause = build_execute_sync_mismatch_where_clause(
@@ -1729,64 +1794,104 @@ impl MetricsStorage for SqliteMetricsStorage {
                 filter.start_date,
                 filter.end_date,
             )?;
-            let mut active_params = Vec::new();
-            let active_clause = build_session_where_clause(
-                filter.start_date,
-                filter.end_date,
-                Some("running"),
-                &mut active_params,
-            );
-            let active_sql = format!(
-                "SELECT COUNT(*) FROM session_metrics {}",
-                active_clause
-            );
-            let mut active_stmt = connection.prepare(&active_sql)?;
-            let active_sessions = active_stmt.query_row(params_from_iter(active_params.iter()), |row| {
-                row.get::<_, i64>(0)
-            })? as u64;
 
-            Ok(MetricsSummary {
-                active_sessions,
-                ..summary
-            })
+            Ok(summary)
         })
         .await
     }
 
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>> {
         self.with_connection(move |connection| {
-            let mut params_vec = Vec::new();
-            let where_clause = build_session_where_clause(
+            let mut models: HashMap<String, ModelMetrics> = HashMap::new();
+
+            // Session counts retain the session row's model/start semantics.
+            let mut session_params = Vec::new();
+            let session_clause = build_session_where_clause(
                 filter.start_date,
                 filter.end_date,
                 None,
-                &mut params_vec,
+                &mut session_params,
             );
-
-            let sql = format!(
-                "SELECT model, COUNT(*), COALESCE(SUM(total_rounds), 0), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0) FROM session_metrics {} GROUP BY model ORDER BY SUM(total_tokens) DESC",
-                where_clause
+            let session_sql = format!(
+                "SELECT model, COUNT(*) FROM session_metrics {} GROUP BY model",
+                session_clause
             );
-
-            let mut stmt = connection.prepare(&sql)?;
-            let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
-            let mut models = Vec::new();
-
-            while let Some(row) = rows.next()? {
-                models.push(ModelMetrics {
-                    model: row.get(0)?,
-                    sessions: row.get::<_, i64>(1)? as u64,
-                    rounds: row.get::<_, i64>(2)? as u64,
-                    tokens: TokenUsage {
-                        prompt_tokens: row.get::<_, i64>(3)? as u64,
-                        completion_tokens: row.get::<_, i64>(4)? as u64,
-                        total_tokens: row.get::<_, i64>(5)? as u64,
-                    },
-                    tool_calls: row.get::<_, i64>(6)? as u64,
-                    prompt_cached_tool_outputs: row.get::<_, i64>(7)? as u64,
-                });
+            {
+                let mut stmt = connection.prepare(&session_sql)?;
+                let mut rows = stmt.query(params_from_iter(session_params.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let model = row.get::<_, String>(0)?;
+                    models
+                        .entry(model.clone())
+                        .or_insert_with(|| empty_model_metrics(model))
+                        .sessions = row.get::<_, i64>(1)? as u64;
+                }
             }
 
+            // Round count, token usage and cache values follow each round's own
+            // model and occurrence date, not the session's current model.
+            let mut round_params = Vec::new();
+            let round_clause = build_started_at_where_clause(
+                "started_at",
+                filter.start_date,
+                filter.end_date,
+                &mut round_params,
+            );
+            let round_sql = format!(
+                "SELECT model, COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0) FROM round_metrics {} GROUP BY model",
+                round_clause
+            );
+            {
+                let mut stmt = connection.prepare(&round_sql)?;
+                let mut rows = stmt.query(params_from_iter(round_params.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let model = row.get::<_, String>(0)?;
+                    let entry = models
+                        .entry(model.clone())
+                        .or_insert_with(|| empty_model_metrics(model));
+                    entry.rounds = row.get::<_, i64>(1)? as u64;
+                    entry.tokens = TokenUsage {
+                        prompt_tokens: row.get::<_, i64>(2)? as u64,
+                        completion_tokens: row.get::<_, i64>(3)? as u64,
+                        total_tokens: row.get::<_, i64>(4)? as u64,
+                    };
+                    entry.prompt_cached_tool_outputs = row.get::<_, i64>(5)? as u64;
+                }
+            }
+
+            // A tool call has no model column, so attribute it through its
+            // owning round while retaining the tool call's own occurrence date.
+            let mut tool_params = Vec::new();
+            let tool_clause = build_started_at_where_clause(
+                "tool_call_metrics.started_at",
+                filter.start_date,
+                filter.end_date,
+                &mut tool_params,
+            );
+            let tool_sql = format!(
+                "SELECT round_metrics.model, COUNT(*) FROM tool_call_metrics JOIN round_metrics ON round_metrics.round_id = tool_call_metrics.round_id {} GROUP BY round_metrics.model",
+                tool_clause
+            );
+            {
+                let mut stmt = connection.prepare(&tool_sql)?;
+                let mut rows = stmt.query(params_from_iter(tool_params.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let model = row.get::<_, String>(0)?;
+                    models
+                        .entry(model.clone())
+                        .or_insert_with(|| empty_model_metrics(model))
+                        .tool_calls = row.get::<_, i64>(1)? as u64;
+                }
+            }
+
+            let mut models = models.into_values().collect::<Vec<_>>();
+            models.sort_by(|left, right| {
+                right
+                    .tokens
+                    .total_tokens
+                    .cmp(&left.tokens.total_tokens)
+                    .then_with(|| left.model.cmp(&right.model))
+            });
             Ok(models)
         })
         .await
@@ -1985,51 +2090,39 @@ impl MetricsStorage for SqliteMetricsStorage {
             let start_bound = start_date.to_string();
             let end_bound = next_day_bound(end_date);
 
-            // Load the per-day model/tool breakdowns for the WHOLE range in one
-            // grouped query each, instead of two per result day (was 1 + 2N).
-            // Done before the main statement so their borrows of `connection`
-            // don't overlap the main `rows` iterator.
+            let mut sessions_by_day =
+                load_session_counts_by_day(connection, &start_bound, &end_bound)?;
+            let mut rounds_by_day =
+                load_round_aggregates_by_day(connection, &start_bound, &end_bound)?;
             let mut model_by_day =
                 load_model_breakdown_by_day(connection, &start_bound, &end_bound)?;
             let mut tool_by_day = load_tool_breakdown_by_day(connection, &start_bound, &end_bound)?;
 
-            let mut stmt = connection.prepare(
-                r#"
-                SELECT
-                    date(started_at) AS date_key,
-                    COUNT(*) AS total_sessions,
-                    COALESCE(SUM(total_rounds), 0) AS total_rounds,
-                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                    COALESCE(SUM(tool_call_count), 0) AS total_tool_calls,
-                    COALESCE(SUM(prompt_cached_tool_outputs), 0) AS prompt_cached_tool_outputs
-                FROM session_metrics
-                WHERE started_at >= ?1 AND started_at < ?2
-                GROUP BY date_key
-                ORDER BY date_key ASC
-                "#,
-            )?;
+            // A continuation day may have rounds or tools but no new session.
+            // Build the output keyset from all three occurrence dimensions so
+            // those later-day rows are never dropped by a session-only driver.
+            let mut dates = BTreeSet::new();
+            dates.extend(sessions_by_day.keys().copied());
+            dates.extend(rounds_by_day.keys().copied());
+            dates.extend(tool_by_day.keys().copied());
 
-            let mut rows = stmt.query(params![start_bound, end_bound])?;
-            let mut result = Vec::new();
-
-            while let Some(row) = rows.next()? {
-                let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+            let mut result = Vec::with_capacity(dates.len());
+            for date in dates {
+                let round = rounds_by_day.remove(&date).unwrap_or_default();
                 let model_breakdown = model_by_day.remove(&date).unwrap_or_default();
                 let tool_breakdown = tool_by_day.remove(&date).unwrap_or_default();
+                let total_tool_calls = tool_breakdown
+                    .values()
+                    .copied()
+                    .fold(0u32, u32::saturating_add);
 
                 result.push(DailyMetrics {
                     date,
-                    total_sessions: row.get::<_, i64>(1)? as u32,
-                    total_rounds: row.get::<_, i64>(2)? as u32,
-                    total_token_usage: TokenUsage {
-                        prompt_tokens: row.get::<_, i64>(3)? as u64,
-                        completion_tokens: row.get::<_, i64>(4)? as u64,
-                        total_tokens: row.get::<_, i64>(5)? as u64,
-                    },
-                    total_tool_calls: row.get::<_, i64>(6)? as u32,
-                    prompt_cached_tool_outputs: row.get::<_, i64>(7)? as u64,
+                    total_sessions: sessions_by_day.remove(&date).unwrap_or(0),
+                    total_rounds: round.total_rounds,
+                    total_token_usage: round.token_usage,
+                    total_tool_calls,
+                    prompt_cached_tool_outputs: round.prompt_cached_tool_outputs,
                     model_breakdown,
                     tool_breakdown,
                 });
@@ -2263,6 +2356,37 @@ fn next_day_bound(end: NaiveDate) -> String {
     end.succ_opt().unwrap_or(end).to_string()
 }
 
+/// Builds a half-open UTC date range over an internal `started_at` column.
+///
+/// Round attribution deliberately uses `round_metrics.started_at`: it is the
+/// non-null occurrence timestamp shared by completed and running rows. Tool
+/// attribution likewise uses the tool row's own `started_at`. The column name
+/// is always a static, code-owned SQL identifier, never user input.
+fn build_started_at_where_clause(
+    started_at_column: &'static str,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    params_vec: &mut Vec<String>,
+) -> String {
+    let mut conditions = Vec::new();
+
+    if let Some(start) = start_date {
+        conditions.push(format!("{started_at_column} >= ?"));
+        params_vec.push(start.to_string());
+    }
+
+    if let Some(end) = end_date {
+        conditions.push(format!("{started_at_column} < ?"));
+        params_vec.push(next_day_bound(end));
+    }
+
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
 fn build_session_where_clause(
     start_date: Option<NaiveDate>,
     end_date: Option<NaiveDate>,
@@ -2293,6 +2417,17 @@ fn build_session_where_clause(
         String::new()
     } else {
         format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn empty_model_metrics(model: String) -> ModelMetrics {
+    ModelMetrics {
+        model,
+        sessions: 0,
+        rounds: 0,
+        tokens: TokenUsage::default(),
+        tool_calls: 0,
+        prompt_cached_tool_outputs: 0,
     }
 }
 
@@ -2807,6 +2942,83 @@ fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec
     Ok(tools)
 }
 
+#[derive(Debug, Default)]
+struct DailyRoundAggregate {
+    total_rounds: u32,
+    token_usage: TokenUsage,
+    prompt_cached_tool_outputs: u64,
+}
+
+/// Loads new-session counts keyed by the session row's UTC start date.
+fn load_session_counts_by_day(
+    connection: &Connection,
+    start_bound: &str,
+    end_bound: &str,
+) -> MetricsResult<HashMap<NaiveDate, u32>> {
+    let mut stmt = connection.prepare(
+        r#"
+        SELECT date(started_at) AS date_key, COUNT(*)
+        FROM session_metrics
+        WHERE started_at >= ?1 AND started_at < ?2
+        GROUP BY date_key
+        "#,
+    )?;
+    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut by_day = HashMap::new();
+
+    while let Some(row) = rows.next()? {
+        let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+        by_day.insert(date, row.get::<_, i64>(1)? as u32);
+    }
+
+    Ok(by_day)
+}
+
+/// Loads round usage keyed by the round row's UTC start date.
+///
+/// `started_at` is present for both completed and running rows. A running row
+/// therefore contributes one round (and its currently persisted, usually-zero
+/// usage) without requiring a nullable completion timestamp.
+fn load_round_aggregates_by_day(
+    connection: &Connection,
+    start_bound: &str,
+    end_bound: &str,
+) -> MetricsResult<HashMap<NaiveDate, DailyRoundAggregate>> {
+    let mut stmt = connection.prepare(
+        r#"
+        SELECT date(started_at) AS date_key,
+               COUNT(*),
+               COALESCE(SUM(prompt_tokens), 0),
+               COALESCE(SUM(completion_tokens), 0),
+               COALESCE(SUM(total_tokens), 0),
+               COALESCE(SUM(prompt_cached_tool_outputs), 0)
+        FROM round_metrics
+        WHERE started_at >= ?1 AND started_at < ?2
+        GROUP BY date_key
+        "#,
+    )?;
+    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut by_day = HashMap::new();
+
+    while let Some(row) = rows.next()? {
+        let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+        by_day.insert(
+            date,
+            DailyRoundAggregate {
+                total_rounds: row.get::<_, i64>(1)? as u32,
+                token_usage: TokenUsage {
+                    prompt_tokens: row.get::<_, i64>(2)? as u64,
+                    completion_tokens: row.get::<_, i64>(3)? as u64,
+                    total_tokens: row.get::<_, i64>(4)? as u64,
+                },
+                prompt_cached_tool_outputs: row.get::<_, i64>(5)? as u64,
+            },
+        );
+    }
+
+    Ok(by_day)
+}
+
 /// Loads per-model token-usage breakdown for a whole date range in ONE grouped
 /// query (`GROUP BY date_key, model`), returning it keyed by day so callers can
 /// look up each day without a per-day query (avoids the daily-metrics N+1).
@@ -2819,7 +3031,7 @@ fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec
 ///
 /// # Returns
 ///
-/// `date -> (model -> total token usage)` for every day with sessions in range.
+/// `date -> (model -> total token usage)` for every day with rounds in range.
 fn load_model_breakdown_by_day(
     connection: &Connection,
     start_bound: &str,
@@ -2832,7 +3044,7 @@ fn load_model_breakdown_by_day(
                COALESCE(SUM(prompt_tokens), 0),
                COALESCE(SUM(completion_tokens), 0),
                COALESCE(SUM(total_tokens), 0)
-        FROM session_metrics
+        FROM round_metrics
         WHERE started_at >= ?1 AND started_at < ?2
         GROUP BY date_key, model
         "#,
@@ -3608,6 +3820,271 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_rollups_follow_round_day_and_model_while_sessions_follow_start() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+
+        let day_one = Utc
+            .with_ymd_and_hms(2026, 1, 31, 23, 59, 58)
+            .single()
+            .expect("valid first day");
+        let day_two = Utc
+            .with_ymd_and_hms(2026, 2, 1, 11, 0, 0)
+            .single()
+            .expect("valid second day");
+        let day_one_date = day_one.date_naive();
+        let day_two_date = day_two.date_naive();
+
+        storage
+            .upsert_session_start("cross-day", "model-a", day_one)
+            .await
+            .expect("session start");
+
+        storage
+            .insert_round_start("day-one-round", "cross-day", "model-a", day_one)
+            .await
+            .expect("first round start");
+        storage
+            .insert_tool_start(
+                "day-one-tool",
+                "day-one-round",
+                "cross-day",
+                "Read",
+                day_one,
+            )
+            .await
+            .expect("first tool start");
+        storage
+            .complete_tool_call(
+                "day-one-tool",
+                ToolCallCompletion {
+                    completed_at: day_one + chrono::Duration::seconds(1),
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("first tool complete");
+        storage
+            .complete_round(
+                "day-one-round",
+                // Completion crosses midnight, but occurrence attribution is
+                // deliberately locked to the round's non-null start timestamp.
+                day_one + chrono::Duration::seconds(2),
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 1,
+                    total_tokens: 11,
+                },
+                1,
+                0,
+                None,
+            )
+            .await
+            .expect("first round complete");
+
+        storage
+            .insert_round_start("day-two-round", "cross-day", "model-b", day_two)
+            .await
+            .expect("second round start");
+        storage
+            .insert_tool_start(
+                "day-two-tool",
+                "day-two-round",
+                "cross-day",
+                "Write",
+                day_two,
+            )
+            .await
+            .expect("second tool start");
+        storage
+            .complete_tool_call(
+                "day-two-tool",
+                ToolCallCompletion {
+                    completed_at: day_two + chrono::Duration::seconds(1),
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("second tool complete");
+        storage
+            .complete_round(
+                "day-two-round",
+                day_two + chrono::Duration::seconds(2),
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 20,
+                    completion_tokens: 2,
+                    total_tokens: 22,
+                },
+                2,
+                0,
+                None,
+            )
+            .await
+            .expect("second round complete");
+
+        // Running rows have no completion timestamp, but are still real round
+        // occurrences and must be counted on their non-null start date.
+        storage
+            .insert_round_start("day-two-running", "cross-day", "model-b", day_two)
+            .await
+            .expect("running round start");
+        storage
+            .complete_session(
+                "cross-day",
+                SessionStatus::Completed,
+                day_two + chrono::Duration::minutes(1),
+            )
+            .await
+            .expect("session completion");
+
+        let daily = storage
+            .daily_metrics(2, Some(day_two_date))
+            .await
+            .expect("cross-day daily metrics");
+        assert_eq!(daily.len(), 2);
+        let first_day = daily
+            .iter()
+            .find(|day| day.date == day_one_date)
+            .expect("session start day");
+        assert_eq!(first_day.total_sessions, 1);
+        assert_eq!(first_day.total_rounds, 1);
+        assert_eq!(first_day.total_token_usage.total_tokens, 11);
+        assert_eq!(first_day.total_tool_calls, 1);
+        assert_eq!(
+            first_day
+                .model_breakdown
+                .get("model-a")
+                .map(|usage| usage.total_tokens),
+            Some(11)
+        );
+
+        let second_day = daily
+            .iter()
+            .find(|day| day.date == day_two_date)
+            .expect("continuation day");
+        assert_eq!(
+            second_day.total_sessions, 0,
+            "session count remains attributed to session start"
+        );
+        assert_eq!(second_day.total_rounds, 2);
+        assert_eq!(second_day.total_token_usage.total_tokens, 22);
+        assert_eq!(second_day.total_tool_calls, 1);
+        assert_eq!(second_day.prompt_cached_tool_outputs, 2);
+        assert_eq!(
+            second_day
+                .model_breakdown
+                .get("model-b")
+                .map(|usage| usage.total_tokens),
+            Some(22)
+        );
+        assert_eq!(
+            second_day.tool_breakdown,
+            HashMap::from([(String::from("Write"), 1)])
+        );
+
+        let day_two_only = storage
+            .daily_metrics(1, Some(day_two_date))
+            .await
+            .expect("day-two-only daily metrics");
+        assert_eq!(day_two_only.len(), 1);
+        assert_eq!(day_two_only[0].total_sessions, 0);
+        assert_eq!(day_two_only[0].total_rounds, 2);
+        assert_eq!(day_two_only[0].total_token_usage.total_tokens, 22);
+
+        let by_model = storage
+            .by_model(MetricsDateFilter::default())
+            .await
+            .expect("model rollup");
+        let model_a = by_model
+            .iter()
+            .find(|model| model.model == "model-a")
+            .expect("session model");
+        assert_eq!(model_a.sessions, 1);
+        assert_eq!(model_a.rounds, 1);
+        assert_eq!(model_a.tokens.total_tokens, 11);
+        assert_eq!(model_a.tool_calls, 1);
+        assert_eq!(model_a.prompt_cached_tool_outputs, 1);
+
+        let model_b = by_model
+            .iter()
+            .find(|model| model.model == "model-b")
+            .expect("later round model retained without a session count");
+        assert_eq!(model_b.sessions, 0);
+        assert_eq!(model_b.rounds, 2);
+        assert_eq!(model_b.tokens.total_tokens, 22);
+        assert_eq!(model_b.tool_calls, 1);
+        assert_eq!(model_b.prompt_cached_tool_outputs, 2);
+
+        let day_two_models = storage
+            .by_model(MetricsDateFilter {
+                start_date: Some(day_two_date),
+                end_date: Some(day_two_date),
+            })
+            .await
+            .expect("day-two model rollup");
+        assert_eq!(day_two_models.len(), 1);
+        assert_eq!(day_two_models[0].model, "model-b");
+        assert_eq!(day_two_models[0].sessions, 0);
+        assert_eq!(day_two_models[0].rounds, 2);
+        assert_eq!(day_two_models[0].tokens.total_tokens, 22);
+
+        let day_two_summary = storage
+            .summary(MetricsDateFilter {
+                start_date: Some(day_two_date),
+                end_date: Some(day_two_date),
+            })
+            .await
+            .expect("day-two summary");
+        assert_eq!(day_two_summary.total_sessions, 0);
+        assert_eq!(day_two_summary.completed_sessions, 0);
+        assert_eq!(day_two_summary.total_tokens.total_tokens, 22);
+        assert_eq!(day_two_summary.total_tool_calls, 1);
+        assert_eq!(day_two_summary.prompt_cached_tool_outputs, 2);
+
+        // Every usage surface must equal a direct fold of round rows: session
+        // counts are separate and must never multiply the usage contribution.
+        let detail = storage
+            .session_detail("cross-day")
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        let direct_total = detail
+            .rounds
+            .iter()
+            .map(|round| round.token_usage.total_tokens)
+            .sum::<u64>();
+        assert_eq!(direct_total, 33);
+        assert_eq!(
+            daily
+                .iter()
+                .map(|day| day.total_token_usage.total_tokens)
+                .sum::<u64>(),
+            direct_total
+        );
+        assert_eq!(
+            by_model
+                .iter()
+                .map(|model| model.tokens.total_tokens)
+                .sum::<u64>(),
+            direct_total
+        );
+        assert_eq!(
+            storage
+                .summary(MetricsDateFilter::default())
+                .await
+                .expect("unfiltered summary")
+                .total_tokens
+                .total_tokens,
+            direct_total
+        );
+    }
+
+    #[tokio::test]
     async fn prune_deletes_old_rounds_and_refreshes_affected_session_aggregate() {
         let dir = tempdir().expect("temp dir");
         let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
@@ -3670,8 +4147,9 @@ mod tests {
 
     #[tokio::test]
     async fn daily_metrics_end_date_is_inclusive_and_next_day_excluded() {
-        // Locks the sargable-range rewrite (#234): a session at the very end of
-        // the end date is kept; one at 00:00 the next day is excluded.
+        // Locks the sargable half-open range for both session and round rows: an
+        // occurrence at the very end of the end date is kept; one at 00:00 the
+        // next day is excluded.
         let dir = tempdir().expect("temp dir");
         let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
         storage.init().await.expect("init storage");
@@ -3692,6 +4170,51 @@ mod tests {
             .upsert_session_start("out-of-range", "gpt-4", next_day_midnight)
             .await
             .expect("session start");
+        storage
+            .insert_round_start("in-range-round", "in-range", "gpt-4", end_of_day)
+            .await
+            .expect("in-range round start");
+        storage
+            .complete_round(
+                "in-range-round",
+                end_of_day,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("in-range round completion");
+        storage
+            .insert_round_start(
+                "out-of-range-round",
+                "out-of-range",
+                "gpt-4",
+                next_day_midnight,
+            )
+            .await
+            .expect("out-of-range round start");
+        storage
+            .complete_round(
+                "out-of-range-round",
+                next_day_midnight,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 2,
+                    completion_tokens: 2,
+                    total_tokens: 4,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("out-of-range round completion");
 
         let daily = storage
             .daily_metrics(
@@ -3707,6 +4230,8 @@ mod tests {
             daily[0].total_sessions, 1,
             "the 23:59:59 session is in range; the next-day 00:00 session is not"
         );
+        assert_eq!(daily[0].total_rounds, 1);
+        assert_eq!(daily[0].total_token_usage.total_tokens, 2);
     }
 
     #[tokio::test]
