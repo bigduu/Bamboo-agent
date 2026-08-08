@@ -536,9 +536,16 @@ impl RuntimeSessionPersistence for FailingCheckpointPersistence {
         Ok(())
     }
 
-    async fn checkpoint_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        Err(std::io::Error::other("intentional checkpoint failure"))
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if session.metadata.contains_key("llm_request_render") {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("intentional checkpoint failure"))
+        } else {
+            // The model-context ledger has its own fail-closed checkpoint test.
+            // This mock targets only the shared post-execution checkpoint whose
+            // failure must not replace the provider's original error.
+            Ok(())
+        }
     }
 }
 

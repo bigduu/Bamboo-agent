@@ -662,15 +662,23 @@ async fn activation_metadata_persistence_failure_releases_pin_before_provider_ca
 
 #[tokio::test]
 async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_pin() {
-    struct FailSecondSave(Arc<std::sync::atomic::AtomicUsize>);
+    struct FailAssistantToolCallSave(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]
-    impl bamboo_domain::RuntimeSessionPersistence for FailSecondSave {
-        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
-            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if call == 0 {
-                Ok(())
+    impl bamboo_domain::RuntimeSessionPersistence for FailAssistantToolCallSave {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            let is_assistant_tool_call_boundary = session.messages.iter().rev().any(|message| {
+                matches!(message.role, bamboo_agent_core::Role::Assistant)
+                    && message.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|call| call.function.name == "load_skill")
+                    })
+            });
+            if is_assistant_tool_call_boundary {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::other(
+                    "assistant tool-call checkpoint failed",
+                ))
             } else {
-                Err(std::io::Error::other("second save failed"))
+                Ok(())
             }
         }
     }
@@ -739,7 +747,7 @@ async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_
         AgentLoopConfig {
             skill_manager: Some(manager.clone()),
             selected_skill_ids: Some(vec!["review".to_string()]),
-            persistence: Some(Arc::new(FailSecondSave(save_count.clone()))),
+            persistence: Some(Arc::new(FailAssistantToolCallSave(save_count.clone()))),
             model_name: Some("model".to_string()),
             ..Default::default()
         },
@@ -749,7 +757,7 @@ async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_
         .expect_err("activation tool-call checkpoint must fail")
         .to_string()
         .contains("assistant tool-call checkpoint could not be persisted"));
-    assert_eq!(save_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(save_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(manager
         .store()
         .activation_descriptor("activation-checkpoint-failure")

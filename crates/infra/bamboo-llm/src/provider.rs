@@ -6,9 +6,9 @@
 use crate::prompt_ir::PromptIR;
 use crate::types::LLMChunk;
 use async_trait::async_trait;
-use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
+use bamboo_domain::{Message, ModelContextResetReason};
 use futures::Stream;
 use std::pin::Pin;
 use thiserror::Error;
@@ -114,6 +114,11 @@ pub struct ResponsesRequestOptions {
     /// `input_file` markers survive byte-for-byte. Agent/runtime calls leave it
     /// unset.
     pub raw_input_with_cache_breakpoints: Option<serde_json::Value>,
+    /// Internal model-context prefix epoch used only for safe wire-shape
+    /// diagnostics. It is never serialized into the upstream request.
+    pub prefix_epoch: Option<u64>,
+    /// Internal, secret-free reset reason paired with `prefix_epoch`.
+    pub prefix_reset_reason: Option<ModelContextResetReason>,
     /// Retain raw Responses protocol events alongside provider-neutral chunks.
     ///
     /// This is an internal compatibility-endpoint control, not an upstream

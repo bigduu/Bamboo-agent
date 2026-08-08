@@ -353,6 +353,307 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
 }
 
 #[tokio::test]
+async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
+    struct FailOncePersistence(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for FailOncePersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(std::io::Error::other("injected ledger checkpoint failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ledger-checkpoint-failure", "test-model");
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let mut config = test_config("system");
+    let persistence = Arc::new(FailOncePersistence(std::sync::atomic::AtomicUsize::new(0)));
+    config.persistence = Some(persistence.clone());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-ledger-checkpoint-failure",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("ledger state must be durable before provider dispatch");
+    };
+
+    assert!(error
+        .to_string()
+        .contains("model-context ledger checkpoint failed before provider dispatch"));
+    assert!(!*llm.ir_invoked.lock().expect("ir_invoked lock"));
+    assert!(llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .is_empty());
+    assert!(
+        session.model_context_state.is_none(),
+        "failed checkpoint must roll the in-memory ledger transaction back"
+    );
+
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-ledger-checkpoint-failure",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+        },
+    )
+    .await
+    .expect("retry checkpoints the same deterministic ledger before dispatch");
+    assert_eq!(
+        persistence.0.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retry must not bypass the failed durable checkpoint"
+    );
+    assert!(*llm.ir_invoked.lock().expect("ir_invoked lock"));
+}
+
+#[tokio::test]
+async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
+    use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
+    use bamboo_config::keyword_masking::{KeywordEntry, MatchType};
+    use bamboo_config::{
+        BodyPatch, BodyPatchOp, KeywordMaskingConfig, PatchValue, RequestOverridesConfig,
+        RequestScopeOverride,
+    };
+    use bamboo_llm::providers::common::{openai_responses, request_overrides};
+    use serde_json::{json, Value};
+
+    struct CapturingResponsesProvider {
+        bodies: Mutex<Vec<Value>>,
+        overrides: RequestOverridesConfig,
+        masking: KeywordMaskingConfig,
+    }
+
+    #[async_trait]
+    impl LLMProvider for CapturingResponsesProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("engine must dispatch the canonical PromptIR path")
+        }
+
+        async fn chat_stream_ir(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            let generic_messages = ir.flatten();
+            let responses = ir
+                .responses_request_options(options.and_then(|options| options.responses.as_ref()));
+            // `None` is intentional: this is the compatible-proxy
+            // explicit_prompt_cache=false lowering used by #781.
+            let mut body = openai_responses::build_responses_body(
+                model,
+                &generic_messages,
+                tools,
+                max_output_tokens,
+                options.and_then(|options| options.reasoning_effort),
+                Some(&responses),
+                options.and_then(|options| options.parallel_tool_calls),
+                None,
+            );
+            request_overrides::apply_overrides_to_body_with_env(
+                &mut body,
+                Some(&self.overrides),
+                request_overrides::ENDPOINT_RESPONSES,
+                Some(model),
+                &std::collections::HashMap::new(),
+            );
+            if let Some(name) = options.and_then(|options| options.required_tool.as_deref()) {
+                body["tool_choice"] = json!({"type": "function", "name": name});
+            }
+            bamboo_llm::masking::mask_outbound_body(&mut body, &self.masking);
+            self.bodies.lock().expect("bodies lock").push(body);
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let provider = Arc::new(CapturingResponsesProvider {
+        bodies: Mutex::new(Vec::new()),
+        overrides: RequestOverridesConfig {
+            common: RequestScopeOverride {
+                headers: Default::default(),
+                body_patch: vec![BodyPatch {
+                    path: "prompt_cache_key".to_string(),
+                    op: BodyPatchOp::Set,
+                    value: Some(PatchValue::Json(json!("operator-cache-key"))),
+                }],
+            },
+            endpoints: Default::default(),
+            rules: Vec::new(),
+        },
+        masking: KeywordMaskingConfig {
+            entries: vec![KeywordEntry {
+                pattern: "wire-secret".to_string(),
+                match_type: MatchType::Exact,
+                enabled: true,
+            }],
+        },
+    });
+    let llm: Arc<dyn LLMProvider> = provider.clone();
+    let mut session = Session::new("serialized-prefix-session", "test-model");
+    session.add_message(Message::system("BASE_IDENTITY"));
+    session.add_message(Message::user("wire-secret"));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Prefix work".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "context-v1".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let config = test_config("BASE_IDENTITY");
+    let tools = vec![ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: "lookup".to_string(),
+            description: "look up a value".to_string(),
+            parameters: json!({"type": "object"}),
+        },
+    }];
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(32);
+
+    macro_rules! capture_round {
+        () => {{
+            let prepared_context = PreparedContext {
+                messages: session.messages.clone(),
+                token_usage: usage(0, 22),
+                truncation_occurred: false,
+                segments_removed: 0,
+                compressed_message_ids: Vec::new(),
+                prompt_cached_tool_outputs: 0,
+                prompt_cached_tool_tokens_saved: 0,
+            };
+            execute_llm_stream(
+                &mut session,
+                &config,
+                &llm,
+                &prepared_context,
+                &tools,
+                &LlmStreamFrame {
+                    event_tx: &event_tx,
+                    cancel_token: &CancellationToken::new(),
+                    session_id: "serialized-prefix-session",
+                    model: "test-model",
+                    provider_name: Some("compatible-proxy"),
+                    provider_type: Some("openai"),
+                    reasoning_effort: None,
+                    max_context_tokens: 400_000,
+                    max_output_tokens: 128,
+                },
+            )
+            .await
+            .expect("captured Responses round");
+        }};
+    }
+
+    capture_round!();
+    session.add_message(Message::assistant(
+        "checking",
+        Some(vec![ToolCall {
+            id: "call-prefix".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: r#"{"query":"wire-secret"}"#.to_string(),
+            },
+        }]),
+    ));
+    session.add_message(Message::tool_result("call-prefix", "tool output"));
+    capture_round!();
+    session.task_list.as_mut().unwrap().items[0].description = "context-v2".to_string();
+    session.task_list.as_mut().unwrap().updated_at = Utc::now();
+    capture_round!();
+    session.add_message(Message::user("continue"));
+    capture_round!();
+
+    let bodies = provider.bodies.lock().expect("bodies lock").clone();
+    assert_eq!(bodies.len(), 4);
+    for pair in bodies.windows(2) {
+        let previous = pair[0]["input"].as_array().expect("previous input");
+        let current = pair[1]["input"].as_array().expect("current input");
+        assert_eq!(
+            previous,
+            &current[..previous.len()],
+            "the complete final serialized input must be the next input's leading slice"
+        );
+    }
+    let tool_round = bodies[1]["input"].as_array().unwrap();
+    assert!(tool_round
+        .iter()
+        .any(|item| item["type"] == "function_call"));
+    assert!(tool_round
+        .iter()
+        .any(|item| item["type"] == "function_call_output"));
+    assert!(bodies.iter().all(|body| {
+        body["prompt_cache_key"] == "operator-cache-key"
+            && body.get("prompt_cache_options").is_none()
+    }));
+    let final_wire = serde_json::to_string(&bodies).unwrap();
+    assert!(!final_wire.contains("wire-secret"));
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
+}
+
+#[tokio::test]
 async fn explicit_activation_pending_suppresses_answer_tokens() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-explicit-guard", "test-model");
@@ -600,17 +901,21 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
         .clone();
     assert_eq!(requested_messages.len(), 3);
     assert!(matches!(requested_messages[0].role, Role::System));
-    // Conversation history precedes the volatile context, which is appended at
-    // the tail so it stays out of the cacheable prefix.
+    // On the first ledger epoch the full task snapshot is seeded before the
+    // real transcript. It is provider-visible but never added to Session.messages.
     assert!(matches!(requested_messages[1].role, Role::User));
-    assert_eq!(requested_messages[1].content, "continue");
-    assert!(matches!(requested_messages[2].role, Role::User));
-    assert!(requested_messages[2]
+    assert!(requested_messages[1]
         .content
         .contains("context_type: task_snapshot"));
-    assert!(requested_messages[2]
+    assert!(requested_messages[1]
         .content
         .contains("Implement task block wiring"));
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert_eq!(requested_messages[2].content, "continue");
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
     assert_eq!(
         llm.requested_instructions
             .lock()
@@ -621,7 +926,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
 }
 
 #[test]
-fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
+fn build_request_envelope_seeds_ledger_without_rewriting_old_breakpoints() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-cache-plan", "test-model");
     session.task_list = Some(TaskList {
@@ -651,22 +956,28 @@ fn build_request_envelope_tails_volatile_context_and_sets_cache_breakpoints() {
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
 
-    // Volatile task context is rendered and placed at the very tail, out of the
-    // cacheable prefix — it is its own run AND the last message of the flat wire.
+    // The first epoch seeds typed context ahead of the real transcript. Future
+    // updates append after the prior transcript boundary instead of moving it.
     assert_eq!(
-        envelope.ir.run(bamboo_llm::SegmentRole::VolatileTail).len(),
-        1
+        envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
+            .len(),
+        2
     );
-    let last = envelope.ir.flatten();
-    let last = last.last().expect("flat messages present");
-    assert!(last.content.contains("context_type: task_snapshot"));
+    let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    assert!(transcript[0]
+        .content
+        .contains("context_type: task_snapshot"));
+    assert_eq!(transcript[1].content, "continue");
 
-    // Plan caches system + tools and puts a rolling breakpoint on the last
-    // conversation message (just before the volatile tail). The cache plan is the
-    // IR's (`ir.cache`), the SOLE authority.
+    // A rolling breakpoint would remove an annotation from the former last item
+    // on the next round and violate byte-prefix identity. Only stable fixed
+    // boundaries (for example a relocated tool guide) may be generated.
     assert!(envelope.ir.cache.cache_system);
     assert!(envelope.ir.cache.cache_tools);
-    assert!(envelope.ir.cache.is_breakpoint(&last_user_id));
+    assert!(!envelope.ir.cache.is_breakpoint(&last_user_id));
+    assert!(envelope.ir.cache.breakpoint_message_ids.is_empty());
     // The stable prefix uses the 1-hour extended TTL so the cache survives
     // pauses longer than the 5-minute default and big tool results keep hitting.
     assert_eq!(envelope.ir.cache.ttl, bamboo_llm::CacheTtl::Extended);
@@ -742,6 +1053,55 @@ fn stable_prefix_is_byte_stable_across_rounds() {
         sections(&e2),
         "stable prefix sections must not drift between rounds"
     );
+}
+
+#[test]
+fn execution_model_change_starts_one_cache_scope_epoch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-model-scope", "recorded-model");
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let first = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "model-a",
+    );
+    assert_eq!(first.prefix_epoch, 0);
+    assert!(first.prefix_reset_reason.is_none());
+
+    let changed = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "model-b",
+    );
+    assert_eq!(changed.prefix_epoch, 1);
+    assert_eq!(
+        changed.prefix_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::CacheScopeChanged)
+    );
+
+    let next = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "model-b",
+    );
+    assert_eq!(next.prefix_epoch, changed.prefix_epoch);
+    assert!(next.prefix_reset_reason.is_none());
 }
 
 #[tokio::test]
@@ -912,26 +1272,39 @@ fn build_request_envelope_relocates_session_context_after_tool_guide() {
         "session-variable skill context must leave the system prompt"
     );
 
-    // Rides as a typed, never-compressed, session-stable context-block message.
-    let msgs = envelope.ir.run(bamboo_llm::SegmentRole::StablePrefix);
-    let skill_pos = msgs
+    // The immutable guide remains the stable prefix; mutable skill state is a
+    // typed event in the chronological ledger.
+    let stable = envelope.ir.run(bamboo_llm::SegmentRole::StablePrefix);
+    let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    let skill_pos = transcript
         .iter()
         .position(|m| m.content.contains("SKILL_CONTEXT_MARKER"))
-        .expect("skill context relocated into a stable-prefix message");
-    assert!(msgs[skill_pos]
+        .expect("skill context reconciled into the model transcript");
+    assert!(transcript[skill_pos]
         .content
         .contains("context_type: skill_context"));
-    assert!(msgs[skill_pos].never_compress);
+    assert!(!transcript[skill_pos].never_compress);
 
-    // Positioned AFTER the large invariant tool guide.
-    let guide_pos = msgs
+    // Provider lowering places the stable guide before the ledger event.
+    let guide_pos = stable
         .iter()
         .position(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
         .expect("tool guide present");
-    assert!(
-        guide_pos < skill_pos,
-        "session context must follow the tool guide in the cached prefix"
-    );
+    let responses = envelope.ir.responses_input();
+    let response_guide = responses
+        .iter()
+        .position(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+        .unwrap();
+    let response_skill = responses
+        .iter()
+        .position(|m| m.content.contains("SKILL_CONTEXT_MARKER"))
+        .unwrap();
+    assert_eq!(guide_pos, 0);
+    assert!(response_guide < response_skill);
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
 }
 
 #[test]
@@ -1071,7 +1444,7 @@ fn system_blocks_join_is_byte_identical_to_lane_system_string() {
 }
 
 #[test]
-fn goal_rides_volatile_tail_and_never_leaks_into_system_blocks() {
+fn goal_rides_model_context_ledger_and_never_leaks_into_system_blocks() {
     // Goal-leak fix (step 6a): a per-session goal is built as a dedicated volatile
     // GoalState block in the tail — NOT injected into the cached system prefix —
     // so changing the goal never invalidates the cached system head.
@@ -1105,21 +1478,21 @@ fn goal_rides_volatile_tail_and_never_leaks_into_system_blocks() {
         .all(|b| !b.text.contains("SHIP_THE_RELEASE_GOAL")));
     assert!(!envelope.ir.system_text.contains("SHIP_THE_RELEASE_GOAL"));
 
-    // It rides the volatile tail as a typed GoalState context block.
+    // It rides the append-only model transcript as a typed GoalState snapshot.
     let goal_msg = envelope
         .ir
-        .run(bamboo_llm::SegmentRole::VolatileTail)
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
         .iter()
         .find(|m| m.content.contains("context_type: goal_state"))
-        .expect("goal rides the volatile tail as a goal_state block");
+        .expect("goal rides the model-context ledger as a goal_state block");
     assert!(goal_msg.content.contains("SHIP_THE_RELEASE_GOAL"));
 }
 
 #[test]
 fn zero_tools_fallback_keeps_merged_system_string_and_no_blocks() {
-    // When there is no tool/server guide (no tools, no MCP guidance), the static
-    // relocation does not apply: the system field stays the legacy merged string
-    // and `system_blocks` is empty (the string remains byte-authoritative).
+    // When there is no tool/server guide (no tools, no MCP guidance), the
+    // invariant system field stays a byte-authoritative string and
+    // `system_blocks` is empty. Mutable context is carried by the ledger.
     let _env_lock = isolate_prompt_safe_env_cache();
     let session = Session::new("session-zero-tools", "test-model");
     let config = test_config("BASE_SYSTEM_IDENTITY");
@@ -1174,7 +1547,7 @@ fn agent_loop_prompt_cache_key_is_stable_isolated_and_private() {
 }
 
 #[test]
-fn plan_llm_request_lanes_path_records_observability() {
+fn plan_llm_request_model_transcript_path_records_observability() {
     // The single request-planning seam: a normal request takes the canonical
     // lanes path and the render descriptor captures the system shape + cache plan.
     let _env_lock = isolate_prompt_safe_env_cache();
@@ -1194,9 +1567,10 @@ fn plan_llm_request_lanes_path_records_observability() {
 
     let planned = super::plan_llm_request(&envelope, "session-plan", None, 3, None);
 
-    // No continuation set on the IR → the canonical lanes wire.
+    // No continuation set on the IR → the canonical model-transcript wire.
     assert!(envelope.ir.continuation.is_none());
-    assert_eq!(planned.render.wire, "lanes");
+    assert_eq!(planned.render.wire, "model_transcript");
+    assert!(planned.render.model_transcript_messages >= 1);
     // System rendered as structured blocks (tool guide present → relocation on).
     assert!(planned.render.system_block_count >= 1);
     assert_eq!(planned.render.tool_count, 3);
@@ -1266,7 +1640,7 @@ fn message_shape(messages: &[bamboo_agent_core::Message]) -> Vec<(Role, String)>
 }
 
 /// Mirror the engine dispatch: set the stateful Responses continuation on the IR
-/// (boundary = the last assistant turn in the Conversation run), as
+/// (boundary = the last assistant turn in the ModelTranscript run), as
 /// `execute_llm_stream` does before planning/dispatch.
 fn with_ir_continuation(
     mut envelope: super::PreparedRequestEnvelope,
@@ -1274,7 +1648,7 @@ fn with_ir_continuation(
 ) -> super::PreparedRequestEnvelope {
     let last_committed_assistant_id = envelope
         .ir
-        .run(bamboo_llm::SegmentRole::Conversation)
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
         .iter()
         .rev()
         .find(|m| matches!(m.role, Role::Assistant))
@@ -1287,9 +1661,9 @@ fn with_ir_continuation(
 }
 
 #[test]
-fn envelope_ir_flatten_orders_runs_canonically() {
-    // The rich IR's flat lowering orders the runs canonically across a non-empty
-    // SystemRemainder + VolatileTail (the case that exposes the run ordering).
+fn envelope_ir_flatten_orders_stable_prefix_and_model_transcript() {
+    // The normal engine path lowers one chronological ModelTranscript after the
+    // immutable guide. Initial typed snapshots precede real history.
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ir-golden", "test-model");
     // A persisted System message that diverges from the assembled system field
@@ -1329,58 +1703,44 @@ fn envelope_ir_flatten_orders_runs_canonically() {
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
 
-    // The fixture must actually exercise the runs we care about.
-    assert!(
-        !envelope
-            .ir
-            .run(bamboo_llm::SegmentRole::SystemRemainder)
-            .is_empty(),
-        "fixture should produce a SystemRemainder run"
-    );
-    assert!(
-        !envelope
-            .ir
-            .run(bamboo_llm::SegmentRole::VolatileTail)
-            .is_empty(),
-        "fixture should produce a VolatileTail run"
-    );
-    // The flat lowering orders the runs canonically: system field first, then the
-    // stable prefix (incl. the relocated tool guide), then the SystemRemainder,
-    // then the conversation, then the volatile tail. The IR is the sole authority
-    // now — there is no lanes to compare against.
+    assert!(envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::SystemRemainder)
+        .is_empty());
+    assert!(envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::VolatileTail)
+        .is_empty());
+    assert!(!envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .is_empty());
+    // Flat order: system, stable guide, initial typed snapshot, then real history.
     let flat = message_shape(&envelope.ir.flatten());
     assert!(matches!(flat[0].0, Role::System));
     assert!(flat[0].1.contains("BASE_IDENTITY"), "system field leads");
     let pos = |needle: &str| flat.iter().position(|(_, c)| c.contains(needle));
     let guide = pos("NOVA_GUIDANCE_MARKER").expect("relocated tool guide present");
+    let task = pos("VOLATILE_TAIL_TASK").expect("task snapshot present");
     let remainder = pos("PERSISTED OPERATOR NOTE").expect("system remainder present");
     let conversation = pos("u1").expect("conversation present");
-    let volatile = pos("VOLATILE_TAIL_TASK").expect("task volatile tail present");
     assert!(
-        0 < guide && guide < remainder,
-        "stable prefix (guide) before the system remainder"
+        0 < guide && guide < task,
+        "stable prefix (guide) precedes the ledger"
     );
     assert!(
-        remainder < conversation,
-        "remainder before the conversation"
-    );
-    assert!(
-        conversation < volatile,
-        "conversation before the volatile tail"
+        task < remainder && remainder < conversation,
+        "initial snapshot precedes the unmodified real transcript"
     );
     // system_field() returns the byte-authoritative system string.
     assert_eq!(envelope.ir.system_field(), envelope.ir.system_text);
 }
 
 #[test]
-fn engine_continuation_delta_orders_all_four_runs() {
-    // GOLDEN: the engine's continuation delta exercises ALL FOUR runs in the
-    // canonical delta order — SystemRemainder FIRST, then DynamicContext (summary),
-    // then the conversation tail after the committed assistant turn, then the
-    // VolatileTail — the deliberately-different ordering from the chat view. The
-    // fixture populates EVERY run so the full ordering is verified (not just
-    // remainder + tail), and the tail is id-pinned to the exact post-boundary
-    // message instance.
+fn engine_model_transcript_continuation_delta_starts_after_assistant_boundary() {
+    // The engine's normal request no longer reconstructs four mutable lanes.
+    // Continuation slicing operates over the single chronological transcript,
+    // retaining only provider-visible items after the committed assistant.
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ir-delta-golden", "test-model");
     session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
@@ -1421,49 +1781,14 @@ fn engine_continuation_delta_orders_all_four_runs() {
     );
 
     let delta = envelope.ir.continuation_delta();
-    let shape = message_shape(&delta);
-    let pos = |needle: &str| {
-        shape
-            .iter()
-            .position(|(_, c)| c.contains(needle))
-            .unwrap_or_else(|| panic!("delta missing {needle}: {shape:?}"))
-    };
-    // All four runs present, in canonical delta order.
-    assert_eq!(
-        pos("PERSISTED OPERATOR NOTE"),
-        0,
-        "SystemRemainder is FIRST"
-    );
-    assert!(matches!(shape[0].0, Role::System));
-    assert!(
-        pos("PERSISTED OPERATOR NOTE") < pos("DELTA_SUMMARY_MARKER"),
-        "remainder before the dynamic-context summary"
-    );
-    assert!(
-        pos("DELTA_SUMMARY_MARKER") < pos("{\"ok\":true}"),
-        "dynamic-context summary before the conversation tail"
-    );
-    assert!(
-        pos("{\"ok\":true}") < pos("DELTA_TASK_MARKER"),
-        "conversation tail before the volatile tail"
-    );
-
-    // The tail is ONLY the post-assistant message (the tool result), pinned by the
-    // exact message id from the Conversation run — NOT the whole conversation.
-    let conversation = envelope.ir.run(bamboo_llm::SegmentRole::Conversation);
-    let tool_result_id = &conversation.last().expect("tool result present").id;
-    assert!(
-        delta
-            .iter()
-            .any(|m| &m.id == tool_result_id && matches!(m.role, Role::Tool)),
-        "delta carries the exact post-boundary message instance (id-pinned)"
-    );
-    assert!(
-        !delta
-            .iter()
-            .any(|m| m.content == "run a tool" || m.content == "calling tool"),
-        "pre-boundary turns (user + committed assistant) are NOT in the delta"
-    );
+    assert_eq!(delta.len(), 1);
+    assert!(matches!(delta[0].role, Role::Tool));
+    assert_eq!(delta[0].content, "{\"ok\":true}");
+    assert!(delta.iter().all(|message| {
+        !message.content.contains("DELTA_SUMMARY_MARKER")
+            && !message.content.contains("DELTA_TASK_MARKER")
+            && !message.content.contains("PERSISTED OPERATOR NOTE")
+    }));
 }
 
 #[test]
@@ -1903,16 +2228,16 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
         .lock()
         .expect("messages lock")
         .clone();
-    // Full request: system field, whole conversation, then the volatile external
-    // memory block at the tail (out of the cacheable prefix).
+    // First epoch: external memory is seeded before the real transcript. Later
+    // revisions append after the then-current transcript boundary.
     assert_eq!(requested_messages.len(), 5);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert!(matches!(requested_messages[3].role, Role::Tool));
-    assert!(matches!(requested_messages[4].role, Role::User));
-    assert!(requested_messages[4]
+    assert!(matches!(requested_messages[1].role, Role::User));
+    assert!(requested_messages[1]
         .content
         .contains("context_type: external_memory"));
-    assert!(requested_messages[4].content.contains("Session note body"));
+    assert!(requested_messages[1].content.contains("Session note body"));
+    assert!(matches!(requested_messages[4].role, Role::Tool));
     // The stale continuation id was ignored, not forwarded.
     assert_eq!(
         llm.requested_previous_response_id
@@ -1998,23 +2323,23 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
         .lock()
         .expect("messages lock")
         .clone();
-    // Full request: system field + conversation, then the volatile plan blocks
-    // at the tail (in push order: plan_runtime, then plan_mode).
+    // Initial snapshots are ordered deterministically by typed context kind,
+    // followed by the unchanged real transcript.
     assert_eq!(requested_messages.len(), 6);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert!(matches!(requested_messages[3].role, Role::Tool));
-    assert!(matches!(requested_messages[4].role, Role::User));
-    assert!(requested_messages[4]
-        .content
-        .contains("context_type: plan_runtime_state"));
-    assert!(requested_messages[4]
-        .content
-        .contains("DURABLE PLAN EXECUTION CONTEXT"));
-    assert!(matches!(requested_messages[5].role, Role::User));
-    assert!(requested_messages[5]
+    assert!(matches!(requested_messages[1].role, Role::User));
+    assert!(requested_messages[1]
         .content
         .contains("context_type: plan_mode_state"));
-    assert!(requested_messages[5].content.contains("PLAN MODE ACTIVE"));
+    assert!(requested_messages[1].content.contains("PLAN MODE ACTIVE"));
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
+        .content
+        .contains("context_type: plan_runtime_state"));
+    assert!(requested_messages[2]
+        .content
+        .contains("DURABLE PLAN EXECUTION CONTEXT"));
+    assert!(matches!(requested_messages[5].role, Role::Tool));
 }
 
 #[tokio::test]
