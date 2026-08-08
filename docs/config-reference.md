@@ -614,6 +614,7 @@ for Docker/CI/secret-manager deploys):
 | `BAMBOO_CORS_ALLOW_ORIGINS` | CORS allowlist. |
 | `BAMBOO_ENABLE_DEV_ENDPOINTS` | Gate dev-only HTTP endpoints. |
 | `BAMBOO_WS_AUTH_DEADLINE_MS` | WS v2 auth handshake timeout. |
+| `BAMBOO_WEB_SEARCH_ENDPOINTS` | Ordered, comma-separated absolute HTTP(S) endpoints used by `WebSearch`. Each endpoint receives a `POST` form with the `q` field; the first recognized HTML/Lite response wins. Defaults to DuckDuckGo's HTML endpoint followed by its Lite endpoint. |
 
 **Workspace / paths:**
 
