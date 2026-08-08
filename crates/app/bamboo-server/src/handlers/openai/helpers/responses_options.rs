@@ -138,6 +138,8 @@ pub(super) fn parse_responses_request_options(
             .filter(|value| value.is_object())
             .cloned(),
         raw_input_with_cache_breakpoints: None,
+        prefix_epoch: None,
+        prefix_reset_reason: None,
         retain_protocol_events: true,
     }
 }

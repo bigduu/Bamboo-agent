@@ -3,7 +3,8 @@ use crate::limits::{create_budget_for_model, ModelLimitsRegistry};
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_domain::MessagePhase;
 use bamboo_domain::{
-    CompressionEvent, CompressionTriggerType, ConversationSummary, Message, Session,
+    CompressionEvent, CompressionTriggerType, ConversationSummary, Message,
+    ModelContextResetReason, Session,
 };
 
 /// Checks if a message is part of a skill tool chain (load_skill / read_skill_resource).
@@ -563,6 +564,22 @@ pub fn estimate_context_compression_exposure(
     model_name: &str,
     configured_budget: Option<&TokenBudget>,
 ) -> ContextCompressionExposure {
+    estimate_context_compression_exposure_with_fixed_tokens(
+        session,
+        model_name,
+        configured_budget,
+        0,
+    )
+}
+
+/// Fixed-token-aware variant used when provider-visible context lives outside
+/// `Session::messages` (for example, the durable model-context ledger).
+pub fn estimate_context_compression_exposure_with_fixed_tokens(
+    session: &Session,
+    model_name: &str,
+    configured_budget: Option<&TokenBudget>,
+    additional_fixed_tokens: u32,
+) -> ContextCompressionExposure {
     // When a budget was already resolved upstream (the production path — see
     // `resolve_token_budget`, which publishes the current-round snapshot in
     // `session.resolved_token_budget` (#180),
@@ -585,7 +602,9 @@ pub fn estimate_context_compression_exposure(
         .as_ref()
         .map(|summary| counter.count_messages(&[compression_summary_message(&summary.content)]))
         .unwrap_or(0);
-    let active_tokens = active_message_tokens.saturating_add(summary_tokens);
+    let active_tokens = active_message_tokens
+        .saturating_add(summary_tokens)
+        .saturating_add(additional_fixed_tokens);
     // Use context window as the denominator for a single, provider-aligned
     // pressure scale across backend and frontend.
     let context_window = budget.max_context_tokens;
@@ -1244,6 +1263,7 @@ pub fn apply_compression_plan(session: &mut Session, plan: CompressionPlan) -> u
         cache_read_input_tokens: 0,
     });
 
+    session.reset_model_context_epoch(ModelContextResetReason::Compression);
     session.updated_at = Utc::now();
     plan.compressed_message_ids.len()
 }
@@ -1358,8 +1378,8 @@ pub fn build_summary_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::TokenBudgetUsage;
     use bamboo_domain::{FunctionCall, TaskItem, TaskItemStatus, TaskList, ToolCall};
+    use bamboo_domain::{ModelContextResetReason, ModelContextState, TokenBudgetUsage};
     use chrono::Utc;
 
     fn make_budget() -> TokenBudget {
@@ -2071,6 +2091,11 @@ mod tests {
         };
         let mut session = Session::new("recovery-inject", "gpt-4o-mini");
         session.token_budget = Some(budget.clone());
+        session.model_context_state = Some(ModelContextState {
+            prefix_epoch: 7,
+            cache_scope_sha256: Some("old-scope".to_string()),
+            ..ModelContextState::default()
+        });
         session.add_message(Message::system("system"));
 
         // Old messages with tool calls containing file paths
@@ -2123,6 +2148,18 @@ mod tests {
             has_recovery,
             "session should contain a post-compaction recovery message with the file path"
         );
+        let state = session
+            .model_context_state
+            .as_ref()
+            .expect("compression retains an explicit empty epoch boundary");
+        assert_eq!(state.prefix_epoch, 8);
+        assert_eq!(
+            state.last_reset_reason,
+            Some(ModelContextResetReason::Compression)
+        );
+        assert!(state.events.is_empty());
+        assert!(state.baselines.is_empty());
+        assert!(state.cache_scope_sha256.is_none());
     }
 
     #[test]

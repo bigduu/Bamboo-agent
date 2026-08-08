@@ -31,6 +31,26 @@ fn replace_or_append_last_user_message_replaces_existing() {
 }
 
 #[test]
+fn replace_last_user_message_marks_existing_model_history_for_rollback() {
+    let mut session = Session::new_child("child", "root", "test-model", "Child");
+    session.add_message(bamboo_agent_core::Message::user("old"));
+    session.model_context_state = Some(bamboo_domain::ModelContextState {
+        prefix_epoch: 2,
+        cache_scope_sha256: Some("scope".to_string()),
+        ..bamboo_domain::ModelContextState::default()
+    });
+
+    replace_or_append_last_user_message(&mut session, "new".to_string());
+
+    let state = session.model_context_state.as_ref().unwrap();
+    assert_eq!(state.prefix_epoch, 3);
+    assert_eq!(
+        state.last_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::Rollback)
+    );
+}
+
+#[test]
 fn normalize_non_empty_optional_rejects_blank_strings() {
     let err = normalize_non_empty_optional(Some("  ".to_string()), "prompt")
         .expect_err("blank should be rejected");

@@ -1,6 +1,6 @@
 //! Pure helpers for child session management.
 
-use bamboo_domain::Session;
+use bamboo_domain::{ModelContextResetReason, Session};
 use serde_json::json;
 
 use super::{ChildRunnerInfo, ChildSessionEntry, ChildSessionError};
@@ -154,7 +154,12 @@ pub fn replace_or_append_last_user_message(session: &mut Session, content: Strin
         .iter()
         .rposition(|message| matches!(message.role, Role::User))
     {
+        let rewrites_visible_history =
+            session.messages[index].content != content && session.model_context_state.is_some();
         session.messages[index].content = content;
+        if rewrites_visible_history {
+            session.reset_model_context_epoch(ModelContextResetReason::Rollback);
+        }
         return index;
     }
 
@@ -169,6 +174,7 @@ pub fn truncate_after_index(session: &mut Session, keep_last_index: usize) -> us
         session.messages.truncate(keep_len);
         session.token_usage = None;
         session.conversation_summary = None;
+        session.reset_model_context_epoch(ModelContextResetReason::Rollback);
     }
     removed
 }

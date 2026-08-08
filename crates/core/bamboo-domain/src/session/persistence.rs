@@ -166,7 +166,10 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// operation with their sidecar-only path. Custom/legacy implementations
     /// remain source-compatible and safely fall back to the full runtime save.
     ///
-    /// Callers must not rely on this operation to persist message changes.
+    /// Callers must not rely on this operation to persist message or
+    /// `model_context_state` changes. The durable ledger is checkpoint-owned;
+    /// sidecar implementations must preserve its latest committed value while
+    /// applying the caller's narrow control-plane mutation.
     async fn save_runtime_control_plane(&self, session: &mut Session) -> io::Result<()> {
         self.save_runtime_session(session).await
     }

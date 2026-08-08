@@ -14,6 +14,7 @@ use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
 use token_estimation::{estimate_completion_tokens, estimate_prompt_tokens};
 
+mod context_ledger;
 mod context_preparation;
 mod prefix_drift;
 mod stream_execution;

@@ -661,6 +661,11 @@ pub struct Session {
     pub prompt_snapshot: Option<PromptSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compression_events: Vec<CompressionEvent>,
+    /// Durable, provider-neutral host-context timeline. Synthetic ledger events
+    /// are projected only into model requests and never exposed through
+    /// `messages` or the existing session API/UI transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_state: Option<crate::session::model_context::ModelContextState>,
     /// Custom instructions for conversation summarization at the session level.
     /// Overrides config-level `compression_instructions` when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -756,6 +761,7 @@ impl Session {
             conversation_summary: None,
             prompt_snapshot: None,
             compression_events: Vec::new(),
+            model_context_state: None,
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -840,6 +846,7 @@ impl Session {
             conversation_summary: None,
             prompt_snapshot: None,
             compression_events: Vec::new(),
+            model_context_state: None,
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -888,6 +895,38 @@ impl Session {
         for message in &mut self.messages {
             message.compressed = false;
             message.compressed_by_event_id = None;
+        }
+        self.reset_model_context_epoch(
+            crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+    }
+
+    /// Mark a deliberate model-history rewrite. The next engine reconciliation
+    /// coalesces current host state into this new epoch before dispatch.
+    pub fn reset_model_context_epoch(
+        &mut self,
+        reason: crate::session::model_context::ModelContextResetReason,
+    ) {
+        let state = self
+            .model_context_state
+            .get_or_insert_with(Default::default);
+        // Several repair steps can participate in one deliberate history
+        // rewrite before another model request is dispatched. Coalesce those
+        // steps into the already-pending boundary instead of advancing through
+        // multiple unobservable epochs. The latest reason is the most precise
+        // description of the final rewrite that will be seeded next.
+        let reset_is_pending = state.cache_scope_sha256.is_none()
+            && state.baselines.is_empty()
+            && state.events.is_empty()
+            && state.transcript_item_sha256.is_empty()
+            && state.last_reset_reason.is_some();
+        if reset_is_pending {
+            if state.last_reset_reason != Some(reason) {
+                state.last_reset_reason = Some(reason);
+                state.advance_state_revision();
+            }
+        } else {
+            state.reset_epoch(reason);
         }
     }
 
@@ -1581,6 +1620,19 @@ mod tests {
         let session = Session::new("test-session", "test-model");
         let json = serde_json::to_string(&session).unwrap();
         assert!(!json.contains("compression_instructions"));
+    }
+
+    #[test]
+    fn legacy_session_without_model_context_state_deserializes_unchanged() {
+        let original = Session::new("legacy-context-ledger", "test-model");
+        let mut json = serde_json::to_value(&original).unwrap();
+        json.as_object_mut().unwrap().remove("model_context_state");
+
+        let restored: Session = serde_json::from_value(json).unwrap();
+        assert!(restored.model_context_state.is_none());
+        assert!(restored.messages.is_empty());
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.model, original.model);
     }
 
     #[test]

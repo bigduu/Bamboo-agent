@@ -1987,6 +1987,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_context_ledger_round_trips_through_session_persistence() -> io::Result<()> {
+        use bamboo_domain::{
+            deterministic_model_context_event_id, model_context_block_sha256,
+            render_model_context_snapshot, ContextBlock, ContextBlockBaseline,
+            ContextBlockPriority, ContextBlockStability, ContextBlockType, ModelContextEvent,
+            ModelContextEventKind, ModelContextState,
+        };
+
+        let (storage, _t) = create_temp_storage().await?;
+        let mut session = session_with_history("ledger-persistence", 2, "run-ledger");
+        let block = ContextBlock::new(
+            ContextBlockType::TaskSnapshot,
+            ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
+            "Task",
+            "durable context bytes",
+        );
+        let digest = model_context_block_sha256(&block);
+        let id = deterministic_model_context_event_id(
+            &session.id,
+            3,
+            ContextBlockType::TaskSnapshot,
+            1,
+            &digest,
+        );
+        let rendered_text = render_model_context_snapshot(&id, 3, 0, &block, 1, None);
+        let state = ModelContextState {
+            prefix_epoch: 3,
+            next_sequence: 1,
+            baselines: std::collections::BTreeMap::from([(
+                ContextBlockType::TaskSnapshot,
+                ContextBlockBaseline {
+                    revision: 1,
+                    content_sha256: digest.clone(),
+                },
+            )]),
+            events: vec![ModelContextEvent {
+                id,
+                epoch: 3,
+                sequence: 0,
+                anchor_message_id: None,
+                block_type: ContextBlockType::TaskSnapshot,
+                revision: 1,
+                supersedes_revision: None,
+                kind: ModelContextEventKind::Snapshot,
+                content_sha256: digest,
+                rendered_text,
+            }],
+            cache_scope_sha256: Some("scope-hash".to_string()),
+            transcript_item_sha256: vec!["item-hash".to_string()],
+            ..ModelContextState::default()
+        };
+        session.model_context_state = Some(state.clone());
+
+        storage.save_session(&session).await?;
+
+        let sidecar = storage
+            .read_runtime_sidecar(&session.id)
+            .await?
+            .expect("runtime sidecar");
+        assert_eq!(sidecar.model_context_state.as_ref(), Some(&state));
+        assert!(sidecar.messages.is_empty());
+
+        let loaded = storage
+            .load_session(&session.id)
+            .await?
+            .expect("persisted session");
+        assert_eq!(loaded.model_context_state.as_ref(), Some(&state));
+        assert_eq!(loaded.messages.len(), session.messages.len());
+        assert!(loaded
+            .messages
+            .iter()
+            .zip(&session.messages)
+            .all(|(loaded, original)| {
+                loaded.id == original.id
+                    && loaded.role == original.role
+                    && loaded.content == original.content
+            }));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn save_runtime_state_does_not_rewrite_session_json_messages() -> io::Result<()> {
         let (storage, _t) = create_temp_storage().await?;
 

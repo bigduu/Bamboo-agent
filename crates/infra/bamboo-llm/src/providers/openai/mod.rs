@@ -26,7 +26,8 @@ use super::common::openai_compat::{
     parse_openai_compat_sse_data_strict_multi,
 };
 use super::common::openai_responses::{
-    build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
+    build_responses_body, select_responses_input_messages, ResponsesInputSource,
+    ResponsesSseParser, ResponsesWirePrefixTracker,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -42,6 +43,7 @@ pub struct OpenAIProvider {
     explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
+    wire_prefix_tracker: ResponsesWirePrefixTracker,
 }
 
 impl OpenAIProvider {
@@ -56,6 +58,7 @@ impl OpenAIProvider {
             explicit_prompt_cache: true,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
+            wire_prefix_tracker: ResponsesWirePrefixTracker::default(),
         }
     }
 
@@ -138,6 +141,48 @@ impl OpenAIProvider {
         m == p
     }
 
+    fn observe_responses_wire(
+        &self,
+        body: &Value,
+        responses_options: Option<&ResponsesRequestOptions>,
+        session_log_id: &str,
+    ) {
+        let diagnostic = self.wire_prefix_tracker.observe_final_body(
+            body,
+            responses_options.and_then(|options| options.prefix_epoch),
+            responses_options
+                .and_then(|options| options.prefix_reset_reason)
+                .map(bamboo_domain::ModelContextResetReason::as_str),
+        );
+        tracing::info!(
+            "[{}] Responses wire prefix: relation={} epoch={} reset_reason={} cache_key_hash={} top_level_hash={} input_items={} previous_input_items={} first_divergent_item={} first_divergent_type={} final_cumulative_hash={}",
+            session_log_id,
+            diagnostic.relation.as_str(),
+            diagnostic
+                .prefix_epoch
+                .map(|epoch| epoch.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic.reset_reason.as_deref().unwrap_or("none"),
+            diagnostic.cache_key_sha256.as_deref().unwrap_or("absent"),
+            diagnostic.top_level_sha256,
+            diagnostic.input_item_count,
+            diagnostic
+                .previous_input_item_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic
+                .first_divergent_item
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic.first_divergent_type.as_deref().unwrap_or("none"),
+            diagnostic
+                .cumulative_item_sha256
+                .last()
+                .map(String::as_str)
+                .unwrap_or("empty"),
+        );
+    }
+
     fn uses_responses_api(&self, model: &str) -> bool {
         self.responses_only_models
             .iter()
@@ -209,6 +254,7 @@ impl OpenAIProvider {
         }
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        self.observe_responses_wire(&body, responses_options, session_log_id);
         let prompt_cache_affinity_hint = body
             .get("prompt_cache_key")
             .and_then(Value::as_str)
@@ -292,6 +338,11 @@ impl OpenAIProvider {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                self.observe_responses_wire(
+                    &fallback_body,
+                    Some(&fallback_options),
+                    session_log_id,
+                );
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
                 let fallback =
@@ -364,6 +415,11 @@ impl OpenAIProvider {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                self.observe_responses_wire(
+                    &fallback_body,
+                    Some(&fallback_options),
+                    session_log_id,
+                );
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
                 let fallback =

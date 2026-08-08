@@ -151,7 +151,9 @@ impl LockedSessionStore {
     /// do so.
     ///
     /// Callers MUST NOT use this when they have appended messages: the in-memory
-    /// `messages` are ignored by the sidecar and would not be persisted.
+    /// `messages` are ignored by the sidecar and would not be persisted. They
+    /// also MUST NOT use it to author `model_context_state`; the durable ledger
+    /// loaded under the lock always wins this narrow save.
     pub async fn save_runtime_only(&self, session: &mut Session) -> std::io::Result<()> {
         self.save_runtime_only_and_publish(session, |_| {}).await
     }
@@ -174,11 +176,16 @@ impl LockedSessionStore {
         F: FnOnce(&Session) + Send,
     {
         let _guard = self.acquire_lock(&session.id).await;
-        if let Ok(Some(latest)) = self.storage.load_runtime_control_plane(&session.id).await {
+        if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
             apply_authoritative_metadata(session, &latest);
             // The control-plane sidecar carries `agent_runtime_state`, so a
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
             adopt_fresher_disk_permission_posture(session, &latest);
+            // Runtime-only callers own narrow control-plane fields (Task list,
+            // parent wait state, …), never the model-context ledger. The sidecar
+            // load and save share this lock, so disk is unconditionally
+            // authoritative for the ledger and the published snapshot.
+            adopt_durable_model_context_state(session, &latest);
         }
         let result = self.storage.save_runtime_state(session).await;
         publish(session);
@@ -223,7 +230,11 @@ impl LockedSessionStore {
     /// between the caller's load and this save, so merge is unnecessary.
     pub async fn commit_metadata(&self, session: &Session) -> std::io::Result<()> {
         let _guard = self.acquire_lock(&session.id).await;
-        self.storage.save_session(session).await
+        let mut committed = session.clone();
+        if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
+            adopt_durable_model_context_state(&mut committed, &latest);
+        }
+        self.storage.save_session(&committed).await
     }
 
     /// Runtime / non-authoritative save with per-session lock.
@@ -296,6 +307,7 @@ impl LockedSessionStore {
         let latest = self.storage.load_session(&session.id).await?;
 
         if let Some(latest) = latest.as_ref() {
+            ensure_model_context_checkpoint_is_current(session, latest)?;
             let incoming_count = session.messages.len();
             let durable_count = latest.messages.len();
             let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
@@ -350,7 +362,7 @@ impl LockedSessionStore {
         // session carrying the full conversation history that doubled the
         // deserialization cost of every runtime save, which is the hot path
         // during sub-agent spawn.
-        let latest = self.storage.load_session(&session.id).await.ok().flatten();
+        let latest = self.storage.load_session(&session.id).await?;
 
         // DIAGNOSTIC: merge_save_runtime overwrites the whole `messages` array
         // (it only merges authoritative metadata, not messages). If the incoming
@@ -396,6 +408,7 @@ impl LockedSessionStore {
             if adopt_bypass {
                 adopt_fresher_disk_permission_posture(session, latest);
             }
+            adopt_fresher_durable_model_context_state(session, latest);
         }
         let result = self.storage.save_session(session).await;
         publish(session, result.is_ok());
@@ -432,6 +445,7 @@ impl LockedSessionStore {
             apply_authoritative_metadata(session, &latest);
             bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
             bamboo_domain::merge_session_inbox_admission(session, &latest);
+            adopt_fresher_durable_model_context_state(session, &latest);
 
             let durable_audit = PermissionAuditSnapshot::from_metadata(&latest.metadata);
             let durable_floor = durable_audit
@@ -707,13 +721,75 @@ impl RuntimeSessionPersistence for LockedSessionStore {
 async fn merge_authoritative_metadata_into_stale(
     storage: &Arc<dyn Storage>,
     session: &mut Session,
-) {
-    if let Ok(Some(latest)) = storage.load_session(&session.id).await {
+) -> std::io::Result<()> {
+    if let Some(latest) = storage.load_session(&session.id).await? {
         apply_authoritative_metadata(session, &latest);
         bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
         bamboo_domain::merge_session_inbox_admission(session, &latest);
         adopt_fresher_disk_permission_posture(session, &latest);
+        adopt_fresher_durable_model_context_state(session, &latest);
     }
+    Ok(())
+}
+
+/// Runtime-only writes never own the ledger, so the snapshot loaded under the
+/// session lock is authoritative even if the caller happens to carry a larger
+/// revision. This keeps both the sidecar and synchronous cache publication from
+/// regressing after a concurrent engine checkpoint.
+fn adopt_durable_model_context_state(session: &mut Session, latest: &Session) {
+    session
+        .model_context_state
+        .clone_from(&latest.model_context_state);
+}
+
+/// Merge policy for ordinary full runtime saves. Legitimate ledger writers
+/// (compression/rollback/reconciliation) advance `state_revision`; stale or
+/// conflicting non-ledger writers adopt the already-committed state. Equal
+/// revisions with different bytes are concurrent children of the same base, so
+/// durable state wins instead of allowing last-writer-wins corruption.
+fn adopt_fresher_durable_model_context_state(session: &mut Session, latest: &Session) {
+    let adopt = match (
+        session.model_context_state.as_ref(),
+        latest.model_context_state.as_ref(),
+    ) {
+        (None, Some(_)) => true,
+        (Some(incoming), Some(durable)) => {
+            durable.state_revision > incoming.state_revision
+                || (durable.state_revision == incoming.state_revision && durable != incoming)
+        }
+        _ => false,
+    };
+    if adopt {
+        adopt_durable_model_context_state(session, latest);
+    }
+}
+
+/// A provider-bound ledger checkpoint must never silently substitute a newer or
+/// conflicting disk ledger after the request body was prepared. Reject it so
+/// the engine can roll back the in-memory candidate and retry from a fresh
+/// session; only a strictly newer incoming revision may replace disk.
+fn ensure_model_context_checkpoint_is_current(
+    session: &Session,
+    latest: &Session,
+) -> std::io::Result<()> {
+    let stale_or_conflicting = match (
+        session.model_context_state.as_ref(),
+        latest.model_context_state.as_ref(),
+    ) {
+        (None, Some(_)) => true,
+        (Some(incoming), Some(durable)) => {
+            durable.state_revision > incoming.state_revision
+                || (durable.state_revision == incoming.state_revision && durable != incoming)
+        }
+        _ => false,
+    };
+    if stale_or_conflicting {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "stale or conflicting model-context ledger checkpoint",
+        ));
+    }
+    Ok(())
 }
 
 /// Adopt the on-disk typed permission posture into the session about to be
@@ -808,7 +884,7 @@ pub async fn merge_save_session(
     storage: &Arc<dyn Storage>,
     session: &mut Session,
 ) -> std::io::Result<()> {
-    merge_authoritative_metadata_into_stale(storage, session).await;
+    merge_authoritative_metadata_into_stale(storage, session).await?;
     storage.save_session(session).await
 }
 
@@ -863,6 +939,16 @@ mod tests {
 
     fn fresh(id: &str) -> Session {
         Session::new(id.to_string(), "test-model".to_string())
+    }
+
+    fn ledger_state(state_revision: u64, marker: &str) -> bamboo_domain::ModelContextState {
+        bamboo_domain::ModelContextState {
+            state_revision,
+            prefix_epoch: state_revision,
+            cache_scope_sha256: Some("scope".to_string()),
+            transcript_item_sha256: vec![marker.to_string()],
+            ..bamboo_domain::ModelContextState::default()
+        }
     }
 
     fn set_permission_audit(
@@ -1422,6 +1508,169 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    #[tokio::test]
+    async fn runtime_only_save_preserves_checkpointed_ledger_and_publishes_merged_state() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-only-ledger-race";
+        let baseline = fresh(session_id);
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale_control = storage.load_session(session_id).await.unwrap().unwrap();
+
+        let mut runner = baseline;
+        runner.model_context_state = Some(ledger_state(1, "runner-l1"));
+        store.checkpoint_runtime_session(&mut runner).await.unwrap();
+
+        stale_control.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        let published = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let published_clone = published.clone();
+        store
+            .save_runtime_only_and_publish(&mut stale_control, move |saved| {
+                *published_clone.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        let expected = runner.model_context_state.clone();
+        assert_eq!(stale_control.model_context_state, expected);
+        assert_eq!(
+            published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .model_context_state,
+            expected
+        );
+        let sidecar = storage
+            .load_runtime_control_plane(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sidecar.model_context_state, expected);
+        assert_eq!(
+            sidecar
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
+        );
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, expected);
+    }
+
+    #[tokio::test]
+    async fn full_runtime_save_preserves_newer_ledger_but_commits_control_mutation() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "full-save-ledger-race";
+        let baseline = fresh(session_id);
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale = storage.load_session(session_id).await.unwrap().unwrap();
+
+        let mut runner = baseline;
+        runner.model_context_state = Some(ledger_state(1, "runner-l1"));
+        store.checkpoint_runtime_session(&mut runner).await.unwrap();
+
+        stale
+            .metadata
+            .insert("activated_tools".to_string(), "[\"search\"]".to_string());
+        let published = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let published_clone = published.clone();
+        store
+            .merge_save_runtime_and_publish(&mut stale, move |saved, committed| {
+                assert!(committed);
+                *published_clone.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        let expected = runner.model_context_state.clone();
+        assert_eq!(stale.model_context_state, expected);
+        assert_eq!(
+            published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .model_context_state,
+            expected
+        );
+        let sidecar = storage
+            .load_runtime_control_plane(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sidecar.model_context_state, expected);
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, expected);
+        assert_eq!(
+            reloaded.metadata.get("activated_tools").map(String::as_str),
+            Some("[\"search\"]")
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_explicit_epoch_reset_wins_an_ordinary_full_runtime_save() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "full-save-ledger-reset";
+        let mut durable = fresh(session_id);
+        durable.model_context_state = Some(ledger_state(1, "runner-l1"));
+        storage.save_session(&durable).await.unwrap();
+
+        let mut compression = storage.load_session(session_id).await.unwrap().unwrap();
+        compression.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        let reset = compression.model_context_state.clone();
+        assert_eq!(reset.as_ref().unwrap().state_revision, 2);
+        store.merge_save_runtime(&mut compression).await.unwrap();
+
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, reset);
+        assert_eq!(
+            reloaded
+                .model_context_state
+                .as_ref()
+                .and_then(|state| state.last_reset_reason),
+            Some(bamboo_domain::ModelContextResetReason::Compression)
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_equal_revision_divergence_without_overwriting_disk() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "ledger-checkpoint-cas";
+        let mut baseline = fresh(session_id);
+        baseline.model_context_state = Some(ledger_state(1, "runner-l1"));
+        storage.save_session(&baseline).await.unwrap();
+
+        let mut first = baseline.clone();
+        first.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        let mut conflicting = baseline;
+        conflicting.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Rollback);
+        assert_eq!(
+            first.model_context_state.as_ref().unwrap().state_revision,
+            conflicting
+                .model_context_state
+                .as_ref()
+                .unwrap()
+                .state_revision
+        );
+
+        store.checkpoint_runtime_session(&mut first).await.unwrap();
+        let error = store
+            .checkpoint_runtime_session(&mut conflicting)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, first.model_context_state);
     }
 
     #[tokio::test]

@@ -11,10 +11,15 @@ use bamboo_agent_core::{
 };
 use bamboo_compression::{
     apply_compression_plan, build_forced_compression_candidate_plan_with_fixed_tokens,
-    estimate_context_compression_exposure, finalize_compression_candidate_plan,
-    prepare_hybrid_context, PreparedContext, TiktokenTokenCounter, TokenBudget, TokenCounter,
+    estimate_context_compression_exposure_with_fixed_tokens,
+    estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
+    prepare_hybrid_context_with_fixed_tokens, PreparedContext, TiktokenTokenCounter, TokenBudget,
+    TokenCounter,
 };
-use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload};
+use bamboo_domain::{
+    AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason,
+    MAX_MODEL_CONTEXT_EVENTS, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+};
 use bamboo_llm::LLMProvider;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,6 +34,8 @@ mod ocr_cache;
 mod transforms;
 
 const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
+const MODEL_CONTEXT_RETENTION_PERCENT: u32 = 25;
+const MAX_PROJECTED_REQUEST_REFIT_PASSES: usize = 3;
 
 /// Session-metadata key holding the last emitted context-pressure level, so
 /// `ContextPressureNotification` is deduplicated across rounds on a per-level-
@@ -38,6 +45,123 @@ const LAST_PRESSURE_LEVEL_KEY: &str = "context_pressure_last_level";
 pub(super) struct PreparedRoundContext {
     pub prepared_context: PreparedContext,
     pub budget: TokenBudget,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelContextLedgerUsage {
+    tokens: u32,
+    rendered_bytes: usize,
+}
+
+fn model_context_ledger_usage(
+    session: &Session,
+    counter: &dyn TokenCounter,
+) -> ModelContextLedgerUsage {
+    let Some(state) = session.model_context_state.as_ref() else {
+        return ModelContextLedgerUsage::default();
+    };
+    let messages = state
+        .events
+        .iter()
+        .map(bamboo_domain::ModelContextEvent::render_message)
+        .collect::<Vec<_>>();
+    ModelContextLedgerUsage {
+        tokens: counter.count_messages(&messages),
+        rendered_bytes: state.events.iter().fold(0usize, |total, event| {
+            total.saturating_add(event.rendered_text.len())
+        }),
+    }
+}
+
+/// Bound superseded ledger history before ordinary message fitting. A single
+/// current snapshot is treated as fixed authority and either fits (with the
+/// conversation trimmed around it) or fails the final request guard; only
+/// historical growth is coalesced automatically into a new prefix epoch.
+fn enforce_model_context_ledger_retention(
+    session: &mut Session,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+) -> ModelContextLedgerUsage {
+    let usage = model_context_ledger_usage(session, counter);
+    let Some(state) = session.model_context_state.as_ref() else {
+        return usage;
+    };
+    let token_limit = budget
+        .max_request_input_tokens()
+        .saturating_mul(MODEL_CONTEXT_RETENTION_PERCENT)
+        / 100;
+    let has_superseded_history = state.events.len() > state.baselines.len();
+    let retention_exceeded = state.events.len() > MAX_MODEL_CONTEXT_EVENTS
+        || usage.rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+        || (has_superseded_history && usage.tokens > token_limit);
+    if !retention_exceeded {
+        return usage;
+    }
+
+    tracing::info!(
+        session_id = %session.id,
+        ledger_events = state.events.len(),
+        ledger_tokens = usage.tokens,
+        ledger_token_limit = token_limit,
+        ledger_rendered_bytes = usage.rendered_bytes,
+        ledger_byte_limit = MAX_MODEL_CONTEXT_RENDERED_BYTES,
+        "model-context ledger retention limit reached; starting a coalesced prefix epoch"
+    );
+    session.reset_model_context_epoch(ModelContextResetReason::RetentionLimit);
+    ModelContextLedgerUsage::default()
+}
+
+fn refit_transformed_context(
+    session: &Session,
+    previous: PreparedContext,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    additional_fixed_tokens: u32,
+) -> Result<PreparedContext, AgentError> {
+    // Image fallback and attachment resolution may perform I/O or a paid
+    // auxiliary model call. Refit the already-transformed candidate rather than
+    // rerunning those transforms on every bounded projection pass.
+    let mut refit_session = session.clone();
+    // A prepared candidate already contains the synthetic summary carrier. Drop
+    // that carrier from the bounded subset and let the fitter re-inject the same
+    // durable summary exactly once, preserving its summary-token attribution.
+    refit_session.messages = previous
+        .messages
+        .iter()
+        .filter(|message| {
+            !(matches!(message.role, Role::System)
+                && message
+                    .content
+                    .contains("<!-- CONVERSATION_SUMMARY_START -->"))
+        })
+        .cloned()
+        .collect();
+
+    let mut refitted = prepare_hybrid_context_with_fixed_tokens(
+        &refit_session,
+        budget,
+        counter,
+        additional_fixed_tokens,
+    )
+    .map_err(|error| AgentError::Budget(error.to_string()))?;
+    refitted.truncation_occurred |= previous.truncation_occurred;
+    refitted.segments_removed = refitted
+        .segments_removed
+        .saturating_add(previous.segments_removed);
+    refitted.prompt_cached_tool_outputs = refitted
+        .prompt_cached_tool_outputs
+        .saturating_add(previous.prompt_cached_tool_outputs);
+    refitted.prompt_cached_tool_tokens_saved = refitted
+        .prompt_cached_tool_tokens_saved
+        .saturating_add(previous.prompt_cached_tool_tokens_saved);
+    let mut compressed_message_ids = previous.compressed_message_ids;
+    for message_id in refitted.compressed_message_ids.drain(..) {
+        if !compressed_message_ids.contains(&message_id) {
+            compressed_message_ids.push(message_id);
+        }
+    }
+    refitted.compressed_message_ids = compressed_message_ids;
+    Ok(refitted)
 }
 
 async fn emit_context_compression_status(
@@ -211,7 +335,14 @@ async fn maybe_apply_host_context_compression_with_budget(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
 ) -> Result<bool, AgentError> {
-    let exposure = estimate_context_compression_exposure(session, model_name, Some(budget));
+    let counter = TiktokenTokenCounter::default();
+    let ledger_usage = enforce_model_context_ledger_retention(session, budget, &counter);
+    let exposure = estimate_context_compression_exposure_with_fixed_tokens(
+        session,
+        model_name,
+        Some(budget),
+        ledger_usage.tokens,
+    );
     let usage_percent = exposure.active_usage_percent;
     let trigger_context_tokens = budget.compression_trigger_context_tokens();
     let auto_threshold = if budget.max_context_tokens > 0 {
@@ -270,17 +401,17 @@ async fn maybe_apply_host_context_compression_with_budget(
     // If projected usage drops below the trigger threshold, skip LLM summarization —
     // the cheaper prompt-side compaction in prepare_hybrid_context will handle it.
     if host_auto_requested && !critical_fallback_requested && !manual_requested {
-        let counter = TiktokenTokenCounter::default();
         let summary_tokens = session
             .conversation_summary
             .as_ref()
             .map(|s| counter.count_message(&bamboo_agent_core::Message::system(&s.content)))
             .unwrap_or(0);
-        let savings = bamboo_compression::estimate_prompt_cache_savings(
+        let savings = estimate_prompt_cache_savings_with_fixed_tokens(
             session,
             budget,
             &counter,
             summary_tokens,
+            ledger_usage.tokens,
         );
         if savings > 0 {
             let projected = exposure.active_tokens.saturating_sub(savings);
@@ -347,7 +478,6 @@ async fn maybe_apply_host_context_compression_with_budget(
 
     let compression_context_blocks =
         build_compression_context_blocks(session, config.app_data_dir.as_deref());
-    let counter = TiktokenTokenCounter::default();
     let additional_fixed_tokens = compression_context_blocks
         .iter()
         .fold(0u32, |total, block| {
@@ -708,7 +838,7 @@ pub(super) async fn prepare_round_context(
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
-    _tool_schemas: &[ToolSchema],
+    tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<PreparedRoundContext, AgentError> {
@@ -730,10 +860,83 @@ pub(super) async fn prepare_round_context(
         );
     }
 
-    let mut prepared_context = prepare_hybrid_context(session, &budget, &counter)
-        .map_err(|error| AgentError::Budget(error.to_string()))?;
-
+    // Compression may have reset/coalesced the ledger, so measure it again at
+    // the exact fitting boundary. Historical context is a fixed part of the
+    // provider-visible transcript and must reduce the ordinary message window.
+    let ledger_usage = enforce_model_context_ledger_retention(session, &budget, &counter);
+    let request_input_limit = budget.max_request_input_tokens();
+    let mut refit_pass = 0usize;
+    let mut prepared_context =
+        prepare_hybrid_context_with_fixed_tokens(session, &budget, &counter, ledger_usage.tokens)
+            .map_err(|error| AgentError::Budget(error.to_string()))?;
     transforms::apply_message_transforms(config, &mut prepared_context, llm, session_id).await?;
+
+    loop {
+        // Reconciliation may append snapshots that did not exist when the
+        // durable ledger was measured above, especially after retention or
+        // hard-truncation starts a fresh epoch. Project the exact final IR on a
+        // shadow session and feed any deficit back into message fitting before
+        // the provider-bound reconciliation mutates or checkpoints live state.
+        let projected = super::stream_execution::project_request_usage(
+            session,
+            &prepared_context,
+            config,
+            tool_schemas,
+            model_name,
+        );
+        if projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES {
+            return Err(AgentError::Budget(format!(
+                "projected model-context ledger exceeds byte limit: ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                projected.ledger_rendered_bytes,
+            )));
+        }
+
+        // Use the exact final PromptIR deficit, not total ledger size:
+        // session-stable workspace/env/instruction/skill content may already be
+        // present in the fitted System message and then merely relocated into the
+        // ledger by the final envelope. Always close any exact-wire gap here, even
+        // when reconciliation itself is unchanged, so execute cannot discover an
+        // avoidable terminal Budget error after preparation.
+        if projected.input_tokens <= request_input_limit {
+            break;
+        }
+        if refit_pass >= MAX_PROJECTED_REQUEST_REFIT_PASSES {
+            return Err(AgentError::Budget(format!(
+                "projected model-context request remains over budget after {refit_pass} refit passes: input_tokens={}, input_limit={request_input_limit}",
+                projected.input_tokens,
+            )));
+        }
+
+        let deficit_tokens = projected.input_tokens.saturating_sub(request_input_limit);
+        let prepared_message_tokens = counter.count_messages(&prepared_context.messages);
+        // The projection is the transformed messages plus provider-visible
+        // material outside that vector. Subtract the messages directly to get
+        // the exact fixed reservation. Deriving it via unused input-window space
+        // would over-reserve when Vision expansion makes the transformed
+        // candidate itself larger than the input limit.
+        let refit_fixed_tokens = projected
+            .input_tokens
+            .saturating_sub(prepared_message_tokens);
+        refit_pass += 1;
+        tracing::info!(
+            session_id = %session.id,
+            refit_pass,
+            projected_input_tokens = projected.input_tokens,
+            request_input_limit,
+            deficit_tokens,
+            prepared_message_tokens,
+            refit_fixed_tokens,
+            "projected model-context snapshots exceeded the exact PromptIR window; refitting transformed transcript"
+        );
+        prepared_context = refit_transformed_context(
+            session,
+            prepared_context,
+            &budget,
+            &counter,
+            refit_fixed_tokens,
+        )?;
+    }
+
     logging::log_context_truncation(session_id, &prepared_context);
 
     // Dedup state for pressure notifications lives in session.metadata so it

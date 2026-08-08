@@ -1231,6 +1231,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_control_plane_save_keeps_checkpointed_ledger_in_durable_and_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("SessionStoreV2"),
+        );
+        let repo = test_repo(storage.clone());
+        let id = "control-plane-ledger-cache";
+        let mut initial = Session::new(id, "model");
+        initial.add_message(bamboo_agent_core::Message::user("durable transcript"));
+        storage.save_session(&initial).await.unwrap();
+        cache_put(&repo, &initial);
+        let mut stale = initial.clone();
+
+        let mut runner = initial;
+        runner.model_context_state = Some(bamboo_domain::ModelContextState {
+            state_revision: 1,
+            prefix_epoch: 1,
+            cache_scope_sha256: Some("scope".to_string()),
+            transcript_item_sha256: vec!["runner-l1".to_string()],
+            ..bamboo_domain::ModelContextState::default()
+        });
+        bamboo_domain::RuntimeSessionPersistence::checkpoint_runtime_session(&repo, &mut runner)
+            .await
+            .unwrap();
+
+        stale
+            .metadata
+            .insert("runtime.suspend_reason".to_string(), "waiting".to_string());
+        bamboo_domain::RuntimeSessionPersistence::save_runtime_control_plane(&repo, &mut stale)
+            .await
+            .unwrap();
+
+        let expected = runner.model_context_state;
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("cached session");
+        for (tier, session) in [("durable", durable), ("cache", cached)] {
+            assert_eq!(session.model_context_state, expected, "tier={tier}");
+            assert_eq!(
+                session
+                    .metadata
+                    .get("runtime.suspend_reason")
+                    .map(String::as_str),
+                Some("waiting"),
+                "tier={tier}"
+            );
+            assert_eq!(session.messages.len(), 1, "tier={tier}");
+        }
+    }
+
+    #[tokio::test]
     async fn narrow_runtime_metadata_transaction_preserves_live_and_durable_non_owned_state() {
         let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
         let repo = test_repo(storage.clone());
