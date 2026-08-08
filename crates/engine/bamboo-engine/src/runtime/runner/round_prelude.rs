@@ -22,6 +22,7 @@ use bamboo_agent_core::PromptSnapshot;
 /// parameters.  Passed into [`prepare_round`] to keep its parameter count
 /// below the clippy threshold.
 pub(crate) struct RoundPreludeFrame<'a> {
+    pub execution_id: &'a str,
     pub round: usize,
     pub max_rounds: usize,
     pub debug_enabled: bool,
@@ -96,8 +97,29 @@ pub(super) fn update_task_round_state(
     }
 }
 
-pub(super) fn build_round_id(session_id: &str, round: usize) -> String {
-    format!("{}-round-{}", session_id, round + 1)
+pub(crate) fn new_execution_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+pub(super) fn build_round_id(session_id: &str, execution_id: &str, round: usize) -> String {
+    debug_assert!(
+        !execution_id.is_empty(),
+        "round metrics require an execution identity"
+    );
+    format!("{session_id}-run-{execution_id}-round-{}", round + 1)
+}
+
+pub(super) fn build_auxiliary_round_id(
+    session_id: &str,
+    execution_id: &str,
+    purpose: &str,
+    round_number: usize,
+) -> String {
+    debug_assert!(
+        !execution_id.is_empty(),
+        "auxiliary round metrics require an execution identity"
+    );
+    format!("{session_id}-run-{execution_id}-{purpose}-round-{round_number}")
 }
 
 pub(super) fn log_round_start(
@@ -282,7 +304,7 @@ pub(crate) async fn prepare_round(
     .await?;
     update_task_round_state(task_context, round, max_rounds);
 
-    let round_id = build_round_id(session_id, round);
+    let round_id = build_round_id(session_id, frame.execution_id, round);
     log_round_start(
         debug_enabled,
         session_id,

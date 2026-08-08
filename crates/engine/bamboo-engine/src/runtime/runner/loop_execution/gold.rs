@@ -355,9 +355,11 @@ pub(super) async fn apply_completed_gold_evaluation(
 
     let usage = apply_gold_evaluation_result(session, &result.evaluation_result);
 
-    let synthetic_round_id = format!(
-        "{}-gold-evaluation-round-{}",
-        state.session_id, result.round_number
+    let synthetic_round_id = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+        &state.session_id,
+        &state.execution_id,
+        "gold-evaluation",
+        result.round_number,
     );
     crate::runtime::runner::metrics_lifecycle::record_round_started(
         state.metrics_collector.as_ref(),
@@ -1115,6 +1117,7 @@ mod tests {
 
         let mut state = crate::runtime::runner::loop_execution::startup::LoopRunState {
             session_id: "session-gold-eval".to_string(),
+            execution_id: "gold-eval-execution".to_string(),
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),

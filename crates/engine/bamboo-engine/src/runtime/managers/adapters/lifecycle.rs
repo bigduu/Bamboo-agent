@@ -27,8 +27,12 @@ impl DefaultLifecycleManager {
 
 #[async_trait]
 impl LifecycleManager for DefaultLifecycleManager {
-    fn initialize_run(&self, session: &Session, config: &AgentLoopConfig) -> AgentRuntimeState {
-        let mut state = AgentRuntimeState::new(&session.id);
+    fn initialize_run(&self, _session: &Session, config: &AgentLoopConfig) -> AgentRuntimeState {
+        // `AgentRuntimeState::run_id` is the existing per-execution identity on
+        // this adapter path. Give every initialized run a fresh value so round
+        // counters can safely restart for the same session.
+        let mut state =
+            AgentRuntimeState::new(crate::runtime::runner::round_prelude::new_execution_id());
         state.llm.model_name = config.model_name.clone();
         state.llm.provider_name = config.provider_name.clone();
         state.llm.fast_model_name = config.fast_model_name.clone();
@@ -43,7 +47,7 @@ impl LifecycleManager for DefaultLifecycleManager {
         &self,
         session: &mut Session,
         task_context: &mut Option<TaskLoopContext>,
-        _runtime_state: &mut AgentRuntimeState,
+        runtime_state: &mut AgentRuntimeState,
         round: usize,
         max_rounds: usize,
         config: &AgentLoopConfig,
@@ -61,6 +65,7 @@ impl LifecycleManager for DefaultLifecycleManager {
             self.llm.clone(),
             tools,
             &crate::runtime::runner::round_prelude::RoundPreludeFrame {
+                execution_id: &runtime_state.run_id,
                 round,
                 max_rounds,
                 debug_enabled: false, // debug logging handled at runner level, not via adapter
@@ -123,5 +128,42 @@ impl LifecycleManager for DefaultLifecycleManager {
             runtime_state,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::Message;
+    use bamboo_llm::provider::LLMStream;
+    use futures::stream;
+
+    struct UnusedProvider;
+
+    #[async_trait]
+    impl LLMProvider for UnusedProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            Ok(Box::pin(stream::iter(vec![Ok(bamboo_llm::LLMChunk::Done)])))
+        }
+    }
+
+    #[test]
+    fn initialize_run_assigns_a_fresh_execution_identity() {
+        let manager = DefaultLifecycleManager::new(Arc::new(UnusedProvider));
+        let session = Session::new("same-session", "model");
+        let config = AgentLoopConfig::default();
+
+        let first = manager.initialize_run(&session, &config);
+        let second = manager.initialize_run(&session, &config);
+
+        assert!(!first.run_id.is_empty());
+        assert_ne!(first.run_id, session.id);
+        assert_ne!(first.run_id, second.run_id);
     }
 }
