@@ -27,13 +27,17 @@ pub use compression_tooling::{
     build_forced_compression_candidate_plan_with_fixed_tokens,
     build_forced_compression_plan_with_summary, build_summary_prompt, compression_summary_message,
     context_window_usage_percent, estimate_context_compression_exposure,
-    finalize_compression_candidate_plan, normalized_summary_target_ratio,
-    normalized_trigger_percent, summary_source_messages, CompressionCandidatePlan, CompressionPlan,
-    CompressionPlanError, ContextCompressionExposure, DEFAULT_SUMMARY_TARGET_RATIO,
+    estimate_context_compression_exposure_with_fixed_tokens, finalize_compression_candidate_plan,
+    normalized_summary_target_ratio, normalized_trigger_percent, summary_source_messages,
+    CompressionCandidatePlan, CompressionPlan, CompressionPlanError, ContextCompressionExposure,
+    DEFAULT_SUMMARY_TARGET_RATIO,
 };
 pub use counter::{HeuristicTokenCounter, TiktokenTokenCounter, TokenCounter};
 pub use limits::{create_budget_for_model, ModelLimitsRegistry};
-pub use preparation::{estimate_prompt_cache_savings, prepare_hybrid_context};
+pub use preparation::{
+    estimate_prompt_cache_savings, estimate_prompt_cache_savings_with_fixed_tokens,
+    prepare_hybrid_context, prepare_hybrid_context_with_fixed_tokens,
+};
 pub use segmenter::MessageSegmenter;
 pub use summarizer::{HeuristicSummarizer, Summarizer, SummaryManager, SummaryTrigger};
 pub use types::{BudgetError, BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown};

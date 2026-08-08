@@ -564,6 +564,22 @@ pub fn estimate_context_compression_exposure(
     model_name: &str,
     configured_budget: Option<&TokenBudget>,
 ) -> ContextCompressionExposure {
+    estimate_context_compression_exposure_with_fixed_tokens(
+        session,
+        model_name,
+        configured_budget,
+        0,
+    )
+}
+
+/// Fixed-token-aware variant used when provider-visible context lives outside
+/// `Session::messages` (for example, the durable model-context ledger).
+pub fn estimate_context_compression_exposure_with_fixed_tokens(
+    session: &Session,
+    model_name: &str,
+    configured_budget: Option<&TokenBudget>,
+    additional_fixed_tokens: u32,
+) -> ContextCompressionExposure {
     // When a budget was already resolved upstream (the production path — see
     // `resolve_token_budget`, which publishes the current-round snapshot in
     // `session.resolved_token_budget` (#180),
@@ -586,7 +602,9 @@ pub fn estimate_context_compression_exposure(
         .as_ref()
         .map(|summary| counter.count_messages(&[compression_summary_message(&summary.content)]))
         .unwrap_or(0);
-    let active_tokens = active_message_tokens.saturating_add(summary_tokens);
+    let active_tokens = active_message_tokens
+        .saturating_add(summary_tokens)
+        .saturating_add(additional_fixed_tokens);
     // Use context window as the denominator for a single, provider-aligned
     // pressure scale across backend and frontend.
     let context_window = budget.max_context_tokens;

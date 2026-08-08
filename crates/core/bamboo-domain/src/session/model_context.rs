@@ -15,6 +15,10 @@ use super::{ContextBlock, ContextBlockType, Message};
 
 pub const MODEL_CONTEXT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_MODEL_CONTEXT_EVENTS: usize = 256;
+/// Hard serialized-text ceiling for one retained ledger epoch. Token-aware
+/// preparation normally starts a retention epoch earlier; this byte bound is a
+/// model-independent backstop against a few pathologically large snapshots.
+pub const MAX_MODEL_CONTEXT_RENDERED_BYTES: usize = 2 * 1024 * 1024;
 
 const EVENT_ID_DOMAIN: &[u8] = b"bamboo/model-context-event/v1\0";
 const REMOVED_CONTENT_DOMAIN: &[u8] = b"bamboo/model-context-removed/v1\0";
@@ -28,6 +32,11 @@ fn default_schema_version() -> u32 {
 pub struct ModelContextState {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    /// Monotonic ordering fence for durable merge/CAS decisions. Every semantic
+    /// change to this state advances the revision, including transcript-only
+    /// extensions whose context-event sequence does not change.
+    #[serde(default)]
+    pub state_revision: u64,
     #[serde(default)]
     pub prefix_epoch: u64,
     #[serde(default)]
@@ -54,6 +63,7 @@ impl Default for ModelContextState {
     fn default() -> Self {
         Self {
             schema_version: MODEL_CONTEXT_SCHEMA_VERSION,
+            state_revision: 0,
             prefix_epoch: 0,
             next_sequence: 0,
             baselines: BTreeMap::new(),
@@ -66,11 +76,17 @@ impl Default for ModelContextState {
 }
 
 impl ModelContextState {
+    /// Advance the durable state ordering fence after a semantic mutation.
+    pub fn advance_state_revision(&mut self) {
+        self.state_revision = self.state_revision.saturating_add(1);
+    }
+
     /// Start a deliberate new prefix epoch and discard superseded event history.
     /// The engine seeds the new epoch with one snapshot per currently-active
     /// context type before the next request is dispatched.
     pub fn reset_epoch(&mut self, reason: ModelContextResetReason) {
         self.schema_version = MODEL_CONTEXT_SCHEMA_VERSION;
+        self.advance_state_revision();
         self.prefix_epoch = self.prefix_epoch.saturating_add(1);
         self.next_sequence = 0;
         self.baselines.clear();
@@ -321,6 +337,7 @@ mod tests {
         }))
         .expect("old state");
         assert_eq!(state.prefix_epoch, 7);
+        assert_eq!(state.state_revision, 0);
         assert!(state.cache_scope_sha256.is_none());
         assert!(state.transcript_item_sha256.is_empty());
         assert!(state.last_reset_reason.is_none());
@@ -340,6 +357,7 @@ mod tests {
 
         let state = session.model_context_state.as_ref().unwrap();
         assert_eq!(state.prefix_epoch, 5);
+        assert_eq!(state.state_revision, 2);
         assert_eq!(
             state.last_reset_reason,
             Some(ModelContextResetReason::Rollback)

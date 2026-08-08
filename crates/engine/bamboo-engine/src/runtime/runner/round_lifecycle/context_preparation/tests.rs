@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use super::{
-    emit_context_pressure_notification, maybe_apply_host_context_compression,
-    prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
+    emit_context_pressure_notification, enforce_model_context_ledger_retention,
+    maybe_apply_host_context_compression, prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
@@ -10,7 +10,11 @@ use bamboo_agent_core::{
     AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
 use bamboo_compression::{BudgetStrategy, TiktokenTokenCounter, TokenBudget, TokenCounter};
-use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, TaskItem, TaskItemStatus, TaskList};
+use bamboo_domain::{
+    AgentHookPoint, ContextBlockType, HookPayload, HookResult, ModelContextEvent,
+    ModelContextEventKind, ModelContextResetReason, ModelContextState, TaskItem, TaskItemStatus,
+    TaskList,
+};
 use bamboo_llm::models::{ContentPart, ImageUrl};
 use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo};
 use bamboo_llm::{LLMChunk, LLMError};
@@ -60,6 +64,48 @@ fn sample_task_list(session_id: &str, status: TaskItemStatus) -> TaskList {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
+}
+
+#[test]
+fn historical_ledger_tokens_start_a_bounded_retention_epoch_below_event_cap() {
+    let mut session = Session::new("ledger-retention-budget", "test-model");
+    let large_snapshot = "historical context ".repeat(2_000);
+    let events = (0..3)
+        .map(|sequence| ModelContextEvent {
+            id: format!("ctx-{sequence}"),
+            epoch: 4,
+            sequence,
+            anchor_message_id: None,
+            block_type: ContextBlockType::TaskSnapshot,
+            revision: sequence + 1,
+            supersedes_revision: (sequence > 0).then_some(sequence),
+            kind: ModelContextEventKind::Snapshot,
+            content_sha256: format!("digest-{sequence}"),
+            rendered_text: large_snapshot.clone(),
+        })
+        .collect();
+    session.model_context_state = Some(ModelContextState {
+        state_revision: 7,
+        prefix_epoch: 4,
+        next_sequence: 3,
+        events,
+        cache_scope_sha256: Some("scope".to_string()),
+        ..ModelContextState::default()
+    });
+    let budget = TokenBudget::with_safety_margin(8_000, 1_000, BudgetStrategy::default(), 0);
+    let counter = TiktokenTokenCounter::default();
+
+    let usage = enforce_model_context_ledger_retention(&mut session, &budget, &counter);
+
+    assert_eq!(usage.tokens, 0);
+    let state = session.model_context_state.as_ref().unwrap();
+    assert_eq!(state.prefix_epoch, 5);
+    assert_eq!(state.state_revision, 8);
+    assert!(state.events.is_empty());
+    assert_eq!(
+        state.last_reset_reason,
+        Some(ModelContextResetReason::RetentionLimit)
+    );
 }
 
 struct RecordingLlmProvider {

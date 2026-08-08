@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::execute_llm_stream;
 use super::LlmStreamFrame;
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
-use bamboo_agent_core::{AgentEvent, Message, Role, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_compression::{PreparedContext, TokenUsageBreakdown};
 use bamboo_llm::{Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream};
 use chrono::Utc;
@@ -923,6 +923,80 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
             .as_deref(),
         Some(expected_system_field("system").as_str())
     );
+}
+
+#[tokio::test]
+async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ledger-final-budget", "test-model");
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Agent Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "retain the ledger budget guard".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    // Seed a valid ledger/cache scope first, then simulate a legacy persisted
+    // epoch whose rendered bytes were not included in context preparation.
+    let _ = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+    let prior_state = session.model_context_state.clone().unwrap();
+    assert!(!prior_state.events.is_empty());
+    session.model_context_state.as_mut().unwrap().events[0].rendered_text =
+        "oversized historical ledger ".repeat(10_000);
+    let inflated_state = session.model_context_state.clone();
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-ledger-final-budget",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 2_000,
+            max_output_tokens: 200,
+        },
+    )
+    .await;
+
+    assert!(matches!(result, Err(AgentError::Budget(_))));
+    assert!(llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .is_empty());
+    assert_eq!(session.model_context_state, inflated_state);
 }
 
 #[test]

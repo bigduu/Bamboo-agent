@@ -25,8 +25,9 @@ use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
 };
-use bamboo_compression::PreparedContext;
+use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::MAX_MODEL_CONTEXT_RENDERED_BYTES;
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, Segment,
@@ -867,6 +868,31 @@ pub(super) async fn execute_llm_stream(
     let previous_model_context_state = session.model_context_state.clone();
     let mut prepared_envelope =
         build_request_envelope_reconciled(session, prepared_context, config, tool_schemas, model);
+    // `prepare_round_context` reserves the already-durable ledger history. The
+    // reconciliation above can append a new host-state snapshot, so verify the
+    // exact final IR again before checkpoint/provider dispatch. Failing closed
+    // preserves the context-window contract without committing an unsendable
+    // ledger candidate.
+    let final_input_tokens =
+        TiktokenTokenCounter::default().count_messages(&prepared_envelope.ir.flatten());
+    let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+    let ledger_rendered_bytes = session
+        .model_context_state
+        .as_ref()
+        .map(|state| {
+            state.events.iter().fold(0usize, |total, event| {
+                total.saturating_add(event.rendered_text.len())
+            })
+        })
+        .unwrap_or(0);
+    if final_input_tokens > request_input_limit
+        || ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+    {
+        session.model_context_state = previous_model_context_state;
+        return Err(AgentError::Budget(format!(
+            "final model input exceeds ledger-safe limits: input_tokens={final_input_tokens}, input_limit={request_input_limit}, ledger_bytes={ledger_rendered_bytes}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}"
+        )));
+    }
     // Reconciliation changes the next outbound model transcript. It must become
     // durable before any provider request is attempted, otherwise a crash/retry
     // could allocate a different event sequence. Fail closed on checkpoint

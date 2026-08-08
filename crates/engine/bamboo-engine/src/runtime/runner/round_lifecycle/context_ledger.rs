@@ -7,7 +7,7 @@ use bamboo_domain::{
     deterministic_model_context_event_id, model_context_block_sha256, removed_model_context_sha256,
     render_model_context_removal, render_model_context_snapshot, sha256_hex, ContextBlockBaseline,
     ModelContextEvent, ModelContextEventKind, ModelContextResetReason, ModelContextState,
-    MAX_MODEL_CONTEXT_EVENTS, MODEL_CONTEXT_SCHEMA_VERSION,
+    MAX_MODEL_CONTEXT_EVENTS, MAX_MODEL_CONTEXT_RENDERED_BYTES, MODEL_CONTEXT_SCHEMA_VERSION,
 };
 
 const ANCHOR_DOMAIN: &[u8] = b"bamboo/model-context-anchor/v1\0";
@@ -37,6 +37,7 @@ pub(super) fn reconcile_model_context(
     let had_state = session.model_context_state.is_some();
     let mut state = session.model_context_state.take().unwrap_or_default();
     let original_state = state.clone();
+    let original_revision = state.state_revision;
 
     // A reset may already have been declared atomically by compression or a
     // rollback use case.  In that case cache_scope is intentionally empty and
@@ -84,13 +85,21 @@ pub(super) fn reconcile_model_context(
         .collect::<BTreeMap<_, _>>();
     append_reconciliation_events(&session.id, &mut state, &current, anchor_message_id.clone());
 
-    if state.events.len() > MAX_MODEL_CONTEXT_EVENTS {
+    if state.events.len() > MAX_MODEL_CONTEXT_EVENTS
+        || rendered_event_bytes(&state.events) > MAX_MODEL_CONTEXT_RENDERED_BYTES
+    {
         state.reset_epoch(ModelContextResetReason::RetentionLimit);
         append_reconciliation_events(&session.id, &mut state, &current, None);
     }
 
     state.cache_scope_sha256 = Some(cache_scope_sha256);
     state.transcript_item_sha256 = current_item_sha256;
+    // A reset already advances the revision. Otherwise advance exactly once
+    // for this reconciliation transaction, including a transcript-only update
+    // where `next_sequence` remains unchanged.
+    if state != original_state && state.state_revision == original_revision {
+        state.advance_state_revision();
+    }
     let transcript = interleave_transcript(real_transcript, &state.events);
     let changed = state != original_state;
     let prefix_epoch = state.prefix_epoch;
@@ -108,6 +117,12 @@ pub(super) fn reconcile_model_context(
         prefix_epoch,
         reset_reason,
     }
+}
+
+fn rendered_event_bytes(events: &[ModelContextEvent]) -> usize {
+    events.iter().fold(0usize, |total, event| {
+        total.saturating_add(event.rendered_text.len())
+    })
 }
 
 fn append_reconciliation_events(
