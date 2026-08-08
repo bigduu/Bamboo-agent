@@ -196,15 +196,18 @@ pub struct SessionDetail {
 pub struct DailyMetrics {
     /// Date for these metrics
     pub date: NaiveDate,
-    /// Total number of sessions
+    /// Sessions whose session-level `started_at` falls on this date.
+    ///
+    /// Round and tool usage below use their own occurrence dates, so a later
+    /// day can legitimately report zero sessions with non-zero usage.
     pub total_sessions: u32,
-    /// Total number of rounds
+    /// Rounds whose round-level `started_at` falls on this date.
     pub total_rounds: u32,
-    /// Total token usage
+    /// Token usage from rounds attributed to this date.
     pub total_token_usage: TokenUsage,
-    /// Total number of tool calls
+    /// Tool calls whose tool-level `started_at` falls on this date.
     pub total_tool_calls: u32,
-    /// Token usage breakdown by model
+    /// Round token usage attributed by each round's own model.
     pub model_breakdown: HashMap<String, TokenUsage>,
     /// Tool call breakdown by tool name
     pub tool_breakdown: HashMap<String, u32>,
@@ -264,13 +267,13 @@ pub struct MetricsSummary {
 pub struct ModelMetrics {
     /// Model name
     pub model: String,
-    /// Number of sessions using this model
+    /// Sessions whose session-level model and start date match this bucket.
     pub sessions: u64,
-    /// Number of rounds using this model
+    /// Rounds whose own model and start date match this bucket.
     pub rounds: u64,
-    /// Token usage for this model
+    /// Token usage from those round rows.
     pub tokens: TokenUsage,
-    /// Number of tool calls using this model
+    /// Tool calls attributed through the model on their owning round.
     pub tool_calls: u64,
     /// Number of prompt-side cached tool outputs for this model.
     #[serde(default)]
