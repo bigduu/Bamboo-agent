@@ -909,8 +909,14 @@ pub(super) async fn prepare_round_context(
 
         let deficit_tokens = projected.input_tokens.saturating_sub(request_input_limit);
         let prepared_message_tokens = counter.count_messages(&prepared_context.messages);
-        let existing_reserve = request_input_limit.saturating_sub(prepared_message_tokens);
-        let refit_fixed_tokens = existing_reserve.saturating_add(deficit_tokens);
+        // The projection is the transformed messages plus provider-visible
+        // material outside that vector. Subtract the messages directly to get
+        // the exact fixed reservation. Deriving it via unused input-window space
+        // would over-reserve when Vision expansion makes the transformed
+        // candidate itself larger than the input limit.
+        let refit_fixed_tokens = projected
+            .input_tokens
+            .saturating_sub(prepared_message_tokens);
         refit_pass += 1;
         tracing::info!(
             session_id = %session.id,

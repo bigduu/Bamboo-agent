@@ -110,6 +110,7 @@ fn historical_ledger_tokens_start_a_bounded_retention_epoch_below_event_cap() {
 
 struct RecordingLlmProvider {
     models: Arc<Mutex<Vec<String>>>,
+    response: String,
 }
 
 #[async_trait::async_trait]
@@ -127,16 +128,23 @@ impl LLMProvider for RecordingLlmProvider {
             .push(model.to_string());
 
         Ok(Box::pin(stream::iter(vec![
-            Ok::<LLMChunk, LLMError>(LLMChunk::Token("summary".to_string())),
+            Ok::<LLMChunk, LLMError>(LLMChunk::Token(self.response.clone())),
             Ok::<LLMChunk, LLMError>(LLMChunk::Done),
         ])))
     }
 }
 
 fn recording_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<String>>>) {
+    recording_llm_with_response("summary")
+}
+
+fn recording_llm_with_response(
+    response: impl Into<String>,
+) -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<String>>>) {
     let models = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn LLMProvider> = Arc::new(RecordingLlmProvider {
         models: Arc::clone(&models),
+        response: response.into(),
     });
     (llm, models)
 }
@@ -1073,7 +1081,7 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
 }
 
 #[tokio::test]
-async fn projected_refit_runs_paid_vision_fallback_exactly_once() {
+async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
     let mut session = Session::new("session-cp-vision-refit", "test-model");
     session.messages.push(Message::system("system"));
     for index in 0..20 {
@@ -1144,6 +1152,25 @@ async fn projected_refit_runs_paid_vision_fallback_exactly_once() {
     )
     .expect("legacy zero-reservation fit");
     let naive_message_count = naive.messages.len();
+    let vision_description = "expanded vision detail with visible text and layout ".repeat(120);
+    let mut expanded_candidate_messages = naive.messages.clone();
+    let expanded_image = expanded_candidate_messages
+        .iter_mut()
+        .find(|message| message.content_parts.is_some())
+        .expect("latest image must survive the initial fit");
+    expanded_image.content = format!(
+        "inspect the latest image\n\n[Vision description of image 1: latest.png]\n{vision_description}\n"
+    );
+    expanded_image.content_parts = None;
+    let request_input_limit = session
+        .token_budget
+        .as_ref()
+        .unwrap()
+        .max_request_input_tokens();
+    assert!(
+        counter.count_messages(&expanded_candidate_messages) > request_input_limit,
+        "fixture must make the transformed candidate itself exceed the input limit"
+    );
     let naive_projection = super::super::stream_execution::project_request_usage(
         &session,
         &naive,
@@ -1161,7 +1188,7 @@ async fn projected_refit_runs_paid_vision_fallback_exactly_once() {
         "fixture must require a projected refit"
     );
 
-    let (llm, models) = recording_llm();
+    let (llm, models) = recording_llm_with_response(vision_description);
     let prepared = prepare_round_context(
         &mut session,
         &config,
@@ -1178,7 +1205,7 @@ async fn projected_refit_runs_paid_vision_fallback_exactly_once() {
     assert!(prepared.prepared_context.messages.len() < naive_message_count);
     assert!(prepared.prepared_context.messages.iter().any(|message| {
         message.content.contains("[Vision description of image 1:")
-            && message.content.contains("summary")
+            && message.content.contains("expanded vision detail")
     }));
     assert_eq!(
         *models.lock().expect("vision call list lock"),
@@ -1191,6 +1218,10 @@ async fn projected_refit_runs_paid_vision_fallback_exactly_once() {
         &config,
         &[],
         "test-model",
+    );
+    assert!(
+        counter.count_messages(&prepared.prepared_context.messages) <= request_input_limit,
+        "refit must bring the transformed message vector itself back under the limit"
     );
     assert!(projected.input_tokens <= prepared.budget.max_request_input_tokens());
 }
