@@ -111,6 +111,59 @@ fn enforce_model_context_ledger_retention(
     ModelContextLedgerUsage::default()
 }
 
+fn refit_transformed_context(
+    session: &Session,
+    previous: PreparedContext,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    additional_fixed_tokens: u32,
+) -> Result<PreparedContext, AgentError> {
+    // Image fallback and attachment resolution may perform I/O or a paid
+    // auxiliary model call. Refit the already-transformed candidate rather than
+    // rerunning those transforms on every bounded projection pass.
+    let mut refit_session = session.clone();
+    // A prepared candidate already contains the synthetic summary carrier. Drop
+    // that carrier from the bounded subset and let the fitter re-inject the same
+    // durable summary exactly once, preserving its summary-token attribution.
+    refit_session.messages = previous
+        .messages
+        .iter()
+        .filter(|message| {
+            !(matches!(message.role, Role::System)
+                && message
+                    .content
+                    .contains("<!-- CONVERSATION_SUMMARY_START -->"))
+        })
+        .cloned()
+        .collect();
+
+    let mut refitted = prepare_hybrid_context_with_fixed_tokens(
+        &refit_session,
+        budget,
+        counter,
+        additional_fixed_tokens,
+    )
+    .map_err(|error| AgentError::Budget(error.to_string()))?;
+    refitted.truncation_occurred |= previous.truncation_occurred;
+    refitted.segments_removed = refitted
+        .segments_removed
+        .saturating_add(previous.segments_removed);
+    refitted.prompt_cached_tool_outputs = refitted
+        .prompt_cached_tool_outputs
+        .saturating_add(previous.prompt_cached_tool_outputs);
+    refitted.prompt_cached_tool_tokens_saved = refitted
+        .prompt_cached_tool_tokens_saved
+        .saturating_add(previous.prompt_cached_tool_tokens_saved);
+    let mut compressed_message_ids = previous.compressed_message_ids;
+    for message_id in refitted.compressed_message_ids.drain(..) {
+        if !compressed_message_ids.contains(&message_id) {
+            compressed_message_ids.push(message_id);
+        }
+    }
+    refitted.compressed_message_ids = compressed_message_ids;
+    Ok(refitted)
+}
+
 async fn emit_context_compression_status(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
@@ -811,18 +864,14 @@ pub(super) async fn prepare_round_context(
     // the exact fitting boundary. Historical context is a fixed part of the
     // provider-visible transcript and must reduce the ordinary message window.
     let ledger_usage = enforce_model_context_ledger_retention(session, &budget, &counter);
-    let mut additional_fixed_tokens = ledger_usage.tokens;
+    let request_input_limit = budget.max_request_input_tokens();
     let mut refit_pass = 0usize;
-    let prepared_context = loop {
-        let mut candidate = prepare_hybrid_context_with_fixed_tokens(
-            session,
-            &budget,
-            &counter,
-            additional_fixed_tokens,
-        )
-        .map_err(|error| AgentError::Budget(error.to_string()))?;
-        transforms::apply_message_transforms(config, &mut candidate, llm, session_id).await?;
+    let mut prepared_context =
+        prepare_hybrid_context_with_fixed_tokens(session, &budget, &counter, ledger_usage.tokens)
+            .map_err(|error| AgentError::Budget(error.to_string()))?;
+    transforms::apply_message_transforms(config, &mut prepared_context, llm, session_id).await?;
 
+    loop {
         // Reconciliation may append snapshots that did not exist when the
         // durable ledger was measured above, especially after retention or
         // hard-truncation starts a fresh epoch. Project the exact final IR on a
@@ -830,7 +879,7 @@ pub(super) async fn prepare_round_context(
         // the provider-bound reconciliation mutates or checkpoints live state.
         let projected = super::stream_execution::project_request_usage(
             session,
-            &candidate,
+            &prepared_context,
             config,
             tool_schemas,
             model_name,
@@ -842,34 +891,45 @@ pub(super) async fn prepare_round_context(
             )));
         }
 
-        // The ordinary fitter already owns system/conversation budgeting. Feed
-        // back only ledger tokens created by the shadow reconciliation; using
-        // the full PromptIR delta here would double-count stable prompt material
-        // that has its own existing budget path.
-        if projected.ledger_tokens <= additional_fixed_tokens {
-            break candidate;
+        // Use the exact final PromptIR deficit, not total ledger size:
+        // session-stable workspace/env/instruction/skill content may already be
+        // present in the fitted System message and then merely relocated into the
+        // ledger by the final envelope. Always close any exact-wire gap here, even
+        // when reconciliation itself is unchanged, so execute cannot discover an
+        // avoidable terminal Budget error after preparation.
+        if projected.input_tokens <= request_input_limit {
+            break;
         }
         if refit_pass >= MAX_PROJECTED_REQUEST_REFIT_PASSES {
             return Err(AgentError::Budget(format!(
-                "projected model-context ledger remains under-reserved after {refit_pass} refit passes: ledger_tokens={}, reserved_tokens={additional_fixed_tokens}",
-                projected.ledger_tokens,
+                "projected model-context request remains over budget after {refit_pass} refit passes: input_tokens={}, input_limit={request_input_limit}",
+                projected.input_tokens,
             )));
         }
 
-        let missing_ledger_tokens = projected
-            .ledger_tokens
-            .saturating_sub(additional_fixed_tokens);
-        additional_fixed_tokens = additional_fixed_tokens.saturating_add(missing_ledger_tokens);
+        let deficit_tokens = projected.input_tokens.saturating_sub(request_input_limit);
+        let prepared_message_tokens = counter.count_messages(&prepared_context.messages);
+        let existing_reserve = request_input_limit.saturating_sub(prepared_message_tokens);
+        let refit_fixed_tokens = existing_reserve.saturating_add(deficit_tokens);
         refit_pass += 1;
         tracing::info!(
             session_id = %session.id,
             refit_pass,
-            projected_ledger_tokens = projected.ledger_tokens,
-            missing_ledger_tokens,
-            additional_fixed_tokens,
-            "projected model-context snapshots were not reserved during fitting; refitting transcript"
+            projected_input_tokens = projected.input_tokens,
+            request_input_limit,
+            deficit_tokens,
+            prepared_message_tokens,
+            refit_fixed_tokens,
+            "projected model-context snapshots exceeded the exact PromptIR window; refitting transformed transcript"
         );
-    };
+        prepared_context = refit_transformed_context(
+            session,
+            prepared_context,
+            &budget,
+            &counter,
+            refit_fixed_tokens,
+        )?;
+    }
 
     logging::log_context_truncation(session_id, &prepared_context);
 

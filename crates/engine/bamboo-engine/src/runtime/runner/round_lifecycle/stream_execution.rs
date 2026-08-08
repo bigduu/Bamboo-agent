@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::sync::Arc;
 
@@ -375,7 +376,6 @@ struct PreparedRequestEnvelope {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ProjectedRequestUsage {
     pub input_tokens: u32,
-    pub ledger_tokens: u32,
     pub ledger_rendered_bytes: usize,
 }
 
@@ -384,29 +384,40 @@ fn measure_request_usage(
     envelope: &PreparedRequestEnvelope,
 ) -> ProjectedRequestUsage {
     let input_tokens = TiktokenTokenCounter::default().count_messages(&envelope.ir.flatten());
-    let (ledger_tokens, ledger_rendered_bytes) = session
+    let ledger_rendered_bytes = session
         .model_context_state
         .as_ref()
         .map(|state| {
-            let messages = state
-                .events
-                .iter()
-                .map(bamboo_domain::ModelContextEvent::render_message)
-                .collect::<Vec<_>>();
-            let rendered_bytes = state.events.iter().fold(0usize, |total, event| {
+            state.events.iter().fold(0usize, |total, event| {
                 total.saturating_add(event.rendered_text.len())
-            });
-            (
-                TiktokenTokenCounter::default().count_messages(&messages),
-                rendered_bytes,
-            )
+            })
         })
-        .unwrap_or((0, 0));
+        .unwrap_or(0);
     ProjectedRequestUsage {
         input_tokens,
-        ledger_tokens,
         ledger_rendered_bytes,
     }
+}
+
+fn required_tool_for_session(session: &Session) -> Option<&'static str> {
+    crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
+        .then_some("load_skill")
+}
+
+fn effective_tool_schemas<'a>(
+    session: &Session,
+    tool_schemas: &'a [ToolSchema],
+) -> Cow<'a, [ToolSchema]> {
+    let Some(required_tool) = required_tool_for_session(session) else {
+        return Cow::Borrowed(tool_schemas);
+    };
+    Cow::Owned(
+        tool_schemas
+            .iter()
+            .filter(|schema| schema.function.name == required_tool)
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Project the exact PromptIR message input after ledger reconciliation without
@@ -421,11 +432,12 @@ pub(super) fn project_request_usage(
     model: &str,
 ) -> ProjectedRequestUsage {
     let mut shadow = session.clone();
+    let effective_tool_schemas = effective_tool_schemas(&shadow, tool_schemas);
     let envelope = build_request_envelope_reconciled(
         &mut shadow,
         prepared_context,
         config,
-        tool_schemas,
+        effective_tool_schemas.as_ref(),
         model,
     );
     measure_request_usage(&shadow, &envelope)
@@ -897,20 +909,9 @@ pub(super) async fn execute_llm_stream(
     let session_id = frame.session_id;
 
     let llm_started_at = std::time::Instant::now();
-    let required_tool =
-        crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
-            .then_some("load_skill");
-    let restricted_tool_schemas;
-    let tool_schemas = if let Some(required_tool) = required_tool {
-        restricted_tool_schemas = tool_schemas
-            .iter()
-            .filter(|schema| schema.function.name == required_tool)
-            .cloned()
-            .collect::<Vec<_>>();
-        restricted_tool_schemas.as_slice()
-    } else {
-        tool_schemas
-    };
+    let required_tool = required_tool_for_session(session);
+    let effective_tool_schemas = effective_tool_schemas(session, tool_schemas);
+    let tool_schemas = effective_tool_schemas.as_ref();
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.

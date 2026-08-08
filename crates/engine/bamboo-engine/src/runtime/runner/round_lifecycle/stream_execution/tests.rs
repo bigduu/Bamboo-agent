@@ -743,6 +743,68 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
         .all(|event| matches!(event, AgentEvent::TokenBudgetUpdated { .. })));
 }
 
+#[test]
+fn projected_explicit_activation_uses_the_live_restricted_tool_schema_slice() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-explicit-projection", "test-model");
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        "[\"review\"]".to_string(),
+    );
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("load it")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let tool_schemas = ["load_skill", "Read"]
+        .into_iter()
+        .map(|name| bamboo_agent_core::tools::ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.to_string(),
+                description: format!("{name} schema ").repeat(32),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let effective = super::effective_tool_schemas(&session, &tool_schemas);
+    assert_eq!(effective.len(), 1);
+    assert_eq!(effective[0].function.name, "load_skill");
+
+    let projected_from_full = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tool_schemas,
+        "test-model",
+    );
+    let projected_from_live_slice = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tool_schemas[..1],
+        "test-model",
+    );
+    assert_eq!(
+        projected_from_full.input_tokens,
+        projected_from_live_slice.input_tokens
+    );
+    assert_eq!(
+        projected_from_full.ledger_rendered_bytes,
+        projected_from_live_slice.ledger_rendered_bytes
+    );
+}
+
 #[tokio::test]
 async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     let _env_lock = isolate_prompt_safe_env_cache();
@@ -1150,16 +1212,36 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
         "the seeded ledger must checkpoint exactly once before dispatch"
     );
 
+    let retry_prepared = super::super::context_preparation::prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-ledger-reseed-refit",
+        &[],
+        &llm_dyn,
+        None,
+    )
+    .await
+    .expect("retry preparation should reuse the durable ledger without duplicate events");
+    let retry_projection = super::project_request_usage(
+        &session,
+        &retry_prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(retry_projection.input_tokens <= retry_prepared.budget.max_request_input_tokens());
+
     execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
-        &prepared.prepared_context,
+        &retry_prepared.prepared_context,
         &[],
         &frame,
     )
     .await
-    .expect("identical retry should dispatch without a duplicate ledger event");
+    .expect("fully re-prepared retry should dispatch without a duplicate ledger event");
     assert_eq!(
         llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
         2
@@ -1167,7 +1249,7 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
     assert_eq!(
         persistence.0.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "identical retry must not checkpoint an unchanged ledger"
+        "fully re-prepared retry must not checkpoint an unchanged ledger"
     );
     assert_eq!(
         request_shape(&llm.requested_messages.lock().unwrap()),
