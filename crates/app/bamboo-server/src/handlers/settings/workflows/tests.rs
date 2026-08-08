@@ -1,5 +1,27 @@
 use super::validation::is_safe_workflow_name;
 
+const MAX_LEGACY_FAILURE_BODY_BYTES: usize = 2 * 1024;
+
+/// Preserve the endpoint's actual status and response body when a success
+/// assertion fails without allowing an unexpectedly large or unescaped body to
+/// flood CI logs. This endpoint and its synthetic fixture carry no credentials.
+async fn assert_legacy_endpoint_success(context: &str, response: actix_web::dev::ServiceResponse) {
+    let status = response.status();
+    if status.is_success() {
+        return;
+    }
+
+    let body = actix_web::test::read_body(response).await;
+    let visible_len = body.len().min(MAX_LEGACY_FAILURE_BODY_BYTES);
+    let visible = String::from_utf8_lossy(&body[..visible_len]);
+    let truncated = if body.len() > visible_len {
+        " <truncated>"
+    } else {
+        ""
+    };
+    panic!("{context} failed: status={status}, body={visible:?}{truncated}");
+}
+
 #[actix_web::test]
 async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_metadata() {
     let data = tempfile::tempdir().expect("data dir");
@@ -844,35 +866,87 @@ async fn deleting_legacy_source_never_deletes_a_same_id_ordinary_skill() {
 
 #[actix_web::test]
 async fn concurrent_legacy_updates_leave_one_source_and_no_skill_bundle() {
+    const WRITES_PER_TASK: usize = 8;
+    const EXPLICIT_RELOADS: usize = WRITES_PER_TASK * 2;
+
     let data = tempfile::tempdir().expect("data dir");
     let state = actix_web::web::Data::new(
         crate::app_state::AppState::new(data.path().to_path_buf())
             .await
             .expect("app state"),
     );
-    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
         "/workflows",
         actix_web::web::post().to(super::save_workflow),
     ))
     .await;
-    let first = actix_web::test::TestRequest::post()
-        .uri("/workflows")
-        .set_json(serde_json::json!({"name": "race", "content": "body one"}))
-        .to_request();
-    let second = actix_web::test::TestRequest::post()
-        .uri("/workflows")
-        .set_json(serde_json::json!({"name": "race", "content": "body two"}))
-        .to_request();
-    let (first, second) = tokio::join!(
-        actix_web::test::call_service(&app, first),
-        actix_web::test::call_service(&app, second)
-    );
-    assert!(first.status().is_success());
-    assert!(second.status().is_success());
+
+    // Historically the handler and SkillStore::reload() both materialized the
+    // same legacy source as a Skill bundle, but only the handler held the
+    // legacy I/O lock. Concurrent first-time hard links could therefore turn a
+    // successful source write into a non-success response. Exercise both paths
+    // together for a fixed number of rounds and retain the source-only contract.
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let first_start = start.clone();
+    let first_writer = async {
+        first_start.wait().await;
+        for round in 0..WRITES_PER_TASK {
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::post()
+                    .uri("/workflows")
+                    .set_json(serde_json::json!({
+                        "name": "race",
+                        "content": format!("body one {round}")
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_legacy_endpoint_success("first concurrent POST /workflows", response).await;
+            tokio::task::yield_now().await;
+        }
+    };
+    let second_start = start.clone();
+    let second_writer = async {
+        second_start.wait().await;
+        for round in 0..WRITES_PER_TASK {
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::post()
+                    .uri("/workflows")
+                    .set_json(serde_json::json!({
+                        "name": "race",
+                        "content": format!("body two {round}")
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_legacy_endpoint_success("second concurrent POST /workflows", response).await;
+            tokio::task::yield_now().await;
+        }
+    };
+    let reload_start = start;
+    let explicit_reloads = async {
+        reload_start.wait().await;
+        for _ in 0..EXPLICIT_RELOADS {
+            state
+                .skill_manager
+                .store()
+                .reload()
+                .await
+                .expect("explicit concurrent catalog reload");
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::join!(first_writer, second_writer, explicit_reloads);
+
     let source = tokio::fs::read_to_string(data.path().join("workflows/race.md"))
         .await
         .expect("source");
-    assert!(source == "body one" || source == "body two");
+    assert!(
+        source == format!("body one {}", WRITES_PER_TASK - 1)
+            || source == format!("body two {}", WRITES_PER_TASK - 1)
+    );
     assert!(
         !data.path().join("skills/race/SKILL.md").exists(),
         "concurrent Workflow writes must not create a Skill"
@@ -916,7 +990,7 @@ async fn legacy_api_preserves_names_outside_skill_id_grammar() {
         .set_json(serde_json::json!({"name": name, "content": "Original body"}))
         .to_request();
     let response = actix_web::test::call_service(&app, request).await;
-    assert!(response.status().is_success());
+    assert_legacy_endpoint_success("POST /workflows with a legacy Unicode name", response).await;
 
     let request = actix_web::test::TestRequest::get()
         .uri("/workflows")
