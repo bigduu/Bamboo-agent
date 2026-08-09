@@ -3,8 +3,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, NoticeLevel, Tab};
+use crate::app::{App, NoticeLevel, QuestionOptionHitbox, Tab};
 use crate::theme::{self, colors};
 
 pub struct AppLayout {
@@ -329,114 +330,307 @@ fn submitting_hint() -> Line<'static> {
     ))
 }
 
-/// Modal for an agent question (permission gate / clarification): the operator
-/// selects an option or types a free-text answer. Rendered over everything when
-/// `app.pending_question` is set.
+fn identity_syncing_hint() -> Line<'static> {
+    Line::from(Span::styled(
+        "  Synchronizing exact question identity\u{2026}",
+        Style::default().fg(colors::WARNING),
+    ))
+}
+
+fn hard_wrap_preview(value: &str, width: usize, max_lines: usize) -> (Vec<String>, bool) {
+    let width = width.max(1);
+    if max_lines == 0 {
+        return (Vec::new(), !value.is_empty());
+    }
+    let mut output = Vec::new();
+    let mut logical_lines = value.split('\n').peekable();
+    while let Some(logical) = logical_lines.next() {
+        let mut current = String::new();
+        let mut current_width = 0;
+        for ch in logical.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if !current.is_empty() && current_width + char_width > width {
+                output.push(std::mem::take(&mut current));
+                if output.len() == max_lines {
+                    return (output, true);
+                }
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += char_width;
+        }
+        output.push(current);
+        if output.len() == max_lines {
+            return (output, logical_lines.peek().is_some());
+        }
+    }
+    if output.is_empty() {
+        output.push(String::new());
+    }
+    (output, false)
+}
+
+fn ellipsize(value: &str, width: usize) -> String {
+    let width = width.max(1);
+    let prefix_width_limit = width.saturating_sub(1);
+    let mut prefix = String::new();
+    let mut prefix_width = 0;
+    let mut total_width = 0;
+    let mut truncated = false;
+    for ch in value.chars() {
+        if ch == '\n' {
+            truncated = true;
+            break;
+        }
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if total_width + char_width > width {
+            truncated = true;
+            break;
+        }
+        total_width += char_width;
+        if prefix_width + char_width <= prefix_width_limit {
+            prefix.push(ch);
+            prefix_width += char_width;
+        }
+    }
+    if truncated {
+        prefix.push('…');
+        prefix
+    } else {
+        value.to_string()
+    }
+}
+
+/// Typed clarification modal. The compact view never changes an option's
+/// underlying value; `v` opens a scrollable full-text inspector for the exact
+/// question or selected option, including on narrow terminals.
 pub fn render_question(f: &mut Frame, app: &App) {
     let Some(q) = &app.pending_question else {
         return;
     };
-
+    q.option_hitboxes.borrow_mut().clear();
     let screen = f.area();
-    // Header: title + blank + (wrapped) question + blank. Cap the question to a
-    // few lines so a very long prompt can't push the options/footer off-screen.
-    let mut header: Vec<Line> = vec![
-        Line::from(Span::styled(
-            " Agent needs your input",
-            Style::default()
-                .fg(colors::BRAND)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
-    const MAX_QUESTION_LINES: usize = 6;
-    for l in q.question.lines().take(MAX_QUESTION_LINES) {
-        header.push(Line::raw(format!("  {l}")));
+
+    if q.inspecting {
+        let height = screen.height.clamp(6, 24);
+        let area = centered_rect(90, height, screen);
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::BRAND))
+            .title(" Clarification text inspector ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(3),
+            ])
+            .split(inner);
+        let (label, value) = if q.inspect_option {
+            (
+                format!("Selected option {} (exact value)", q.selected + 1),
+                q.options.get(q.selected).map(String::as_str).unwrap_or(""),
+            )
+        } else {
+            ("Question (full text)".to_string(), q.question.as_str())
+        };
+        let context = q
+            .tool_name
+            .as_deref()
+            .map(|tool| format!("tool: {tool}"))
+            .unwrap_or_else(|| "tool: unknown".to_string());
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!(" {label}"),
+                    Style::default()
+                        .fg(colors::BRAND)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::raw(format!(" {context}")),
+            ]),
+            sections[0],
+        );
+        let paragraph = Paragraph::new(value).wrap(Wrap { trim: false });
+        let wrapped_count = paragraph.line_count(sections[1].width);
+        let max_scroll = u16::try_from(wrapped_count.saturating_sub(sections[1].height as usize))
+            .unwrap_or(u16::MAX);
+        q.inspect_max_scroll.set(max_scroll);
+        f.render_widget(
+            paragraph.scroll((q.inspect_scroll.min(max_scroll), 0)),
+            sections[1],
+        );
+        let footer = if q.options.is_empty() {
+            vec![
+                Line::raw(" ↑/↓/PgUp/PgDn scroll"),
+                Line::raw(" y copy exact"),
+                Line::raw(" v/Esc back"),
+            ]
+        } else {
+            vec![
+                Line::raw(" ↑/↓/PgUp/PgDn scroll"),
+                Line::raw(" Tab question/option"),
+                Line::raw(" y copy exact  ·  v/Esc back"),
+            ]
+        };
+        f.render_widget(Paragraph::new(footer), sections[2]);
+        return;
     }
-    if q.question.lines().count() > MAX_QUESTION_LINES {
-        header.push(Line::raw("  …"));
+
+    let popup_width = (screen.width as usize * 80 / 100).max(1);
+    let text_width = popup_width.saturating_sub(6).max(1);
+    let mut header = vec![Line::from(Span::styled(
+        " Clarification needed",
+        Style::default()
+            .fg(colors::BRAND)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if q.tool_name.is_some() || q.source.is_some() {
+        let context = format!(
+            "  tool: {}  ·  source: {}",
+            q.tool_name.as_deref().unwrap_or("unknown"),
+            q.source.as_deref().unwrap_or("unknown")
+        );
+        header.push(Line::raw(ellipsize(&context, text_width + 2)));
+    }
+    header.push(Line::raw(""));
+    const QUESTION_PREVIEW_LINES: usize = 4;
+    let (wrapped_question, question_truncated) =
+        hard_wrap_preview(&q.question, text_width, QUESTION_PREVIEW_LINES);
+    for line in &wrapped_question {
+        header.push(Line::raw(format!("  {line}")));
+    }
+    if question_truncated {
+        header.push(Line::raw("  …  (v inspect full question)"));
     }
     header.push(Line::raw(""));
 
-    let mut body: Vec<Line> = Vec::new();
-    match &q.custom {
-        Some(buf) => {
-            body.push(Line::raw("  Type your answer:"));
-            body.push(Line::from(Span::styled(
-                format!("  > {buf}\u{258f}"),
-                Style::default().fg(colors::BRAND),
-            )));
-            body.push(Line::raw(""));
-            if q.submitting {
-                body.push(submitting_hint());
-            } else {
-                body.push(Line::raw(if q.options.is_empty() {
-                    "  Enter answer  ·  Esc dismiss"
-                } else {
-                    "  Enter answer  ·  Esc back to options"
-                }));
-            }
+    let mut body = Vec::new();
+    let mut option_line_positions = Vec::new();
+    if let Some(entry) = &q.number_entry {
+        body.push(Line::raw(format!("  Go to option #: {entry}▏")));
+        body.push(Line::raw(""));
+        body.push(Line::raw("  digits type  ·  Enter select"));
+        body.push(Line::raw("  Backspace edit  ·  Esc cancel"));
+    } else if let Some(buf) = &q.custom {
+        body.push(Line::raw("  Custom answer:"));
+        body.push(Line::from(Span::styled(
+            format!("  > {}▏", ellipsize(buf, text_width.saturating_sub(2))),
+            Style::default().fg(colors::BRAND),
+        )));
+        body.push(Line::raw(""));
+        if q.identity_syncing {
+            body.push(identity_syncing_hint());
+        } else if q.submitting {
+            body.push(submitting_hint());
+        } else if q.options.is_empty() {
+            body.push(Line::raw("  Enter answer  ·  Esc dismiss"));
+            body.push(Line::raw("  Ctrl+V inspect/copy question"));
+        } else {
+            body.push(Line::raw("  Enter answer  ·  Esc options"));
+            body.push(Line::raw("  Ctrl+V inspect/copy question"));
         }
-        None => {
-            // Window the option list around the selection so it stays visible and
-            // the modal never overflows the screen, no matter how many options.
-            let max_h = screen.height.min(22);
-            // rows available for options = modal height - borders(2) - header - footer(1)
-            let budget = (max_h as usize).saturating_sub(2 + header.len() + 1).max(1);
-            let total = q.options.len();
-            let start = if total <= budget {
-                0
+    } else if q.options.is_empty() {
+        body.push(Line::from(Span::styled(
+            "  No selectable answers were supplied and custom input is disabled.",
+            Style::default().fg(colors::WARNING),
+        )));
+        body.push(Line::raw(""));
+        body.push(Line::raw("  v inspect/copy question  ·  Esc dismiss"));
+    } else {
+        let max_h = screen.height.min(24);
+        let reserved =
+            2 + header.len() + 7 + usize::from(q.allow_custom) + usize::from(q.error.is_some());
+        let budget = (max_h as usize).saturating_sub(reserved).max(1);
+        let total = q.options.len();
+        let start = if total <= budget {
+            0
+        } else {
+            q.selected
+                .saturating_sub(budget / 2)
+                .min(total.saturating_sub(budget))
+        };
+        let end = (start + budget).min(total);
+        if start > 0 {
+            body.push(Line::raw(format!("  ↑ {start} more")));
+        }
+        for i in start..end {
+            let selected = i == q.selected;
+            let marker = if selected { "›" } else { " " };
+            let style = if selected {
+                Style::default()
+                    .fg(colors::BRAND)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                q.selected
-                    .saturating_sub(budget / 2)
-                    .min(total.saturating_sub(budget))
+                Style::default()
             };
-            let end = (start + budget).min(total);
-            if start > 0 {
-                body.push(Line::raw(format!("  \u{2191} {start} more")));
-            }
-            for i in start..end {
-                let selected = i == q.selected;
-                let marker = if selected { "\u{203a}" } else { " " };
-                let style = if selected {
-                    Style::default()
-                        .fg(colors::BRAND)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                body.push(Line::from(Span::styled(
-                    format!("  {marker} {}. {}", i + 1, q.options[i]),
-                    style,
-                )));
-            }
-            if end < total {
-                body.push(Line::raw(format!("  \u{2193} {} more", total - end)));
-            }
-            body.push(Line::raw(""));
-            if q.submitting {
-                body.push(submitting_hint());
-            } else {
-                body.push(Line::raw(
-                    "  \u{2191}/\u{2193} select  ·  Enter answer  ·  1-9 quick  ·  c custom  ·  Esc dismiss",
-                ));
+            let prefix = format!("  {marker} {}. ", i + 1);
+            let option_width = text_width.saturating_sub(prefix.chars().count()).max(1);
+            option_line_positions.push((body.len(), i));
+            body.push(Line::from(Span::styled(
+                format!("{prefix}{}", ellipsize(&q.options[i], option_width)),
+                style,
+            )));
+        }
+        if end < total {
+            body.push(Line::raw(format!("  ↓ {} more", total - end)));
+        }
+        body.push(Line::raw(""));
+        if q.identity_syncing {
+            body.push(identity_syncing_hint());
+        } else if q.submitting {
+            body.push(submitting_hint());
+        } else {
+            body.push(Line::raw("  click option answer  ·  ↑/↓/wheel select"));
+            body.push(Line::raw("  Enter answer  ·  Esc dismiss  ·  1-9 quick"));
+            body.push(Line::raw("  g number  ·  v inspect  ·  y copy"));
+            if q.allow_custom {
+                body.push(Line::raw("  c custom answer"));
             }
         }
     }
-
+    if let Some(error) = &q.error {
+        body.push(Line::from(Span::styled(
+            format!(
+                "  Error: {}",
+                ellipsize(error, text_width.saturating_sub(7))
+            ),
+            Style::default().fg(colors::ERROR),
+        )));
+    }
+    let header_len = header.len();
     let mut lines = header;
     lines.extend(body);
     let height = (lines.len() as u16 + 2).min(screen.height);
-    let area = centered_rect(60, height, screen);
+    let area = centered_rect(80, height, screen);
+    let option_x = area.x.saturating_add(1);
+    let option_width = area.width.saturating_sub(2);
+    let option_bottom = area.y.saturating_add(area.height).saturating_sub(1);
+    *q.option_hitboxes.borrow_mut() = option_line_positions
+        .into_iter()
+        .filter_map(|(body_line, index)| {
+            let y = area
+                .y
+                .saturating_add(1)
+                .saturating_add(header_len as u16)
+                .saturating_add(body_line as u16);
+            (y < option_bottom).then_some(QuestionOptionHitbox {
+                x: option_x,
+                y,
+                width: option_width,
+                index,
+            })
+        })
+        .collect();
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::BRAND))
-        .title(" Question ");
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, area);
+        .title(" Clarification ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Modal confirming a session delete (`d` on the Sessions tab). Mirrors the

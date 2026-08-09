@@ -4,7 +4,8 @@ use crate::api::types::{
     ListSessionsEnvelope, McpServer, PendingQuestion, ProviderCatalog, Schedule, Skill,
     SkillDetail, ToolInfo,
 };
-use crate::app::OpenedSession;
+use crate::api::RespondFailure;
+use crate::app::{OpenedSession, QuestionIdentity};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -52,8 +53,31 @@ pub enum AppEvent {
         result: Result<OpenedSession, String>,
     },
     /// `Ctrl+Q` with no cached dismissed question found one on the server (or
-    /// confirmed there isn't one).
-    PendingQuestionChecked(Loaded<PendingQuestion>),
+    /// confirmed there isn't one). Session + epoch bind the async result to
+    /// the context that requested it so a late fetch cannot replace a newer
+    /// session/tool-call question.
+    PendingQuestionChecked {
+        session_id: String,
+        epoch: u64,
+        result: Loaded<PendingQuestion>,
+    },
+    /// Authoritative pending-question state fetched after an SSE handshake.
+    /// The epoch prevents a late fetch from replacing a question or answer
+    /// that changed while the request was in flight.
+    PendingQuestionReconciled {
+        session_id: String,
+        epoch: u64,
+        reconcile_epoch: u64,
+        result: Loaded<PendingQuestion>,
+    },
+    /// Server-state reconciliation after a rejected answer whose 400/409
+    /// status indicates the question may have changed or been consumed.
+    PendingQuestionRefreshed {
+        session_id: String,
+        epoch: u64,
+        identity: QuestionIdentity,
+        result: Loaded<PendingQuestion>,
+    },
     /// The answer POST for the pending question finished (`submit_answer`
     /// spawns it off the event loop — awaiting it inline froze the whole UI
     /// for the round-trip). `epoch` is the submission epoch captured when the
@@ -64,8 +88,9 @@ pub enum AppEvent {
     /// `result` carries the server's `auto_resume_status` on success.
     AnswerSubmitted {
         epoch: u64,
+        identity: QuestionIdentity,
         answer: String,
-        result: Loaded<String>,
+        result: Result<String, RespondFailure>,
     },
     /// `Ctrl+O`'s provider-catalog fetch finished. Dropped by the handler if
     /// `model_picker` was already closed (Esc) before this arrived.

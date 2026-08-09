@@ -58,6 +58,7 @@ pub async fn submit_permission_decision(
 ) -> Result<HttpResponse, AppError> {
     let session_id = session_id.into_inner();
     let decision = payload.into_inner();
+    let expected_tool_call_id = decision.request_id.clone();
     let Some(config) = state.permission_checker.permission_config() else {
         return Err(AppError::InternalError(anyhow::anyhow!(
             "permission checker does not expose typed decisions"
@@ -220,6 +221,10 @@ pub async fn submit_permission_decision(
         web::Path::from(session_id),
         web::Json(RespondRequest {
             response: legacy_response.to_string(),
+            // Permission request identity is the originating tool-call id.
+            // Keep that exact CAS on replay so receipt A can never answer a
+            // newer pending permission B.
+            expected_tool_call_id: Some(expected_tool_call_id),
             model: None,
             provider: None,
             model_ref: None,
@@ -238,4 +243,124 @@ pub async fn submit_permission_decision(
         receipt,
         resume: Some(serde_json::json!({ "accepted": true })),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::{PendingQuestionSource, Session};
+    use bamboo_engine::execution::{AgentRunner, AgentStatus};
+
+    #[actix_web::test]
+    async fn replayed_decision_returns_immediately_while_successor_is_running() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "permission-replay-running-successor";
+        state
+            .storage
+            .save_session(&Session::new(session_id, "test-model"))
+            .await
+            .expect("save completed session");
+
+        let decision = PermissionDecision {
+            request_id: "request-1".to_string(),
+            decision: PermissionDecisionKind::AllowOnce,
+            matcher_id: None,
+            expected_policy_revision: None,
+            confirm_global: false,
+        };
+        state
+            .permission_checker
+            .permission_config()
+            .expect("typed permission config")
+            .record_decision(session_id, decision.clone())
+            .expect("record original decision");
+
+        let mut successor = AgentRunner::new();
+        successor.status = AgentStatus::Running;
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(session_id.to_string(), successor);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            submit_permission_decision(
+                state,
+                web::Path::from(session_id.to_string()),
+                web::Json(decision),
+            ),
+        )
+        .await
+        .expect("idempotent replay must not wait for the running successor")
+        .expect("response");
+
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    }
+
+    #[actix_web::test]
+    async fn replayed_old_decision_cannot_consume_a_newer_permission_question() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = web::Data::new(
+            AppState::new(dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "permission-replay-newer-question";
+        let old_decision = PermissionDecision {
+            request_id: "request-a".to_string(),
+            decision: PermissionDecisionKind::AllowOnce,
+            matcher_id: None,
+            expected_policy_revision: None,
+            confirm_global: false,
+        };
+        state
+            .permission_checker
+            .permission_config()
+            .expect("typed permission config")
+            .record_decision(session_id, old_decision.clone())
+            .expect("record old receipt");
+
+        let mut session = Session::new(session_id, "test-model");
+        session.set_pending_question_with_source(
+            "request-b".to_string(),
+            "Bash".to_string(),
+            "Allow the newer command?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+            PendingQuestionSource::PauseTool,
+        );
+        state.save_and_cache_session(&mut session).await;
+        let baseline_runners = state.agent_runners.read().await.len();
+        let baseline_senders = state.session_event_senders.read().await.len();
+
+        let response = submit_permission_decision(
+            state.clone(),
+            web::Path::from(session_id.to_string()),
+            web::Json(old_decision),
+        )
+        .await
+        .expect("replay response");
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+
+        let durable = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("durable load")
+            .expect("durable session");
+        let pending = durable.pending_question.expect("newer question remains");
+        assert_eq!(pending.tool_call_id, "request-b");
+        assert_eq!(pending.question, "Allow the newer command?");
+        assert_eq!(state.agent_runners.read().await.len(), baseline_runners);
+        assert_eq!(
+            state.session_event_senders.read().await.len(),
+            baseline_senders
+        );
+    }
 }

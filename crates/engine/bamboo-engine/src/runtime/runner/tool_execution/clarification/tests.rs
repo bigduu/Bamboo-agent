@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::{maybe_handle_user_question_tool, UserQuestionToolContext};
@@ -7,6 +9,17 @@ use bamboo_agent_core::{AgentEvent, Role, Session};
 use bamboo_domain::session::runtime_state::{AgentRuntimeState, PlanModeState, PlanModeStatus};
 use bamboo_memory::plan_store::PlanStore;
 use chrono::Utc;
+
+struct FailingClarificationPersistence;
+
+#[async_trait]
+impl bamboo_domain::RuntimeSessionPersistence for FailingClarificationPersistence {
+    async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "injected pending-question save failure",
+        ))
+    }
+}
 
 #[tokio::test]
 async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events() {
@@ -87,15 +100,73 @@ async fn maybe_handle_user_question_tool_sets_pending_question_and_emits_events(
             tool_call_id,
             tool_name,
             allow_custom,
+            source,
         } => {
             assert_eq!(question, "Continue?");
             assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
             assert_eq!(tool_call_id, Some("ask-1".to_string()));
             assert_eq!(tool_name, Some("request_permissions".to_string()));
             assert!(!allow_custom);
+            assert_eq!(
+                source,
+                Some(bamboo_agent_core::PendingQuestionSource::PauseTool)
+            );
         }
         other => panic!("unexpected second event: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn legacy_pending_question_persistence_failure_never_publishes_clarification() {
+    let tool_call = ToolCall {
+        id: "ask-failed-save".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "request_permissions".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let result = ToolResult {
+        success: true,
+        result: serde_json::json!({
+            "question": "Continue?",
+            "options": ["Yes", "No"],
+            "allow_custom": false
+        })
+        .to_string(),
+        display_preference: Some("request_permissions".to_string()),
+        images: Vec::new(),
+    };
+    let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+        Arc::new(FailingClarificationPersistence);
+    let config = AgentLoopConfig {
+        persistence: Some(persistence),
+        ..AgentLoopConfig::default()
+    };
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut session = Session::new("failed-save", "model");
+
+    assert!(
+        maybe_handle_user_question_tool(UserQuestionToolContext {
+            tool_call: &tool_call,
+            result: &result,
+            session: &mut session,
+            event_tx: &tx,
+            metrics_collector: None,
+            session_id: "failed-save",
+            round_id: "round-1",
+            config: &config,
+        })
+        .await
+    );
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Error { message } if message.contains("could not be saved"))
+    ));
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, AgentEvent::NeedClarification { .. })));
 }
 
 #[tokio::test]
@@ -173,6 +244,7 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
             tool_call_id,
             tool_name,
             allow_custom,
+            source,
         } => {
             assert!(question.contains("Permission Request"));
             assert_eq!(
@@ -182,6 +254,10 @@ async fn maybe_handle_user_question_tool_handles_request_permissions() {
             assert_eq!(tool_call_id, Some("perm-1".to_string()));
             assert_eq!(tool_name, Some("request_permissions".to_string()));
             assert!(!allow_custom);
+            assert_eq!(
+                source,
+                Some(bamboo_agent_core::PendingQuestionSource::PauseTool)
+            );
         }
         other => panic!("unexpected second event: {other:?}"),
     }

@@ -542,6 +542,7 @@ async fn run_schedule_job(
 
     let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
         session_id.clone(),
+        execution_reservation.run_id().to_string(),
         session_tx.clone(),
         ctx.agent_runners.clone(),
         ctx.account_feed_inbox.clone(),

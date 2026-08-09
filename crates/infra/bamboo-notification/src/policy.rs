@@ -400,6 +400,7 @@ mod tests {
             tool_call_id: tool_call_id.map(str::to_string),
             tool_name: None,
             allow_custom: true,
+            source: None,
         }
     }
 

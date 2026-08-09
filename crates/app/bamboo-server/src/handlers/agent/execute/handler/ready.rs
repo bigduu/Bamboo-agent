@@ -177,6 +177,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     spawn_event_forwarder(
         state.clone(),
         session_id.to_string(),
+        run_id.clone(),
         mpsc_rx,
         session_tx.clone(),
         gold_config.clone(),

@@ -206,6 +206,7 @@ mod tests {
             tool_call_id: Some("tc-1".to_string()),
             tool_name: None,
             allow_custom: true,
+            source: None,
         })
         .unwrap();
 

@@ -13,7 +13,8 @@
 //! ## Invariant
 //!
 //! No code in the workspace may pair `runner.push_critical_event` with
-//! `sender.send` outside this helper or the server's `spawn_event_forwarder`
+//! `sender.send` outside this helper, the generic engine event forwarder, or
+//! the server's `spawn_event_forwarder`
 //! (in `handlers::agent::execute::runtime::events`).
 //! Hand-rolling the pair has historically led to inverted ordering (broadcast
 //! first, cache second), which leaves a small window where a late subscriber

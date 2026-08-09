@@ -37,31 +37,31 @@ pub fn render(f: &mut Frame, app: &App) {
         layout::render_notifications(f, app);
     }
 
-    // Exclusive modals — at most one of these is ever `Some` at a time (see
-    // the precedence comment on `App::handle_key`), so draw order only
-    // matters for visually layering over the help/notification overlays
-    // above; kept in the same 0-5 precedence order as the key routing.
-    if app.serve_offer.is_some() {
-        layout::render_serve_offer(f, app);
-    }
-
-    if app.pending_question.is_some() {
-        layout::render_question(f, app);
-    }
-
-    if app.pending_delete.is_some() {
-        layout::render_delete_confirm(f, app);
-    }
-
-    if app.model_picker.is_some() {
-        layout::render_model_picker(f, app);
+    // A clarification can arrive asynchronously while a local editor or
+    // confirmation is already open. Draw from lowest to highest input
+    // precedence so the modal that owns the keyboard is always the visible
+    // frontmost modal (the reverse of `App::handle_key`'s routing order).
+    if app.config_editor.is_some() {
+        config::render_editor(f, app);
     }
 
     if app.schedule_form.is_some() {
         layout::render_schedule_form(f, app);
     }
 
-    if app.config_editor.is_some() {
-        config::render_editor(f, app);
+    if app.model_picker.is_some() {
+        layout::render_model_picker(f, app);
+    }
+
+    if app.pending_delete.is_some() {
+        layout::render_delete_confirm(f, app);
+    }
+
+    if app.pending_question.is_some() {
+        layout::render_question(f, app);
+    }
+
+    if app.serve_offer.is_some() {
+        layout::render_serve_offer(f, app);
     }
 }

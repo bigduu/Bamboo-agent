@@ -49,6 +49,7 @@ use crate::model_config_helper::{
 use crate::session_activation::{
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationSpawner,
 };
+use crate::session_app::execute::consume_pending_clarification_resume;
 use crate::session_app::provider_model::session_effective_model_ref;
 use crate::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
@@ -953,10 +954,21 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         .await
     }
 
+    fn dispatch_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = self.clone();
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
         let ResumeSpawnRequest {
             session_id,
-            session,
+            mut session,
             mut execution_reservation,
             event_sender,
             config,
@@ -1018,6 +1030,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
 
         let (mpsc_tx, _forwarder) = create_event_forwarder(
             session_id.clone(),
+            execution_reservation.run_id().to_string(),
             event_sender,
             self.agent_runners.clone(),
             self.account_feed_inbox.clone(),
@@ -1071,6 +1084,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         let guardian_config = read_guardian_config(&session);
         let guardian_spawner = self.guardian_spawner.read().await.clone();
 
+        consume_pending_clarification_resume(&mut session);
         spawn_session_execution(SessionExecutionArgs {
             agent: self.agent.clone(),
             session_id,

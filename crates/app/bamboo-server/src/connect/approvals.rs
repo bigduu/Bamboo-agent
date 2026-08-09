@@ -33,13 +33,14 @@ use bamboo_engine::runtime::execution::agent_spawn::{
 use bamboo_engine::session_app::approval_replay::{
     refresh_approval_replay_posture, ApprovalReplayDecision,
 };
+use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
 use bamboo_engine::session_app::respond::{
-    submit_pending_response, PERMISSION_REEXECUTE_METADATA_KEY,
+    acquire_pending_response_guard, inspect_pending_response_guarded,
+    submit_pending_response_checked_guarded, validate_pending_response,
+    PERMISSION_REEXECUTE_METADATA_KEY,
 };
-use bamboo_engine::session_app::resume::{
-    resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
-};
+use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use bamboo_engine::session_app::types::RespondInput;
 use bamboo_engine::{ModelRoster, RoleModel};
 
@@ -66,6 +67,10 @@ pub struct ParkedAsk {
     /// forged/stale data is ignored.
     pub nonce: String,
     pub session_id: String,
+    /// Exact durable identity used as the response CAS guard. Legacy live
+    /// events are reconciled against session persistence before a `ParkedAsk`
+    /// can be constructed, so a new Connect client never submits an
+    /// unguarded clarification answer.
     pub tool_call_id: String,
     pub tool_name: String,
     pub question: String,
@@ -74,16 +79,16 @@ pub struct ParkedAsk {
 }
 
 impl ParkedAsk {
-    pub fn new(nonce: String, session_id: String, ask: &PendingAsk) -> Self {
-        Self {
+    pub fn new(nonce: String, session_id: String, ask: &PendingAsk) -> Option<Self> {
+        Some(Self {
             nonce,
             session_id,
-            tool_call_id: ask.tool_call_id.clone(),
+            tool_call_id: ask.tool_call_id.clone()?,
             tool_name: ask.tool_name.clone(),
             question: ask.question.clone(),
             options: ask.options.clone(),
             allow_custom: ask.allow_custom,
-        }
+        })
     }
 }
 
@@ -155,6 +160,32 @@ pub async fn render_ask(
         OutboundMessage::text(text)
     };
     platform.reply(reply_ctx, outbound).await.map(|_| ())
+}
+
+/// Render a legacy/external clarification that cannot be matched to a durable
+/// pending tool call. It remains fully inspectable, but deliberately has no
+/// buttons or reply instructions and is never registered as answerable chat
+/// state.
+pub async fn render_read_only_ask(
+    platform: &Arc<dyn Platform>,
+    reply_ctx: &ReplyCtx,
+    ask: &PendingAsk,
+    reason: &str,
+) -> PlatformResult<()> {
+    let mut text = ask.question.clone();
+    if !ask.options.is_empty() {
+        text.push_str("\n\n");
+        for (index, option) in ask.options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", index + 1, option));
+        }
+    }
+    text.push_str("\n(Response unavailable: ");
+    text.push_str(reason);
+    text.push(')');
+    platform
+        .reply(reply_ctx, OutboundMessage::text(text))
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +322,8 @@ pub enum ResponderError {
     NotFound,
     #[error("no pending question waiting for a response")]
     NoPendingQuestion,
+    #[error("the pending question changed; this action has expired")]
+    PendingQuestionChanged,
     #[error("invalid response: {0}")]
     InvalidResponse(String),
     #[error("{0}")]
@@ -308,6 +341,7 @@ pub trait Responder: Send + Sync {
     async fn respond_and_resume(
         &self,
         session_id: &str,
+        expected_tool_call_id: Option<&str>,
         answer: String,
     ) -> Result<RespondAndResumeOutcome, ResponderError>;
 }
@@ -317,6 +351,7 @@ fn map_respond_error(error: bamboo_engine::session_app::errors::RespondError) ->
     match error {
         RespondError::NotFound(_) => ResponderError::NotFound,
         RespondError::NoPendingQuestion => ResponderError::NoPendingQuestion,
+        RespondError::PendingQuestionMismatch { .. } => ResponderError::PendingQuestionChanged,
         RespondError::InvalidResponse(message) => ResponderError::InvalidResponse(message),
         other => ResponderError::Other(other.to_string()),
     }
@@ -346,8 +381,45 @@ impl Responder for EngineResponder {
     async fn respond_and_resume(
         &self,
         session_id: &str,
+        expected_tool_call_id: Option<&str>,
         answer: String,
     ) -> Result<RespondAndResumeOutcome, ResponderError> {
+        let response_guard = acquire_pending_response_guard(session_id).await;
+        let current =
+            inspect_pending_response_guarded(&self.ctx.session_repo, session_id, &response_guard)
+                .await
+                .map_err(map_respond_error)?
+                .ok_or(ResponderError::NotFound)?;
+        let pending = current
+            .pending_question
+            .as_ref()
+            .ok_or(ResponderError::NoPendingQuestion)?;
+        if expected_tool_call_id.is_some_and(|expected| expected != pending.tool_call_id) {
+            return Err(ResponderError::PendingQuestionChanged);
+        }
+        validate_pending_response(pending, &answer).map_err(ResponderError::InvalidResponse)?;
+
+        let port = ConnectResumePort {
+            ctx: self.ctx.clone(),
+        };
+        let handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
+            &port,
+            session_id,
+            std::time::Duration::from_secs(15),
+        )
+        .await
+        .map_err(|_| {
+            ResponderError::Other(
+                "the suspending run is still finalizing; answer not consumed".to_string(),
+            )
+        })?;
+        // Subscribe and resolve async configuration before the response CAS.
+        // This intentionally gives one response a stable config snapshot;
+        // concurrent config changes apply to later requests/runs. After the
+        // answer commits, the reserved successor is transferred to a detached
+        // owner synchronously, so callback cancellation cannot strand it.
+        let receiver = handoff.subscribe();
+        let config_snapshot = self.ctx.config.read().await.clone();
         let input = RespondInput {
             session_id: session_id.to_string(),
             user_response: answer,
@@ -357,10 +429,21 @@ impl Responder for EngineResponder {
             reasoning_effort: None,
         };
 
-        let (session, _submitted_answer, plan_mode_transition, permission_grants) =
-            submit_pending_response(&self.ctx.session_repo, input)
-                .await
-                .map_err(map_respond_error)?;
+        let submission = submit_pending_response_checked_guarded(
+            &self.ctx.session_repo,
+            input,
+            expected_tool_call_id.map(str::to_string),
+            &response_guard,
+        )
+        .await;
+        let (session, _submitted_answer, plan_mode_transition, permission_grants) = match submission
+        {
+            Ok(submission) => submission,
+            Err(error) => {
+                handoff.abandon().await;
+                return Err(map_respond_error(error));
+            }
+        };
 
         // Mirrors `handlers::agent::respond::handlers::submit`: record any
         // permission grant so the resumed re-execution of the gated tool
@@ -376,18 +459,10 @@ impl Responder for EngineResponder {
             }
         }
 
-        // Subscribe BEFORE triggering resume so the `ExecutionStarted` event
-        // (and everything after) is never missed — same ordering
-        // `bridge::ConnectBridge::run_prompt` uses for a fresh prompt.
-        let session_tx =
-            get_or_create_event_sender(&self.ctx.session_event_senders, session_id).await;
-        let receiver = session_tx.subscribe();
-
         if let Some(event) = plan_mode_transition_event(session_id, plan_mode_transition.as_ref()) {
-            let _ = session_tx.send(event);
+            handoff.publish_event(event);
         }
 
-        let config_snapshot = self.ctx.config.read().await.clone();
         let resume_config = resolve_resume_config_snapshot(
             &config_snapshot,
             &self.ctx.provider_registry,
@@ -395,10 +470,15 @@ impl Responder for EngineResponder {
             None,
         );
 
-        let port = ConnectResumePort {
-            ctx: self.ctx.clone(),
-        };
-        let outcome = resume_session_execution(&port, session_id, resume_config).await;
+        let outcome = bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
+            &port,
+            session_id,
+            session,
+            resume_config,
+            handoff,
+        )
+        .await;
+        drop(response_guard);
 
         match outcome {
             bamboo_engine::session_app::types::ResumeOutcome::Started { .. } => {
@@ -496,10 +576,23 @@ impl ResumeExecutionPort for ConnectResumePort {
         get_or_create_event_sender(&self.ctx.session_event_senders, session_id).await
     }
 
+    fn dispatch_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = ConnectResumePort {
+            ctx: self.ctx.clone(),
+        };
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
         let ResumeSpawnRequest {
             session_id,
-            session,
+            mut session,
             mut execution_reservation,
             event_sender,
             config,
@@ -533,6 +626,7 @@ impl ResumeExecutionPort for ConnectResumePort {
 
         let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
             session_id.clone(),
+            execution_reservation.run_id().to_string(),
             event_sender,
             self.ctx.agent_runners.clone(),
             self.ctx.account_feed_inbox.clone(),
@@ -551,6 +645,7 @@ impl ResumeExecutionPort for ConnectResumePort {
             .cloned();
 
         let Some(reexecute_tool_call_id) = reexecute_tool_call_id else {
+            consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
                 agent: self.ctx.agent.clone(),
                 session_id,
@@ -710,6 +805,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 );
             }
 
+            consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
                 agent: ctx.agent.clone(),
                 session_id,

@@ -193,6 +193,7 @@ pub enum ExecutePreparationOutcome {
 // ---- Respond types ----
 
 /// Input for the respond use case.
+#[derive(Clone)]
 pub struct RespondInput {
     pub session_id: String,
     pub user_response: String,

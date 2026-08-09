@@ -1,4 +1,6 @@
-use bamboo_agent_core::tools::{handle_tool_result_with_agentic_support, ToolHandlingOutcome};
+use bamboo_agent_core::tools::{
+    handle_tool_result_with_agentic_support_and_persistence, ToolHandlingOutcome,
+};
 use bamboo_agent_core::AgentEvent;
 
 use super::super::{clarification, events, task, tool_error_collector};
@@ -152,7 +154,7 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         })
     );
 
-    let outcome = handle_tool_result_with_agentic_support(
+    let outcome = handle_tool_result_with_agentic_support_and_persistence(
         ctx.result,
         ctx.tool_call,
         ctx.event_tx,
@@ -163,6 +165,7 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
         // in the agent runtime. Catalog-pinned workflow_run is the single
         // production orchestration authority (#578).
         None,
+        ctx.config.persistence.as_ref(),
     )
     .await;
 

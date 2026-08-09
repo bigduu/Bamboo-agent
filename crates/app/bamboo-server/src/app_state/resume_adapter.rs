@@ -16,6 +16,7 @@ use bamboo_engine::model_config_helper::{
 use bamboo_engine::session_app::approval_replay::{
     refresh_approval_replay_posture, ApprovalReplayDecision,
 };
+use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 use bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY;
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
@@ -62,10 +63,21 @@ impl ResumeExecutionPort for AppStateResumeRef {
         get_or_create_event_sender(&self.0.session_event_senders, session_id).await
     }
 
+    fn dispatch_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = AppStateResumeRef(self.0.clone());
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
         let ResumeSpawnRequest {
             session_id,
-            session,
+            mut session,
             mut execution_reservation,
             event_sender,
             config,
@@ -141,6 +153,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         spawn_event_forwarder(
             state.clone(),
             session_id.clone(),
+            execution_reservation.run_id().to_string(),
             mpsc_rx,
             event_sender,
             gold_config.clone(),
@@ -175,6 +188,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
             .cloned();
         let reexecute_tool_call_id = match reexecute_tool_call_id {
             None => {
+                // Keep the durable startup marker armed across every async
+                // preparation step. Clear it only in the in-memory snapshot at
+                // the synchronous handoff to the spawned runner; the runner's
+                // first checkpoint durably acknowledges takeover.
+                consume_pending_clarification_resume(&mut session);
                 spawn_agent_execution(SpawnAgentExecution {
                     state: state.clone(),
                     session_id,
@@ -326,6 +344,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 );
             }
 
+            consume_pending_clarification_resume(&mut session);
             spawn_agent_execution(SpawnAgentExecution {
                 state: state.clone(),
                 session_id,

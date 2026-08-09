@@ -2,7 +2,7 @@ use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::ToolCall;
-use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_agent_core::{AgentEvent, PendingQuestionSource, Session};
 
 use super::payload::UserQuestionPayload;
 
@@ -31,6 +31,7 @@ pub(super) async fn emit_need_clarification_event(
     payload: &UserQuestionPayload,
     tool_call_id: &str,
     tool_name: &str,
+    source: PendingQuestionSource,
 ) {
     let _ = event_tx
         .send(AgentEvent::NeedClarification {
@@ -43,6 +44,7 @@ pub(super) async fn emit_need_clarification_event(
             tool_call_id: Some(tool_call_id.to_string()),
             tool_name: Some(tool_name.to_string()),
             allow_custom: payload.allow_custom,
+            source: Some(source),
         })
         .await;
 }
@@ -50,15 +52,29 @@ pub(super) async fn emit_need_clarification_event(
 pub(super) async fn persist_session_after_question(
     config: &AgentLoopConfig,
     session: &mut Session,
-    session_id: &str,
-) {
+    _session_id: &str,
+) -> std::io::Result<()> {
     if let Some(ref persistence) = config.persistence {
-        if let Err(error) = persistence.save_runtime_session(session).await {
-            tracing::warn!(
-                "[{}] Failed to save session after user-question tool: {}",
-                session_id,
-                error
-            );
-        }
+        persistence.save_runtime_session(session).await?;
     }
+    Ok(())
+}
+
+pub(super) async fn emit_clarification_persistence_error(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    error: &std::io::Error,
+) {
+    tracing::error!(
+        session_id,
+        %error,
+        "Failed to persist clarification; suppressing NeedClarification"
+    );
+    let _ = event_tx
+        .send(AgentEvent::Error {
+            message: format!(
+                "Clarification could not be saved; retry after session storage recovers: {error}"
+            ),
+        })
+        .await;
 }

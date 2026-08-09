@@ -45,6 +45,51 @@ pub(crate) fn coalesce_key(event: &AgentEvent) -> Option<CoalesceKey> {
 /// burst yet small enough to bound the allocation.
 pub(crate) const MAX_PENDING_CONTENT_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEventDisposition {
+    Forward,
+    ForwardAndClose,
+    SuppressPauseComplete,
+}
+
+/// Tracks one clarification suspension across runner generations sharing the
+/// same long-lived session broadcaster. The suspending runner emits Complete,
+/// but that is an activation boundary rather than terminal user work. A fresh
+/// subscriber installed for the answer must remain attached until the
+/// successor announces ExecutionStarted and later emits its own terminal.
+#[derive(Debug, Default)]
+struct ClarificationBoundary {
+    open: bool,
+}
+
+impl ClarificationBoundary {
+    fn from_replay(events: &[AgentEvent]) -> Self {
+        Self {
+            open: events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::NeedClarification { .. })),
+        }
+    }
+
+    fn classify(&mut self, event: &AgentEvent) -> StreamEventDisposition {
+        match event {
+            AgentEvent::NeedClarification { .. } => {
+                self.open = true;
+                StreamEventDisposition::Forward
+            }
+            AgentEvent::ExecutionStarted { .. } => {
+                self.open = false;
+                StreamEventDisposition::Forward
+            }
+            AgentEvent::Complete { .. } if self.open => {
+                StreamEventDisposition::SuppressPauseComplete
+            }
+            event if is_terminal_event(event) => StreamEventDisposition::ForwardAndClose,
+            _ => StreamEventDisposition::Forward,
+        }
+    }
+}
+
 /// Returns the byte length of a coalescible event's `content`, or 0 for
 /// non-token events (which are never buffered).
 pub(crate) fn pending_content_len(event: &AgentEvent) -> usize {
@@ -203,6 +248,8 @@ pub(super) fn live_stream_response(
             // decrementing the session's live-watcher count. Never read —
             // only its RAII drop matters.
             let _watcher_guard = watcher_guard;
+            let mut clarification_boundary =
+                ClarificationBoundary::from_replay(&critical_events_to_replay);
             // Replay cached critical state events first (task list, sub-sessions, …).
             for event in &critical_events_to_replay {
                 if let Some(sse_data) = as_sse_data(Some(event)) {
@@ -275,7 +322,15 @@ pub(super) fn live_stream_response(
                         recv = receiver.recv() => {
                             match recv {
                                 Ok(event) => {
-                                    let is_terminal = is_terminal_event(&event);
+                                    let disposition = clarification_boundary.classify(&event);
+                                    if disposition == StreamEventDisposition::SuppressPauseComplete {
+                                        // Do not forward a pause activation's Complete: clients
+                                        // classify Complete as transport-terminal and would drop
+                                        // the fresh answer subscriber before the successor starts.
+                                        continue;
+                                    }
+                                    let is_terminal =
+                                        disposition == StreamEventDisposition::ForwardAndClose;
                                     let is_child_completed =
                                         matches!(event, AgentEvent::SubAgentCompleted { .. });
                                     let Ok(event_json) = serde_json::to_string(&event) else {
@@ -304,8 +359,10 @@ pub(super) fn live_stream_response(
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_skipped)) => {
-                                    // Best-effort stream; late subscribers can open history.
-                                    continue;
+                                    // A lag gap may include a one-shot modal gate such as
+                                    // NeedClarification. Close this response so clients
+                                    // reconnect and reconcile authoritative pending state.
+                                    break;
                                 }
                                 Err(broadcast::error::RecvError::Closed) => {
                                     // Should not happen for long-lived session senders, but exit cleanly.
@@ -377,7 +434,21 @@ pub(super) fn live_stream_response(
                         recv = receiver.recv() => {
                             match recv {
                                 Ok(event) => {
-                                    let is_terminal = is_terminal_event(&event);
+                                    let disposition = clarification_boundary.classify(&event);
+                                    if disposition == StreamEventDisposition::SuppressPauseComplete {
+                                        // Preserve any token buffered before the pause boundary,
+                                        // but keep the connection open and omit the boundary
+                                        // Complete itself.
+                                        if let Some(pending) = coalescer.take_pending() {
+                                            if let Some(sse_data) = event_sse_data(&pending) {
+                                                yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
+                                            }
+                                        }
+                                        flush_deadline = None;
+                                        continue;
+                                    }
+                                    let is_terminal =
+                                        disposition == StreamEventDisposition::ForwardAndClose;
                                     let is_child_completed =
                                         matches!(event, AgentEvent::SubAgentCompleted { .. });
 
@@ -433,9 +504,10 @@ pub(super) fn live_stream_response(
                                         if let Some(sse_data) = event_sse_data(&pending) {
                                             yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                                         }
-                                        flush_deadline = None;
                                     }
-                                    continue;
+                                    // Do not keep a healthy-looking stream after an
+                                    // unknown event gap: closing forces client resync.
+                                    break;
                                 }
                                 Err(broadcast::error::RecvError::Closed) => {
                                     // Flush any buffered tokens before closing so
@@ -507,6 +579,168 @@ mod coalesce_tests {
             tool_name: "Bash".to_string(),
             arguments: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn fresh_answer_stream_ignores_old_pause_complete_until_successor_generation() {
+        let clarification = AgentEvent::NeedClarification {
+            question: "Choose".to_string(),
+            options: Some(vec!["A".to_string()]),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some(bamboo_agent_core::PendingQuestionSource::PauseTool),
+        };
+        // A fresh SSE handshake replays the still-pending clarification before
+        // the respond request begins.
+        let mut boundary = ClarificationBoundary::from_replay(&[clarification]);
+        // The old suspending runner finalizes after POST starts. Its Complete
+        // must neither be forwarded nor close this fresh transport.
+        assert_eq!(
+            boundary.classify(&AgentEvent::Complete {
+                usage: TokenUsage::default(),
+            }),
+            StreamEventDisposition::SuppressPauseComplete
+        );
+        assert_eq!(
+            boundary.classify(&AgentEvent::ExecutionStarted {
+                run_id: "run-successor".to_string(),
+                session_id: "s1".to_string(),
+                started_at: "2026-08-10T00:00:00Z".to_string(),
+            }),
+            StreamEventDisposition::Forward
+        );
+        assert_eq!(
+            boundary.classify(&AgentEvent::Token {
+                content: "successor🙂".to_string(),
+            }),
+            StreamEventDisposition::Forward
+        );
+        assert_eq!(
+            boundary.classify(&AgentEvent::Complete {
+                usage: TokenUsage::default(),
+            }),
+            StreamEventDisposition::ForwardAndClose
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_forwarder_replay_bridges_pause_to_successor_generation() {
+        use std::{collections::HashMap, sync::Arc};
+
+        use bamboo_engine::{execution::create_event_forwarder, AgentRunner, AgentStatus};
+        use tokio::sync::RwLock;
+
+        let session_id = "generic-pause";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(32);
+        let mut old_runner = AgentRunner::new();
+        old_runner.run_id = "run-old".to_string();
+        old_runner.status = AgentStatus::Running;
+        old_runner.event_sender = broadcast_tx.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            old_runner,
+        )])));
+
+        let (old_tx, old_forwarder) = create_event_forwarder(
+            session_id.to_string(),
+            "run-old".to_string(),
+            broadcast_tx.clone(),
+            runners.clone(),
+            None,
+        );
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { ref run_id, .. } if run_id == "run-old"
+        ));
+
+        let clarification = AgentEvent::NeedClarification {
+            question: "Choose".to_string(),
+            options: Some(vec!["A".to_string()]),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some(bamboo_agent_core::PendingQuestionSource::PauseTool),
+        };
+        old_tx.send(clarification.clone()).await.unwrap();
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::NeedClarification { .. }
+        ));
+
+        // A fresh HTTP/SSE subscriber snapshots the generic runner after the
+        // live Need frame. The clarification must already be replayable, so
+        // its boundary is open before the old activation terminal arrives.
+        let replay = runners
+            .read()
+            .await
+            .get(session_id)
+            .unwrap()
+            .last_critical_events
+            .clone();
+        assert_eq!(replay.len(), 1);
+        assert!(matches!(
+            &replay[0],
+            AgentEvent::NeedClarification {
+                tool_call_id: Some(tool_call_id),
+                ..
+            } if tool_call_id == "call-1"
+        ));
+        let mut boundary = ClarificationBoundary::from_replay(&replay);
+
+        old_tx
+            .send(AgentEvent::Complete {
+                usage: TokenUsage::default(),
+            })
+            .await
+            .unwrap();
+        let old_complete = broadcast_rx.recv().await.unwrap();
+        assert_eq!(
+            boundary.classify(&old_complete),
+            StreamEventDisposition::SuppressPauseComplete
+        );
+        drop(old_tx);
+        old_forwarder.await.unwrap();
+
+        let mut successor = AgentRunner::new();
+        successor.run_id = "run-successor".to_string();
+        successor.status = AgentStatus::Running;
+        successor.event_sender = broadcast_tx.clone();
+        runners
+            .write()
+            .await
+            .insert(session_id.to_string(), successor);
+        let (successor_tx, successor_forwarder) = create_event_forwarder(
+            session_id.to_string(),
+            "run-successor".to_string(),
+            broadcast_tx,
+            runners,
+            None,
+        );
+        let started = broadcast_rx.recv().await.unwrap();
+        assert_eq!(boundary.classify(&started), StreamEventDisposition::Forward);
+        successor_tx
+            .send(AgentEvent::Token {
+                content: "successor output".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            boundary.classify(&broadcast_rx.recv().await.unwrap()),
+            StreamEventDisposition::Forward
+        );
+        successor_tx
+            .send(AgentEvent::Complete {
+                usage: TokenUsage::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            boundary.classify(&broadcast_rx.recv().await.unwrap()),
+            StreamEventDisposition::ForwardAndClose
+        );
+        drop(successor_tx);
+        successor_forwarder.await.unwrap();
     }
 
     fn complete() -> AgentEvent {

@@ -201,6 +201,33 @@ pub async fn handle_tool_result_with_agentic_support(
     session_flags: ToolExecutionSessionFlags,
     composition_executor: Option<Arc<CompositionExecutor>>,
 ) -> ToolHandlingOutcome {
+    handle_tool_result_with_agentic_support_and_persistence(
+        result,
+        tool_call,
+        event_tx,
+        session,
+        tools,
+        session_flags,
+        composition_executor,
+        None,
+    )
+    .await
+}
+
+/// Engine integration variant that makes an agentic clarification durable
+/// before publishing `NeedClarification`. The compatibility wrapper above is
+/// retained for in-process callers without a persistence adapter.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_tool_result_with_agentic_support_and_persistence(
+    result: &ToolResult,
+    tool_call: &ToolCall,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session: &mut Session,
+    tools: &dyn ToolExecutor,
+    session_flags: ToolExecutionSessionFlags,
+    composition_executor: Option<Arc<CompositionExecutor>>,
+    clarification_persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+) -> ToolHandlingOutcome {
     let should_wait_for_children = is_waiting_for_children_control(result);
     if should_wait_for_children {
         session.metadata.insert(
@@ -260,16 +287,15 @@ pub async fn handle_tool_result_with_agentic_support(
             ToolHandlingOutcome::Continue
         }
         AgenticToolResult::NeedClarification { question, options } => {
-            send_clarification_request(
+            persist_and_publish_agentic_clarification(
                 event_tx,
-                question.clone(),
-                options.clone(),
-                Some(tool_call.id.clone()),
-                Some(tool_call.function.name.clone()),
+                session,
+                tool_call,
+                question,
+                options,
+                clarification_persistence,
             )
             .await;
-
-            persist_agentic_clarification(session, tool_call, question, options);
 
             ToolHandlingOutcome::AwaitingClarification
         }
@@ -282,17 +308,55 @@ pub async fn handle_tool_result_with_agentic_support(
                 ),
             ));
 
-            execute_sub_actions(
+            execute_sub_actions_with_persistence(
                 &actions,
                 event_tx,
                 session,
                 tools,
                 session_flags,
                 composition_executor,
+                clarification_persistence,
             )
             .await
         }
     }
+}
+
+async fn persist_and_publish_agentic_clarification(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session: &mut Session,
+    tool_call: &ToolCall,
+    question: String,
+    options: Option<Vec<String>>,
+    clarification_persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+) -> bool {
+    persist_agentic_clarification(session, tool_call, question.clone(), options.clone());
+    if let Some(persistence) = clarification_persistence {
+        if let Err(error) = persistence.save_runtime_session(session).await {
+            tracing::error!(
+                session_id = %session.id,
+                %error,
+                "Failed to persist agentic clarification; suppressing NeedClarification"
+            );
+            let _ = event_tx
+                .send(AgentEvent::Error {
+                    message: format!(
+                        "Clarification could not be saved; retry after session storage recovers: {error}"
+                    ),
+                })
+                .await;
+            return false;
+        }
+    }
+    send_clarification_request(
+        event_tx,
+        question,
+        options,
+        Some(tool_call.id.clone()),
+        Some(tool_call.function.name.clone()),
+    )
+    .await;
+    true
 }
 
 fn persist_agentic_clarification(
@@ -334,6 +398,7 @@ pub async fn send_clarification_request(
             tool_call_id,
             tool_name,
             allow_custom: true,
+            source: Some(PendingQuestionSource::AgenticClarification),
         })
         .await;
 }
@@ -345,6 +410,27 @@ pub async fn execute_sub_actions(
     tools: &dyn ToolExecutor,
     session_flags: ToolExecutionSessionFlags,
     composition_executor: Option<Arc<CompositionExecutor>>,
+) -> ToolHandlingOutcome {
+    execute_sub_actions_with_persistence(
+        actions,
+        event_tx,
+        session,
+        tools,
+        session_flags,
+        composition_executor,
+        None,
+    )
+    .await
+}
+
+async fn execute_sub_actions_with_persistence(
+    actions: &[ToolCall],
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session: &mut Session,
+    tools: &dyn ToolExecutor,
+    session_flags: ToolExecutionSessionFlags,
+    composition_executor: Option<Arc<CompositionExecutor>>,
+    clarification_persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
 ) -> ToolHandlingOutcome {
     let mut pending: VecDeque<ToolCall> = actions.iter().cloned().collect();
     let mut processed = 0usize;
@@ -453,15 +539,15 @@ pub async fn execute_sub_actions(
                         ));
                     }
                     Some(AgenticToolResult::NeedClarification { question, options }) => {
-                        send_clarification_request(
+                        persist_and_publish_agentic_clarification(
                             event_tx,
-                            question.clone(),
-                            options.clone(),
-                            Some(action.id.clone()),
-                            Some(action.function.name.clone()),
+                            session,
+                            &action,
+                            question,
+                            options,
+                            clarification_persistence,
                         )
                         .await;
-                        persist_agentic_clarification(session, &action, question, options);
                         return ToolHandlingOutcome::AwaitingClarification;
                     }
                     Some(AgenticToolResult::NeedMoreActions {
@@ -519,6 +605,32 @@ mod tests {
 
     struct StaticExecutor {
         results: HashMap<String, ToolResult>,
+    }
+
+    #[derive(Default)]
+    struct BlockingClarificationPersistence {
+        saved: std::sync::Mutex<Vec<Session>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for BlockingClarificationPersistence {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.saved.lock().unwrap().push(session.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    struct FailingClarificationPersistence;
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for FailingClarificationPersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected clarification save failure"))
+        }
     }
 
     impl StaticExecutor {
@@ -739,6 +851,131 @@ mod tests {
 
         assert!(saw_sub_start);
         assert!(saw_sub_complete);
+    }
+
+    #[tokio::test]
+    async fn nested_clarification_is_persisted_before_its_event_is_published() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let sub_action = make_tool_call("call_sub", "sub_tool", "{}");
+        let parent_call = make_tool_call("call_parent", "smart_tool", "{}");
+        let mut results = HashMap::new();
+        results.insert(
+            "sub_tool".to_string(),
+            ToolResult {
+                success: true,
+                result: serde_json::to_string(&AgenticToolResult::NeedClarification {
+                    question: "Which nested action?".to_string(),
+                    options: Some(vec!["A".to_string(), "B".to_string()]),
+                })
+                .unwrap(),
+                display_preference: None,
+                images: Vec::new(),
+            },
+        );
+        let tools: Arc<dyn ToolExecutor> = Arc::new(StaticExecutor::new(results));
+        let persistence = Arc::new(BlockingClarificationPersistence::default());
+        let persistence_port: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            persistence.clone();
+        let parent_result = ToolResult {
+            success: true,
+            result: serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                actions: vec![sub_action],
+                reason: "Need nested input".to_string(),
+            })
+            .unwrap(),
+            display_preference: None,
+            images: Vec::new(),
+        };
+
+        let handling = tokio::spawn(async move {
+            let mut session = Session::new("nested-clarification", "test-model");
+            let outcome = handle_tool_result_with_agentic_support_and_persistence(
+                &parent_result,
+                &parent_call,
+                &event_tx,
+                &mut session,
+                tools.as_ref(),
+                ToolExecutionSessionFlags::default(),
+                None,
+                Some(&persistence_port),
+            )
+            .await;
+            (outcome, session)
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            persistence.entered.notified(),
+        )
+        .await
+        .expect("nested clarification should reach persistence");
+        let events_before_save: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(!events_before_save
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+        let saved = persistence.saved.lock().unwrap().last().cloned().unwrap();
+        let pending = saved
+            .pending_question
+            .expect("saved nested pending question");
+        assert_eq!(pending.tool_call_id, "call_sub");
+        assert_eq!(pending.tool_name, "sub_tool");
+
+        persistence.release.notify_one();
+        let (outcome, session) = handling.await.unwrap();
+        assert_eq!(outcome, ToolHandlingOutcome::AwaitingClarification);
+        assert_eq!(session.pending_question.unwrap().tool_call_id, "call_sub");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("clarification should publish after save")
+            .expect("event channel should stay open");
+        assert!(matches!(
+            event,
+            AgentEvent::NeedClarification {
+                tool_call_id: Some(ref id),
+                ..
+            } if id == "call_sub"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_agentic_clarification_persistence_is_terminal_and_never_published() {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let tool_call = make_tool_call("call_pending", "smart_tool", "{}");
+        let result = ToolResult {
+            success: true,
+            result: serde_json::to_string(&AgenticToolResult::NeedClarification {
+                question: "Choose safely?".to_string(),
+                options: Some(vec!["A".to_string(), "B".to_string()]),
+            })
+            .unwrap(),
+            display_preference: None,
+            images: Vec::new(),
+        };
+        let tools: Arc<dyn ToolExecutor> = Arc::new(StaticExecutor::new(HashMap::new()));
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(FailingClarificationPersistence);
+        let mut session = Session::new("failed-agentic-clarification", "test-model");
+
+        let outcome = handle_tool_result_with_agentic_support_and_persistence(
+            &result,
+            &tool_call,
+            &event_tx,
+            &mut session,
+            tools.as_ref(),
+            ToolExecutionSessionFlags::default(),
+            None,
+            Some(&persistence),
+        )
+        .await;
+
+        assert_eq!(outcome, ToolHandlingOutcome::AwaitingClarification);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::Error { message } if message.contains("could not be saved"))
+        ));
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::NeedClarification { .. })));
     }
 
     #[tokio::test]

@@ -62,6 +62,60 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("parent-1"));
         assert!(matches!(mirrored, AgentEvent::ChildApprovalChanged { .. }));
     }
+
+    #[tokio::test]
+    async fn delayed_old_forwarder_cannot_publish_after_successor_reservation() {
+        let session_id = "session-generation";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(16);
+        let mut successor = AgentRunner::new();
+        successor.run_id = "run-new".to_string();
+        successor.status = super::super::runner_state::AgentStatus::Running;
+        successor.event_sender = broadcast_tx.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            successor,
+        )])));
+
+        // The successor is already visible on the shared transport before an
+        // old forwarder task finally gets CPU time.
+        broadcast_tx
+            .send(AgentEvent::ExecutionStarted {
+                run_id: "run-new".to_string(),
+                session_id: session_id.to_string(),
+                started_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let (old_tx, old_forwarder) = create_event_forwarder(
+            session_id.to_string(),
+            "run-old".to_string(),
+            broadcast_tx.clone(),
+            runners,
+            None,
+        );
+        let _ = old_tx
+            .send(AgentEvent::NeedClarification {
+                question: "stale".to_string(),
+                options: Some(vec!["A".to_string()]),
+                tool_call_id: Some("old-tool".to_string()),
+                tool_name: Some("ConclusionWithOptions".to_string()),
+                allow_custom: false,
+                source: Some(bamboo_agent_core::PendingQuestionSource::PauseTool),
+            })
+            .await;
+        drop(old_tx);
+        old_forwarder.await.unwrap();
+
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { ref run_id, .. } if run_id == "run-new"
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), broadcast_rx.recv())
+                .await
+                .is_err(),
+            "old Started/Need/Complete must all be suppressed"
+        );
+    }
 }
 
 /// Create an MPSC channel for agent events and spawn a forwarding task
@@ -74,6 +128,7 @@ mod tests {
 /// Returns `(mpsc_tx, forwarder_handle)`.
 pub fn create_event_forwarder(
     session_id: String,
+    run_id: String,
     broadcast_tx: broadcast::Sender<AgentEvent>,
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     account_feed_inbox: Option<AccountFeedInbox>,
@@ -81,47 +136,68 @@ pub fn create_event_forwarder(
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<AgentEvent>(100);
 
     let forwarder = tokio::spawn(async move {
-        // Emit ExecutionStarted as the first event so the frontend can correlate
-        // all subsequent events to this run via run_id.
+        // The exact reservation generation is captured synchronously by the
+        // caller. Never re-read the replaceable runner registry here: this
+        // task may be scheduled only after a clarification handoff installs a
+        // successor, which would mis-tag the old terminal as the new run.
+        let started_event = AgentEvent::ExecutionStarted {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            started_at: Utc::now().to_rfc3339(),
+        };
         {
             let runners = runners.read().await;
-            if let Some(runner) = runners.get(&session_id) {
-                let started_event = AgentEvent::ExecutionStarted {
-                    run_id: runner.run_id.clone(),
-                    session_id: session_id.clone(),
-                    started_at: Utc::now().to_rfc3339(),
-                };
-                mirror_to_account_feed(&account_feed_inbox, &session_id, &started_event);
-                let _ = broadcast_tx.send(started_event);
+            if runners
+                .get(&session_id)
+                .is_none_or(|runner| runner.run_id != run_id)
+            {
+                return;
             }
+            mirror_to_account_feed(&account_feed_inbox, &session_id, &started_event);
+            let _ = broadcast_tx.send(started_event);
         }
 
         while let Some(event) = mpsc_rx.recv().await {
-            {
-                let mut runners = runners.write().await;
-                if let Some(runner) = runners.get_mut(&session_id) {
-                    runner.last_event_at = Some(Utc::now());
+            let mut runners = runners.write().await;
+            let Some(runner) = runners
+                .get_mut(&session_id)
+                .filter(|runner| runner.run_id == run_id)
+            else {
+                // A clarification handoff installed a successor before this
+                // delayed forwarder/frame ran. Drop the entire stale stream;
+                // broadcasting even its Started/Need would corrupt the shared
+                // session generation state.
+                return;
+            };
+            runner.last_event_at = Some(Utc::now());
 
-                    match &event {
-                        AgentEvent::TokenBudgetUpdated { .. } => {
-                            runner.last_budget_event = Some(event.clone());
-                        }
-                        AgentEvent::ToolStart { tool_name, .. } => {
-                            runner.last_tool_name = Some(tool_name.clone());
-                            runner.last_tool_phase = Some("begin".to_string());
-                        }
-                        AgentEvent::ToolLifecycle {
-                            tool_name, phase, ..
-                        } => {
-                            runner.last_tool_name = Some(tool_name.clone());
-                            runner.last_tool_phase = Some(phase.clone());
-                        }
-                        AgentEvent::RunnerProgress { round_count, .. } => {
-                            runner.round_count = *round_count;
-                        }
-                        _ => {}
-                    }
+            // Cache live state before publication so a subscriber installed
+            // between a clarification pause and its response sees the exact
+            // boundary. This generic forwarder powers Connect, schedules,
+            // SDK spawn, and child-resume paths, so it must preserve the same
+            // replay invariant as the server-owned forwarder.
+            if event.is_replayable_session_state() {
+                runner.push_critical_event(event.clone());
+            }
+
+            match &event {
+                AgentEvent::TokenBudgetUpdated { .. } => {
+                    runner.last_budget_event = Some(event.clone());
                 }
+                AgentEvent::ToolStart { tool_name, .. } => {
+                    runner.last_tool_name = Some(tool_name.clone());
+                    runner.last_tool_phase = Some("begin".to_string());
+                }
+                AgentEvent::ToolLifecycle {
+                    tool_name, phase, ..
+                } => {
+                    runner.last_tool_name = Some(tool_name.clone());
+                    runner.last_tool_phase = Some(phase.clone());
+                }
+                AgentEvent::RunnerProgress { round_count, .. } => {
+                    runner.round_count = *round_count;
+                }
+                _ => {}
             }
             mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
             let _ = broadcast_tx.send(event);

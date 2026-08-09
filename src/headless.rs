@@ -634,6 +634,7 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             web::Path::from(session_id.clone()),
             web::Json(RespondRequest {
                 response,
+                expected_tool_call_id: Some(pending.tool_call_id.clone()),
                 model: model_selection.model.clone(),
                 provider: model_selection.provider.clone(),
                 model_ref: model_selection.model_ref.clone(),

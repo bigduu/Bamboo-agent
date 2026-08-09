@@ -9,6 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_allow_custom() -> bool {
+    true
+}
+
 // ── Chat ──
 
 #[derive(Serialize, Clone, Debug)]
@@ -74,6 +78,11 @@ pub struct ExecuteResponse {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    ExecutionStarted {
+        run_id: String,
+        session_id: String,
+        started_at: String,
+    },
     Token {
         content: String,
     },
@@ -100,6 +109,14 @@ pub enum AgentEvent {
     NeedClarification {
         question: String,
         options: Option<Vec<String>>,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        tool_name: Option<String>,
+        #[serde(default = "default_allow_custom")]
+        allow_custom: bool,
+        #[serde(default)]
+        source: Option<String>,
     },
     ToolLifecycle {
         tool_call_id: String,
@@ -193,4 +210,60 @@ pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+#[cfg(test)]
+mod clarification_event_tests {
+    use super::AgentEvent;
+
+    #[test]
+    fn typed_clarification_preserves_all_contract_fields() {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "need_clarification",
+            "question": "Choose",
+            "options": ["same", "same"],
+            "tool_call_id": "call-1",
+            "tool_name": "ConclusionWithOptions",
+            "allow_custom": false,
+            "source": "pause_tool"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            AgentEvent::NeedClarification {
+                question,
+                options: Some(options),
+                tool_call_id: Some(tool_call_id),
+                tool_name: Some(tool_name),
+                allow_custom: false,
+                source: Some(source),
+            } if question == "Choose"
+                && options == ["same", "same"]
+                && tool_call_id == "call-1"
+                && tool_name == "ConclusionWithOptions"
+                && source == "pause_tool"
+        ));
+    }
+
+    #[test]
+    fn legacy_clarification_defaults_to_open_custom_mode() {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "need_clarification",
+            "question": "Explain",
+            "options": null
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            AgentEvent::NeedClarification {
+                allow_custom: true,
+                tool_call_id: None,
+                tool_name: None,
+                source: None,
+                ..
+            }
+        ));
+    }
 }
