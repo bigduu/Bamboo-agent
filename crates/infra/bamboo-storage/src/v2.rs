@@ -713,21 +713,34 @@ impl SessionStoreV2 {
             }
         }
 
-        // Re-materialize sessions.json even when nothing was recovered (we may
-        // have renamed the only copy to sessions.json.bak), so the "index file
-        // always exists after boot" invariant holds.
-        self.update_index(|index| {
-            // Publishing the current version is the commit point for a complete rebuild.
-            // `persist_index_locked` writes a temp file and atomically renames it.
-            index.version = SESSIONS_INDEX_VERSION;
-            index.rebuild_in_progress = false;
-            Ok(())
-        })
-        .await?;
+        // The per-entry lifecycle -> shared-Task probes above must not be held
+        // across this final phase: deletion owns lifecycle -> shared-Task, so
+        // taking Task first and then attempting another lifecycle probe would
+        // invert that order. A single shared Task guard here instead seals the
+        // scan result against a new paired transaction and rejects any durable
+        // journal left by a transaction that crashed between entry probes. In
+        // that case the old rebuild marker remains retryable for the next boot.
+        {
+            let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+
+            // Re-materialize sessions.json even when nothing was recovered (we
+            // may have renamed the only copy to sessions.json.bak), so the
+            // "index file always exists after boot" invariant holds.
+            self.update_index(|index| {
+                // Publishing the current version is the commit point for a complete rebuild.
+                // `persist_index_locked` writes a temp file and atomically renames it.
+                index.version = SESSIONS_INDEX_VERSION;
+                index.rebuild_in_progress = false;
+                Ok(())
+            })
+            .await?;
+        }
 
         tracing::info!("index rebuild from disk complete: recovered {recovered} session(s)");
 
-        // Rebuild the FTS index from the freshly recovered sessions.
+        // Pair transactions only modify Task list/generation, neither of which
+        // is indexed by FTS. Keep this best-effort pass outside the final guard
+        // so the server's background rebuild retains per-session lock scope.
         if let Err(error) = self.rebuild_search_index().await {
             tracing::warn!("index rebuild: failed to rebuild search index: {error}");
         }
@@ -1398,6 +1411,12 @@ impl SessionStoreV2 {
         session_id: &str,
     ) -> io::Result<Option<(PathBuf, Session)>> {
         validate_session_id(session_id)?;
+        if !Self::runtime_task_recovery_real_directory(&self.sessions_dir).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "runtime Task recovery sessions directory is missing",
+            ));
+        }
         let mut candidates = Vec::new();
 
         let root_dir = self.sessions_dir.join(session_id);
@@ -1486,6 +1505,12 @@ impl SessionStoreV2 {
         abs_dir: &Path,
         current: &Session,
     ) -> io::Result<()> {
+        if !Self::runtime_task_recovery_real_directory(&self.sessions_dir).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "runtime Task recovery sessions directory is missing",
+            ));
+        }
         let expected_dir = match current.kind {
             SessionKind::Root => self.sessions_dir.join(&current.id),
             SessionKind::Child => self
@@ -3995,6 +4020,108 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuild_keeps_retry_marker_when_pair_transaction_crashes_mid_scan() -> io::Result<()> {
+        let temp = TempDir::new().map_err(io::Error::other)?;
+        let home = temp.path().to_path_buf();
+        let rebuild_store = Arc::new(SessionStoreV2::new(home.clone()).await?);
+        let (child_original, child_updated, root_original, root_updated) =
+            seed_runtime_task_transaction_pair(&rebuild_store).await?;
+        // Independent in-memory locks model the second Bamboo process that can
+        // start a Task pair commit after constructor recovery releases its
+        // exclusive cross-process guard.
+        let commit_store = Arc::new(SessionStoreV2::new(home.clone()).await?);
+
+        rebuild_store
+            .update_index(|index| {
+                *index = SessionsIndex::empty();
+                index.version = 0;
+                index.rebuild_in_progress = true;
+                Ok(())
+            })
+            .await?;
+
+        // Freeze the first per-entry lifecycle probe. Pair commits do not own
+        // lifecycle, so the independent store can publish its journal and
+        // first sidecar while rebuild is demonstrably mid-scan.
+        let lifecycle = rebuild_store.lock_session_lifecycle_exclusive().await?;
+        let rebuilding = Arc::clone(&rebuild_store);
+        let rebuild = tokio::spawn(async move { rebuilding.rebuild_index_from_disk().await });
+        tokio::task::yield_now().await;
+
+        let (first_write_reached, _release_first_write) =
+            commit_store.pause_runtime_task_transaction_after_first_write();
+        let committing = Arc::clone(&commit_store);
+        let commit = tokio::spawn(async move {
+            committing
+                .save_task_control_planes_atomically(
+                    &child_original,
+                    &child_updated,
+                    &root_original,
+                    &root_updated,
+                )
+                .await
+        });
+        first_write_reached.wait().await;
+        assert_eq!(commit_store.runtime_task_journal_paths().await?.len(), 1);
+        assert_eq!(
+            commit_store.take_runtime_task_durability_events(),
+            vec![
+                RuntimeTaskDurabilityEvent::JournalPublished,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+            ]
+        );
+
+        // Cancellation models process death: the exclusive file guard drops,
+        // while the prepared undo journal and first durable sidecar remain.
+        commit.abort();
+        assert!(
+            commit
+                .await
+                .expect_err("commit task must be cancelled")
+                .is_cancelled(),
+            "cancelled commit must release the cross-process Task guard"
+        );
+        drop(lifecycle);
+
+        let rebuild_error = rebuild
+            .await
+            .map_err(io::Error::other)?
+            .expect_err("a pending journal must prevent rebuild finalization");
+        assert!(
+            rebuild_error.to_string().contains("recovery is required"),
+            "{rebuild_error}"
+        );
+        let retryable: SessionsIndex =
+            serde_json::from_slice(&fs::read(&home.join("sessions.json")).await?)
+                .map_err(io::Error::other)?;
+        assert_eq!(retryable.version, 0);
+        assert!(retryable.rebuild_in_progress);
+        assert!(retryable.sessions.is_empty());
+        assert_eq!(commit_store.runtime_task_journal_paths().await?.len(), 1);
+
+        drop(commit_store);
+        drop(rebuild_store);
+        let reopened = SessionStoreV2::new(home).await?;
+        assert_eq!(
+            reopened.take_runtime_task_durability_events(),
+            vec![
+                RuntimeTaskDurabilityEvent::FirstRollbackSidecarPublished,
+                RuntimeTaskDurabilityEvent::SecondRollbackSidecarPublished,
+                RuntimeTaskDurabilityEvent::JournalDeactivated,
+            ]
+        );
+        assert_original_runtime_task_pair(&reopened).await?;
+        assert!(reopened.runtime_task_journal_paths().await?.is_empty());
+        let rebuilt: SessionsIndex =
+            serde_json::from_slice(&fs::read(reopened.index_path()).await?)
+                .map_err(io::Error::other)?;
+        assert_eq!(rebuilt.version, SESSIONS_INDEX_VERSION);
+        assert!(!rebuilt.rebuild_in_progress);
+        assert_eq!(rebuilt.sessions.len(), 2);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn orphan_recovery_rejects_symlinked_child_without_writing_outside_sessions(
@@ -4052,6 +4179,71 @@ mod tests {
             "recovery must not rewrite runtime.json outside sessions/"
         );
         assert!(fs::symlink_metadata(&child_dir)
+            .await?
+            .file_type()
+            .is_symlink());
+        assert!(journal_path.exists(), "failed recovery must retain undo");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_recovery_rejects_symlinked_sessions_root_without_writing_outside_home(
+    ) -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (storage, temp) = create_temp_storage().await?;
+        let (child_original, child_updated, root_original, _root_updated) =
+            seed_runtime_task_transaction_pair(&storage).await?;
+        let journal = RuntimeTaskTransactionJournal {
+            version: RUNTIME_TASK_TRANSACTION_VERSION,
+            transaction_id: Uuid::new_v4().to_string(),
+            first: TaskControlPlaneUndo {
+                session_id: child_original.id.clone(),
+                task_list: child_original.task_list.clone(),
+                task_list_version: child_original
+                    .task_list_version_meta()
+                    .expect("child generation"),
+            },
+            second: TaskControlPlaneUndo {
+                session_id: root_original.id.clone(),
+                task_list: root_original.task_list.clone(),
+                task_list_version: root_original
+                    .task_list_version_meta()
+                    .expect("root generation"),
+            },
+        };
+        let journal_path = storage.write_runtime_task_journal(&journal).await?;
+        storage
+            .write_existing_runtime_sidecar_durable_unchecked(
+                &child_updated,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+            )
+            .await?;
+
+        let sessions_dir = temp.path().join("sessions");
+        let outside_home = TempDir::new().map_err(io::Error::other)?;
+        let outside_dir = outside_home.path().join("sessions");
+        fs::rename(&sessions_dir, &outside_dir).await?;
+        symlink(&outside_dir, &sessions_dir).map_err(io::Error::other)?;
+        let outside_runtime = outside_dir.join("tx-root/children/tx-child/runtime.json");
+        let outside_before = fs::read(&outside_runtime).await?;
+        fs::write(storage.index_path(), b"{ corrupt sessions index").await?;
+        drop(storage);
+
+        let error = SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .expect_err("symlinked sessions root must fail closed");
+        assert!(
+            error.to_string().contains("not a real directory"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(&outside_runtime).await?,
+            outside_before,
+            "recovery must not rewrite runtime.json outside Bamboo home"
+        );
+        assert!(fs::symlink_metadata(&sessions_dir)
             .await?
             .file_type()
             .is_symlink());
