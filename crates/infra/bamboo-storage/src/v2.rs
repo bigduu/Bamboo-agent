@@ -1295,6 +1295,311 @@ impl SessionStoreV2 {
         Ok(Some(session))
     }
 
+    fn validate_runtime_task_recovery_identity(
+        session: &Session,
+        session_id: &str,
+        expected_kind: SessionKind,
+        expected_root_id: &str,
+    ) -> io::Result<()> {
+        if session.id != session_id
+            || session.kind != expected_kind
+            || session.root_session_id != expected_root_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime Task recovery identity mismatch for {session_id}: found id={}, kind={:?}, root={}",
+                    session.id, session.kind, session.root_session_id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn runtime_task_recovery_real_directory(path: &Path) -> io::Result<bool> {
+        let metadata = match fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime Task recovery candidate is not a real directory: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(true)
+    }
+
+    async fn runtime_task_recovery_real_file(path: &Path) -> io::Result<bool> {
+        let metadata = match fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime Task recovery candidate is not a real file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(true)
+    }
+
+    async fn read_runtime_task_recovery_main_at(
+        abs_dir: &Path,
+        session_id: &str,
+        expected_kind: SessionKind,
+        expected_root_id: &str,
+    ) -> io::Result<Option<Session>> {
+        if !Self::runtime_task_recovery_real_directory(abs_dir).await? {
+            return Ok(None);
+        }
+        let path = abs_dir.join("session.json");
+        if !Self::runtime_task_recovery_real_file(&path).await? {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&path).await?;
+        let session: Session = serde_json::from_str(&raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid authoritative session.json for runtime Task recovery at {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        Self::validate_runtime_task_recovery_identity(
+            &session,
+            session_id,
+            expected_kind,
+            expected_root_id,
+        )?;
+        Ok(Some(session))
+    }
+
+    /// Resolve one journal target without consulting the rebuildable index.
+    ///
+    /// Constructor recovery deliberately runs before corrupt-index rebuild so
+    /// no half-published Task sidecar can be folded into index/FTS state. The
+    /// caller holds the cross-process runtime-Task lock exclusively: session
+    /// deletion therefore cannot mutate the tree while this strict scan finds
+    /// either `sessions/<id>` or the unique
+    /// `sessions/*/children/<id>`. Corrupt identity or duplicate candidates
+    /// fail closed instead of selecting an arbitrary sidecar.
+    async fn load_runtime_task_recovery_target(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<(PathBuf, Session)>> {
+        validate_session_id(session_id)?;
+        let mut candidates = Vec::new();
+
+        let root_dir = self.sessions_dir.join(session_id);
+        if let Some(session) = Self::read_runtime_task_recovery_main_at(
+            &root_dir,
+            session_id,
+            SessionKind::Root,
+            session_id,
+        )
+        .await?
+        {
+            candidates.push((root_dir, session));
+        }
+
+        let mut root_dirs = match fs::read_dir(&self.sessions_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidates.pop()),
+            Err(error) => return Err(error),
+        };
+        while let Some(root_entry) = root_dirs.next_entry().await? {
+            if !root_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let Ok(root_id) = root_entry.file_name().into_string() else {
+                continue;
+            };
+            if validate_session_id(&root_id).is_err() {
+                continue;
+            }
+            let children_dir = root_entry.path().join("children");
+            let children_metadata = match fs::symlink_metadata(&children_dir).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            // This is an intermediate container rather than an exact journal
+            // target. Match rebuild semantics by ignoring malformed/symlinked
+            // children trees; the exact target will then remain missing and
+            // recovery fails closed without following it outside sessions/.
+            if children_metadata.file_type().is_symlink() || !children_metadata.is_dir() {
+                continue;
+            }
+            let child_dir = children_dir.join(session_id);
+            if let Some(session) = Self::read_runtime_task_recovery_main_at(
+                &child_dir,
+                session_id,
+                SessionKind::Child,
+                &root_id,
+            )
+            .await?
+            {
+                if Self::read_runtime_task_recovery_main_at(
+                    &root_entry.path(),
+                    &root_id,
+                    SessionKind::Root,
+                    &root_id,
+                )
+                .await?
+                .is_none()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "runtime Task recovery child {session_id} has no authoritative root {root_id}"
+                        ),
+                    ));
+                }
+                candidates.push((child_dir, session));
+            }
+        }
+
+        match candidates.len() {
+            0 => Ok(None),
+            1 => Ok(candidates.pop()),
+            count => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime Task recovery target {session_id} is ambiguous across {count} authoritative directories"
+                ),
+            )),
+        }
+    }
+
+    async fn validate_runtime_task_recovery_write_target(
+        &self,
+        abs_dir: &Path,
+        current: &Session,
+    ) -> io::Result<()> {
+        let expected_dir = match current.kind {
+            SessionKind::Root => self.sessions_dir.join(&current.id),
+            SessionKind::Child => self
+                .sessions_dir
+                .join(&current.root_session_id)
+                .join("children")
+                .join(&current.id),
+        };
+        if abs_dir != expected_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime Task recovery path mismatch for {}: {}",
+                    current.id,
+                    abs_dir.display()
+                ),
+            ));
+        }
+
+        if current.kind == SessionKind::Child {
+            let root_dir = self.sessions_dir.join(&current.root_session_id);
+            if Self::read_runtime_task_recovery_main_at(
+                &root_dir,
+                &current.root_session_id,
+                SessionKind::Root,
+                &current.root_session_id,
+            )
+            .await?
+            .is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "runtime Task recovery child {} lost authoritative root {}",
+                        current.id, current.root_session_id
+                    ),
+                ));
+            }
+            let children_dir = root_dir.join("children");
+            if !Self::runtime_task_recovery_real_directory(&children_dir).await? {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "runtime Task recovery children directory disappeared for {}",
+                        current.id
+                    ),
+                ));
+            }
+        }
+        let Some(main) = Self::read_runtime_task_recovery_main_at(
+            abs_dir,
+            &current.id,
+            current.kind,
+            &current.root_session_id,
+        )
+        .await?
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "runtime Task recovery target disappeared for {}",
+                    current.id
+                ),
+            ));
+        };
+        if main.parent_session_id != current.parent_session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime Task recovery parent identity changed for {}",
+                    current.id
+                ),
+            ));
+        }
+
+        let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
+        let _ = Self::runtime_task_recovery_real_file(&runtime_path).await?;
+        Ok(())
+    }
+
+    async fn load_runtime_task_recovery_control_plane(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<(PathBuf, Session)>> {
+        let Some((abs_dir, main)) = self.load_runtime_task_recovery_target(session_id).await?
+        else {
+            return Ok(None);
+        };
+        let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
+        let sidecar = if Self::runtime_task_recovery_real_file(&runtime_path).await? {
+            Self::read_runtime_sidecar_at(&runtime_path, session_id).await?
+        } else {
+            None
+        };
+        if let Some(sidecar) = sidecar.as_ref() {
+            Self::validate_runtime_task_recovery_identity(
+                sidecar,
+                session_id,
+                main.kind,
+                &main.root_session_id,
+            )?;
+            if sidecar.parent_session_id != main.parent_session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("runtime Task recovery parent identity mismatch for {session_id}"),
+                ));
+            }
+        }
+        let mut session = overlay_runtime_sidecar(main, sidecar);
+        session.messages.clear();
+        session.clear_stale_root_token_budget();
+        Ok(Some((abs_dir, session)))
+    }
+
     async fn write_existing_runtime_sidecar_durable_unchecked(
         &self,
         session: &Session,
@@ -1466,8 +1771,8 @@ impl SessionStoreV2 {
         fault: RuntimeTaskTransactionFault,
     ) -> io::Result<()> {
         self.maybe_fail_runtime_task_transaction(fault)?;
-        let Some(mut current) = self
-            .load_runtime_control_plane_unchecked(&undo.session_id)
+        let Some((abs_dir, mut current)) = self
+            .load_runtime_task_recovery_control_plane(&undo.session_id)
             .await?
         else {
             return Err(io::Error::new(
@@ -1486,8 +1791,12 @@ impl SessionStoreV2 {
             }
             _ => unreachable!("rollback helper only accepts rollback write faults"),
         };
-        self.write_existing_runtime_sidecar_durable_unchecked(&current, event)
-            .await
+        self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
+            .await?;
+        self.write_runtime_sidecar_durable(&abs_dir, &current)
+            .await?;
+        self.record_runtime_task_durability_event(event);
+        Ok(())
     }
 
     async fn rollback_runtime_task_journal(
@@ -3561,9 +3870,13 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn reopening_store_recovers_orphan_task_journal_without_transcript_or_metadata_copy(
+    async fn assert_corrupt_index_orphan_task_journal_recovers(
+        marker_state: RuntimeTaskJournalMarkerState,
     ) -> io::Result<()> {
+        assert!(matches!(
+            marker_state,
+            RuntimeTaskJournalMarkerState::Prepared | RuntimeTaskJournalMarkerState::Committing
+        ));
         let (storage, temp) = create_temp_storage().await?;
         let (child_original, child_updated, root_original, _root_updated) =
             seed_runtime_task_transaction_pair(&storage).await?;
@@ -3586,7 +3899,7 @@ mod tests {
                     .expect("root generation"),
             },
         };
-        let journal_path = storage.write_runtime_task_journal(&journal).await?;
+        let mut journal_path = storage.write_runtime_task_journal(&journal).await?;
         let journal_json = fs::read_to_string(&journal_path).await?;
         assert!(!journal_json.contains("transcript secret"));
         assert!(!journal_json.contains("metadata secret"));
@@ -3610,11 +3923,139 @@ mod tests {
                 RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
             )
             .await?;
+        if marker_state == RuntimeTaskJournalMarkerState::Committing {
+            let committing = journal_path.with_extension("committing");
+            atomic_rename(&journal_path, &committing).await?;
+            sync_parent_directory_entry(&committing).await?;
+            journal_path = committing;
+        }
+        assert!(journal_path.exists());
+        let child_sidecar = storage
+            .runtime_json_path("tx-child")
+            .await?
+            .expect("child runtime sidecar path");
+        let root_sidecar = storage
+            .runtime_json_path("tx-root")
+            .await?
+            .expect("root runtime sidecar path");
+        assert!(child_sidecar.exists());
+        assert!(root_sidecar.exists());
+
+        // Exercise the constructor ordering hazard: corrupt-index handling
+        // publishes an empty rebuild marker before orphan Task recovery. Undo
+        // must therefore locate these intact authoritative session directories
+        // without consulting that temporarily empty index.
+        fs::write(storage.index_path(), b"{ corrupt sessions index").await?;
         drop(storage);
 
         let reopened = SessionStoreV2::new(temp.path().to_path_buf()).await?;
+        assert_eq!(
+            reopened.take_runtime_task_durability_events(),
+            vec![
+                RuntimeTaskDurabilityEvent::FirstRollbackSidecarPublished,
+                RuntimeTaskDurabilityEvent::SecondRollbackSidecarPublished,
+                RuntimeTaskDurabilityEvent::JournalDeactivated,
+            ]
+        );
         assert_original_runtime_task_pair(&reopened).await?;
         assert!(reopened.runtime_task_journal_paths().await?.is_empty());
+        assert!(temp.path().join("sessions.json.bak").exists());
+        let rebuilt_raw = fs::read_to_string(reopened.index_path()).await?;
+        let rebuilt: SessionsIndex = serde_json::from_str(&rebuilt_raw)
+            .map_err(|error| other_io_error(format!("parse rebuilt sessions index: {error}")))?;
+        assert_eq!(rebuilt.version, SESSIONS_INDEX_VERSION);
+        assert!(!rebuilt.rebuild_in_progress);
+        assert_eq!(rebuilt.sessions.len(), 2);
+        assert_eq!(
+            rebuilt
+                .sessions
+                .get("tx-root")
+                .map(|entry| entry.rel_path.as_str()),
+            Some("sessions/tx-root")
+        );
+        assert_eq!(
+            rebuilt
+                .sessions
+                .get("tx-child")
+                .map(|entry| entry.rel_path.as_str()),
+            Some("sessions/tx-root/children/tx-child")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopening_store_recovers_orphan_task_journal_without_transcript_or_metadata_copy(
+    ) -> io::Result<()> {
+        for marker_state in [
+            RuntimeTaskJournalMarkerState::Prepared,
+            RuntimeTaskJournalMarkerState::Committing,
+        ] {
+            assert_corrupt_index_orphan_task_journal_recovers(marker_state).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_recovery_rejects_symlinked_child_without_writing_outside_sessions(
+    ) -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (storage, temp) = create_temp_storage().await?;
+        let (child_original, child_updated, root_original, _root_updated) =
+            seed_runtime_task_transaction_pair(&storage).await?;
+        let journal = RuntimeTaskTransactionJournal {
+            version: RUNTIME_TASK_TRANSACTION_VERSION,
+            transaction_id: Uuid::new_v4().to_string(),
+            first: TaskControlPlaneUndo {
+                session_id: child_original.id.clone(),
+                task_list: child_original.task_list.clone(),
+                task_list_version: child_original
+                    .task_list_version_meta()
+                    .expect("child generation"),
+            },
+            second: TaskControlPlaneUndo {
+                session_id: root_original.id.clone(),
+                task_list: root_original.task_list.clone(),
+                task_list_version: root_original
+                    .task_list_version_meta()
+                    .expect("root generation"),
+            },
+        };
+        let journal_path = storage.write_runtime_task_journal(&journal).await?;
+        storage
+            .write_existing_runtime_sidecar_durable_unchecked(
+                &child_updated,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+            )
+            .await?;
+
+        let child_dir = temp.path().join("sessions/tx-root/children/tx-child");
+        let outside_dir = temp.path().join("outside-session-tree");
+        fs::rename(&child_dir, &outside_dir).await?;
+        symlink(&outside_dir, &child_dir).map_err(io::Error::other)?;
+        let outside_runtime = outside_dir.join(RUNTIME_SIDECAR_FILE);
+        let outside_before = fs::read(&outside_runtime).await?;
+        fs::write(storage.index_path(), b"{ corrupt sessions index").await?;
+        drop(storage);
+
+        let error = SessionStoreV2::new(temp.path().to_path_buf())
+            .await
+            .expect_err("symlinked journal target must fail closed");
+        assert!(
+            error.to_string().contains("not a real directory"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(&outside_runtime).await?,
+            outside_before,
+            "recovery must not rewrite runtime.json outside sessions/"
+        );
+        assert!(fs::symlink_metadata(&child_dir)
+            .await?
+            .file_type()
+            .is_symlink());
+        assert!(journal_path.exists(), "failed recovery must retain undo");
         Ok(())
     }
 
