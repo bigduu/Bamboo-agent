@@ -10,6 +10,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+fn default_allow_custom() -> bool {
+    true
+}
+
 fn default_title_generated() -> bool {
     true
 }
@@ -76,6 +80,8 @@ pub struct ListSessionsEnvelope {
 #[derive(Serialize)]
 pub struct RespondRequest {
     pub response: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_tool_call_id: Option<String>,
 }
 
 /// Wire shape of `GET /api/v1/sessions/{session_id}` — the server wraps the
@@ -163,7 +169,7 @@ pub struct PendingQuestion {
     pub question: String,
     #[serde(default)]
     pub options: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default = "default_allow_custom")]
     pub allow_custom: bool,
     #[serde(default)]
     pub tool_call_id: Option<String>,
@@ -587,6 +593,31 @@ mod tests {
             Some(&["Yes".to_string(), "No".to_string()][..])
         );
         assert!(some.allow_custom);
+
+        let legacy: PendingQuestion =
+            serde_json::from_str(r#"{"has_pending_question":true,"question":"Legacy question"}"#)
+                .unwrap();
+        assert!(
+            legacy.allow_custom,
+            "missing legacy field preserves free-text compatibility"
+        );
+    }
+
+    #[test]
+    fn respond_request_serializes_optional_question_identity() {
+        let guarded = serde_json::to_value(RespondRequest {
+            response: "Yes".to_string(),
+            expected_tool_call_id: Some("t1".to_string()),
+        })
+        .unwrap();
+        assert_eq!(guarded["expected_tool_call_id"], "t1");
+
+        let legacy = serde_json::to_value(RespondRequest {
+            response: "Yes".to_string(),
+            expected_tool_call_id: None,
+        })
+        .unwrap();
+        assert!(legacy.get("expected_tool_call_id").is_none());
     }
 
     /// `GET /api/v1/sessions/{id}` wraps the summary in a `{ "session": ... }`

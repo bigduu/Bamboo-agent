@@ -116,7 +116,8 @@ pub use registry::{
     global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,
 };
 pub use result_handler::{
-    execute_sub_actions, handle_tool_result_with_agentic_support, parse_tool_args,
+    execute_sub_actions, handle_tool_result_with_agentic_support,
+    handle_tool_result_with_agentic_support_and_persistence, parse_tool_args,
     parse_tool_args_best_effort, send_clarification_request, try_parse_agentic_result,
     ToolHandlingOutcome, MAX_SUB_ACTIONS,
 };

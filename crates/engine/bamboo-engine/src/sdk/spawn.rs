@@ -449,6 +449,7 @@ async fn run_child_spawn_inner(
     // Create mpsc channel for agent loop → session events sender.
     let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
         job.child_session_id.clone(),
+        run_id.clone(),
         child_tx.clone(),
         ctx.agent_runners.clone(),
         ctx.account_feed_inbox.clone(),

@@ -19,8 +19,8 @@ mod session_effects;
 
 use payload::{parse_user_question_payload, should_handle_user_question_tool, UserQuestionPayload};
 use session_effects::{
-    append_waiting_tool_result_message, emit_need_clarification_event,
-    persist_session_after_question,
+    append_waiting_tool_result_message, emit_clarification_persistence_error,
+    emit_need_clarification_event, persist_session_after_question,
 };
 
 fn stable_plan_hash(plan: &str) -> String {
@@ -230,9 +230,10 @@ fn plan_content_summary(result_payload: &str) -> Option<String> {
 /// B). Unlike [`maybe_handle_user_question_tool`] (which sniffs a `ToolResult`),
 /// this is driven by the `PendingQuestion` the tool built. It synthesizes the
 /// paired placeholder `tool_result` (so the transcript stays paired now that the
-/// tool returns no result), emits the clarification event, sets the pending
-/// question, stamps `runtime.suspend_reason=awaiting_clarification`, and
-/// persists. The caller marks awaiting-clarification and breaks the round.
+/// tool returns no result), sets the pending question, stamps
+/// `runtime.suspend_reason=awaiting_clarification`, persists it, and only then
+/// emits the clarification event. The caller marks awaiting-clarification and
+/// breaks the round.
 ///
 /// Note: plan-file persistence (ExitPlanMode) and child→parent approval
 /// delegation (permission tools) are NOT handled here — those tools stay on the
@@ -248,6 +249,23 @@ pub(super) async fn suspend_for_pending_question(
     round_id: &str,
     config: &AgentLoopConfig,
 ) {
+    // The runner's ToolCall is the authoritative identity. A third-party tool
+    // may accidentally return a PendingQuestion copied from another call; do
+    // not let that split durable state from the SSE event or target the wrong
+    // transcript entry when the answer arrives.
+    if pq.tool_call_id != tool_call.id || pq.tool_name != tool_call.function.name {
+        tracing::warn!(
+            session_id,
+            returned_tool_call_id = %pq.tool_call_id,
+            returned_tool_name = %pq.tool_name,
+            canonical_tool_call_id = %tool_call.id,
+            canonical_tool_name = %tool_call.function.name,
+            "canonicalizing mismatched pending-question tool identity"
+        );
+    }
+    let tool_call_id = tool_call.id.clone();
+    let tool_name = tool_call.function.name.clone();
+
     // The tool's own result IS the paired tool_result (carries the rich display
     // payload: conclusion / plan / permission data), kept identical to the
     // pre-Phase-B transcript.
@@ -270,23 +288,25 @@ pub(super) async fn suspend_for_pending_question(
         options: pq.options.clone(),
         allow_custom: pq.allow_custom,
     };
-    emit_need_clarification_event(event_tx, &payload, &tool_call.id, &tool_call.function.name)
-        .await;
-
+    let source = pq.source.clone();
     session.set_pending_question_with_source(
-        pq.tool_call_id,
-        pq.tool_name,
+        tool_call_id.clone(),
+        tool_name.clone(),
         pq.question,
         pq.options,
         pq.allow_custom,
-        pq.source,
+        source,
     );
     session.metadata.insert(
         "runtime.suspend_reason".to_string(),
         "awaiting_clarification".to_string(),
     );
 
-    persist_session_after_question(config, session, session_id).await;
+    if let Err(error) = persist_session_after_question(config, session, session_id).await {
+        emit_clarification_persistence_error(event_tx, session_id, &error).await;
+        return;
+    }
+    emit_need_clarification_event(event_tx, &payload, &tool_call_id, &tool_name, pq.source).await;
 }
 
 pub(super) struct UserQuestionToolContext<'a> {
@@ -390,23 +410,17 @@ pub(super) async fn maybe_handle_user_question_tool(context: UserQuestionToolCon
             "runtime.suspend_reason".to_string(),
             "awaiting_parent_approval".to_string(),
         );
-        persist_session_after_question(config, session, session_id).await;
+        if let Err(error) = persist_session_after_question(config, session, session_id).await {
+            emit_clarification_persistence_error(event_tx, session_id, &error).await;
+        }
         return true;
     }
-
-    emit_need_clarification_event(
-        event_tx,
-        &question_payload,
-        &tool_call.id,
-        &tool_call.function.name,
-    )
-    .await;
 
     session.set_pending_question_with_source(
         tool_call.id.clone(),
         tool_call.function.name.clone(),
-        question_payload.question,
-        question_payload.options,
+        question_payload.question.clone(),
+        question_payload.options.clone(),
         question_payload.allow_custom,
         bamboo_agent_core::PendingQuestionSource::PauseTool,
     );
@@ -415,7 +429,18 @@ pub(super) async fn maybe_handle_user_question_tool(context: UserQuestionToolCon
         "awaiting_clarification".to_string(),
     );
 
-    persist_session_after_question(config, session, session_id).await;
+    if let Err(error) = persist_session_after_question(config, session, session_id).await {
+        emit_clarification_persistence_error(event_tx, session_id, &error).await;
+        return true;
+    }
+    emit_need_clarification_event(
+        event_tx,
+        &question_payload,
+        &tool_call.id,
+        &tool_call.function.name,
+        bamboo_agent_core::PendingQuestionSource::PauseTool,
+    )
+    .await;
 
     true
 }

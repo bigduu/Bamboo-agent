@@ -64,6 +64,8 @@ pub enum RespondError {
     SaveFailed(#[from] SessionSaveError),
     #[error("no pending question waiting for response")]
     NoPendingQuestion,
+    #[error("pending question changed (expected tool call {expected}, actual {actual})")]
+    PendingQuestionMismatch { expected: String, actual: String },
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 }

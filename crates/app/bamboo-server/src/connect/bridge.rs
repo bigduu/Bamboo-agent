@@ -26,7 +26,7 @@ use bamboo_llm::{Config, ProviderRegistry};
 
 use crate::permission_audit::record_bamboo_runtime_permission_metadata;
 
-use super::approvals::{self, ParkedAsk, RespondAndResumeOutcome, Responder};
+use super::approvals::{self, ParkedAsk, RespondAndResumeOutcome, Responder, ResponderError};
 use super::platform::{CallbackQuery, InboundMessage, OutboundMessage, Platform, ReplyCtx};
 use super::render;
 
@@ -153,8 +153,11 @@ struct ChatState {
 #[derive(Debug, Clone)]
 enum AskResolution {
     /// A button press or text reply matched the parked ask; submit this as
-    /// the answer.
-    Answer(String),
+    /// the answer only if that exact tool call is still pending.
+    Answer {
+        answer: String,
+        expected_tool_call_id: String,
+    },
     /// `/new`, session rotation, or an explicit clear invalidated the ask
     /// before it was answered — the waiting render task must stop rendering
     /// this (now-abandoned) run rather than hang forever.
@@ -370,14 +373,15 @@ impl ConnectBridge {
         &self,
         key: &str,
         resolve: impl FnOnce(&ParkedAsk) -> Option<String>,
-    ) -> Option<(String, mpsc::Sender<AskResolution>)> {
+    ) -> Option<(String, String, mpsc::Sender<AskResolution>)> {
         let mut guard = self.chat_state.lock().await;
         let state = guard.get_mut(key)?;
         let ask_ref = state.pending_ask.as_ref()?;
         let answer = resolve(ask_ref)?;
+        let expected_tool_call_id = ask_ref.tool_call_id.clone();
         let sender = state.ask_resolution.take()?;
         state.pending_ask = None;
-        Some((answer, sender))
+        Some((answer, expected_tool_call_id, sender))
     }
 
     /// Clears `key`'s parked ask (if any) and wakes its waiting render task
@@ -510,11 +514,16 @@ impl ConnectBridge {
         // reply, so it must never sit behind the FIFO queue. A non-matching
         // reply on a CLOSED ask (no free text allowed) falls through to the
         // normal busy/queue handling below, exactly like any other message.
-        if let Some((answer, sender)) = self
+        if let Some((answer, expected_tool_call_id, sender)) = self
             .try_resolve_pending_ask(&key, |ask| approvals::match_text_answer(ask, &msg.text))
             .await
         {
-            let _ = sender.send(AskResolution::Answer(answer)).await;
+            let _ = sender
+                .send(AskResolution::Answer {
+                    answer,
+                    expected_tool_call_id,
+                })
+                .await;
             return;
         }
 
@@ -622,11 +631,16 @@ impl ConnectBridge {
             .await;
 
         match resolved {
-            Some((answer, sender)) => {
+            Some((answer, expected_tool_call_id, sender)) => {
                 let _ = platform
                     .answer_callback(&callback.callback_query_id, None)
                     .await;
-                let _ = sender.send(AskResolution::Answer(answer)).await;
+                let _ = sender
+                    .send(AskResolution::Answer {
+                        answer,
+                        expected_tool_call_id,
+                    })
+                    .await;
             }
             None => {
                 tracing::debug!(
@@ -895,6 +909,7 @@ impl ConnectBridge {
 
         let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
             session_id.clone(),
+            execution_reservation.run_id().to_string(),
             session_tx.clone(),
             self.ctx.agent_runners.clone(),
             self.ctx.account_feed_inbox.clone(),
@@ -987,7 +1002,7 @@ impl ConnectBridge {
         mut rx: broadcast::Receiver<AgentEvent>,
     ) {
         let mut stream_state: Option<Box<render::StreamState>> = None;
-        loop {
+        'stream: loop {
             match render::stream_execution(
                 platform.clone(),
                 reply_ctx.clone(),
@@ -998,38 +1013,162 @@ impl ConnectBridge {
             {
                 render::RunOutcome::Terminal => return,
                 render::RunOutcome::Paused {
-                    ask,
+                    mut ask,
                     stream_state: paused_state,
                 } => {
                     stream_state = paused_state;
-                    let caps = platform.capabilities();
-                    let parked =
-                        ParkedAsk::new(approvals::new_nonce(), session_id.to_string(), &ask);
+                    'ask: loop {
+                        if ask.tool_call_id.is_none() {
+                            match self.authoritative_pending_ask(session_id).await {
+                                Ok(Some(current)) if ask.same_visible_contract(&current) => {
+                                    ask = current;
+                                }
+                                Ok(Some(_)) => {
+                                    let _ = approvals::render_read_only_ask(
+                                        &platform,
+                                        &reply_ctx,
+                                        &ask,
+                                        "the durable pending question changed",
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                Ok(None) => {
+                                    let _ = approvals::render_read_only_ask(
+                                        &platform,
+                                        &reply_ctx,
+                                        &ask,
+                                        "the server did not expose an exact response identity",
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                Err(error) => {
+                                    let _ = approvals::render_read_only_ask(
+                                        &platform,
+                                        &reply_ctx,
+                                        &ask,
+                                        &format!("identity reconciliation failed: {error}"),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                        }
 
-                    if let Err(error) =
-                        approvals::render_ask(&platform, &reply_ctx, &parked, caps.buttons).await
-                    {
-                        tracing::warn!("connect: failed to render pending ask: {error}");
-                    }
+                        let caps = platform.capabilities();
+                        let Some(parked) =
+                            ParkedAsk::new(approvals::new_nonce(), session_id.to_string(), &ask)
+                        else {
+                            // The branch above makes this unreachable, but
+                            // retain the constructor's invariant at the type
+                            // boundary instead of ever parking an unguarded
+                            // ask if future control flow changes.
+                            return;
+                        };
 
-                    let (ask_tx, mut ask_rx) = mpsc::channel(1);
-                    {
-                        let mut guard = self.chat_state.lock().await;
-                        let state = guard.entry(key.to_string()).or_default();
-                        state.pending_ask = Some(parked);
-                        state.ask_resolution = Some(ask_tx);
-                    }
+                        if let Err(error) =
+                            approvals::render_ask(&platform, &reply_ctx, &parked, caps.buttons)
+                                .await
+                        {
+                            tracing::warn!("connect: failed to render pending ask: {error}");
+                        }
 
-                    match ask_rx.recv().await {
-                        Some(AskResolution::Answer(answer)) => {
-                            match self.responder.respond_and_resume(session_id, answer).await {
+                        let (ask_tx, mut ask_rx) = mpsc::channel(1);
+                        {
+                            let mut guard = self.chat_state.lock().await;
+                            let state = guard.entry(key.to_string()).or_default();
+                            state.pending_ask = Some(parked);
+                            state.ask_resolution = Some(ask_tx);
+                        }
+
+                        match ask_rx.recv().await {
+                            Some(AskResolution::Answer {
+                                answer,
+                                expected_tool_call_id,
+                            }) => match self
+                                .responder
+                                .respond_and_resume(
+                                    session_id,
+                                    Some(expected_tool_call_id.as_str()),
+                                    answer,
+                                )
+                                .await
+                            {
                                 Ok(RespondAndResumeOutcome::Resumed(new_rx)) => {
                                     rx = new_rx;
-                                    continue;
+                                    continue 'stream;
                                 }
                                 Ok(RespondAndResumeOutcome::NotResumed(reason)) => {
                                     reply_text(&platform, &reply_ctx, format!("({reason})")).await;
                                     return;
+                                }
+                                Err(
+                                    error @ (ResponderError::PendingQuestionChanged
+                                    | ResponderError::NoPendingQuestion),
+                                ) => {
+                                    reply_text(
+                                        &platform,
+                                        &reply_ctx,
+                                        format!("Your previous action expired: {error}"),
+                                    )
+                                    .await;
+                                    match self.authoritative_pending_ask(session_id).await {
+                                        Ok(Some(current)) => {
+                                            ask = current;
+                                            continue 'ask;
+                                        }
+                                        Ok(None) => {}
+                                        Err(load_error) => {
+                                            reply_text(
+                                                &platform,
+                                                &reply_ctx,
+                                                format!(
+                                                    "Could not refresh the current question: {load_error}"
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    return;
+                                }
+                                Err(
+                                    error @ (ResponderError::InvalidResponse(_)
+                                    | ResponderError::Other(_)),
+                                ) => {
+                                    reply_text(
+                                        &platform,
+                                        &reply_ctx,
+                                        format!("Failed to record your answer: {error}"),
+                                    )
+                                    .await;
+                                    // The inbound fast path atomically removed
+                                    // the parked ask before waking this task.
+                                    // Validation, storage, or handoff failures
+                                    // do not necessarily consume the durable
+                                    // question, so reload it and park a fresh
+                                    // nonce instead of leaving the chat able to
+                                    // route subsequent replies as new prompts.
+                                    match self.authoritative_pending_ask(session_id).await {
+                                        Ok(Some(current)) => ask = current,
+                                        Ok(None) => return,
+                                        Err(load_error) => {
+                                            // Keep the exact original ask and
+                                            // mint a new nonce. Its tool id is
+                                            // still a safe CAS guard if another
+                                            // client consumed it while storage
+                                            // was unavailable.
+                                            reply_text(
+                                                &platform,
+                                                &reply_ctx,
+                                                format!(
+                                                    "Could not reload the question ({load_error}); the original question is still available to retry."
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    continue 'ask;
                                 }
                                 Err(error) => {
                                     reply_text(
@@ -1040,21 +1179,39 @@ impl ConnectBridge {
                                     .await;
                                     return;
                                 }
+                            },
+                            Some(AskResolution::Invalidated) | None => {
+                                // Already cleared by the invalidator in the
+                                // common case; clear defensively so a stale entry
+                                // never lingers if the sender was dropped instead.
+                                self.clear_pending_ask(key).await;
+                                return;
                             }
-                        }
-                        Some(AskResolution::Invalidated) | None => {
-                            // Already cleared by the invalidator in the
-                            // common case; clear defensively so a stale entry
-                            // never lingers if the sender was dropped instead
-                            // (e.g. a bug elsewhere) rather than sending
-                            // `Invalidated` explicitly.
-                            self.clear_pending_ask(key).await;
-                            return;
                         }
                     }
                 }
             }
         }
+    }
+
+    async fn authoritative_pending_ask(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<render::PendingAsk>, String> {
+        let pending = self
+            .ctx
+            .session_repo
+            .load_merged_checked(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .and_then(|session| session.pending_question);
+        Ok(pending.map(|pending| render::PendingAsk {
+            tool_call_id: Some(pending.tool_call_id),
+            tool_name: pending.tool_name,
+            question: pending.question,
+            options: pending.options,
+            allow_custom: pending.allow_custom,
+        }))
     }
 }
 
@@ -1086,6 +1243,10 @@ mod tests {
     use super::*;
     use crate::app_state::AppState;
     use crate::tools::ToolSurface;
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{PendingQuestion, PendingQuestionSource, Session};
+    use bamboo_storage::LockedSessionStore;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -1179,9 +1340,11 @@ mod tests {
     /// broadcast receiver subscribed to a test-controlled sender, so a test
     /// can drive the "resumed run" by sending events directly.
     struct FakeResponder {
-        calls: TokioMutex<Vec<(String, String)>>,
+        calls: TokioMutex<Vec<(String, Option<String>, String)>>,
         resume_sender: broadcast::Sender<AgentEvent>,
         fail_with: Option<String>,
+        failures_remaining: AtomicUsize,
+        current_tool_call_id: Option<String>,
     }
 
     impl FakeResponder {
@@ -1190,6 +1353,8 @@ mod tests {
                 calls: TokioMutex::new(Vec::new()),
                 resume_sender,
                 fail_with: None,
+                failures_remaining: AtomicUsize::new(0),
+                current_tool_call_id: None,
             })
         }
 
@@ -1198,6 +1363,31 @@ mod tests {
                 calls: TokioMutex::new(Vec::new()),
                 resume_sender,
                 fail_with: Some(reason.to_string()),
+                failures_remaining: AtomicUsize::new(usize::MAX),
+                current_tool_call_id: None,
+            })
+        }
+
+        fn failing_once(resume_sender: broadcast::Sender<AgentEvent>, reason: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: TokioMutex::new(Vec::new()),
+                resume_sender,
+                fail_with: Some(reason.to_string()),
+                failures_remaining: AtomicUsize::new(1),
+                current_tool_call_id: None,
+            })
+        }
+
+        fn guarding_current(
+            resume_sender: broadcast::Sender<AgentEvent>,
+            current_tool_call_id: &str,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                calls: TokioMutex::new(Vec::new()),
+                resume_sender,
+                fail_with: None,
+                failures_remaining: AtomicUsize::new(0),
+                current_tool_call_id: Some(current_tool_call_id.to_string()),
             })
         }
     }
@@ -1207,20 +1397,57 @@ mod tests {
         async fn respond_and_resume(
             &self,
             session_id: &str,
+            expected_tool_call_id: Option<&str>,
             answer: String,
         ) -> Result<RespondAndResumeOutcome, super::super::approvals::ResponderError> {
-            self.calls
-                .lock()
-                .await
-                .push((session_id.to_string(), answer));
-            if let Some(reason) = &self.fail_with {
+            self.calls.lock().await.push((
+                session_id.to_string(),
+                expected_tool_call_id.map(str::to_string),
+                answer,
+            ));
+            if self
+                .current_tool_call_id
+                .as_deref()
+                .is_some_and(|current| Some(current) != expected_tool_call_id)
+            {
+                return Err(super::super::approvals::ResponderError::PendingQuestionChanged);
+            }
+            let remaining = self.failures_remaining.load(Ordering::SeqCst);
+            if remaining > 0 {
+                if remaining != usize::MAX {
+                    self.failures_remaining.fetch_sub(1, Ordering::SeqCst);
+                }
+                let reason = self.fail_with.as_deref().unwrap_or("injected failure");
                 return Err(super::super::approvals::ResponderError::Other(
-                    reason.clone(),
+                    reason.to_string(),
                 ));
             }
             Ok(RespondAndResumeOutcome::Resumed(
                 self.resume_sender.subscribe(),
             ))
+        }
+    }
+
+    struct ToggleLoadStorage {
+        inner: Arc<dyn Storage>,
+        fail_load: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for ToggleLoadStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            if self.fail_load.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected connect reload failure"));
+            }
+            self.inner.load_session(session_id).await
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(session_id).await
         }
     }
 
@@ -1818,6 +2045,7 @@ mod tests {
             tool_call_id: Some("call-1".to_string()),
             tool_name: Some("request_permissions".to_string()),
             allow_custom,
+            source: Some(bamboo_agent_core::PendingQuestionSource::PauseTool),
         }
     }
 
@@ -1908,13 +2136,338 @@ mod tests {
 
         assert_eq!(
             responder.calls.lock().await.as_slice(),
-            &[("sess-1".to_string(), "Approve".to_string())]
+            &[(
+                "sess-1".to_string(),
+                Some("call-1".to_string()),
+                "Approve".to_string()
+            )]
         );
         assert_eq!(
             platform.answered_callbacks.lock().await.as_slice(),
             &[("cbq-1".to_string(), None)]
         );
         assert!(!bridge.has_pending_ask(&key).await);
+    }
+
+    #[tokio::test]
+    async fn legacy_clarification_hydrates_exact_identity_before_submission() {
+        let (ctx, _dir) = test_context().await;
+        let mut session = Session::new("sess-legacy", "model");
+        session.pending_question = Some(PendingQuestion {
+            tool_call_id: "call-legacy-exact".to_string(),
+            tool_name: "conclusion_with_options".to_string(),
+            question: "Legacy approval?".to_string(),
+            options: vec!["Approve".to_string(), "Deny".to_string()],
+            allow_custom: false,
+            source: PendingQuestionSource::PauseTool,
+        });
+        ctx.session_repo.save_and_cache(&mut session).await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx.clone());
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("legacy-chat", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "legacy-chat" }));
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(AgentEvent::NeedClarification {
+            question: "Legacy approval?".to_string(),
+            options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+            tool_call_id: None,
+            tool_name: None,
+            allow_custom: false,
+            source: None,
+        })
+        .unwrap();
+
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-legacy", rx)
+                    .await;
+            })
+        };
+        let parked = wait_for_parked_ask(&bridge, &key).await;
+        assert_eq!(parked.tool_call_id, "call-legacy-exact");
+        ConnectBridge::handle_callback(
+            bridge,
+            platform,
+            vec!["u1".to_string()],
+            CallbackQuery {
+                platform: "fake".to_string(),
+                chat_id: "legacy-chat".to_string(),
+                user_id: "u1".to_string(),
+                callback_query_id: "legacy-callback".to_string(),
+                data: format!("{}:0", parked.nonce),
+                reply_ctx,
+            },
+        )
+        .await;
+        wait_for_responder_calls(&responder, 1).await;
+        resume_tx
+            .send(AgentEvent::ExecutionStarted {
+                run_id: "run-legacy-successor".to_string(),
+                session_id: "sess-legacy".to_string(),
+                started_at: "2026-08-10T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        resume_tx
+            .send(AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            responder.calls.lock().await.as_slice(),
+            &[(
+                "sess-legacy".to_string(),
+                Some("call-legacy-exact".to_string()),
+                "Approve".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_clarification_without_durable_identity_is_read_only() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx);
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("legacy-read-only", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "legacy-read-only" }));
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(AgentEvent::NeedClarification {
+            question: "External legacy question?".to_string(),
+            options: Some(vec!["One".to_string(), "Two".to_string()]),
+            tool_call_id: None,
+            tool_name: None,
+            allow_custom: true,
+            source: Some(PendingQuestionSource::ExternalAgent),
+        })
+        .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.render_until_settled(&key, platform.clone(), reply_ctx, "sess-external", rx),
+        )
+        .await
+        .expect("read-only legacy ask must not wait for an answer");
+
+        assert!(!bridge.has_pending_ask(&key).await);
+        assert!(responder.calls.lock().await.is_empty());
+        let sent = platform.sent_texts().await;
+        assert!(sent.iter().any(|message| {
+            message.contains("External legacy question?")
+                && message.contains("1. One")
+                && message.contains("2. Two")
+                && message.contains("Response unavailable")
+        }));
+    }
+
+    #[tokio::test]
+    async fn reload_failure_reparks_exact_ask_until_storage_recovers() {
+        let (mut ctx, _dir) = test_context().await;
+        let mut session = Session::new("sess-retry", "model");
+        session.pending_question = Some(PendingQuestion {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "request_permissions".to_string(),
+            question: "Retry approval?".to_string(),
+            options: vec!["Approve".to_string(), "Deny".to_string()],
+            allow_custom: false,
+            source: PendingQuestionSource::PauseTool,
+        });
+        ctx.session_repo.save_and_cache(&mut session).await;
+
+        let toggle = Arc::new(ToggleLoadStorage {
+            inner: ctx.session_repo.storage().clone(),
+            fail_load: AtomicBool::new(false),
+        });
+        let storage: Arc<dyn Storage> = toggle.clone();
+        ctx.session_repo = SessionRepository::new(
+            ctx.session_repo.cache().clone(),
+            storage.clone(),
+            Arc::new(LockedSessionStore::new(storage)),
+        );
+
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::failing_once(resume_tx.clone(), "temporary write failure");
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("retry-chat", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "retry-chat" }));
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Retry approval?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-retry", rx)
+                    .await;
+            })
+        };
+
+        let first = wait_for_parked_ask(&bridge, &key).await;
+        toggle.fail_load.store(true, Ordering::SeqCst);
+        ConnectBridge::handle_callback(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            CallbackQuery {
+                platform: "fake".to_string(),
+                chat_id: "retry-chat".to_string(),
+                user_id: "u1".to_string(),
+                callback_query_id: "retry-1".to_string(),
+                data: format!("{}:0", first.nonce),
+                reply_ctx: reply_ctx.clone(),
+            },
+        )
+        .await;
+        wait_for_responder_calls(&responder, 1).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let second = loop {
+            if let Some(parked) = bridge
+                .chat_state
+                .lock()
+                .await
+                .get(&key)
+                .and_then(|state| state.pending_ask.clone())
+                .filter(|parked| parked.nonce != first.nonce)
+            {
+                break parked;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ask was not reparked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(second.tool_call_id, "call-1");
+        assert!(platform
+            .sent_texts()
+            .await
+            .iter()
+            .any(|message| message.contains("original question is still available")));
+
+        toggle.fail_load.store(false, Ordering::SeqCst);
+        ConnectBridge::handle_callback(
+            bridge.clone(),
+            platform,
+            vec!["u1".to_string()],
+            CallbackQuery {
+                platform: "fake".to_string(),
+                chat_id: "retry-chat".to_string(),
+                user_id: "u1".to_string(),
+                callback_query_id: "retry-2".to_string(),
+                data: format!("{}:0", second.nonce),
+                reply_ctx,
+            },
+        )
+        .await;
+        wait_for_responder_calls(&responder, 2).await;
+        tokio::task::yield_now().await;
+        resume_tx
+            .send(AgentEvent::ExecutionStarted {
+                run_id: "run-retry-successor".to_string(),
+                session_id: "sess-retry".to_string(),
+                started_at: "2026-08-10T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        resume_tx
+            .send(AgentEvent::Complete {
+                usage: Default::default(),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("retry should resume and finish")
+            .unwrap();
+        assert!(!bridge.has_pending_ask(&key).await);
+        assert_eq!(responder.calls.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn old_parked_ask_cannot_answer_a_newer_pending_tool_call() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        // Simulate another client consuming call-1 and advancing the same
+        // session to call-2 while Connect still displays call-1.
+        let responder = FakeResponder::guarding_current(resume_tx, "call-2");
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx, None, responder.clone()));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("chat1", "u1");
+        let reply_ctx = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(need_clarification_event(
+            "Old approval?",
+            vec!["Approve", "Deny"],
+            false,
+        ))
+        .unwrap();
+        let render_handle = {
+            let bridge = bridge.clone();
+            let platform = platform.clone();
+            let reply_ctx = reply_ctx.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                bridge
+                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .await;
+            })
+        };
+
+        let parked = wait_for_parked_ask(&bridge, &key).await;
+        ConnectBridge::handle_callback(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            CallbackQuery {
+                platform: "fake".to_string(),
+                chat_id: "chat1".to_string(),
+                user_id: "u1".to_string(),
+                callback_query_id: "cbq-old".to_string(),
+                data: format!("{}:0", parked.nonce),
+                reply_ctx,
+            },
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(5), render_handle)
+            .await
+            .expect("stale answer rejection should settle the render task")
+            .unwrap();
+        assert_eq!(
+            responder.calls.lock().await.as_slice(),
+            &[(
+                "sess-1".to_string(),
+                Some("call-1".to_string()),
+                "Approve".to_string()
+            )]
+        );
+        assert!(platform.sent_texts().await.iter().any(|message| {
+            message.contains("pending question changed") || message.contains("expired")
+        }));
     }
 
     #[tokio::test]
@@ -2045,7 +2598,11 @@ mod tests {
 
         assert_eq!(
             responder.calls.lock().await.as_slice(),
-            &[("sess-1".to_string(), "please also add tests".to_string())]
+            &[(
+                "sess-1".to_string(),
+                Some("call-1".to_string()),
+                "please also add tests".to_string()
+            )]
         );
     }
 
@@ -2114,7 +2671,11 @@ mod tests {
 
         assert_eq!(
             responder.calls.lock().await.as_slice(),
-            &[("sess-1".to_string(), "Approve".to_string())]
+            &[(
+                "sess-1".to_string(),
+                Some("call-1".to_string()),
+                "Approve".to_string()
+            )]
         );
     }
 

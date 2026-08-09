@@ -60,9 +60,10 @@ pub enum RunOutcome {
         /// pause/answer/resume loop can pass it into the NEXT
         /// [`stream_execution`] call — the resumed run keeps EDITING the same
         /// status message instead of opening a fresh "⏳ Working…" bubble per
-        /// resume. `None` in legacy (non-`edit_message`) mode, which has no
-        /// cross-run state. Boxed to keep the enum's variants close in size
-        /// (clippy `large_enum_variant`).
+        /// resume. Legacy mode carries only accumulated assistant text; the
+        /// edit-in-place mode also carries its status-message bookkeeping.
+        /// Boxed to keep the enum's variants close in size (clippy
+        /// `large_enum_variant`).
         stream_state: Option<Box<StreamState>>,
     },
 }
@@ -84,11 +85,23 @@ pub struct StreamState {
 /// match on `AgentEvent` itself.
 #[derive(Debug, Clone)]
 pub struct PendingAsk {
-    pub tool_call_id: String,
+    pub tool_call_id: Option<String>,
     pub tool_name: String,
     pub question: String,
     pub options: Vec<String>,
     pub allow_custom: bool,
+}
+
+impl PendingAsk {
+    /// Whether two asks expose the same answer contract to the operator.
+    /// Legacy events may omit `tool_call_id`/`tool_name`; those transport
+    /// fields are intentionally excluded so a checked durable snapshot can
+    /// hydrate identity without mapping input onto a different question.
+    pub(super) fn same_visible_contract(&self, other: &Self) -> bool {
+        self.question == other.question
+            && self.options == other.options
+            && self.allow_custom == other.allow_custom
+    }
 }
 
 /// Split `text` into chunks of at most `limit` **characters** (not bytes), so
@@ -166,7 +179,7 @@ fn pending_ask_from_event(
     allow_custom: bool,
 ) -> PendingAsk {
     PendingAsk {
-        tool_call_id: tool_call_id.unwrap_or_default(),
+        tool_call_id,
         tool_name: tool_name.unwrap_or_default(),
         question,
         options: options.unwrap_or_default(),
@@ -193,7 +206,7 @@ pub async fn stream_execution(
     if platform.capabilities().edit_message {
         stream_execution_streaming(platform, reply_ctx, rx, prior).await
     } else {
-        stream_execution_legacy(platform, reply_ctx, rx).await
+        stream_execution_legacy(platform, reply_ctx, rx, prior).await
     }
 }
 
@@ -205,8 +218,13 @@ async fn stream_execution_legacy(
     platform: Arc<dyn Platform>,
     reply_ctx: ReplyCtx,
     mut rx: broadcast::Receiver<AgentEvent>,
+    prior: Option<Box<StreamState>>,
 ) -> RunOutcome {
-    let mut final_text = String::new();
+    let prior = prior.map(|state| *state);
+    let mut final_text = prior
+        .as_ref()
+        .map(|state| state.assistant_text.clone())
+        .unwrap_or_default();
     let mut terminal_note: Option<String> = None;
 
     loop {
@@ -220,12 +238,14 @@ async fn stream_execution_legacy(
                 send_chunks(&platform, &reply_ctx, &line).await;
             }
             Ok(AgentEvent::Token { content }) => final_text.push_str(&content),
+            Ok(AgentEvent::ExecutionStarted { .. }) => {}
             Ok(AgentEvent::NeedClarification {
                 question,
                 options,
                 tool_call_id,
                 tool_name,
                 allow_custom,
+                ..
             }) => {
                 return RunOutcome::Paused {
                     ask: pending_ask_from_event(
@@ -235,7 +255,13 @@ async fn stream_execution_legacy(
                         tool_name,
                         allow_custom,
                     ),
-                    stream_state: None,
+                    stream_state: Some(Box::new(StreamState {
+                        tool_lines: Vec::new(),
+                        assistant_text: final_text,
+                        status_ref: None,
+                        last_edit_at: None,
+                        chars_since_edit: 0,
+                    })),
                 };
             }
             Ok(AgentEvent::Complete { .. }) => break,
@@ -485,12 +511,14 @@ async fn stream_execution_streaming(
                 renderer.assistant_text.push_str(&content);
                 renderer.note_growth(added).await;
             }
+            Ok(AgentEvent::ExecutionStarted { .. }) => {}
             Ok(AgentEvent::NeedClarification {
                 question,
                 options,
                 tool_call_id,
                 tool_name,
                 allow_custom,
+                ..
             }) => {
                 renderer.finalize_paused().await;
                 return RunOutcome::Paused {
@@ -668,6 +696,7 @@ mod tests {
             tool_call_id: Some("call-1".to_string()),
             tool_name: Some("conclusion_with_options".to_string()),
             allow_custom,
+            source: Some(bamboo_agent_core::PendingQuestionSource::PauseTool),
         }
     }
 
@@ -765,10 +794,11 @@ mod tests {
             RunOutcome::Paused { ask, stream_state } => {
                 assert_eq!(ask.question, "Pick one");
                 assert_eq!(ask.options, vec!["A".to_string(), "B".to_string()]);
-                assert_eq!(ask.tool_call_id, "call-1");
+                assert_eq!(ask.tool_call_id.as_deref(), Some("call-1"));
                 assert!(!ask.allow_custom);
-                // Legacy mode carries no streaming state.
-                assert!(stream_state.is_none());
+                // Legacy mode also carries accumulated assistant text across
+                // the pause so pre-question output is not lost on resume.
+                assert!(stream_state.is_some());
             }
             RunOutcome::Terminal => panic!("expected Paused"),
         }

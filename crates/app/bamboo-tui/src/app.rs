@@ -1,19 +1,22 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tui_textarea::TextArea;
 
-use crate::api::sse::SseStream;
+use crate::api::sse::{SessionSseEvent, SseStream};
 use crate::api::types::*;
-use crate::api::BambooClient;
+use crate::api::{BambooClient, RespondFailure};
 use crate::event::AppEvent;
 use crate::history::map_history;
 use crate::ui;
@@ -322,15 +325,111 @@ pub struct Notification {
 // ── Interactive question (permission gate / clarification) ──
 
 /// An agent question awaiting the operator's answer, driven by the modal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QuestionIdentity {
+    pub session_id: String,
+    pub tool_call_id: Option<String>,
+    /// Fallback discriminator for older/external events that do not carry a
+    /// tool-call id. The server-side optimistic guard is available whenever
+    /// `tool_call_id` is present; this keeps local replay/draft state separate
+    /// even for legacy events.
+    pub question: String,
+}
+
+impl QuestionIdentity {
+    fn new(session_id: String, tool_call_id: Option<String>, question: String) -> Self {
+        let fallback_question = if tool_call_id.is_none() {
+            question
+        } else {
+            String::new()
+        };
+        Self {
+            session_id,
+            tool_call_id,
+            question: fallback_question,
+        }
+    }
+}
+
+const MAX_QUESTION_DRAFTS: usize = 64;
+
+/// Draft cache key. Typed questions are keyed by their durable tool-call id;
+/// legacy questions additionally retain the visible contract so a later
+/// `/pending` hydration cannot carry text onto a different prompt that happens
+/// to reuse the same question label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QuestionDraftKey {
+    identity: QuestionIdentity,
+    fallback_options: Vec<String>,
+    fallback_allow_custom: bool,
+}
+
+impl QuestionDraftKey {
+    fn new(
+        session_id: String,
+        tool_call_id: Option<String>,
+        question: String,
+        options: Vec<String>,
+        allow_custom: bool,
+    ) -> Self {
+        let legacy = tool_call_id.is_none();
+        Self {
+            identity: QuestionIdentity::new(session_id, tool_call_id, question),
+            fallback_options: if legacy { options } else { Vec::new() },
+            fallback_allow_custom: legacy && allow_custom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QuestionOptionHitbox {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub index: usize,
+}
+
+impl QuestionOptionHitbox {
+    fn contains(self, column: u16, row: u16) -> bool {
+        row == self.y && column >= self.x && column < self.x.saturating_add(self.width)
+    }
+}
+
+/// An agent question awaiting the operator's answer, driven by the modal.
 pub struct ActiveQuestion {
+    pub session_id: String,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub source: Option<String>,
     pub question: String,
     /// Preset choices; empty means free-text only.
     pub options: Vec<String>,
     /// Highlighted option index (option-select mode).
     pub selected: usize,
+    pub allow_custom: bool,
     /// `Some(buf)` = free-text entry mode (typing into `buf`); `None` =
     /// option-select mode. Starts `Some("")` when there are no options.
     pub custom: Option<String>,
+    /// Draft retained while focus returns to the option list. The currently
+    /// edited value lives in `custom`; `custom_draft` keeps it when custom mode
+    /// is temporarily closed.
+    pub custom_draft: String,
+    /// Numeric jump entry (`g`, digits, Enter) reaches options beyond 1-9
+    /// without submitting an ambiguous/truncated display label.
+    pub number_entry: Option<String>,
+    /// Full-text inspector for long questions and selected option values.
+    pub inspecting: bool,
+    /// `false` inspects/copies the question; `true` the selected exact option.
+    pub inspect_option: bool,
+    pub inspect_scroll: u16,
+    /// Last maximum scroll measured by the renderer. Input handling clamps to
+    /// this value so a terminal resize cannot leave an unreachable raw offset.
+    pub inspect_max_scroll: Cell<u16>,
+    /// Last submission error, rendered in the modal until the next retry.
+    pub error: Option<String>,
+    /// Option rows recorded by the renderer for click hit-testing.
+    pub option_hitboxes: RefCell<Vec<QuestionOptionHitbox>>,
+    pub mouse_pressed_option: Option<usize>,
     /// An answer POST is in flight for this question: the modal renders a
     /// "Submitting answer…" state and `handle_question_key` swallows every
     /// key (preventing a double-submit on repeated Enter, and preventing the
@@ -338,26 +437,110 @@ pub struct ActiveQuestion {
     /// `AppEvent::AnswerSubmitted` lands. Cleared on failure so the operator
     /// can retry; on success the whole question is dropped.
     pub submitting: bool,
+    /// A legacy/external event omitted its durable tool-call identity. The
+    /// modal remains inspectable but cannot submit until `/pending` supplies
+    /// the exact CAS guard.
+    pub identity_syncing: bool,
 }
 
 impl ActiveQuestion {
     /// Build the modal state from a `GET .../pending` response. Mirrors the
     /// SSE `NeedClarification` handler: no preset options opens straight into
     /// free-text entry instead of an empty option list.
-    fn from_pending(pending: &PendingQuestion) -> Self {
+    fn from_pending(session_id: String, pending: &PendingQuestion, draft: String) -> Self {
         let options = pending.options.clone().unwrap_or_default();
-        let custom = if options.is_empty() {
-            Some(String::new())
+        let custom = if options.is_empty() && pending.allow_custom {
+            Some(draft.clone())
         } else {
             None
         };
         Self {
+            session_id,
+            tool_call_id: pending.tool_call_id.clone(),
+            tool_name: pending.tool_name.clone(),
+            source: pending.source.clone(),
             question: pending.question.clone(),
             options,
             selected: 0,
+            allow_custom: pending.allow_custom,
             custom,
+            custom_draft: draft,
+            number_entry: None,
+            inspecting: false,
+            inspect_option: false,
+            inspect_scroll: 0,
+            inspect_max_scroll: Cell::new(0),
+            error: None,
+            option_hitboxes: RefCell::new(Vec::new()),
+            mouse_pressed_option: None,
             submitting: false,
+            identity_syncing: pending.tool_call_id.is_none(),
         }
+    }
+
+    fn identity(&self) -> QuestionIdentity {
+        QuestionIdentity::new(
+            self.session_id.clone(),
+            self.tool_call_id.clone(),
+            self.question.clone(),
+        )
+    }
+
+    fn draft_key(&self) -> QuestionDraftKey {
+        QuestionDraftKey::new(
+            self.session_id.clone(),
+            self.tool_call_id.clone(),
+            self.question.clone(),
+            self.options.clone(),
+            self.allow_custom,
+        )
+    }
+
+    /// A legacy live event can omit the durable tool-call id while exposing
+    /// the rest of the exact question contract.  Let the authoritative
+    /// `/pending` snapshot fill in that one missing identity component in
+    /// place so an operator's custom draft survives the handshake.  Contract
+    /// mismatches still replace the modal instead of carrying input onto a
+    /// different question.
+    fn can_hydrate_identity_from(&self, incoming: &Self) -> bool {
+        self.tool_call_id.is_none()
+            && incoming.tool_call_id.is_some()
+            && self.session_id == incoming.session_id
+            && self.question == incoming.question
+            && self.options == incoming.options
+            && self.allow_custom == incoming.allow_custom
+    }
+
+    fn refresh_contract(&mut self, incoming: Self) {
+        let was_identity_syncing = self.identity_syncing;
+        self.tool_call_id = incoming.tool_call_id;
+        self.tool_name = incoming.tool_name;
+        self.source = incoming.source;
+        self.question = incoming.question;
+        self.options = incoming.options;
+        self.option_hitboxes.borrow_mut().clear();
+        self.mouse_pressed_option = None;
+        self.allow_custom = incoming.allow_custom;
+        self.identity_syncing = incoming.identity_syncing;
+        if was_identity_syncing && !self.identity_syncing {
+            self.error = None;
+        }
+        self.selected = self.selected.min(self.options.len().saturating_sub(1));
+        if self.options.is_empty() && self.inspect_option {
+            self.inspect_option = false;
+            self.inspect_scroll = 0;
+        }
+        if !self.allow_custom {
+            if let Some(draft) = self.custom.take() {
+                self.custom_draft = draft;
+            }
+        } else if self.options.is_empty() && self.custom.is_none() {
+            self.custom = Some(std::mem::take(&mut self.custom_draft));
+        }
+    }
+
+    fn draft(&self) -> &str {
+        self.custom.as_deref().unwrap_or(&self.custom_draft)
     }
 }
 
@@ -600,11 +783,48 @@ pub struct App {
     /// underneath it, so a late response for a superseded question is
     /// discarded instead of applied to the wrong question/session.
     answer_epoch: u64,
+    /// Tracked answer task so stopping, switching sessions, or superseding a
+    /// question cancels the network operation itself.  Ignoring only the late
+    /// result is insufficient: a task waiting for SSE readiness could still
+    /// POST after the UI already reported the run stopped.
+    answer_task: Option<tokio::task::JoinHandle<()>>,
+    /// Free-text drafts survive dismissal, session switches, and SSE replay,
+    /// keyed by the typed question identity rather than the active tab.
+    question_drafts: HashMap<QuestionDraftKey, String>,
+    /// Insertion/LRU order for the bounded draft cache. Drafts are useful
+    /// across session switches, but must not accumulate for the lifetime of a
+    /// long-running TUI process.
+    question_draft_order: VecDeque<QuestionDraftKey>,
+    /// Latest session whose async resume result is authoritative. An older
+    /// request finishing later must not switch the operator back.
+    opening_session_id: Option<String>,
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
-    sse_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
-    sse_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    sse_tx: Option<mpsc::UnboundedSender<SessionSseEvent>>,
+    sse_rx: Option<mpsc::UnboundedReceiver<SessionSseEvent>>,
+    sse_task: Option<tokio::task::JoinHandle<()>>,
+    /// Monotonic identity for an attached SSE task. Control/data events from a
+    /// detached generation are ignored even if they were already queued when
+    /// a replacement stream was installed.
+    sse_epoch: u64,
+    /// Monotonic identity for pending-question reconciliation requests. One
+    /// SSE generation can reconnect more than once; a slower earlier GET must
+    /// never overwrite a newer authoritative snapshot for the same session
+    /// and answer epoch.
+    pending_reconcile_epoch: u64,
+    /// Handshake state for the current SSE generation. Pending answers wait
+    /// until this is true before POSTing because the server may resume the run
+    /// before the respond HTTP request returns.
+    sse_ready: Option<watch::Receiver<bool>>,
+    /// The agent may still be running but its event transport is unavailable.
+    /// Kept separate from `chat.streaming` so input stays blocked and partial
+    /// output remains intact while the operator can still request Stop.
+    pub stream_disconnected: bool,
+    /// A new execution generation was observed after the currently-submitting
+    /// clarification answer. Its Complete is a real terminal event even if the
+    /// respond HTTP result has not yet arrived to clear the local modal.
+    pending_answer_run_started: bool,
 }
 
 /// Move a list selection by `delta` (positive = down, negative = up),
@@ -616,6 +836,28 @@ fn scroll_selection(selected: usize, len: usize, delta: i32) -> usize {
     }
     let next = selected as i64 + delta as i64;
     next.clamp(0, (len - 1) as i64) as usize
+}
+
+fn question_option_at(question: &ActiveQuestion, column: u16, row: u16) -> Option<usize> {
+    if question.inspecting || question.custom.is_some() || question.number_entry.is_some() {
+        return None;
+    }
+    question
+        .option_hitboxes
+        .borrow()
+        .iter()
+        .find(|hitbox| hitbox.contains(column, row))
+        .map(|hitbox| hitbox.index)
+}
+
+/// Copy text through the terminal-standard OSC 52 clipboard sequence. The
+/// payload is base64 encoded, so arbitrary Unicode and line breaks remain
+/// exact and never terminate the control sequence early.
+fn copy_via_osc52(value: &str) -> std::io::Result<()> {
+    let encoded = BASE64_STANDARD.encode(value.as_bytes());
+    let mut stdout = std::io::stdout().lock();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
 }
 
 impl App {
@@ -646,9 +888,19 @@ impl App {
             notifications_visible: false,
             unseen_alerts: 0,
             answer_epoch: 0,
+            answer_task: None,
+            question_drafts: HashMap::new(),
+            question_draft_order: VecDeque::new(),
+            opening_session_id: None,
             event_tx: None,
             sse_tx: None,
             sse_rx: None,
+            sse_task: None,
+            sse_epoch: 0,
+            pending_reconcile_epoch: 0,
+            sse_ready: None,
+            stream_disconnected: false,
+            pending_answer_run_started: false,
         }
     }
 
@@ -747,7 +999,7 @@ impl App {
                     }
                 } => {
                     if let Some(event) = sse_event {
-                        if let Err(e) = self.handle_sse_event(event) {
+                        if let Err(e) = self.handle_session_sse_event(event) {
                             self.notify(NoticeLevel::Error, format!("SSE error: {e}"));
                         }
                     }
@@ -762,20 +1014,20 @@ impl App {
     }
 
     fn poll_sse(&mut self) {
-        let events: Vec<AgentEvent> = if let Some(rx) = &mut self.sse_rx {
+        let events: Vec<SessionSseEvent> = if let Some(rx) = &mut self.sse_rx {
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
         } else {
             Vec::new()
         };
         for event in events {
-            if let Err(e) = self.handle_sse_event(event) {
+            if let Err(e) = self.handle_session_sse_event(event) {
                 self.notify(NoticeLevel::Error, format!("SSE error: {e}"));
             }
         }
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
-        if self.help_visible {
+        if self.help_visible && !self.any_modal_open() {
             if let AppEvent::Key(_) = &event {
                 self.help_visible = false;
                 return Ok(());
@@ -783,7 +1035,7 @@ impl App {
         }
 
         // The notification-log overlay is dismissed by any key.
-        if self.notifications_visible {
+        if self.notifications_visible && !self.any_modal_open() {
             if let AppEvent::Key(_) = &event {
                 self.notifications_visible = false;
                 return Ok(());
@@ -916,76 +1168,235 @@ impl App {
                 }
                 Err(e) => self.skills.error = Some(e),
             },
-            AppEvent::SessionOpened { session_id, result } => match result {
-                Ok(opened) => {
-                    // Reset every per-run scratch field `finalize_streaming`
-                    // would otherwise leave behind from whatever was open
-                    // before — a resumed session must not inherit stale
-                    // in-flight-turn state from a prior chat.
-                    self.chat.session_id = Some(session_id.clone());
-                    self.chat.model = opened.model;
-                    self.chat.project_id = opened.project_id;
-                    self.chat.current_response.clear();
-                    self.chat.current_tool_calls.clear();
-                    self.chat.current_reasoning.clear();
-                    self.chat.sub_agents.clear();
-                    self.chat.token_usage = None;
-                    self.chat.scroll_offset = 0;
-                    self.chat.streaming = false;
-                    self.supersede_pending_answer();
-                    self.pending_question = None;
-                    self.dismissed_question = None;
+            AppEvent::SessionOpened { session_id, result } => {
+                if self.opening_session_id.as_deref() != Some(session_id.as_str()) {
+                    return Ok(());
+                }
+                self.opening_session_id = None;
+                match result {
+                    Ok(opened) => {
+                        // Reset every per-run scratch field `finalize_streaming`
+                        // would otherwise leave behind from whatever was open
+                        // before — a resumed session must not inherit stale
+                        // in-flight-turn state from a prior chat.
+                        self.detach_stream();
+                        self.chat.session_id = Some(session_id.clone());
+                        self.chat.model = opened.model;
+                        self.chat.project_id = opened.project_id;
+                        self.chat.current_response.clear();
+                        self.chat.current_tool_calls.clear();
+                        self.chat.current_reasoning.clear();
+                        self.chat.sub_agents.clear();
+                        self.chat.token_usage = None;
+                        self.chat.scroll_offset = 0;
+                        self.chat.streaming = false;
+                        self.stream_disconnected = false;
+                        self.pending_answer_run_started = false;
+                        self.stash_question_drafts();
+                        self.supersede_pending_answer();
+                        self.pending_question = None;
+                        self.dismissed_question = None;
 
-                    let shown = opened.messages.len();
-                    self.chat.messages = opened.messages;
-                    self.chat.auto_scroll = true;
-                    self.tab = Tab::Chat;
-                    self.status_message = "Session resumed".to_string();
+                        let shown = opened.messages.len();
+                        self.chat.messages = opened.messages;
+                        self.chat.auto_scroll = true;
+                        self.tab = Tab::Chat;
+                        self.status_message = "Session resumed".to_string();
 
-                    if opened.truncated {
-                        self.notify(
-                            NoticeLevel::Info,
-                            format!(
-                                "Showing last {shown} of {} messages",
-                                opened.total_message_count
-                            ),
-                        );
+                        if opened.truncated {
+                            self.notify(
+                                NoticeLevel::Info,
+                                format!(
+                                    "Showing last {shown} of {} messages",
+                                    opened.total_message_count
+                                ),
+                            );
+                        }
+
+                        // A persisted question is an idle pause, but answering
+                        // it resumes execution inside the respond handler
+                        // before that HTTP response returns. Subscribe now so
+                        // even an immediate resumed Token/Complete is observed.
+                        if opened.is_running || opened.pending.is_some() {
+                            self.attach_stream(session_id.clone());
+                            self.chat.streaming = true;
+                            self.status_message = if opened.is_running {
+                                "Reattached — streaming".to_string()
+                            } else {
+                                "Reattached — waiting for answer".to_string()
+                            };
+                        }
+
+                        if let Some(pending) = &opened.pending {
+                            self.status_message =
+                                format!("Question: {} (answer in the dialog)", pending.question);
+                            let question = self.question_from_pending(session_id, pending);
+                            self.pending_question = Some(question);
+                        }
                     }
-
-                    if opened.is_running {
+                    Err(e) => {
+                        self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
+                    }
+                }
+            }
+            AppEvent::PendingQuestionChecked {
+                session_id,
+                epoch,
+                result,
+            } => {
+                if epoch != self.answer_epoch
+                    || self.chat.session_id.as_deref() != Some(session_id.as_str())
+                {
+                    return Ok(());
+                }
+                match result {
+                    Ok(pending) if pending.has_pending_question => {
+                        self.stash_question_drafts();
+                        self.supersede_pending_answer();
+                        let question = self.question_from_pending(session_id.clone(), &pending);
+                        self.pending_question = Some(question);
+                        // Ctrl+Q may recover a server-side pause after the old
+                        // event stream was detached. Treat it as an active run
+                        // again so Ctrl+C routes to STOP (instead of quitting
+                        // the TUI), and subscribe before any answer can resume.
                         self.attach_stream(session_id);
                         self.chat.streaming = true;
-                        self.status_message = "Reattached — streaming".to_string();
+                        self.status_message = "Question reopened".to_string();
                     }
+                    Ok(_) => {
+                        self.notify(NoticeLevel::Info, "No pending question on the server");
+                    }
+                    Err(e) => {
+                        self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to check pending question: {e}"),
+                        );
+                    }
+                }
+            }
+            AppEvent::PendingQuestionReconciled {
+                session_id,
+                epoch,
+                reconcile_epoch,
+                result,
+            } => {
+                if epoch != self.answer_epoch
+                    || reconcile_epoch != self.pending_reconcile_epoch
+                    || self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || self
+                        .pending_question
+                        .as_ref()
+                        .is_some_and(|question| question.submitting)
+                {
+                    return Ok(());
+                }
+                match result {
+                    Ok(pending) if pending.has_pending_question => {
+                        let incoming = self.question_from_pending(session_id, &pending);
+                        if let Some(existing) = self.pending_question.as_mut() {
+                            if existing.identity() == incoming.identity()
+                                || existing.can_hydrate_identity_from(&incoming)
+                            {
+                                existing.refresh_contract(incoming);
+                                return Ok(());
+                            }
+                        } else if let Some(dismissed) = self.dismissed_question.as_mut() {
+                            if dismissed.identity() == incoming.identity()
+                                || dismissed.can_hydrate_identity_from(&incoming)
+                            {
+                                dismissed.refresh_contract(incoming);
+                                return Ok(());
+                            }
+                        }
 
-                    if let Some(pending) = &opened.pending {
+                        self.stash_question_drafts();
+                        self.supersede_pending_answer();
+                        self.dismissed_question = None;
+                        self.status_message = format!(
+                            "Question recovered after stream sync: {}",
+                            incoming.question
+                        );
+                        self.pending_question = Some(incoming);
+                    }
+                    Ok(_) => {
+                        if let Some(question) = self.pending_question.as_mut() {
+                            if question.identity_syncing {
+                                question.identity_syncing = false;
+                                question.error = Some(
+                                    "The server did not expose an exact response identity; this question cannot be answered from the TUI yet"
+                                        .to_string(),
+                                );
+                                self.status_message =
+                                    "Question identity unavailable — answer not sent".to_string();
+                                return Ok(());
+                            }
+                        }
+                        if self.pending_question.is_some() || self.dismissed_question.is_some() {
+                            self.stash_question_drafts();
+                            self.supersede_pending_answer();
+                            self.pending_question = None;
+                            self.dismissed_question = None;
+                            self.status_message =
+                                "Pending question cleared after stream sync".to_string();
+                        }
+                    }
+                    Err(error) => self.notify(
+                        NoticeLevel::Error,
+                        format!("Failed to reconcile question after SSE connect: {error}"),
+                    ),
+                }
+            }
+            AppEvent::PendingQuestionRefreshed {
+                session_id,
+                epoch,
+                identity,
+                result,
+            } => {
+                if epoch != self.answer_epoch
+                    || self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || self
+                        .pending_question
+                        .as_ref()
+                        .is_none_or(|question| question.identity() != identity)
+                {
+                    return Ok(());
+                }
+                match result {
+                    Ok(pending) if pending.has_pending_question => {
+                        self.stash_question_drafts();
+                        self.supersede_pending_answer();
+                        let question = self.question_from_pending(session_id, &pending);
+                        self.pending_question = Some(question);
                         self.status_message =
-                            format!("Question: {} (answer in the dialog)", pending.question);
-                        self.pending_question = Some(ActiveQuestion::from_pending(pending));
+                            "Question refreshed after rejected answer".to_string();
+                    }
+                    Ok(_) => {
+                        self.remove_question_drafts_for_identity(&identity);
+                        self.supersede_pending_answer();
+                        self.pending_question = None;
+                        self.dismissed_question = None;
+                        self.status_message = "Question was already answered".to_string();
+                        self.notify(
+                            NoticeLevel::Info,
+                            "The pending question no longer exists on the server",
+                        );
+                    }
+                    Err(error) => {
+                        if let Some(question) = self.pending_question.as_mut() {
+                            question.submitting = false;
+                            question.error =
+                                Some(format!("Could not refresh after rejection: {error}"));
+                        }
+                        self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to refresh pending question: {error}"),
+                        );
                     }
                 }
-                Err(e) => {
-                    self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
-                }
-            },
-            AppEvent::PendingQuestionChecked(r) => match r {
-                Ok(pending) if pending.has_pending_question => {
-                    self.supersede_pending_answer();
-                    self.pending_question = Some(ActiveQuestion::from_pending(&pending));
-                    self.status_message = "Question reopened".to_string();
-                }
-                Ok(_) => {
-                    self.notify(NoticeLevel::Info, "No pending question on the server");
-                }
-                Err(e) => {
-                    self.notify(
-                        NoticeLevel::Error,
-                        format!("Failed to check pending question: {e}"),
-                    );
-                }
-            },
+            }
             AppEvent::AnswerSubmitted {
                 epoch,
+                identity,
                 answer,
                 result,
             } => {
@@ -996,34 +1407,64 @@ impl App {
                 // discarded outright: applying it would clear or resume state
                 // that belongs to a different question than the one this
                 // answer was for.
-                if epoch != self.answer_epoch {
+                if epoch != self.answer_epoch
+                    || self
+                        .pending_question
+                        .as_ref()
+                        .is_none_or(|question| question.identity() != identity)
+                {
                     return Ok(());
                 }
+                self.answer_task.take();
                 match result {
                     Ok(status) => {
+                        self.remove_question_drafts_for_identity(&identity);
                         self.pending_question = None;
+                        if self
+                            .dismissed_question
+                            .as_ref()
+                            .is_some_and(|question| question.identity() == identity)
+                        {
+                            self.dismissed_question = None;
+                        }
                         // Only keep the spinner on if a run is actually
                         // running: the server returns 200 even when it did
                         // NOT resume (e.g. the session already `completed`),
-                        // so a blind `streaming = true` would spin forever
-                        // with no events behind it. No SSE reattach here —
-                        // the stream opened for the run stays attached across
-                        // the question, exactly as before.
+                        // so a blind `streaming = true` would spin forever.
+                        // Normally the original stream stays attached across
+                        // the question. If transport retries gave up while it
+                        // was open, a successful POST proves the server is
+                        // reachable again, so reattach before waiting for the
+                        // resumed run's events.
                         if matches!(status.as_str(), "started" | "already_running") {
+                            if !self.stream_is_ready() {
+                                self.attach_stream(identity.session_id.clone());
+                            }
                             self.status_message = format!("Answered: {answer} — resuming");
                             self.chat.streaming = true;
                         } else {
-                            self.status_message = format!("Answered: {answer} ({status})");
                             self.finalize_streaming();
+                            self.status_message = format!("Answered: {answer} ({status})");
                         }
                     }
-                    Err(e) => {
-                        // Keep the modal open — with input re-enabled — so
-                        // the operator can pick a valid option or retry.
+                    Err(error) if error.should_refresh_question() => {
+                        let message = error.to_string();
+                        self.notify(
+                            NoticeLevel::Warn,
+                            format!("Answer rejected; refreshing question state: {message}"),
+                        );
+                        self.refresh_question_after_rejection(identity, message);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        // Transport/server failures do not prove the question
+                        // changed. Keep the modal open with input enabled so
+                        // the operator can retry the exact submission.
                         if let Some(q) = self.pending_question.as_mut() {
                             q.submitting = false;
+                            q.error = Some(message.clone());
                         }
-                        self.notify(NoticeLevel::Error, format!("Answer rejected: {e}"));
+                        self.notify(NoticeLevel::Error, format!("Answer rejected: {message}"));
                     }
                 }
             }
@@ -1090,7 +1531,66 @@ impl App {
     /// selection instead (3 rows per notch, clamped) rather than being a
     /// dead input.
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if self.pending_question.is_some() {
+            let mut submit = None;
+            {
+                let question = self.pending_question.as_mut().unwrap();
+                if question.submitting {
+                    return;
+                }
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let delta: i32 = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                            -3
+                        } else {
+                            3
+                        };
+                        if question.inspecting {
+                            let max_scroll = question.inspect_max_scroll.get();
+                            let current = question.inspect_scroll.min(max_scroll);
+                            if delta < 0 {
+                                question.inspect_scroll =
+                                    current.saturating_sub(delta.unsigned_abs() as u16);
+                            } else {
+                                question.inspect_scroll =
+                                    current.saturating_add(delta as u16).min(max_scroll);
+                            }
+                        } else if question.custom.is_none() && !question.options.is_empty() {
+                            question.selected =
+                                scroll_selection(question.selected, question.options.len(), delta);
+                            question.error = None;
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        question.mouse_pressed_option =
+                            question_option_at(question, mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let pressed = question.mouse_pressed_option.take();
+                        if let Some(index) = question_option_at(question, mouse.column, mouse.row)
+                            .filter(|index| Some(*index) == pressed)
+                        {
+                            // Commit the selection only on release. Updating it
+                            // on mouse-down recenters a long option window on
+                            // the next redraw and moves the hitboxes before the
+                            // matching mouse-up arrives.
+                            question.selected = index;
+                            question.error = None;
+                            submit = question.options.get(index).cloned();
+                        }
+                    }
+                    _ => {
+                        question.mouse_pressed_option = None;
+                    }
+                }
+            }
+            if let Some(answer) = submit {
+                self.submit_answer(answer);
+            }
+            return;
+        }
+
         let delta: i32 = match mouse.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
@@ -1192,8 +1692,8 @@ impl App {
 
     /// Route one key event.
     ///
-    /// Modal precedence (checked top to bottom, each returning early — so at
-    /// most one modal ever owns the keyboard, and every one of them runs
+    /// Modal precedence (checked top to bottom, each returning early — so
+    /// exactly one visible modal owns the keyboard, and every one of them runs
     /// before the global bindings further down: Ctrl+N/Ctrl+O/Ctrl+Q, `?`,
     /// digit tab-switching, Tab/Shift+Tab):
     ///   0. `serve_offer`      — startup-only "start a local server?" offer
@@ -1202,6 +1702,10 @@ impl App {
     ///   3. `model_picker`     — Ctrl+O provider-catalog picker
     ///   4. `schedule_form`    — new-schedule authoring form
     ///   5. `config_editor`    — raw config JSON editor
+    ///
+    /// Runtime modals can coexist in state because a clarification arrives
+    /// asynchronously. The renderer layers them in the reverse order below,
+    /// keeping this keyboard owner visible without discarding editor drafts.
     ///
     /// `serve_offer` can never actually coexist with 1-5 in practice — `run`
     /// sets it (if at all) before the main loop starts driving any of the
@@ -1506,7 +2010,9 @@ impl App {
         enum QAction {
             None,
             Dismiss,
+            CloseCustom,
             Submit(String),
+            Copy(String),
         }
 
         let action = {
@@ -1520,15 +2026,101 @@ impl App {
                 // request (Ctrl+C at the top of `handle_key` still preempts).
                 return Ok(());
             }
-            if let Some(buf) = q.custom.as_mut() {
+
+            if q.inspecting {
+                match key.code {
+                    KeyCode::Char('v') | KeyCode::Esc => {
+                        q.inspecting = false;
+                        q.inspect_scroll = 0;
+                        QAction::None
+                    }
+                    KeyCode::Tab if !q.options.is_empty() => {
+                        q.inspect_option = !q.inspect_option;
+                        q.inspect_scroll = 0;
+                        QAction::None
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        q.inspect_scroll = q
+                            .inspect_scroll
+                            .min(q.inspect_max_scroll.get())
+                            .saturating_sub(1);
+                        QAction::None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        q.inspect_scroll = q
+                            .inspect_scroll
+                            .min(q.inspect_max_scroll.get())
+                            .saturating_add(1)
+                            .min(q.inspect_max_scroll.get());
+                        QAction::None
+                    }
+                    KeyCode::PageUp => {
+                        q.inspect_scroll = q
+                            .inspect_scroll
+                            .min(q.inspect_max_scroll.get())
+                            .saturating_sub(5);
+                        QAction::None
+                    }
+                    KeyCode::PageDown => {
+                        q.inspect_scroll = q
+                            .inspect_scroll
+                            .min(q.inspect_max_scroll.get())
+                            .saturating_add(5)
+                            .min(q.inspect_max_scroll.get());
+                        QAction::None
+                    }
+                    KeyCode::Home => {
+                        q.inspect_scroll = 0;
+                        QAction::None
+                    }
+                    KeyCode::Char('y') => {
+                        let value = if q.inspect_option {
+                            q.options.get(q.selected).cloned().unwrap_or_default()
+                        } else {
+                            q.question.clone()
+                        };
+                        QAction::Copy(value)
+                    }
+                    _ => QAction::None,
+                }
+            } else if let Some(entry) = q.number_entry.as_mut() {
+                match key.code {
+                    KeyCode::Char(d) if d.is_ascii_digit() => {
+                        entry.push(d);
+                        QAction::None
+                    }
+                    KeyCode::Backspace => {
+                        entry.pop();
+                        QAction::None
+                    }
+                    KeyCode::Esc => {
+                        q.number_entry = None;
+                        QAction::None
+                    }
+                    KeyCode::Enter => {
+                        let requested = entry.parse::<usize>().ok();
+                        q.number_entry = None;
+                        match requested.and_then(|number| number.checked_sub(1)) {
+                            Some(index) if index < q.options.len() => {
+                                q.selected = index;
+                                q.error = None;
+                            }
+                            _ => {
+                                q.error = Some("That option number does not exist".to_string());
+                            }
+                        }
+                        QAction::None
+                    }
+                    _ => QAction::None,
+                }
+            } else if let Some(buf) = q.custom.as_mut() {
                 // Free-text entry mode.
                 match key.code {
                     KeyCode::Enter => {
-                        let answer = buf.trim().to_string();
-                        if answer.is_empty() {
+                        if buf.trim().is_empty() {
                             QAction::None
                         } else {
-                            QAction::Submit(answer)
+                            QAction::Submit(buf.clone())
                         }
                     }
                     KeyCode::Esc => {
@@ -1536,16 +2128,23 @@ impl App {
                         if q.options.is_empty() {
                             QAction::Dismiss
                         } else {
-                            q.custom = None;
-                            QAction::None
+                            QAction::CloseCustom
                         }
                     }
                     KeyCode::Backspace => {
                         buf.pop();
+                        q.error = None;
+                        QAction::None
+                    }
+                    KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        q.inspecting = true;
+                        q.inspect_option = false;
+                        q.inspect_scroll = 0;
                         QAction::None
                     }
                     KeyCode::Char(c) => {
                         buf.push(c);
+                        q.error = None;
                         QAction::None
                     }
                     _ => QAction::None,
@@ -1555,18 +2154,64 @@ impl App {
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         q.selected = q.selected.saturating_sub(1);
+                        q.error = None;
                         QAction::None
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if q.selected + 1 < q.options.len() {
                             q.selected += 1;
                         }
+                        q.error = None;
                         QAction::None
                     }
-                    KeyCode::Char('c') => {
-                        // Switch to free-text entry (for allow-custom questions).
-                        q.custom = Some(String::new());
+                    KeyCode::PageUp => {
+                        q.selected = q.selected.saturating_sub(5);
+                        q.error = None;
                         QAction::None
+                    }
+                    KeyCode::PageDown => {
+                        q.selected = q
+                            .selected
+                            .saturating_add(5)
+                            .min(q.options.len().saturating_sub(1));
+                        q.error = None;
+                        QAction::None
+                    }
+                    KeyCode::Home => {
+                        q.selected = 0;
+                        q.error = None;
+                        QAction::None
+                    }
+                    KeyCode::End => {
+                        q.selected = q.options.len().saturating_sub(1);
+                        q.error = None;
+                        QAction::None
+                    }
+                    KeyCode::Char('c') if q.allow_custom => {
+                        // Switch to free-text entry without discarding a draft
+                        // entered before dismissal/session switching.
+                        q.custom = Some(std::mem::take(&mut q.custom_draft));
+                        q.error = None;
+                        QAction::None
+                    }
+                    KeyCode::Char('g') if !q.options.is_empty() => {
+                        q.number_entry = Some(String::new());
+                        q.error = None;
+                        QAction::None
+                    }
+                    KeyCode::Char('v') => {
+                        q.inspecting = true;
+                        q.inspect_option = false;
+                        q.inspect_scroll = 0;
+                        QAction::None
+                    }
+                    KeyCode::Char('y') => {
+                        let value = q
+                            .options
+                            .get(q.selected)
+                            .cloned()
+                            .unwrap_or_else(|| q.question.clone());
+                        QAction::Copy(value)
                     }
                     KeyCode::Enter => q
                         .options
@@ -1590,6 +2235,17 @@ impl App {
 
         match action {
             QAction::Submit(answer) => self.submit_answer(answer),
+            QAction::CloseCustom => {
+                if let Some(question) = self.pending_question.as_mut() {
+                    question.custom_draft = question.custom.take().unwrap_or_default();
+                }
+            }
+            QAction::Copy(value) => match copy_via_osc52(&value) {
+                Ok(()) => self.status_message = "Copied exact text".to_string(),
+                Err(error) => {
+                    self.notify(NoticeLevel::Error, format!("Failed to copy text: {error}"))
+                }
+            },
             QAction::Dismiss => {
                 // Keep it, not just drop it: dismissing does NOT tell the
                 // server to stop waiting, so the run is still blocked on an
@@ -1605,6 +2261,84 @@ impl App {
         Ok(())
     }
 
+    fn stash_question_drafts(&mut self) {
+        let drafts = [
+            self.pending_question.as_ref(),
+            self.dismissed_question.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|question| question.allow_custom)
+        .map(|question| (question.draft_key(), question.draft().to_string()))
+        .collect::<Vec<_>>();
+        for (key, draft) in drafts {
+            self.store_question_draft(key, draft);
+        }
+    }
+
+    fn store_question_draft(&mut self, key: QuestionDraftKey, draft: String) {
+        self.question_draft_order
+            .retain(|existing| existing != &key);
+        if draft.is_empty() {
+            self.question_drafts.remove(&key);
+            return;
+        }
+
+        self.question_drafts.insert(key.clone(), draft);
+        self.question_draft_order.push_back(key);
+        while self.question_draft_order.len() > MAX_QUESTION_DRAFTS {
+            if let Some(oldest) = self.question_draft_order.pop_front() {
+                self.question_drafts.remove(&oldest);
+            }
+        }
+    }
+
+    fn take_question_draft(&mut self, key: &QuestionDraftKey) -> Option<String> {
+        let draft = self.question_drafts.remove(key);
+        if draft.is_some() {
+            self.question_draft_order.retain(|existing| existing != key);
+        }
+        draft
+    }
+
+    fn remove_question_drafts_for_identity(&mut self, identity: &QuestionIdentity) {
+        self.question_drafts
+            .retain(|key, _| &key.identity != identity);
+        self.question_draft_order
+            .retain(|key| &key.identity != identity);
+    }
+
+    fn question_from_pending(
+        &mut self,
+        session_id: String,
+        pending: &PendingQuestion,
+    ) -> ActiveQuestion {
+        let exact_key = QuestionDraftKey::new(
+            session_id.clone(),
+            pending.tool_call_id.clone(),
+            pending.question.clone(),
+            pending.options.clone().unwrap_or_default(),
+            pending.allow_custom,
+        );
+        let draft = if pending.allow_custom {
+            self.take_question_draft(&exact_key).or_else(|| {
+                pending.tool_call_id.as_ref()?;
+                let legacy_key = QuestionDraftKey::new(
+                    session_id.clone(),
+                    None,
+                    pending.question.clone(),
+                    pending.options.clone().unwrap_or_default(),
+                    pending.allow_custom,
+                );
+                self.take_question_draft(&legacy_key)
+            })
+        } else {
+            None
+        }
+        .unwrap_or_default();
+        ActiveQuestion::from_pending(session_id, pending, draft)
+    }
+
     /// Invalidate any in-flight answer POST by bumping `answer_epoch`. Called
     /// from every site that changes the pending-question context (a new
     /// question arriving, a session switch/resume, the run finalizing, the
@@ -1612,7 +2346,11 @@ impl App {
     /// `AppEvent::AnswerSubmitted` carrying an older epoch is discarded in
     /// `handle_event` instead of applied to a question it doesn't belong to.
     fn supersede_pending_answer(&mut self) {
+        if let Some(task) = self.answer_task.take() {
+            task.abort();
+        }
         self.answer_epoch = self.answer_epoch.wrapping_add(1);
+        self.pending_answer_run_started = false;
     }
 
     /// Submit an answer to the agent's pending question WITHOUT blocking the
@@ -1622,10 +2360,44 @@ impl App {
     /// `AppEvent::AnswerSubmitted`. Until then the modal stays open in a
     /// "Submitting answer…" state with input disabled.
     fn submit_answer(&mut self, answer: String) {
-        let Some(session_id) = self.chat.session_id.clone() else {
-            self.notify(NoticeLevel::Warn, "No active chat session to answer");
-            self.supersede_pending_answer();
-            self.pending_question = None;
+        let Some(identity) = self.pending_question.as_ref().map(ActiveQuestion::identity) else {
+            return;
+        };
+        if self.chat.session_id.as_deref() != Some(identity.session_id.as_str()) {
+            self.notify(
+                NoticeLevel::Warn,
+                "Question belongs to a different session; reopen that session before answering",
+            );
+            return;
+        }
+        if identity.tool_call_id.is_none() {
+            if let Some(question) = self.pending_question.as_mut() {
+                question.identity_syncing = true;
+                question.error = Some(
+                    "Waiting for the server's exact question identity; answer not sent".to_string(),
+                );
+            }
+            self.status_message = "Synchronizing question identity...".to_string();
+            self.reconcile_pending_question_after_stream_connect(identity.session_id);
+            return;
+        }
+        // The old pause activation can have queued its terminal Complete while
+        // its SSE task/readiness flag still looks live. Reusing that generation
+        // creates a gap: the server closes it at Complete and a fast successor
+        // run can finish before the UI processes Complete and reconnects.
+        // Always install and await a fresh subscriber generation before POSTing
+        // the answer; attaching also discards any queued terminal from the old
+        // pause stream.
+        if !self.attach_stream(identity.session_id.clone()) {
+            if let Some(question) = self.pending_question.as_mut() {
+                question.error = Some("Could not attach the event stream; answer not sent".into());
+            }
+            return;
+        }
+        let Some(mut sse_ready) = self.sse_ready.clone() else {
+            if let Some(question) = self.pending_question.as_mut() {
+                question.error = Some("Event stream is unavailable; answer not sent".into());
+            }
             return;
         };
         let Some(tx) = self.event_tx.clone() else {
@@ -1640,6 +2412,8 @@ impl App {
             return;
         }
         q.submitting = true;
+        q.error = None;
+        self.pending_answer_run_started = false;
 
         // Claim a fresh epoch for this submission; the spawned task carries a
         // copy so the handler can tell whether the response still belongs to
@@ -1649,14 +2423,71 @@ impl App {
         self.status_message = format!("Submitting answer: {answer}…");
 
         let client = self.client.clone();
-        tokio::spawn(async move {
-            let result = client
-                .respond(&session_id, &answer)
+        let session_id = identity.session_id.clone();
+        let expected_tool_call_id = identity.tool_call_id.clone();
+        let submitted_identity = identity.clone();
+        self.answer_task = Some(tokio::spawn(async move {
+            let stream_ready = if *sse_ready.borrow() {
+                Ok(())
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    sse_ready.wait_for(|ready| *ready),
+                )
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|_| "timed out waiting for the event stream".to_string())
+                .and_then(|result| {
+                    result
+                        .map(|_| ())
+                        .map_err(|_| "event stream closed before subscribing".to_string())
+                })
+            };
+            let result = match stream_ready {
+                Ok(()) => {
+                    client
+                        .respond(&session_id, &answer, expected_tool_call_id.as_deref())
+                        .await
+                }
+                Err(message) => Err(RespondFailure::unavailable(format!(
+                    "Answer not sent: {message}"
+                ))),
+            };
             let _ = tx.send(AppEvent::AnswerSubmitted {
                 epoch,
+                identity: submitted_identity,
                 answer,
+                result,
+            });
+        }));
+    }
+
+    fn refresh_question_after_rejection(&mut self, identity: QuestionIdentity, error: String) {
+        let Some(tx) = self.event_tx.clone() else {
+            if let Some(question) = self.pending_question.as_mut() {
+                question.submitting = false;
+                question.error = Some(error);
+            }
+            return;
+        };
+        if let Some(question) = self.pending_question.as_mut() {
+            // Keep input disabled until the authoritative pending state is
+            // known; retrying during reconciliation could repeat the same
+            // stale submission.
+            question.error = Some(format!("{error}; refreshing from server..."));
+        }
+        self.supersede_pending_answer();
+        let epoch = self.answer_epoch;
+        let session_id = identity.session_id.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_pending_question(&session_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::PendingQuestionRefreshed {
+                session_id,
+                epoch,
+                identity,
                 result,
             });
         });
@@ -1870,20 +2701,49 @@ impl App {
     /// `poll_sse`/`run`'s select loop starts receiving events. Shared by a
     /// freshly-started run (`start_stream_and_execute`, before `execute` so no
     /// early event is missed) and reattaching to an already-running session on
-    /// resume (`AppEvent::SessionOpened` with `is_running: true`) — in both
-    /// cases the server replays cached critical events then live-tails, so
-    /// connecting mid-flight doesn't lose anything. Returns whether the
-    /// connection was opened; on failure it has already `notify`'d.
+    /// resume (`AppEvent::SessionOpened` with `is_running: true`). Successful
+    /// retries also trigger an authoritative pending-question reconciliation,
+    /// because that state is not part of the server's critical-event replay.
+    /// Returns whether the connection was opened; on failure it has already
+    /// `notify`'d.
     fn attach_stream(&mut self, session_id: String) -> bool {
+        self.detach_stream();
+        let stream_epoch = self.sse_epoch;
         let (sse_tx, sse_rx) = mpsc::unbounded_channel();
         self.sse_tx = Some(sse_tx.clone());
         self.sse_rx = Some(sse_rx);
+        self.stream_disconnected = true;
         let base_url = self.client.base_url.clone();
-        if let Err(e) = SseStream::start(&base_url, &session_id, sse_tx) {
-            self.notify(NoticeLevel::Error, format!("SSE start failed: {e}"));
-            return false;
+        match SseStream::start(&base_url, &session_id, stream_epoch, sse_tx) {
+            Ok((task, ready)) => {
+                self.sse_task = Some(task);
+                self.sse_ready = Some(ready);
+            }
+            Err(error) => {
+                self.detach_stream();
+                self.notify(NoticeLevel::Error, format!("SSE start failed: {error}"));
+                return false;
+            }
         }
         true
+    }
+
+    fn stream_is_ready(&self) -> bool {
+        self.sse_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+            && self.sse_ready.as_ref().is_some_and(|ready| *ready.borrow())
+    }
+
+    fn detach_stream(&mut self) {
+        self.sse_epoch = self.sse_epoch.wrapping_add(1);
+        self.pending_reconcile_epoch = self.pending_reconcile_epoch.wrapping_add(1);
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+        self.sse_ready = None;
+        self.sse_tx = None;
+        self.sse_rx = None;
     }
 
     /// After `chat` returns a session id, open the SSE stream (before execute, so
@@ -1892,6 +2752,13 @@ impl App {
         if !self.attach_stream(session_id.clone()) {
             return;
         }
+        let Some(mut sse_ready) = self.sse_ready.clone() else {
+            self.notify(
+                NoticeLevel::Error,
+                "SSE readiness channel unavailable; run was not started",
+            );
+            return;
+        };
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
@@ -1899,6 +2766,27 @@ impl App {
         let model = self.chat.model.clone();
         tokio::spawn(async move {
             let model = if model.is_empty() { None } else { Some(model) };
+            let ready = if *sse_ready.borrow() {
+                Ok(())
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    sse_ready.wait_for(|ready| *ready),
+                )
+                .await
+                .map_err(|_| "timed out waiting for the event stream".to_string())
+                .and_then(|result| {
+                    result
+                        .map(|_| ())
+                        .map_err(|_| "event stream closed before subscribing".to_string())
+                })
+            };
+            if let Err(error) = ready {
+                let _ = tx.send(AppEvent::ExecuteFailed(format!(
+                    "execute not started: {error}"
+                )));
+                return;
+            }
             // If this POST fails (server down, 4xx/5xx), no SSE terminal event
             // will ever arrive for a run that never started — report it back so
             // the handler can finalize `chat.streaming` instead of spinning
@@ -1918,6 +2806,7 @@ impl App {
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
+        self.opening_session_id = Some(session_id.clone());
         let client = self.client.clone();
         self.status_message = "Resuming session...".to_string();
         tokio::spawn(async move {
@@ -1942,15 +2831,23 @@ impl App {
                 }
             };
             // Only fetch the pending question when the summary says there is
-            // one — saves a round-trip for the common case, and a failure
-            // here is non-fatal: the session still opens, just without the
-            // modal pre-populated (Ctrl+Q can fetch it again).
+            // one. A detail-fetch failure is fatal to this open attempt: the
+            // summary is authoritative that input must remain blocked, so
+            // opening without the modal would silently expose an unusable
+            // chat composer and lose the discoverable retry path.
             let pending = if summary.has_pending_question {
-                client
-                    .get_pending_question(&session_id)
-                    .await
-                    .ok()
-                    .filter(|p| p.has_pending_question)
+                match client.get_pending_question(&session_id).await {
+                    Ok(pending) => pending.has_pending_question.then_some(pending),
+                    Err(error) => {
+                        let _ = tx.send(AppEvent::SessionOpened {
+                            session_id,
+                            result: Err(format!(
+                                "session has a pending question, but its details could not be loaded: {error}"
+                            )),
+                        });
+                        return;
+                    }
+                }
             } else {
                 None
             };
@@ -1974,6 +2871,9 @@ impl App {
     /// membership (the operator picked both deliberately) while dropping
     /// per-session conversation state.
     fn new_session(&mut self) {
+        self.stash_question_drafts();
+        self.detach_stream();
+        self.opening_session_id = None;
         self.chat.session_id = None;
         self.chat.messages.clear();
         self.chat.current_response.clear();
@@ -2010,6 +2910,8 @@ impl App {
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
+        self.supersede_pending_answer();
+        let epoch = self.answer_epoch;
         let client = self.client.clone();
         self.status_message = "Checking for a pending question...".to_string();
         tokio::spawn(async move {
@@ -2017,7 +2919,36 @@ impl App {
                 .get_pending_question(&session_id)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::PendingQuestionChecked(r));
+            let _ = tx.send(AppEvent::PendingQuestionChecked {
+                session_id,
+                epoch,
+                result: r,
+            });
+        });
+    }
+
+    fn reconcile_pending_question_after_stream_connect(&mut self, session_id: String) {
+        if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let epoch = self.answer_epoch;
+        self.pending_reconcile_epoch = self.pending_reconcile_epoch.wrapping_add(1);
+        let reconcile_epoch = self.pending_reconcile_epoch;
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_pending_question(&session_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::PendingQuestionReconciled {
+                session_id,
+                epoch,
+                reconcile_epoch,
+                result,
+            });
         });
     }
 
@@ -2033,6 +2964,74 @@ impl App {
             .find(|t| t.id == tool_call_id)
     }
 
+    fn handle_session_sse_event(&mut self, message: SessionSseEvent) -> Result<()> {
+        match message {
+            SessionSseEvent::Event {
+                session_id,
+                stream_epoch,
+                event,
+            } => {
+                if self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || self.sse_epoch != stream_epoch
+                {
+                    return Ok(());
+                }
+                self.handle_sse_event(event)
+            }
+            SessionSseEvent::Connected {
+                session_id,
+                stream_epoch,
+                reconnecting,
+            } => {
+                if self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || self.sse_epoch != stream_epoch
+                {
+                    return Ok(());
+                }
+                self.connected = true;
+                self.stream_disconnected = false;
+                if reconnecting {
+                    self.status_message = "SSE reconnected — synchronizing".to_string();
+                }
+                // Answer submission deliberately attaches a fresh stream
+                // before POST. Its watch readiness can wake the POST task
+                // before this Connected control message reaches the UI loop;
+                // a pending GET issued here could then observe the consumed
+                // question as `none` and invalidate the still-pending
+                // AnswerSubmitted result. The answer outcome owns
+                // reconciliation while the modal is submitting.
+                if self
+                    .pending_question
+                    .as_ref()
+                    .is_none_or(|question| !question.submitting)
+                {
+                    self.reconcile_pending_question_after_stream_connect(session_id);
+                }
+                Ok(())
+            }
+            SessionSseEvent::TransportFailed {
+                session_id,
+                stream_epoch,
+                message,
+            } => {
+                if self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || self.sse_epoch != stream_epoch
+                {
+                    return Ok(());
+                }
+                // Transport failure is not an AgentEvent::Error: the server
+                // may still be waiting on the visible question. Detach the
+                // exhausted stream but preserve modal/dismissed state, draft,
+                // identity, and answer epoch for a safe retry.
+                self.detach_stream();
+                self.connected = false;
+                self.stream_disconnected = true;
+                self.notify(NoticeLevel::Error, format!("SSE disconnected: {message}"));
+                Ok(())
+            }
+        }
+    }
+
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
         if self.chat.auto_scroll {
             // Any incoming event means new content; auto_scroll will reposition.
@@ -2041,6 +3040,16 @@ impl App {
             AgentEvent::Token { content } => {
                 self.chat.current_response.push_str(&content);
                 self.chat.auto_scroll = true;
+            }
+            AgentEvent::ExecutionStarted { .. } => {
+                if self
+                    .pending_question
+                    .as_ref()
+                    .is_some_and(|question| question.submitting)
+                {
+                    self.pending_answer_run_started = true;
+                }
+                self.stream_disconnected = false;
             }
             AgentEvent::ReasoningToken { content } => {
                 self.chat.current_reasoning.push_str(&content);
@@ -2128,31 +3137,83 @@ impl App {
                 // Complete/Error's definitive terminal result).
             }
             AgentEvent::NeedClarification {
-                question, options, ..
+                question,
+                options,
+                tool_call_id,
+                tool_name,
+                allow_custom,
+                source,
             } => {
-                let options = options.unwrap_or_default();
-                // No preset options ⇒ open straight into free-text entry.
-                let custom = if options.is_empty() {
-                    Some(String::new())
-                } else {
-                    None
+                let Some(session_id) = self.chat.session_id.clone() else {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Ignored clarification without an active session",
+                    );
+                    return Ok(());
                 };
-                self.status_message = format!("Question: {} (answer in the dialog)", question);
-                // A new question supersedes any answer still in flight for a
-                // previous one — a late response must not clear this modal.
-                self.supersede_pending_answer();
-                self.pending_question = Some(ActiveQuestion {
+                let pending = PendingQuestion {
+                    has_pending_question: true,
                     question,
                     options,
-                    selected: 0,
-                    custom,
-                    submitting: false,
-                });
+                    allow_custom,
+                    tool_call_id,
+                    tool_name,
+                    source,
+                };
+                let incoming = self.question_from_pending(session_id, &pending);
+                let needs_identity_sync = incoming.tool_call_id.is_none();
+                if let Some(existing) = self.pending_question.as_mut() {
+                    if existing.identity() == incoming.identity() {
+                        // Critical-event replay/reconnect may deliver the same
+                        // question again. Refresh its contract without resetting
+                        // selection, draft, inspector, error, or in-flight state.
+                        existing.refresh_contract(incoming);
+                        if needs_identity_sync {
+                            self.status_message = "Synchronizing question identity...".to_string();
+                            if let Some(session_id) = self.chat.session_id.clone() {
+                                self.reconcile_pending_question_after_stream_connect(session_id);
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                if self.pending_question.is_none() {
+                    if let Some(dismissed) = self.dismissed_question.as_mut() {
+                        if dismissed.identity() == incoming.identity() {
+                            // Replayed critical events must not undo an explicit
+                            // Esc dismissal. Refresh the typed contract/draft in
+                            // place and keep the question cached for Ctrl+Q.
+                            dismissed.refresh_contract(incoming);
+                            self.status_message =
+                                "Question remains dismissed (Ctrl+Q to reopen)".to_string();
+                            if needs_identity_sync {
+                                if let Some(session_id) = self.chat.session_id.clone() {
+                                    self.reconcile_pending_question_after_stream_connect(
+                                        session_id,
+                                    );
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+                // A new question supersedes any answer still in flight for a
+                // previous one — a late response must not clear this modal.
+                self.stash_question_drafts();
+                self.supersede_pending_answer();
+                self.pending_answer_run_started = false;
+                self.dismissed_question = None;
+                self.status_message =
+                    format!("Question: {} (answer in the dialog)", incoming.question);
+                self.pending_question = Some(incoming);
+                if needs_identity_sync {
+                    self.status_message = "Synchronizing question identity...".to_string();
+                    if let Some(session_id) = self.chat.session_id.clone() {
+                        self.reconcile_pending_question_after_stream_connect(session_id);
+                    }
+                }
             }
-            AgentEvent::Complete { usage } => {
-                self.finalize_streaming();
-                self.chat.token_usage = Some(usage);
-            }
+            AgentEvent::Complete { usage } => self.handle_complete(usage),
             AgentEvent::Cancelled { message } => {
                 self.status_message = message.unwrap_or_else(|| "Cancelled".to_string());
                 self.finalize_streaming();
@@ -2245,6 +3306,49 @@ impl App {
 
     fn finalize_streaming(&mut self) {
         self.chat.streaming = false;
+        self.flush_streaming_output();
+        self.status_message = "Ready".to_string();
+        self.detach_stream();
+        self.stream_disconnected = false;
+        self.pending_answer_run_started = false;
+        self.chat.sub_agents.clear();
+        // A run that ended (completed / cancelled / stopped) can no longer accept
+        // an answer, so drop any open (or dismissed-but-cached) question modal
+        // to avoid answering a dead session — and invalidate any answer POST
+        // still in flight for it.
+        self.supersede_pending_answer();
+        self.pending_question = None;
+        self.dismissed_question = None;
+    }
+
+    fn handle_complete(&mut self, usage: TokenUsage) {
+        let answer_in_flight = self
+            .pending_question
+            .as_ref()
+            .is_some_and(|question| question.submitting);
+        if (self.pending_question.is_some() || self.dismissed_question.is_some())
+            && !self.pending_answer_run_started
+            && !answer_in_flight
+        {
+            // Legacy servers may still expose the Complete emitted by the
+            // activation that suspended at NeedClarification. That boundary is
+            // not terminal user work: preserve the exact modal/draft and keep
+            // the session input-blocked.
+            self.flush_streaming_output();
+            self.chat.token_usage = Some(usage);
+            self.chat.streaming = true;
+            self.chat.sub_agents.clear();
+            self.status_message = "Paused — waiting for your answer".to_string();
+            if let Some(session_id) = self.chat.session_id.clone() {
+                self.attach_stream(session_id);
+            }
+            return;
+        }
+        self.finalize_streaming();
+        self.chat.token_usage = Some(usage);
+    }
+
+    fn flush_streaming_output(&mut self) {
         if !self.chat.current_response.is_empty() || !self.chat.current_tool_calls.is_empty() {
             self.chat.messages.push(ChatMessage {
                 role: MessageRole::Assistant,
@@ -2257,17 +3361,6 @@ impl App {
                 },
             });
         }
-        self.status_message = "Ready".to_string();
-        self.sse_tx = None;
-        self.sse_rx = None;
-        self.chat.sub_agents.clear();
-        // A run that ended (completed / cancelled / stopped) can no longer accept
-        // an answer, so drop any open (or dismissed-but-cached) question modal
-        // to avoid answering a dead session — and invalidate any answer POST
-        // still in flight for it.
-        self.supersede_pending_answer();
-        self.pending_question = None;
-        self.dismissed_question = None;
     }
 
     /// Stop the current run WITHOUT blocking the event loop: the `stop` POST
@@ -2278,6 +3371,11 @@ impl App {
     /// possible moment (pressing Ctrl+C to stop a run) tore down the whole
     /// TUI instead of just failing the stop.
     fn stop_streaming(&mut self) {
+        // Cancel a clarification answer before launching the stop request.
+        // In particular this prevents a task blocked on SSE readiness from
+        // waking later and POSTing into a session the operator already
+        // stopped.
+        self.supersede_pending_answer();
         let Some(sid) = self.chat.session_id.clone() else {
             // Nothing to stop server-side; still clear local streaming state.
             self.finalize_streaming();
@@ -2744,21 +3842,139 @@ mod question_tests {
         KeyEvent::new(code, KeyModifiers::empty())
     }
 
+    async fn read_test_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break request.len();
+            }
+            request.extend_from_slice(&chunk[..read]);
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    async fn read_test_http_path(stream: &mut tokio::net::TcpStream) -> String {
+        read_test_http_request(stream)
+            .await
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    async fn respond_test_http(stream: &mut tokio::net::TcpStream, content_type: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    async fn spawn_answer_test_server(
+        session_id: &str,
+    ) -> (BambooClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let expected_events_path = format!("/api/v1/events/{session_id}");
+        let expected_respond_path = format!("/api/v1/respond/{session_id}");
+        let server = tokio::spawn(async move {
+            let (mut sse_socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut sse_socket).await,
+                expected_events_path
+            );
+            sse_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            sse_socket.flush().await.unwrap();
+
+            let (mut respond_socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut respond_socket).await,
+                expected_respond_path
+            );
+            respond_test_http(
+                &mut respond_socket,
+                "application/json",
+                r#"{"auto_resume_status":"completed"}"#,
+            )
+            .await;
+        });
+        (BambooClient::new(&base_url), server)
+    }
+
+    fn question_identity(app: &App) -> QuestionIdentity {
+        app.pending_question
+            .as_ref()
+            .expect("pending question")
+            .identity()
+    }
+
+    fn active_question(
+        session_id: &str,
+        question: String,
+        options: Option<Vec<String>>,
+        tool_call_id: &str,
+        allow_custom: bool,
+        draft: &str,
+    ) -> ActiveQuestion {
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question,
+            options,
+            allow_custom,
+            tool_call_id: Some(tool_call_id.to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            source: Some("pause_tool".to_string()),
+        };
+        ActiveQuestion::from_pending(session_id.to_string(), &pending, draft.to_string())
+    }
+
     fn app_with_question(options: Vec<&str>) -> App {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-1".to_string());
         let options: Vec<String> = options.into_iter().map(String::from).collect();
-        let custom = if options.is_empty() {
-            Some(String::new())
-        } else {
-            None
-        };
-        app.pending_question = Some(ActiveQuestion {
-            question: "Run this command?".to_string(),
-            options,
-            selected: 0,
-            custom,
-            submitting: false,
-        });
+        app.pending_question = Some(active_question(
+            "sess-1",
+            "Run this command?".to_string(),
+            Some(options),
+            "tool-1",
+            true,
+            "",
+        ));
         app
     }
 
@@ -2808,18 +4024,600 @@ mod question_tests {
     }
 
     #[tokio::test]
-    async fn submitting_without_a_session_clears_the_question() {
-        // No chat session ⇒ submit short-circuits (no network) and clears the modal.
+    async fn submitting_without_matching_session_keeps_the_question() {
+        // The modal is bound to sess-1. If the active chat no longer matches,
+        // keep the draft/question and refuse to send it anywhere.
         let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.session_id = None;
         assert!(app.chat.session_id.is_none());
         app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
-        assert!(app.pending_question.is_none());
+        assert!(app.pending_question.is_some());
+        assert!(!app.pending_question.as_ref().unwrap().submitting);
+        assert!(app
+            .notifications
+            .last()
+            .is_some_and(|notice| notice.text.contains("different session")));
     }
 
     #[tokio::test]
     async fn no_options_opens_in_free_text_mode() {
         let app = app_with_question(vec![]);
         assert!(app.pending_question.as_ref().unwrap().custom.is_some());
+    }
+
+    #[tokio::test]
+    async fn closed_questions_never_expose_custom_input() {
+        let mut app = app_with_question(vec!["One"]);
+        app.pending_question.as_mut().unwrap().allow_custom = false;
+
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+
+        assert!(app.pending_question.as_ref().unwrap().custom.is_none());
+
+        let closed_empty = active_question(
+            "sess-1",
+            "No choices".to_string(),
+            None,
+            "tool-closed",
+            false,
+            "must not open",
+        );
+        assert!(closed_empty.custom.is_none());
+    }
+
+    #[test]
+    fn modal_hints_follow_allow_custom_at_narrow_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut closed = app_with_question(vec!["One", "Two"]);
+        closed.pending_question.as_mut().unwrap().allow_custom = false;
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &closed))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains("custom"));
+        assert!(text.contains("v inspect"));
+
+        let open = app_with_question(vec!["One", "Two"]);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &open))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("c custom answer"));
+    }
+
+    #[test]
+    fn http_and_sse_build_equivalent_typed_question_state() {
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question: "Choose carefully".to_string(),
+            options: Some(vec!["A".to_string(), "B".to_string()]),
+            allow_custom: false,
+            tool_call_id: Some("call-7".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            source: Some("pause_tool".to_string()),
+        };
+        let http = ActiveQuestion::from_pending("sess-7".to_string(), &pending, String::new());
+        let sse = active_question(
+            "sess-7",
+            pending.question.clone(),
+            pending.options.clone(),
+            "call-7",
+            pending.allow_custom,
+            "",
+        );
+
+        assert_eq!(http.identity(), sse.identity());
+        assert_eq!(http.tool_name, sse.tool_name);
+        assert_eq!(http.source, sse.source);
+        assert_eq!(http.options, sse.options);
+        assert_eq!(http.allow_custom, sse.allow_custom);
+        assert_eq!(http.custom, sse.custom);
+    }
+
+    #[tokio::test]
+    async fn numeric_jump_reaches_and_submits_option_beyond_nine() {
+        let options = (1..=12)
+            .map(|number| format!("exact option {number}"))
+            .collect::<Vec<_>>();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let (client, server) = spawn_answer_test_server("sess-1").await;
+        app.client = client;
+        app.chat.session_id = Some("sess-1".to_string());
+        app.pending_question = Some(active_question(
+            "sess-1",
+            "Pick".to_string(),
+            Some(options),
+            "tool-12",
+            false,
+            "",
+        ));
+
+        app.handle_question_key(key(KeyCode::Char('g')))
+            .await
+            .unwrap();
+        app.handle_question_key(key(KeyCode::Char('1')))
+            .await
+            .unwrap();
+        app.handle_question_key(key(KeyCode::Char('2')))
+            .await
+            .unwrap();
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert_eq!(app.pending_question.as_ref().unwrap().selected, 11);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::AnswerSubmitted {
+                answer,
+                identity: QuestionIdentity {
+                    tool_call_id: Some(tool_call_id),
+                    ..
+                },
+                ..
+            } if answer == "exact option 12" && tool_call_id == "tool-12"
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_labels_remain_distinct_ordered_choices() {
+        let mut app = app_with_question(vec!["Same", "Same", "Other"]);
+        app.handle_question_key(key(KeyCode::Char('g')))
+            .await
+            .unwrap();
+        app.handle_question_key(key(KeyCode::Char('2')))
+            .await
+            .unwrap();
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+
+        let question = app.pending_question.as_ref().unwrap();
+        assert_eq!(question.options.len(), 3);
+        assert_eq!(question.selected, 1);
+        assert_eq!(question.options[0], question.options[1]);
+    }
+
+    #[test]
+    fn long_unicode_question_and_option_are_inspectable_at_common_widths() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for width in [60, 80, 120] {
+            let question = format!(
+                "START-问题🎋\n{}\nQUESTION_END",
+                "长文本 🚀 wrapped words ".repeat(80)
+            );
+            let option = format!(
+                "OPTION_START\n{}\nOPTION_END",
+                "选项 🌟 wrapped words ".repeat(80)
+            );
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.pending_question = Some(active_question(
+                "sess-1",
+                question,
+                Some(vec![option]),
+                "tool-1",
+                false,
+                "",
+            ));
+            let backend = TestBackend::new(width, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            app.pending_question.as_mut().unwrap().inspecting = true;
+            app.pending_question.as_mut().unwrap().inspect_scroll = u16::MAX;
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("QUESTION_END"), "width {width}");
+
+            let question_state = app.pending_question.as_mut().unwrap();
+            question_state.inspect_option = true;
+            question_state.inspect_scroll = u16::MAX;
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("OPTION_END"), "width {width}");
+        }
+    }
+
+    #[tokio::test]
+    async fn inspector_scroll_normalizes_after_terminal_width_increases() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_question = Some(active_question(
+            "sess-1",
+            "wrapped question words ".repeat(160),
+            Some(vec!["A".to_string()]),
+            "tool-1",
+            false,
+            "",
+        ));
+        let question = app.pending_question.as_mut().unwrap();
+        question.inspecting = true;
+        question.inspect_scroll = u16::MAX;
+
+        let mut narrow = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        narrow.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        let narrow_max = app
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .inspect_max_scroll
+            .get();
+
+        let mut wide = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        wide.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        let wide_max = app
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .inspect_max_scroll
+            .get();
+        assert!(wide_max < narrow_max);
+
+        app.handle_question_key(key(KeyCode::Up)).await.unwrap();
+        assert_eq!(
+            app.pending_question.as_ref().unwrap().inspect_scroll,
+            wide_max.saturating_sub(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_draft_selection_and_submission_state() {
+        let mut app = app_with_question(vec!["A", "B"]);
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+        for ch in "draft".chars() {
+            app.handle_question_key(key(KeyCode::Char(ch)))
+                .await
+                .unwrap();
+        }
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+        app.handle_question_key(key(KeyCode::Down)).await.unwrap();
+        app.pending_question.as_mut().unwrap().submitting = true;
+        let epoch = app.answer_epoch;
+
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Run this command?".to_string(),
+            options: Some(vec!["A".to_string(), "B".to_string()]),
+            tool_call_id: Some("tool-1".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: true,
+            source: Some("pause_tool".to_string()),
+        })
+        .unwrap();
+
+        let replayed = app.pending_question.as_ref().unwrap();
+        assert_eq!(app.answer_epoch, epoch);
+        assert_eq!(replayed.selected, 1);
+        assert_eq!(replayed.custom_draft, "draft");
+        assert!(replayed.submitting);
+    }
+
+    #[tokio::test]
+    async fn replay_of_a_dismissed_question_keeps_it_dismissed() {
+        let mut app = app_with_question(vec!["A", "B"]);
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Run this command?".to_string(),
+            options: Some(vec!["Updated A".to_string(), "Updated B".to_string()]),
+            tool_call_id: Some("tool-1".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some("pause_tool".to_string()),
+        })
+        .unwrap();
+
+        assert!(app.pending_question.is_none());
+        let dismissed = app.dismissed_question.as_ref().unwrap();
+        assert_eq!(dismissed.options, ["Updated A", "Updated B"]);
+        assert!(app.status_message.contains("remains dismissed"));
+    }
+
+    #[tokio::test]
+    async fn a_new_question_discards_the_old_dismissed_cache() {
+        let mut app = app_with_question(vec!["Old"]);
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "New question".to_string(),
+            options: Some(vec!["New answer".to_string()]),
+            tool_call_id: Some("tool-2".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some("pause_tool".to_string()),
+        })
+        .unwrap();
+        assert!(app.dismissed_question.is_none());
+
+        let identity = question_identity(&app);
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: app.answer_epoch,
+            identity,
+            answer: "New answer".to_string(),
+            result: Ok("started".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(app.dismissed_question.is_none());
+
+        app.reopen_pending_question();
+        assert!(
+            app.pending_question.is_none(),
+            "Ctrl+Q must not resurrect the old consumed question"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_draft_survives_session_switch_and_reconnect() {
+        let mut app = app_with_question(vec!["A", "B"]);
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+        for ch in "keep me".chars() {
+            app.handle_question_key(key(KeyCode::Char(ch)))
+                .await
+                .unwrap();
+        }
+
+        app.opening_session_id = Some("sess-2".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "sess-2".to_string(),
+            result: Ok(OpenedSession {
+                messages: Vec::new(),
+                model: "model".to_string(),
+                project_id: None,
+                is_running: false,
+                pending: None,
+                truncated: false,
+                total_message_count: 0,
+            }),
+        })
+        .await
+        .unwrap();
+        app.opening_session_id = Some("sess-1".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "sess-1".to_string(),
+            result: Ok(OpenedSession {
+                messages: Vec::new(),
+                model: "model".to_string(),
+                project_id: None,
+                is_running: false,
+                pending: Some(PendingQuestion {
+                    has_pending_question: true,
+                    question: "Run this command?".to_string(),
+                    options: Some(vec!["A".to_string(), "B".to_string()]),
+                    allow_custom: true,
+                    tool_call_id: Some("tool-1".to_string()),
+                    tool_name: Some("ConclusionWithOptions".to_string()),
+                    source: Some("pause_tool".to_string()),
+                }),
+                truncated: false,
+                total_message_count: 0,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            app.pending_question.as_ref().unwrap().custom_draft,
+            "keep me"
+        );
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.pending_question.as_ref().unwrap().custom.as_deref(),
+            Some("keep me")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_custom_draft_migrates_after_exact_pending_identity_arrives() {
+        let mut app = app_with_question(vec!["A", "B"]);
+        let legacy = app.pending_question.as_mut().unwrap();
+        legacy.tool_call_id = None;
+        legacy.identity_syncing = true;
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+        for ch in "保留这个答案".chars() {
+            app.handle_question_key(key(KeyCode::Char(ch)))
+                .await
+                .unwrap();
+        }
+
+        app.opening_session_id = Some("sess-2".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "sess-2".to_string(),
+            result: Ok(OpenedSession {
+                messages: Vec::new(),
+                model: "model".to_string(),
+                project_id: None,
+                is_running: false,
+                pending: None,
+                truncated: false,
+                total_message_count: 0,
+            }),
+        })
+        .await
+        .unwrap();
+
+        app.opening_session_id = Some("sess-1".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "sess-1".to_string(),
+            result: Ok(OpenedSession {
+                messages: Vec::new(),
+                model: "model".to_string(),
+                project_id: None,
+                is_running: false,
+                pending: Some(PendingQuestion {
+                    has_pending_question: true,
+                    question: "Run this command?".to_string(),
+                    options: Some(vec!["A".to_string(), "B".to_string()]),
+                    allow_custom: true,
+                    tool_call_id: Some("tool-1".to_string()),
+                    tool_name: Some("ConclusionWithOptions".to_string()),
+                    source: Some("pause_tool".to_string()),
+                }),
+                truncated: false,
+                total_message_count: 0,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let restored = app.pending_question.as_ref().unwrap();
+        assert_eq!(restored.tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(restored.custom_draft, "保留这个答案");
+    }
+
+    #[tokio::test]
+    async fn legacy_custom_draft_does_not_cross_a_changed_question_contract() {
+        let mut app = app_with_question(vec!["A", "B"]);
+        let legacy = app.pending_question.as_mut().unwrap();
+        legacy.tool_call_id = None;
+        legacy.identity_syncing = true;
+        legacy.custom_draft = "must stay with the old choices".to_string();
+
+        app.opening_session_id = Some("sess-2".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "sess-2".to_string(),
+            result: Ok(OpenedSession {
+                messages: Vec::new(),
+                model: "model".to_string(),
+                project_id: None,
+                is_running: false,
+                pending: None,
+                truncated: false,
+                total_message_count: 0,
+            }),
+        })
+        .await
+        .unwrap();
+
+        app.opening_session_id = Some("sess-1".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "sess-1".to_string(),
+            result: Ok(OpenedSession {
+                messages: Vec::new(),
+                model: "model".to_string(),
+                project_id: None,
+                is_running: false,
+                pending: Some(PendingQuestion {
+                    has_pending_question: true,
+                    question: "Run this command?".to_string(),
+                    options: Some(vec!["A".to_string(), "different".to_string()]),
+                    allow_custom: true,
+                    tool_call_id: Some("tool-new".to_string()),
+                    tool_name: Some("ConclusionWithOptions".to_string()),
+                    source: Some("pause_tool".to_string()),
+                }),
+                truncated: false,
+                total_message_count: 0,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(app
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .custom_draft
+            .is_empty());
+    }
+
+    #[test]
+    fn question_draft_cache_is_bounded() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let oldest = QuestionDraftKey::new(
+            "session-0".to_string(),
+            Some("tool-0".to_string()),
+            "question".to_string(),
+            vec!["A".to_string()],
+            true,
+        );
+        for index in 0..=MAX_QUESTION_DRAFTS {
+            app.store_question_draft(
+                QuestionDraftKey::new(
+                    format!("session-{index}"),
+                    Some(format!("tool-{index}")),
+                    "question".to_string(),
+                    vec!["A".to_string()],
+                    true,
+                ),
+                format!("draft-{index}"),
+            );
+        }
+
+        assert_eq!(app.question_drafts.len(), MAX_QUESTION_DRAFTS);
+        assert_eq!(app.question_draft_order.len(), MAX_QUESTION_DRAFTS);
+        assert!(!app.question_drafts.contains_key(&oldest));
+    }
+
+    #[tokio::test]
+    async fn stale_pending_fetch_cannot_replace_another_session_question() {
+        let mut app = app_with_question(vec!["Current"]);
+        let original = app.pending_question.as_ref().unwrap().identity();
+        app.handle_event(AppEvent::PendingQuestionChecked {
+            session_id: "sess-old".to_string(),
+            epoch: app.answer_epoch,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "Stale".to_string(),
+                options: Some(vec!["Wrong".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("stale-tool".to_string()),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.pending_question.as_ref().unwrap().identity(), original);
     }
 
     #[test]
@@ -2839,6 +4637,45 @@ mod question_tests {
         assert!(text.contains("Approve"), "option label missing");
     }
 
+    #[tokio::test]
+    async fn sse_clarification_stays_visible_and_owns_input_over_config_editor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-1".to_string());
+        app.config_editor = Some(ConfigEditor {
+            textarea: tui_textarea::TextArea::new(vec!["CONFIG_EDITOR_SENTINEL".to_string()]),
+        });
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "VISIBLE_SECURITY_DECISION".to_string(),
+            options: Some(vec!["Approve exact capability".to_string()]),
+            tool_call_id: Some("tool-security".to_string()),
+            tool_name: Some("request_permissions".to_string()),
+            allow_custom: false,
+            source: Some("pause_tool".to_string()),
+        })
+        .unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("VISIBLE_SECURITY_DECISION"));
+        assert!(text.contains("Clarification needed"));
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.handle_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.pending_question.as_ref().unwrap().submitting);
+        assert!(app.config_editor.is_some(), "editor draft stays suspended");
+    }
+
     /// Enter dispatches the answer POST off the event loop: the modal stays
     /// open in a submitting state with input disabled (no double-submit on
     /// repeated Enter, no dismissal out from under the request), and the
@@ -2847,6 +4684,8 @@ mod question_tests {
     #[tokio::test]
     async fn submit_dispatches_async_and_sets_in_flight() {
         let mut app = app_with_question(vec!["Approve", "Deny"]);
+        let (client, server) = spawn_answer_test_server("sess-1").await;
+        app.client = client;
         app.chat.session_id = Some("sess-1".to_string());
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
@@ -2870,9 +4709,8 @@ mod question_tests {
             "Esc is disabled while submitting"
         );
 
-        // The spawned task posts its result back (the POST itself fails fast
-        // here — nothing listens on port 0 — which is fine: the dispatch and
-        // its epoch/answer payload are what's under test).
+        // The spawned task posts its result back after the fresh SSE handshake;
+        // the dispatch and its epoch/answer payload are what's under test.
         let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
             .await
             .expect("async result must be posted back")
@@ -2881,15 +4719,17 @@ mod question_tests {
             epoch,
             answer,
             result,
+            ..
         } = event
         else {
             panic!("expected AnswerSubmitted");
         };
         assert_eq!(answer, "Approve");
         assert_eq!(epoch, app.answer_epoch, "in-flight epoch is current");
-        assert!(result.is_err(), "no server behind port 0");
+        assert!(result.is_ok());
         // The swallowed repeat-Enter must not have dispatched a second POST.
         assert!(rx.try_recv().is_err(), "exactly one dispatch expected");
+        server.await.unwrap();
     }
 
     /// A late `AnswerSubmitted` whose epoch no longer matches (the question
@@ -2905,11 +4745,16 @@ mod question_tests {
         // Submit → the in-flight POST carries this epoch.
         app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
         let stale_epoch = app.answer_epoch;
+        let stale_identity = question_identity(&app);
 
         // A NEW question arrives before the response lands — supersedes it.
         app.handle_sse_event(AgentEvent::NeedClarification {
             question: "Second question?".to_string(),
             options: Some(vec!["A".to_string(), "B".to_string()]),
+            tool_call_id: Some("tool-2".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some("pause_tool".to_string()),
         })
         .unwrap();
         assert_ne!(app.answer_epoch, stale_epoch, "supersede bumps the epoch");
@@ -2917,6 +4762,7 @@ mod question_tests {
         // The stale success response must be discarded, not applied.
         app.handle_event(AppEvent::AnswerSubmitted {
             epoch: stale_epoch,
+            identity: stale_identity,
             answer: "Approve".to_string(),
             result: Ok("started".to_string()),
         })
@@ -2934,10 +4780,12 @@ mod question_tests {
         // Session switch / run finalization also supersede an in-flight answer.
         app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
         let stale_epoch = app.answer_epoch;
+        let stale_identity = question_identity(&app);
         app.finalize_streaming();
         assert_ne!(app.answer_epoch, stale_epoch);
         app.handle_event(AppEvent::AnswerSubmitted {
             epoch: stale_epoch,
+            identity: stale_identity,
             answer: "A".to_string(),
             result: Ok("started".to_string()),
         })
@@ -2958,11 +4806,13 @@ mod question_tests {
 
         app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
         assert!(app.pending_question.as_ref().unwrap().submitting);
+        let identity = question_identity(&app);
 
         app.handle_event(AppEvent::AnswerSubmitted {
             epoch: app.answer_epoch,
+            identity,
             answer: "Approve".to_string(),
-            result: Err("boom".to_string()),
+            result: Err(crate::api::RespondFailure::unavailable("boom")),
         })
         .await
         .unwrap();
@@ -2972,6 +4822,7 @@ mod question_tests {
             .as_ref()
             .expect("question kept for retry");
         assert!(!q.submitting, "input re-enabled for retry");
+        assert_eq!(q.error.as_deref(), Some("boom"));
         let last = app.notifications.last().expect("notified");
         assert_eq!(last.level, NoticeLevel::Error);
         assert!(last.text.contains("boom"));
@@ -2979,6 +4830,85 @@ mod question_tests {
         // And a retry dispatches again.
         app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
         assert!(app.pending_question.as_ref().unwrap().submitting);
+    }
+
+    #[tokio::test]
+    async fn stale_answer_rejection_refreshes_the_authoritative_question() {
+        let mut app = app_with_question(vec!["Old"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.pending_question.as_mut().unwrap().submitting = true;
+        let old_identity = question_identity(&app);
+
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: app.answer_epoch,
+            identity: old_identity.clone(),
+            answer: "Old".to_string(),
+            result: Err(crate::api::RespondFailure::rejected(
+                reqwest::StatusCode::CONFLICT,
+                "pending question changed".to_string(),
+            )),
+        })
+        .await
+        .unwrap();
+        let refresh_epoch = app.answer_epoch;
+        assert!(app.pending_question.as_ref().unwrap().submitting);
+
+        app.handle_event(AppEvent::PendingQuestionRefreshed {
+            session_id: "sess-1".to_string(),
+            epoch: refresh_epoch,
+            identity: old_identity,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "New question".to_string(),
+                options: Some(vec!["New value".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("tool-2".to_string()),
+                tool_name: Some("ConclusionWithOptions".to_string()),
+                source: Some("pause_tool".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let question = app.pending_question.as_ref().unwrap();
+        assert_eq!(question.tool_call_id.as_deref(), Some("tool-2"));
+        assert_eq!(question.options, ["New value"]);
+        assert!(!question.submitting);
+    }
+
+    #[tokio::test]
+    async fn consumed_answer_rejection_closes_the_stale_modal() {
+        let mut app = app_with_question(vec!["Old"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.pending_question.as_mut().unwrap().submitting = true;
+        let identity = question_identity(&app);
+
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: app.answer_epoch,
+            identity: identity.clone(),
+            answer: "Old".to_string(),
+            result: Err(crate::api::RespondFailure::rejected(
+                reqwest::StatusCode::BAD_REQUEST,
+                "no pending question".to_string(),
+            )),
+        })
+        .await
+        .unwrap();
+        let refresh_epoch = app.answer_epoch;
+
+        app.handle_event(AppEvent::PendingQuestionRefreshed {
+            session_id: "sess-1".to_string(),
+            epoch: refresh_epoch,
+            identity,
+            result: Ok(PendingQuestion::default()),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.pending_question.is_none());
+        assert!(app.status_message.contains("no longer exists"));
     }
 
     /// Success preserves the pre-existing post-submit semantics: the modal
@@ -2993,8 +4923,10 @@ mod question_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
         app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        let identity = question_identity(&app);
         app.handle_event(AppEvent::AnswerSubmitted {
             epoch: app.answer_epoch,
+            identity,
             answer: "Approve".to_string(),
             result: Ok("started".to_string()),
         })
@@ -3011,8 +4943,10 @@ mod question_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
         app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        let identity = question_identity(&app);
         app.handle_event(AppEvent::AnswerSubmitted {
             epoch: app.answer_epoch,
+            identity,
             answer: "Approve".to_string(),
             result: Ok("completed".to_string()),
         })
@@ -3020,6 +4954,238 @@ mod question_tests {
         .unwrap();
         assert!(app.pending_question.is_none());
         assert!(!app.chat.streaming, "non-resuming status must not spin");
+    }
+
+    #[tokio::test]
+    async fn connected_reconciliation_cannot_erase_in_flight_completed_answer() {
+        let mut app = app_with_question(vec!["Approve"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.chat.streaming = true;
+        app.pending_question.as_mut().unwrap().submitting = true;
+        app.pending_reconcile_epoch = 9;
+        let epoch = app.answer_epoch;
+        let identity = question_identity(&app);
+
+        app.handle_session_sse_event(SessionSseEvent::Connected {
+            session_id: "sess-1".to_string(),
+            stream_epoch: app.sse_epoch,
+            reconnecting: false,
+        })
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "submitting handshake must not launch pending reconciliation"
+        );
+
+        // Even a response already queued by a racing request cannot clear the
+        // modal or bump the answer epoch while the POST outcome owns it.
+        app.handle_event(AppEvent::PendingQuestionReconciled {
+            session_id: "sess-1".to_string(),
+            epoch,
+            reconcile_epoch: 9,
+            result: Ok(PendingQuestion::default()),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_some());
+        assert_eq!(app.answer_epoch, epoch);
+
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch,
+            identity,
+            answer: "Approve".to_string(),
+            result: Ok("completed".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(!app.chat.streaming);
+        assert_eq!(app.status_message, "Answered: Approve (completed)");
+    }
+
+    #[tokio::test]
+    async fn legacy_question_cannot_submit_until_exact_identity_is_reconciled() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut sse_socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut sse_socket).await,
+                "/api/v1/events/sess-legacy"
+            );
+            sse_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            sse_socket.flush().await.unwrap();
+
+            let (mut respond_socket, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut respond_socket).await;
+            assert!(request.starts_with("POST /api/v1/respond/sess-legacy "));
+            assert!(
+                request.contains(r#""expected_tool_call_id":"call-exact""#),
+                "exact CAS identity missing from request: {request}"
+            );
+            assert!(
+                request.contains(r#""response":"草稿🙂""#),
+                "custom answer changed in request: {request}"
+            );
+            respond_test_http(
+                &mut respond_socket,
+                "application/json",
+                r#"{"auto_resume_status":"completed"}"#,
+            )
+            .await;
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        app.chat.session_id = Some("sess-legacy".to_string());
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Legacy approval?".to_string(),
+            options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+            tool_call_id: None,
+            tool_name: None,
+            allow_custom: true,
+            source: None,
+        })
+        .unwrap();
+        assert!(app.pending_question.as_ref().unwrap().identity_syncing);
+
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+        for character in "草稿🙂".chars() {
+            app.handle_question_key(key(KeyCode::Char(character)))
+                .await
+                .unwrap();
+        }
+
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        let unresolved = app.pending_question.as_ref().unwrap();
+        assert!(!unresolved.submitting);
+        assert_eq!(unresolved.custom.as_deref(), Some("草稿🙂"));
+        assert!(unresolved
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("not sent")));
+        assert!(
+            app.sse_task.is_none(),
+            "no answer stream means no POST can start"
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.pending_reconcile_epoch = 7;
+        let answer_epoch = app.answer_epoch;
+        app.handle_event(AppEvent::PendingQuestionReconciled {
+            session_id: "sess-legacy".to_string(),
+            epoch: answer_epoch,
+            reconcile_epoch: 7,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "Legacy approval?".to_string(),
+                options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+                allow_custom: true,
+                tool_call_id: Some("call-exact".to_string()),
+                tool_name: Some("ConclusionWithOptions".to_string()),
+                source: Some("pause_tool".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let resolved = app.pending_question.as_ref().unwrap();
+        assert_eq!(resolved.tool_call_id.as_deref(), Some("call-exact"));
+        assert!(!resolved.identity_syncing);
+        assert_eq!(resolved.custom.as_deref(), Some("草稿🙂"));
+        app.submit_answer("草稿🙂".to_string());
+        assert!(app.pending_question.as_ref().unwrap().submitting);
+        assert!(app.sse_task.is_some());
+
+        let submitted = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("answer result must return")
+            .expect("event channel must stay open");
+        app.handle_event(submitted).await.unwrap();
+        assert!(app.pending_question.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_aborts_answer_waiting_for_sse_before_it_can_post() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (sse_seen_tx, sse_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_sse_tx, release_sse_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut sse_socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut sse_socket).await,
+                "/api/v1/events/sess-1"
+            );
+            sse_seen_tx.send(()).ok();
+            release_sse_rx.await.unwrap();
+            sse_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            sse_socket.flush().await.unwrap();
+
+            let (mut stop_socket, _) = listener.accept().await.unwrap();
+            let stop_path = read_test_http_path(&mut stop_socket).await;
+            assert_eq!(stop_path, "/api/v1/stop/sess-1");
+            respond_test_http(
+                &mut stop_socket,
+                "application/json",
+                r#"{"status":"stopped"}"#,
+            )
+            .await;
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "aborted answer task must not POST after SSE becomes ready"
+            );
+        });
+
+        let mut app = app_with_question(vec!["Approve"]);
+        app.client = BambooClient::new(&base_url);
+        app.chat.streaming = true;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+
+        app.submit_answer("Approve".to_string());
+        sse_seen_rx.await.unwrap();
+        assert!(app.answer_task.is_some());
+        assert!(app.pending_question.as_ref().unwrap().submitting);
+
+        app.stop_streaming();
+        assert!(
+            app.answer_task.is_none(),
+            "stop must abort the network task"
+        );
+        release_sse_tx.send(()).unwrap();
+
+        let stop_finished =
+            tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("stop result must return")
+                .expect("event channel must stay open");
+        assert!(matches!(stop_finished, AppEvent::StopFinished(Ok(()))));
+        app.handle_event(stop_finished).await.unwrap();
+        assert!(!app.chat.streaming);
+        assert!(app.pending_question.is_none());
+        server.await.unwrap();
     }
 
     /// While the POST is out, the modal renders the submitting state instead
@@ -3054,13 +5220,16 @@ mod question_tests {
 
         let opts: Vec<String> = (1..=30).map(|n| format!("opt{n}")).collect();
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.pending_question = Some(ActiveQuestion {
-            question: "Pick one".to_string(),
-            options: opts,
-            selected: 24, // "25. opt25", deep in the list
-            custom: None,
-            submitting: false,
-        });
+        let mut question = active_question(
+            "sess-1",
+            "Pick one".to_string(),
+            Some(opts),
+            "tool-1",
+            false,
+            "",
+        );
+        question.selected = 24; // "25. opt25", deep in the list
+        app.pending_question = Some(question);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3072,6 +5241,72 @@ mod question_tests {
         // an overflow marker indicates hidden options above.
         assert!(text.contains("opt25"), "selected option not in the window");
         assert!(text.contains("more"), "overflow marker missing");
+    }
+
+    #[tokio::test]
+    async fn mouse_click_submits_the_exact_option_value() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let options = (1..=30)
+            .map(|index| format!("exact option {index}"))
+            .collect::<Vec<_>>();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let (client, server) = spawn_answer_test_server("sess-1").await;
+        app.client = client;
+        app.chat.session_id = Some("sess-1".to_string());
+        app.pending_question = Some(active_question(
+            "sess-1",
+            "Pick one".to_string(),
+            Some(options),
+            "tool-1",
+            false,
+            "",
+        ));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let hitbox = *app
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .option_hitboxes
+            .borrow()
+            .last()
+            .unwrap();
+        let expected = app.pending_question.as_ref().unwrap().options[hitbox.index].clone();
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: hitbox.x,
+            row: hitbox.y,
+            modifiers: KeyModifiers::empty(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            app.pending_question.as_ref().unwrap().selected,
+            0,
+            "mouse-down must not recenter a long option window"
+        );
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::AnswerSubmitted { answer, .. } if answer == expected
+        ));
+        server.await.unwrap();
     }
 
     fn bare_session(id: &str) -> SessionSummary {
@@ -3611,6 +5846,7 @@ mod question_tests {
             total_tokens: 2,
         });
 
+        app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
             result: Ok(opened(vec![asst_msg("hello again")])),
@@ -3631,6 +5867,660 @@ mod question_tests {
         assert!(app.chat.token_usage.is_none(), "scratch state wiped");
     }
 
+    #[tokio::test]
+    async fn out_of_order_session_open_result_is_ignored() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("current".to_string());
+        app.opening_session_id = Some("newest".to_string());
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "older".to_string(),
+            result: Ok(opened(vec![asst_msg("stale")])),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("current"));
+        assert_eq!(app.opening_session_id.as_deref(), Some("newest"));
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "newest".to_string(),
+            result: Ok(opened(vec![asst_msg("fresh")])),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("newest"));
+        assert_eq!(app.chat.messages[0].content, "fresh");
+        assert!(app.opening_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn opening_a_stopped_session_detaches_the_previous_stream() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("old".to_string());
+        let (sse_tx, sse_rx) = mpsc::unbounded_channel::<SessionSseEvent>();
+        let old_tx = sse_tx.clone();
+        app.sse_tx = Some(sse_tx);
+        app.sse_rx = Some(sse_rx);
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+        app.opening_session_id = Some("new".to_string());
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "new".to_string(),
+            result: Ok(opened(vec![])),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.sse_tx.is_none());
+        assert!(app.sse_rx.is_none());
+        assert!(app.sse_task.is_none());
+        assert!(
+            old_tx.is_closed(),
+            "the old SSE sender must lose its receiver"
+        );
+    }
+
+    #[test]
+    fn stale_session_sse_event_cannot_mutate_the_current_session() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("new".to_string());
+        let clarification = || AgentEvent::NeedClarification {
+            question: "Old session question".to_string(),
+            options: Some(vec!["Wrong".to_string()]),
+            tool_call_id: Some("old-tool".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some("pause_tool".to_string()),
+        };
+
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "old".to_string(),
+            stream_epoch: app.sse_epoch,
+            event: clarification(),
+        })
+        .unwrap();
+        assert!(app.pending_question.is_none());
+
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "new".to_string(),
+            stream_epoch: app.sse_epoch,
+            event: clarification(),
+        })
+        .unwrap();
+        assert!(app.pending_question.is_some());
+    }
+
+    #[tokio::test]
+    async fn transport_failure_preserves_question_draft_and_answer_reattaches_stream() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.chat.streaming = true;
+        app.connected = true;
+        app.handle_question_key(key(KeyCode::Char('c')))
+            .await
+            .unwrap();
+        for ch in "keep this draft".chars() {
+            app.handle_question_key(key(KeyCode::Char(ch)))
+                .await
+                .unwrap();
+        }
+        let identity = question_identity(&app);
+        let epoch = app.answer_epoch;
+        let (sse_tx, sse_rx) = mpsc::unbounded_channel();
+        app.sse_tx = Some(sse_tx);
+        app.sse_rx = Some(sse_rx);
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+
+        app.handle_session_sse_event(SessionSseEvent::TransportFailed {
+            session_id: "sess-1".to_string(),
+            stream_epoch: app.sse_epoch,
+            message: "retry budget exhausted".to_string(),
+        })
+        .unwrap();
+
+        let question = app.pending_question.as_ref().expect("question retained");
+        assert_eq!(question.custom.as_deref(), Some("keep this draft"));
+        assert_eq!(app.answer_epoch, epoch);
+        assert!(
+            app.chat.streaming,
+            "unknown server run stays input-blocking"
+        );
+        assert!(app.stream_disconnected);
+        assert!(!app.connected);
+        assert!(app.sse_task.is_none());
+
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch,
+            identity,
+            answer: "keep this draft".to_string(),
+            result: Ok("started".to_string()),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(app.chat.streaming);
+        assert!(app.sse_task.is_some(), "successful answer reattaches SSE");
+        app.detach_stream();
+    }
+
+    #[tokio::test]
+    async fn transport_failure_keeps_unknown_active_run_input_blocked_and_partial_output() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-transport".to_string());
+        app.chat.streaming = true;
+        app.chat.current_response = "partial 你好".to_string();
+        app.chat.textarea.input(key(KeyCode::Char('n')));
+        app.chat.textarea.input(key(KeyCode::Char('e')));
+        app.chat.textarea.input(key(KeyCode::Char('w')));
+        let (sse_tx, sse_rx) = mpsc::unbounded_channel();
+        app.sse_tx = Some(sse_tx);
+        app.sse_rx = Some(sse_rx);
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+
+        app.handle_session_sse_event(SessionSseEvent::TransportFailed {
+            session_id: "sess-transport".to_string(),
+            stream_epoch: app.sse_epoch,
+            message: "network gone".to_string(),
+        })
+        .unwrap();
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+
+        assert!(app.chat.streaming);
+        assert!(app.stream_disconnected);
+        assert_eq!(app.chat.current_response, "partial 你好");
+        assert_eq!(app.chat.textarea.lines(), &["new"]);
+        assert!(app.chat.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_transport_failure_cannot_detach_a_new_stream_generation() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-1".to_string());
+        app.sse_epoch = 8;
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+
+        app.handle_session_sse_event(SessionSseEvent::TransportFailed {
+            session_id: "sess-1".to_string(),
+            stream_epoch: 7,
+            message: "old stream failed".to_string(),
+        })
+        .unwrap();
+
+        assert!(app.sse_task.is_some());
+        assert_eq!(app.sse_epoch, 8);
+        app.detach_stream();
+    }
+
+    #[tokio::test]
+    async fn clarification_boundary_complete_preserves_modal_and_draft() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-1".to_string());
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Choose carefully".to_string(),
+            options: Some(vec!["A".to_string()]),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: true,
+            source: Some("pause_tool".to_string()),
+        })
+        .unwrap();
+        app.pending_question.as_mut().unwrap().custom = Some("草稿🙂".to_string());
+        let epoch = app.answer_epoch;
+
+        app.handle_sse_event(AgentEvent::Complete {
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        })
+        .unwrap();
+
+        let question = app.pending_question.as_ref().expect("modal remains");
+        assert_eq!(question.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(question.custom.as_deref(), Some("草稿🙂"));
+        assert_eq!(app.answer_epoch, epoch);
+        assert!(app.chat.streaming);
+        app.detach_stream();
+    }
+
+    #[test]
+    fn successor_complete_without_replayed_started_is_terminal_while_answer_submits() {
+        let mut app = app_with_question(vec!["A"]);
+        app.pending_question.as_mut().unwrap().submitting = true;
+        app.handle_sse_event(AgentEvent::Token {
+            content: "恢复完成🙂".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::Complete {
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        })
+        .unwrap();
+
+        assert!(app.pending_question.is_none());
+        assert!(!app.chat.streaming);
+        assert_eq!(app.chat.messages.last().unwrap().content, "恢复完成🙂");
+    }
+
+    #[tokio::test]
+    async fn non_resuming_answer_status_is_not_overwritten_by_ready() {
+        let mut app = app_with_question(vec!["A"]);
+        let identity = question_identity(&app);
+        let epoch = app.answer_epoch;
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch,
+            identity,
+            answer: "A".to_string(),
+            result: Ok("error: session not found".to_string()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.status_message, "Answered: A (error: session not found)");
+    }
+
+    #[tokio::test]
+    async fn fresh_execute_waits_for_sse_subscription_handshake() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (execute_seen_tx, execute_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut sse_socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut sse_socket).await,
+                "/api/v1/events/sess-handshake"
+            );
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err(),
+                "execute must not reach the server before SSE responds"
+            );
+            sse_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            sse_socket.flush().await.unwrap();
+
+            let (mut execute_socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut execute_socket).await,
+                "/api/v1/execute/sess-handshake"
+            );
+            execute_seen_tx.send(()).ok();
+            respond_test_http(
+                &mut execute_socket,
+                "application/json",
+                r#"{"session_id":"sess-handshake","status":"started","events_url":"/api/v1/events/sess-handshake"}"#,
+            )
+            .await;
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+        app.chat.session_id = Some("sess-handshake".to_string());
+        app.start_stream_and_execute("sess-handshake".to_string());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), execute_seen_rx)
+            .await
+            .expect("execute should follow the SSE handshake")
+            .unwrap();
+        server.await.unwrap();
+        app.detach_stream();
+    }
+
+    #[tokio::test]
+    async fn answer_replaces_live_old_stream_before_fast_successor_events() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (successor_sent_tx, successor_sent_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut successor_sse, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut successor_sse).await,
+                "/api/v1/events/sess-1"
+            );
+            successor_sse
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            successor_sse.flush().await.unwrap();
+
+            let (mut respond_socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut respond_socket).await,
+                "/api/v1/respond/sess-1"
+            );
+
+            // The successor completes before the respond HTTP body is
+            // returned. Only a subscriber installed before POST can observe
+            // this complete sequence.
+            successor_sse
+                .write_all(
+                    concat!(
+                        "data: {\"type\":\"execution_started\",\"run_id\":\"run-successor\",\"session_id\":\"sess-1\",\"started_at\":\"2026-08-10T00:00:00Z\"}\n\n",
+                        "data: {\"type\":\"token\",\"content\":\"快速恢复🙂\"}\n\n",
+                        "data: {\"type\":\"complete\",\"run_id\":\"run-successor\",\"session_id\":\"sess-1\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            successor_sse.flush().await.unwrap();
+            successor_sent_tx.send(()).ok();
+            respond_test_http(
+                &mut respond_socket,
+                "application/json",
+                r#"{"auto_resume_status":"started"}"#,
+            )
+            .await;
+        });
+
+        let mut app = app_with_question(vec!["A"]);
+        app.client = BambooClient::new(&base_url);
+        let (app_tx, _app_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(app_tx);
+
+        // Model the dangerous old state: readiness is still true and the task
+        // is still live, but its pause Complete is already queued for the UI.
+        let old_epoch = app.sse_epoch;
+        let (old_tx, old_rx) = mpsc::unbounded_channel();
+        old_tx
+            .send(SessionSseEvent::Event {
+                session_id: "sess-1".to_string(),
+                stream_epoch: old_epoch,
+                event: AgentEvent::Complete {
+                    usage: TokenUsage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    },
+                },
+            })
+            .unwrap();
+        app.sse_tx = Some(old_tx);
+        app.sse_rx = Some(old_rx);
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+        let (_old_ready_tx, old_ready_rx) = tokio::sync::watch::channel(true);
+        app.sse_ready = Some(old_ready_rx);
+
+        app.submit_answer("A".to_string());
+        assert_ne!(
+            app.sse_epoch, old_epoch,
+            "answer must replace old generation"
+        );
+        successor_sent_rx.await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .chat
+            .messages
+            .last()
+            .is_none_or(|message| message.content != "快速恢复🙂")
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            app.poll_sse();
+            tokio::task::yield_now().await;
+        }
+
+        assert!(app.pending_question.is_none());
+        assert!(!app.chat.streaming);
+        assert_eq!(app.chat.messages.last().unwrap().content, "快速恢复🙂");
+        server.await.unwrap();
+        app.detach_stream();
+    }
+
+    #[tokio::test]
+    async fn reconnect_recovers_a_clarification_created_during_the_sse_gap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let fake_server = tokio::spawn(async move {
+            let mut event_connections = 0;
+            let mut pending_requests = 0;
+            while event_connections < 2 || pending_requests < 2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let path = read_test_http_path(&mut stream).await;
+                if path == "/api/v1/events/sess-gap" {
+                    event_connections += 1;
+                    if event_connections == 1 {
+                        // Drop the first stream. The authoritative question is
+                        // created during this gap and is deliberately absent
+                        // from critical-event replay.
+                        respond_test_http(&mut stream, "text/event-stream", "").await;
+                    } else {
+                        respond_test_http(
+                            &mut stream,
+                            "text/event-stream",
+                            "data: {\"type\":\"complete\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                        )
+                        .await;
+                    }
+                } else if path == "/api/v1/respond/sess-gap/pending" {
+                    pending_requests += 1;
+                    if pending_requests == 1 {
+                        respond_test_http(
+                            &mut stream,
+                            "application/json",
+                            r#"{"has_pending_question":false}"#,
+                        )
+                        .await;
+                    } else {
+                        respond_test_http(
+                            &mut stream,
+                            "application/json",
+                            r#"{"has_pending_question":true,"question":"Recovered gap question","options":["Approve"],"allow_custom":false,"tool_call_id":"gap-tool","tool_name":"request_permissions","source":"pause_tool"}"#,
+                        )
+                        .await;
+                    }
+                } else {
+                    panic!("unexpected fake-server path: {path}");
+                }
+            }
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        app.chat.session_id = Some("sess-gap".to_string());
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(app_tx);
+        let (sse_tx, mut sse_rx) = mpsc::unbounded_channel();
+        let (sse_task, _ready) = SseStream::start(&base_url, "sess-gap", 0, sse_tx).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = sse_rx.recv().await.expect("SSE control event");
+                let reconnected = matches!(
+                    &message,
+                    SessionSseEvent::Connected {
+                        reconnecting: true,
+                        ..
+                    }
+                );
+                app.handle_session_sse_event(message).unwrap();
+                if reconnected {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("SSE should reconnect after the deliberate gap");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.pending_question.is_none() {
+                let reconciled = app_rx
+                    .recv()
+                    .await
+                    .expect("app event channel should stay open");
+                assert!(matches!(
+                    &reconciled,
+                    AppEvent::PendingQuestionReconciled { session_id, .. }
+                        if session_id == "sess-gap"
+                ));
+                app.handle_event(reconciled).await.unwrap();
+            }
+        })
+        .await
+        .expect("reconnect reconciliation should recover the question");
+
+        let question = app
+            .pending_question
+            .as_ref()
+            .expect("reconnect should recover the missed clarification");
+        assert_eq!(question.question, "Recovered gap question");
+        assert_eq!(question.tool_call_id.as_deref(), Some("gap-tool"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), fake_server)
+            .await
+            .expect("fake server should serve every request")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), sse_task)
+            .await
+            .expect("terminal replay should stop the SSE task")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn older_reconciliation_response_cannot_supersede_newer_request() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-race".to_string());
+        app.pending_reconcile_epoch = 2;
+        let answer_epoch = app.answer_epoch;
+
+        // Request 1 finishes after request 2 has already been issued. It must
+        // be discarded before it can bump answer_epoch and thereby invalidate
+        // request 2's authoritative response.
+        app.handle_event(AppEvent::PendingQuestionReconciled {
+            session_id: "sess-race".to_string(),
+            epoch: answer_epoch,
+            reconcile_epoch: 1,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "Stale question A".to_string(),
+                options: Some(vec!["A".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("tool-a".to_string()),
+                tool_name: Some("ConclusionWithOptions".to_string()),
+                source: Some("pause_tool".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        assert_eq!(app.answer_epoch, answer_epoch);
+
+        app.handle_event(AppEvent::PendingQuestionReconciled {
+            session_id: "sess-race".to_string(),
+            epoch: answer_epoch,
+            reconcile_epoch: 2,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "Current question B".to_string(),
+                options: Some(vec!["B".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("tool-b".to_string()),
+                tool_name: Some("ConclusionWithOptions".to_string()),
+                source: Some("pause_tool".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let question = app.pending_question.as_ref().expect("newest result wins");
+        assert_eq!(question.question, "Current question B");
+        assert_eq!(question.tool_call_id.as_deref(), Some("tool-b"));
+    }
+
+    #[tokio::test]
+    async fn initial_sse_handshake_recovers_a_question_created_before_subscription() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let fake_server = tokio::spawn(async move {
+            let mut events_served = false;
+            let mut pending_served = false;
+            while !events_served || !pending_served {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                match read_test_http_path(&mut stream).await.as_str() {
+                    "/api/v1/events/sess-initial-gap" => {
+                        events_served = true;
+                        // No NeedClarification replay: the question existed
+                        // before this first subscription was established.
+                        respond_test_http(
+                            &mut stream,
+                            "text/event-stream",
+                            "data: {\"type\":\"complete\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                        )
+                        .await;
+                    }
+                    "/api/v1/respond/sess-initial-gap/pending" => {
+                        pending_served = true;
+                        respond_test_http(
+                            &mut stream,
+                            "application/json",
+                            r#"{"has_pending_question":true,"question":"Initial gap question","options":["Continue"],"allow_custom":false,"tool_call_id":"initial-gap-tool","tool_name":"request_permissions","source":"pause_tool"}"#,
+                        )
+                        .await;
+                    }
+                    path => panic!("unexpected fake-server path: {path}"),
+                }
+            }
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        app.chat.session_id = Some("sess-initial-gap".to_string());
+        let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(app_tx);
+        let (sse_tx, mut sse_rx) = mpsc::unbounded_channel();
+        let (sse_task, _ready) =
+            SseStream::start(&base_url, "sess-initial-gap", 0, sse_tx).unwrap();
+
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(5), sse_rx.recv())
+            .await
+            .expect("initial SSE handshake should finish")
+            .expect("SSE control channel should stay open");
+        assert!(matches!(
+            &connected,
+            SessionSseEvent::Connected {
+                reconnecting: false,
+                ..
+            }
+        ));
+        app.handle_session_sse_event(connected).unwrap();
+
+        let reconciled = tokio::time::timeout(std::time::Duration::from_secs(5), app_rx.recv())
+            .await
+            .expect("initial pending reconciliation should finish")
+            .expect("app event channel should stay open");
+        app.handle_event(reconciled).await.unwrap();
+        let question = app
+            .pending_question
+            .as_ref()
+            .expect("initial handshake must recover the pre-subscription question");
+        assert_eq!(question.question, "Initial gap question");
+        assert_eq!(question.tool_call_id.as_deref(), Some("initial-gap-tool"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), fake_server)
+            .await
+            .expect("fake server should serve initial sync")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), sse_task)
+            .await
+            .expect("terminal frame should stop the SSE task")
+            .unwrap();
+    }
+
     /// `is_running: true` reattaches the SSE stream and sets `streaming`.
     /// `event_tx` isn't wired in a bare `App::new`, so `attach_stream`'s
     /// `SseStream::start` call still runs (it only spawns a task, no network
@@ -3639,6 +6529,7 @@ mod question_tests {
     async fn session_opened_reattaches_when_running() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
 
+        app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
             result: Ok(OpenedSession {
@@ -3659,6 +6550,7 @@ mod question_tests {
     async fn session_opened_truncated_notifies() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
 
+        app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
             result: Ok(OpenedSession {
@@ -3680,6 +6572,7 @@ mod question_tests {
     async fn session_opened_with_pending_question_opens_modal() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
 
+        app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
             result: Ok(OpenedSession {
@@ -3708,6 +6601,7 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("old".to_string());
 
+        app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
             result: Err("not found".to_string()),
@@ -3725,6 +6619,79 @@ mod question_tests {
         assert_eq!(last.level, NoticeLevel::Error);
     }
 
+    #[tokio::test]
+    async fn pending_question_detail_failure_aborts_session_open() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut history, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut history).await,
+                "/api/v1/history/s1"
+            );
+            respond_test_http(
+                &mut history,
+                "application/json",
+                r#"{"session_id":"s1","messages":[],"truncated":false,"total_message_count":0}"#,
+            )
+            .await;
+
+            let (mut summary, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut summary).await,
+                "/api/v1/sessions/s1"
+            );
+            respond_test_http(
+                &mut summary,
+                "application/json",
+                r#"{"session":{"id":"s1","model":"model","is_running":false,"has_pending_question":true}}"#,
+            )
+            .await;
+
+            let (mut pending, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut pending).await,
+                "/api/v1/respond/s1/pending"
+            );
+            let body = r#"{"error":"storage unavailable"}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            pending.write_all(response.as_bytes()).await.unwrap();
+            pending.shutdown().await.unwrap();
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        app.chat.session_id = Some("old".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.resume_session("s1".to_string());
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resume result should arrive")
+            .expect("event channel should stay open");
+        assert!(matches!(
+            &event,
+            AppEvent::SessionOpened {
+                session_id,
+                result: Err(error),
+            } if session_id == "s1" && error.contains("pending question")
+        ));
+        app.handle_event(event).await.unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("old"));
+        assert!(app.pending_question.is_none());
+        assert!(app
+            .notifications
+            .last()
+            .is_some_and(|notice| notice.text.contains("pending question")));
+        server.await.unwrap();
+    }
+
     /// `Ctrl+N` clears every session-scoped field but keeps the model and
     /// stable Project membership.
     #[tokio::test]
@@ -3740,13 +6707,14 @@ mod question_tests {
             completion_tokens: 1,
             total_tokens: 2,
         });
-        app.dismissed_question = Some(ActiveQuestion {
-            question: "q".to_string(),
-            options: vec![],
-            selected: 0,
-            custom: Some(String::new()),
-            submitting: false,
-        });
+        app.dismissed_question = Some(active_question(
+            "s1",
+            "q".to_string(),
+            None,
+            "tool-1",
+            true,
+            "",
+        ));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
             .await
@@ -3828,28 +6796,71 @@ mod question_tests {
     #[tokio::test]
     async fn pending_question_checked_opens_when_present() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.handle_event(AppEvent::PendingQuestionChecked(Ok(PendingQuestion {
-            has_pending_question: true,
-            question: "Still there?".to_string(),
-            options: Some(vec!["Yes".to_string()]),
-            ..Default::default()
-        })))
+        app.chat.session_id = Some("sess-1".to_string());
+        app.handle_event(AppEvent::PendingQuestionChecked {
+            session_id: "sess-1".to_string(),
+            epoch: app.answer_epoch,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "Still there?".to_string(),
+                options: Some(vec!["Yes".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("tool-1".to_string()),
+                ..Default::default()
+            }),
+        })
         .await
         .unwrap();
         assert_eq!(
             app.pending_question.as_ref().map(|q| q.question.as_str()),
             Some("Still there?")
         );
+        assert!(app.chat.streaming);
+        assert!(app.sse_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_after_server_question_recovery_stops_instead_of_quitting() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-1".to_string());
+        app.handle_event(AppEvent::PendingQuestionChecked {
+            session_id: "sess-1".to_string(),
+            epoch: app.answer_epoch,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "Still there?".to_string(),
+                options: Some(vec!["Yes".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("tool-1".to_string()),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert!(app.running, "Ctrl+C must not quit while the run is paused");
+        assert_eq!(app.status_message, "Stopping...");
     }
 
     /// ...and reports there's nothing to reopen when the server agrees.
     #[tokio::test]
     async fn pending_question_checked_notifies_when_absent() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.handle_event(AppEvent::PendingQuestionChecked(Ok(PendingQuestion {
-            has_pending_question: false,
-            ..Default::default()
-        })))
+        app.chat.session_id = Some("sess-1".to_string());
+        app.handle_event(AppEvent::PendingQuestionChecked {
+            session_id: "sess-1".to_string(),
+            epoch: app.answer_epoch,
+            result: Ok(PendingQuestion {
+                has_pending_question: false,
+                ..Default::default()
+            }),
+        })
         .await
         .unwrap();
         assert!(app.pending_question.is_none());

@@ -1605,6 +1605,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bamboo-client-core",
+ "base64 0.23.0",
  "chrono",
  "clap",
  "crossterm 0.29.0",
@@ -1615,6 +1616,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tui-textarea-2",
+ "unicode-width",
 ]
 
 [[package]]

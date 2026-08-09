@@ -6,6 +6,86 @@ use reqwest::Client;
 
 use types::*;
 
+#[derive(Debug, Clone)]
+pub struct RespondFailure {
+    refresh_question: bool,
+    message: String,
+}
+
+impl RespondFailure {
+    fn transport(error: reqwest::Error) -> Self {
+        Self {
+            // Once the POST has been sent, a transport failure leaves its
+            // outcome unknown: the server may have consumed the question and
+            // resumed before the response was lost. Reconcile authoritative
+            // state instead of enabling a blind duplicate submission.
+            refresh_question: true,
+            message: format!("answer response transport failed: {error}"),
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            // A successful status with an unreadable/invalid body is the same
+            // unknown-outcome class as a lost response body.
+            refresh_question: true,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn rejected(status: reqwest::StatusCode, body: String) -> Self {
+        let refresh_question = status == reqwest::StatusCode::CONFLICT
+            || (status == reqwest::StatusCode::BAD_REQUEST && body.contains("No pending question"));
+        Self {
+            refresh_question,
+            message: format!("server rejected the answer ({status}): {}", body.trim()),
+        }
+    }
+
+    /// A conflict means the tool identity changed; a bad request can mean the
+    /// pending question was already consumed. In both cases the modal must be
+    /// reconciled with the server instead of blindly retrying stale state.
+    pub fn should_refresh_question(&self) -> bool {
+        self.refresh_question
+    }
+
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            refresh_question: false,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RespondFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RespondFailure {}
+
+fn parse_auto_resume_status(body: &str) -> std::result::Result<String, RespondFailure> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        RespondFailure::protocol(format!("invalid answer response JSON: {error}"))
+    })?;
+    let status = value
+        .get("auto_resume_status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            RespondFailure::protocol("answer response is missing string field 'auto_resume_status'")
+        })?;
+
+    match status {
+        "started" | "already_running" | "completed" | "error: session not found" => {
+            Ok(status.to_string())
+        }
+        other => Err(RespondFailure::protocol(format!(
+            "answer response returned unsupported auto_resume_status '{other}'"
+        ))),
+    }
+}
+
 #[derive(Clone)]
 pub struct BambooClient {
     pub base_url: String,
@@ -83,34 +163,35 @@ impl BambooClient {
     /// Submit an answer to a pending question. Returns the server's
     /// `auto_resume_status` (`started` / `already_running` / `completed` /
     /// `error: …`) so the caller knows whether a run is actually resuming.
-    pub async fn respond(&self, session_id: &str, response: &str) -> Result<String> {
+    pub async fn respond(
+        &self,
+        session_id: &str,
+        response: &str,
+        expected_tool_call_id: Option<&str>,
+    ) -> std::result::Result<String, RespondFailure> {
         let resp = self
             .client
             .post(self.url(&format!("/api/v1/respond/{}", session_id)))
             .json(&RespondRequest {
                 response: response.to_string(),
+                expected_tool_call_id: expected_tool_call_id.map(str::to_string),
             })
             .send()
-            .await?;
+            .await
+            .map_err(RespondFailure::transport)?;
         // The respond validator rejects an answer that doesn't match an option
         // (when custom input is not allowed) with a non-2xx status. Surface that
         // so the UI can keep the question open instead of silently swallowing it.
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.map_err(|error| {
+            RespondFailure::protocol(format!("failed to read answer response body: {error}"))
+        })?;
         if !status.is_success() {
-            anyhow::bail!("server rejected the answer ({status}): {}", body.trim());
+            return Err(RespondFailure::rejected(status, body));
         }
-        // Extract auto_resume_status; the run only actually resumes for
-        // `started` / `already_running`.
-        let auto_resume = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v.get("auto_resume_status")
-                    .and_then(|s| s.as_str())
-                    .map(String::from)
-            })
-            .unwrap_or_default();
-        Ok(auto_resume)
+        // Do not turn an unknown successful response into an empty status:
+        // that would clear the modal and detach the fresh successor stream.
+        parse_auto_resume_status(&body)
     }
 
     // ── Session resume ──
@@ -447,5 +528,36 @@ impl BambooClient {
     pub async fn health(&self) -> Result<bool> {
         let resp = self.client.get(self.url("/api/v1/health")).send().await?;
         Ok(resp.status().is_success())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_auto_resume_status;
+
+    #[test]
+    fn auto_resume_status_accepts_only_server_contract_values() {
+        for status in [
+            "started",
+            "already_running",
+            "completed",
+            "error: session not found",
+        ] {
+            let body = format!(r#"{{"auto_resume_status":"{status}"}}"#);
+            assert_eq!(parse_auto_resume_status(&body).unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn malformed_missing_and_unknown_resume_status_require_reconciliation() {
+        for body in [
+            "not-json",
+            r#"{"success":true}"#,
+            r#"{"auto_resume_status":7}"#,
+            r#"{"auto_resume_status":"future_status"}"#,
+        ] {
+            let error = parse_auto_resume_status(body).unwrap_err();
+            assert!(error.should_refresh_question(), "body: {body}");
+        }
     }
 }

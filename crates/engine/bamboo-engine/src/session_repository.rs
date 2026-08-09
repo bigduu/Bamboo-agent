@@ -188,18 +188,14 @@ impl SessionRepository {
     /// The cache is refreshed cache-aside but with a no-regression guarantee:
     /// `load_merged` never overwrites a newer cached session with an older
     /// storage copy, so it is safe to call from hot read paths.
-    pub async fn load_merged(&self, session_id: &str) -> Option<Session> {
+    pub async fn load_merged_checked(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         let _guard = self.persistence.acquire_lock(session_id).await;
         let memory_session = read_cached_session(&self.cache, session_id);
-        let storage_session = self
-            .storage
-            .load_session(session_id)
-            .await
-            .unwrap_or_default();
+        let storage_session = self.storage.load_session(session_id).await?;
         #[cfg(test)]
         self.run_post_durable_hook("load_merged", session_id);
 
-        match (memory_session, storage_session) {
+        Ok(match (memory_session, storage_session) {
             (Some(memory), Some(storage)) => {
                 let prefer_storage = should_prefer_storage(&memory, &storage);
                 let diverged = prefer_storage || memory.messages.len() != storage.messages.len();
@@ -253,6 +249,23 @@ impl SessionRepository {
                 Some(storage)
             }
             (None, None) => None,
+        })
+    }
+
+    /// Compatibility wrapper for read paths where the historical contract
+    /// treated a storage failure like absence. Mutating/recovery paths should
+    /// use [`Self::load_merged_checked`] so they can preserve retry state.
+    pub async fn load_merged(&self, session_id: &str) -> Option<Session> {
+        match self.load_merged_checked(session_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(
+                    "[{}] Failed to load merged session from storage: {}",
+                    session_id,
+                    error
+                );
+                read_cached_session(&self.cache, session_id)
+            }
         }
     }
 

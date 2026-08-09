@@ -664,6 +664,26 @@ mod hook_tests {
     use bamboo_config::{LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    #[derive(Default)]
+    struct BlockingPendingPersistence {
+        saved: std::sync::Mutex<Vec<Session>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for BlockingPendingPersistence {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.saved
+                .lock()
+                .expect("pending persistence lock")
+                .push(session.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
     struct DenyToolHook;
 
     #[async_trait]
@@ -962,6 +982,91 @@ mod hook_tests {
             outcome,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn needs_human_uses_runner_identity_and_persists_before_clarification_event() {
+        let persistence = Arc::new(BlockingPendingPersistence::default());
+        let config = AgentLoopConfig {
+            persistence: Some(persistence.clone()),
+            ..Default::default()
+        };
+        let tools: Arc<dyn ToolExecutor> = Arc::new(RecordingExecutor(AtomicBool::new(false)));
+        let tool_call = probe_call("canonical-tool");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let outcome = ToolExecutionOutcome {
+            result: Ok(ToolResult::text(false, "decision pending")),
+            needs_human: Some(bamboo_agent_core::PendingQuestion {
+                tool_call_id: "stale-call".to_string(),
+                tool_name: "stale-tool".to_string(),
+                question: "Choose?".to_string(),
+                options: vec!["yes".to_string(), "no".to_string()],
+                allow_custom: false,
+                source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+            }),
+            post_tool_hook_eligible: false,
+            tool_duration: std::time::Duration::from_millis(1),
+        };
+
+        let apply = tokio::spawn(async move {
+            let mut session = Session::new("canonical-pending", "model");
+            apply_test_outcome(
+                &config,
+                &tools,
+                &tool_call,
+                &mut session,
+                &event_tx,
+                outcome,
+            )
+            .await
+            .unwrap();
+            session
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            persistence.entered.notified(),
+        )
+        .await
+        .expect("pending-question persistence should begin");
+        let events_before_save: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events_before_save
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolComplete { .. })));
+        assert!(!events_before_save
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+
+        let saved = persistence
+            .saved
+            .lock()
+            .expect("pending persistence lock")
+            .last()
+            .cloned()
+            .expect("pending session snapshot");
+        let persisted_question = saved.pending_question.expect("persisted pending question");
+        assert_eq!(persisted_question.tool_call_id, "call-canonical-tool");
+        assert_eq!(persisted_question.tool_name, "canonical-tool");
+
+        persistence.release.notify_one();
+        let session = apply.await.unwrap();
+        let pending = session.pending_question.expect("runtime pending question");
+        assert_eq!(pending.tool_call_id, "call-canonical-tool");
+        assert_eq!(pending.tool_name, "canonical-tool");
+
+        let clarification =
+            tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("clarification event should arrive after persistence")
+                .expect("clarification channel should stay open");
+        assert!(matches!(
+            clarification,
+            AgentEvent::NeedClarification {
+                tool_call_id: Some(ref id),
+                tool_name: Some(ref name),
+                ..
+            } if id == "call-canonical-tool" && name == "canonical-tool"
+        ));
     }
 
     #[tokio::test]

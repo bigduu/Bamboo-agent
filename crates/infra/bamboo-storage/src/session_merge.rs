@@ -42,8 +42,86 @@ use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
+const CONSUMED_CLARIFICATION_IDS_KEY: &str = "clarification.consumed_tool_call_ids";
+const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
+    CONSUMED_CLARIFICATION_IDS_KEY,
+    "runtime.suspend_reason",
+    "clarification_resume_pending",
+    "conclusion_with_options_resume_pending",
+    "execute.startup_handoff_at",
+    "permission.reexecute_tool_call_id",
+    "retry_resume_pending",
+    "retry_resume_reason",
+    "provider_name",
+];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
+
+/// A pending response is an authoritative compare-and-consume transaction.
+/// When a stale runner still carries the consumed ask, its terminal save must
+/// adopt the durable response control plane instead of resurrecting the ask or
+/// erasing the resume handoff. The bounded consumed-id ledger distinguishes a
+/// genuinely new pending question from an old snapshot after `pending_question`
+/// itself has been cleared.
+fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session) -> bool {
+    let Some(incoming_tool_call_id) = session
+        .pending_question
+        .as_ref()
+        .map(|pending| pending.tool_call_id.clone())
+    else {
+        return false;
+    };
+    let consumed = durable
+        .metadata
+        .get(CONSUMED_CLARIFICATION_IDS_KEY)
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    if !consumed
+        .iter()
+        .any(|tool_call_id| tool_call_id == &incoming_tool_call_id)
+    {
+        return false;
+    }
+
+    // Durable ordering/content wins (including the selected-response rewrite),
+    // while any truly new runner-only suffix remains append-only.
+    bamboo_domain::append_missing_runtime_messages(session, durable);
+    session
+        .pending_question
+        .clone_from(&durable.pending_question);
+    for key in RESPONSE_CONTROL_METADATA_KEYS {
+        if let Some(value) = durable.metadata.get(*key) {
+            session.metadata.insert((*key).to_string(), value.clone());
+        } else {
+            session.metadata.remove(*key);
+        }
+    }
+    session.model.clone_from(&durable.model);
+    session.model_ref.clone_from(&durable.model_ref);
+    session.reasoning_effort = durable.reasoning_effort;
+    session
+        .agent_runtime_state
+        .clone_from(&durable.agent_runtime_state);
+    if let Some(runtime_metadata) = session.runtime_metadata.as_mut() {
+        runtime_metadata.provider_name = durable
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.provider_name.clone());
+    } else if durable
+        .runtime_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.provider_name.is_some())
+    {
+        session.runtime_metadata = durable.runtime_metadata.as_ref().map(|metadata| {
+            let mut response_metadata = bamboo_domain::SessionRuntimeMetadata::default();
+            response_metadata
+                .provider_name
+                .clone_from(&metadata.provider_name);
+            response_metadata
+        });
+    }
+    true
+}
 
 fn is_task_control_plane_save_conflict(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
@@ -601,12 +679,14 @@ impl LockedSessionStore {
             let durable_count = latest.messages.len();
             let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
             bamboo_domain::merge_session_inbox_admission(session, latest);
+            let adopted_response = adopt_durable_consumed_clarification(session, latest);
             tracing::debug!(
-                "[{}] append-safe runtime checkpoint: durable={}, incoming={}, appended={}, saved={}",
+                "[{}] append-safe runtime checkpoint: durable={}, incoming={}, appended={}, adopted_response={}, saved={}",
                 session.id,
                 durable_count,
                 incoming_count,
                 appended,
+                adopted_response,
                 session.messages.len(),
             );
             apply_authoritative_metadata(session, latest);
@@ -680,6 +760,7 @@ impl LockedSessionStore {
         }
 
         if let Some(latest) = latest.as_ref() {
+            adopt_durable_consumed_clarification(session, latest);
             apply_authoritative_metadata(session, latest);
             let restored = bamboo_domain::restore_missing_admitted_inbox_messages(session, latest);
             if restored > 0 {
@@ -909,6 +990,115 @@ impl LockedSessionStore {
         Ok(Some(session))
     }
 
+    /// Load the authoritative response transaction candidate while the caller
+    /// holds this store's per-session lock. The merge rules intentionally
+    /// match [`Self::mutate_runtime_session_and_publish`], including adoption
+    /// of a clarification that durable storage already consumed.
+    async fn load_response_candidate<C>(
+        &self,
+        session_id: &str,
+        load_cached: C,
+    ) -> std::io::Result<Option<Session>>
+    where
+        C: FnOnce() -> Option<Session> + Send,
+    {
+        let cached_candidate = load_cached();
+        let durable = self.storage.load_session(session_id).await?;
+        let Some(mut session) = (match (cached_candidate, durable.as_ref()) {
+            (Some(cached), Some(durable)) => {
+                let prefer_durable = durable.updated_at > cached.updated_at
+                    || (durable.updated_at == cached.updated_at
+                        && cached.pending_question.is_none()
+                        && durable.pending_question.is_some());
+                Some(if prefer_durable {
+                    durable.clone()
+                } else {
+                    cached
+                })
+            }
+            (Some(cached), None) => Some(cached),
+            (None, durable) => durable.cloned(),
+        }) else {
+            return Ok(None);
+        };
+        if let Some(latest) = durable.as_ref() {
+            // A response transaction starts from an append-safe transcript.
+            // In particular, a cache snapshot that is timestamp-newer but
+            // still carries an already-consumed ask must not resurrect that
+            // ask or discard ordinary messages committed with the answer.
+            adopt_durable_consumed_clarification(&mut session, latest);
+            bamboo_domain::append_missing_runtime_messages(&mut session, latest);
+            apply_authoritative_metadata(&mut session, latest);
+            let restored =
+                bamboo_domain::restore_missing_admitted_inbox_messages(&mut session, latest);
+            if restored > 0 {
+                tracing::warn!(
+                    session_id,
+                    restored,
+                    "restored durable SessionInbox transcript messages into response transaction"
+                );
+            }
+            bamboo_domain::merge_session_inbox_admission(&mut session, latest);
+            adopt_fresher_disk_permission_posture(&mut session, latest);
+            adopt_fresher_durable_model_context_state(&mut session, latest);
+        }
+        Ok(Some(session))
+    }
+
+    /// Inspect the same authoritative snapshot a response mutation would use,
+    /// without persisting or publishing it. Callers use this immediately before
+    /// reserving a successor so an already-consumed response cannot allocate a
+    /// replacement runner.
+    pub async fn inspect_runtime_session_for_response<C>(
+        &self,
+        session_id: &str,
+        load_cached: C,
+    ) -> std::io::Result<Option<Session>>
+    where
+        C: FnOnce() -> Option<Session> + Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        self.load_response_candidate(session_id, load_cached).await
+    }
+
+    /// Atomically load, validate/mutate, persist, and publish one runtime
+    /// session under its canonical per-session lock.
+    ///
+    /// The nested result keeps validation errors distinct from storage errors:
+    /// `Ok(Err(error))` means `mutate` rejected the latest snapshot and no save
+    /// occurred. This is suitable for compare-and-consume operations such as a
+    /// typed pending-question response, where separate load/save calls would
+    /// allow another writer to replace the question between validation and
+    /// persistence.
+    pub async fn mutate_runtime_session_and_publish<C, M, P, E>(
+        &self,
+        session_id: &str,
+        load_cached: C,
+        mutate: M,
+        publish: P,
+    ) -> std::io::Result<Result<Option<Session>, E>>
+    where
+        C: FnOnce() -> Option<Session> + Send,
+        M: FnOnce(&mut Session) -> Result<(), E> + Send,
+        P: FnOnce(&Session) + Send,
+        E: Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut session) = self
+            .load_response_candidate(session_id, load_cached)
+            .await?
+        else {
+            return Ok(Ok(None));
+        };
+        if let Err(error) = mutate(&mut session) {
+            return Ok(Err(error));
+        }
+        self.save_session_rebasing_task_conflicts(&mut session)
+            .await?;
+        publish(&session);
+        Ok(Ok(Some(session)))
+    }
+
     /// Clear the legacy compatibility queue using durable CAS and publish the
     /// saved full snapshot before releasing the same session lock.
     pub async fn clear_legacy_pending_messages_and_publish<F>(
@@ -1056,6 +1246,7 @@ async fn merge_authoritative_metadata_into_stale(
     session: &mut Session,
 ) -> std::io::Result<()> {
     if let Some(latest) = storage.load_session(&session.id).await? {
+        adopt_durable_consumed_clarification(session, &latest);
         apply_authoritative_metadata(session, &latest);
         bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
         bamboo_domain::merge_session_inbox_admission(session, &latest);
@@ -1494,6 +1685,193 @@ mod tests {
             Some(transitioned_at),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn checked_runtime_mutation_persists_a_cache_only_pending_session() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut cached = fresh("cache-only-response");
+        cached.set_pending_question(
+            "tool-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        let saved = store
+            .mutate_runtime_session_and_publish(
+                &cached.id.clone(),
+                move || Some(cached),
+                |session| {
+                    assert!(session.pending_question.is_some());
+                    session.clear_pending_question();
+                    Ok::<_, ()>(())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("cache-only session should be created durably");
+
+        assert!(saved.pending_question.is_none());
+        assert!(storage
+            .load_session("cache-only-response")
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_question
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn checked_runtime_mutation_preserves_durable_authorities_for_newer_cache() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "cached-response-authorities";
+        let mut durable = fresh(session_id);
+        durable.title = "Durable title".to_string();
+        durable.title_version = 4;
+        durable.title_generated = true;
+        durable.metadata_version = 9;
+        set_permission_audit(
+            &mut durable,
+            bamboo_domain::SessionPermissionMode::Auto,
+            7,
+            "bamboo_runtime:durable-auto",
+            "2026-08-10T09:00:00Z",
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut cached = fresh(session_id);
+        cached.title = "Stale cached title".to_string();
+        cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
+        cached.set_pending_question(
+            "tool-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        store
+            .mutate_runtime_session_and_publish(
+                session_id,
+                move || Some(cached),
+                |session| {
+                    session.clear_pending_question();
+                    Ok::<_, ()>(())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("session should exist");
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(saved.title, "Durable title");
+        assert_eq!(saved.title_version, 4);
+        assert_eq!(saved.metadata_version, 9);
+        assert_eq!(
+            saved
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+        let audit = bamboo_domain::PermissionAuditSnapshot::from_metadata(&saved.metadata).unwrap();
+        assert_eq!(audit.policy_revision, 7);
+        assert_eq!(audit.executor_mapping, "bamboo_runtime:durable-auto");
+    }
+
+    #[tokio::test]
+    async fn checked_runtime_mutation_cannot_resurrect_consumed_ask_from_newer_cache() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "cached-consumed-response";
+        let mut stale_cached = fresh(session_id);
+        stale_cached.add_message(Message::tool_result("call-1", "waiting"));
+        stale_cached.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        let mut durable = stale_cached.clone();
+        durable.clear_pending_question();
+        durable.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        durable.messages[0].content = "Selected response: A".to_string();
+        durable.add_message(Message::user("durable concurrent message"));
+        storage.save_session(&durable).await.unwrap();
+
+        // A cache write after the durable response can have a newer wall-clock
+        // timestamp while still containing the old runner snapshot.
+        stale_cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
+        let saved = store
+            .mutate_runtime_session_and_publish(
+                session_id,
+                move || Some(stale_cached),
+                |session| {
+                    assert!(session.pending_question.is_none());
+                    Ok::<_, ()>(())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(saved.pending_question.is_none());
+        assert_eq!(saved.messages.len(), 2);
+        assert_eq!(saved.messages[0].content, "Selected response: A");
+        assert_eq!(saved.messages[1].content, "durable concurrent message");
+    }
+
+    #[tokio::test]
+    async fn response_inspection_adopts_durable_consumption_without_writing() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "inspect-consumed-response";
+        let mut stale_cached = fresh(session_id);
+        stale_cached.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        let mut durable = stale_cached.clone();
+        durable.clear_pending_question();
+        durable.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        storage.save_session(&durable).await.unwrap();
+        stale_cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
+
+        let inspected = store
+            .inspect_runtime_session_for_response(session_id, move || Some(stale_cached))
+            .await
+            .unwrap()
+            .expect("session should be inspectable");
+        assert!(inspected.pending_question.is_none());
+
+        let unchanged = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.updated_at, durable.updated_at);
+        assert!(unchanged.pending_question.is_none());
     }
 
     #[tokio::test]
@@ -1988,6 +2366,135 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_final_save_cannot_resurrect_a_consumed_clarification() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "consumed-clarification-final-save";
+
+        let mut suspended = fresh(session_id);
+        suspended.add_message(Message::tool_result(
+            "call-1",
+            r#"{"status":"awaiting_clarification"}"#,
+        ));
+        suspended.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+        suspended.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "awaiting_clarification".to_string(),
+        );
+        storage.save_session(&suspended).await.unwrap();
+        let mut stale_runner = suspended.clone();
+
+        let mut answered = suspended;
+        answered.clear_pending_question();
+        answered.metadata.remove("runtime.suspend_reason");
+        answered.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        answered.metadata.insert(
+            "clarification_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        answered.metadata.insert(
+            "conclusion_with_options_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        answered.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            "2026-08-10T09:00:00.000Z".to_string(),
+        );
+        let answer = answered
+            .messages
+            .iter_mut()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .unwrap();
+        answer.content = "Selected response: A".to_string();
+        storage.save_session(&answered).await.unwrap();
+
+        store.merge_save_runtime(&mut stale_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.pending_question.is_none());
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(
+            saved
+                .metadata
+                .get("clarification_resume_pending")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            saved
+                .metadata
+                .get("execute.startup_handoff_at")
+                .map(String::as_str),
+            Some("2026-08-10T09:00:00.000Z")
+        );
+        let answers = saved
+            .messages
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].content, "Selected response: A");
+    }
+
+    #[tokio::test]
+    async fn runtime_checkpoint_cannot_resurrect_a_consumed_clarification() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "consumed-clarification-checkpoint";
+        let mut stale_runner = fresh(session_id);
+        stale_runner.add_message(Message::tool_result("call-1", "waiting"));
+        stale_runner.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+        stale_runner.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "awaiting_clarification".to_string(),
+        );
+
+        let mut answered = stale_runner.clone();
+        answered.clear_pending_question();
+        answered.metadata.remove("runtime.suspend_reason");
+        answered.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        answered.metadata.insert(
+            "clarification_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        answered.messages[0].content = "Selected response: A".to_string();
+        storage.save_session(&answered).await.unwrap();
+
+        store
+            .checkpoint_runtime_session(&mut stale_runner)
+            .await
+            .unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.pending_question.is_none());
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(saved.messages.len(), 1);
+        assert_eq!(saved.messages[0].content, "Selected response: A");
     }
 
     #[tokio::test]
