@@ -247,9 +247,9 @@ where
         cache: None,
     };
 
-    let timeout_context = frame.timeout_context.clone().begin_request();
     let cancel_token = CancellationToken::new();
     let _dispatch_guard = acquire_dispatch_guard.await;
+    let timeout_context = frame.timeout_context.clone().begin_request();
     let stream = await_stream_bootstrap(
         llm.chat_stream_with_options(
             &messages,

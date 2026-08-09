@@ -21,6 +21,11 @@ use decision::{
     canonicalize_pending_answer, session_is_awaiting_clarification, should_attempt_gold_auto_answer,
 };
 use evaluation::{evaluate_gold_auto_answer_question, evaluate_gold_state_for_pending_question};
+#[cfg(test)]
+pub(crate) use evaluation::{
+    evaluate_gold_auto_answer_question_with_target, evaluate_gold_state_with_target,
+    GoldAuxiliaryTarget,
+};
 use resume::{build_resume_config_snapshot, plan_mode_transition_event};
 
 const GOLD_AUTO_ANSWER_TOOL_NAME: &str = "report_gold_auto_answer";

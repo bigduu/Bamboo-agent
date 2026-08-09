@@ -78,6 +78,52 @@ struct SaveOnlyPersistence {
     storage: Arc<dyn Storage>,
 }
 
+struct RootCasPauseStorage {
+    inner: Arc<bamboo_storage::SessionStoreV2>,
+    root_id: String,
+    root_cas_reached: Arc<tokio::sync::Barrier>,
+    release_root_cas: Arc<tokio::sync::Barrier>,
+    full_saves: AtomicUsize,
+}
+
+#[async_trait]
+impl Storage for RootCasPauseStorage {
+    async fn save_session(&self, session: &Session) -> io::Result<()> {
+        self.full_saves.fetch_add(1, Ordering::SeqCst);
+        self.inner.save_session(session).await
+    }
+
+    async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
+        self.inner.load_session(session_id).await
+    }
+
+    async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
+        self.inner.delete_session(session_id).await
+    }
+
+    async fn save_runtime_state(&self, session: &Session) -> io::Result<()> {
+        self.inner.save_runtime_state(session).await
+    }
+
+    async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {
+        self.inner.load_runtime_control_plane(session_id).await
+    }
+
+    async fn save_task_control_plane_if_matches(
+        &self,
+        original: &Session,
+        updated: &Session,
+    ) -> io::Result<bool> {
+        if original.id == self.root_id {
+            self.root_cas_reached.wait().await;
+            self.release_root_cas.wait().await;
+        }
+        self.inner
+            .save_task_control_plane_if_matches(original, updated)
+            .await
+    }
+}
+
 #[derive(Default)]
 struct FullSessionPersistence {
     full_saves: AtomicUsize,
@@ -362,6 +408,116 @@ async fn child_taskwrite_custom_fallback_full_load_and_save_preserve_message_his
     assert_eq!(
         saved_root.task_list_version_meta(),
         saved_child.task_list_version_meta()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_taskwrite_root_cas_conflict_refreshes_repository_without_full_save_fallback() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let home = directory.path().to_path_buf();
+    let first_inner = Arc::new(
+        bamboo_storage::SessionStoreV2::new(home.clone())
+            .await
+            .expect("first SessionStoreV2"),
+    );
+    let root_id = "taskwrite-cas-conflict-root";
+    let child_id = "taskwrite-cas-conflict-child";
+    let mut root = Session::new(root_id, "model");
+    root.add_message(Message::user("root transcript must survive"));
+    first_inner.save_session(&root).await.expect("seed root");
+    let second_inner = Arc::new(
+        bamboo_storage::SessionStoreV2::new(home)
+            .await
+            .expect("second SessionStoreV2"),
+    );
+
+    let root_cas_reached = Arc::new(tokio::sync::Barrier::new(2));
+    let release_root_cas = Arc::new(tokio::sync::Barrier::new(2));
+    let gated_storage = Arc::new(RootCasPauseStorage {
+        inner: first_inner.clone(),
+        root_id: root_id.to_string(),
+        root_cas_reached: root_cas_reached.clone(),
+        release_root_cas: release_root_cas.clone(),
+        full_saves: AtomicUsize::new(0),
+    });
+    let storage: Arc<dyn Storage> = gated_storage.clone();
+    let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repository = Arc::new(crate::SessionRepository::new(
+        Default::default(),
+        storage.clone(),
+        locked,
+    ));
+    repository.load(root_id).await.expect("cache root");
+
+    let mut child = Session::new_child(child_id, root_id, "model", "Child");
+    child.add_message(Message::user("child transcript"));
+    let mut config = AgentLoopConfig::default();
+    config.storage = Some(storage);
+    config.persistence = Some(repository.clone());
+    let (tx, _rx) = mpsc::channel(4);
+    let (tool_call, result) = task_call_and_result();
+    let taskwrite = tokio::spawn(async move {
+        let mut task_context = None;
+        maybe_handle_taskwrite(
+            &tool_call,
+            &result,
+            &mut child,
+            child_id,
+            &tx,
+            &config,
+            &mut task_context,
+        )
+        .await;
+        child
+    });
+
+    root_cas_reached.wait().await;
+    let original = second_inner
+        .load_runtime_control_plane(root_id)
+        .await
+        .expect("load competing root")
+        .expect("competing root exists");
+    let now = chrono::Utc::now();
+    let mut winner = original.clone();
+    winner.task_list = Some(bamboo_domain::TaskList {
+        session_id: root_id.to_string(),
+        title: "concurrent winner".to_string(),
+        items: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    });
+    winner.set_task_list_version_meta("1");
+    assert!(second_inner
+        .save_task_control_plane_if_matches(&original, &winner)
+        .await
+        .expect("commit competing root Task"));
+    release_root_cas.wait().await;
+    let child = taskwrite.await.expect("Taskwrite task");
+
+    assert_eq!(
+        gated_storage.full_saves.load(Ordering::SeqCst),
+        0,
+        "an unconditional CAS conflict is an error, not the Ok(false) legacy fallback signal"
+    );
+    let durable = first_inner
+        .load_session(root_id)
+        .await
+        .expect("load durable root")
+        .expect("durable root exists");
+    let cached = repository.load(root_id).await.expect("cached root");
+    for (tier, session) in [("durable", &durable), ("cache", &cached)] {
+        assert_eq!(session.task_list_version_meta().as_deref(), Some("1"));
+        assert_eq!(
+            session.task_list.as_ref().map(|list| list.title.as_str()),
+            Some("concurrent winner"),
+            "tier={tier}"
+        );
+        assert_eq!(session.messages.len(), 1, "tier={tier}");
+    }
+    assert_ne!(
+        task_list_value(&child),
+        task_list_value(&durable),
+        "the losing child candidate must not be published into the shared root"
     );
 }
 

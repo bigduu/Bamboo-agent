@@ -230,10 +230,14 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(false)
     }
 
-    /// Atomically compare-and-patch the executing session and its shared root.
+    /// Recoverably compare-and-patch the executing session and its shared root.
     /// Implementations must validate both generations before either target is
-    /// written. Root-session callers pass the same id twice and receive the
-    /// single-target CAS semantics above.
+    /// written and may return `Ok(true)` only after both Task generations are
+    /// durable with no undo record that could later revert them. An error after
+    /// one physical write must restore both originals before returning or retain
+    /// durable recovery state and fail subsequent paired access closed until
+    /// recovery completes. Root-session callers pass the same id twice and
+    /// receive the single-target CAS semantics above.
     async fn update_task_list_control_planes_if_version(
         &self,
         session_id: &str,

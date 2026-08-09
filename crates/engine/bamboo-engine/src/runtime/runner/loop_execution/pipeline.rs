@@ -776,6 +776,38 @@ fn record_task_evaluation_terminal_metrics(
     }
 }
 
+fn task_evaluation_result_usage(
+    result: &crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationResult,
+) -> MetricsTokenUsage {
+    let prompt_tokens = result.evaluation_result.prompt_tokens;
+    let completion_tokens = result.evaluation_result.completion_tokens;
+    MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
+fn record_harvested_task_evaluation_metrics(
+    metrics_collector: Option<&MetricsCollector>,
+    result: &crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationResult,
+) {
+    let (status, error) = match result.error.clone() {
+        Some(error) => (MetricsRoundStatus::Error, Some(error)),
+        None => (MetricsRoundStatus::Success, None),
+    };
+    record_task_evaluation_terminal_metrics(
+        metrics_collector,
+        &result.metrics_round_id,
+        result.metrics_started.as_ref(),
+        result.metrics_terminal.as_ref(),
+        result.finished_at,
+        status,
+        task_evaluation_result_usage(result),
+        error,
+    );
+}
+
 async fn poll_completed_task_evaluation(state: &mut LoopRunState) {
     let finished = state
         .task_evaluation
@@ -1006,35 +1038,99 @@ async fn abort_in_flight_evaluations(
     event_tx: &mpsc::Sender<AgentEvent>,
     reason: &'static str,
 ) {
-    let task_was_running = state.task_evaluation.in_flight.is_some();
-    let task_generation = state
-        .task_evaluation
-        .in_flight
-        .as_ref()
-        .map(|in_flight| in_flight.request.based_on_task_context_version);
-    let gold_was_running = state.gold_evaluation.in_flight.is_some();
+    let mut task_was_cancelled = false;
+    let mut task_generation = None;
+    let mut gold_was_cancelled = false;
     if let Some(in_flight) = state.task_evaluation.in_flight.take() {
-        in_flight.join_handle.abort();
+        task_generation = Some(in_flight.request.based_on_task_context_version);
+        let was_finished = in_flight.join_handle.is_finished();
+        if !was_finished {
+            in_flight.join_handle.abort();
+        }
         let metrics_round_id = in_flight.request.metrics_round_id.clone();
         let metrics_started = in_flight.metrics_started.clone();
         let metrics_terminal = in_flight.metrics_terminal.clone();
-        // Wait only for Tokio to observe the abort. This is not a provider
-        // drain, but it closes the race where dispatch starts immediately
-        // after an earlier `metrics_started` check.
-        let _ = in_flight.join_handle.await;
-        record_task_evaluation_terminal_metrics(
-            state.metrics_collector.as_ref(),
-            &metrics_round_id,
-            metrics_started.as_ref(),
-            metrics_terminal.as_ref(),
-            Utc::now(),
-            MetricsRoundStatus::Cancelled,
-            MetricsTokenUsage::default(),
-            Some(reason.to_string()),
-        );
+        // Awaiting a handle that was already finished is an immediate harvest,
+        // not a provider drain. For an active handle this wait only lets Tokio
+        // observe the abort. In either case the actual join outcome wins the
+        // is_finished/abort race: a completed result must never be rewritten as
+        // Cancelled or followed by a duplicate cancellation event.
+        match in_flight.join_handle.await {
+            Ok(Some(result)) => {
+                record_harvested_task_evaluation_metrics(state.metrics_collector.as_ref(), &result);
+            }
+            Ok(None) => {
+                task_was_cancelled = true;
+                record_task_evaluation_terminal_metrics(
+                    state.metrics_collector.as_ref(),
+                    &metrics_round_id,
+                    metrics_started.as_ref(),
+                    metrics_terminal.as_ref(),
+                    Utc::now(),
+                    MetricsRoundStatus::Cancelled,
+                    MetricsTokenUsage::default(),
+                    Some(reason.to_string()),
+                );
+            }
+            Err(error) if error.is_cancelled() => {
+                task_was_cancelled = true;
+                record_task_evaluation_terminal_metrics(
+                    state.metrics_collector.as_ref(),
+                    &metrics_round_id,
+                    metrics_started.as_ref(),
+                    metrics_terminal.as_ref(),
+                    Utc::now(),
+                    MetricsRoundStatus::Cancelled,
+                    MetricsTokenUsage::default(),
+                    Some(reason.to_string()),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "[{}] Async task evaluation join failed during cleanup for round {}: {}",
+                    state.session_id,
+                    in_flight.request.round_number,
+                    error
+                );
+                record_task_evaluation_terminal_metrics(
+                    state.metrics_collector.as_ref(),
+                    &metrics_round_id,
+                    metrics_started.as_ref(),
+                    metrics_terminal.as_ref(),
+                    Utc::now(),
+                    MetricsRoundStatus::Error,
+                    MetricsTokenUsage::default(),
+                    Some(format!("task evaluation join failed: {error}")),
+                );
+                // A panic/failure is harvested as Error and must not receive a
+                // fabricated cancellation lifecycle event.
+            }
+        }
     }
     if let Some(in_flight) = state.gold_evaluation.in_flight.take() {
-        in_flight.join_handle.abort();
+        let was_finished = in_flight.join_handle.is_finished();
+        if !was_finished {
+            in_flight.join_handle.abort();
+        }
+        // As with Task evaluation, the join result is authoritative when abort
+        // races natural completion. A finished Gold evaluator has already
+        // emitted GoldEvaluationCompleted and must not receive a contradictory
+        // cancellation lifecycle event during run cleanup.
+        match in_flight.join_handle.await {
+            Ok(Some(_result)) => {}
+            Ok(None) => gold_was_cancelled = true,
+            Err(error) if error.is_cancelled() => gold_was_cancelled = true,
+            Err(error) => {
+                tracing::warn!(
+                    "[{}] Async Gold evaluation join failed during cleanup for round {}: {}",
+                    state.session_id,
+                    in_flight.request.round_number,
+                    error
+                );
+                // A panic/failure is terminal in its own right; its actual join
+                // outcome must never be rewritten as cancellation.
+            }
+        }
     }
     // Queued snapshots belong to this run. A later run rebuilds an evaluation
     // request from the current task-list generation instead of replaying stale
@@ -1045,7 +1141,7 @@ async fn abort_in_flight_evaluations(
     // A Started event may already be visible to clients. Always close that
     // lifecycle explicitly so a reconnecting/current UI never remains stuck in
     // "evaluating" after the owning run has reached a terminal/suspended state.
-    if task_was_running {
+    if task_was_cancelled {
         let _ = event_tx
             .send(AgentEvent::TaskEvaluationCancelled {
                 session_id: state.session_id.clone(),
@@ -1054,7 +1150,7 @@ async fn abort_in_flight_evaluations(
             })
             .await;
     }
-    if gold_was_running {
+    if gold_was_cancelled {
         let _ = event_tx
             .send(AgentEvent::GoldEvaluationCancelled {
                 session_id: state.session_id.clone(),
@@ -7275,6 +7371,153 @@ mod tests {
         );
     }
 
+    struct CompletedTaskEvaluationProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for CompletedTaskEvaluationProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let call = bamboo_agent_core::tools::ToolCall {
+                id: "completed-unharvested-evaluation".to_string(),
+                tool_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "update_task_item".to_string(),
+                    arguments: r#"{"item_id":"pending","status":"completed","notes":"verified"}"#
+                        .to_string(),
+                },
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![call])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_harvests_finished_task_evaluation_without_false_cancellation() {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        let session_id = "task-eval-finished-before-cleanup";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        collector.session_started(session_id, "model", Utc::now());
+
+        let mut session = Session::new(session_id, "model");
+        let mut state = e2e_loop_state(session_id);
+        seed_blocked_task_evaluation(&mut session, &mut state);
+        let (reset_tx, _reset_rx) = mpsc::channel(4);
+        super::abort_in_flight_evaluations(&mut state, &reset_tx, "test_reset").await;
+
+        let request = crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
+            &state.task_context,
+            &session,
+            session_id,
+            1,
+            Some("fast-model"),
+            None,
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .expect("request builds")
+        .expect("task context exists");
+        let metrics_round_id = request.metrics_round_id.clone();
+        state.metrics_collector = Some(collector);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        super::spawn_task_evaluation_request(
+            &mut state,
+            &event_tx,
+            request,
+            Arc::new(CompletedTaskEvaluationProvider),
+            CancellationToken::new(),
+            1,
+        );
+        let metrics_started = state
+            .task_evaluation
+            .in_flight
+            .as_ref()
+            .expect("evaluation spawned")
+            .metrics_started
+            .clone();
+        let metrics_terminal = state
+            .task_evaluation
+            .in_flight
+            .as_ref()
+            .expect("evaluation spawned")
+            .metrics_terminal
+            .clone();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .task_evaluation
+                .in_flight
+                .as_ref()
+                .expect("unharvested handle remains installed")
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("evaluator should finish before cleanup");
+        assert!(metrics_started.load(Ordering::Acquire));
+        assert!(!metrics_terminal.load(Ordering::Acquire));
+
+        super::abort_in_flight_evaluations(&mut state, &event_tx, "run_completed").await;
+        assert!(state.task_evaluation.in_flight.is_none());
+        assert!(metrics_terminal.load(Ordering::Acquire));
+
+        let mut started_events = 0;
+        let mut completed_events = 0;
+        let mut cancelled_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::TaskEvaluationStarted { .. } => started_events += 1,
+                AgentEvent::TaskEvaluationCompleted { .. } => completed_events += 1,
+                AgentEvent::TaskEvaluationCancelled { .. } => cancelled_events += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started_events, 1);
+        assert_eq!(completed_events, 1);
+        assert_eq!(
+            cancelled_events, 0,
+            "a completed evaluator must not receive a duplicate cancellation event"
+        );
+
+        let detail = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(detail) = storage
+                    .session_detail(session_id)
+                    .await
+                    .expect("session metrics query")
+                {
+                    if detail.rounds.len() == 1 && detail.rounds[0].completed_at.is_some() {
+                        break detail;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("harvested evaluator terminal metric persists");
+        let row = &detail.rounds[0];
+        assert_eq!(row.round_id, metrics_round_id);
+        assert_eq!(row.status, MetricsRoundStatus::Success);
+        assert!(row.error.is_none());
+        assert!(row.token_usage.prompt_tokens > 0);
+        assert!(row.token_usage.completion_tokens > 0);
+        assert_eq!(
+            row.token_usage.total_tokens,
+            row.token_usage
+                .prompt_tokens
+                .saturating_add(row.token_usage.completion_tokens)
+        );
+    }
+
     /// What the scripted main agent does on its SECOND round, once the Gold
     /// evaluation spawned after round 1 is genuinely in flight.
     #[derive(Clone, Copy)]
@@ -7412,6 +7655,95 @@ mod tests {
             max_rounds: 5,
             ..AgentLoopConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_harvests_finished_gold_evaluation_without_false_cancellation() {
+        let session_id = "gold-eval-finished-before-cleanup";
+        let mut state = e2e_loop_state(session_id);
+        let checkpoint = bamboo_agent_core::GoldCheckpoint::PostRound;
+        let request = crate::runtime::gold_evaluation::AsyncGoldEvaluationRequest {
+            session_id: session_id.to_string(),
+            round_number: 1,
+            model_name: "fast".to_string(),
+            reasoning_effort: None,
+            checkpoint,
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::default(),
+            session_snapshot: Session::new(session_id, "model"),
+            task_context_snapshot: None,
+            gold_config: crate::runtime::config::GoldConfig::default(),
+        };
+        let result = crate::runtime::gold_evaluation::AsyncGoldEvaluationResult {
+            round_number: 1,
+            model_name: "fast".to_string(),
+            evaluation_result: crate::runtime::gold_evaluation::GoldEvaluationResult {
+                checkpoint,
+                iteration: 1,
+                decision: bamboo_agent_core::GoldDecision::Continue,
+                confidence: bamboo_agent_core::GoldConfidence::High,
+                reasoning: "complete".to_string(),
+                missing_information: Vec::new(),
+                next_action: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(AgentEvent::GoldEvaluationStarted {
+            session_id: session_id.to_string(),
+            checkpoint,
+            iteration: 1,
+        })
+        .await
+        .expect("started event");
+        tx.send(AgentEvent::GoldEvaluationCompleted {
+            session_id: session_id.to_string(),
+            checkpoint,
+            iteration: 1,
+            decision: bamboo_agent_core::GoldDecision::Continue,
+            confidence: bamboo_agent_core::GoldConfidence::High,
+            reasoning: "complete".to_string(),
+        })
+        .await
+        .expect("completed event");
+        state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            request,
+            join_handle: tokio::spawn(async move { Some(result) }),
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .expect("unharvested Gold handle")
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Gold evaluator should finish before cleanup");
+
+        super::abort_in_flight_evaluations(&mut state, &tx, "run_completed").await;
+        assert!(state.gold_evaluation.in_flight.is_none());
+        let mut started = 0;
+        let mut completed = 0;
+        let mut cancelled = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::GoldEvaluationStarted { .. } => started += 1,
+                AgentEvent::GoldEvaluationCompleted { .. } => completed += 1,
+                AgentEvent::GoldEvaluationCancelled { .. } => cancelled += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started, 1);
+        assert_eq!(completed, 1);
+        assert_eq!(
+            cancelled, 0,
+            "a completed Gold evaluator must not receive a contradictory cancellation"
+        );
     }
 
     /// A run the user CANCELS with a Gold evaluation in flight must not run that

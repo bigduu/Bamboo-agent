@@ -77,7 +77,6 @@ where
     let session_id = frame.session_id;
     let model = frame.model;
     let reasoning_effort = frame.reasoning_effort;
-    let timeout_context = frame.timeout_context.clone().begin_request();
 
     let in_progress_count = ctx
         .items
@@ -134,6 +133,7 @@ where
     };
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let _dispatch_guard = acquire_dispatch_guard.await;
+    let timeout_context = frame.timeout_context.clone().begin_request();
     on_dispatch();
     let stream = match await_stream_bootstrap(
         llm.chat_stream_with_options(&messages, &tools, Some(8192), model, Some(&request_options)),
