@@ -423,6 +423,58 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn update_task_list_control_plane_if_version(
+        &self,
+        session_id: &str,
+        expected_version: &str,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        self.persistence
+            .update_task_list_control_plane_if_version_and_publish(
+                session_id,
+                expected_version,
+                task_list,
+                version,
+                |_| {
+                    if let Some(cached) = self.cache.get(session_id) {
+                        let mut cached = cached.write();
+                        cached.set_task_list(task_list.clone());
+                        cached.set_task_list_version_meta(version.to_string());
+                    }
+                },
+            )
+            .await
+    }
+
+    async fn update_task_list_control_planes_if_version(
+        &self,
+        session_id: &str,
+        shared_session_id: &str,
+        expected_version: &str,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        self.persistence
+            .update_task_list_control_planes_if_version_and_publish(
+                session_id,
+                shared_session_id,
+                expected_version,
+                task_list,
+                version,
+                |_, _| {
+                    for id in [session_id, shared_session_id] {
+                        if let Some(cached) = self.cache.get(id) {
+                            let mut cached = cached.write();
+                            cached.set_task_list(task_list.clone());
+                            cached.set_task_list_version_meta(version.to_string());
+                        }
+                    }
+                },
+            )
+            .await
+    }
+
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         // The execute-boundary checkpoint uses LockedSessionStore's atomic
         // append-safe transcript merge, then publishes that reconciled snapshot
@@ -551,6 +603,65 @@ mod tests {
             items: Vec::new(),
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_task_cas_narrowly_updates_child_and_root_cache() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let root_id = "paired-cache-root";
+        let child_id = "paired-cache-child";
+
+        let mut root = Session::new(root_id, "model");
+        root.add_message(bamboo_agent_core::Message::user("root transcript"));
+        root.metadata
+            .insert("unrelated.root".to_string(), "keep".to_string());
+        root.set_task_list(task_list(root_id, "old root"));
+        root.set_task_list_version_meta("1");
+        storage.save_session(&root).await.unwrap();
+        cache_put(&repo, &root);
+
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.add_message(bamboo_agent_core::Message::user("child transcript"));
+        child
+            .metadata
+            .insert("unrelated.child".to_string(), "keep".to_string());
+        child.set_task_list(task_list(root_id, "old child"));
+        child.set_task_list_version_meta("1");
+        storage.save_session(&child).await.unwrap();
+        cache_put(&repo, &child);
+
+        assert!(
+            bamboo_domain::RuntimeSessionPersistence::update_task_list_control_planes_if_version(
+                &repo,
+                child_id,
+                root_id,
+                "1",
+                &task_list(root_id, "evaluated"),
+                "2",
+            )
+            .await
+            .expect("paired cache CAS succeeds")
+        );
+
+        let cached_root = read_cached_session(repo.cache(), root_id).expect("cached root");
+        let cached_child = read_cached_session(repo.cache(), child_id).expect("cached child");
+        for (session, transcript, metadata_key) in [
+            (&cached_root, "root transcript", "unrelated.root"),
+            (&cached_child, "child transcript", "unrelated.child"),
+        ] {
+            assert_eq!(session.task_list_version_meta().as_deref(), Some("2"));
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some("evaluated")
+            );
+            assert_eq!(session.messages.len(), 1);
+            assert_eq!(session.messages[0].content, transcript);
+            assert_eq!(
+                session.metadata.get(metadata_key).map(String::as_str),
+                Some("keep")
+            );
         }
     }
 

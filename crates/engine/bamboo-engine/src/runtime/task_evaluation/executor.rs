@@ -49,6 +49,26 @@ pub async fn evaluate_task_progress(
     llm: Arc<dyn LLMProvider>,
     frame: &TaskEvaluationFrame<'_>,
 ) -> Result<TaskEvaluationResult, AgentError> {
+    evaluate_task_progress_with_dispatch(ctx, session, llm, frame, std::future::ready(()), || {})
+        .await
+}
+
+/// Internal evaluator entry point that observes the exact provider-dispatch
+/// boundary. Queueing and prompt preparation must not inflate evaluator
+/// duration metrics, so the callback runs immediately before the provider
+/// future is first polled.
+pub(crate) async fn evaluate_task_progress_with_dispatch<G, Fut, F>(
+    ctx: &TaskLoopContext,
+    session: &Session,
+    llm: Arc<dyn LLMProvider>,
+    frame: &TaskEvaluationFrame<'_>,
+    acquire_dispatch_guard: Fut,
+    on_dispatch: F,
+) -> Result<TaskEvaluationResult, AgentError>
+where
+    Fut: std::future::Future<Output = G>,
+    F: FnOnce(),
+{
     use crate::runtime::stream::handler::{
         await_stream_bootstrap, consume_llm_stream_silent_with_context,
     };
@@ -113,6 +133,8 @@ pub async fn evaluate_task_progress(
         cache: None,
     };
     let cancel_token = tokio_util::sync::CancellationToken::new();
+    let _dispatch_guard = acquire_dispatch_guard.await;
+    on_dispatch();
     let stream = match await_stream_bootstrap(
         llm.chat_stream_with_options(&messages, &tools, Some(8192), model, Some(&request_options)),
         &cancel_token,
@@ -124,7 +146,7 @@ pub async fn evaluate_task_progress(
         Ok(stream) => stream,
         Err(error) => {
             tracing::warn!("[{}] Task evaluation failed: {}", session_id, error);
-            return Ok(skipped_evaluation(&format!("Evaluation failed: {}", error)));
+            return Ok(skipped_evaluation(&format!("Evaluation failed: {error}")));
         }
     };
     let stream_output =

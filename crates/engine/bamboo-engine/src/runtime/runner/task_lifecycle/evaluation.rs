@@ -1,15 +1,17 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::runtime::task_context::TaskLoopContext;
-use crate::runtime::task_evaluation::{evaluate_task_progress, TaskEvaluationResult};
+use crate::runtime::task_evaluation::{evaluate_task_progress_with_dispatch, TaskEvaluationResult};
 use bamboo_agent_core::{AgentError, AgentEvent, Session, SessionKind};
 use bamboo_domain::task::{TaskBlocker, TaskBlockerKind, TaskEvidence, TaskEvidenceKind};
 use bamboo_domain::{ReasoningEffort, TaskItemStatus};
 use bamboo_llm::LLMProvider;
-use bamboo_metrics::TokenUsage as MetricsTokenUsage;
+use bamboo_metrics::{MetricsCollector, TokenUsage as MetricsTokenUsage};
 
 fn normalize_criterion(value: &str) -> Option<String> {
     let normalized = value
@@ -104,6 +106,8 @@ impl TaskEvaluationApplyOutcome {
 
 #[derive(Debug, Clone)]
 pub(in crate::runtime::runner) struct AsyncTaskEvaluationRequest {
+    pub(in crate::runtime::runner) evaluation_id: String,
+    pub(in crate::runtime::runner) metrics_round_id: String,
     pub(in crate::runtime::runner) session_id: String,
     pub(in crate::runtime::runner) shared_session_id: String,
     pub(in crate::runtime::runner) round_number: usize,
@@ -119,12 +123,16 @@ pub(in crate::runtime::runner) struct AsyncTaskEvaluationRequest {
 
 #[derive(Debug, Clone)]
 pub(in crate::runtime::runner) struct AsyncTaskEvaluationResult {
+    pub(in crate::runtime::runner) metrics_round_id: String,
     pub(in crate::runtime::runner) shared_session_id: String,
     pub(in crate::runtime::runner) round_number: usize,
     pub(in crate::runtime::runner) based_on_task_context_version: u64,
     pub(in crate::runtime::runner) task_list_title: Option<String>,
-    pub(in crate::runtime::runner) model_name: String,
     pub(in crate::runtime::runner) evaluation_result: TaskEvaluationResult,
+    pub(in crate::runtime::runner) finished_at: DateTime<Utc>,
+    pub(in crate::runtime::runner) error: Option<String>,
+    pub(in crate::runtime::runner) metrics_started: Arc<AtomicBool>,
+    pub(in crate::runtime::runner) metrics_terminal: Arc<AtomicBool>,
 }
 
 pub(in crate::runtime::runner) fn build_async_task_evaluation_request(
@@ -148,7 +156,12 @@ pub(in crate::runtime::runner) fn build_async_task_evaluation_request(
         SessionKind::Root => session.id.clone(),
     };
 
+    let evaluation_id = crate::runtime::runner::round_prelude::new_execution_id();
+    let metrics_round_id = format!("{session_id}-task-evaluation-{evaluation_id}");
+
     Ok(Some(AsyncTaskEvaluationRequest {
+        evaluation_id,
+        metrics_round_id,
         session_id: session_id.to_string(),
         shared_session_id,
         round_number,
@@ -169,8 +182,27 @@ pub(in crate::runtime::runner) async fn execute_async_task_evaluation(
     request: AsyncTaskEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
     event_tx: mpsc::Sender<AgentEvent>,
+    configured_limit: usize,
+    metrics_collector: Option<MetricsCollector>,
+    metrics_started: Arc<AtomicBool>,
+    metrics_terminal: Arc<AtomicBool>,
 ) -> AsyncTaskEvaluationResult {
-    let evaluation_result = match evaluate_task_progress(
+    let budget_provider = llm.clone();
+    let budget_model = request.model_name.clone();
+    let acquire_dispatch_guard = async move {
+        crate::runtime::runner::auxiliary_budget::acquire(
+            &budget_provider,
+            &budget_model,
+            configured_limit,
+        )
+        .await
+    };
+    let metrics_for_dispatch = metrics_collector.clone();
+    let metrics_round_id = request.metrics_round_id.clone();
+    let metrics_session_id = request.session_id.clone();
+    let metrics_model_name = request.model_name.clone();
+    let metrics_started_for_dispatch = metrics_started.clone();
+    let evaluation = evaluate_task_progress_with_dispatch(
         &request.task_context_snapshot,
         &request.session_snapshot,
         llm,
@@ -181,26 +213,52 @@ pub(in crate::runtime::runner) async fn execute_async_task_evaluation(
             reasoning_effort: request.reasoning_effort,
             timeout_context: &request.timeout_context,
         },
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => TaskEvaluationResult {
-            needs_evaluation: false,
-            updates: Vec::new(),
-            reasoning: format!("Evaluation failed: {error}"),
-            prompt_tokens: 0,
-            completion_tokens: 0,
+        acquire_dispatch_guard,
+        move || {
+            if let Some(metrics) = metrics_for_dispatch.as_ref() {
+                metrics.round_started(
+                    metrics_round_id,
+                    metrics_session_id,
+                    metrics_model_name,
+                    Utc::now(),
+                );
+            }
+            metrics_started_for_dispatch.store(true, Ordering::Release);
         },
+    )
+    .await;
+    let finished_at = Utc::now();
+    let (evaluation_result, error) = match evaluation {
+        Ok(result) => {
+            let error = result
+                .reasoning
+                .strip_prefix("Evaluation failed:")
+                .map(|_| result.reasoning.clone());
+            (result, error)
+        }
+        Err(error) => (
+            TaskEvaluationResult {
+                needs_evaluation: false,
+                updates: Vec::new(),
+                reasoning: format!("Evaluation failed: {error}"),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            },
+            Some(error.to_string()),
+        ),
     };
 
     AsyncTaskEvaluationResult {
+        metrics_round_id: request.metrics_round_id,
         shared_session_id: request.shared_session_id,
         round_number: request.round_number,
         based_on_task_context_version: request.based_on_task_context_version,
         task_list_title: request.task_list_title,
-        model_name: request.model_name,
         evaluation_result,
+        finished_at,
+        error,
+        metrics_started,
+        metrics_terminal,
     }
 }
 
@@ -379,13 +437,19 @@ pub(in crate::runtime::runner) fn apply_task_evaluation_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_task_evaluation_result, missing_completion_criteria, AsyncTaskEvaluationResult,
+        apply_task_evaluation_result, build_async_task_evaluation_request,
+        execute_async_task_evaluation, missing_completion_criteria, AsyncTaskEvaluationResult,
     };
     use crate::runtime::task_context::TaskLoopContext;
-    use bamboo_agent_core::Session;
+    use bamboo_agent_core::{AgentEvent, Message, Session, ToolSchema};
     use bamboo_domain::task::{TaskPhase, TaskPriority};
     use bamboo_domain::{TaskItem, TaskItemStatus, TaskList};
+    use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use chrono::Utc;
+    use futures::stream;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn session_with_single_in_progress_task() -> (Session, TaskLoopContext) {
         let mut session = Session::new("task-eval-session", "model");
@@ -410,6 +474,118 @@ mod tests {
         (session, context)
     }
 
+    struct BlockingEvaluationProvider {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        entered: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for BlockingEvaluationProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("provider release gate stays open");
+            permit.forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    #[tokio::test]
+    async fn task_evaluations_from_multiple_sessions_obey_shared_provider_model_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider: Arc<dyn LLMProvider> = Arc::new(BlockingEvaluationProvider {
+            active: active.clone(),
+            peak: peak.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(32);
+        let mut handles = Vec::new();
+
+        for index in 0..6 {
+            let session_id = format!("evaluation-session-{index}");
+            let mut session = Session::new(&session_id, "main-model");
+            let now = Utc::now();
+            session.set_task_list(TaskList {
+                session_id: session_id.clone(),
+                title: "Shared-budget task".to_string(),
+                items: vec![TaskItem {
+                    id: "task-1".to_string(),
+                    description: "evaluate me".to_string(),
+                    status: TaskItemStatus::InProgress,
+                    ..TaskItem::default()
+                }],
+                created_at: now,
+                updated_at: now,
+            });
+            session.set_task_list_version_meta("1");
+            let context = TaskLoopContext::from_session(&session);
+            let request = build_async_task_evaluation_request(
+                &context,
+                &session,
+                &session_id,
+                1,
+                Some("shared-fast-model"),
+                None,
+                crate::runtime::stream::handler::StreamTimeoutContext::default(),
+            )
+            .expect("request builds")
+            .expect("context exists");
+            let provider = provider.clone();
+            let event_tx = event_tx.clone();
+            handles.push(tokio::spawn(async move {
+                execute_async_task_evaluation(
+                    request,
+                    provider,
+                    event_tx,
+                    2,
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            }));
+        }
+
+        for expected_entered in [2, 4, 6] {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while entered.load(Ordering::SeqCst) < expected_entered {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("next cross-session evaluation batch dispatches");
+            assert!(active.load(Ordering::SeqCst) <= 2);
+            assert_eq!(peak.load(Ordering::SeqCst), 2);
+            release.add_permits(2);
+        }
+
+        let mut metric_ids = std::collections::HashSet::new();
+        for handle in handles {
+            let result = handle.await.expect("evaluation session joins");
+            assert!(result.metrics_started.load(Ordering::Acquire));
+            assert!(metric_ids.insert(result.metrics_round_id));
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn apply_task_evaluation_result_rejects_stale_results() {
         let (mut session, mut context) = session_with_single_in_progress_task();
@@ -420,11 +596,11 @@ mod tests {
             &mut session,
             "task-eval-session",
             AsyncTaskEvaluationResult {
+                metrics_round_id: "stale-evaluation".to_string(),
                 shared_session_id: "task-eval-session".to_string(),
                 round_number: 2,
                 based_on_task_context_version: 4,
                 task_list_title: Some("Eval Tasks".to_string()),
-                model_name: "fast-model".to_string(),
                 evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
                     needs_evaluation: true,
                     updates: vec![crate::runtime::task_evaluation::TaskItemUpdate {
@@ -439,6 +615,10 @@ mod tests {
                     prompt_tokens: 12,
                     completion_tokens: 6,
                 },
+                finished_at: Utc::now(),
+                error: None,
+                metrics_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                metrics_terminal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
 
@@ -461,11 +641,11 @@ mod tests {
             &mut session,
             "task-eval-session",
             AsyncTaskEvaluationResult {
+                metrics_round_id: "matching-evaluation".to_string(),
                 shared_session_id: "task-eval-session".to_string(),
                 round_number: 2,
                 based_on_task_context_version: context.version,
                 task_list_title: Some("Eval Tasks".to_string()),
-                model_name: "fast-model".to_string(),
                 evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
                     needs_evaluation: true,
                     updates: vec![crate::runtime::task_evaluation::TaskItemUpdate {
@@ -480,6 +660,10 @@ mod tests {
                     prompt_tokens: 12,
                     completion_tokens: 6,
                 },
+                finished_at: Utc::now(),
+                error: None,
+                metrics_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                metrics_terminal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
 

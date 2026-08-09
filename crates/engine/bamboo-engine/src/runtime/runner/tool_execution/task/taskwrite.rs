@@ -75,7 +75,7 @@ pub(super) async fn maybe_handle_taskwrite(
     reinitialize_task_context(task_context, session, session_id);
 }
 
-pub(in crate::runtime::runner) async fn persist_shared_task_list(
+async fn persist_shared_task_list(
     config: &AgentLoopConfig,
     session: &mut Session,
     shared_session_id: &str,

@@ -54,7 +54,6 @@ mod output_compressor;
 mod per_call;
 mod policy;
 mod task;
-pub(in crate::runtime::runner) use task::persist_shared_task_list;
 pub(crate) mod tool_error_collector;
 
 use loop_state::RoundExecutionState;
