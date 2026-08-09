@@ -73,6 +73,76 @@ impl RuntimeSessionPersistence for RecordingPersistence {
     }
 }
 
+struct RebasingTaskPersistence {
+    authoritative_task_list: bamboo_domain::TaskList,
+    local_saves: Mutex<Vec<(String, bamboo_domain::TaskList, String)>>,
+    root_patches: Mutex<Vec<(String, bamboo_domain::TaskList, String)>>,
+    full_saves: AtomicUsize,
+}
+
+impl RebasingTaskPersistence {
+    fn new(authoritative_task_list: bamboo_domain::TaskList) -> Self {
+        Self {
+            authoritative_task_list,
+            local_saves: Mutex::new(Vec::new()),
+            root_patches: Mutex::new(Vec::new()),
+            full_saves: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for RebasingTaskPersistence {
+    async fn save_runtime_session(&self, _session: &mut Session) -> io::Result<()> {
+        self.full_saves.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn save_runtime_control_plane(&self, session: &mut Session) -> io::Result<()> {
+        let candidate = session.task_list.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "candidate Task list is missing",
+            )
+        })?;
+        let candidate_version = session.task_list_version_meta().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "candidate Task version is missing",
+            )
+        })?;
+        self.local_saves
+            .lock()
+            .expect("local save recording lock")
+            .push((session.id.clone(), candidate, candidate_version));
+
+        // Model the real LockedSessionStore conflict-rebase contract: a
+        // competing evaluator already made E/v2 durable, so the local A/v1
+        // caller is rewritten to that authoritative snapshot before save
+        // returns successfully.
+        session.set_task_list(self.authoritative_task_list.clone());
+        session.set_task_list_version_meta("2");
+        Ok(())
+    }
+
+    async fn update_task_list_control_plane(
+        &self,
+        session_id: &str,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> io::Result<bool> {
+        self.root_patches
+            .lock()
+            .expect("root patch recording lock")
+            .push((
+                session_id.to_string(),
+                task_list.clone(),
+                version.to_string(),
+            ));
+        Ok(true)
+    }
+}
+
 struct SaveOnlyPersistence {
     full_saves: AtomicUsize,
     storage: Arc<dyn Storage>,
@@ -349,6 +419,99 @@ async fn child_taskwrite_saves_child_and_shared_root_control_planes_without_full
 }
 
 #[tokio::test]
+async fn child_taskwrite_publishes_snapshot_rebased_by_local_save_everywhere() {
+    let root_id = "rebased-task-root";
+    let child_id = "rebased-task-child";
+    let now = chrono::Utc::now();
+    let authoritative_task_list = bamboo_domain::TaskList {
+        session_id: root_id.to_string(),
+        title: "Evaluator authority".to_string(),
+        items: vec![bamboo_domain::TaskItem {
+            id: "evaluated-task".to_string(),
+            description: "Evaluator-owned task".to_string(),
+            status: TaskItemStatus::Completed,
+            ..bamboo_domain::TaskItem::default()
+        }],
+        created_at: now,
+        updated_at: now,
+    };
+    let persistence = Arc::new(RebasingTaskPersistence::new(
+        authoritative_task_list.clone(),
+    ));
+    let mut config = AgentLoopConfig::default();
+    config.persistence = Some(persistence.clone());
+    let mut child = Session::new_child(child_id, root_id, "model", "Child");
+    let mut task_context = None;
+    let (tx, mut rx) = mpsc::channel(4);
+    let (tool_call, result) = task_call_and_result();
+
+    maybe_handle_taskwrite(
+        &tool_call,
+        &result,
+        &mut child,
+        child_id,
+        &tx,
+        &config,
+        &mut task_context,
+    )
+    .await;
+
+    let local_saves = persistence
+        .local_saves
+        .lock()
+        .expect("local save recording lock")
+        .clone();
+    assert_eq!(local_saves.len(), 1);
+    let (saved_child_id, stale_candidate, stale_version) = &local_saves[0];
+    assert_eq!(saved_child_id, child_id);
+    assert_eq!(stale_version, "1");
+    assert_eq!(stale_candidate.items[0].description, "Refactor module");
+    assert_ne!(
+        serde_json::to_value(stale_candidate).expect("serialize stale candidate"),
+        serde_json::to_value(&authoritative_task_list).expect("serialize authority")
+    );
+
+    let root_patches = persistence
+        .root_patches
+        .lock()
+        .expect("root patch recording lock")
+        .clone();
+    assert_eq!(root_patches.len(), 1);
+    let (patched_root_id, patched_task_list, patched_version) = &root_patches[0];
+    assert_eq!(patched_root_id, root_id);
+    assert_eq!(patched_version, "2");
+    assert_eq!(
+        serde_json::to_value(patched_task_list).expect("serialize root patch"),
+        serde_json::to_value(&authoritative_task_list).expect("serialize authority")
+    );
+    assert_eq!(persistence.full_saves.load(Ordering::SeqCst), 0);
+
+    assert_eq!(child.task_list_version_meta().as_deref(), Some("2"));
+    assert_eq!(
+        serde_json::to_value(&child.task_list).expect("serialize live child Task list"),
+        serde_json::to_value(Some(&authoritative_task_list)).expect("serialize authority")
+    );
+    let context = task_context.expect("rebased Task context");
+    assert!(context.task_list_dirty);
+    assert_eq!(context.version, 2);
+    assert_eq!(
+        serde_json::to_value(
+            context.to_task_list_with_title(authoritative_task_list.title.clone())
+        )
+        .expect("serialize Task context"),
+        serde_json::to_value(&authoritative_task_list).expect("serialize authority")
+    );
+    let event_task_list = match rx.recv().await.expect("rebased Task event") {
+        AgentEvent::TaskListUpdated { task_list } => task_list,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert_eq!(
+        serde_json::to_value(event_task_list).expect("serialize Task event"),
+        serde_json::to_value(authoritative_task_list).expect("serialize authority")
+    );
+}
+
+#[tokio::test]
 async fn child_taskwrite_custom_fallback_full_load_and_save_preserve_message_histories() {
     let directory = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(
@@ -454,7 +617,7 @@ async fn child_taskwrite_root_cas_conflict_refreshes_repository_without_full_sav
     let mut config = AgentLoopConfig::default();
     config.storage = Some(storage);
     config.persistence = Some(repository.clone());
-    let (tx, _rx) = mpsc::channel(4);
+    let (tx, mut rx) = mpsc::channel(4);
     let (tool_call, result) = task_call_and_result();
     let taskwrite = tokio::spawn(async move {
         let mut task_context = None;
@@ -468,10 +631,19 @@ async fn child_taskwrite_root_cas_conflict_refreshes_repository_without_full_sav
             &mut task_context,
         )
         .await;
-        child
+        (child, task_context)
     });
 
     root_cas_reached.wait().await;
+    let stale_child_candidate = first_inner
+        .load_runtime_control_plane(child_id)
+        .await
+        .expect("load staged child candidate")
+        .expect("staged child candidate exists");
+    assert_eq!(
+        stale_child_candidate.task_list_version_meta().as_deref(),
+        Some("1")
+    );
     let original = second_inner
         .load_runtime_control_plane(root_id)
         .await
@@ -492,33 +664,91 @@ async fn child_taskwrite_root_cas_conflict_refreshes_repository_without_full_sav
         .await
         .expect("commit competing root Task"));
     release_root_cas.wait().await;
-    let child = taskwrite.await.expect("Taskwrite task");
+    let (child, task_context) = taskwrite.await.expect("Taskwrite task");
 
     assert_eq!(
         gated_storage.full_saves.load(Ordering::SeqCst),
         0,
         "an unconditional CAS conflict is an error, not the Ok(false) legacy fallback signal"
     );
-    let durable = first_inner
+    let durable_root = first_inner
         .load_session(root_id)
         .await
         .expect("load durable root")
         .expect("durable root exists");
-    let cached = repository.load(root_id).await.expect("cached root");
-    for (tier, session) in [("durable", &durable), ("cache", &cached)] {
+    let durable_child = first_inner
+        .load_session(child_id)
+        .await
+        .expect("load durable child")
+        .expect("durable child exists");
+    let cached_root = repository.load(root_id).await.expect("cached root");
+    let cached_child = repository.load(child_id).await.expect("cached child");
+    for (tier, session) in [
+        ("durable root", &durable_root),
+        ("durable child", &durable_child),
+        ("cache root", &cached_root),
+        ("cache child", &cached_child),
+        ("live child", &child),
+    ] {
         assert_eq!(session.task_list_version_meta().as_deref(), Some("1"));
         assert_eq!(
             session.task_list.as_ref().map(|list| list.title.as_str()),
             Some("concurrent winner"),
             "tier={tier}"
         );
-        assert_eq!(session.messages.len(), 1, "tier={tier}");
     }
-    assert_ne!(
-        task_list_value(&child),
-        task_list_value(&durable),
-        "the losing child candidate must not be published into the shared root"
+    assert_eq!(durable_root.messages.len(), 1);
+    let winner_task_list = durable_root.task_list.as_ref().expect("winner task list");
+    let context = task_context.expect("Task context follows authoritative winner");
+    assert!(context.task_list_dirty);
+    assert_eq!(
+        serde_json::to_value(context.to_task_list_with_title(winner_task_list.title.clone()))
+            .expect("serialize Task context"),
+        serde_json::to_value(winner_task_list).expect("serialize winner task list")
     );
+    let event_task_list = match rx.recv().await.expect("authoritative Task event") {
+        AgentEvent::TaskListUpdated { task_list } => task_list,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert_eq!(
+        serde_json::to_value(event_task_list).expect("serialize event task list"),
+        serde_json::to_value(winner_task_list).expect("serialize winner task list")
+    );
+
+    // A real evaluator result produced from the losing A/v1 snapshot must not
+    // be allowed to overwrite the reconciled B/v1 pair merely because the
+    // numeric generation is unchanged.
+    let stale_task_list = stale_child_candidate
+        .task_list
+        .expect("staged child candidate task list");
+    let mut stale_evaluation = stale_task_list.clone();
+    stale_evaluation.title = "evaluation based on losing candidate".to_string();
+    stale_evaluation.updated_at = chrono::Utc::now();
+    assert!(
+        !RuntimeSessionPersistence::update_task_list_control_planes_if_version(
+            repository.as_ref(),
+            child_id,
+            root_id,
+            "1",
+            &stale_task_list,
+            &stale_evaluation,
+            "2",
+        )
+        .await
+        .expect("stale evaluator CAS returns a clean conflict")
+    );
+    for id in [child_id, root_id] {
+        let durable = first_inner
+            .load_session(id)
+            .await
+            .expect("reload after stale evaluator")
+            .expect("session remains");
+        assert_eq!(durable.task_list_version_meta().as_deref(), Some("1"));
+        assert_eq!(
+            durable.task_list.as_ref().map(|list| list.title.as_str()),
+            Some("concurrent winner")
+        );
+    }
 }
 
 #[tokio::test]

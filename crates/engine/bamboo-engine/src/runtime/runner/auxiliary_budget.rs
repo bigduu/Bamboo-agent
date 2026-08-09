@@ -348,6 +348,10 @@ mod tests {
                         shared_session_id: task_session.id.clone(),
                         round_number: 1,
                         based_on_task_context_version: task_context.version,
+                        based_on_task_list: task_session
+                            .task_list
+                            .clone()
+                            .expect("task session list"),
                         task_list_title: Some("Tasks".to_string()),
                         model_name: "shared-fast-model".to_string(),
                         timeout_context:
@@ -514,6 +518,10 @@ mod tests {
                         shared_session_id: task_session.id.clone(),
                         round_number: 1,
                         based_on_task_context_version: task_context.version,
+                        based_on_task_list: task_session
+                            .task_list
+                            .clone()
+                            .expect("task session list"),
                         task_list_title: Some("Tasks".to_string()),
                         model_name: model.to_string(),
                         timeout_context: timeout_context(),

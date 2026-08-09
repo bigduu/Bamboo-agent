@@ -72,6 +72,36 @@ fn adopt_durable_task_control_plane(session: &mut Session, durable: &Session) {
     }
 }
 
+fn task_list_snapshot_matches(
+    session: &Session,
+    expected_task_list: &bamboo_domain::TaskList,
+) -> std::io::Result<bool> {
+    Ok(serde_json::to_value(&session.task_list)
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        == serde_json::to_value(Some(expected_task_list))
+            .map_err(|error| std::io::Error::other(error.to_string()))?)
+}
+
+fn unconditional_task_patch_would_regress(
+    durable: &Session,
+    incoming_task_list: &bamboo_domain::TaskList,
+    incoming_version: &str,
+) -> std::io::Result<bool> {
+    let same_list = task_list_snapshot_matches(durable, incoming_task_list)?;
+    let Some(durable_version) = durable.task_list_version_meta() else {
+        return Ok(false);
+    };
+    match (
+        incoming_version.parse::<u64>(),
+        durable_version.parse::<u64>(),
+    ) {
+        (Ok(incoming), Ok(durable)) => {
+            Ok(incoming < durable || (incoming == durable && !same_list))
+        }
+        _ => Ok(incoming_version != durable_version || !same_list),
+    }
+}
+
 // ── LockedSessionStore ────────────────────────────────────────────────
 
 /// Wraps a [`Storage`] implementation with per-session write serialization.
@@ -320,6 +350,12 @@ impl LockedSessionStore {
         let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
             return Ok(false);
         };
+        if unconditional_task_patch_would_regress(&latest, task_list, version)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("Task control-plane changed while patching session {session_id}"),
+            ));
+        }
         let original = latest.clone();
         latest.task_list = Some(task_list.clone());
         latest.set_task_list_version_meta(version.to_string());
@@ -344,6 +380,7 @@ impl LockedSessionStore {
         &self,
         session_id: &str,
         expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
         task_list: &bamboo_domain::TaskList,
         version: &str,
         publish: F,
@@ -355,7 +392,9 @@ impl LockedSessionStore {
         let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
             return Ok(false);
         };
-        if latest.task_list_version_meta().as_deref() != Some(expected_version) {
+        if latest.task_list_version_meta().as_deref() != Some(expected_version)
+            || !task_list_snapshot_matches(&latest, expected_task_list)?
+        {
             return Ok(false);
         }
         let original = latest.clone();
@@ -382,6 +421,7 @@ impl LockedSessionStore {
         session_id: &str,
         shared_session_id: &str,
         expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
         task_list: &bamboo_domain::TaskList,
         version: &str,
         publish: F,
@@ -394,6 +434,7 @@ impl LockedSessionStore {
                 .update_task_list_control_plane_if_version_and_publish(
                     session_id,
                     expected_version,
+                    expected_task_list,
                     task_list,
                     version,
                     |session| publish(session, session),
@@ -429,6 +470,8 @@ impl LockedSessionStore {
         };
         if local.task_list_version_meta().as_deref() != Some(expected_version)
             || shared.task_list_version_meta().as_deref() != Some(expected_version)
+            || !task_list_snapshot_matches(&local, expected_task_list)?
+            || !task_list_snapshot_matches(&shared, expected_task_list)?
         {
             return Ok(false);
         }
@@ -946,12 +989,14 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         &self,
         session_id: &str,
         expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
         task_list: &bamboo_domain::TaskList,
         version: &str,
     ) -> std::io::Result<bool> {
         self.update_task_list_control_plane_if_version_and_publish(
             session_id,
             expected_version,
+            expected_task_list,
             task_list,
             version,
             |_| {},
@@ -964,6 +1009,7 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         session_id: &str,
         shared_session_id: &str,
         expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
         task_list: &bamboo_domain::TaskList,
         version: &str,
     ) -> std::io::Result<bool> {
@@ -971,6 +1017,7 @@ impl RuntimeSessionPersistence for LockedSessionStore {
             session_id,
             shared_session_id,
             expected_version,
+            expected_task_list,
             task_list,
             version,
             |_, _| {},
@@ -2906,6 +2953,7 @@ mod tests {
             child_id,
             root_id,
             "1",
+            &task_list("current child"),
             &task_list("stale evaluator"),
             "3",
         )
@@ -2970,7 +3018,7 @@ mod tests {
         root.metadata
             .insert("unrelated.root".to_string(), "preserve".to_string());
         root.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("root-run"));
-        root.set_task_list(task_list("old root"));
+        root.set_task_list(task_list("old shared"));
         root.set_task_list_version_meta("1");
         inner.save_session(&root).await.expect("seed root");
 
@@ -2980,7 +3028,7 @@ mod tests {
             .metadata
             .insert("unrelated.child".to_string(), "preserve".to_string());
         child.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("child-run"));
-        child.set_task_list(task_list("old child"));
+        child.set_task_list(task_list("old shared"));
         child.set_task_list_version_meta("1");
         inner.save_session(&child).await.expect("seed child");
 
@@ -2998,6 +3046,7 @@ mod tests {
                 child_id,
                 root_id,
                 "1",
+                &task_list("old shared"),
                 &task_list("evaluated"),
                 "2",
             )
@@ -3175,6 +3224,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_task_cas_rejects_same_version_divergent_snapshot_without_callback() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "single-task-exact-snapshot";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let durable_winner = task_list("durable winner");
+        let stale_snapshot = task_list("stale same-version snapshot");
+        let mut session = fresh(session_id);
+        session.set_task_list(durable_winner.clone());
+        session.set_task_list_version_meta("1");
+        storage.save_session(&session).await.expect("seed session");
+
+        let published = Arc::new(AtomicBool::new(false));
+        let callback = published.clone();
+        assert!(!store
+            .update_task_list_control_plane_if_version_and_publish(
+                session_id,
+                "1",
+                &stale_snapshot,
+                &task_list("stale evaluation"),
+                "2",
+                move |_| callback.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect("same-version divergence is a clean stale result"));
+        assert!(!published.load(Ordering::SeqCst));
+        let durable = storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .expect("session remains");
+        assert_eq!(durable.task_list_version_meta().as_deref(), Some("1"));
+        assert_eq!(
+            serde_json::to_value(&durable.task_list).expect("serialize durable Task list"),
+            serde_json::to_value(Some(&durable_winner)).expect("serialize expected Task list")
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_task_cas_rejects_same_version_divergent_snapshot_without_callback() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let root_id = "paired-task-exact-snapshot-root";
+        let child_id = "paired-task-exact-snapshot-child";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let durable_winner = task_list("durable winner");
+        let stale_snapshot = task_list("stale same-version snapshot");
+        let mut root = fresh(root_id);
+        root.set_task_list(durable_winner.clone());
+        root.set_task_list_version_meta("1");
+        storage.save_session(&root).await.expect("seed root");
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.set_task_list(durable_winner.clone());
+        child.set_task_list_version_meta("1");
+        storage.save_session(&child).await.expect("seed child");
+
+        let published = Arc::new(AtomicBool::new(false));
+        let callback = published.clone();
+        assert!(!store
+            .update_task_list_control_planes_if_version_and_publish(
+                child_id,
+                root_id,
+                "1",
+                &stale_snapshot,
+                &task_list("stale evaluation"),
+                "2",
+                move |_, _| callback.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect("same-version divergence is a clean stale result"));
+        assert!(!published.load(Ordering::SeqCst));
+        for id in [child_id, root_id] {
+            let durable = storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .expect("session remains");
+            assert_eq!(durable.task_list_version_meta().as_deref(), Some("1"));
+            assert_eq!(
+                serde_json::to_value(&durable.task_list).expect("serialize durable Task list"),
+                serde_json::to_value(Some(&durable_winner)).expect("serialize expected Task list")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unconditional_root_task_patch_reports_final_cas_conflict_without_publishing() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().to_path_buf();
@@ -3293,6 +3442,7 @@ mod tests {
         let second_published = Arc::new(AtomicBool::new(false));
         let first_callback = first_published.clone();
         let second_callback = second_published.clone();
+        let expected = task_list("original");
         let first_candidate = task_list("candidate one");
         let second_candidate = task_list("candidate two");
 
@@ -3301,6 +3451,7 @@ mod tests {
         let first = first_store.update_task_list_control_plane_if_version_and_publish(
             root_id,
             "1",
+            &expected,
             &first_candidate,
             "2",
             move |_| first_callback.store(true, Ordering::SeqCst),
@@ -3308,6 +3459,7 @@ mod tests {
         let second = second_store.update_task_list_control_plane_if_version_and_publish(
             root_id,
             "1",
+            &expected,
             &second_candidate,
             "2",
             move |_| second_callback.store(true, Ordering::SeqCst),
@@ -3356,11 +3508,11 @@ mod tests {
         };
 
         let mut root = fresh(root_id);
-        root.set_task_list(task_list("original root"));
+        root.set_task_list(task_list("original shared"));
         root.set_task_list_version_meta("1");
         first_inner.save_session(&root).await.expect("seed root");
         let mut child = Session::new_child(child_id, root_id, "model", "child");
-        child.set_task_list(task_list("original child"));
+        child.set_task_list(task_list("original shared"));
         child.set_task_list_version_meta("1");
         first_inner.save_session(&child).await.expect("seed child");
 
@@ -3384,6 +3536,7 @@ mod tests {
         let second_published = Arc::new(AtomicBool::new(false));
         let first_published_callback = first_published.clone();
         let second_published_callback = second_published.clone();
+        let expected = task_list("original shared");
         let first_candidate = task_list("candidate one");
         let second_candidate = task_list("candidate two");
 
@@ -3391,6 +3544,7 @@ mod tests {
             child_id,
             root_id,
             "1",
+            &expected,
             &first_candidate,
             "2",
             move |_, _| first_published_callback.store(true, Ordering::SeqCst),
@@ -3399,6 +3553,7 @@ mod tests {
             child_id,
             root_id,
             "1",
+            &expected,
             &second_candidate,
             "2",
             move |_, _| second_published_callback.store(true, Ordering::SeqCst),
@@ -3459,7 +3614,7 @@ mod tests {
         root.add_message(Message::user("root transcript"));
         root.metadata
             .insert("unrelated.root".to_string(), "preserve".to_string());
-        root.set_task_list(task_list("old root"));
+        root.set_task_list(task_list("old shared"));
         root.set_task_list_version_meta("1");
         inner.save_session(&root).await.expect("seed root");
 
@@ -3468,7 +3623,7 @@ mod tests {
         child
             .metadata
             .insert("unrelated.child".to_string(), "preserve".to_string());
-        child.set_task_list(task_list("old child"));
+        child.set_task_list(task_list("old shared"));
         child.set_task_list_version_meta("1");
         inner.save_session(&child).await.expect("seed child");
 
@@ -3483,6 +3638,7 @@ mod tests {
                 child_id,
                 root_id,
                 "1",
+                &task_list("old shared"),
                 &task_list("must roll back"),
                 "2",
                 move |_, _| published_for_callback.store(true, Ordering::SeqCst),
@@ -3500,13 +3656,13 @@ mod tests {
         for (session, title, transcript, metadata_key) in [
             (
                 &durable_root,
-                "old root",
+                "old shared",
                 "root transcript",
                 "unrelated.root",
             ),
             (
                 &durable_child,
-                "old child",
+                "old shared",
                 "child transcript",
                 "unrelated.child",
             ),

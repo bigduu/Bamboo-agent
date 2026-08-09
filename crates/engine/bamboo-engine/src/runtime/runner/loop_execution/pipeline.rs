@@ -911,6 +911,7 @@ async fn apply_completed_task_evaluation(
                         &state.session_id,
                         &result.shared_session_id,
                         &expected_version,
+                        &result.based_on_task_list,
                         &task_list,
                         &new_version,
                     )
@@ -5726,6 +5727,7 @@ mod tests {
             session_id: &str,
             shared_session_id: &str,
             expected_version: &str,
+            _expected_task_list: &bamboo_domain::TaskList,
             _task_list: &bamboo_domain::TaskList,
             version: &str,
         ) -> std::io::Result<bool> {
@@ -6084,6 +6086,7 @@ mod tests {
         session
             .metadata
             .insert("task_list_version".to_string(), "1".to_string());
+        let based_on_task_list = session.task_list.clone().expect("task list");
 
         let mut state = super::super::startup::LoopRunState {
             session_id: "session-task-eval".to_string(),
@@ -6101,6 +6104,7 @@ mod tests {
                         shared_session_id: "session-task-eval".to_string(),
                         round_number: 1,
                         based_on_task_context_version: 1,
+                        based_on_task_list,
                         task_list_title: Some("Eval Tasks".to_string()),
                         evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
                             needs_evaluation: true,

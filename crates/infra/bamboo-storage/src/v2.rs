@@ -82,12 +82,46 @@ struct RuntimeTaskTransactionJournal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeTaskJournalMarkerState {
+    Prepared,
+    Committing,
+    Committed,
+}
+
+impl RuntimeTaskJournalMarkerState {
+    fn from_path(path: &Path) -> Option<Self> {
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("json") => Some(Self::Prepared),
+            Some("committing") => Some(Self::Committing),
+            Some("committed") => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+enum RuntimeTaskJournalFinalizeError {
+    Rollback(io::Error),
+    RecoveryRequired(io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeTaskTransactionFault {
     FirstUpdatedWrite,
     SecondUpdatedWrite,
     JournalRemove,
     FirstRollbackWrite,
     SecondRollbackWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeTaskDurabilityEvent {
+    JournalPublished,
+    SingleUpdatedSidecarPublished,
+    FirstUpdatedSidecarPublished,
+    SecondUpdatedSidecarPublished,
+    FirstRollbackSidecarPublished,
+    SecondRollbackSidecarPublished,
+    JournalDeactivated,
 }
 
 struct RuntimeTaskTransactionReadGuard {
@@ -411,6 +445,8 @@ pub struct SessionStoreV2 {
     runtime_task_faults: std::sync::Mutex<Vec<RuntimeTaskTransactionFault>>,
     #[cfg(test)]
     runtime_task_first_write_pause: std::sync::Mutex<Option<RuntimeTaskFirstWritePause>>,
+    #[cfg(test)]
+    runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
 }
 
 impl SessionStoreV2 {
@@ -532,6 +568,8 @@ impl SessionStoreV2 {
             runtime_task_faults: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             runtime_task_first_write_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
         };
 
         // Create and permission the private journal directory once at store
@@ -785,22 +823,36 @@ impl SessionStoreV2 {
         let path = self
             .bamboo_home_dir
             .join(RUNTIME_TASK_TRANSACTION_LOCK_FILE);
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path)?;
-            if exclusive {
-                FileExt::lock_exclusive(&file)?;
-            } else {
-                FileExt::lock_shared(&file)?;
+        let open = |path: PathBuf| async move {
+            tokio::task::spawn_blocking(move || {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&path)?;
+                if exclusive {
+                    FileExt::lock_exclusive(&file)?;
+                } else {
+                    FileExt::lock_shared(&file)?;
+                }
+                Ok::<_, io::Error>(file)
+            })
+            .await
+            .map_err(|error| other_io_error(format!("join runtime Task lock task: {error}")))?
+        };
+
+        match open(path.clone()).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Keep the existing save-session recovery contract when an
+                // embedding removes an otherwise idle Bamboo home between
+                // construction and first use. The normal hot path performs no
+                // mkdir; only a missing lock-file parent takes this retry.
+                fs::create_dir_all(&self.bamboo_home_dir).await?;
+                open(path).await
             }
-            Ok(file)
-        })
-        .await
-        .map_err(|error| other_io_error(format!("join runtime Task lock task: {error}")))?
+            result => result,
+        }
     }
 
     async fn lock_index_file_exclusive(&self) -> io::Result<SessionIndexFileGuard> {
@@ -1079,6 +1131,12 @@ impl SessionStoreV2 {
 
     async fn ensure_runtime_task_transaction_dir(&self) -> io::Result<PathBuf> {
         let path = self.runtime_task_transaction_dir();
+        let home_existed = fs::try_exists(&self.bamboo_home_dir).await?;
+        fs::create_dir_all(&self.bamboo_home_dir).await?;
+        if !home_existed {
+            sync_parent_directory_entry(&self.bamboo_home_dir).await?;
+        }
+        let path_existed = fs::try_exists(&path).await?;
         fs::create_dir_all(&path).await?;
         // Journals contain only Task lists/generations (never transcripts or
         // arbitrary metadata), but Task descriptions may still be private user
@@ -1087,6 +1145,11 @@ impl SessionStoreV2 {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+        if !path_existed {
+            // The journal file cannot be durable if the directory containing it
+            // can itself disappear after a power loss.
+            sync_parent_directory_entry(&path).await?;
         }
         Ok(path)
     }
@@ -1134,6 +1197,26 @@ impl SessionStoreV2 {
             .lock()
             .expect("runtime task fault lock")
             .push(fault);
+    }
+
+    fn record_runtime_task_durability_event(&self, event: RuntimeTaskDurabilityEvent) {
+        #[cfg(test)]
+        self.runtime_task_durability_events
+            .lock()
+            .expect("runtime task durability event lock")
+            .push(event);
+        #[cfg(not(test))]
+        let _ = event;
+    }
+
+    #[cfg(test)]
+    fn take_runtime_task_durability_events(&self) -> Vec<RuntimeTaskDurabilityEvent> {
+        std::mem::take(
+            &mut *self
+                .runtime_task_durability_events
+                .lock()
+                .expect("runtime task durability event lock"),
+        )
     }
 
     #[cfg(test)]
@@ -1212,7 +1295,11 @@ impl SessionStoreV2 {
         Ok(Some(session))
     }
 
-    async fn write_existing_runtime_sidecar_unchecked(&self, session: &Session) -> io::Result<()> {
+    async fn write_existing_runtime_sidecar_durable_unchecked(
+        &self,
+        session: &Session,
+        event: RuntimeTaskDurabilityEvent,
+    ) -> io::Result<()> {
         validate_session_id(&session.id)?;
         let Some(rel) = self.resolve_rel_path(&session.id).await else {
             return Err(io::Error::new(
@@ -1220,8 +1307,10 @@ impl SessionStoreV2 {
                 format!("session {} has no persisted runtime target", session.id),
             ));
         };
-        self.write_runtime_sidecar(&self.abs_path_from_rel(&rel), session)
-            .await
+        self.write_runtime_sidecar_durable(&self.abs_path_from_rel(&rel), session)
+            .await?;
+        self.record_runtime_task_durability_event(event);
+        Ok(())
     }
 
     async fn runtime_task_journal_paths(&self) -> io::Result<Vec<PathBuf>> {
@@ -1233,14 +1322,15 @@ impl SessionStoreV2 {
         };
         let mut paths = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
             if entry
                 .file_type()
                 .await
                 .map(|kind| kind.is_file())
                 .unwrap_or(false)
-                && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                && RuntimeTaskJournalMarkerState::from_path(&path).is_some()
             {
-                paths.push(entry.path());
+                paths.push(path);
             }
         }
         paths.sort();
@@ -1311,13 +1401,63 @@ impl SessionStoreV2 {
         let path = dir.join(format!("{}.json", journal.transaction_id));
         let bytes = serde_json::to_vec(journal)
             .map_err(|error| other_io_error(format!("serialize Task undo journal: {error}")))?;
-        atomic_write(&path, &bytes).await?;
+        durable_atomic_write(&path, &bytes).await?;
+        self.record_runtime_task_durability_event(RuntimeTaskDurabilityEvent::JournalPublished);
         Ok(path)
     }
 
     async fn remove_runtime_task_journal(&self, path: &Path) -> io::Result<()> {
-        self.maybe_fail_runtime_task_transaction(RuntimeTaskTransactionFault::JournalRemove)?;
-        fs::remove_file(path).await
+        durable_deactivate_recovery_marker(path).await?;
+        self.record_runtime_task_durability_event(RuntimeTaskDurabilityEvent::JournalDeactivated);
+        Ok(())
+    }
+
+    async fn remove_runtime_task_journal_family(
+        &self,
+        journal: &RuntimeTaskTransactionJournal,
+    ) -> io::Result<()> {
+        let dir = self.runtime_task_transaction_dir();
+        for extension in ["json", "committing", "committed"] {
+            let path = dir.join(format!("{}.{}", journal.transaction_id, extension));
+            match fs::try_exists(&path).await {
+                Ok(true) => self.remove_runtime_task_journal(&path).await?,
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Transition a prepared undo journal through a fail-closed intermediate
+    /// name to a committed marker, then durably deactivate it. Recovery rolls
+    /// back `.json`/`.committing`, but never rolls back `.committed`; a failure
+    /// after the committed rename therefore cannot turn two durable sidecars
+    /// into a later undo.
+    async fn finalize_runtime_task_journal(
+        &self,
+        path: &Path,
+    ) -> Result<(), RuntimeTaskJournalFinalizeError> {
+        self.maybe_fail_runtime_task_transaction(RuntimeTaskTransactionFault::JournalRemove)
+            .map_err(RuntimeTaskJournalFinalizeError::Rollback)?;
+
+        let committing = path.with_extension("committing");
+        atomic_rename(path, &committing)
+            .await
+            .map_err(RuntimeTaskJournalFinalizeError::Rollback)?;
+        sync_parent_directory_entry(&committing)
+            .await
+            .map_err(RuntimeTaskJournalFinalizeError::Rollback)?;
+
+        let committed = path.with_extension("committed");
+        atomic_rename(&committing, &committed)
+            .await
+            .map_err(RuntimeTaskJournalFinalizeError::Rollback)?;
+        sync_parent_directory_entry(&committed)
+            .await
+            .map_err(RuntimeTaskJournalFinalizeError::RecoveryRequired)?;
+        self.remove_runtime_task_journal(&committed)
+            .await
+            .map_err(RuntimeTaskJournalFinalizeError::RecoveryRequired)
     }
 
     async fn restore_runtime_task_undo(
@@ -1337,7 +1477,16 @@ impl SessionStoreV2 {
         };
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
-        self.write_existing_runtime_sidecar_unchecked(&current)
+        let event = match fault {
+            RuntimeTaskTransactionFault::FirstRollbackWrite => {
+                RuntimeTaskDurabilityEvent::FirstRollbackSidecarPublished
+            }
+            RuntimeTaskTransactionFault::SecondRollbackWrite => {
+                RuntimeTaskDurabilityEvent::SecondRollbackSidecarPublished
+            }
+            _ => unreachable!("rollback helper only accepts rollback write faults"),
+        };
+        self.write_existing_runtime_sidecar_durable_unchecked(&current, event)
             .await
     }
 
@@ -1379,7 +1528,15 @@ impl SessionStoreV2 {
         path: &Path,
         journal: &RuntimeTaskTransactionJournal,
     ) -> io::Result<()> {
-        self.rollback_runtime_task_journal(journal).await?;
+        let state = RuntimeTaskJournalMarkerState::from_path(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid runtime Task journal marker extension",
+            )
+        })?;
+        if state != RuntimeTaskJournalMarkerState::Committed {
+            self.rollback_runtime_task_journal(journal).await?;
+        }
         self.remove_runtime_task_journal(path).await
     }
 
@@ -1427,6 +1584,12 @@ impl SessionStoreV2 {
         let paths = self.runtime_task_journal_paths().await?;
         for path in paths {
             let journal = self.read_runtime_task_journal(&path).await?;
+            if RuntimeTaskJournalMarkerState::from_path(&path)
+                == Some(RuntimeTaskJournalMarkerState::Committed)
+            {
+                self.recover_runtime_task_journal(&path, &journal).await?;
+                continue;
+            }
             if journal.first.session_id != first_session_id
                 || journal.second.session_id != second_session_id
             {
@@ -1453,14 +1616,14 @@ impl SessionStoreV2 {
 
     async fn fail_runtime_task_transaction_with_rollback(
         &self,
-        path: &Path,
+        _path: &Path,
         journal: &RuntimeTaskTransactionJournal,
         primary: io::Error,
     ) -> io::Result<()> {
         let primary_kind = primary.kind();
         let primary_message = primary.to_string();
         match self.rollback_runtime_task_journal(journal).await {
-            Ok(()) => match self.remove_runtime_task_journal(path).await {
+            Ok(()) => match self.remove_runtime_task_journal_family(journal).await {
                 Ok(()) => {
                     self.runtime_task_recovery_required
                         .store(false, Ordering::Release);
@@ -1532,8 +1695,11 @@ impl SessionStoreV2 {
                 .task_list_version_meta()
                 .expect("validated updated Task generation"),
         );
-        self.write_existing_runtime_sidecar_unchecked(&committed)
-            .await?;
+        self.write_existing_runtime_sidecar_durable_unchecked(
+            &committed,
+            RuntimeTaskDurabilityEvent::SingleUpdatedSidecarPublished,
+        )
+        .await?;
         Ok(true)
     }
 
@@ -1672,7 +1838,10 @@ impl SessionStoreV2 {
                 .map(|()| true);
         }
         if let Err(error) = self
-            .write_existing_runtime_sidecar_unchecked(&first_commit)
+            .write_existing_runtime_sidecar_durable_unchecked(
+                &first_commit,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+            )
             .await
         {
             return self
@@ -1694,7 +1863,10 @@ impl SessionStoreV2 {
                 .map(|()| true);
         }
         if let Err(error) = self
-            .write_existing_runtime_sidecar_unchecked(&second_commit)
+            .write_existing_runtime_sidecar_durable_unchecked(
+                &second_commit,
+                RuntimeTaskDurabilityEvent::SecondUpdatedSidecarPublished,
+            )
             .await
         {
             return self
@@ -1703,11 +1875,25 @@ impl SessionStoreV2 {
                 .map(|()| true);
         }
 
-        if let Err(error) = self.remove_runtime_task_journal(&journal_path).await {
-            return self
-                .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error)
-                .await
-                .map(|()| true);
+        match self.finalize_runtime_task_journal(&journal_path).await {
+            Ok(()) => {}
+            Err(RuntimeTaskJournalFinalizeError::Rollback(error)) => {
+                return self
+                    .fail_runtime_task_transaction_with_rollback(&journal_path, &journal, error)
+                    .await
+                    .map(|()| true);
+            }
+            Err(RuntimeTaskJournalFinalizeError::RecoveryRequired(error)) => {
+                // Both sidecars were synchronized before the committed marker
+                // transition began. Never roll them back after a committed
+                // marker may be visible: exclusive recovery will retain the
+                // committed pair and durably deactivate that marker.
+                self.runtime_task_recovery_required
+                    .store(true, Ordering::Release);
+                return Err(other_io_error(format!(
+                    "runtime Task transaction committed durably but marker cleanup requires recovery: {error}"
+                )));
+            }
         }
         self.runtime_task_recovery_required
             .store(false, Ordering::Release);
@@ -1808,6 +1994,21 @@ impl SessionStoreV2 {
         fs::write(&tmp, bytes).await?;
         atomic_rename(&tmp, &path).await?;
         Ok(())
+    }
+
+    /// Task CAS/transaction replacement with a file+directory durability
+    /// boundary. Ordinary runtime saves intentionally keep the cheaper helper
+    /// above; only authoritative Task commits and recovery pay these fsyncs.
+    async fn write_runtime_sidecar_durable(
+        &self,
+        abs_dir: &Path,
+        session: &Session,
+    ) -> io::Result<()> {
+        let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
+        let snapshot = runtime_sidecar_snapshot(session);
+        let bytes = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        durable_atomic_write(&path, &bytes).await
     }
 
     /// One-shot migration: create the runtime sidecar (`runtime.json`) for every
@@ -2410,9 +2611,11 @@ pub struct CleanupResult {
 ///
 /// Residuals (tracked in #166): the rename + parent directory are not fsync'd, so
 /// after a power loss the file may revert to the OLD complete content (still never
-/// torn); a crash BETWEEN temp-create and rename leaks an orphan `*.tmp.*` (disk
-/// litter, not corruption — no sweep yet); and [`atomic_rename`] is
-/// remove-then-rename on Windows, where a crash in that window can lose the target.
+/// torn), and a crash BETWEEN temp-create and rename leaks an orphan `*.tmp.*`
+/// (disk litter, not corruption — no sweep yet). Windows replacement is a true
+/// `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`, so it has no remove-first gap.
+/// Task CAS/transaction paths use [`durable_atomic_write`] below, which also
+/// synchronizes the published directory entry.
 pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
@@ -2432,21 +2635,104 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 async fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
-    // Best-effort atomic on Unix. On Windows, rename cannot overwrite.
-    match fs::rename(from, to).await {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            if to.exists() {
-                let _ = fs::remove_file(to).await;
-            }
-            fs::rename(from, to).await.map_err(|e| {
-                other_io_error(format!(
-                    "failed to rename {:?} -> {:?}: {} (original: {})",
-                    from, to, e, err
-                ))
-            })
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to).await
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let source: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
+}
+
+/// Flush the directory entry containing `path` after a create/rename/remove.
+/// Unix exposes directory handles through `std`; Windows does not, so Windows
+/// transaction renames use `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` above as
+/// the strongest portable completion boundary available here.
+async fn sync_parent_directory_entry(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    #[cfg(unix)]
+    {
+        let parent = parent.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
+            .await
+            .map_err(|error| other_io_error(format!("join directory sync task: {error}")))?
+    }
+    #[cfg(windows)]
+    {
+        let _ = parent;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+}
+
+/// Transaction-only durable replacement. Unlike ordinary sidecar writes, the
+/// temp contents and the published directory entry are both synchronized
+/// before this returns. Windows uses a true replace-existing primitive, never
+/// the target-loss-prone remove-then-rename fallback.
+async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let tmp = path.with_extension(format!("durable.tmp.{}", Uuid::new_v4()));
+    let write_result = async {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await
+    }
+    .await;
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(error);
+    }
+    if let Err(error) = atomic_rename(&tmp, path).await {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(error);
+    }
+    sync_parent_directory_entry(path).await
+}
+
+/// Durably remove an active recovery marker without relying on directory
+/// unlink persistence. The marker is first renamed to an extension the scanner
+/// never treats as active; a resurrected cleanup tombstone is therefore inert.
+async fn durable_deactivate_recovery_marker(path: &Path) -> io::Result<()> {
+    let tombstone = path.with_extension(format!("removed.{}", Uuid::new_v4()));
+    atomic_rename(path, &tombstone).await?;
+    sync_parent_directory_entry(&tombstone).await?;
+
+    // Once the rename above is durable, cleanup cannot affect recovery
+    // correctness. A power-loss-resurrected tombstone remains non-scannable.
+    if fs::remove_file(&tombstone).await.is_ok() {
+        let _ = sync_parent_directory_entry(&tombstone).await;
+    }
+    Ok(())
 }
 
 fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
@@ -2837,10 +3123,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_task_success_records_durable_publish_order() -> io::Result<()> {
+        let (storage, _temp) = create_temp_storage().await?;
+        let (child_original, child_updated, root_original, root_updated) =
+            seed_runtime_task_transaction_pair(&storage).await?;
+        assert!(storage.take_runtime_task_durability_events().is_empty());
+
+        assert!(
+            storage
+                .save_task_control_planes_atomically(
+                    &child_original,
+                    &child_updated,
+                    &root_original,
+                    &root_updated,
+                )
+                .await?
+        );
+        assert_eq!(
+            storage.take_runtime_task_durability_events(),
+            vec![
+                RuntimeTaskDurabilityEvent::JournalPublished,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+                RuntimeTaskDurabilityEvent::SecondUpdatedSidecarPublished,
+                RuntimeTaskDurabilityEvent::JournalDeactivated,
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn paired_task_second_write_failure_rolls_back_both_originals() -> io::Result<()> {
         let (storage, _temp) = create_temp_storage().await?;
         let (child_original, child_updated, root_original, root_updated) =
             seed_runtime_task_transaction_pair(&storage).await?;
+        assert!(storage.take_runtime_task_durability_events().is_empty());
         storage
             .inject_runtime_task_transaction_fault(RuntimeTaskTransactionFault::SecondUpdatedWrite);
 
@@ -2856,6 +3172,16 @@ mod tests {
         assert!(error.to_string().contains("rolled back"), "{error}");
         assert_original_runtime_task_pair(&storage).await?;
         assert!(storage.runtime_task_journal_paths().await?.is_empty());
+        assert_eq!(
+            storage.take_runtime_task_durability_events(),
+            vec![
+                RuntimeTaskDurabilityEvent::JournalPublished,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+                RuntimeTaskDurabilityEvent::FirstRollbackSidecarPublished,
+                RuntimeTaskDurabilityEvent::SecondRollbackSidecarPublished,
+                RuntimeTaskDurabilityEvent::JournalDeactivated,
+            ]
+        );
         Ok(())
     }
 
@@ -3279,13 +3605,103 @@ mod tests {
         // Simulate process death after the first rename: leave the durable undo
         // journal and only the lexically first target at generation 2.
         storage
-            .write_existing_runtime_sidecar_unchecked(&child_updated)
+            .write_existing_runtime_sidecar_durable_unchecked(
+                &child_updated,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+            )
             .await?;
         drop(storage);
 
         let reopened = SessionStoreV2::new(temp.path().to_path_buf()).await?;
         assert_original_runtime_task_pair(&reopened).await?;
         assert!(reopened.runtime_task_journal_paths().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopening_store_keeps_durable_pair_when_committed_marker_survives() -> io::Result<()> {
+        let (storage, temp) = create_temp_storage().await?;
+        let (child_original, child_updated, root_original, root_updated) =
+            seed_runtime_task_transaction_pair(&storage).await?;
+        let journal = RuntimeTaskTransactionJournal {
+            version: RUNTIME_TASK_TRANSACTION_VERSION,
+            transaction_id: Uuid::new_v4().to_string(),
+            first: TaskControlPlaneUndo {
+                session_id: child_original.id.clone(),
+                task_list: child_original.task_list.clone(),
+                task_list_version: child_original
+                    .task_list_version_meta()
+                    .expect("child generation"),
+            },
+            second: TaskControlPlaneUndo {
+                session_id: root_original.id.clone(),
+                task_list: root_original.task_list.clone(),
+                task_list_version: root_original
+                    .task_list_version_meta()
+                    .expect("root generation"),
+            },
+        };
+        let prepared = storage.write_runtime_task_journal(&journal).await?;
+        storage
+            .write_existing_runtime_sidecar_durable_unchecked(
+                &child_updated,
+                RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+            )
+            .await?;
+        storage
+            .write_existing_runtime_sidecar_durable_unchecked(
+                &root_updated,
+                RuntimeTaskDurabilityEvent::SecondUpdatedSidecarPublished,
+            )
+            .await?;
+        let committing = prepared.with_extension("committing");
+        atomic_rename(&prepared, &committing).await?;
+        sync_parent_directory_entry(&committing).await?;
+        let committed = prepared.with_extension("committed");
+        atomic_rename(&committing, &committed).await?;
+        sync_parent_directory_entry(&committed).await?;
+        drop(storage);
+
+        let reopened = SessionStoreV2::new(temp.path().to_path_buf()).await?;
+        assert_eq!(
+            reopened.take_runtime_task_durability_events(),
+            vec![RuntimeTaskDurabilityEvent::JournalDeactivated],
+            "committed recovery must clean the marker without publishing either undo"
+        );
+        assert!(reopened.runtime_task_journal_paths().await?.is_empty());
+        let child = reopened
+            .load_session("tx-child")
+            .await?
+            .expect("child remains");
+        let root = reopened
+            .load_session("tx-root")
+            .await?
+            .expect("root remains");
+        for (session, transcript, metadata_key, metadata_value) in [
+            (
+                &child,
+                "child transcript secret",
+                "unrelated.child",
+                "child metadata secret",
+            ),
+            (
+                &root,
+                "root transcript secret",
+                "unrelated.root",
+                "root metadata secret",
+            ),
+        ] {
+            assert_eq!(session.task_list_version_meta().as_deref(), Some("2"));
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some("evaluated")
+            );
+            assert_eq!(session.messages[0].content, transcript);
+            assert_eq!(
+                session.metadata.get(metadata_key).map(String::as_str),
+                Some(metadata_value)
+            );
+        }
         Ok(())
     }
 
@@ -3299,6 +3715,26 @@ mod tests {
         let _storage = SessionStoreV2::new(bamboo_home).await?;
         assert!(sessions_dir.exists());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_save_recreates_removed_home_before_opening_task_lock() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().join("removed-bamboo-home");
+        let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+        fs::remove_dir_all(&bamboo_home).await?;
+
+        let session = Session::new("first-save-after-home-removal", "model");
+        storage.save_session(&session).await?;
+
+        assert!(
+            bamboo_home
+                .join(RUNTIME_TASK_TRANSACTION_LOCK_FILE)
+                .exists(),
+            "the Task transaction lock parent must be recreated on first use"
+        );
+        assert!(storage.load_session(&session.id).await?.is_some());
         Ok(())
     }
 

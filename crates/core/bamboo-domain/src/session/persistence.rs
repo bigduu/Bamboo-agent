@@ -213,7 +213,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     }
 
     /// Atomically update Task-owned control-plane fields only when the durable
-    /// Task generation still matches `expected_version`.
+    /// Task generation and exact list still match the expected snapshot.
     ///
     /// `false` covers an unsupported atomic compare-and-patch, a missing target,
     /// or a version conflict. Callers must treat it as a stale write and must
@@ -223,10 +223,17 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         &self,
         session_id: &str,
         expected_version: &str,
+        expected_task_list: &TaskList,
         task_list: &TaskList,
         version: &str,
     ) -> io::Result<bool> {
-        let _ = (session_id, expected_version, task_list, version);
+        let _ = (
+            session_id,
+            expected_version,
+            expected_task_list,
+            task_list,
+            version,
+        );
         Ok(false)
     }
 
@@ -243,6 +250,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         session_id: &str,
         shared_session_id: &str,
         expected_version: &str,
+        expected_task_list: &TaskList,
         task_list: &TaskList,
         version: &str,
     ) -> io::Result<bool> {
@@ -251,6 +259,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
                 .update_task_list_control_plane_if_version(
                     session_id,
                     expected_version,
+                    expected_task_list,
                     task_list,
                     version,
                 )
@@ -260,6 +269,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
             session_id,
             shared_session_id,
             expected_version,
+            expected_task_list,
             task_list,
             version,
         );
@@ -365,6 +375,7 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         &self,
         session_id: &str,
         expected_version: &str,
+        expected_task_list: &TaskList,
         task_list: &TaskList,
         version: &str,
     ) -> io::Result<bool> {
@@ -372,6 +383,7 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
             .update_task_list_control_plane_if_version(
                 session_id,
                 expected_version,
+                expected_task_list,
                 task_list,
                 version,
             )
@@ -383,6 +395,7 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         session_id: &str,
         shared_session_id: &str,
         expected_version: &str,
+        expected_task_list: &TaskList,
         task_list: &TaskList,
         version: &str,
     ) -> io::Result<bool> {
@@ -391,6 +404,7 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
                 session_id,
                 shared_session_id,
                 expected_version,
+                expected_task_list,
                 task_list,
                 version,
             )

@@ -475,6 +475,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         &self,
         session_id: &str,
         expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
         task_list: &bamboo_domain::TaskList,
         version: &str,
     ) -> std::io::Result<bool> {
@@ -482,6 +483,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .update_task_list_control_plane_if_version_and_publish(
                 session_id,
                 expected_version,
+                expected_task_list,
                 task_list,
                 version,
                 |_| {
@@ -500,6 +502,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         session_id: &str,
         shared_session_id: &str,
         expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
         task_list: &bamboo_domain::TaskList,
         version: &str,
     ) -> std::io::Result<bool> {
@@ -508,6 +511,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 session_id,
                 shared_session_id,
                 expected_version,
+                expected_task_list,
                 task_list,
                 version,
                 |_, _| {
@@ -718,12 +722,13 @@ mod tests {
         let repo = test_repo(storage.clone());
         let root_id = "paired-cache-root";
         let child_id = "paired-cache-child";
+        let expected_task_list = task_list(root_id, "old shared");
 
         let mut root = Session::new(root_id, "model");
         root.add_message(bamboo_agent_core::Message::user("root transcript"));
         root.metadata
             .insert("unrelated.root".to_string(), "keep".to_string());
-        root.set_task_list(task_list(root_id, "old root"));
+        root.set_task_list(expected_task_list.clone());
         root.set_task_list_version_meta("1");
         storage.save_session(&root).await.unwrap();
         cache_put(&repo, &root);
@@ -733,7 +738,7 @@ mod tests {
         child
             .metadata
             .insert("unrelated.child".to_string(), "keep".to_string());
-        child.set_task_list(task_list(root_id, "old child"));
+        child.set_task_list(expected_task_list.clone());
         child.set_task_list_version_meta("1");
         storage.save_session(&child).await.unwrap();
         cache_put(&repo, &child);
@@ -744,6 +749,7 @@ mod tests {
                 child_id,
                 root_id,
                 "1",
+                &expected_task_list,
                 &task_list(root_id, "evaluated"),
                 "2",
             )
@@ -778,12 +784,13 @@ mod tests {
         let repo = test_repo(storage.clone());
         let root_id = "paired-cache-failure-root";
         let child_id = "paired-cache-failure-child";
+        let expected_task_list = task_list(root_id, "old shared");
 
         let mut root = Session::new(root_id, "model");
         root.add_message(bamboo_agent_core::Message::user("root transcript"));
         root.metadata
             .insert("unrelated.root".to_string(), "keep".to_string());
-        root.set_task_list(task_list(root_id, "old root"));
+        root.set_task_list(expected_task_list.clone());
         root.set_task_list_version_meta("1");
         storage.save_session(&root).await.unwrap();
         cache_put(&repo, &root);
@@ -793,7 +800,7 @@ mod tests {
         child
             .metadata
             .insert("unrelated.child".to_string(), "keep".to_string());
-        child.set_task_list(task_list(root_id, "old child"));
+        child.set_task_list(expected_task_list.clone());
         child.set_task_list_version_meta("1");
         storage.save_session(&child).await.unwrap();
         cache_put(&repo, &child);
@@ -805,6 +812,7 @@ mod tests {
                 child_id,
                 root_id,
                 "1",
+                &expected_task_list,
                 &task_list(root_id, "must not publish"),
                 "2",
             )
@@ -813,8 +821,13 @@ mod tests {
         assert!(error.to_string().contains("injected paired"));
 
         for (id, expected_title, transcript, metadata_key) in [
-            (root_id, "old root", "root transcript", "unrelated.root"),
-            (child_id, "old child", "child transcript", "unrelated.child"),
+            (root_id, "old shared", "root transcript", "unrelated.root"),
+            (
+                child_id,
+                "old shared",
+                "child transcript",
+                "unrelated.child",
+            ),
         ] {
             let cached = read_cached_session(repo.cache(), id).expect("cached session remains");
             assert_eq!(cached.task_list_version_meta().as_deref(), Some("1"));

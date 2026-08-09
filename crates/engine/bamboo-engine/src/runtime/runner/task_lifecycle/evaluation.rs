@@ -9,9 +9,19 @@ use crate::runtime::task_context::TaskLoopContext;
 use crate::runtime::task_evaluation::{evaluate_task_progress_with_dispatch, TaskEvaluationResult};
 use bamboo_agent_core::{AgentError, AgentEvent, Session, SessionKind};
 use bamboo_domain::task::{TaskBlocker, TaskBlockerKind, TaskEvidence, TaskEvidenceKind};
-use bamboo_domain::{ReasoningEffort, TaskItemStatus};
+use bamboo_domain::{ReasoningEffort, TaskItemStatus, TaskList};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, TokenUsage as MetricsTokenUsage};
+
+fn task_lists_match(current: &TaskList, expected: &TaskList) -> bool {
+    match (
+        serde_json::to_value(current),
+        serde_json::to_value(expected),
+    ) {
+        (Ok(current), Ok(expected)) => current == expected,
+        _ => false,
+    }
+}
 
 fn normalize_criterion(value: &str) -> Option<String> {
     let normalized = value
@@ -112,6 +122,7 @@ pub(in crate::runtime::runner) struct AsyncTaskEvaluationRequest {
     pub(in crate::runtime::runner) shared_session_id: String,
     pub(in crate::runtime::runner) round_number: usize,
     pub(in crate::runtime::runner) based_on_task_context_version: u64,
+    pub(in crate::runtime::runner) based_on_task_list: TaskList,
     pub(in crate::runtime::runner) task_list_title: Option<String>,
     pub(in crate::runtime::runner) model_name: String,
     pub(in crate::runtime::runner) timeout_context:
@@ -127,6 +138,7 @@ pub(in crate::runtime::runner) struct AsyncTaskEvaluationResult {
     pub(in crate::runtime::runner) shared_session_id: String,
     pub(in crate::runtime::runner) round_number: usize,
     pub(in crate::runtime::runner) based_on_task_context_version: u64,
+    pub(in crate::runtime::runner) based_on_task_list: TaskList,
     pub(in crate::runtime::runner) task_list_title: Option<String>,
     pub(in crate::runtime::runner) evaluation_result: TaskEvaluationResult,
     pub(in crate::runtime::runner) finished_at: DateTime<Utc>,
@@ -145,6 +157,9 @@ pub(in crate::runtime::runner) fn build_async_task_evaluation_request(
     timeout_context: crate::runtime::stream::handler::StreamTimeoutContext,
 ) -> Result<Option<AsyncTaskEvaluationRequest>, AgentError> {
     let Some(task_context_snapshot) = task_context.clone() else {
+        return Ok(None);
+    };
+    let Some(based_on_task_list) = session.task_list.clone() else {
         return Ok(None);
     };
 
@@ -166,6 +181,7 @@ pub(in crate::runtime::runner) fn build_async_task_evaluation_request(
         shared_session_id,
         round_number,
         based_on_task_context_version: task_context_snapshot.version,
+        based_on_task_list,
         task_list_title: session
             .task_list
             .as_ref()
@@ -253,6 +269,7 @@ pub(in crate::runtime::runner) async fn execute_async_task_evaluation(
         shared_session_id: request.shared_session_id,
         round_number: request.round_number,
         based_on_task_context_version: request.based_on_task_context_version,
+        based_on_task_list: request.based_on_task_list,
         task_list_title: request.task_list_title,
         evaluation_result,
         finished_at,
@@ -328,13 +345,26 @@ pub(in crate::runtime::runner) fn apply_task_evaluation_result(
         return TaskEvaluationApplyOutcome::stale(usage);
     };
 
-    if ctx.version != evaluation.based_on_task_context_version {
+    let session_matches_snapshot = session
+        .task_list
+        .as_ref()
+        .is_some_and(|task_list| task_lists_match(task_list, &evaluation.based_on_task_list));
+    let context_matches_snapshot = task_lists_match(
+        &ctx.to_task_list_with_title(evaluation.based_on_task_list.title.clone()),
+        &evaluation.based_on_task_list,
+    );
+    if ctx.version != evaluation.based_on_task_context_version
+        || !session_matches_snapshot
+        || !context_matches_snapshot
+    {
         tracing::debug!(
-            "[{}] Dropping stale async task evaluation for round {} (snapshot version={}, current version={})",
+            "[{}] Dropping stale async task evaluation for round {} (snapshot version={}, current version={}, session_snapshot_match={}, context_snapshot_match={})",
             session_id,
             evaluation.round_number,
             evaluation.based_on_task_context_version,
-            ctx.version
+            ctx.version,
+            session_matches_snapshot,
+            context_matches_snapshot,
         );
         return TaskEvaluationApplyOutcome::stale(usage);
     }
@@ -590,6 +620,7 @@ mod tests {
     fn apply_task_evaluation_result_rejects_stale_results() {
         let (mut session, mut context) = session_with_single_in_progress_task();
         context.version = 5;
+        let based_on_task_list = session.task_list.clone().expect("task list");
 
         let outcome = apply_task_evaluation_result(
             &mut Some(context.clone()),
@@ -600,6 +631,7 @@ mod tests {
                 shared_session_id: "task-eval-session".to_string(),
                 round_number: 2,
                 based_on_task_context_version: 4,
+                based_on_task_list,
                 task_list_title: Some("Eval Tasks".to_string()),
                 evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
                     needs_evaluation: true,
@@ -632,9 +664,60 @@ mod tests {
     }
 
     #[test]
+    fn apply_task_evaluation_result_rejects_same_version_divergent_snapshot() {
+        let (mut session, original_context) = session_with_single_in_progress_task();
+        let based_on_task_list = session.task_list.clone().expect("task list");
+        session.task_list.as_mut().expect("live task list").items[0].description =
+            "Competing same-generation winner".to_string();
+        let winner_context =
+            TaskLoopContext::from_session(&session).expect("winner context should exist");
+        assert_eq!(winner_context.version, original_context.version);
+        let mut maybe_context = Some(winner_context);
+
+        let outcome = apply_task_evaluation_result(
+            &mut maybe_context,
+            &mut session,
+            "task-eval-session",
+            AsyncTaskEvaluationResult {
+                metrics_round_id: "same-version-stale-evaluation".to_string(),
+                shared_session_id: "task-eval-session".to_string(),
+                round_number: 2,
+                based_on_task_context_version: original_context.version,
+                based_on_task_list,
+                task_list_title: Some("Eval Tasks".to_string()),
+                evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
+                    needs_evaluation: true,
+                    updates: vec![crate::runtime::task_evaluation::TaskItemUpdate {
+                        item_id: "task-1".to_string(),
+                        status: TaskItemStatus::Completed,
+                        notes: Some("stale result must not apply".to_string()),
+                        evidence: Some("stale evidence".to_string()),
+                        blocker: None,
+                        criteria_met: None,
+                    }],
+                    reasoning: "stale".to_string(),
+                    prompt_tokens: 7,
+                    completion_tokens: 3,
+                },
+                finished_at: Utc::now(),
+                error: None,
+                metrics_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                metrics_terminal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+
+        assert!(outcome.stale);
+        assert_eq!(outcome.applied_updates, 0);
+        let live_item = &session.task_list.as_ref().expect("live task list").items[0];
+        assert_eq!(live_item.status, TaskItemStatus::InProgress);
+        assert_eq!(live_item.description, "Competing same-generation winner");
+    }
+
+    #[test]
     fn apply_task_evaluation_result_applies_matching_results() {
         let (mut session, context) = session_with_single_in_progress_task();
         let mut maybe_context = Some(context.clone());
+        let based_on_task_list = session.task_list.clone().expect("task list");
 
         let outcome = apply_task_evaluation_result(
             &mut maybe_context,
@@ -645,6 +728,7 @@ mod tests {
                 shared_session_id: "task-eval-session".to_string(),
                 round_number: 2,
                 based_on_task_context_version: context.version,
+                based_on_task_list,
                 task_list_title: Some("Eval Tasks".to_string()),
                 evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
                     needs_evaluation: true,
