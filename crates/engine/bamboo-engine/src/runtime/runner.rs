@@ -6,6 +6,7 @@
 use bamboo_agent_core::TokenUsage;
 use bamboo_agent_core::{AgentError, Session};
 
+pub(crate) mod auxiliary_budget;
 pub mod image_fallback;
 mod logging;
 mod loop_execution;

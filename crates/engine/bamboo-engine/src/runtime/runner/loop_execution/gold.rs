@@ -9,7 +9,7 @@ use crate::runtime::goal_state::{
     GoalState,
 };
 use crate::runtime::gold_evaluation::{
-    apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold,
+    apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold_with_dispatch,
     execute_async_gold_evaluation, AsyncGoldEvaluationRequest, GoldEvaluationResult,
 };
 use crate::runtime::runner::loop_execution::startup::{InFlightGoldEvaluation, LoopRunState};
@@ -110,7 +110,17 @@ pub(super) async fn evaluate_gold_terminal(
 
     // Side-channel double-check: re-verify achievement at the stop boundary.
     let model_name = gold_config.model_name.as_deref().unwrap_or(eval_model);
-    let verdict = match evaluate_gold(
+    let budget_provider = llm.clone();
+    let budget_model = model_name.to_string();
+    let acquire_dispatch_guard = async move {
+        crate::runtime::runner::auxiliary_budget::acquire(
+            &budget_provider,
+            &budget_model,
+            config.auxiliary_evaluation_max_concurrency,
+        )
+        .await
+    };
+    let verdict = match evaluate_gold_with_dispatch(
         session,
         task_context.as_ref(),
         gold_config,
@@ -128,6 +138,7 @@ pub(super) async fn evaluate_gold_terminal(
             checkpoint: GoldCheckpoint::Terminal,
             iteration,
         },
+        acquire_dispatch_guard,
     )
     .await
     {
@@ -405,6 +416,7 @@ fn spawn_gold_evaluation_request(
     request: AsyncGoldEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
     cancel_token: CancellationToken,
+    configured_limit: usize,
 ) {
     let gold_round = request.round_number;
     let session_id = state.session_id.clone();
@@ -420,7 +432,12 @@ fn spawn_gold_evaluation_request(
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => None,
-            result = execute_async_gold_evaluation(request_for_spawn, llm, event_tx) => Some(result),
+            result = execute_async_gold_evaluation(
+                request_for_spawn,
+                llm,
+                event_tx,
+                configured_limit,
+            ) => Some(result),
         }
     });
 
@@ -441,6 +458,7 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
     event_tx: &mpsc::Sender<AgentEvent>,
     llm: Arc<dyn LLMProvider>,
     cancel_token: CancellationToken,
+    configured_limit: usize,
 ) {
     if state.gold_evaluation.in_flight.is_some() {
         return;
@@ -450,7 +468,14 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
         return;
     };
 
-    spawn_gold_evaluation_request(state, event_tx, request, llm, cancel_token);
+    spawn_gold_evaluation_request(
+        state,
+        event_tx,
+        request,
+        llm,
+        cancel_token,
+        configured_limit,
+    );
 }
 
 pub(super) fn spawn_gold_evaluation_if_needed(
@@ -503,7 +528,14 @@ pub(super) fn spawn_gold_evaluation_if_needed(
         return Ok(());
     }
 
-    spawn_gold_evaluation_request(state, event_tx, request, llm, cancel_token);
+    spawn_gold_evaluation_request(
+        state,
+        event_tx,
+        request,
+        llm,
+        cancel_token,
+        config.auxiliary_evaluation_max_concurrency,
+    );
     Ok(())
 }
 

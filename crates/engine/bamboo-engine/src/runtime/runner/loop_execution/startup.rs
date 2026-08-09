@@ -8,6 +8,8 @@ use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
 use bamboo_metrics::MetricsCollector;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use super::super::logging::DebugLogger;
 use crate::runtime::runner::state_bridge;
@@ -39,6 +41,11 @@ impl OverflowRecoveryState {
 
 pub(super) struct InFlightTaskEvaluation {
     pub(super) request: AsyncTaskEvaluationRequest,
+    /// Set only at the provider-dispatch boundary, after the low-priority
+    /// budget has admitted this request.
+    pub(super) metrics_started: Arc<AtomicBool>,
+    /// Exactly-once guard shared with the completed result.
+    pub(super) metrics_terminal: Arc<AtomicBool>,
     // `Option<..>` output: the spawned future `select!`s on the run's
     // `CancellationToken`, so a cancelled run yields `None` (the eval work was
     // dropped at an await point, stopping the wasted LLM spend) instead of a

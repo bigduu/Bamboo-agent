@@ -136,8 +136,19 @@ pub(crate) async fn execute_async_gold_evaluation(
     request: AsyncGoldEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
     event_tx: mpsc::Sender<AgentEvent>,
+    configured_limit: usize,
 ) -> AsyncGoldEvaluationResult {
-    let evaluation_result = match evaluate_gold(
+    let budget_provider = llm.clone();
+    let budget_model = request.model_name.clone();
+    let acquire_dispatch_guard = async move {
+        crate::runtime::runner::auxiliary_budget::acquire(
+            &budget_provider,
+            &budget_model,
+            configured_limit,
+        )
+        .await
+    };
+    let evaluation_result = match evaluate_gold_with_dispatch(
         &request.session_snapshot,
         request.task_context_snapshot.as_ref(),
         &request.gold_config,
@@ -151,6 +162,7 @@ pub(crate) async fn execute_async_gold_evaluation(
             checkpoint: request.checkpoint,
             iteration: request.round_number as u32,
         },
+        acquire_dispatch_guard,
     )
     .await
     {
@@ -182,6 +194,28 @@ pub async fn evaluate_gold(
     llm: Arc<dyn LLMProvider>,
     frame: &GoldEvalFrame<'_>,
 ) -> Result<GoldEvaluationResult, AgentError> {
+    evaluate_gold_with_dispatch(
+        session,
+        task_context,
+        config,
+        llm,
+        frame,
+        std::future::ready(()),
+    )
+    .await
+}
+
+pub(crate) async fn evaluate_gold_with_dispatch<G, Fut>(
+    session: &Session,
+    task_context: Option<&TaskLoopContext>,
+    config: &GoldConfig,
+    llm: Arc<dyn LLMProvider>,
+    frame: &GoldEvalFrame<'_>,
+    acquire_dispatch_guard: Fut,
+) -> Result<GoldEvaluationResult, AgentError>
+where
+    Fut: std::future::Future<Output = G>,
+{
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let session_id = frame.session_id;
@@ -213,8 +247,9 @@ pub async fn evaluate_gold(
         cache: None,
     };
 
-    let timeout_context = frame.timeout_context.clone().begin_request();
     let cancel_token = CancellationToken::new();
+    let _dispatch_guard = acquire_dispatch_guard.await;
+    let timeout_context = frame.timeout_context.clone().begin_request();
     let stream = await_stream_bootstrap(
         llm.chat_stream_with_options(
             &messages,

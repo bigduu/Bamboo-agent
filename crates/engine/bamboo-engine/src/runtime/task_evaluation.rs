@@ -34,6 +34,7 @@ pub struct TaskItemUpdate {
     pub criteria_met: Option<Vec<String>>,
 }
 
+pub(crate) use executor::evaluate_task_progress_with_dispatch;
 pub use executor::{evaluate_task_progress, TaskEvaluationFrame};
 pub use message_builder::build_task_evaluation_messages;
 pub use schema::get_task_evaluation_tools;

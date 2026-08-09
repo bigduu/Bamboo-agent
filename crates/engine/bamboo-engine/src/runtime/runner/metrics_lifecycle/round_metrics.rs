@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use bamboo_metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -11,6 +11,22 @@ pub(in crate::runtime::runner) fn record_round_started(
     session_id: &str,
     model_name: &str,
 ) {
+    record_round_started_at(
+        metrics_collector,
+        round_id,
+        session_id,
+        model_name,
+        Utc::now(),
+    );
+}
+
+pub(in crate::runtime::runner) fn record_round_started_at(
+    metrics_collector: Option<&MetricsCollector>,
+    round_id: &str,
+    session_id: &str,
+    model_name: &str,
+    started_at: DateTime<Utc>,
+) {
     let Some(metrics) = metrics_collector else {
         return;
     };
@@ -18,7 +34,7 @@ pub(in crate::runtime::runner) fn record_round_started(
         round_id.to_string(),
         session_id.to_string(),
         model_name.to_string(),
-        Utc::now(),
+        started_at,
     );
 }
 
@@ -34,19 +50,46 @@ pub(in crate::runtime::runner) fn record_round_completed(
     prompt_cached_tool_tokens_saved: u32,
     round_error: Option<String>,
 ) {
+    record_round_completed_at(
+        metrics_collector,
+        round_id,
+        session_id,
+        message_count,
+        round_status,
+        round_usage,
+        prompt_cached_tool_outputs,
+        prompt_cached_tool_tokens_saved,
+        round_error,
+        Utc::now(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::runtime::runner) fn record_round_completed_at(
+    metrics_collector: Option<&MetricsCollector>,
+    round_id: &str,
+    session_id: &str,
+    message_count: u32,
+    round_status: MetricsRoundStatus,
+    round_usage: MetricsTokenUsage,
+    prompt_cached_tool_outputs: u32,
+    prompt_cached_tool_tokens_saved: u32,
+    round_error: Option<String>,
+    completed_at: DateTime<Utc>,
+) {
     let Some(metrics) = metrics_collector else {
         return;
     };
     metrics.round_completed(
         round_id.to_string(),
-        Utc::now(),
+        completed_at,
         round_status,
         round_usage,
         prompt_cached_tool_outputs,
         prompt_cached_tool_tokens_saved,
         round_error,
     );
-    metrics.session_message_count(session_id.to_string(), message_count, Utc::now());
+    metrics.session_message_count(session_id.to_string(), message_count, completed_at);
 }
 
 #[allow(clippy::too_many_arguments)]
