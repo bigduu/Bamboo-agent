@@ -1,8 +1,9 @@
 //! Replayable session-event publishing infrastructure.
 //!
-//! This module owns the **single canonical path** for publishing UI-replayable
-//! session events. Every replayable event must go through
-//! [`publish_replayable_session_event`] so that:
+//! This module owns the canonical [`AgentSessionContext`] path for publishing
+//! UI-replayable session events. Every replayable event must go through an
+//! atomic publisher — this helper, the runtime child-event publisher, or an
+//! event forwarder — so that:
 //!
 //! 1. The event is cached on the session's runner for late-subscriber replay
 //!    *before* any subscriber sees it on the live broadcast channel.
@@ -13,7 +14,8 @@
 //! ## Invariant
 //!
 //! No code in the workspace may pair `runner.push_critical_event` with
-//! `sender.send` outside this helper, the generic engine event forwarder, or
+//! `sender.send` outside this helper, the runtime
+//! `ReplayableSessionEventPublisher`, the generic engine event forwarder, or
 //! the server's `spawn_event_forwarder`
 //! (in `handlers::agent::execute::runtime::events`).
 //! Hand-rolling the pair has historically led to inverted ordering (broadcast

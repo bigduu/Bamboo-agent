@@ -117,10 +117,9 @@ fn reconcile_actor_host_wait(
 /// not found) before the background task is spawned.
 ///
 /// Preserves EXACTLY the canonical behavior:
-/// - Scheduler callers own launch announcements: queued adapter launches
-///   retain their titled event, while reserved SessionInbox activation emits
-///   an untitled event from [`crate::execution::SpawnScheduler`].
-///   Direct SDK callers remain responsible for their own announcement.
+/// - Launch wrappers own announcements: [`crate::execution::SpawnScheduler`]
+///   publishes before queued/reserved jobs become runnable, while
+///   [`crate::sdk::runner::ChildRunner`] announces direct SDK launches.
 /// - Event forwarder + 5s heartbeat tasks, watchdog, runner reservation.
 /// - Full real [`ExecuteRequest`] field set incl. split provider fields.
 /// - Terminal status strings `completed | cancelled | error | skipped | timeout`.
@@ -146,6 +145,7 @@ async fn run_child_spawn_inner(
     // Ensure both session event streams exist.
     let parent_tx =
         get_or_create_event_sender(&ctx.session_event_senders, &job.parent_session_id).await;
+    let parent_event_publisher = ctx.replayable_event_publisher();
     let child_tx =
         get_or_create_event_sender(&ctx.session_event_senders, &job.child_session_id).await;
 
@@ -160,7 +160,7 @@ async fn run_child_spawn_inner(
         Ok(None) => {
             let error = "child session not found".to_string();
             publish_child_completion_parts(
-                &parent_tx,
+                &parent_event_publisher,
                 ctx.completion_handler.clone(),
                 job.parent_session_id.clone(),
                 job.child_session_id.clone(),
@@ -173,7 +173,7 @@ async fn run_child_spawn_inner(
         Err(e) => {
             let error = format!("failed to load child session: {e}");
             publish_child_completion_parts(
-                &parent_tx,
+                &parent_event_publisher,
                 ctx.completion_handler.clone(),
                 job.parent_session_id.clone(),
                 job.child_session_id.clone(),
@@ -260,7 +260,7 @@ async fn run_child_spawn_inner(
                 .await;
         }
         publish_child_completion_parts(
-            &parent_tx,
+            &parent_event_publisher,
             ctx.completion_handler.clone(),
             job.parent_session_id.clone(),
             job.child_session_id.clone(),
@@ -301,7 +301,7 @@ async fn run_child_spawn_inner(
             Arc::new(parking_lot::RwLock::new(session)),
         );
         publish_child_completion_parts(
-            &parent_tx,
+            &parent_event_publisher,
             ctx.completion_handler.clone(),
             job.parent_session_id.clone(),
             job.child_session_id.clone(),
@@ -359,7 +359,7 @@ async fn run_child_spawn_inner(
         }
         let setup_error = error.to_string();
         publish_child_completion_parts(
-            &parent_tx,
+            &parent_event_publisher,
             ctx.completion_handler.clone(),
             job.parent_session_id.clone(),
             job.child_session_id.clone(),
@@ -477,7 +477,7 @@ async fn run_child_spawn_inner(
     let agent = ctx.agent.clone();
     let external_runner = ctx.external_child_runner.clone();
     let done = forwarder_done.clone();
-    let parent_tx_for_done = parent_tx.clone();
+    let parent_event_publisher_for_done = parent_event_publisher.clone();
     let parent_id_for_done = job.parent_session_id.clone();
     let child_id_for_done = job.child_session_id.clone();
     let session_event_senders = ctx.session_event_senders.clone();
@@ -730,7 +730,7 @@ async fn run_child_spawn_inner(
         // same durable completion path used by success/error/cancel/timeout.
         done.cancel();
         publish_child_completion_parts(
-            &parent_tx_for_done,
+            &parent_event_publisher_for_done,
             completion_handler,
             parent_id_for_done,
             child_id_for_done,
