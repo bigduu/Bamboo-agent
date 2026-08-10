@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -5,7 +7,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, NoticeLevel, QuestionOptionHitbox, SessionPickerMode, Tab};
+use crate::app::{
+    App, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger, NoticeLevel,
+    QuestionOptionHitbox, SessionPickerMode, Tab,
+};
 use crate::theme::{self, colors};
 use crate::ui::sessions::{session_row_line, truncate_cells};
 
@@ -178,6 +183,7 @@ const HELP_LEFT: &[(&str, &str)] = &[
     ("g / G", "Jump to top / bottom (Chat)"),
 ];
 const HELP_RIGHT: &[(&str, &str)] = &[
+    ("Ctrl+K", "Command palette"),
     ("Ctrl+N", "New session"),
     ("Ctrl+O", "Model picker (Chat)"),
     ("Ctrl+P", "Session picker (Chat)"),
@@ -1124,6 +1130,315 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
+/// Combined built-in and session-aware command palette. Each result owns two
+/// fixed terminal rows, which makes both keyboard windowing and mouse hitboxes
+/// deterministic even when descriptions are long or the terminal is narrow.
+/// The list is clipped instead of wrapped so a row can never push the footer
+/// below the popup or move beneath the pointer between mouse-down/up events.
+pub fn render_command_palette(f: &mut Frame, app: &App) {
+    let Some(palette) = &app.command_palette else {
+        return;
+    };
+    let disabled_reasons = palette
+        .entries
+        .iter()
+        .map(|entry| {
+            app.command_palette_disabled_reason(entry)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    let view = CommandPaletteView {
+        trigger: palette.trigger,
+        input: &palette.input,
+        entries: &palette.entries,
+        visible: &palette.visible,
+        selected: palette.selected,
+        loading: palette.loading,
+        resolving: palette.resolving,
+        error: palette.error.as_deref(),
+        disabled_reasons: &disabled_reasons,
+    };
+    render_command_palette_view(f, view, Some(&palette.hitboxes));
+}
+
+struct CommandPaletteView<'a> {
+    trigger: CommandPaletteTrigger,
+    input: &'a str,
+    entries: &'a [CommandPaletteEntry],
+    visible: &'a [usize],
+    selected: usize,
+    loading: bool,
+    resolving: bool,
+    error: Option<&'a str>,
+    disabled_reasons: &'a [Option<String>],
+}
+
+struct CommandPaletteRender {
+    lines: Vec<Line<'static>>,
+    /// `(visible index, first content-row, height)` for the rows actually
+    /// present in this frame. The content row is relative to the block's
+    /// inner top edge and becomes an absolute hitbox after centering.
+    item_rows: Vec<(usize, u16, u16)>,
+}
+
+fn render_command_palette_view(
+    f: &mut Frame,
+    view: CommandPaletteView<'_>,
+    hitboxes: Option<&RefCell<Vec<CommandPaletteHitbox>>>,
+) {
+    let screen = f.area();
+    let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
+    let row_width = popup_width.saturating_sub(4) as usize;
+    let rendered = command_palette_lines(&view, screen.height, row_width);
+    let height = (rendered.lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(94, height, screen);
+
+    if let Some(hitboxes) = hitboxes {
+        if view.resolving {
+            hitboxes.borrow_mut().clear();
+        } else {
+            let width = area.width.saturating_sub(2);
+            *hitboxes.borrow_mut() = rendered
+                .item_rows
+                .iter()
+                .filter_map(|(index, row, row_height)| {
+                    let y = area.y.saturating_add(1).saturating_add(*row);
+                    let available = area
+                        .y
+                        .saturating_add(area.height.saturating_sub(1))
+                        .saturating_sub(y);
+                    let height = (*row_height).min(available);
+                    (width > 0 && height > 0).then_some(CommandPaletteHitbox {
+                        index: *index,
+                        x: area.x.saturating_add(1),
+                        y,
+                        width,
+                        height,
+                    })
+                })
+                .collect();
+        }
+    }
+
+    f.render_widget(Clear, area);
+    let title = match view.trigger {
+        CommandPaletteTrigger::Slash => " Slash commands ",
+        CommandPaletteTrigger::Global => " Command palette ",
+    };
+    let border_color = if view.resolving {
+        colors::WARNING
+    } else {
+        colors::BRAND
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title);
+    f.render_widget(Paragraph::new(rendered.lines).block(block), area);
+}
+
+fn command_palette_lines(
+    view: &CommandPaletteView<'_>,
+    screen_height: u16,
+    row_width: usize,
+) -> CommandPaletteRender {
+    let title = match view.trigger {
+        CommandPaletteTrigger::Slash => " Slash commands",
+        CommandPaletteTrigger::Global => " Command palette",
+    };
+    let query_prefix = if matches!(view.trigger, CommandPaletteTrigger::Slash) {
+        "/"
+    } else {
+        ""
+    };
+    let search_width = row_width.saturating_sub(10).max(1);
+    let search_cursor = if view.resolving { "" } else { "▏" };
+    let search_style = if view.resolving {
+        Style::default().fg(colors::INACTIVE)
+    } else {
+        Style::default().fg(colors::BRAND)
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
+            Span::styled(
+                format!(
+                    "{}{}{}",
+                    query_prefix,
+                    clip_tail_cells(view.input, search_width.saturating_sub(query_prefix.len())),
+                    search_cursor
+                ),
+                search_style,
+            ),
+        ]),
+        Line::raw(""),
+    ];
+
+    if view.resolving {
+        lines.push(Line::from(Span::styled(
+            "  Resolving preview…",
+            Style::default().fg(colors::WARNING),
+        )));
+    } else if view.loading {
+        lines.push(Line::from(Span::styled(
+            clip_cells(
+                "  Loading session commands… built-ins remain available",
+                row_width,
+            ),
+            Style::default().fg(colors::INACTIVE),
+        )));
+    }
+
+    let status_rows = usize::from(view.loading || view.resolving);
+    let error_rows = usize::from(view.error.is_some());
+    // Border (2), header (3), status/error, footer (3), and at most two
+    // above/below indicators are reserved before selecting the two-row item
+    // window. The selected item is therefore always fully visible at 60,
+    // 80, and 120 columns on ordinary 24-row terminals.
+    let max_content_rows = screen_height.min(26).saturating_sub(2) as usize;
+    let non_list_rows = 3 + status_rows + error_rows + 3;
+    let list_rows = max_content_rows.saturating_sub(non_list_rows);
+    let max_items = list_rows.saturating_sub(2).max(2) / 2;
+    let total = view.visible.len();
+    let mut item_rows = Vec::new();
+
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            if view.entries.is_empty() && !view.loading {
+                "  No commands available"
+            } else if view.loading {
+                "  Waiting for commands…"
+            } else {
+                "  No commands match this search"
+            },
+            Style::default().fg(colors::INACTIVE),
+        )));
+    } else {
+        let selected = view.selected.min(total.saturating_sub(1));
+        let window_len = max_items.max(1).min(total);
+        let start = selected
+            .saturating_sub(window_len / 2)
+            .min(total.saturating_sub(window_len));
+        let end = (start + window_len).min(total);
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ↑ {start} more"),
+                Style::default().fg(colors::SUBTLE),
+            )));
+        }
+
+        for visible_index in start..end {
+            let Some(entry_index) = view.visible.get(visible_index) else {
+                continue;
+            };
+            let Some(entry) = view.entries.get(*entry_index) else {
+                continue;
+            };
+            let first_row = lines.len() as u16;
+            let is_selected = !view.resolving && visible_index == selected;
+            let marker = if is_selected { "›" } else { " " };
+            let name_style = if view.resolving {
+                Style::default().fg(colors::INACTIVE)
+            } else if is_selected {
+                Style::default()
+                    .fg(colors::BRAND)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let badge = clip_cells(
+                &format!("[{} · {}]", entry.type_label(), entry.source_label()),
+                (row_width / 2).max(1),
+            );
+            let badge_width: usize = badge
+                .chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum();
+            let name_width = row_width.saturating_sub(badge_width + 6);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {marker} "), name_style),
+                Span::styled(
+                    clip_cells(entry.display_name(), name_width.max(1)),
+                    name_style,
+                ),
+                Span::raw("  "),
+                Span::styled(badge, palette_type_style(entry.type_label())),
+            ]));
+
+            let disabled = view.disabled_reasons.get(*entry_index).cloned().flatten();
+            let description = disabled
+                .as_ref()
+                .map(|reason| format!("Disabled: {reason}"))
+                .unwrap_or_else(|| {
+                    let description = entry.description().trim();
+                    if description.is_empty() {
+                        "No description".to_string()
+                    } else {
+                        description.to_string()
+                    }
+                });
+            lines.push(Line::from(Span::styled(
+                clip_cells(&format!("      {description}"), row_width),
+                if disabled.is_some() {
+                    Style::default().fg(colors::ERROR)
+                } else {
+                    Style::default().fg(colors::INACTIVE)
+                },
+            )));
+            if !view.resolving {
+                item_rows.push((visible_index, first_row, 2));
+            }
+        }
+        if end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ↓ {} more", total - end),
+                Style::default().fg(colors::SUBTLE),
+            )));
+        }
+    }
+
+    if let Some(error) = view.error {
+        lines.push(Line::from(Span::styled(
+            clip_cells(&format!("  {error}"), row_width),
+            Style::default().fg(colors::ERROR),
+        )));
+    }
+    lines.push(Line::raw(""));
+    if view.resolving {
+        lines.push(Line::raw("  Input paused while the preview resolves"));
+        lines.push(Line::raw("  Esc cancel"));
+    } else if row_width < 70 {
+        lines.push(Line::raw("  ↑/↓/wheel select · Enter use · Esc cancel"));
+        lines.push(Line::raw("  Ctrl+R retry/refresh · Ctrl+U clear"));
+    } else {
+        lines.push(Line::raw(
+            "  ↑/↓/PgUp/PgDn/wheel select · Enter use · Esc cancel",
+        ));
+        lines.push(Line::raw(
+            "  Type to search · Ctrl+R refresh · Ctrl+U clear",
+        ));
+    }
+
+    CommandPaletteRender { lines, item_rows }
+}
+
+fn palette_type_style(command_type: &str) -> Style {
+    let color = match command_type {
+        "prompt" => colors::BRAND,
+        "workflow" => colors::SUCCESS,
+        "skill" => colors::WARNING,
+        "mcp" => colors::TOOL_RUNNING,
+        _ => colors::INACTIVE,
+    };
+    Style::default().fg(color)
+}
+
 fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     // u32 math so a very wide terminal (width ≥ 820) can't overflow the u16
     // multiply of `r.width * percent_x`.
@@ -1191,11 +1506,64 @@ fn clip_tail_cells(value: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_cells, clip_tail_cells};
+    use std::cell::RefCell;
+
+    use super::{
+        clip_cells, clip_tail_cells, command_palette_lines, render_command_palette_view,
+        CommandPaletteView,
+    };
+    use crate::api::types::CommandItem;
     use crate::api::BambooClient;
-    use crate::app::App;
+    use crate::app::{
+        App, BuiltinPaletteAction, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger,
+    };
     use ratatui::backend::TestBackend;
+    use ratatui::text::Line;
     use ratatui::Terminal;
+    use unicode_width::UnicodeWidthStr;
+
+    fn command(
+        name: impl Into<String>,
+        command_type: &str,
+        source: &str,
+        description: impl Into<String>,
+    ) -> CommandPaletteEntry {
+        let name = name.into();
+        CommandPaletteEntry::Server(CommandItem {
+            id: format!("{command_type}:{name}"),
+            display_name: name.clone(),
+            name,
+            description: description.into(),
+            command_type: command_type.to_string(),
+            category: None,
+            tags: None,
+            metadata: serde_json::json!({ "source": source }),
+        })
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn palette_text(lines: &[Line<'_>]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (area.y..area.y.saturating_add(area.height))
+            .map(|row| {
+                (area.x..area.x.saturating_add(area.width))
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// The two-column help overlay must fit a normal-height terminal without
     /// vertical clipping and must still mention the headline bindings — the
@@ -1214,6 +1582,7 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         for needle in [
+            "Ctrl+K",
             "Ctrl+N",
             "Ctrl+O",
             "Ctrl+P",
@@ -1238,5 +1607,273 @@ mod tests {
         assert_eq!(clip_tail_cells("abcdef", 4), "…def");
         assert_eq!(clip_tail_cells("会话标题", 5), "…标题");
         assert_eq!(clip_tail_cells("界", 1), "…");
+    }
+
+    #[test]
+    fn command_palette_render_snapshots_are_responsive_at_60_80_120() {
+        let mut entries = vec![
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession),
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop),
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::ToggleDetails),
+        ];
+        entries.extend((0..12).map(|index| {
+            if index == 7 {
+                command(
+                    "Deploy production",
+                    "workflow",
+                    "workspace",
+                    "Preview a deploy workflow without sending it",
+                )
+            } else {
+                command(
+                    format!("Command {index}"),
+                    if index % 2 == 0 { "prompt" } else { "skill" },
+                    if index % 3 == 0 { "project" } else { "global" },
+                    format!("Description for command {index}"),
+                )
+            }
+        }));
+        let visible = (0..entries.len()).collect::<Vec<_>>();
+        let selected = 10; // `Deploy production` after the three built-ins.
+        let disabled_reasons = vec![None; entries.len()];
+
+        for width in [60, 80, 120] {
+            let hitboxes = RefCell::<Vec<CommandPaletteHitbox>>::new(Vec::new());
+            let view = CommandPaletteView {
+                trigger: CommandPaletteTrigger::Slash,
+                input: "dep production",
+                entries: &entries,
+                visible: &visible,
+                selected,
+                loading: false,
+                resolving: false,
+                error: None,
+                disabled_reasons: &disabled_reasons,
+            };
+            let backend = TestBackend::new(width, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_command_palette_view(frame, view, Some(&hitboxes)))
+                .unwrap();
+
+            let text = terminal_text(&terminal);
+            for needle in [
+                "Slash commands",
+                "/dep production",
+                "Deploy production",
+                "workflow · workspace",
+                "Enter use",
+                "Ctrl+R",
+            ] {
+                assert!(
+                    text.contains(needle),
+                    "{width}-column palette missing {needle:?}:\n{text}"
+                );
+            }
+            assert!(text.contains("↑ "), "selected window lost its upper marker");
+            assert!(text.contains("↓ "), "selected window lost its lower marker");
+
+            let hitboxes = hitboxes.borrow();
+            assert!(
+                hitboxes.iter().any(|hitbox| hitbox.index == selected),
+                "{width}-column palette did not expose the selected row hitbox"
+            );
+            assert!(hitboxes.iter().all(|hitbox| {
+                hitbox.height == 2
+                    && hitbox.x.saturating_add(hitbox.width) <= width
+                    && hitbox.y.saturating_add(hitbox.height) <= 24
+            }));
+
+            let row_width = ((width as u32 * 94 / 100) as usize).saturating_sub(4);
+            let pure = command_palette_lines(
+                &CommandPaletteView {
+                    trigger: CommandPaletteTrigger::Slash,
+                    input: "dep production",
+                    entries: &entries,
+                    visible: &visible,
+                    selected,
+                    loading: false,
+                    resolving: false,
+                    error: None,
+                    disabled_reasons: &disabled_reasons,
+                },
+                24,
+                row_width,
+            );
+            assert!(pure
+                .lines
+                .iter()
+                .map(line_text)
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= row_width));
+        }
+    }
+
+    #[test]
+    fn command_palette_renders_loading_error_empty_and_resolving_states() {
+        let entries = vec![command("Review", "prompt", "workspace", "Review changes")];
+        let disabled_reasons = vec![None; entries.len()];
+        let empty_visible = Vec::new();
+        let loading = command_palette_lines(
+            &CommandPaletteView {
+                trigger: CommandPaletteTrigger::Global,
+                input: "missing",
+                entries: &entries,
+                visible: &empty_visible,
+                selected: 0,
+                loading: true,
+                resolving: false,
+                error: Some("API unavailable — Ctrl+R to retry"),
+                disabled_reasons: &disabled_reasons,
+            },
+            24,
+            72,
+        );
+        let text = palette_text(&loading.lines);
+        assert!(text.contains("Loading session commands"));
+        assert!(text.contains("Waiting for commands"));
+        assert!(text.contains("API unavailable"));
+
+        let visible = vec![0];
+        let resolving = command_palette_lines(
+            &CommandPaletteView {
+                trigger: CommandPaletteTrigger::Global,
+                input: "review",
+                entries: &entries,
+                visible: &visible,
+                selected: 0,
+                loading: false,
+                resolving: true,
+                error: None,
+                disabled_reasons: &disabled_reasons,
+            },
+            24,
+            72,
+        );
+        let resolving_text = palette_text(&resolving.lines);
+        assert!(resolving_text.contains("Resolving preview"));
+        assert!(resolving_text.contains("Input paused"));
+        assert!(resolving_text.contains("Esc cancel"));
+        assert!(!resolving_text.contains('▏'));
+        assert!(!resolving_text.contains("Enter use"));
+        assert!(!resolving_text.contains("Ctrl+R"));
+        assert!(resolving.item_rows.is_empty());
+
+        let hitboxes = RefCell::new(vec![CommandPaletteHitbox {
+            index: 0,
+            x: 1,
+            y: 1,
+            width: 10,
+            height: 2,
+        }]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_command_palette_view(
+                    frame,
+                    CommandPaletteView {
+                        trigger: CommandPaletteTrigger::Global,
+                        input: "review",
+                        entries: &entries,
+                        visible: &visible,
+                        selected: 0,
+                        loading: false,
+                        resolving: true,
+                        error: None,
+                        disabled_reasons: &disabled_reasons,
+                    },
+                    Some(&hitboxes),
+                )
+            })
+            .unwrap();
+        assert!(hitboxes.borrow().is_empty());
+
+        let no_commands = command_palette_lines(
+            &CommandPaletteView {
+                trigger: CommandPaletteTrigger::Global,
+                input: "",
+                entries: &[],
+                visible: &[],
+                selected: 0,
+                loading: false,
+                resolving: false,
+                error: None,
+                disabled_reasons: &[],
+            },
+            24,
+            72,
+        );
+        assert!(palette_text(&no_commands.lines).contains("No commands available"));
+
+        let no_matches = command_palette_lines(
+            &CommandPaletteView {
+                trigger: CommandPaletteTrigger::Global,
+                input: "missing",
+                entries: &entries,
+                visible: &[],
+                selected: 0,
+                loading: false,
+                resolving: false,
+                error: None,
+                disabled_reasons: &disabled_reasons,
+            },
+            24,
+            72,
+        );
+        assert!(palette_text(&no_matches.lines).contains("No commands match"));
+    }
+
+    #[test]
+    fn disabled_reasons_match_runtime_availability_and_label_type_source() {
+        let entries = vec![
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession),
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop),
+            command(
+                "Deploy production",
+                "workflow",
+                "workspace",
+                "Preview deploy workflow",
+            ),
+        ];
+        let visible = vec![0, 1, 2];
+        let disabled_reasons = vec![
+            Some("Unavailable while an agent run is active".to_string()),
+            None,
+            Some("Composer commands are unavailable while a run is active".to_string()),
+        ];
+        let rendered = command_palette_lines(
+            &CommandPaletteView {
+                trigger: CommandPaletteTrigger::Global,
+                input: "",
+                entries: &entries,
+                visible: &visible,
+                selected: 1,
+                loading: false,
+                resolving: false,
+                error: None,
+                disabled_reasons: &disabled_reasons,
+            },
+            24,
+            80,
+        );
+        let lines = rendered.lines.iter().map(line_text).collect::<Vec<_>>();
+        let description_for = |visible_index| {
+            let (_, first_row, _) = rendered
+                .item_rows
+                .iter()
+                .find(|(index, _, _)| *index == visible_index)
+                .copied()
+                .unwrap();
+            &lines[first_row as usize + 1]
+        };
+
+        assert!(description_for(0).contains("Disabled: Unavailable"));
+        assert_eq!(
+            description_for(1).trim(),
+            BuiltinPaletteAction::Stop.description()
+        );
+        assert!(description_for(2).contains("Disabled: Composer commands"));
+        assert!(description_for(2).contains("run is active"));
+        assert!(palette_text(&rendered.lines).contains("workflow · workspace"));
     }
 }

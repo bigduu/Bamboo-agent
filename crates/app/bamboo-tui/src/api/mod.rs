@@ -179,6 +179,61 @@ impl BambooClient {
         format!("{}{}", self.base_url, path)
     }
 
+    // ── Command catalog ──
+
+    /// List Bamboo's authoritative command catalog in the active Session's
+    /// Project/workspace scope. Omitting `session_id` intentionally requests
+    /// only the global catalog for a not-yet-created chat.
+    pub async fn list_commands(&self, session_id: Option<&str>) -> Result<CommandListResponse> {
+        let mut request = self.client.get(self.url("/api/v1/commands"));
+        if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+            request = request.query(&[("session_id", session_id)]);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("list commands failed ({status}): {}", body.trim());
+        }
+        Ok(response.json().await?)
+    }
+
+    /// Resolve a prompt/workflow command into preview content. Path segments
+    /// are appended through `Url::path_segments_mut`, so namespaced prompt
+    /// names such as `db/migrate` remain one percent-encoded route parameter.
+    pub async fn get_command(
+        &self,
+        command_type: &str,
+        name: &str,
+        session_id: Option<&str>,
+        arguments: Option<&str>,
+    ) -> Result<CommandDetail> {
+        let mut url = reqwest::Url::parse(&self.base_url)?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("Bamboo base URL cannot contain command paths"))?;
+            segments.pop_if_empty();
+            segments.extend(["api", "v1", "commands", command_type, name]);
+        }
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+                query.append_pair("session_id", session_id);
+            }
+            if let Some(arguments) = arguments.filter(|value| !value.is_empty()) {
+                query.append_pair("arguments", arguments);
+            }
+        }
+        let response = self.client.get(url).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("resolve command failed ({status}): {}", body.trim());
+        }
+        Ok(response.json().await?)
+    }
+
     // ── Chat ──
 
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
@@ -751,6 +806,72 @@ mod tests {
             let error = parse_auto_resume_status(body).unwrap_err();
             assert!(error.should_refresh_question(), "body: {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn command_catalog_is_session_scoped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("GET /api/v1/commands?session_id=session-1 HTTP/1.1"));
+            respond(
+                &mut socket,
+                "200 OK",
+                "\"1\"",
+                r#"{"commands":[{"id":"command-workspace-review","name":"review","display_name":"Review","description":"Review changes","type":"prompt","metadata":{"source":"workspace"}}],"total":1}"#,
+            )
+            .await;
+        });
+
+        let catalog = BambooClient::new(&base_url)
+            .list_commands(Some("session-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(catalog.total, 1);
+        assert_eq!(catalog.commands[0].name, "review");
+        assert_eq!(catalog.commands[0].metadata["source"], "workspace");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_resolution_encodes_namespaces_and_arguments() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap();
+            assert!(path.starts_with("/api/v1/commands/prompt/db%2Fmigrate?"));
+            assert!(path.contains("session_id=session-1"));
+            assert!(path.contains("arguments=production+now"));
+            respond(
+                &mut socket,
+                "200 OK",
+                "\"1\"",
+                r#"{"id":"command-workspace-db-migrate","name":"db/migrate","content":"Migrate production now","type":"prompt"}"#,
+            )
+            .await;
+        });
+
+        let detail = BambooClient::new(&base_url)
+            .get_command(
+                "prompt",
+                "db/migrate",
+                Some("session-1"),
+                Some("production now"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(detail.content, "Migrate production now");
+        server.await.unwrap();
     }
 
     #[tokio::test]

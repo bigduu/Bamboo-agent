@@ -49,6 +49,10 @@ pub fn render(f: &mut Frame, app: &App) {
         layout::render_schedule_form(f, app);
     }
 
+    if app.command_palette.is_some() {
+        layout::render_command_palette(f, app);
+    }
+
     if app.model_picker.is_some() {
         layout::render_model_picker(f, app);
     }

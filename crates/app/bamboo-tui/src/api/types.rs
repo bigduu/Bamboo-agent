@@ -25,6 +25,49 @@ pub use bamboo_client_core::{
     AgentEvent, ChatRequest, ChatResponse, ExecuteRequest, ExecuteResponse, TokenUsage,
 };
 
+// ── Command catalog ──
+
+/// One entry from the session-aware `GET /api/v1/commands` catalog.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct CommandItem {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    #[serde(rename = "type")]
+    pub command_type: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct CommandListResponse {
+    #[serde(default)]
+    pub commands: Vec<CommandItem>,
+    #[serde(default)]
+    pub total: usize,
+}
+
+/// The content-bearing subset returned by prompt/workflow command resolution.
+/// Skill and MCP entries deliberately never use this endpoint in the TUI.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct CommandDetail {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(rename = "type", default)]
+    pub command_type: String,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
 // ── Sessions ──
 
 /// Subset of the server's `SessionSummary` (see
