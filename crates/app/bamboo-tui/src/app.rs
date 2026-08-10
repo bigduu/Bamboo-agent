@@ -675,7 +675,7 @@ impl ChatState {
         self.current_execution_started = true;
     }
 
-    fn take_child_start_intent(&mut self, child_session_id: &str) -> bool {
+    fn take_child_start_intent(&mut self, child_session_id: &str, allow_any: bool) -> bool {
         let exact =
             self.child_start_intents
                 .iter()
@@ -686,11 +686,15 @@ impl ChatState {
                     _ => None,
                 });
         let matching_tool_call = exact.or_else(|| {
-            self.child_start_intents
-                .iter()
-                .find_map(|(tool_call_id, intent)| {
-                    (intent == &ChildStartIntent::Any).then(|| tool_call_id.clone())
-                })
+            if allow_any {
+                self.child_start_intents
+                    .iter()
+                    .find_map(|(tool_call_id, intent)| {
+                        (intent == &ChildStartIntent::Any).then(|| tool_call_id.clone())
+                    })
+            } else {
+                None
+            }
         });
         matching_tool_call
             .and_then(|tool_call_id| self.child_start_intents.remove(&tool_call_id))
@@ -5723,13 +5727,29 @@ impl App {
                 child_session_id,
                 title,
             } => {
-                let fresh_start = self.chat.take_child_start_intent(&child_session_id);
                 let replay_expected = self
                     .chat
                     .replay_expected_child_ids
                     .contains(&child_session_id);
                 let already_active = self.chat.active_child_ids.contains(&child_session_id);
                 let current_execution_started = self.chat.current_execution_started;
+                let current_row_is_running = self
+                    .chat
+                    .sub_agents
+                    .iter()
+                    .find(|child| child.child_session_id == child_session_id)
+                    .is_some_and(|child| subagent_status_is_running(&child.status));
+                // Exact intents always match their named child. An identity-
+                // agnostic resident create, however, must remain available
+                // when this Start is already attributable to a replayed or
+                // active child; otherwise one child can steal another's
+                // pending create authorization during multi-child replay.
+                let fresh_start = self.chat.take_child_start_intent(
+                    &child_session_id,
+                    !(replay_expected
+                        || already_active
+                        || (current_row_is_running && current_execution_started)),
+                );
                 let is_current_row = self
                     .chat
                     .sub_agents
@@ -10700,6 +10720,143 @@ mod question_tests {
         .unwrap();
         assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");
         assert!(!app.has_running_subagents());
+    }
+
+    #[test]
+    fn replayed_active_child_does_not_consume_pending_resident_create() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = vec![
+            ChatMessage {
+                id: "history:old-parent".to_string(),
+                role: MessageRole::Assistant,
+                content: "resident history".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: vec![
+                    SubAgentDisplay {
+                        child_session_id: "active-child".to_string(),
+                        title: Some("active worker".to_string()),
+                        status: "running_in_background".to_string(),
+                        error: None,
+                    },
+                    SubAgentDisplay {
+                        child_session_id: "resident-child".to_string(),
+                        title: Some("resident worker".to_string()),
+                        status: "completed".to_string(),
+                        error: None,
+                    },
+                ],
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:new-user".to_string(),
+                role: MessageRole::User,
+                content: "continue both workers".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:active-round".to_string(),
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCallDisplay {
+                        id: "active-run".to_string(),
+                        tool_name: "SubAgent".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "run",
+                            "child_session_id": "active-child"
+                        })
+                        .to_string(),
+                        result: Some(
+                            serde_json::json!({
+                                "child_session_id": "active-child",
+                                "status": "running_in_background",
+                                "waiting_for_children": true
+                            })
+                            .to_string(),
+                        ),
+                        stream_output: String::new(),
+                        error: None,
+                        phase: "complete".to_string(),
+                    },
+                    ToolCallDisplay {
+                        id: "resident-create".to_string(),
+                        tool_name: "SubAgent".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "create",
+                            "resident_name": "worker",
+                            "prompt": "next task",
+                            "auto_run": true
+                        })
+                        .to_string(),
+                        result: None,
+                        stream_output: String::new(),
+                        error: None,
+                        phase: "pending".to_string(),
+                    },
+                ],
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+        ];
+        app.chat.prepare_replay_reconciliation();
+        assert!(app.chat.replay_expected_child_ids.contains("active-child"));
+        assert!(app.chat.active_child_ids.contains("active-child"));
+        assert_eq!(
+            app.chat.child_start_intents.get("resident-create"),
+            Some(&ChildStartIntent::Any)
+        );
+
+        // The coalesced Start for an already known active child must not take
+        // the identity-agnostic authorization owned by the resident create.
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "active-child".to_string(),
+            title: Some("active worker".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            app.chat.child_start_intents.get("resident-create"),
+            Some(&ChildStartIntent::Any)
+        );
+
+        // The following Start is the pending resident generation and may now
+        // consume the Any intent, reviving its physically older terminal row.
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "resident-child".to_string(),
+            title: Some("resident worker rerun".to_string()),
+        })
+        .unwrap();
+        let resident = app
+            .chat
+            .messages
+            .iter()
+            .flat_map(|message| &message.sub_agents)
+            .find(|child| child.child_session_id == "resident-child")
+            .unwrap();
+        assert_eq!(resident.status, "running");
+        assert!(app.chat.active_child_ids.contains("resident-child"));
+        assert!(app.chat.child_start_intents.is_empty());
+
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "resident-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
+        let resident = app
+            .chat
+            .messages
+            .iter()
+            .flat_map(|message| &message.sub_agents)
+            .find(|child| child.child_session_id == "resident-child")
+            .unwrap();
+        assert_eq!(resident.status, "completed");
+        assert!(!app.chat.active_child_ids.contains("resident-child"));
+        assert!(app.chat.active_child_ids.contains("active-child"));
     }
 
     #[test]
