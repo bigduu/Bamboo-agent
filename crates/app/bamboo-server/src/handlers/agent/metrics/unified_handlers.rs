@@ -19,7 +19,7 @@ use super::core_handlers::memory::build_memory_summary;
 fn build_unified_summary_filters(
     query: &MetricsSummaryQuery,
 ) -> (
-    bamboo_metrics::MetricsDateFilter,
+    bamboo_metrics::ModelMetricsDateFilter,
     bamboo_metrics::ForwardMetricsFilter,
 ) {
     let chat = build_summary_filter(query);

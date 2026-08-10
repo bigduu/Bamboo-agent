@@ -4,8 +4,9 @@ use std::sync::Arc;
 use crate::{
     aggregate_monthly, aggregate_weekly, DailyMetrics, ForwardEndpointMetrics,
     ForwardMetricsFilter, ForwardMetricsSummary, ForwardRequestMetrics, MetricsCollector,
-    MetricsDateFilter, MetricsError, MetricsStorage, MetricsSummary, ModelMetrics, PeriodMetrics,
-    SessionDetail, SessionMetrics, SessionMetricsFilter, SqliteMetricsStorage,
+    MetricsDateFilter, MetricsError, MetricsStorage, MetricsSummary, ModelMetrics,
+    ModelMetricsDateFilter, PeriodMetrics, SessionDetail, SessionMetrics, SessionMetricsFilter,
+    SqliteMetricsStorage,
 };
 use bamboo_agent_core::Session;
 use chrono::NaiveDate;
@@ -57,19 +58,19 @@ impl MetricsService {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
     ) -> Result<MetricsSummary, MetricsError> {
-        self.summary_filtered(MetricsDateFilter {
-            start_date,
-            end_date,
-            model: None,
-        })
-        .await
+        self.storage
+            .summary(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
     }
 
     pub async fn summary_filtered(
         &self,
-        filter: MetricsDateFilter,
+        filter: ModelMetricsDateFilter,
     ) -> Result<MetricsSummary, MetricsError> {
-        self.storage.summary(filter).await
+        self.storage.summary_filtered(filter).await
     }
 
     pub async fn by_model(
@@ -77,19 +78,19 @@ impl MetricsService {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
     ) -> Result<Vec<ModelMetrics>, MetricsError> {
-        self.by_model_filtered(MetricsDateFilter {
-            start_date,
-            end_date,
-            model: None,
-        })
-        .await
+        self.storage
+            .by_model(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
     }
 
     pub async fn by_model_filtered(
         &self,
-        filter: MetricsDateFilter,
+        filter: ModelMetricsDateFilter,
     ) -> Result<Vec<ModelMetrics>, MetricsError> {
-        self.storage.by_model(filter).await
+        self.storage.by_model_filtered(filter).await
     }
 
     pub async fn sessions(
@@ -424,6 +425,17 @@ mod tests {
         );
         assert_eq!(current_month_rollup.total_rounds, 1);
         assert_eq!(current_month_rollup.total_token_usage.total_tokens, 20);
+
+        let legacy_summary = service
+            .summary(None, None)
+            .await
+            .expect("legacy all-model summary");
+        assert_eq!(legacy_summary.total_tokens.total_tokens, 30);
+        let legacy_by_model = service
+            .by_model(None, None)
+            .await
+            .expect("legacy all-model grouped metrics");
+        assert_eq!(legacy_by_model.len(), 2);
 
         let selected_weekly = service
             .weekly_for_model(2, Some(current_month_date), Some("model-a".to_string()))

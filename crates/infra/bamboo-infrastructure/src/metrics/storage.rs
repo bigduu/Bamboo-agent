@@ -91,8 +91,8 @@ use thiserror::Error;
 use crate::metrics::types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, MetricsSummary,
-    ModelMetrics, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter,
-    SessionStatus, TokenUsage, ToolCallMetrics,
+    ModelMetrics, ModelMetricsDateFilter, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics,
+    SessionMetricsFilter, SessionStatus, TokenUsage, ToolCallMetrics,
 };
 
 /// Result type for metrics storage operations.
@@ -599,7 +599,6 @@ pub trait MetricsStorage: Send + Sync {
     /// let filter = MetricsDateFilter {
     ///     start_date: Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
     ///     end_date: Some(NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()),
-    ///     model: None,
     /// };
     ///
     /// let summary = storage.summary(filter).await?;
@@ -607,6 +606,33 @@ pub trait MetricsStorage: Send + Sync {
     /// println!("Total tokens: {}", summary.total_tokens.total_tokens);
     /// ```
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary>;
+
+    /// Retrieves aggregate chat metrics with an optional model restriction.
+    ///
+    /// The default preserves compatibility for existing storage
+    /// implementations when no model is selected. Implementations that support
+    /// model filtering should override this method.
+    async fn summary_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<MetricsSummary> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        if normalize_filter_value(model).is_none() {
+            self.summary(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered summary metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
 
     /// Retrieves metrics grouped by AI model.
     ///
@@ -632,6 +658,33 @@ pub trait MetricsStorage: Send + Sync {
     /// }
     /// ```
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>>;
+
+    /// Retrieves grouped model metrics with an optional model restriction.
+    ///
+    /// The default preserves compatibility for existing storage
+    /// implementations when no model is selected. Implementations that support
+    /// model filtering should override this method.
+    async fn by_model_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<Vec<ModelMetrics>> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        if normalize_filter_value(model).is_none() {
+            self.by_model(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered grouped metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
 
     /// Retrieves session metrics with filtering and pagination.
     ///
@@ -1766,7 +1819,14 @@ impl MetricsStorage for SqliteMetricsStorage {
     }
 
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary> {
-        let MetricsDateFilter {
+        self.summary_filtered(filter.into()).await
+    }
+
+    async fn summary_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<MetricsSummary> {
+        let ModelMetricsDateFilter {
             start_date,
             end_date,
             model,
@@ -1921,7 +1981,14 @@ impl MetricsStorage for SqliteMetricsStorage {
     }
 
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>> {
-        let MetricsDateFilter {
+        self.by_model_filtered(filter.into()).await
+    }
+
+    async fn by_model_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<Vec<ModelMetrics>> {
+        let ModelMetricsDateFilter {
             start_date,
             end_date,
             model,
@@ -3387,8 +3454,8 @@ mod tests {
 
     use super::{MetricsStorage, SqliteMetricsStorage, ToolCallCompletion};
     use crate::metrics::types::{
-        ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, RoundStatus,
-        SessionMetricsFilter, SessionStatus, TokenUsage,
+        ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter,
+        ModelMetricsDateFilter, RoundStatus, SessionMetricsFilter, SessionStatus, TokenUsage,
     };
 
     #[test]
@@ -4125,12 +4192,12 @@ mod tests {
             .await
             .expect("sync mismatch");
 
-        let selected = MetricsDateFilter {
+        let selected = ModelMetricsDateFilter {
             model: Some("model-a".to_string()),
-            ..MetricsDateFilter::default()
+            ..ModelMetricsDateFilter::default()
         };
         let summary = storage
-            .summary(selected.clone())
+            .summary_filtered(selected.clone())
             .await
             .expect("filtered summary");
         assert_eq!(summary.total_sessions, 1);
@@ -4146,7 +4213,10 @@ mod tests {
         assert_eq!(summary.total_sync_mismatches, 0);
         assert!(summary.sync_mismatch_breakdown.is_empty());
 
-        let by_model = storage.by_model(selected).await.expect("filtered by-model");
+        let by_model = storage
+            .by_model_filtered(selected)
+            .await
+            .expect("filtered by-model");
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "model-a");
         assert_eq!(by_model[0].sessions, 1);
@@ -4155,9 +4225,9 @@ mod tests {
         assert_eq!(by_model[0].tokens.total_tokens, 10);
 
         let cleared_by_model = storage
-            .by_model(MetricsDateFilter {
+            .by_model_filtered(ModelMetricsDateFilter {
                 model: Some("\t".to_string()),
-                ..MetricsDateFilter::default()
+                ..ModelMetricsDateFilter::default()
             })
             .await
             .expect("blank model restores all-model by-model metrics");
@@ -4182,9 +4252,9 @@ mod tests {
         assert!(daily[0].model_breakdown.contains_key("model-a"));
 
         let cleared = storage
-            .summary(MetricsDateFilter {
+            .summary_filtered(ModelMetricsDateFilter {
                 model: Some("   ".to_string()),
-                ..MetricsDateFilter::default()
+                ..ModelMetricsDateFilter::default()
             })
             .await
             .expect("blank model restores all-model summary");
@@ -4468,7 +4538,6 @@ mod tests {
             .by_model(MetricsDateFilter {
                 start_date: Some(day_two_date),
                 end_date: Some(day_two_date),
-                model: None,
             })
             .await
             .expect("day-two model rollup");
@@ -4482,7 +4551,6 @@ mod tests {
             .summary(MetricsDateFilter {
                 start_date: Some(day_two_date),
                 end_date: Some(day_two_date),
-                model: None,
             })
             .await
             .expect("day-two summary");
@@ -4923,7 +4991,6 @@ mod tests {
             .summary(MetricsDateFilter {
                 start_date: Some(NaiveDate::from_ymd_opt(2026, 2, 10).expect("valid date")),
                 end_date: Some(NaiveDate::from_ymd_opt(2026, 2, 10).expect("valid date")),
-                model: None,
             })
             .await
             .expect("day a summary");

@@ -29,8 +29,8 @@ pub(in crate::handlers::agent::metrics) fn normalize_model_filter(
 
 pub(in crate::handlers::agent::metrics) fn build_summary_filter(
     query: &MetricsSummaryQuery,
-) -> bamboo_metrics::MetricsDateFilter {
-    bamboo_metrics::MetricsDateFilter {
+) -> bamboo_metrics::ModelMetricsDateFilter {
+    bamboo_metrics::ModelMetricsDateFilter {
         start_date: query.start_date,
         end_date: query.end_date,
         model: normalize_model_filter(query.model.as_deref()),
