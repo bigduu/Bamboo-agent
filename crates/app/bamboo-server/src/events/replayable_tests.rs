@@ -39,6 +39,23 @@ async fn install_runner(state: &AppState, session_id: &str) {
         .insert(session_id.to_string(), runner);
 }
 
+fn child_started(session_id: &str, generation: &str) -> AgentEvent {
+    AgentEvent::SubAgentStarted {
+        parent_session_id: session_id.to_string(),
+        child_session_id: "resident-child".to_string(),
+        title: Some(generation.to_string()),
+    }
+}
+
+fn child_completed(session_id: &str) -> AgentEvent {
+    AgentEvent::SubAgentCompleted {
+        parent_session_id: session_id.to_string(),
+        child_session_id: "resident-child".to_string(),
+        status: "completed".to_string(),
+        error: None,
+    }
+}
+
 #[tokio::test]
 async fn caches_before_broadcasting_for_title_event() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -109,6 +126,55 @@ async fn caches_before_broadcasting_for_pinned_event() {
     assert!(matches!(
         received,
         AgentEvent::SessionPinnedUpdated { pinned: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn child_lifecycle_cache_coalesces_without_dropping_live_transitions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state init");
+    let session_id = "resident-generations";
+    install_runner(&state, session_id).await;
+
+    let sender = state.get_session_event_sender(session_id).await;
+    let mut subscriber = sender.subscribe();
+    for event in [
+        child_started(session_id, "generation-1"),
+        child_completed(session_id),
+        child_started(session_id, "generation-2"),
+    ] {
+        publish_replayable_session_event(&state, session_id, event).await;
+    }
+
+    // Existing subscribers retain the full ordered lifecycle stream.
+    let first = subscriber.recv().await.expect("generation 1 start");
+    let second = subscriber.recv().await.expect("generation 1 complete");
+    let third = subscriber.recv().await.expect("generation 2 start");
+    assert!(matches!(first, AgentEvent::SubAgentStarted { .. }));
+    assert!(matches!(second, AgentEvent::SubAgentCompleted { .. }));
+    assert!(matches!(
+        third,
+        AgentEvent::SubAgentStarted {
+            title: Some(ref title),
+            ..
+        } if title == "generation-2"
+    ));
+
+    // A late/reconnecting subscriber receives only the newest state for the
+    // stable child id, so no historical generation can consume a current TUI
+    // rerun authorization.
+    let runners = state.agent_runners.read().await;
+    let runner = runners.get(session_id).expect("runner registered");
+    assert_eq!(runner.last_critical_events.len(), 1);
+    assert!(matches!(
+        &runner.last_critical_events[0],
+        AgentEvent::SubAgentStarted {
+            child_session_id,
+            title: Some(title),
+            ..
+        } if child_session_id == "resident-child" && title == "generation-2"
     ));
 }
 

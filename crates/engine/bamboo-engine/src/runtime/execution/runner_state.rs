@@ -11,6 +11,18 @@ use uuid::Uuid;
 
 use bamboo_agent_core::AgentEvent;
 
+fn subagent_lifecycle_child_id(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::SubAgentStarted {
+            child_session_id, ..
+        }
+        | AgentEvent::SubAgentCompleted {
+            child_session_id, ..
+        } => Some(child_session_id),
+        _ => None,
+    }
+}
+
 /// Status of an agent execution runner.
 ///
 /// Represents the lifecycle state of an agent run from initialization
@@ -140,9 +152,15 @@ impl AgentRunner {
         }
     }
 
-    /// Push a critical event into the bounded replay cache.
+    /// Push a critical state event into the bounded replay cache.
     ///
-    /// If the cache is full, the oldest entry is evicted.
+    /// Sub-agent lifecycle entries are snapshots keyed by stable child id, not
+    /// an event log: a rerunnable/resident child can produce many generations,
+    /// and replaying older Start/Complete pairs makes the current generation
+    /// ambiguous to reconnecting clients. Keep only the newest lifecycle state
+    /// for each child while live subscribers still receive every event.
+    ///
+    /// If the remaining cache is full, the oldest entry is evicted.
     pub fn push_critical_event(&mut self, event: AgentEvent) {
         let lifecycle_id = match &event {
             AgentEvent::WorkflowActivated { event_id, .. }
@@ -166,9 +184,96 @@ impl AgentRunner {
         }) {
             return;
         }
+        if let Some(child_session_id) = subagent_lifecycle_child_id(&event) {
+            self.last_critical_events
+                .retain(|existing| subagent_lifecycle_child_id(existing) != Some(child_session_id));
+        }
         if self.last_critical_events.len() >= Self::CRITICAL_EVENTS_CAPACITY {
             self.last_critical_events.remove(0);
         }
         self.last_critical_events.push(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn started(child_session_id: &str, title: &str) -> AgentEvent {
+        AgentEvent::SubAgentStarted {
+            parent_session_id: "parent".to_string(),
+            child_session_id: child_session_id.to_string(),
+            title: Some(title.to_string()),
+        }
+    }
+
+    fn completed(child_session_id: &str, status: &str) -> AgentEvent {
+        AgentEvent::SubAgentCompleted {
+            parent_session_id: "parent".to_string(),
+            child_session_id: child_session_id.to_string(),
+            status: status.to_string(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn critical_replay_keeps_only_latest_generation_state_per_child() {
+        let mut runner = AgentRunner::new();
+
+        // A stable resident child may be reused repeatedly inside one parent
+        // runner. Reconnect must see S3 only, never the ambiguous historical
+        // sequence S1,C1,S2,C2,S3.
+        for event in [
+            started("resident", "generation-1"),
+            completed("resident", "completed"),
+            started("resident", "generation-2"),
+            completed("resident", "completed"),
+            started("resident", "generation-3"),
+        ] {
+            runner.push_critical_event(event);
+        }
+
+        assert_eq!(runner.last_critical_events.len(), 1);
+        assert!(matches!(
+            &runner.last_critical_events[0],
+            AgentEvent::SubAgentStarted {
+                child_session_id,
+                title: Some(title),
+                ..
+            } if child_session_id == "resident" && title == "generation-3"
+        ));
+
+        runner.push_critical_event(completed("resident", "completed"));
+        assert_eq!(runner.last_critical_events.len(), 1);
+        assert!(matches!(
+            &runner.last_critical_events[0],
+            AgentEvent::SubAgentCompleted {
+                child_session_id,
+                status,
+                ..
+            } if child_session_id == "resident" && status == "completed"
+        ));
+    }
+
+    #[test]
+    fn subagent_coalescing_preserves_other_children_and_recency() {
+        let mut runner = AgentRunner::new();
+        runner.push_critical_event(started("child-a", "a1"));
+        runner.push_critical_event(started("child-b", "b1"));
+        runner.push_critical_event(completed("child-a", "completed"));
+
+        assert_eq!(runner.last_critical_events.len(), 2);
+        assert!(matches!(
+            &runner.last_critical_events[0],
+            AgentEvent::SubAgentStarted {
+                child_session_id, ..
+            } if child_session_id == "child-b"
+        ));
+        assert!(matches!(
+            &runner.last_critical_events[1],
+            AgentEvent::SubAgentCompleted {
+                child_session_id, ..
+            } if child_session_id == "child-a"
+        ));
     }
 }

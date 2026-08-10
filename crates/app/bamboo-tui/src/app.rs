@@ -437,14 +437,9 @@ pub struct ChatState {
     /// and lets terminal tool events revoke it when enqueue never happened.
     child_start_intents: HashMap<String, ChildStartIntent>,
     /// Child ids whose latest-user-turn history authoritatively describes a
-    /// queued/running generation. A reconnect may replay older lifecycle pairs
-    /// before the Start for this generation, so this expectation deliberately
-    /// survives those older terminal events.
+    /// queued/running generation. The server's replay cache exposes only the
+    /// newest lifecycle state per stable child id.
     replay_expected_child_ids: HashSet<String>,
-    /// Expected children that have crossed an older replayed terminal. A later
-    /// Start is then known to belong to a newer generation of the stable id.
-    replay_child_terminal_seen: HashSet<String>,
-    replay_current_child_started: HashSet<String>,
     /// Child sessions observed as started in the current turn/stream
     /// generation. Historical rows are presentation state only and must never
     /// keep a later parent turn artificially open.
@@ -501,8 +496,6 @@ impl ChatState {
             replay_child_ids: HashSet::new(),
             child_start_intents: HashMap::new(),
             replay_expected_child_ids: HashSet::new(),
-            replay_child_terminal_seen: HashSet::new(),
-            replay_current_child_started: HashSet::new(),
             active_child_ids: HashSet::new(),
             current_execution_started: false,
             stop_requested_turn_id: None,
@@ -654,8 +647,6 @@ impl ChatState {
                 ChildStartIntent::Exact(_) | ChildStartIntent::Any => None,
             })
             .collect();
-        self.replay_child_terminal_seen.clear();
-        self.replay_current_child_started.clear();
         self.active_child_ids = self
             .messages
             .iter()
@@ -711,8 +702,6 @@ impl ChatState {
         self.replay_child_ids.clear();
         self.child_start_intents.clear();
         self.replay_expected_child_ids.clear();
-        self.replay_child_terminal_seen.clear();
-        self.replay_current_child_started.clear();
         self.active_child_ids.clear();
         self.current_execution_started = false;
         self.stop_requested_turn_id = None;
@@ -4743,8 +4732,6 @@ impl App {
         self.chat.replay_tool_ids.clear();
         self.chat.child_start_intents.clear();
         self.chat.replay_expected_child_ids.clear();
-        self.chat.replay_child_terminal_seen.clear();
-        self.chat.replay_current_child_started.clear();
         self.chat.active_child_ids.clear();
         self.chat.current_execution_started = false;
         self.chat.stop_requested_turn_id = None;
@@ -5422,8 +5409,6 @@ impl App {
                 // retires any child-generation expectation reconstructed for
                 // the previous suspended/reconnected run.
                 self.chat.replay_expected_child_ids.clear();
-                self.chat.replay_child_terminal_seen.clear();
-                self.chat.replay_current_child_started.clear();
                 self.chat.current_execution_started = true;
                 if self.chat.current_turn_id.is_none() {
                     self.chat.current_turn_id = Some(format!("run:{run_id}"));
@@ -5743,20 +5728,6 @@ impl App {
                     .chat
                     .replay_expected_child_ids
                     .contains(&child_session_id);
-                if replay_expected
-                    && self
-                        .chat
-                        .replay_child_terminal_seen
-                        .contains(&child_session_id)
-                {
-                    // FIFO critical replay can contain Start₁, Complete₁,
-                    // Start₂ for a stable child id. Once a Start follows an
-                    // older terminal, it is the expected current generation;
-                    // its eventual Complete may retire the expectation.
-                    self.chat
-                        .replay_current_child_started
-                        .insert(child_session_id.clone());
-                }
                 let already_active = self.chat.active_child_ids.contains(&child_session_id);
                 let current_execution_started = self.chat.current_execution_started;
                 let is_current_row = self
@@ -5811,29 +5782,9 @@ impl App {
                 error,
             } => {
                 self.chat.active_child_ids.remove(&child_session_id);
-                if self
-                    .chat
-                    .replay_current_child_started
-                    .remove(&child_session_id)
-                {
-                    self.chat
-                        .replay_expected_child_ids
-                        .remove(&child_session_id);
-                    self.chat
-                        .replay_child_terminal_seen
-                        .remove(&child_session_id);
-                } else if self
-                    .chat
+                self.chat
                     .replay_expected_child_ids
-                    .contains(&child_session_id)
-                {
-                    // Keep the expectation alive: this can be Complete₁ from
-                    // an older cached generation, followed by the current
-                    // generation's Start₂.
-                    self.chat
-                        .replay_child_terminal_seen
-                        .insert(child_session_id.clone());
-                }
+                    .remove(&child_session_id);
                 if let Some(sa) = self.find_subagent_mut(&child_session_id) {
                     sa.status = status;
                     sa.error = error;
@@ -10557,7 +10508,7 @@ mod question_tests {
     }
 
     #[test]
-    fn resumed_completed_rerun_survives_older_generation_replay() {
+    fn resumed_completed_rerun_uses_latest_coalesced_lifecycle() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.messages = vec![
             ChatMessage {
@@ -10624,26 +10575,8 @@ mod question_tests {
             .contains("reusable-child"));
         assert!(app.chat.child_start_intents.is_empty());
 
-        // The server's FIFO critical cache can retain both the previous child
-        // generation and the current rerun. Start₁/Complete₁ must not consume
-        // or revoke the history-backed expectation for Start₂.
-        app.handle_sse_event(AgentEvent::SubAgentStarted {
-            child_session_id: "reusable-child".to_string(),
-            title: Some("old replay".to_string()),
-        })
-        .unwrap();
-        app.handle_sse_event(AgentEvent::SubAgentCompleted {
-            child_session_id: "reusable-child".to_string(),
-            status: "completed".to_string(),
-            error: None,
-        })
-        .unwrap();
-        assert!(!app.has_running_subagents());
-        assert!(app
-            .chat
-            .replay_expected_child_ids
-            .contains("reusable-child"));
-
+        // The server coalesces every older lifecycle generation for this
+        // stable id, so reconnect receives only the current Start.
         app.handle_sse_event(AgentEvent::SubAgentStarted {
             child_session_id: "reusable-child".to_string(),
             title: Some("worker retry".to_string()),
@@ -10656,13 +10589,9 @@ mod question_tests {
             Some("worker retry")
         );
         assert!(app.chat.active_child_ids.contains("reusable-child"));
-        assert!(app
-            .chat
-            .replay_current_child_started
-            .contains("reusable-child"));
 
-        // Only the current generation's terminal event retires the replay
-        // expectation; a subsequent stale Start cannot revive it.
+        // The latest terminal snapshot retires the history expectation; a
+        // subsequent uncorrelated Start cannot revive it.
         app.handle_sse_event(AgentEvent::SubAgentCompleted {
             child_session_id: "reusable-child".to_string(),
             status: "completed".to_string(),
@@ -10673,6 +10602,99 @@ mod question_tests {
         assert!(app.chat.replay_expected_child_ids.is_empty());
         app.handle_sse_event(AgentEvent::SubAgentStarted {
             child_session_id: "reusable-child".to_string(),
+            title: None,
+        })
+        .unwrap();
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");
+        assert!(!app.has_running_subagents());
+    }
+
+    #[test]
+    fn pending_resident_create_keeps_any_intent_through_old_terminal_snapshot() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = vec![
+            ChatMessage {
+                id: "history:old-parent".to_string(),
+                role: MessageRole::Assistant,
+                content: "old resident result".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: vec![SubAgentDisplay {
+                    child_session_id: "resident-child".to_string(),
+                    title: Some("resident worker".to_string()),
+                    status: "completed".to_string(),
+                    error: None,
+                }],
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:new-user".to_string(),
+                role: MessageRole::User,
+                content: "reuse resident".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:pending-resident-create".to_string(),
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCallDisplay {
+                    id: "resident-create".to_string(),
+                    tool_name: "SubAgent".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "create",
+                        "resident_name": "worker",
+                        "prompt": "next task",
+                        "auto_run": true
+                    })
+                    .to_string(),
+                    result: None,
+                    stream_output: String::new(),
+                    error: None,
+                    phase: "pending".to_string(),
+                }],
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+        ];
+        app.chat.prepare_replay_reconciliation();
+        assert!(app.chat.replay_expected_child_ids.is_empty());
+        assert_eq!(
+            app.chat.child_start_intents.get("resident-create"),
+            Some(&ChildStartIntent::Any)
+        );
+
+        // If the new enqueue has not emitted Start yet, the coalesced replay
+        // can still contain C1 from the prior resident generation. It must not
+        // consume the pending create's identity-agnostic authorization.
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "resident-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
+        assert!(app.chat.child_start_intents.contains_key("resident-create"));
+
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "resident-child".to_string(),
+            title: Some("resident worker rerun".to_string()),
+        })
+        .unwrap();
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "running");
+        assert!(app.chat.active_child_ids.contains("resident-child"));
+        assert!(app.chat.child_start_intents.is_empty());
+
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "resident-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "resident-child".to_string(),
             title: None,
         })
         .unwrap();
