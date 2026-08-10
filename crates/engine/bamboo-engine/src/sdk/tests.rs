@@ -2314,6 +2314,14 @@ async fn s_t2_2_run_child_never_disables_tools() {
 async fn s_t2_4_run_child_model_override_is_persisted() {
     let harness = build_harness(Arc::new(CompletedProvider), Vec::new(), &[]).await;
     let runner = ChildRunner::new(harness.ctx.clone());
+    let mut parent_runner = crate::execution::AgentRunner::new();
+    parent_runner.status = crate::execution::AgentStatus::Running;
+    harness
+        .ctx
+        .agent_runners
+        .write()
+        .await
+        .insert(harness.parent_session_id.clone(), parent_runner);
 
     // Child session was persisted with model "gpt-5"; run with a different model.
     let override_model = "claude-3-7-sonnet";
@@ -2327,7 +2335,44 @@ async fn s_t2_4_run_child_model_override_is_persisted() {
         .await
         .unwrap();
 
-    let _ = collect_until_completed(&mut parent_rx).await;
+    let events = collect_until_completed(&mut parent_rx).await;
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::SubAgentStarted {
+            child_session_id,
+            ..
+        }) if child_session_id == &harness.child_session_id
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::SubAgentCompleted {
+            child_session_id,
+            ..
+        }) if child_session_id == &harness.child_session_id
+    ));
+
+    let runners = harness.ctx.agent_runners.read().await;
+    let cached_lifecycle = runners
+        .get(&harness.parent_session_id)
+        .expect("parent runner retained")
+        .last_critical_events
+        .iter()
+        .filter(|event| match event {
+            AgentEvent::SubAgentStarted {
+                child_session_id, ..
+            }
+            | AgentEvent::SubAgentCompleted {
+                child_session_id, ..
+            } => child_session_id == &harness.child_session_id,
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cached_lifecycle.len(), 1);
+    assert!(matches!(
+        cached_lifecycle[0],
+        AgentEvent::SubAgentCompleted { .. }
+    ));
+    drop(runners);
 
     let persisted = harness
         .storage

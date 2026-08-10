@@ -4,11 +4,14 @@
 //! they construct a full `AppState` to exercise the trait-based code path.
 
 use crate::app_state::AppState;
+use crate::handlers::agent::events::subscribe_with_runner_snapshot;
 use bamboo_agent_core::AgentEvent;
 use bamboo_agent_core::TitleSource;
 use bamboo_engine::events::publish_replayable_session_event;
 use bamboo_engine::runtime::execution::runner_state::{AgentRunner, AgentStatus};
 use chrono::Utc;
+use std::sync::Arc;
+use std::time::Duration;
 
 fn title_event(session_id: &str) -> AgentEvent {
     AgentEvent::SessionTitleUpdated {
@@ -37,6 +40,23 @@ async fn install_runner(state: &AppState, session_id: &str) {
         .write()
         .await
         .insert(session_id.to_string(), runner);
+}
+
+fn child_started(session_id: &str, generation: &str) -> AgentEvent {
+    AgentEvent::SubAgentStarted {
+        parent_session_id: session_id.to_string(),
+        child_session_id: "resident-child".to_string(),
+        title: Some(generation.to_string()),
+    }
+}
+
+fn child_completed(session_id: &str) -> AgentEvent {
+    AgentEvent::SubAgentCompleted {
+        parent_session_id: session_id.to_string(),
+        child_session_id: "resident-child".to_string(),
+        status: "completed".to_string(),
+        error: None,
+    }
 }
 
 #[tokio::test]
@@ -110,6 +130,118 @@ async fn caches_before_broadcasting_for_pinned_event() {
         received,
         AgentEvent::SessionPinnedUpdated { pinned: true, .. }
     ));
+}
+
+#[tokio::test]
+async fn child_lifecycle_cache_coalesces_without_dropping_live_transitions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state init");
+    let session_id = "resident-generations";
+    install_runner(&state, session_id).await;
+
+    let sender = state.get_session_event_sender(session_id).await;
+    let mut subscriber = sender.subscribe();
+    for event in [
+        child_started(session_id, "generation-1"),
+        child_completed(session_id),
+        child_started(session_id, "generation-2"),
+    ] {
+        publish_replayable_session_event(&state, session_id, event).await;
+    }
+
+    // Existing subscribers retain the full ordered lifecycle stream.
+    let first = subscriber.recv().await.expect("generation 1 start");
+    let second = subscriber.recv().await.expect("generation 1 complete");
+    let third = subscriber.recv().await.expect("generation 2 start");
+    assert!(matches!(first, AgentEvent::SubAgentStarted { .. }));
+    assert!(matches!(second, AgentEvent::SubAgentCompleted { .. }));
+    assert!(matches!(
+        third,
+        AgentEvent::SubAgentStarted {
+            title: Some(ref title),
+            ..
+        } if title == "generation-2"
+    ));
+
+    // A late/reconnecting subscriber receives only the newest state for the
+    // stable child id, so no historical generation can consume a current TUI
+    // rerun authorization.
+    let runners = state.agent_runners.read().await;
+    let runner = runners.get(session_id).expect("runner registered");
+    assert_eq!(runner.last_critical_events.len(), 1);
+    assert!(matches!(
+        &runner.last_critical_events[0],
+        AgentEvent::SubAgentStarted {
+            child_session_id,
+            title: Some(title),
+            ..
+        } if child_session_id == "resident-child" && title == "generation-2"
+    ));
+}
+
+#[tokio::test]
+async fn subscription_boundary_delivers_each_replayable_event_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state init"),
+    );
+    let session_id = "atomic-subscription";
+    install_runner(state.as_ref(), session_id).await;
+    let sender = state.get_session_event_sender(session_id).await;
+
+    // Hold publication ownership while the subscriber attempts to establish
+    // its boundary. Because subscribe + snapshot share the runner read lock,
+    // the publication lands only in the snapshot, never in both sources.
+    let mut runners = state.agent_runners.write().await;
+    let subscriber_state = Arc::clone(&state);
+    let subscriber = tokio::spawn(async move {
+        subscribe_with_runner_snapshot(subscriber_state.as_ref(), session_id).await
+    });
+    tokio::task::yield_now().await;
+
+    let before_boundary = child_started(session_id, "before-boundary");
+    runners
+        .get_mut(session_id)
+        .expect("runner registered")
+        .push_critical_event(before_boundary.clone());
+    let _ = sender.send(before_boundary);
+    drop(runners);
+
+    let (_sender, mut receiver, snapshot) = subscriber.await.expect("subscriber task");
+    let snapshot = snapshot.expect("runner snapshot");
+    assert_eq!(snapshot.last_critical_events.len(), 1);
+    assert!(matches!(
+        &snapshot.last_critical_events[0],
+        AgentEvent::SubAgentStarted {
+            title: Some(title),
+            ..
+        } if title == "before-boundary"
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), receiver.recv())
+            .await
+            .is_err(),
+        "the snapshot event must not also be buffered live"
+    );
+
+    // Publications after the boundary take the other path: they are absent
+    // from the captured snapshot and arrive exactly once on the receiver.
+    publish_replayable_session_event(state.as_ref(), session_id, child_completed(session_id)).await;
+    let live = tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+        .await
+        .expect("live event before timeout")
+        .expect("live channel open");
+    assert!(matches!(live, AgentEvent::SubAgentCompleted { .. }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), receiver.recv())
+            .await
+            .is_err(),
+        "the live event must be delivered only once"
+    );
 }
 
 #[tokio::test]

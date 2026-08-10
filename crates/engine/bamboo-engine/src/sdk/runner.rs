@@ -66,12 +66,27 @@ impl ChildRunner {
         }
     }
 
+    async fn announce_started(&self, input: &RunChildInput) {
+        self.ctx
+            .replayable_event_publisher()
+            .publish(
+                &input.parent_session_id,
+                AgentEvent::SubAgentStarted {
+                    parent_session_id: input.parent_session_id.clone(),
+                    child_session_id: input.child_session_id.clone(),
+                    title: None,
+                },
+            )
+            .await;
+    }
+
     /// Run a child session via the canonical spawn core.
     ///
     /// ANTI-FORK: constructs a [`SpawnJob`] and delegates to
     /// [`crate::sdk::spawn::run_child_spawn`]; there is no inline execute/finalize.
     pub async fn run_child(&self, input: RunChildInput) -> Result<(), String> {
         let job = self.build_job(&input);
+        self.announce_started(&input).await;
         crate::sdk::spawn::run_child_spawn(self.ctx.clone(), job).await
     }
 
@@ -91,6 +106,7 @@ impl ChildRunner {
                 .await;
         let rx = child_tx.subscribe();
         let job = self.build_job(&input);
+        self.announce_started(&input).await;
         crate::sdk::spawn::run_child_spawn(self.ctx.clone(), job).await?;
         Ok(rx)
     }

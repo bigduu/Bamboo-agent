@@ -972,8 +972,15 @@ async fn create_requires_session_id_in_tool_context() {
 }
 
 #[tokio::test]
-async fn create_emits_sub_agent_started_event_after_queueing() {
+async fn create_publishes_started_before_fast_completion_and_caches_latest() {
     let mut harness = build_test_harness().await;
+    let mut parent_runner = AgentRunner::new();
+    parent_runner.status = bamboo_engine::AgentStatus::Running;
+    harness
+        .agent_runners
+        .write()
+        .await
+        .insert(harness.parent_session_id.clone(), parent_runner);
 
     let result = invoke_completed(
         &harness.tool,
@@ -1010,27 +1017,65 @@ async fn create_emits_sub_agent_started_event_after_queueing() {
         .expect("tool result should include child_session_id")
         .to_string();
 
-    let started_event = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
+    let lifecycle = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut lifecycle = Vec::new();
+        while lifecycle.len() < 2 {
             match harness.parent_rx.recv().await {
                 Ok(AgentEvent::SubAgentStarted {
                     parent_session_id: pid,
                     child_session_id: cid,
                     ..
-                }) => break (pid, cid),
+                }) if cid == child_session_id => lifecycle.push(("started", pid, cid)),
+                Ok(AgentEvent::SubAgentCompleted {
+                    parent_session_id: pid,
+                    child_session_id: cid,
+                    ..
+                }) if cid == child_session_id => lifecycle.push(("completed", pid, cid)),
                 Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => {
-                    panic!("parent stream closed before start event")
+                    panic!("parent stream closed before child lifecycle completed")
                 }
             }
         }
+        lifecycle
     })
     .await
-    .expect("should receive SubAgentStarted event quickly");
+    .expect("should receive the fast child lifecycle quickly");
 
-    assert_eq!(started_event.0, harness.parent_session_id);
-    assert_eq!(started_event.1, child_session_id);
+    assert_eq!(lifecycle[0].0, "started");
+    assert_eq!(lifecycle[1].0, "completed");
+    assert!(lifecycle.iter().all(|(_, parent_id, child_id)| parent_id
+        == &harness.parent_session_id
+        && child_id == &child_session_id));
+
+    let runners = harness.agent_runners.read().await;
+    let parent_runner = runners
+        .get(&harness.parent_session_id)
+        .expect("parent runner retained");
+    let cached_child_lifecycle = parent_runner
+        .last_critical_events
+        .iter()
+        .filter(|event| match event {
+            AgentEvent::SubAgentStarted {
+                child_session_id: event_child_id,
+                ..
+            }
+            | AgentEvent::SubAgentCompleted {
+                child_session_id: event_child_id,
+                ..
+            } => event_child_id == &child_session_id,
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cached_child_lifecycle.len(), 1);
+    assert!(matches!(
+        cached_child_lifecycle[0],
+        AgentEvent::SubAgentCompleted {
+            child_session_id: cached_child_id,
+            ..
+        } if cached_child_id == &child_session_id
+    ));
 }
 
 #[tokio::test]

@@ -71,6 +71,21 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(colors::TOOL_RUNNING),
         ));
         spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
+        spans.push(Span::styled(
+            " draft editable; Enter sends after run ",
+            Style::default().fg(colors::INACTIVE),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
+    }
+
+    if app.chat.unseen_updates > 0 {
+        spans.push(Span::styled(
+            format!(" ↓ {} new · Ctrl+G jump ", app.chat.unseen_updates),
+            Style::default()
+                .fg(colors::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
     }
 
     // Model
@@ -178,9 +193,13 @@ const HELP_LEFT: &[(&str, &str)] = &[
     ("Enter", "Send / select / resume session"),
     ("Alt+Enter", "Insert newline (Chat)"),
     ("\u{2191}/\u{2193}, Wheel", "Move selection (lists)"),
-    ("j/k, Wheel", "Scroll (Chat/Config)"),
-    ("PgUp/PgDn", "Scroll by page (Chat/Config)"),
-    ("g / G", "Jump to top / bottom (Chat)"),
+    ("PgUp/PgDn", "Scroll transcript (Chat/Config)"),
+    ("Alt+↑/↓", "Scroll transcript (Chat)"),
+    ("Ctrl+Home/G", "Top / bottom (Chat)"),
+    ("Ctrl+B", "Focus conversation blocks"),
+    ("Block ↑/↓", "Previous / next block"),
+    ("Block Enter", "Expand / open child session"),
+    ("Block j/k/y", "Inspect scroll / copy exact block"),
 ];
 const HELP_RIGHT: &[(&str, &str)] = &[
     ("Ctrl+K", "Command palette"),
@@ -190,7 +209,7 @@ const HELP_RIGHT: &[(&str, &str)] = &[
     ("Ctrl+Q", "Reopen pending question"),
     ("Ctrl+C", "Quit / stop streaming"),
     ("Ctrl+S", "Stop agent execution"),
-    ("Ctrl+X", "Expand/collapse tool detail"),
+    ("Ctrl+X", "Focused detail / new-block default"),
     ("Ctrl+L", "Notification log"),
     ("] / [", "Next / previous page (Sessions)"),
     ("d", "Delete, with confirm (Sessions/Schedules)"),

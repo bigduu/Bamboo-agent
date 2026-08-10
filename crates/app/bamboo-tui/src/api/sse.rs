@@ -68,7 +68,7 @@ impl SseStream {
                 )
                 .await;
                 if terminal_seen {
-                    return; // run completed / cancelled / hard error — done.
+                    return; // protocol [DONE] / non-retryable error — done.
                 }
                 ready_tx.send(false).ok();
                 // The UI dropped the receiver ⇒ nothing to reconnect for.
@@ -93,10 +93,10 @@ impl SseStream {
         Ok((task, ready_rx))
     }
 
-    /// One connect + consume cycle. Returns `true` when a terminal event (or a
-    /// non-retryable client error) was seen — the caller should then stop.
-    /// Returns `false` on a retryable outcome (connect error, 5xx, or the stream
-    /// ending without a terminal event), so the caller reconnects.
+    /// One connect + consume cycle. Returns `true` when the protocol `[DONE]`
+    /// sentinel (or a non-retryable client error) was seen — the caller should
+    /// then stop. Returns `false` on a retryable outcome (connect error, 5xx,
+    /// or the stream ending without `[DONE]`), so the caller reconnects.
     async fn consume_once(
         client: &reqwest::Client,
         url: &str,
@@ -169,16 +169,18 @@ impl SseStream {
                     continue;
                 };
                 if Self::parse_sse_block(event_text, session_id, stream_epoch, tx) {
-                    return true; // terminal event delivered
+                    return true; // protocol sentinel delivered
                 }
             }
         }
-        // Stream ended without a terminal event (unexpected EOF) → reconnect.
+        // Stream ended without [DONE] (unexpected EOF) → reconnect.
         false
     }
 
-    /// Parse one SSE block and forward its events. Returns `true` if a terminal
-    /// event (Complete / Cancelled / Error) or a closed receiver was seen.
+    /// Parse one SSE block and forward its events. Agent terminal events do
+    /// not necessarily close the transport: the server keeps the session SSE
+    /// alive while background children emit lifecycle events. Only the
+    /// protocol `[DONE]` sentinel (or a closed receiver) ends this consumer.
     fn parse_sse_block(
         block: &str,
         session_id: &str,
@@ -191,16 +193,13 @@ impl SseStream {
                 continue;
             }
             if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" || data == "[KEEPALIVE]" {
+                if data == "[DONE]" {
+                    return true;
+                }
+                if data == "[KEEPALIVE]" {
                     continue;
                 }
                 if let Ok(event) = serde_json::from_str::<AgentEvent>(data) {
-                    let is_terminal = matches!(
-                        &event,
-                        AgentEvent::Complete { .. }
-                            | AgentEvent::Cancelled { .. }
-                            | AgentEvent::Error { .. }
-                    );
                     if tx
                         .send(SessionSseEvent::Event {
                             session_id: session_id.to_string(),
@@ -210,9 +209,6 @@ impl SseStream {
                         .is_err()
                     {
                         return true; // receiver gone — stop
-                    }
-                    if is_terminal {
-                        return true;
                     }
                 }
             }
@@ -240,7 +236,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn parse_block_flags_terminal_events_only() {
+    fn parse_block_only_closes_on_done_sentinel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         // A token is not terminal.
@@ -267,14 +263,38 @@ mod tests {
         ));
         assert!(rx.try_recv().is_err());
 
-        // Complete is terminal.
+        // Parent completion is forwarded but the transport remains open for
+        // late background-child lifecycle events.
         let terminal = SseStream::parse_sse_block(
             r#"data: {"type":"complete","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
             "s1",
             7,
             &tx,
         );
-        assert!(terminal);
+        assert!(!terminal);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionSseEvent::Event {
+                event: AgentEvent::Complete { .. },
+                ..
+            }
+        ));
+
+        assert!(!SseStream::parse_sse_block(
+            r#"data: {"type":"sub_agent_completed","child_session_id":"child-1","status":"completed"}"#,
+            "s1",
+            7,
+            &tx,
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SessionSseEvent::Event {
+                event: AgentEvent::SubAgentCompleted { .. },
+                ..
+            }
+        ));
+
+        assert!(SseStream::parse_sse_block("data: [DONE]", "s1", 7, &tx));
     }
 
     #[test]

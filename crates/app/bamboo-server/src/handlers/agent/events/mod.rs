@@ -2,6 +2,7 @@
 
 mod handler;
 mod stream;
+mod subscription;
 mod terminal;
 
 pub use handler::handler;
@@ -12,6 +13,7 @@ pub use handler::handler;
 //   WS forwarder reuses it rather than reimplementing coalescing.
 pub(crate) use handler::MAX_BATCH_MS;
 pub(crate) use stream::Coalescer;
+pub(crate) use subscription::subscribe_with_runner_snapshot;
 // Reused by the v2 WS `agent.{sid}` forwarder to keep the channel open while
 // child sub-agents are still running (parity with the v1 SSE stream, which does
 // not close on the parent terminal while descendants survive).

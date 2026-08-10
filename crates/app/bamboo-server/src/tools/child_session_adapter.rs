@@ -11,7 +11,6 @@ use chrono::Utc;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
-use crate::app_state::session_events::get_or_create_event_sender;
 use crate::app_state::{AgentRunner, AgentStatus};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::{AgentEvent, Session, SessionKind};
@@ -820,21 +819,17 @@ impl ChildSessionPort for ChildSessionAdapter {
         // suspending it — see `register_parent_wait_for_child` /
         // `register_parent_wait_for_children` and the `SubAgent.wait` action.
         self.scheduler
-            .enqueue(SpawnJob {
-                parent_session_id: parent.id.clone(),
-                child_session_id: child.id.clone(),
-                model,
-                disabled_tools,
-            })
+            .enqueue_announced(
+                SpawnJob {
+                    parent_session_id: parent.id.clone(),
+                    child_session_id: child.id.clone(),
+                    model,
+                    disabled_tools,
+                },
+                Some(child.title.clone()),
+            )
             .await
             .map_err(ChildSessionError::Execution)?;
-
-        let parent_tx = get_or_create_event_sender(&self.session_event_senders, &parent.id).await;
-        let _ = parent_tx.send(AgentEvent::SubAgentStarted {
-            parent_session_id: parent.id.clone(),
-            child_session_id: child.id.clone(),
-            title: Some(child.title.clone()),
-        });
 
         Ok(())
     }
@@ -908,16 +903,19 @@ impl ChildSessionPort for ChildSessionAdapter {
         {
             let mut senders = self.session_event_senders.write().await;
             senders.remove(child_id);
-            if cancelled_running_child {
-                if let Some(parent_tx) = senders.get(parent_session_id) {
-                    let _ = parent_tx.send(AgentEvent::SubAgentCompleted {
+        }
+        if cancelled_running_child {
+            self.scheduler
+                .publish_parent_replayable_event(
+                    parent_session_id,
+                    AgentEvent::SubAgentCompleted {
                         parent_session_id: parent_session_id.to_string(),
                         child_session_id: child_id.to_string(),
                         status: "cancelled".to_string(),
                         error: Some("Child session deleted while running".to_string()),
-                    });
-                }
-            }
+                    },
+                )
+                .await;
         }
 
         Ok(DeleteChildResult {

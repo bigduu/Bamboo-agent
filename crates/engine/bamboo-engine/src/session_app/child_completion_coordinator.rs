@@ -2660,14 +2660,15 @@ impl ChildCompletionCoordinator {
         status: &str,
         error: Option<String>,
     ) {
-        let parent_tx = crate::execution::session_events::get_or_create_event_sender(
-            &self.session_event_senders,
-            parent_session_id,
-        )
-        .await;
+        let publisher =
+            crate::runtime::execution::session_events::ReplayableSessionEventPublisher::new(
+                self.agent_runners.clone(),
+                self.session_event_senders.clone(),
+                self.account_feed_inbox.clone(),
+            );
         let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
         crate::runtime::execution::spawn::publish_child_completion_parts(
-            &parent_tx,
+            &publisher,
             Some(handler),
             parent_session_id.to_string(),
             child_session_id.to_string(),
