@@ -2,7 +2,8 @@ use actix_web::{web, HttpResponse, Responder};
 
 use super::super::{internal_error, MetricsDailyQuery, MetricsSessionsQuery, MetricsSummaryQuery};
 use super::filters::{
-    build_sessions_filter, normalize_days, resolve_timeline_granularity, TimelineGranularity,
+    build_chat_timeline_filter, build_sessions_filter, build_summary_filter,
+    resolve_timeline_granularity, TimelineGranularity,
 };
 use crate::app_state::AppState;
 
@@ -14,11 +15,8 @@ pub async fn summary(
     state: web::Data<AppState>,
     query: web::Query<MetricsSummaryQuery>,
 ) -> impl Responder {
-    match state
-        .metrics_service
-        .summary(query.start_date, query.end_date)
-        .await
-    {
+    let filter = build_summary_filter(&query);
+    match state.metrics_service.summary_filtered(filter).await {
         Ok(summary) => HttpResponse::Ok().json(summary),
         Err(error) => internal_error(error),
     }
@@ -32,11 +30,8 @@ pub async fn by_model(
     state: web::Data<AppState>,
     query: web::Query<MetricsSummaryQuery>,
 ) -> impl Responder {
-    match state
-        .metrics_service
-        .by_model(query.start_date, query.end_date)
-        .await
-    {
+    let filter = build_summary_filter(&query);
+    match state.metrics_service.by_model_filtered(filter).await {
         Ok(data) => HttpResponse::Ok().json(data),
         Err(error) => internal_error(error),
     }
@@ -82,25 +77,38 @@ pub async fn daily(
     state: web::Data<AppState>,
     query: web::Query<MetricsDailyQuery>,
 ) -> impl Responder {
-    let days = normalize_days(query.days);
+    let filter = build_chat_timeline_filter(&query);
 
     match resolve_timeline_granularity(query.granularity.as_deref()) {
         TimelineGranularity::Weekly => {
-            match state.metrics_service.weekly(days, query.end_date).await {
+            match state
+                .metrics_service
+                .weekly_for_model(filter.days, filter.end_date, filter.model)
+                .await
+            {
                 Ok(data) => HttpResponse::Ok().json(data),
                 Err(error) => internal_error(error),
             }
         }
         TimelineGranularity::Monthly => {
-            match state.metrics_service.monthly(days, query.end_date).await {
+            match state
+                .metrics_service
+                .monthly_for_model(filter.days, filter.end_date, filter.model)
+                .await
+            {
                 Ok(data) => HttpResponse::Ok().json(data),
                 Err(error) => internal_error(error),
             }
         }
-        TimelineGranularity::Daily => match state.metrics_service.daily(days, query.end_date).await
-        {
-            Ok(data) => HttpResponse::Ok().json(data),
-            Err(error) => internal_error(error),
-        },
+        TimelineGranularity::Daily => {
+            match state
+                .metrics_service
+                .daily_for_model(filter.days, filter.end_date, filter.model)
+                .await
+            {
+                Ok(data) => HttpResponse::Ok().json(data),
+                Err(error) => internal_error(error),
+            }
+        }
     }
 }

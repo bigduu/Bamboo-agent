@@ -287,6 +287,8 @@ pub struct MetricsDateFilter {
     pub start_date: Option<NaiveDate>,
     /// End date (inclusive)
     pub end_date: Option<NaiveDate>,
+    /// Filter by model name. Blank values are treated as no filter.
+    pub model: Option<String>,
 }
 
 /// Filter for session metrics queries

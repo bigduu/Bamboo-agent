@@ -12,6 +12,8 @@ pub struct MetricsSummaryQuery {
     pub start_date: Option<NaiveDate>,
     /// End date for the metrics range (YYYY-MM-DD)
     pub end_date: Option<NaiveDate>,
+    /// Filter by model name
+    pub model: Option<String>,
 }
 
 /// Query parameters for session metrics requests
@@ -34,6 +36,8 @@ pub struct MetricsDailyQuery {
     pub days: Option<u32>,
     /// End date for the range
     pub end_date: Option<NaiveDate>,
+    /// Filter by model name
+    pub model: Option<String>,
     /// Granularity: "daily", "weekly", or "monthly" (default: "daily").
     /// Unknown values follow the existing timeline policy and fall back to daily.
     pub granularity: Option<String>,
@@ -236,11 +240,12 @@ pub struct UnifiedSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actix_web::web;
     use chrono::NaiveDate;
 
     #[test]
     fn test_metrics_summary_query_deserialization() {
-        let json = r#"{"start_date":"2024-01-01","end_date":"2024-01-31"}"#;
+        let json = r#"{"start_date":"2024-01-01","end_date":"2024-01-31","model":"gpt-4"}"#;
         let query: MetricsSummaryQuery = serde_json::from_str(json).unwrap();
 
         assert_eq!(
@@ -251,6 +256,7 @@ mod tests {
             query.end_date,
             Some(NaiveDate::from_ymd_opt(2024, 1, 31).unwrap())
         );
+        assert_eq!(query.model.as_deref(), Some("gpt-4"));
     }
 
     #[test]
@@ -260,6 +266,7 @@ mod tests {
 
         assert!(query.start_date.is_none());
         assert!(query.end_date.is_none());
+        assert!(query.model.is_none());
     }
 
     #[test]
@@ -289,16 +296,34 @@ mod tests {
 
         assert!(query.days.is_none());
         assert!(query.end_date.is_none());
+        assert!(query.model.is_none());
         assert!(query.granularity.is_none());
     }
 
     #[test]
     fn test_metrics_daily_query_with_options() {
-        let json = r#"{"days":30,"granularity":"weekly"}"#;
+        let json = r#"{"days":30,"model":"claude-sonnet","granularity":"weekly"}"#;
         let query: MetricsDailyQuery = serde_json::from_str(json).unwrap();
 
         assert_eq!(query.days, Some(30));
+        assert_eq!(query.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(query.granularity, Some("weekly".to_string()));
+    }
+
+    #[test]
+    fn metrics_model_filters_deserialize_from_http_query_strings() {
+        let summary = web::Query::<MetricsSummaryQuery>::from_query(
+            "start_date=2024-01-01&end_date=2024-01-31&model=gpt-4",
+        )
+        .expect("summary query");
+        assert_eq!(summary.model.as_deref(), Some("gpt-4"));
+
+        let timeline = web::Query::<MetricsDailyQuery>::from_query(
+            "days=30&end_date=2024-01-31&model=claude-sonnet&granularity=monthly",
+        )
+        .expect("timeline query");
+        assert_eq!(timeline.model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(timeline.granularity.as_deref(), Some("monthly"));
     }
 
     #[test]
@@ -327,6 +352,7 @@ mod tests {
         let query = MetricsSummaryQuery {
             start_date: None,
             end_date: None,
+            model: None,
         };
 
         let debug_str = format!("{:?}", query);
@@ -351,6 +377,7 @@ mod tests {
         let query = MetricsDailyQuery {
             days: Some(7),
             end_date: None,
+            model: None,
             granularity: Some("daily".to_string()),
         };
 

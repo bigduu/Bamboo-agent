@@ -4,7 +4,10 @@ use actix_web::{web, HttpResponse, Responder};
 use bamboo_metrics::{DailyMetrics, PeriodMetrics, TokenUsage};
 
 use super::{
-    core_handlers::filters::{normalize_days, resolve_timeline_granularity, TimelineGranularity},
+    core_handlers::filters::{
+        build_chat_timeline_filter, build_summary_filter, resolve_timeline_granularity,
+        TimelineGranularity,
+    },
     internal_error, CombinedSummary, MemoryMetricsQuery, MetricsDailyQuery, MetricsSummaryQuery,
     UnifiedSummary, UnifiedTimelinePoint,
 };
@@ -12,6 +15,40 @@ use crate::app_state::AppState;
 use bamboo_memory::memory_store::MemoryStore;
 
 use super::core_handlers::memory::build_memory_summary;
+
+fn build_unified_summary_filters(
+    query: &MetricsSummaryQuery,
+) -> (
+    bamboo_metrics::MetricsDateFilter,
+    bamboo_metrics::ForwardMetricsFilter,
+) {
+    let chat = build_summary_filter(query);
+    let forward = bamboo_metrics::ForwardMetricsFilter {
+        start_date: chat.start_date,
+        end_date: chat.end_date,
+        endpoint: None,
+        model: chat.model.clone(),
+        limit: None,
+    };
+    (chat, forward)
+}
+
+fn build_unified_timeline_filters(
+    query: &MetricsDailyQuery,
+) -> (
+    super::core_handlers::filters::ChatTimelineFilter,
+    bamboo_metrics::ForwardMetricsFilter,
+) {
+    let chat = build_chat_timeline_filter(query);
+    let forward = bamboo_metrics::ForwardMetricsFilter {
+        start_date: None,
+        end_date: chat.end_date,
+        endpoint: None,
+        model: chat.model.clone(),
+        limit: Some(chat.days),
+    };
+    (chat, forward)
+}
 
 /// Gets unified metrics summary combining chat and forward data
 ///
@@ -21,21 +58,10 @@ pub async fn v2_unified_summary(
     state: web::Data<AppState>,
     query: web::Query<MetricsSummaryQuery>,
 ) -> impl Responder {
-    let chat_result = state
-        .metrics_service
-        .summary(query.start_date, query.end_date)
-        .await;
+    let (chat_filter, forward_filter) = build_unified_summary_filters(&query);
+    let chat_result = state.metrics_service.summary_filtered(chat_filter).await;
 
-    let forward_result = state
-        .metrics_service
-        .forward_summary(bamboo_metrics::ForwardMetricsFilter {
-            start_date: query.start_date,
-            end_date: query.end_date,
-            endpoint: None,
-            model: None,
-            limit: None,
-        })
-        .await;
+    let forward_result = state.metrics_service.forward_summary(forward_filter).await;
 
     let memory_store = MemoryStore::new(state.app_data_dir.clone());
     let memory_result = build_memory_summary(
@@ -101,20 +127,14 @@ pub async fn v2_unified_timeline(
     state: web::Data<AppState>,
     query: web::Query<MetricsDailyQuery>,
 ) -> impl Responder {
-    let days = normalize_days(query.days);
+    let (filter, forward_filter) = build_unified_timeline_filters(&query);
     let granularity = resolve_timeline_granularity(query.granularity.as_deref());
 
-    let chat_result = state.metrics_service.daily(days, query.end_date).await;
-    let forward_result = state
+    let chat_result = state
         .metrics_service
-        .forward_daily(bamboo_metrics::ForwardMetricsFilter {
-            start_date: None,
-            end_date: query.end_date,
-            endpoint: None,
-            model: None,
-            limit: Some(days),
-        })
+        .daily_for_model(filter.days, filter.end_date, filter.model.clone())
         .await;
+    let forward_result = state.metrics_service.forward_daily(forward_filter).await;
 
     match (chat_result, forward_result) {
         (Ok(chat_daily), Ok(forward_daily)) => HttpResponse::Ok().json(build_unified_timeline(
@@ -284,6 +304,39 @@ mod tests {
             model_breakdown: Default::default(),
             tool_breakdown: Default::default(),
         }
+    }
+
+    #[test]
+    fn unified_handlers_apply_one_normalized_model_to_chat_and_forward_sources() {
+        let summary_query = MetricsSummaryQuery {
+            start_date: Some(NaiveDate::from_ymd_opt(2099, 2, 1).expect("date")),
+            end_date: Some(NaiveDate::from_ymd_opt(2099, 2, 28).expect("date")),
+            model: Some("  model-a  ".to_string()),
+        };
+        let (chat_summary, forward_summary) = build_unified_summary_filters(&summary_query);
+        assert_eq!(chat_summary.model.as_deref(), Some("model-a"));
+        assert_eq!(forward_summary.model, chat_summary.model);
+
+        let timeline_query = MetricsDailyQuery {
+            days: Some(7),
+            end_date: summary_query.end_date,
+            model: Some("model-a".to_string()),
+            granularity: Some("weekly".to_string()),
+        };
+        let (chat_timeline, forward_timeline) = build_unified_timeline_filters(&timeline_query);
+        assert_eq!(chat_timeline.model.as_deref(), Some("model-a"));
+        assert_eq!(forward_timeline.model, chat_timeline.model);
+        assert_eq!(forward_timeline.limit, Some(chat_timeline.days));
+
+        let cleared_query = MetricsDailyQuery {
+            days: None,
+            end_date: None,
+            model: Some("   ".to_string()),
+            granularity: None,
+        };
+        let (cleared_chat, cleared_forward) = build_unified_timeline_filters(&cleared_query);
+        assert_eq!(cleared_chat.model, None);
+        assert_eq!(cleared_forward.model, None);
     }
 
     #[test]

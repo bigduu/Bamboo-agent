@@ -57,12 +57,19 @@ impl MetricsService {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
     ) -> Result<MetricsSummary, MetricsError> {
-        self.storage
-            .summary(MetricsDateFilter {
-                start_date,
-                end_date,
-            })
-            .await
+        self.summary_filtered(MetricsDateFilter {
+            start_date,
+            end_date,
+            model: None,
+        })
+        .await
+    }
+
+    pub async fn summary_filtered(
+        &self,
+        filter: MetricsDateFilter,
+    ) -> Result<MetricsSummary, MetricsError> {
+        self.storage.summary(filter).await
     }
 
     pub async fn by_model(
@@ -70,12 +77,19 @@ impl MetricsService {
         start_date: Option<NaiveDate>,
         end_date: Option<NaiveDate>,
     ) -> Result<Vec<ModelMetrics>, MetricsError> {
-        self.storage
-            .by_model(MetricsDateFilter {
-                start_date,
-                end_date,
-            })
-            .await
+        self.by_model_filtered(MetricsDateFilter {
+            start_date,
+            end_date,
+            model: None,
+        })
+        .await
+    }
+
+    pub async fn by_model_filtered(
+        &self,
+        filter: MetricsDateFilter,
+    ) -> Result<Vec<ModelMetrics>, MetricsError> {
+        self.storage.by_model(filter).await
     }
 
     pub async fn sessions(
@@ -97,7 +111,18 @@ impl MetricsService {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> Result<Vec<DailyMetrics>, MetricsError> {
-        self.storage.daily_metrics(days, end_date).await
+        self.daily_for_model(days, end_date, None).await
+    }
+
+    pub async fn daily_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> Result<Vec<DailyMetrics>, MetricsError> {
+        self.storage
+            .daily_metrics_for_model(days, end_date, model)
+            .await
     }
 
     pub async fn weekly(
@@ -105,7 +130,16 @@ impl MetricsService {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> Result<Vec<PeriodMetrics>, MetricsError> {
-        let daily = self.daily(days, end_date).await?;
+        self.weekly_for_model(days, end_date, None).await
+    }
+
+    pub async fn weekly_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> Result<Vec<PeriodMetrics>, MetricsError> {
+        let daily = self.daily_for_model(days, end_date, model).await?;
         Ok(aggregate_weekly(&daily))
     }
 
@@ -114,7 +148,16 @@ impl MetricsService {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> Result<Vec<PeriodMetrics>, MetricsError> {
-        let daily = self.daily(days, end_date).await?;
+        self.monthly_for_model(days, end_date, None).await
+    }
+
+    pub async fn monthly_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> Result<Vec<PeriodMetrics>, MetricsError> {
+        let daily = self.daily_for_model(days, end_date, model).await?;
         Ok(aggregate_monthly(&daily))
     }
 
@@ -145,7 +188,12 @@ impl MetricsService {
         filter: ForwardMetricsFilter,
     ) -> Result<Vec<DailyMetrics>, MetricsError> {
         self.storage
-            .forward_daily_metrics(filter.limit.unwrap_or(30), filter.end_date)
+            .forward_daily_metrics_filtered(
+                filter.limit.unwrap_or(30),
+                filter.end_date,
+                filter.endpoint,
+                filter.model,
+            )
             .await
     }
 }
@@ -156,7 +204,74 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{RoundStatus, SessionStatus, TokenUsage};
+    use crate::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
+
+    #[tokio::test]
+    async fn forward_daily_preserves_endpoint_and_model_filters() {
+        let directory = tempdir().expect("metrics tempdir");
+        let service = MetricsService::new(directory.path().join("metrics.db"))
+            .await
+            .expect("metrics service");
+        let now = Utc::now();
+
+        for (suffix, endpoint, model, tokens) in [
+            ("a", "openai.responses", "model-a", 5),
+            ("b", "openai.responses", "model-b", 9),
+            ("c", "anthropic.messages", "model-a", 11),
+        ] {
+            let forward_id = format!("service-forward-{suffix}");
+            service
+                .storage
+                .insert_forward_start(&forward_id, endpoint, model, false, now)
+                .await
+                .expect("forward start");
+            service
+                .storage
+                .complete_forward(
+                    &forward_id,
+                    now,
+                    Some(200),
+                    ForwardStatus::Success,
+                    Some(TokenUsage {
+                        prompt_tokens: tokens,
+                        completion_tokens: 0,
+                        total_tokens: tokens,
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .expect("forward completion");
+        }
+
+        let selected = service
+            .forward_daily(ForwardMetricsFilter {
+                end_date: Some(now.date_naive()),
+                endpoint: Some("openai.responses".to_string()),
+                model: Some("model-a".to_string()),
+                limit: Some(1),
+                ..ForwardMetricsFilter::default()
+            })
+            .await
+            .expect("endpoint and model filtered forward daily");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].total_sessions, 1);
+        assert_eq!(selected[0].total_token_usage.total_tokens, 5);
+
+        let cleared = service
+            .forward_daily(ForwardMetricsFilter {
+                end_date: Some(now.date_naive()),
+                endpoint: Some("openai.responses".to_string()),
+                model: Some("  ".to_string()),
+                limit: Some(1),
+                ..ForwardMetricsFilter::default()
+            })
+            .await
+            .expect("blank model restores all models for selected endpoint");
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].total_sessions, 2);
+        assert_eq!(cleared[0].total_token_usage.total_tokens, 14);
+    }
 
     #[tokio::test]
     async fn weekly_and_monthly_preserve_round_attributed_daily_usage() {
@@ -309,5 +424,43 @@ mod tests {
         );
         assert_eq!(current_month_rollup.total_rounds, 1);
         assert_eq!(current_month_rollup.total_token_usage.total_tokens, 20);
+
+        let selected_weekly = service
+            .weekly_for_model(2, Some(current_month_date), Some("model-a".to_string()))
+            .await
+            .expect("model-filtered weekly metrics");
+        assert_eq!(
+            selected_weekly
+                .iter()
+                .map(|period| period.total_sessions)
+                .sum::<u32>(),
+            1
+        );
+        assert_eq!(
+            selected_weekly
+                .iter()
+                .map(|period| period.total_rounds)
+                .sum::<u32>(),
+            1
+        );
+        assert_eq!(
+            selected_weekly
+                .iter()
+                .map(|period| period.total_token_usage.total_tokens)
+                .sum::<u64>(),
+            10
+        );
+        assert!(selected_weekly
+            .iter()
+            .all(|period| !period.model_breakdown.contains_key("model-b")));
+
+        let selected_monthly = service
+            .monthly_for_model(2, Some(current_month_date), Some("model-a".to_string()))
+            .await
+            .expect("model-filtered monthly metrics");
+        assert_eq!(selected_monthly.len(), 1);
+        assert_eq!(selected_monthly[0].total_sessions, 1);
+        assert_eq!(selected_monthly[0].total_rounds, 1);
+        assert_eq!(selected_monthly[0].total_token_usage.total_tokens, 10);
     }
 }
