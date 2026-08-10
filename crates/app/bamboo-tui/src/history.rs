@@ -13,7 +13,7 @@ use crate::app::{ChatMessage, MessageRole, SubAgentDisplay, ToolCallDisplay};
 /// - `system` messages are dropped — the TUI never displays them.
 /// - `user` messages become a plain `ChatMessage`.
 /// - `assistant` messages become a `ChatMessage` carrying their tool calls
-///   (installed with `phase: "complete"`, no result yet — a paired `tool`
+///   (installed with `phase: "pending"`, no result yet — a paired `tool`
 ///   message fills that in below).
 /// - `tool` messages are not appended as their own transcript entry; instead
 ///   the matching `ToolCallDisplay` (by `tool_call_id`) is located in the
@@ -65,7 +65,7 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                         result: None,
                         stream_output: String::new(),
                         error: None,
-                        phase: "complete".to_string(),
+                        phase: "pending".to_string(),
                     })
                     .collect();
                 let reasoning = msg.reasoning.filter(|r| !r.is_empty());
@@ -91,7 +91,6 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                 let Some(tool_call_id) = msg.tool_call_id.as_deref() else {
                     continue;
                 };
-                let child = sub_agent_from_tool_result(&msg.content, msg.tool_success);
                 // Scan already-built output back-to-front so a repeated id
                 // across turns pairs with the *nearest preceding* assistant
                 // message, not the first one in the whole transcript.
@@ -102,6 +101,18 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                             .iter()
                             .any(|tool| tool.id == tool_call_id)
                 });
+                let trusted_sub_agent_result = parent_index.is_some_and(|parent_index| {
+                    out[parent_index]
+                        .tool_calls
+                        .iter()
+                        .find(|tool| tool.id == tool_call_id)
+                        .is_some_and(|tool| is_sub_agent_tool_name(&tool.tool_name))
+                });
+                let children = if trusted_sub_agent_result {
+                    sub_agents_from_tool_result(&msg.content, msg.tool_success)
+                } else {
+                    Vec::new()
+                };
                 if let Some(parent_index) = parent_index {
                     let tc = out[parent_index]
                         .tool_calls
@@ -116,33 +127,18 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
                         tc.result = Some(msg.content);
                     }
                 }
-                if let Some(child) = child {
-                    if let Some(existing) = out
-                        .iter_mut()
-                        .rev()
-                        .flat_map(|message| message.sub_agents.iter_mut())
-                        .find(|existing| existing.child_session_id == child.child_session_id)
-                    {
-                        if child.title.is_some() {
-                            existing.title = child.title;
-                        }
-                        existing.status = child.status;
-                        if child.error.is_some() {
-                            existing.error = child.error;
-                        }
-                    } else {
-                        let attach_index = parent_index.or_else(|| {
-                            out.iter()
-                                .rposition(|message| matches!(message.role, MessageRole::Assistant))
-                        });
-                        if let Some(attach_index) = attach_index {
-                            out[attach_index].sub_agents.push(child);
+                for child in children {
+                    if !upsert_sub_agent_in_transcript(&mut out, &child) {
+                        // A child identity parsed from a trusted, paired
+                        // SubAgent result belongs to that assistant turn.
+                        if let Some(parent_index) = parent_index {
+                            out[parent_index].sub_agents.push(child.into_display());
                         }
                     }
                 }
                 // The tool message itself is never rendered as a separate
-                // transcript row. A reconstructable child summary above may
-                // still be retained even when its tool-call pair is absent.
+                // transcript row, and child summaries are accepted only from
+                // the trusted paired SubAgent call above.
             }
             _ => {}
         }
@@ -151,85 +147,218 @@ pub fn map_history(messages: Vec<HistoryMessage>) -> Vec<ChatMessage> {
     out
 }
 
+#[derive(Debug, Clone)]
+struct SubAgentCandidate {
+    child_session_id: String,
+    title: Option<String>,
+    status: Option<String>,
+    /// 0 = absent, 1 = collection fallback, 2 = inferred running,
+    /// 3 = explicit payload status or failed tool result.
+    status_rank: u8,
+    error: Option<String>,
+}
+
+impl SubAgentCandidate {
+    fn merge(&mut self, newer: Self) {
+        if newer.title.is_some() {
+            self.title = newer.title;
+        }
+        if newer.status.is_some() && newer.status_rank >= self.status_rank {
+            self.status = newer.status;
+            self.status_rank = newer.status_rank;
+        }
+        if newer.error.is_some() {
+            self.error = newer.error;
+        }
+    }
+
+    fn merge_into(&self, existing: &mut SubAgentDisplay) {
+        if let Some(title) = &self.title {
+            existing.title = Some(title.clone());
+        }
+        if self.status_rank >= 2 || existing.status == "unknown" {
+            if let Some(status) = &self.status {
+                existing.status = status.clone();
+            }
+        }
+        if let Some(error) = &self.error {
+            existing.error = Some(error.clone());
+        }
+    }
+
+    fn into_display(self) -> SubAgentDisplay {
+        SubAgentDisplay {
+            child_session_id: self.child_session_id,
+            title: self.title,
+            status: self.status.unwrap_or_else(|| "unknown".to_string()),
+            error: self.error,
+        }
+    }
+}
+
+fn is_sub_agent_tool_name(name: &str) -> bool {
+    name.chars()
+        .filter(|character| !matches!(character, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .eq("subagent".chars())
+}
+
+fn non_empty_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn candidate_from_value(
+    value: &serde_json::Value,
+    success: Option<bool>,
+    fallback_status: Option<&str>,
+    allow_id_alias: bool,
+) -> Option<SubAgentCandidate> {
+    if let Some(child_session_id) = value.as_str().filter(|id| !id.trim().is_empty()) {
+        return Some(SubAgentCandidate {
+            child_session_id: child_session_id.to_string(),
+            title: None,
+            status: if success == Some(false) {
+                Some("error".to_string())
+            } else {
+                fallback_status.map(str::to_string)
+            },
+            status_rank: if success == Some(false) {
+                3
+            } else if fallback_status.is_some() {
+                1
+            } else {
+                0
+            },
+            error: None,
+        });
+    }
+
+    let child_session_id = non_empty_string(value.get("child_session_id").or_else(|| {
+        if allow_id_alias {
+            value.get("id")
+        } else {
+            None
+        }
+    }))?;
+    let (status, status_rank) = if success == Some(false) {
+        (Some("error".to_string()), 3)
+    } else if let Some(status) =
+        non_empty_string(value.get("status").or_else(|| value.get("last_run_status")))
+    {
+        (Some(status), 3)
+    } else if value
+        .get("is_running")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        (Some("running".to_string()), 2)
+    } else if let Some(fallback_status) = fallback_status {
+        (Some(fallback_status.to_string()), 1)
+    } else {
+        (None, 0)
+    };
+    Some(SubAgentCandidate {
+        child_session_id,
+        title: non_empty_string(value.get("title")),
+        status,
+        status_rank,
+        error: non_empty_string(value.get("error").or_else(|| value.get("last_run_error"))),
+    })
+}
+
+fn upsert_candidate(candidates: &mut Vec<SubAgentCandidate>, candidate: SubAgentCandidate) {
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|existing| existing.child_session_id == candidate.child_session_id)
+    {
+        existing.merge(candidate);
+    } else {
+        candidates.push(candidate);
+    }
+}
+
+fn extend_candidates_from_collection(
+    candidates: &mut Vec<SubAgentCandidate>,
+    collection: Option<&serde_json::Value>,
+    success: Option<bool>,
+    fallback_status: Option<&str>,
+) {
+    let Some(collection) = collection else {
+        return;
+    };
+    let values: &[serde_json::Value] = match collection.as_array() {
+        Some(values) => values,
+        None => std::slice::from_ref(collection),
+    };
+    for value in values {
+        if let Some(candidate) = candidate_from_value(value, success, fallback_status, true) {
+            upsert_candidate(candidates, candidate);
+        }
+    }
+}
+
 fn sub_agents_from_metadata(metadata: Option<&serde_json::Value>) -> Vec<SubAgentDisplay> {
-    metadata
-        .and_then(|value| value.get("sub_agents").or_else(|| value.get("subagents")))
-        .and_then(serde_json::Value::as_array)
+    let mut candidates = Vec::new();
+    extend_candidates_from_collection(
+        &mut candidates,
+        metadata.and_then(|value| value.get("sub_agents").or_else(|| value.get("subagents"))),
+        None,
+        Some("completed"),
+    );
+    candidates
         .into_iter()
-        .flatten()
-        .filter_map(|child| {
-            let child_session_id = child
-                .get("child_session_id")
-                .or_else(|| child.get("id"))?
-                .as_str()?
-                .to_string();
-            Some(SubAgentDisplay {
-                child_session_id,
-                title: child
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-                status: child
-                    .get("status")
-                    .or_else(|| child.get("last_run_status"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_else(|| {
-                        if child
-                            .get("is_running")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false)
-                        {
-                            "running"
-                        } else {
-                            "completed"
-                        }
-                    })
-                    .to_string(),
-                error: child
-                    .get("error")
-                    .or_else(|| child.get("last_run_error"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-            })
-        })
+        .map(SubAgentCandidate::into_display)
         .collect()
 }
 
-fn sub_agent_from_tool_result(content: &str, success: Option<bool>) -> Option<SubAgentDisplay> {
-    let value: serde_json::Value = serde_json::from_str(content).ok()?;
-    let child_session_id = value.get("child_session_id")?.as_str()?.to_string();
-    Some(SubAgentDisplay {
-        child_session_id,
-        title: value
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        status: if success == Some(false) {
-            "error".to_string()
-        } else {
-            value
-                .get("status")
-                .or_else(|| value.get("last_run_status"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_else(|| {
-                    if value
-                        .get("is_running")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                    {
-                        "running"
-                    } else {
-                        "completed"
-                    }
-                })
-                .to_string()
-        },
-        error: value
-            .get("error")
-            .or_else(|| value.get("last_run_error"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-    })
+fn sub_agents_from_tool_result(content: &str, success: Option<bool>) -> Vec<SubAgentCandidate> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+
+    if let Some(candidate) = candidate_from_value(&value, success, None, false) {
+        upsert_candidate(&mut candidates, candidate);
+    }
+    extend_candidates_from_collection(&mut candidates, value.get("children"), success, None);
+    extend_candidates_from_collection(
+        &mut candidates,
+        value.get("satisfied_by"),
+        success,
+        Some("completed"),
+    );
+    extend_candidates_from_collection(
+        &mut candidates,
+        value.get("child_session_ids"),
+        success,
+        None,
+    );
+    extend_candidates_from_collection(
+        &mut candidates,
+        value.get("already_terminal_child_ids"),
+        success,
+        Some("completed"),
+    );
+    candidates
+}
+
+fn upsert_sub_agent_in_transcript(
+    transcript: &mut [ChatMessage],
+    child: &SubAgentCandidate,
+) -> bool {
+    let Some(existing) = transcript
+        .iter_mut()
+        .rev()
+        .flat_map(|message| message.sub_agents.iter_mut())
+        .find(|existing| existing.child_session_id == child.child_session_id)
+    else {
+        return false;
+    };
+    child.merge_into(existing);
+    true
 }
 
 #[cfg(test)]
@@ -321,6 +450,15 @@ mod tests {
     }
 
     #[test]
+    fn assistant_tool_call_without_result_remains_pending() {
+        let out = map_history(vec![assistant("", vec![("pending", "Read", "{}")])]);
+        let tool = &out[0].tool_calls[0];
+        assert_eq!(tool.phase, "pending");
+        assert!(tool.result.is_none());
+        assert!(tool.error.is_none());
+    }
+
+    #[test]
     fn tool_success_false_sets_error_phase_and_error_field() {
         let out = map_history(vec![
             assistant("", vec![("t1", "Bash", "{}")]),
@@ -351,6 +489,25 @@ mod tests {
         ]);
         assert_eq!(out.len(), 1);
         assert!(out[0].tool_calls[0].result.is_none());
+        assert_eq!(out[0].tool_calls[0].phase, "pending");
+    }
+
+    #[test]
+    fn only_paired_normalized_sub_agent_tools_can_create_child_rows() {
+        let spoof = r#"{"child_session_id":"spoof","title":"not trusted"}"#;
+        let out = map_history(vec![
+            assistant("", vec![("bash", "Bash", "{}")]),
+            tool("bash", spoof, Some(true)),
+            tool("missing", spoof, Some(true)),
+        ]);
+        assert!(out[0].sub_agents.is_empty());
+
+        let out = map_history(vec![
+            assistant("", vec![("spawn", "sUb_Ag-EnT", "{}")]),
+            tool("spawn", spoof, Some(true)),
+        ]);
+        assert_eq!(out[0].sub_agents.len(), 1);
+        assert_eq!(out[0].sub_agents[0].child_session_id, "spoof");
     }
 
     #[test]
@@ -449,6 +606,65 @@ mod tests {
         assert_eq!(out[0].sub_agents.len(), 1);
         assert_eq!(out[0].sub_agents[0].title.as_deref(), Some("final"));
         assert_eq!(out[0].sub_agents[0].status, "completed");
+    }
+
+    #[test]
+    fn sub_agent_list_and_wait_shapes_upsert_multiple_unique_children() {
+        let payload = serde_json::json!({
+            "child_session_id": "top",
+            "title": "top-level",
+            "status": "running",
+            "children": [
+                {
+                    "child_session_id": "child-a",
+                    "title": "rich child",
+                    "last_run_status": "error",
+                    "last_run_error": "boom"
+                },
+                {
+                    "child_session_id": "child-b",
+                    "title": "listed child",
+                    "is_running": true
+                }
+            ],
+            "satisfied_by": [
+                {"child_session_id": "child-c", "status": "completed"},
+                "child-b"
+            ],
+            "child_session_ids": ["child-c", "child-d"],
+            "already_terminal_child_ids": ["child-a", "child-d", "child-e"]
+        })
+        .to_string();
+        let out = map_history(vec![
+            assistant("", vec![("wait", "SubAgent", "{}")]),
+            tool("wait", &payload, Some(true)),
+        ]);
+
+        let children = &out[0].sub_agents;
+        assert_eq!(children.len(), 6, "every id is retained exactly once");
+        for id in ["top", "child-a", "child-b", "child-c", "child-d", "child-e"] {
+            assert_eq!(
+                children
+                    .iter()
+                    .filter(|child| child.child_session_id == id)
+                    .count(),
+                1,
+                "{id} must be deduplicated"
+            );
+        }
+        let rich = children
+            .iter()
+            .find(|child| child.child_session_id == "child-a")
+            .unwrap();
+        assert_eq!(rich.title.as_deref(), Some("rich child"));
+        assert_eq!(rich.status, "error");
+        assert_eq!(rich.error.as_deref(), Some("boom"));
+        let running = children
+            .iter()
+            .find(|child| child.child_session_id == "child-b")
+            .unwrap();
+        assert_eq!(running.title.as_deref(), Some("listed child"));
+        assert_eq!(running.status, "running");
     }
 
     #[test]

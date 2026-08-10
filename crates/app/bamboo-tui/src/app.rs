@@ -286,6 +286,14 @@ pub(crate) fn inspector_lines(value: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+#[derive(Debug)]
+struct InspectorCacheEntry {
+    source_ptr: usize,
+    source_len: usize,
+    width: usize,
+    lines: Vec<String>,
+}
+
 pub struct ChatState {
     pub session_id: Option<String>,
     /// Project inherited from the opened/selected session and propagated when
@@ -331,6 +339,26 @@ pub struct ChatState {
     pub block_line_ranges: RefCell<Vec<ConversationBlockLineRange>>,
     pub content_height: Cell<u16>,
     pub content_width: Cell<u16>,
+    /// Tool/reasoning payloads can be hundreds of KiB. Cache their wrapped
+    /// rows so the fixed redraw tick only clones the bounded visible window
+    /// instead of re-walking every byte on every frame.
+    inspector_cache: RefCell<HashMap<String, InspectorCacheEntry>>,
+    #[cfg(test)]
+    inspector_cache_builds: Cell<usize>,
+    /// IDs installed from a running session's history (or from an intermediate
+    /// live round flushed while execution continues). Replayed lifecycle
+    /// events update those authoritative rows instead of creating duplicate
+    /// `unknown` live blocks.
+    replay_tool_ids: HashSet<String>,
+    replay_child_ids: HashSet<String>,
+    /// Turn whose stop request has already been dispatched. A late chat POST
+    /// response for this same optimistic turn must not attach SSE and start an
+    /// execution after the operator has asked to cancel it.
+    stop_requested_turn_id: Option<String>,
+    /// The parent emitted its terminal event while background children were
+    /// still running. The transport remains attached until the final child
+    /// lifecycle event arrives.
+    parent_terminal_pending: bool,
     next_ui_id: u64,
 }
 
@@ -364,6 +392,13 @@ impl ChatState {
             block_line_ranges: RefCell::new(Vec::new()),
             content_height: Cell::new(0),
             content_width: Cell::new(0),
+            inspector_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            inspector_cache_builds: Cell::new(0),
+            replay_tool_ids: HashSet::new(),
+            replay_child_ids: HashSet::new(),
+            stop_requested_turn_id: None,
+            parent_terminal_pending: false,
             next_ui_id: 0,
         }
     }
@@ -395,12 +430,82 @@ impl ChatState {
         }
     }
 
+    pub(crate) fn inspector_slice(
+        &self,
+        key: &str,
+        value: &str,
+        width: usize,
+        start: usize,
+        limit: usize,
+    ) -> (usize, Vec<String>) {
+        let width = width.max(1);
+        let source_ptr = value.as_ptr() as usize;
+        let source_len = value.len();
+        let mut cache = self.inspector_cache.borrow_mut();
+        let rebuild = cache.get(key).is_none_or(|entry| {
+            entry.source_ptr != source_ptr || entry.source_len != source_len || entry.width != width
+        });
+        if rebuild {
+            cache.insert(
+                key.to_string(),
+                InspectorCacheEntry {
+                    source_ptr,
+                    source_len,
+                    width,
+                    lines: inspector_lines(value, width),
+                },
+            );
+            #[cfg(test)]
+            self.inspector_cache_builds
+                .set(self.inspector_cache_builds.get().saturating_add(1));
+        }
+        let entry = cache
+            .get(key)
+            .expect("inspector cache entry was just populated");
+        let total = entry.lines.len();
+        let lines = entry
+            .lines
+            .iter()
+            .skip(start.min(total))
+            .take(limit)
+            .cloned()
+            .collect();
+        (total, lines)
+    }
+
+    fn prepare_replay_reconciliation(&mut self) {
+        self.replay_tool_ids = self
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter().map(|tool| tool.id.clone()))
+            .collect();
+        self.replay_child_ids = self
+            .messages
+            .iter()
+            .flat_map(|message| {
+                message
+                    .sub_agents
+                    .iter()
+                    .map(|child| child.child_session_id.clone())
+            })
+            .collect();
+    }
+
+    fn clear_replay_reconciliation(&mut self) {
+        self.replay_tool_ids.clear();
+        self.replay_child_ids.clear();
+        self.stop_requested_turn_id = None;
+        self.parent_terminal_pending = false;
+    }
+
     fn reset_conversation_ui(&mut self) {
         self.block_ui.clear();
         self.focused_block = None;
         self.block_line_ranges.borrow_mut().clear();
         self.content_height.set(0);
         self.content_width.set(0);
+        self.inspector_cache.borrow_mut().clear();
+        self.clear_replay_reconciliation();
         self.unseen_updates = 0;
         self.current_turn_id = None;
         self.current_terminal_status = None;
@@ -637,6 +742,10 @@ impl QuestionOptionHitbox {
 
 /// An agent question awaiting the operator's answer, driven by the modal.
 pub struct ActiveQuestion {
+    /// Immutable render/focus identity. Protocol identity may hydrate from a
+    /// legacy event to a durable tool_call_id, but UI expansion/focus state
+    /// must not jump to a different block when that happens.
+    pub ui_id: String,
     pub session_id: String,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
@@ -687,7 +796,12 @@ impl ActiveQuestion {
     /// Build the modal state from a `GET .../pending` response. Mirrors the
     /// SSE `NeedClarification` handler: no preset options opens straight into
     /// free-text entry instead of an empty option list.
-    fn from_pending(session_id: String, pending: &PendingQuestion, draft: String) -> Self {
+    fn from_pending(
+        ui_id: String,
+        session_id: String,
+        pending: &PendingQuestion,
+        draft: String,
+    ) -> Self {
         let options = pending.options.clone().unwrap_or_default();
         let custom = if options.is_empty() && pending.allow_custom {
             Some(draft.clone())
@@ -695,6 +809,7 @@ impl ActiveQuestion {
             None
         };
         Self {
+            ui_id,
             session_id,
             tool_call_id: pending.tool_call_id.clone(),
             tool_name: pending.tool_name.clone(),
@@ -1985,25 +2100,43 @@ impl App {
                 }
                 self.load_tab_data();
             }
-            AppEvent::ChatStarted(r) => match r {
-                Ok(session_id) => {
-                    self.chat.session_id = Some(session_id.clone());
-                    self.rebind_command_palette_to_active_session();
-                    self.status_message = "Streaming...".to_string();
-                    self.start_stream_and_execute(session_id);
+            AppEvent::ChatStarted { turn_id, result: r } => {
+                if !self.chat.streaming
+                    || self.chat.current_turn_id.as_deref() != Some(turn_id.as_str())
+                    || self.chat.stop_requested_turn_id.as_deref() == Some(turn_id.as_str())
+                {
+                    return Ok(());
                 }
-                Err(e) => {
-                    // The optimistic user turn already reserved a matching
-                    // assistant turn id. Preserve that turn with an explicit
-                    // terminal block: otherwise the next send clears the
-                    // scratch id and the failed start disappears from the
-                    // structured transcript.
-                    self.chat.current_terminal_status = Some(format!("failed to start: {e}"));
-                    self.finalize_streaming();
-                    self.notify(NoticeLevel::Error, format!("Error: {e}"));
+                match r {
+                    Ok(session_id) => {
+                        self.chat.session_id = Some(session_id.clone());
+                        self.rebind_command_palette_to_active_session();
+                        self.status_message = "Streaming...".to_string();
+                        self.start_stream_and_execute(session_id, turn_id);
+                    }
+                    Err(e) => {
+                        // The optimistic user turn already reserved a matching
+                        // assistant turn id. Preserve that turn with an explicit
+                        // terminal block: otherwise the next send clears the
+                        // scratch id and the failed start disappears from the
+                        // structured transcript.
+                        self.chat.current_terminal_status = Some(format!("failed to start: {e}"));
+                        self.finalize_streaming();
+                        self.notify(NoticeLevel::Error, format!("Error: {e}"));
+                    }
                 }
-            },
-            AppEvent::ExecuteFailed(msg) => {
+            }
+            AppEvent::ExecuteFailed {
+                session_id,
+                turn_id,
+                message: msg,
+            } => {
+                if self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || !self.chat.streaming
+                    || self.chat.current_turn_id.as_deref() != Some(turn_id.as_str())
+                {
+                    return Ok(());
+                }
                 // The POST that starts the run never succeeded, so no SSE
                 // terminal event is ever coming — finalize here or
                 // `chat.streaming` spins forever.
@@ -2011,7 +2144,19 @@ impl App {
                 self.chat.current_terminal_status = Some(format!("failed to start: {msg}"));
                 self.finalize_streaming();
             }
-            AppEvent::StopFinished(r) => {
+            AppEvent::StopFinished {
+                session_id,
+                turn_id,
+                stream_epoch,
+                result: r,
+            } => {
+                if self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || self.sse_epoch != stream_epoch
+                    || !self.chat.streaming
+                    || self.chat.current_turn_id.as_deref() != Some(turn_id.as_str())
+                {
+                    return Ok(());
+                }
                 // Finalize regardless of outcome: even if the stop request
                 // failed (server down/unreachable), the operator must regain
                 // control of the input instead of being stuck waiting for a
@@ -2023,20 +2168,11 @@ impl App {
                 // internally, so the outcome-specific message is set AFTER it
                 // (same ordering the old synchronous `stop_streaming` used to
                 // get "Stopped" to stick instead of being overwritten).
-                let has_unflushed_turn = self.chat.streaming
-                    || self.chat.current_turn_id.is_some()
-                    || !self.chat.current_response.is_empty()
-                    || !self.chat.current_tool_calls.is_empty()
-                    || !self.chat.current_reasoning.is_empty()
-                    || !self.chat.sub_agents.is_empty()
-                    || self.chat.current_terminal_status.is_some();
-                if has_unflushed_turn {
-                    self.chat.current_terminal_status = Some(match &r {
-                        Ok(()) => "stopped".to_string(),
-                        Err(error) => format!("stop failed: {error}"),
-                    });
-                    self.finalize_streaming();
-                }
+                self.chat.current_terminal_status = Some(match &r {
+                    Ok(()) => "stopped".to_string(),
+                    Err(error) => format!("stop failed: {error}"),
+                });
+                self.finalize_streaming();
                 match r {
                     Ok(()) => self.status_message = "Stopped".to_string(),
                     Err(e) => self.notify(NoticeLevel::Error, format!("Stop failed: {e}")),
@@ -2112,6 +2248,7 @@ impl App {
                         // before that HTTP response returns. Subscribe now so
                         // even an immediate resumed Token/Complete is observed.
                         if opened.is_running || opened.pending.is_some() {
+                            self.chat.prepare_replay_reconciliation();
                             self.chat.current_turn_id =
                                 Some(format!("session:{session_id}:active"));
                             self.attach_stream(session_id.clone());
@@ -3944,7 +4081,8 @@ impl App {
             None
         }
         .unwrap_or_default();
-        ActiveQuestion::from_pending(session_id, pending, draft)
+        let ui_id = self.chat.allocate_ui_id("question");
+        ActiveQuestion::from_pending(ui_id, session_id, pending, draft)
     }
 
     /// Invalidate any in-flight answer POST by bumping `answer_epoch`. Called
@@ -4368,6 +4506,15 @@ impl App {
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
+        // A completed parent may leave its transport attached solely to watch
+        // background child lifecycle. Supersede that generation before the
+        // next optimistic turn so a replayed old Complete can never finalize
+        // the new run; the fresh subscription replays durable child events.
+        if self.chat.parent_terminal_pending {
+            self.detach_stream();
+            self.chat.parent_terminal_pending = false;
+        }
+        self.chat.stop_requested_turn_id = None;
         let model = if self.chat.model.is_empty() {
             "default".to_string()
         } else {
@@ -4393,7 +4540,7 @@ impl App {
         self.chat.current_tool_calls.clear();
         self.chat.current_reasoning.clear();
         self.chat.sub_agents.clear();
-        self.chat.current_turn_id = Some(assistant_turn_id);
+        self.chat.current_turn_id = Some(assistant_turn_id.clone());
         self.chat.current_terminal_status = None;
         self.status_message = "Sending...".to_string();
 
@@ -4414,7 +4561,10 @@ impl App {
                 .await
                 .map(|resp| resp.session_id)
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::ChatStarted(result));
+            let _ = tx.send(AppEvent::ChatStarted {
+                turn_id: assistant_turn_id,
+                result,
+            });
         });
     }
 
@@ -4469,8 +4619,11 @@ impl App {
 
     /// After `chat` returns a session id, open the SSE stream (before execute, so
     /// no early event is missed) and spawn the agent run.
-    fn start_stream_and_execute(&mut self, session_id: String) {
+    fn start_stream_and_execute(&mut self, session_id: String, turn_id: String) {
         if !self.attach_stream(session_id.clone()) {
+            self.chat.current_terminal_status =
+                Some("failed to start: SSE unavailable".to_string());
+            self.finalize_streaming();
             return;
         }
         let Some(mut sse_ready) = self.sse_ready.clone() else {
@@ -4478,15 +4631,23 @@ impl App {
                 NoticeLevel::Error,
                 "SSE readiness channel unavailable; run was not started",
             );
+            self.chat.current_terminal_status =
+                Some("failed to start: SSE readiness unavailable".to_string());
+            self.finalize_streaming();
             return;
         };
         let Some(tx) = self.event_tx.clone() else {
+            self.chat.current_terminal_status =
+                Some("failed to start: event channel unavailable".to_string());
+            self.finalize_streaming();
             return;
         };
         let client = self.client.clone();
         let model = self.chat.model.clone();
         let provider = self.chat.provider.clone();
         tokio::spawn(async move {
+            let execute_session_id = session_id.clone();
+            let execute_turn_id = turn_id.clone();
             let model = if model.is_empty() { None } else { Some(model) };
             let ready = if *sse_ready.borrow() {
                 Ok(())
@@ -4504,9 +4665,11 @@ impl App {
                 })
             };
             if let Err(error) = ready {
-                let _ = tx.send(AppEvent::ExecuteFailed(format!(
-                    "execute not started: {error}"
-                )));
+                let _ = tx.send(AppEvent::ExecuteFailed {
+                    session_id: execute_session_id,
+                    turn_id: execute_turn_id,
+                    message: format!("execute not started: {error}"),
+                });
                 return;
             }
             // If this POST fails (server down, 4xx/5xx), no SSE terminal event
@@ -4517,7 +4680,11 @@ impl App {
                 .execute(&session_id, model.as_deref(), provider.as_deref())
                 .await
             {
-                let _ = tx.send(AppEvent::ExecuteFailed(e.to_string()));
+                let _ = tx.send(AppEvent::ExecuteFailed {
+                    session_id,
+                    turn_id,
+                    message: e.to_string(),
+                });
             }
         });
     }
@@ -4694,10 +4861,79 @@ impl App {
     /// own Complete/Error/Lifecycle update instead of clobbering whichever
     /// entry happens to be last in the list.
     fn find_tool_mut(&mut self, tool_call_id: &str) -> Option<&mut ToolCallDisplay> {
-        self.chat
+        if let Some(index) = self
+            .chat
             .current_tool_calls
-            .iter_mut()
-            .find(|t| t.id == tool_call_id)
+            .iter()
+            .position(|tool| tool.id == tool_call_id)
+        {
+            return self.chat.current_tool_calls.get_mut(index);
+        }
+        if !self.chat.replay_tool_ids.contains(tool_call_id) {
+            return None;
+        }
+        self.chat.messages.iter_mut().rev().find_map(|message| {
+            message
+                .tool_calls
+                .iter_mut()
+                .find(|tool| tool.id == tool_call_id)
+        })
+    }
+
+    fn find_subagent_mut(&mut self, child_session_id: &str) -> Option<&mut SubAgentDisplay> {
+        if let Some(index) = self
+            .chat
+            .sub_agents
+            .iter()
+            .position(|child| child.child_session_id == child_session_id)
+        {
+            return self.chat.sub_agents.get_mut(index);
+        }
+        if !self.chat.replay_child_ids.contains(child_session_id) {
+            return None;
+        }
+        self.chat.messages.iter_mut().rev().find_map(|message| {
+            message
+                .sub_agents
+                .iter_mut()
+                .find(|child| child.child_session_id == child_session_id)
+        })
+    }
+
+    fn has_running_subagents(&self) -> bool {
+        fn running(status: &str) -> bool {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "running" | "running_in_background" | "queued" | "starting" | "in_progress"
+            )
+        }
+
+        self.chat
+            .sub_agents
+            .iter()
+            .any(|child| running(&child.status))
+            || self.chat.messages.iter().any(|message| {
+                message
+                    .sub_agents
+                    .iter()
+                    .any(|child| running(&child.status))
+            })
+    }
+
+    /// A tool-bearing assistant message is one persisted LLM round. The next
+    /// Token/ReasoningToken belongs to the following round, so seal the tool
+    /// round before appending it; otherwise live ordering differs from the
+    /// authoritative history after resume.
+    fn begin_next_round_after_tools(&mut self) {
+        if !self.chat.current_tool_calls.is_empty()
+            && self
+                .chat
+                .current_tool_calls
+                .iter()
+                .all(|tool| matches!(tool.phase.as_str(), "complete" | "error"))
+        {
+            self.flush_streaming_output();
+        }
     }
 
     /// Produce the one structured rendering shape used by both history and
@@ -4828,11 +5064,7 @@ impl App {
         }
         if let Some(question) = self.pending_question.as_ref() {
             blocks.push(ConversationBlock {
-                id: format!(
-                    "question:{}:{}",
-                    question.session_id,
-                    question.tool_call_id.as_deref().unwrap_or("pending")
-                ),
+                id: question.ui_id.clone(),
                 kind: ConversationBlockKind::Question {
                     question: &question.question,
                     source: question.source.as_deref(),
@@ -4842,11 +5074,7 @@ impl App {
             });
         } else if let Some(question) = self.dismissed_question.as_ref() {
             blocks.push(ConversationBlock {
-                id: format!(
-                    "question:{}:{}",
-                    question.session_id,
-                    question.tool_call_id.as_deref().unwrap_or("pending")
-                ),
+                id: question.ui_id.clone(),
                 kind: ConversationBlockKind::Question {
                     question: &question.question,
                     source: question.source.as_deref(),
@@ -4964,6 +5192,7 @@ impl App {
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
         match event {
             AgentEvent::Token { content } => {
+                self.begin_next_round_after_tools();
                 self.chat.ensure_current_turn_id();
                 self.chat.current_response.push_str(&content);
                 self.chat.note_update();
@@ -4982,6 +5211,7 @@ impl App {
                 self.stream_disconnected = false;
             }
             AgentEvent::ReasoningToken { content } => {
+                self.begin_next_round_after_tools();
                 let turn_id = self.chat.ensure_current_turn_id();
                 self.chat.register_block(format!("{turn_id}:reasoning"));
                 self.chat.current_reasoning.push_str(&content);
@@ -4992,9 +5222,6 @@ impl App {
                 tool_name,
                 arguments,
             } => {
-                let turn_id = self.chat.ensure_current_turn_id();
-                self.chat
-                    .register_block(tool_block_id(&turn_id, &tool_call_id));
                 let arguments = serde_json::to_string(&arguments).unwrap_or_default();
                 if let Some(tool) = self.find_tool_mut(&tool_call_id) {
                     // A ToolToken can race ahead of ToolStart. Hydrate that
@@ -5006,6 +5233,10 @@ impl App {
                         tool.phase = "running".to_string();
                     }
                 } else {
+                    self.begin_next_round_after_tools();
+                    let turn_id = self.chat.ensure_current_turn_id();
+                    self.chat
+                        .register_block(tool_block_id(&turn_id, &tool_call_id));
                     self.chat.current_tool_calls.push(ToolCallDisplay {
                         id: tool_call_id,
                         tool_name,
@@ -5022,23 +5253,37 @@ impl App {
                 tool_call_id,
                 result,
             } => {
-                let turn_id = self.chat.ensure_current_turn_id();
+                let success = result.success;
+                let result = result.result;
                 match self.find_tool_mut(&tool_call_id) {
                     Some(tc) => {
-                        tc.result = Some(result.result);
-                        tc.phase = "complete".to_string();
+                        if success {
+                            tc.result = Some(result);
+                            tc.error = None;
+                            tc.phase = "complete".to_string();
+                        } else {
+                            tc.result = None;
+                            tc.error = Some(result);
+                            tc.phase = "error".to_string();
+                        }
                     }
                     None => {
                         // No matching ToolStart (dropped/out-of-order) — surface it
                         // defensively instead of silently losing the result.
+                        let (stored_result, stored_error, phase) = if success {
+                            (Some(result), None, "complete")
+                        } else {
+                            (None, Some(result), "error")
+                        };
+                        let turn_id = self.chat.ensure_current_turn_id();
                         self.chat.current_tool_calls.push(ToolCallDisplay {
                             id: tool_call_id.clone(),
                             tool_name: "unknown".to_string(),
                             arguments: String::new(),
-                            result: Some(result.result),
+                            result: stored_result,
                             stream_output: String::new(),
-                            error: None,
-                            phase: "complete".to_string(),
+                            error: stored_error,
+                            phase: phase.to_string(),
                         });
                         self.chat
                             .register_block(tool_block_id(&turn_id, &tool_call_id));
@@ -5050,13 +5295,13 @@ impl App {
                 tool_call_id,
                 error,
             } => {
-                let turn_id = self.chat.ensure_current_turn_id();
                 match self.find_tool_mut(&tool_call_id) {
                     Some(tc) => {
                         tc.error = Some(error);
                         tc.phase = "error".to_string();
                     }
                     None => {
+                        let turn_id = self.chat.ensure_current_turn_id();
                         self.chat.current_tool_calls.push(ToolCallDisplay {
                             id: tool_call_id.clone(),
                             tool_name: "unknown".to_string(),
@@ -5182,14 +5427,12 @@ impl App {
             AgentEvent::Complete { usage } => self.handle_complete(usage),
             AgentEvent::Cancelled { message } => {
                 let message = message.unwrap_or_else(|| "Cancelled".to_string());
-                self.chat.current_terminal_status = Some(message.clone());
                 self.status_message = message;
-                self.finalize_streaming();
+                self.finish_parent_terminal(self.status_message.clone());
             }
             AgentEvent::Error { message } => {
-                self.chat.current_terminal_status = Some(format!("error: {message}"));
                 self.notify(NoticeLevel::Error, format!("Error: {message}"));
-                self.finalize_streaming();
+                self.finish_parent_terminal(format!("error: {message}"));
             }
             AgentEvent::BudgetExceeded {
                 kind,
@@ -5209,10 +5452,10 @@ impl App {
                 tool_call_id,
                 content,
             } => {
-                let turn_id = self.chat.ensure_current_turn_id();
                 if let Some(tool) = self.find_tool_mut(&tool_call_id) {
                     tool.stream_output.push_str(&content);
                 } else {
+                    let turn_id = self.chat.ensure_current_turn_id();
                     self.chat.current_tool_calls.push(ToolCallDisplay {
                         id: tool_call_id.clone(),
                         tool_name: "unknown".to_string(),
@@ -5255,19 +5498,21 @@ impl App {
                 child_session_id,
                 title,
             } => {
-                let turn_id = self.chat.ensure_current_turn_id();
-                self.chat
-                    .register_block(subagent_block_id(&turn_id, &child_session_id));
-                if let Some(existing) = self
-                    .chat
-                    .sub_agents
-                    .iter_mut()
-                    .find(|child| child.child_session_id == child_session_id)
-                {
+                if let Some(existing) = self.find_subagent_mut(&child_session_id) {
                     if title.is_some() {
                         existing.title = title;
                     }
+                    if !matches!(
+                        existing.status.as_str(),
+                        "completed" | "error" | "cancelled" | "skipped" | "timeout"
+                    ) {
+                        existing.status = "running".to_string();
+                        existing.error = None;
+                    }
                 } else {
+                    let turn_id = self.chat.ensure_current_turn_id();
+                    self.chat
+                        .register_block(subagent_block_id(&turn_id, &child_session_id));
                     self.chat.sub_agents.push(SubAgentDisplay {
                         child_session_id,
                         title,
@@ -5283,16 +5528,11 @@ impl App {
                 status,
                 error,
             } => {
-                let turn_id = self.chat.ensure_current_turn_id();
-                if let Some(sa) = self
-                    .chat
-                    .sub_agents
-                    .iter_mut()
-                    .find(|s| s.child_session_id == child_session_id)
-                {
+                if let Some(sa) = self.find_subagent_mut(&child_session_id) {
                     sa.status = status;
                     sa.error = error;
                 } else {
+                    let turn_id = self.chat.ensure_current_turn_id();
                     self.chat
                         .register_block(subagent_block_id(&turn_id, &child_session_id));
                     self.chat.sub_agents.push(SubAgentDisplay {
@@ -5303,6 +5543,12 @@ impl App {
                     });
                 }
                 self.chat.note_update();
+                if self.chat.parent_terminal_pending && !self.has_running_subagents() {
+                    self.chat.parent_terminal_pending = false;
+                    self.detach_stream();
+                    self.stream_disconnected = false;
+                    self.status_message = "Ready".to_string();
+                }
             }
         }
         Ok(())
@@ -5323,6 +5569,31 @@ impl App {
         // an answer, so drop any open (or dismissed-but-cached) question modal
         // to avoid answering a dead session — and invalidate any answer POST
         // still in flight for it.
+        self.supersede_pending_answer();
+        self.pending_question = None;
+        self.dismissed_question = None;
+        self.chat.clear_replay_reconciliation();
+    }
+
+    fn finish_parent_terminal(&mut self, status: String) {
+        self.chat.current_terminal_status = Some(status);
+        if !self.has_running_subagents() {
+            self.finalize_streaming();
+            return;
+        }
+
+        // The parent run is terminal and the composer must be usable now, but
+        // the session stream deliberately remains open while background
+        // children finish. Flush the parent round, retain replay identities,
+        // and detach only after the last child lifecycle event (or when a new
+        // turn supersedes this watcher).
+        self.chat.parent_terminal_pending = true;
+        self.chat.streaming = false;
+        self.chat.note_update();
+        self.flush_streaming_output();
+        self.status_message = "Ready — background child agents still running".to_string();
+        self.stream_disconnected = false;
+        self.pending_answer_run_started = false;
         self.supersede_pending_answer();
         self.pending_question = None;
         self.dismissed_question = None;
@@ -5352,12 +5623,23 @@ impl App {
             }
             return;
         }
-        self.chat.current_terminal_status = Some("completed".to_string());
-        self.finalize_streaming();
         self.chat.token_usage = Some(usage);
+        self.finish_parent_terminal("completed".to_string());
     }
 
     fn flush_streaming_output(&mut self) {
+        self.chat.replay_tool_ids.extend(
+            self.chat
+                .current_tool_calls
+                .iter()
+                .map(|tool| tool.id.clone()),
+        );
+        self.chat.replay_child_ids.extend(
+            self.chat
+                .sub_agents
+                .iter()
+                .map(|child| child.child_session_id.clone()),
+        );
         if !self.chat.current_response.is_empty()
             || !self.chat.current_tool_calls.is_empty()
             || !self.chat.current_reasoning.is_empty()
@@ -5409,9 +5691,17 @@ impl App {
         };
         self.status_message = "Stopping...".to_string();
         let client = self.client.clone();
+        let stream_epoch = self.sse_epoch;
+        let turn_id = self.chat.ensure_current_turn_id();
+        self.chat.stop_requested_turn_id = Some(turn_id.clone());
         tokio::spawn(async move {
             let r = client.stop(&sid).await.map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::StopFinished(r));
+            let _ = tx.send(AppEvent::StopFinished {
+                session_id: sid,
+                turn_id,
+                stream_epoch,
+                result: r,
+            });
         });
     }
 
@@ -7663,7 +7953,12 @@ mod question_tests {
             tool_name: Some("ConclusionWithOptions".to_string()),
             source: Some("pause_tool".to_string()),
         };
-        ActiveQuestion::from_pending(session_id.to_string(), &pending, draft.to_string())
+        ActiveQuestion::from_pending(
+            format!("test:question:{tool_call_id}"),
+            session_id.to_string(),
+            &pending,
+            draft.to_string(),
+        )
     }
 
     fn app_with_question(options: Vec<&str>) -> App {
@@ -7817,7 +8112,12 @@ mod question_tests {
             tool_name: Some("ConclusionWithOptions".to_string()),
             source: Some("pause_tool".to_string()),
         };
-        let http = ActiveQuestion::from_pending("sess-7".to_string(), &pending, String::new());
+        let http = ActiveQuestion::from_pending(
+            "test:question:http".to_string(),
+            "sess-7".to_string(),
+            &pending,
+            String::new(),
+        );
         let sse = active_question(
             "sess-7",
             pending.question.clone(),
@@ -8035,6 +8335,52 @@ mod question_tests {
         assert_eq!(replayed.selected, 1);
         assert_eq!(replayed.custom_draft, "draft");
         assert!(replayed.submitting);
+    }
+
+    #[test]
+    fn question_ui_identity_survives_protocol_identity_hydration() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("sess-legacy".to_string());
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Legacy question".to_string(),
+            options: Some(vec!["A".to_string()]),
+            tool_call_id: None,
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some("pause_tool".to_string()),
+        })
+        .unwrap();
+
+        let ui_id = app.pending_question.as_ref().unwrap().ui_id.clone();
+        app.chat.focused_block = Some(ui_id.clone());
+        let incoming = app.question_from_pending(
+            "sess-legacy".to_string(),
+            &PendingQuestion {
+                has_pending_question: true,
+                question: "Legacy question".to_string(),
+                options: Some(vec!["A".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("durable-tool-id".to_string()),
+                tool_name: Some("ConclusionWithOptions".to_string()),
+                source: Some("pause_tool".to_string()),
+            },
+        );
+        assert!(app
+            .pending_question
+            .as_ref()
+            .unwrap()
+            .can_hydrate_identity_from(&incoming));
+        app.pending_question
+            .as_mut()
+            .unwrap()
+            .refresh_contract(incoming);
+
+        let hydrated = app.pending_question.as_ref().unwrap();
+        assert_eq!(hydrated.tool_call_id.as_deref(), Some("durable-tool-id"));
+        assert_eq!(hydrated.ui_id, ui_id);
+        assert_eq!(app.chat.focused_block.as_deref(), Some(ui_id.as_str()));
+        assert_eq!(app.conversation_blocks().last().unwrap().id, ui_id);
     }
 
     #[tokio::test]
@@ -8890,7 +9236,14 @@ mod question_tests {
                 .await
                 .expect("stop result must return")
                 .expect("event channel must stay open");
-        assert!(matches!(stop_finished, AppEvent::StopFinished(Ok(()))));
+        assert!(matches!(
+            &stop_finished,
+            AppEvent::StopFinished {
+                session_id,
+                result: Ok(()),
+                ..
+            } if session_id == "sess-1"
+        ));
         app.handle_event(stop_finished).await.unwrap();
         assert!(!app.chat.streaming);
         assert!(app.pending_question.is_none());
@@ -9530,6 +9883,92 @@ mod question_tests {
         assert_eq!(app.chat.sub_agents[1].status, "completed");
     }
 
+    #[tokio::test]
+    async fn parent_completion_opens_composer_while_late_child_watcher_isolated_from_next_turn() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+        app.chat.session_id = Some("parent".to_string());
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-a".to_string());
+        app.chat.current_response = "parent answer".to_string();
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+        let old_epoch = app.sse_epoch;
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "child-late".to_string(),
+            title: Some("background review".to_string()),
+        })
+        .unwrap();
+
+        app.handle_sse_event(AgentEvent::Complete {
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        })
+        .unwrap();
+
+        assert!(!app.chat.streaming, "parent completion opens the send gate");
+        assert!(app.chat.parent_terminal_pending);
+        assert!(app.sse_task.is_some(), "late-child watcher stays attached");
+        assert_eq!(app.chat.messages.last().unwrap().content, "parent answer");
+
+        for character in "next".chars() {
+            app.handle_chat_key(key(KeyCode::Char(character)))
+                .await
+                .unwrap();
+        }
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.chat.streaming, "the next turn starts immediately");
+        assert!(!app.chat.parent_terminal_pending);
+        assert!(
+            app.sse_epoch > old_epoch,
+            "old watcher generation is retired"
+        );
+        let turn_b = app.chat.current_turn_id.clone().unwrap();
+        app.chat.current_response = "new partial".to_string();
+
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "parent".to_string(),
+            stream_epoch: old_epoch,
+            event: AgentEvent::Complete {
+                usage: TokenUsage {
+                    prompt_tokens: 9,
+                    completion_tokens: 9,
+                    total_tokens: 18,
+                },
+            },
+        })
+        .unwrap();
+        assert!(app.chat.streaming);
+        assert_eq!(app.chat.current_turn_id.as_deref(), Some(turn_b.as_str()));
+        assert_eq!(app.chat.current_response, "new partial");
+
+        // A replay on the fresh subscription still updates A's durable child
+        // row instead of attaching it to B.
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "parent".to_string(),
+            stream_epoch: app.sse_epoch,
+            event: AgentEvent::SubAgentCompleted {
+                child_session_id: "child-late".to_string(),
+                status: "completed".to_string(),
+                error: None,
+            },
+        })
+        .unwrap();
+        let children = app
+            .chat
+            .messages
+            .iter()
+            .flat_map(|message| &message.sub_agents)
+            .filter(|child| child.child_session_id == "child-late")
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, "completed");
+        assert!(app.chat.sub_agents.is_empty());
+    }
+
     /// Parallel tool calls: a `ToolComplete` must land on the entry whose
     /// `tool_call_id` it names, not on whichever entry is last in the list.
     #[tokio::test]
@@ -9569,6 +10008,31 @@ mod question_tests {
         assert_eq!(a.phase, "complete");
         assert!(b.result.is_none(), "b's result must be untouched");
         assert_eq!(b.phase, "running", "b must still be running");
+    }
+
+    #[test]
+    fn failed_tool_complete_uses_error_state_in_live_reducer() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "failed".into(),
+            tool_name: "Bash".into(),
+            arguments: serde_json::json!({ "cmd": "false" }),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "failed".into(),
+            result: ToolResult {
+                success: false,
+                result: "exit status 1".into(),
+            },
+        })
+        .unwrap();
+
+        let tool = &app.chat.current_tool_calls[0];
+        assert_eq!(tool.phase, "error");
+        assert_eq!(tool.error.as_deref(), Some("exit status 1"));
+        assert!(tool.result.is_none());
     }
 
     #[tokio::test]
@@ -9674,6 +10138,105 @@ mod question_tests {
     }
 
     #[test]
+    fn live_tool_round_then_final_round_matches_real_split_history_order() {
+        use crate::api::types::{HistoryFunctionCall, HistoryMessage, HistoryToolCall};
+
+        let mapped = map_history(vec![
+            HistoryMessage {
+                id: "history-round-1".to_string(),
+                role: "assistant".to_string(),
+                content: "before tool".to_string(),
+                tool_calls: Some(vec![HistoryToolCall {
+                    id: "call-1".to_string(),
+                    function: HistoryFunctionCall {
+                        name: "Read".to_string(),
+                        arguments: "{\"path\":\"a\"}".to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            HistoryMessage {
+                role: "tool".to_string(),
+                content: "tool result".to_string(),
+                tool_call_id: Some("call-1".to_string()),
+                tool_success: Some(true),
+                ..Default::default()
+            },
+            HistoryMessage {
+                id: "history-round-2".to_string(),
+                role: "assistant".to_string(),
+                content: "final answer".to_string(),
+                ..Default::default()
+            },
+        ]);
+
+        let mut history_app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        history_app.chat.messages = mapped;
+        let mut live_app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        live_app.chat.streaming = true;
+        live_app.chat.current_turn_id = Some("live-round-1".to_string());
+        live_app
+            .handle_sse_event(AgentEvent::Token {
+                content: "before tool".to_string(),
+            })
+            .unwrap();
+        live_app
+            .handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: serde_json::json!({ "path": "a" }),
+            })
+            .unwrap();
+        live_app
+            .handle_sse_event(AgentEvent::ToolComplete {
+                tool_call_id: "call-1".to_string(),
+                result: ToolResult {
+                    success: true,
+                    result: "tool result".to_string(),
+                },
+            })
+            .unwrap();
+        live_app
+            .handle_sse_event(AgentEvent::Token {
+                content: "final answer".to_string(),
+            })
+            .unwrap();
+        live_app.chat.streaming = false;
+
+        assert_eq!(live_app.chat.messages.len(), 1);
+        assert_eq!(live_app.chat.messages[0].content, "before tool");
+        assert_eq!(live_app.chat.messages[0].tool_calls.len(), 1);
+        assert_eq!(live_app.chat.current_response, "final answer");
+
+        let describe = |app: &App| {
+            app.conversation_blocks()
+                .into_iter()
+                .filter_map(|block| match block.kind {
+                    ConversationBlockKind::AssistantMarkdown { content, .. } => {
+                        Some(format!("assistant:{content}"))
+                    }
+                    ConversationBlockKind::ToolCall { tool, .. } => Some(format!(
+                        "tool:{}:{}:{}",
+                        tool.id,
+                        tool.tool_name,
+                        tool.display_output()
+                    )),
+                    ConversationBlockKind::TerminalStatus(_) => None,
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(describe(&live_app), describe(&history_app));
+        let live_tool_id = live_app
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| matches!(block.kind, ConversationBlockKind::ToolCall { .. }))
+            .unwrap()
+            .id;
+        assert!(live_tool_id.ends_with(":tool:call-1"));
+    }
+
+    #[test]
     fn long_single_line_tool_tokens_remain_bounded_scrollable_and_lossless() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
@@ -9719,6 +10282,35 @@ mod question_tests {
             inspector_lines(&output, 17).len() > CONVERSATION_DETAIL_VIEWPORT,
             "a long no-newline payload must be scrollable by visual rows"
         );
+    }
+
+    #[test]
+    fn inspector_wrap_cache_reuses_large_static_payload_across_redraws() {
+        let app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let payload = "界🙂payload".repeat(32_768);
+
+        let (total, first) = app
+            .chat
+            .inspector_slice("large:tool:output", &payload, 72, 0, 10);
+        assert!(total > 10);
+        assert_eq!(first.len(), 10);
+        assert_eq!(app.chat.inspector_cache_builds.get(), 1);
+
+        for start in [0, 1, 25, total.saturating_sub(10)] {
+            let (_, window) =
+                app.chat
+                    .inspector_slice("large:tool:output", &payload, 72, start, 10);
+            assert!(!window.is_empty());
+        }
+        assert_eq!(
+            app.chat.inspector_cache_builds.get(),
+            1,
+            "fixed redraws and viewport scrolling must not rewrap the full payload"
+        );
+
+        app.chat
+            .inspector_slice("large:tool:output", &payload, 71, 0, 10);
+        assert_eq!(app.chat.inspector_cache_builds.get(), 2);
     }
 
     #[tokio::test]
@@ -9919,11 +10511,17 @@ mod question_tests {
     async fn execute_failed_event_clears_streaming() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.current_turn_id = Some("turn-1".to_string());
         app.chat.current_response = "partial".to_string();
 
-        app.handle_event(AppEvent::ExecuteFailed("connection refused".to_string()))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::ExecuteFailed {
+            session_id: "s1".to_string(),
+            turn_id: "turn-1".to_string(),
+            message: "connection refused".to_string(),
+        })
+        .await
+        .unwrap();
 
         assert!(
             !app.chat.streaming,
@@ -9944,9 +10542,12 @@ mod question_tests {
         app.chat.streaming = true;
         app.chat.current_turn_id = Some("live:assistant:7".to_string());
 
-        app.handle_event(AppEvent::ChatStarted(Err("server unavailable".to_string())))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::ChatStarted {
+            turn_id: "live:assistant:7".to_string(),
+            result: Err("server unavailable".to_string()),
+        })
+        .await
+        .unwrap();
 
         assert!(!app.chat.streaming);
         assert!(app.chat.current_turn_id.is_none());
@@ -9959,7 +10560,67 @@ mod question_tests {
         assert!(app.status_message.contains("server unavailable"));
     }
 
-    /// `StopFinished(Err)` must still finalize streaming locally so the
+    #[tokio::test]
+    async fn stale_start_and_execute_callbacks_cannot_mutate_a_newer_turn() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("current-session".to_string());
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("new-turn".to_string());
+        app.chat.current_response = "new partial".to_string();
+        app.status_message = "Streaming new turn".to_string();
+
+        app.handle_event(AppEvent::ChatStarted {
+            turn_id: "old-turn".to_string(),
+            result: Ok("stale-session".to_string()),
+        })
+        .await
+        .unwrap();
+        app.handle_event(AppEvent::ExecuteFailed {
+            session_id: "current-session".to_string(),
+            turn_id: "old-turn".to_string(),
+            message: "old execute failed".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("current-session"));
+        assert_eq!(app.chat.current_turn_id.as_deref(), Some("new-turn"));
+        assert_eq!(app.chat.current_response, "new partial");
+        assert!(app.chat.streaming);
+        assert_eq!(app.status_message, "Streaming new turn");
+        assert!(app.notifications.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_requested_before_chat_response_prevents_late_execution_start() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+        app.chat.session_id = Some("existing-session".to_string());
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-being-stopped".to_string());
+
+        app.stop_streaming();
+        assert_eq!(
+            app.chat.stop_requested_turn_id.as_deref(),
+            Some("turn-being-stopped")
+        );
+        app.handle_event(AppEvent::ChatStarted {
+            turn_id: "turn-being-stopped".to_string(),
+            result: Ok("existing-session".to_string()),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.sse_task.is_none());
+        assert_eq!(app.status_message, "Stopping...");
+        assert_eq!(
+            app.chat.current_turn_id.as_deref(),
+            Some("turn-being-stopped")
+        );
+    }
+
+    /// `StopFinished { result: Err, .. }` must still finalize streaming locally so the
     /// operator regains control of the input even when the stop request
     /// itself failed (e.g. the server is unreachable) — `App::running` stays
     /// `true` (the app itself does not exit).
@@ -9968,10 +10629,15 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
         app.chat.session_id = Some("s1".to_string());
+        app.chat.current_turn_id = Some("turn-1".to_string());
 
-        app.handle_event(AppEvent::StopFinished(
-            Err("server unreachable".to_string()),
-        ))
+        let stream_epoch = app.sse_epoch;
+        app.handle_event(AppEvent::StopFinished {
+            session_id: "s1".to_string(),
+            turn_id: "turn-1".to_string(),
+            stream_epoch,
+            result: Err("server unreachable".to_string()),
+        })
         .await
         .unwrap();
 
@@ -9983,25 +10649,33 @@ mod question_tests {
         assert!(app.status_message.contains("server unreachable"));
     }
 
-    /// `StopFinished(Ok)` finalizes streaming and reports "Stopped".
+    /// `StopFinished { result: Ok, .. }` finalizes streaming and reports "Stopped".
     #[tokio::test]
     async fn stop_success_finalizes_with_stopped_status() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
         app.chat.session_id = Some("s1".to_string());
+        app.chat.current_turn_id = Some("turn-1".to_string());
 
-        app.handle_event(AppEvent::StopFinished(Ok(())))
-            .await
-            .unwrap();
+        let stream_epoch = app.sse_epoch;
+        app.handle_event(AppEvent::StopFinished {
+            session_id: "s1".to_string(),
+            turn_id: "turn-1".to_string(),
+            stream_epoch,
+            result: Ok(()),
+        })
+        .await
+        .unwrap();
 
         assert!(!app.chat.streaming);
         assert_eq!(app.status_message, "Stopped");
     }
 
     #[tokio::test]
-    async fn cancelled_sse_before_stop_response_does_not_append_a_second_terminal_turn() {
+    async fn stale_stop_response_cannot_finalize_a_newer_turn() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
+        app.chat.session_id = Some("s1".to_string());
         app.chat.current_turn_id = Some("live:assistant:stop".to_string());
 
         app.handle_sse_event(AgentEvent::Cancelled {
@@ -10010,20 +10684,38 @@ mod question_tests {
         .unwrap();
         assert_eq!(app.chat.messages.len(), 1);
 
-        app.handle_event(AppEvent::StopFinished(Ok(())))
-            .await
-            .unwrap();
+        // The operator starts another turn after the terminal SSE but before
+        // the old HTTP stop response arrives.
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("live:assistant:new".to_string());
+        app.chat.current_response = "new turn output".to_string();
+        app.status_message = "Streaming new turn".to_string();
+
+        app.handle_event(AppEvent::StopFinished {
+            session_id: "s1".to_string(),
+            turn_id: "live:assistant:stop".to_string(),
+            stream_epoch: app.sse_epoch,
+            result: Ok(()),
+        })
+        .await
+        .unwrap();
 
         assert_eq!(
             app.chat.messages.len(),
             1,
             "the HTTP response must not create a second terminal-only turn"
         );
+        assert!(app.chat.streaming, "the newer turn must remain active");
+        assert_eq!(
+            app.chat.current_turn_id.as_deref(),
+            Some("live:assistant:new")
+        );
+        assert_eq!(app.chat.current_response, "new turn output");
         assert_eq!(
             app.chat.messages[0].terminal_status.as_deref(),
             Some("cancelled by operator")
         );
-        assert_eq!(app.status_message, "Stopped");
+        assert_eq!(app.status_message, "Streaming new turn");
     }
 
     // ── Session resume (WP3) ──
@@ -10051,6 +10743,76 @@ mod question_tests {
             sub_agents: Vec::new(),
             terminal_status: None,
         }
+    }
+
+    #[test]
+    fn replayed_running_tool_and_child_update_history_without_duplicate_live_rows() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages.push(ChatMessage {
+            id: "history:active".to_string(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCallDisplay {
+                id: "tool-active".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: "{}".to_string(),
+                result: None,
+                stream_output: String::new(),
+                error: None,
+                phase: "pending".to_string(),
+            }],
+            reasoning: None,
+            sub_agents: vec![SubAgentDisplay {
+                child_session_id: "child-active".to_string(),
+                title: Some("worker".to_string()),
+                status: "running".to_string(),
+                error: None,
+            }],
+            terminal_status: None,
+        });
+        app.chat.prepare_replay_reconciliation();
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("session:s1:active".to_string());
+
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "tool-active".to_string(),
+            tool_name: "Read".to_string(),
+            arguments: serde_json::json!({ "path": "a" }),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolToken {
+            tool_call_id: "tool-active".to_string(),
+            content: "partial".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "tool-active".to_string(),
+            result: ToolResult {
+                success: true,
+                result: "complete result".to_string(),
+            },
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "child-active".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
+
+        assert!(app.chat.current_tool_calls.is_empty());
+        assert!(app.chat.sub_agents.is_empty());
+        let history = &app.chat.messages[0];
+        assert_eq!(history.tool_calls.len(), 1);
+        assert_eq!(history.tool_calls[0].tool_name, "Read");
+        assert_eq!(history.tool_calls[0].phase, "complete");
+        assert_eq!(
+            history.tool_calls[0].result.as_deref(),
+            Some("complete result")
+        );
+        assert_eq!(history.tool_calls[0].stream_output, "partial");
+        assert_eq!(history.sub_agents.len(), 1);
+        assert_eq!(history.sub_agents[0].status, "completed");
     }
 
     /// A successful resume installs the mapped history, the model, and the
@@ -10317,6 +11079,12 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("sess-1".to_string());
         app.chat.streaming = true;
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "ConclusionWithOptions".to_string(),
+            arguments: serde_json::json!({ "question": "Choose carefully" }),
+        })
+        .unwrap();
         app.handle_sse_event(AgentEvent::NeedClarification {
             question: "Choose carefully".to_string(),
             options: Some(vec!["A".to_string()]),
@@ -10356,6 +11124,35 @@ mod question_tests {
             vec!["paused — waiting for answer"],
             "a clarification pause must not also claim that the run is running"
         );
+
+        // The pause flushed the still-running question tool into history. A
+        // resumed terminal event must reconcile that exact row, not create an
+        // `unknown` duplicate in live scratch state.
+        app.handle_sse_event(AgentEvent::ExecutionStarted {
+            run_id: "resume-1".to_string(),
+            session_id: "sess-1".to_string(),
+            started_at: "now".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "call-1".to_string(),
+            result: ToolResult {
+                success: true,
+                result: "A".to_string(),
+            },
+        })
+        .unwrap();
+        assert!(app.chat.current_tool_calls.is_empty());
+        let question_tools = app
+            .chat
+            .messages
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .filter(|tool| tool.id == "call-1")
+            .collect::<Vec<_>>();
+        assert_eq!(question_tools.len(), 1);
+        assert_eq!(question_tools[0].phase, "complete");
+        assert_eq!(question_tools[0].result.as_deref(), Some("A"));
         app.detach_stream();
     }
 
@@ -10444,7 +11241,10 @@ mod question_tests {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         app.event_tx = Some(event_tx);
         app.chat.session_id = Some("sess-handshake".to_string());
-        app.start_stream_and_execute("sess-handshake".to_string());
+        app.start_stream_and_execute(
+            "sess-handshake".to_string(),
+            "live:assistant:handshake".to_string(),
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(5), execute_seen_rx)
             .await
@@ -10580,7 +11380,7 @@ mod question_tests {
                         respond_test_http(
                             &mut stream,
                             "text/event-stream",
-                            "data: {\"type\":\"complete\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                            "data: {\"type\":\"complete\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n",
                         )
                         .await;
                     }
@@ -10735,7 +11535,7 @@ mod question_tests {
                         respond_test_http(
                             &mut stream,
                             "text/event-stream",
-                            "data: {\"type\":\"complete\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                            "data: {\"type\":\"complete\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n",
                         )
                         .await;
                     }

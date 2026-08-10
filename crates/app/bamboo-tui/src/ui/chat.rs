@@ -5,8 +5,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
-    inspector_lines, App, ConversationBlockKind, ConversationBlockLineRange,
-    ConversationBlockUiState, ToolCallDisplay, CONVERSATION_DETAIL_VIEWPORT,
+    App, ConversationBlockKind, ConversationBlockLineRange, ConversationBlockUiState,
+    ToolCallDisplay, CONVERSATION_DETAIL_VIEWPORT,
 };
 use crate::components::markdown;
 use crate::theme::{self, colors};
@@ -18,6 +18,8 @@ const COLLAPSED_DETAIL_LINES: usize = 3;
 /// independent `scroll` offset instead of flooding the whole transcript.
 fn push_tool_detail(
     lines: &mut Vec<Line<'static>>,
+    app: &App,
+    block_id: &str,
     tc: &ToolCallDisplay,
     state: &ConversationBlockUiState,
     focused: bool,
@@ -26,15 +28,21 @@ fn push_tool_detail(
     // Arguments.
     let args = tc.arguments.trim();
     if !args.is_empty() && args != "null" && args != "{}" {
-        let argument_lines = inspector_lines(args, width.saturating_sub(9) as usize);
+        let (argument_count, argument_lines) = app.chat.inspector_slice(
+            &format!("{block_id}:args"),
+            args,
+            width.saturating_sub(9) as usize,
+            0,
+            3,
+        );
         if state.expanded {
-            for aline in argument_lines.iter().take(3) {
+            for aline in &argument_lines {
                 lines.push(Line::from(Span::styled(
                     format!("   args: {aline}"),
                     Style::default().fg(colors::SUBTLE),
                 )));
             }
-            let extra = argument_lines.len().saturating_sub(3);
+            let extra = argument_count.saturating_sub(3);
             if extra > 0 {
                 lines.push(Line::from(Span::styled(
                     format!("   … {extra} more argument lines"),
@@ -46,7 +54,7 @@ fn push_tool_detail(
                 .first()
                 .map(String::as_str)
                 .unwrap_or_default();
-            let ellipsis = if argument_lines.len() > 1 { "…" } else { "" };
+            let ellipsis = if argument_count > 1 { "…" } else { "" };
             lines.push(Line::from(Span::styled(
                 format!("   args: {preview}{ellipsis}"),
                 Style::default().fg(colors::SUBTLE),
@@ -57,31 +65,41 @@ fn push_tool_detail(
     // Result.
     let output = tc.display_output();
     if !output.is_empty() {
-        let output_lines = inspector_lines(output, width.saturating_sub(3) as usize);
         let limit = if state.expanded {
             CONVERSATION_DETAIL_VIEWPORT
         } else {
             COLLAPSED_DETAIL_LINES
         };
-        let max_start = output_lines.len().saturating_sub(limit);
+        let output_key = format!("{block_id}:output");
+        let (output_count, _) =
+            app.chat
+                .inspector_slice(&output_key, output, width.saturating_sub(3) as usize, 0, 0);
+        let max_start = output_count.saturating_sub(limit);
         let start = if state.expanded {
             state.scroll.min(max_start)
         } else {
             0
         };
+        let (_, output_lines) = app.chat.inspector_slice(
+            &output_key,
+            output,
+            width.saturating_sub(3) as usize,
+            start,
+            limit,
+        );
         if start > 0 {
             lines.push(Line::from(Span::styled(
                 format!("   ↑ {start} earlier lines"),
                 Style::default().fg(colors::SUBTLE),
             )));
         }
-        for rline in output_lines.iter().skip(start).take(limit) {
+        for rline in &output_lines {
             lines.push(Line::from(Span::styled(
                 format!("   {rline}"),
                 Style::default().fg(colors::INACTIVE),
             )));
         }
-        let hidden_after = output_lines.len().saturating_sub(start + limit);
+        let hidden_after = output_count.saturating_sub(start + limit);
         if hidden_after > 0 {
             lines.push(Line::from(Span::styled(
                 if state.expanded {
@@ -96,8 +114,14 @@ fn push_tool_detail(
 
     // Error.
     if let Some(err) = &tc.error {
-        let error_lines = inspector_lines(err, width.saturating_sub(10) as usize);
-        for (index, line) in error_lines.iter().take(3).enumerate() {
+        let (error_count, error_lines) = app.chat.inspector_slice(
+            &format!("{block_id}:error"),
+            err,
+            width.saturating_sub(10) as usize,
+            0,
+            3,
+        );
+        for (index, line) in error_lines.iter().enumerate() {
             lines.push(Line::from(Span::styled(
                 if index == 0 {
                     format!("   Error: {line}")
@@ -107,7 +131,7 @@ fn push_tool_detail(
                 Style::default().fg(colors::TOOL_ERROR),
             )));
         }
-        let extra = error_lines.len().saturating_sub(3);
+        let extra = error_count.saturating_sub(3);
         if extra > 0 {
             lines.push(Line::from(Span::styled(
                 format!("   … {extra} more error lines · y copies exact text"),
@@ -215,8 +239,14 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                 lines.extend(rendered);
             }
             ConversationBlockKind::Reasoning { content, streaming } => {
-                let detail = inspector_lines(content, width.saturating_sub(1) as usize);
-                let count = detail.len();
+                let reasoning_key = format!("{}:detail", block.id);
+                let (count, _) = app.chat.inspector_slice(
+                    &reasoning_key,
+                    content,
+                    width.saturating_sub(1) as usize,
+                    0,
+                    0,
+                );
                 lines.push(Line::from(Span::styled(
                     format!(
                         "{} thinking{} · {count} lines",
@@ -228,22 +258,27 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                 if state.expanded {
                     let start = state
                         .scroll
-                        .min(detail.len().saturating_sub(CONVERSATION_DETAIL_VIEWPORT));
+                        .min(count.saturating_sub(CONVERSATION_DETAIL_VIEWPORT));
+                    let (_, detail) = app.chat.inspector_slice(
+                        &reasoning_key,
+                        content,
+                        width.saturating_sub(1) as usize,
+                        start,
+                        CONVERSATION_DETAIL_VIEWPORT,
+                    );
                     if start > 0 {
                         lines.push(Line::from(Span::styled(
                             format!(" ↑ {start} earlier lines"),
                             Style::default().fg(colors::SUBTLE),
                         )));
                     }
-                    for line in detail.iter().skip(start).take(CONVERSATION_DETAIL_VIEWPORT) {
+                    for line in &detail {
                         lines.push(Line::from(Span::styled(
                             format!(" {line}"),
                             Style::default().fg(colors::SUBTLE),
                         )));
                     }
-                    let remaining = detail
-                        .len()
-                        .saturating_sub(start + CONVERSATION_DETAIL_VIEWPORT);
+                    let remaining = count.saturating_sub(start + CONVERSATION_DETAIL_VIEWPORT);
                     if remaining > 0 {
                         lines.push(Line::from(Span::styled(
                             format!(" ↓ {remaining} later lines"),
@@ -287,15 +322,17 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                     ),
                     style,
                 )));
-                push_tool_detail(&mut lines, tool, &state, focused, width);
+                push_tool_detail(&mut lines, app, &block.id, tool, &state, focused, width);
             }
             ConversationBlockKind::SubAgent { child, streaming } => {
                 let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
                 let (icon, style) = match child.status.as_str() {
-                    "running" if streaming => (
-                        theme::BRAILLE_SPINNER[tick],
-                        Style::default().fg(colors::TOOL_RUNNING),
-                    ),
+                    "running" | "running_in_background" | "queued" | "starting" | "in_progress" => {
+                        (
+                            theme::BRAILLE_SPINNER[tick],
+                            Style::default().fg(colors::TOOL_RUNNING),
+                        )
+                    }
                     "completed" => ("✓", Style::default().fg(colors::TOOL_DONE)),
                     "error" | "cancelled" => ("✗", Style::default().fg(colors::TOOL_ERROR)),
                     _ => ("·", Style::default().fg(colors::INACTIVE)),
@@ -429,10 +466,13 @@ mod tests {
     #[test]
     fn tool_detail_truncates_then_expands() {
         let t = tc("{\"path\":\"x\"}", Some("l1\nl2\nl3\nl4\nl5"));
+        let app = App::new(BambooClient::new("http://127.0.0.1:0"));
 
         let mut lines: Vec<Line> = Vec::new();
         push_tool_detail(
             &mut lines,
+            &app,
+            "test:tool",
             &t,
             &ConversationBlockUiState::default(),
             false,
@@ -444,6 +484,8 @@ mod tests {
         let mut lines: Vec<Line> = Vec::new();
         push_tool_detail(
             &mut lines,
+            &app,
+            "test:tool",
             &t,
             &ConversationBlockUiState {
                 expanded: true,
@@ -458,9 +500,12 @@ mod tests {
 
     #[test]
     fn empty_args_and_no_result_render_nothing() {
+        let app = App::new(BambooClient::new("http://127.0.0.1:0"));
         let mut lines: Vec<Line> = Vec::new();
         push_tool_detail(
             &mut lines,
+            &app,
+            "test:tool",
             &tc("{}", None),
             &ConversationBlockUiState::default(),
             false,

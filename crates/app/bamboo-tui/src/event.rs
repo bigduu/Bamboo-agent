@@ -44,16 +44,31 @@ pub enum AppEvent {
         result: Loaded<()>,
         session_picker_epoch: Option<u64>,
     },
-    /// A chat turn was created + started; carries the new session id.
-    ChatStarted(Loaded<String>),
+    /// A chat turn was created + started. The optimistic assistant turn id
+    /// binds this late HTTP result to the draft that originated it.
+    ChatStarted {
+        turn_id: String,
+        result: Loaded<String>,
+    },
     /// The `execute` POST that kicks off a run failed (server down, 4xx/5xx).
     /// Since no SSE terminal event will ever arrive for a run that never
     /// started, this is how `chat.streaming` gets unstuck.
-    ExecuteFailed(String),
+    ExecuteFailed {
+        session_id: String,
+        turn_id: String,
+        message: String,
+    },
     /// The background `stop` POST finished; `Err` still finalizes streaming
     /// locally (see `stop_streaming`) so the operator regains control even if
-    /// the server is unreachable.
-    StopFinished(Loaded<()>),
+    /// the server is unreachable. Session + stream generation bind the late
+    /// HTTP result to the run that originated it, so it cannot stop a newer
+    /// turn that started after a terminal SSE won the race.
+    StopFinished {
+        session_id: String,
+        turn_id: String,
+        stream_epoch: u64,
+        result: Loaded<()>,
+    },
     /// A skill's detail view finished loading (`Enter` on the Skills tab).
     SkillDetailLoaded(Loaded<SkillDetail>),
     /// A session resume (Sessions-tab `Enter` or `--session-id` at startup)
