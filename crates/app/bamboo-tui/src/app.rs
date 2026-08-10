@@ -135,6 +135,10 @@ pub struct ChatState {
     pub current_tool_calls: Vec<ToolCallDisplay>,
     pub current_reasoning: String,
     pub model: String,
+    /// Provider paired with `model` when the selection has an authoritative
+    /// catalog/session identity. Kept across Ctrl+N so a new session does not
+    /// silently fall back to another provider for a same-named model.
+    pub provider: Option<String>,
     pub token_usage: Option<TokenUsage>,
     pub plan_mode: bool,
     /// When true, tool-call arguments and results render in full instead
@@ -161,6 +165,7 @@ impl ChatState {
             current_tool_calls: Vec::new(),
             current_reasoning: String::new(),
             model: String::new(),
+            provider: None,
             token_usage: None,
             plan_mode: false,
             expand_tools: false,
@@ -176,6 +181,7 @@ impl ChatState {
 pub struct OpenedSession {
     pub messages: Vec<ChatMessage>,
     pub model: String,
+    pub provider: Option<String>,
     pub project_id: Option<String>,
     pub is_running: bool,
     pub pending: Option<PendingQuestion>,
@@ -635,6 +641,11 @@ pub enum SessionPickerMode {
     Rename {
         session_id: String,
         draft: String,
+        /// Title represented by the ETag preparation snapshot. A fresh GET
+        /// must reconcile this baseline before its version can authorize the
+        /// draft, otherwise a stale list row could silently revert a rename.
+        base_title: String,
+        draft_dirty: bool,
         metadata_version: Option<u64>,
         loading_version: bool,
         submitting: bool,
@@ -672,6 +683,9 @@ pub struct SessionPicker {
     pub visible: Vec<usize>,
     pub query: String,
     pub selected: usize,
+    /// Once the operator moves or filters the cursor, later lazy pages must
+    /// preserve that choice instead of jumping back to the active session.
+    pub selection_touched: bool,
     pub loading: bool,
     pub error: Option<String>,
     pub total: usize,
@@ -740,14 +754,38 @@ fn session_search_text(session: &SessionSummary) -> String {
     )
 }
 
+fn current_model_key(
+    models: &[CatalogModel],
+    current_provider: Option<&str>,
+    current_model: &str,
+) -> Option<(String, String)> {
+    if current_model.trim().is_empty() {
+        return None;
+    }
+    if let Some(provider) = current_provider.filter(|provider| !provider.trim().is_empty()) {
+        return Some((provider.to_string(), current_model.to_string()));
+    }
+
+    // Legacy sessions expose only a bare model id. Treat it as Current only
+    // when the catalog maps that id to exactly one provider; duplicate ids are
+    // deliberately left unmarked rather than claiming several providers are
+    // simultaneously active.
+    let mut matches = models
+        .iter()
+        .filter(|model| model.reference.model == current_model)
+        .map(model_key);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
 fn sort_catalog_models(
     models: &mut [CatalogModel],
-    current_model: &str,
+    current: Option<&(String, String)>,
     recent: &VecDeque<(String, String)>,
 ) {
     models.sort_by_key(|model| {
         let key = model_key(model);
-        let current_rank = usize::from(model.reference.model != current_model);
+        let current_rank = usize::from(current != Some(&key));
         let recent_rank = recent
             .iter()
             .position(|candidate| candidate == &key)
@@ -1316,13 +1354,22 @@ impl App {
             AppEvent::ActionDone {
                 outcome,
                 reload_tab,
+                session_picker_epoch,
             } => {
+                let succeeded = outcome.is_ok();
                 match outcome {
                     Ok(msg) => self.notify(NoticeLevel::Info, msg),
                     Err(msg) => self.notify(NoticeLevel::Error, msg),
                 }
                 if reload_tab {
-                    if self.session_picker.is_some() {
+                    let reload_origin_picker = succeeded
+                        && session_picker_epoch.is_some_and(|epoch| {
+                            self.session_picker.as_ref().is_some_and(|picker| {
+                                picker.epoch == epoch
+                                    && matches!(picker.mode, SessionPickerMode::Browse)
+                            })
+                        });
+                    if reload_origin_picker {
                         self.reload_session_picker();
                     }
                     self.load_tab_data();
@@ -1375,6 +1422,15 @@ impl App {
                 self.opening_session_id = None;
                 match result {
                     Ok(opened) => {
+                        // Contextual pickers are bound to the chat session
+                        // visible beneath them. A concurrently completing
+                        // resume invalidates that context and any in-flight
+                        // model PATCH result before installing the new session.
+                        if self.session_picker.is_some() {
+                            self.pending_delete = None;
+                        }
+                        self.close_session_picker();
+                        self.close_model_picker();
                         // Reset every per-run scratch field `finalize_streaming`
                         // would otherwise leave behind from whatever was open
                         // before — a resumed session must not inherit stale
@@ -1382,6 +1438,7 @@ impl App {
                         self.detach_stream();
                         self.chat.session_id = Some(session_id.clone());
                         self.chat.model = opened.model;
+                        self.chat.provider = opened.provider;
                         self.chat.project_id = opened.project_id;
                         self.chat.current_response.clear();
                         self.chat.current_tool_calls.clear();
@@ -1686,9 +1743,18 @@ impl App {
                 picker.loading = false;
                 match result {
                     Ok(mut catalog) => {
+                        catalog.models.retain(|model| {
+                            !model.reference.provider.trim().is_empty()
+                                && !model.reference.model.trim().is_empty()
+                        });
+                        let current = current_model_key(
+                            &catalog.models,
+                            self.chat.provider.as_deref(),
+                            &self.chat.model,
+                        );
                         sort_catalog_models(
                             &mut catalog.models,
-                            &self.chat.model,
+                            current.as_ref(),
                             &self.recent_models,
                         );
                         picker.models = catalog.models;
@@ -1706,6 +1772,7 @@ impl App {
             }
             AppEvent::ModelPatched {
                 epoch,
+                session_id,
                 model,
                 result,
             } => {
@@ -1718,6 +1785,13 @@ impl App {
                 };
                 self.model_picker_task = None;
                 picker.applying = false;
+                if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+                    picker.error = Some(
+                        "Active session changed while applying the model — reopen the picker"
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
                 match result {
                     Ok(()) => self.commit_model_selection(model),
                     Err(error) => {
@@ -1742,6 +1816,7 @@ impl App {
                 self.session_picker_task = None;
                 picker.loading = false;
                 let selected_before = picker.selected_session().map(|session| session.id.clone());
+                let loaded_page = result.is_ok();
                 match result {
                     Ok(envelope) => {
                         if offset == 0 {
@@ -1768,27 +1843,31 @@ impl App {
                             .flatten()
                             .filter(|next| *next > offset);
                         picker.error = None;
-                        let preserve_id = self
-                            .chat
-                            .session_id
-                            .clone()
-                            .filter(|active_id| {
-                                picker
-                                    .sessions
-                                    .iter()
-                                    .any(|session| &session.id == active_id)
-                            })
-                            .or(selected_before);
+                        let preserve_id = if picker.selection_touched {
+                            selected_before
+                        } else {
+                            self.chat
+                                .session_id
+                                .clone()
+                                .filter(|active_id| {
+                                    picker
+                                        .sessions
+                                        .iter()
+                                        .any(|session| &session.id == active_id)
+                                })
+                                .or(selected_before)
+                        };
                         picker.refresh_filter(preserve_id);
                     }
                     Err(error) => {
                         picker.error = Some(format!(
-                            "Failed to load sessions: {error} — press r to retry"
+                            "Failed to load sessions: {error} — press Ctrl+R to retry"
                         ));
                     }
                 }
                 let should_continue = self.session_picker.as_ref().is_some_and(|picker| {
-                    !picker.query.is_empty()
+                    loaded_page
+                        && !picker.query.is_empty()
                         && picker.next_offset.is_some()
                         && picker.sessions.len() < MAX_SESSION_PICKER_SESSIONS
                 });
@@ -1816,6 +1895,8 @@ impl App {
                 let mut patch = None;
                 match result {
                     Ok(versioned) => {
+                        let fresh_title = versioned.summary.title.clone();
+                        let fresh_version = versioned.metadata_version;
                         if let Some(existing) = picker
                             .sessions
                             .iter_mut()
@@ -1825,14 +1906,34 @@ impl App {
                         }
                         match &mut picker.mode {
                             SessionPickerMode::Rename {
+                                draft,
+                                base_title,
+                                draft_dirty,
                                 metadata_version,
                                 loading_version,
                                 error,
                                 ..
                             } => {
-                                *metadata_version = Some(versioned.metadata_version);
                                 *loading_version = false;
-                                *error = None;
+                                if *draft_dirty && *base_title != fresh_title {
+                                    // The user edited a title derived from a
+                                    // stale list row. Do not bind that draft to
+                                    // a newer ETag until the conflict has been
+                                    // made visible and explicitly retried.
+                                    *metadata_version = None;
+                                    *base_title = fresh_title;
+                                    *error = Some(
+                                        "Title changed on the server; draft preserved — press Ctrl+R to confirm against the latest title"
+                                            .to_string(),
+                                    );
+                                } else {
+                                    if !*draft_dirty {
+                                        *draft = fresh_title.clone();
+                                    }
+                                    *base_title = fresh_title;
+                                    *metadata_version = Some(fresh_version);
+                                    *error = None;
+                                }
                             }
                             SessionPickerMode::Pinning {
                                 target,
@@ -1844,7 +1945,7 @@ impl App {
                                 *loading_version = false;
                                 *submitting = true;
                                 *error = None;
-                                patch = Some((versioned.metadata_version, *target));
+                                patch = Some((fresh_version, *target));
                             }
                             SessionPickerMode::Browse => {}
                         }
@@ -1862,7 +1963,7 @@ impl App {
                         } => {
                             *loading_version = false;
                             *error = Some(format!(
-                                "Failed to prepare update: {error_message} — press r to retry"
+                                "Failed to prepare update: {error_message} — press Ctrl+R to retry"
                             ));
                         }
                         SessionPickerMode::Browse => {}
@@ -1925,7 +2026,8 @@ impl App {
                             .current_version
                             .map(|version| format!(" (server version {version})"))
                             .unwrap_or_default();
-                        let message = format!("{prefix}{current}: {failure} — press r to retry");
+                        let message =
+                            format!("{prefix}{current}: {failure} — press Ctrl+R to retry");
                         match &mut picker.mode {
                             SessionPickerMode::Rename {
                                 metadata_version,
@@ -2045,6 +2147,17 @@ impl App {
             return;
         }
 
+        // Non-pointer modal owners still consume mouse input. In particular,
+        // a delete confirmation must not let the wheel move the Session row
+        // hidden behind it; cancel then returns to the exact prior selection.
+        if self.serve_offer.is_some()
+            || self.pending_delete.is_some()
+            || self.schedule_form.is_some()
+            || self.config_editor.is_some()
+        {
+            return;
+        }
+
         if let Some(picker) = self.session_picker.as_mut() {
             if matches!(picker.mode, SessionPickerMode::Browse) {
                 let delta = match mouse.kind {
@@ -2053,6 +2166,7 @@ impl App {
                     _ => return,
                 };
                 picker.selected = scroll_selection(picker.selected, picker.visible.len(), delta);
+                picker.selection_touched = true;
             }
             return;
         }
@@ -2995,6 +3109,8 @@ impl App {
                 self.pending_delete = None;
                 if let Some(tx) = self.event_tx.clone() {
                     let client = self.client.clone();
+                    let session_picker_epoch =
+                        self.session_picker.as_ref().map(|picker| picker.epoch);
                     tokio::spawn(async move {
                         let outcome = match client.delete_session(&id).await {
                             Ok(()) => Ok("Session deleted".to_string()),
@@ -3003,6 +3119,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: true,
+                            session_picker_epoch,
                         });
                     });
                 }
@@ -3170,12 +3287,14 @@ impl App {
         let client = self.client.clone();
         let existing_session = self.chat.session_id.clone();
         let project_id = self.chat.project_id.clone();
+        let provider = self.chat.provider.clone();
         tokio::spawn(async move {
             let req = ChatRequest {
                 message,
                 session_id: existing_session,
                 project_id,
                 model: Some(model),
+                provider,
             };
             let result = client
                 .chat(req)
@@ -3253,6 +3372,7 @@ impl App {
         };
         let client = self.client.clone();
         let model = self.chat.model.clone();
+        let provider = self.chat.provider.clone();
         tokio::spawn(async move {
             let model = if model.is_empty() { None } else { Some(model) };
             let ready = if *sse_ready.borrow() {
@@ -3280,7 +3400,10 @@ impl App {
             // will ever arrive for a run that never started — report it back so
             // the handler can finalize `chat.streaming` instead of spinning
             // forever waiting for events behind a run that doesn't exist.
-            if let Err(e) = client.execute(&session_id, model.as_deref()).await {
+            if let Err(e) = client
+                .execute(&session_id, model.as_deref(), provider.as_deref())
+                .await
+            {
                 let _ = tx.send(AppEvent::ExecuteFailed(e.to_string()));
             }
         });
@@ -3340,9 +3463,15 @@ impl App {
             } else {
                 None
             };
+            let provider = summary
+                .model_ref
+                .as_ref()
+                .map(|model_ref| model_ref.provider.clone())
+                .or_else(|| summary.provider.clone());
             let opened = OpenedSession {
                 messages: map_history(history.messages),
                 model: summary.model,
+                provider,
                 project_id: summary.project_id,
                 is_running: summary.is_running,
                 pending,
@@ -3963,6 +4092,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: true,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -4021,6 +4151,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: true,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -4040,6 +4171,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: false,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -4103,6 +4235,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: true,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -4219,6 +4352,7 @@ impl App {
                             let _ = tx.send(AppEvent::ActionDone {
                                 outcome,
                                 reload_tab: true,
+                                session_picker_epoch: None,
                             });
                         });
                     }
@@ -4246,6 +4380,7 @@ impl App {
             visible: Vec::new(),
             query: String::new(),
             selected: 0,
+            selection_touched: false,
             loading: true,
             error: None,
             total: 0,
@@ -4289,6 +4424,7 @@ impl App {
         picker.sessions.clear();
         picker.visible.clear();
         picker.selected = 0;
+        picker.selection_touched = false;
         picker.loading = true;
         picker.error = None;
         picker.total = 0;
@@ -4372,6 +4508,7 @@ impl App {
                     if let Some(picker) = self.session_picker.as_mut() {
                         let preserve = picker.selected_session().map(|s| s.id.clone());
                         picker.query.clear();
+                        picker.selection_touched = true;
                         picker.refresh_filter(preserve);
                     }
                     return;
@@ -4394,10 +4531,12 @@ impl App {
             KeyCode::Up => {
                 if let Some(picker) = self.session_picker.as_mut() {
                     picker.selected = picker.selected.saturating_sub(1);
+                    picker.selection_touched = true;
                 }
             }
             KeyCode::Down => {
                 let load_more = if let Some(picker) = self.session_picker.as_mut() {
+                    picker.selection_touched = true;
                     if picker.selected + 1 < picker.visible.len() {
                         picker.selected += 1;
                         false
@@ -4439,6 +4578,7 @@ impl App {
                 if let Some(picker) = self.session_picker.as_mut() {
                     let preserve = picker.selected_session().map(|s| s.id.clone());
                     picker.query.pop();
+                    picker.selection_touched = true;
                     picker.refresh_filter(preserve);
                 }
             }
@@ -4450,6 +4590,7 @@ impl App {
                 if let Some(picker) = self.session_picker.as_mut() {
                     let preserve = picker.selected_session().map(|s| s.id.clone());
                     picker.query.push(character);
+                    picker.selection_touched = true;
                     picker.refresh_filter(preserve);
                 }
                 if self
@@ -4478,7 +4619,9 @@ impl App {
         if let Some(picker) = self.session_picker.as_mut() {
             picker.mode = SessionPickerMode::Rename {
                 session_id: session_id.clone(),
+                base_title: draft.clone(),
                 draft,
+                draft_dirty: false,
                 metadata_version: None,
                 loading_version: true,
                 submitting: false,
@@ -4521,10 +4664,12 @@ impl App {
         let SessionPickerMode::Rename {
             session_id,
             draft,
+            draft_dirty,
             metadata_version,
             loading_version,
             submitting,
             error,
+            ..
         } = &mut picker.mode
         else {
             return;
@@ -4558,6 +4703,7 @@ impl App {
                 KeyCode::Esc => cancel = true,
                 KeyCode::Backspace => {
                     draft.pop();
+                    *draft_dirty = true;
                     *error = None;
                 }
                 KeyCode::Char(character)
@@ -4566,6 +4712,7 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     draft.push(character);
+                    *draft_dirty = true;
                     *error = None;
                 }
                 _ => {}
@@ -4843,15 +4990,16 @@ impl App {
         picker.applying = true;
         picker.error = None;
         let epoch = picker.epoch;
-        let model_id = model.reference.model.clone();
+        let model_ref = model.reference.clone();
         let client = self.client.clone();
         self.model_picker_task = Some(tokio::spawn(async move {
             let result = client
-                .patch_session_model(&session_id, &model_id)
+                .patch_session_model(&session_id, &model_ref)
                 .await
                 .map_err(|error| error.to_string());
             let _ = tx.send(AppEvent::ModelPatched {
                 epoch,
+                session_id,
                 model,
                 result,
             });
@@ -4859,7 +5007,14 @@ impl App {
     }
 
     pub(crate) fn model_group_label(&self, model: &CatalogModel) -> String {
-        if model.reference.model == self.chat.model {
+        let current = self.model_picker.as_ref().and_then(|picker| {
+            current_model_key(
+                &picker.models,
+                self.chat.provider.as_deref(),
+                &self.chat.model,
+            )
+        });
+        if current.as_ref() == Some(&model_key(model)) {
             "Current".to_string()
         } else if self.recent_models.contains(&model_key(model)) {
             "Recent".to_string()
@@ -4875,15 +5030,18 @@ impl App {
 
     fn commit_model_selection(&mut self, model: CatalogModel) {
         let key = model_key(&model);
+        let provider_label = if model.provider_display_name.trim().is_empty() {
+            model.reference.provider.clone()
+        } else {
+            model.provider_display_name.clone()
+        };
         self.recent_models.retain(|candidate| candidate != &key);
         self.recent_models.push_front(key);
         self.recent_models.truncate(MAX_RECENT_MODELS);
         self.chat.model = model.reference.model.clone();
+        self.chat.provider = Some(model.reference.provider.clone());
         self.model_picker = None;
-        self.status_message = format!(
-            "Model: {} ({})",
-            model.display_name, model.provider_display_name
-        );
+        self.status_message = format!("Model: {} ({provider_label})", model.display_name);
     }
 }
 
@@ -5463,6 +5621,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: None,
@@ -5478,6 +5637,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: Some(PendingQuestion {
@@ -5530,6 +5690,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: None,
@@ -5546,6 +5707,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: Some(PendingQuestion {
@@ -5583,6 +5745,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: None,
@@ -5599,6 +5762,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: Some(PendingQuestion {
@@ -6371,6 +6535,8 @@ mod question_tests {
             title: String::new(),
             title_generated: true,
             model: String::new(),
+            model_ref: None,
+            provider: None,
             is_running: false,
             has_pending_question: false,
             last_run_status: None,
@@ -6869,6 +7035,7 @@ mod question_tests {
         OpenedSession {
             messages,
             model: "claude-sonnet-5".to_string(),
+            provider: None,
             project_id: None,
             is_running: false,
             pending: None,
@@ -7754,6 +7921,7 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("s1".to_string());
         app.chat.model = "claude-sonnet-5".to_string();
+        app.chat.provider = Some("anthropic".to_string());
         app.chat.project_id = Some("project-tui".to_string());
         app.chat.messages = vec![asst_msg("leftover")];
         app.chat.current_response = "partial".to_string();
@@ -7788,6 +7956,7 @@ mod question_tests {
             app.chat.model, "claude-sonnet-5",
             "model must survive a new session"
         );
+        assert_eq!(app.chat.provider.as_deref(), Some("anthropic"));
         assert_eq!(
             app.chat.project_id.as_deref(),
             Some("project-tui"),
@@ -8065,6 +8234,7 @@ mod question_tests {
             sessions,
             query: String::new(),
             selected: 0,
+            selection_touched: false,
             loading: false,
             error: None,
             total: 0,
@@ -8211,6 +8381,32 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn session_picker_page_failure_stops_until_explicit_retry() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut picker = contextual_session_picker(vec![bare_session("s1")]);
+        picker.query = "match".to_string();
+        picker.next_offset = Some(1);
+        picker.total = 2;
+        app.session_picker = Some(picker);
+
+        app.handle_event(AppEvent::SessionPickerPageLoaded {
+            epoch: 7,
+            offset: 1,
+            result: Err("offline".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let picker = app.session_picker.as_ref().unwrap();
+        assert_eq!(picker.next_offset, Some(1), "retry offset stays available");
+        assert!(picker.error.as_deref().unwrap().contains("offline"));
+        assert!(
+            app.session_picker_task.is_none(),
+            "an error must not immediately spawn the same page again"
+        );
+    }
+
+    #[tokio::test]
     async fn active_session_becomes_selected_when_a_later_page_arrives() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("active".to_string());
@@ -8246,12 +8442,143 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn lazy_page_preserves_operator_selection_after_navigation() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        let mut picker =
+            contextual_session_picker(vec![bare_session("s1"), bare_session("chosen")]);
+        picker.selected = 1;
+        picker.selection_touched = true;
+        app.session_picker = Some(picker);
+
+        app.handle_event(AppEvent::SessionPickerPageLoaded {
+            epoch: 7,
+            offset: 2,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("active")],
+                total: 3,
+                limit: 2,
+                offset: 2,
+                next_offset: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            app.session_picker
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "chosen"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_version_rebases_an_untouched_rename_draft() {
+        let mut original = bare_session("s1");
+        original.title = "A".to_string();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![original]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "A".to_string(),
+            base_title: "A".to_string(),
+            draft_dirty: false,
+            metadata_version: None,
+            loading_version: true,
+            submitting: false,
+            error: None,
+        };
+        let mut fresh = bare_session("s1");
+        fresh.title = "B".to_string();
+
+        app.handle_event(AppEvent::SessionPickerVersionLoaded {
+            epoch: 7,
+            session_id: "s1".to_string(),
+            intent: SessionPickerIntent::Rename,
+            result: Ok(crate::api::VersionedSession {
+                summary: fresh,
+                metadata_version: 2,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename {
+            draft,
+            base_title,
+            metadata_version,
+            error,
+            ..
+        } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("rename mode closed unexpectedly");
+        };
+        assert_eq!(draft, "B");
+        assert_eq!(base_title, "B");
+        assert_eq!(*metadata_version, Some(2));
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_changed_title_does_not_authorize_a_dirty_stale_draft() {
+        let mut original = bare_session("s1");
+        original.title = "A".to_string();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![original]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "my edit".to_string(),
+            base_title: "A".to_string(),
+            draft_dirty: true,
+            metadata_version: None,
+            loading_version: true,
+            submitting: false,
+            error: None,
+        };
+        let mut fresh = bare_session("s1");
+        fresh.title = "B".to_string();
+
+        app.handle_event(AppEvent::SessionPickerVersionLoaded {
+            epoch: 7,
+            session_id: "s1".to_string(),
+            intent: SessionPickerIntent::Rename,
+            result: Ok(crate::api::VersionedSession {
+                summary: fresh,
+                metadata_version: 2,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename {
+            draft,
+            base_title,
+            metadata_version,
+            error,
+            ..
+        } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("rename mode closed unexpectedly");
+        };
+        assert_eq!(draft, "my edit");
+        assert_eq!(base_title, "B");
+        assert!(metadata_version.is_none());
+        assert!(error.as_deref().unwrap().contains("Title changed"));
+    }
+
+    #[tokio::test]
     async fn rename_conflict_preserves_draft_and_exposes_retry() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
         app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
             session_id: "s1".to_string(),
             draft: "keep my draft".to_string(),
+            base_title: "old title".to_string(),
+            draft_dirty: true,
             metadata_version: Some(1),
             loading_version: false,
             submitting: true,
@@ -8318,6 +8645,8 @@ mod question_tests {
         app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
             session_id: "s1".to_string(),
             draft: "new draft".to_string(),
+            base_title: "old title".to_string(),
+            draft_dirty: true,
             metadata_version: None,
             loading_version: true,
             submitting: false,
@@ -8354,19 +8683,68 @@ mod question_tests {
 
     #[tokio::test]
     async fn contextual_delete_confirmation_owns_input_then_returns_to_picker() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
         let mut session = bare_session("s1");
         session.title = "Delete me".to_string();
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.session_picker = Some(contextual_session_picker(vec![session]));
+        app.session_picker = Some(contextual_session_picker(vec![
+            session,
+            bare_session("s2"),
+            bare_session("s3"),
+            bare_session("s4"),
+        ]));
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
             .await
             .unwrap();
         assert_eq!(app.pending_delete.as_ref().unwrap().0, "s1");
 
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(
+            app.session_picker.as_ref().unwrap().selected,
+            0,
+            "delete confirmation must consume the wheel"
+        );
+
         app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
         assert!(app.pending_delete.is_none());
         assert!(app.session_picker.is_some());
         assert!(app.session_picker.as_ref().unwrap().query.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_action_completion_cannot_erase_a_newer_rename_editor() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "keep this draft".to_string(),
+            base_title: "old".to_string(),
+            draft_dirty: true,
+            metadata_version: Some(1),
+            loading_version: false,
+            submitting: false,
+            error: None,
+        };
+
+        app.handle_event(AppEvent::ActionDone {
+            outcome: Ok("older delete completed".to_string()),
+            reload_tab: true,
+            session_picker_epoch: Some(7),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename { draft, .. } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("late generic completion erased the editor");
+        };
+        assert_eq!(draft, "keep this draft");
     }
 
     #[test]
@@ -8551,6 +8929,7 @@ mod question_tests {
 
         app.handle_event(AppEvent::ModelPatched {
             epoch: 1,
+            session_id: "s1".to_string(),
             model: catalog_model(
                 "anthropic",
                 "claude-sonnet-5",
@@ -8571,6 +8950,82 @@ mod question_tests {
         assert_eq!(app.chat.textarea.lines().join("\n"), "d");
     }
 
+    #[tokio::test]
+    async fn session_switch_invalidates_an_in_flight_model_patch() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-a".to_string());
+        app.chat.model = "model-a".to_string();
+        app.chat.provider = Some("provider-a".to_string());
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "provider-a",
+            "selected-for-a",
+            "Selected for A",
+            "Provider A",
+        )]));
+        app.model_picker.as_mut().unwrap().applying = true;
+        app.opening_session_id = Some("session-b".to_string());
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "session-b".to_string(),
+            result: Ok(OpenedSession {
+                model: "model-b".to_string(),
+                provider: Some("provider-b".to_string()),
+                ..opened(vec![])
+            }),
+        })
+        .await
+        .unwrap();
+        assert!(app.model_picker.is_none());
+
+        app.handle_event(AppEvent::ModelPatched {
+            epoch: 1,
+            session_id: "session-a".to_string(),
+            model: catalog_model(
+                "provider-a",
+                "selected-for-a",
+                "Selected for A",
+                "Provider A",
+            ),
+            result: Ok(()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-b"));
+        assert_eq!(app.chat.model, "model-b");
+        assert_eq!(app.chat.provider.as_deref(), Some("provider-b"));
+    }
+
+    #[test]
+    fn duplicate_model_ids_require_provider_identity_for_current_group() {
+        let models = vec![
+            catalog_model("provider-a", "shared", "Shared A", "Provider A"),
+            catalog_model("provider-b", "shared", "Shared B", "Provider B"),
+        ];
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "shared".to_string();
+        app.model_picker = Some(model_picker(models));
+
+        assert!(app
+            .model_picker
+            .as_ref()
+            .unwrap()
+            .models
+            .iter()
+            .all(|model| app.model_group_label(model) != "Current"));
+
+        app.chat.provider = Some("provider-b".to_string());
+        let labels = app
+            .model_picker
+            .as_ref()
+            .unwrap()
+            .models
+            .iter()
+            .map(|model| app.model_group_label(model))
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["Provider: Provider A", "Current"]);
+    }
+
     #[test]
     fn model_picker_renders_current_recent_and_provider_groups() {
         use ratatui::backend::TestBackend;
@@ -8583,7 +9038,8 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.model = "current".to_string();
         app.recent_models.push_back(model_key(&recent));
-        sort_catalog_models(&mut models, &app.chat.model, &app.recent_models);
+        let current = current_model_key(&models, app.chat.provider.as_deref(), &app.chat.model);
+        sort_catalog_models(&mut models, current.as_ref(), &app.recent_models);
         app.model_picker = Some(model_picker(models));
 
         let backend = TestBackend::new(120, 30);
@@ -8604,9 +9060,9 @@ mod question_tests {
     }
 
     /// `↑/↓` move the selection (clamped); `Enter` applies the highlighted
-    /// model — `chat.model` gets the plain model id (NOT `provider/model`),
-    /// matching what `ChatRequest`/`ExecuteRequest`/`PatchSessionRequest.model`
-    /// resolve on the server.
+    /// model — `chat.model` keeps the plain model id while `chat.provider`
+    /// keeps its paired provider, matching the server's separate compatibility
+    /// fields without collapsing identity into a synthetic string.
     #[tokio::test]
     async fn model_picker_navigation_and_enter_applies() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
@@ -8647,6 +9103,7 @@ mod question_tests {
             app.chat.model, "claude-sonnet-5",
             "chat.model gets the plain model id, not provider/model"
         );
+        assert_eq!(app.chat.provider.as_deref(), Some("anthropic"));
         assert_eq!(app.status_message, "Model: Claude Sonnet 5 (Anthropic)");
     }
 

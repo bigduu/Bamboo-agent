@@ -197,12 +197,18 @@ impl BambooClient {
         Ok(chat_resp)
     }
 
-    pub async fn execute(&self, session_id: &str, model: Option<&str>) -> Result<ExecuteResponse> {
+    pub async fn execute(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<ExecuteResponse> {
         let resp = self
             .client
             .post(self.url(&format!("/api/v1/execute/{}", session_id)))
             .json(&ExecuteRequest {
                 model: model.map(|m| m.to_string()),
+                provider: provider.map(str::to_string),
             })
             .send()
             .await?;
@@ -457,12 +463,17 @@ impl BambooClient {
     /// PATCH the active session's model before the picker commits a selection
     /// locally. The caller keeps the overlay open on failure so the visible
     /// model badge can never drift from the persisted session record.
-    pub async fn patch_session_model(&self, session_id: &str, model: &str) -> Result<()> {
+    pub async fn patch_session_model(
+        &self,
+        session_id: &str,
+        model_ref: &CatalogModelRef,
+    ) -> Result<()> {
         let resp = self
             .client
             .patch(self.url(&format!("/api/v1/sessions/{}", session_id)))
             .json(&PatchSessionModelRequest {
-                model: model.to_string(),
+                model: model_ref.model.clone(),
+                provider: model_ref.provider.clone(),
             })
             .send()
             .await?;
@@ -824,6 +835,31 @@ mod tests {
         assert!(failure.conflict);
         assert_eq!(failure.current_version, Some(5));
         assert!(failure.to_string().contains("metadata changed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_patch_preserves_provider_model_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let patch = read_request(&mut socket).await;
+            assert!(patch.starts_with("PATCH /api/v1/sessions/s1 HTTP/1.1"));
+            assert!(patch.ends_with(r#"{"model":"shared","provider":"provider-b"}"#));
+            respond(&mut socket, "200 OK", "\"1\"", "{}").await;
+        });
+
+        BambooClient::new(&base_url)
+            .patch_session_model(
+                "s1",
+                &CatalogModelRef {
+                    provider: "provider-b".to_string(),
+                    model: "shared".to_string(),
+                },
+            )
+            .await
+            .unwrap();
         server.await.unwrap();
     }
 }

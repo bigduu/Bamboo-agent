@@ -31,6 +31,10 @@ pub enum AppEvent {
     ActionDone {
         outcome: Loaded<String>,
         reload_tab: bool,
+        /// The contextual Session picker generation that originated this
+        /// action, if any. Generic background actions must never reload and
+        /// erase a newer picker/editor merely because they finish late.
+        session_picker_epoch: Option<u64>,
     },
     /// A chat turn was created + started; carries the new session id.
     ChatStarted(Loaded<String>),
@@ -102,6 +106,7 @@ pub enum AppEvent {
     /// query/selection and the chat draft survive validation/network errors.
     ModelPatched {
         epoch: u64,
+        session_id: String,
         model: CatalogModel,
         result: Loaded<()>,
     },

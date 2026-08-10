@@ -47,6 +47,10 @@ pub struct SessionSummary {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
+    pub model_ref: Option<CatalogModelRef>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
     pub is_running: bool,
     #[serde(default)]
     pub has_pending_question: bool,
@@ -320,11 +324,10 @@ pub struct ScheduleRunConfigReq {
 // ── Provider catalog (model picker, Ctrl+O) ──
 
 /// Mirrors the server's `ProviderModelRef` (`crates/core/bamboo-domain`) on
-/// the wire: `{"provider": "...", "model": "..."}`. `model` alone (NOT
-/// `provider/model`) is the string form `ChatRequest.model` /
-/// `ExecuteRequest.model` / `PatchSessionRequest.model` actually resolve —
-/// see `apply_model` in `app.rs`.
-#[derive(Deserialize, Debug, Clone, Default)]
+/// the wire: `{"provider": "...", "model": "..."}`. The TUI keeps those
+/// fields separate on Chat/Execute/PATCH requests so same-named models from
+/// different providers remain unambiguous without inventing a combined id.
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogModelRef {
     #[serde(default)]
     pub provider: String,
@@ -356,12 +359,13 @@ pub struct ProviderCatalog {
     pub models: Vec<CatalogModel>,
 }
 
-/// Body of `PATCH /api/v1/sessions/{id}` for the model-picker's
-/// fire-and-forget session update. Must match the server's
-/// `PatchSessionRequest.model` field name.
-#[derive(Serialize)]
+/// Body of `PATCH /api/v1/sessions/{id}` for the model-picker's exact
+/// provider/model update. The server derives and persists its typed
+/// `model_ref` when both legacy-compatible fields are present.
+#[derive(Serialize, Debug, Clone)]
 pub struct PatchSessionModelRequest {
     pub model: String,
+    pub provider: String,
 }
 
 /// Canonical metadata subset used by the session picker's rename/pin actions.
@@ -692,9 +696,10 @@ mod tests {
     fn patch_session_model_request_serializes_model_field() {
         let req = PatchSessionModelRequest {
             model: "gpt-4.1".to_string(),
+            provider: "openai".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"model":"gpt-4.1"}"#);
+        assert_eq!(json, r#"{"model":"gpt-4.1","provider":"openai"}"#);
     }
 
     #[test]

@@ -259,6 +259,8 @@ mod tests {
             title: String::new(),
             title_generated: true,
             model: String::new(),
+            model_ref: None,
+            provider: None,
             is_running: false,
             has_pending_question: false,
             last_run_status: None,
