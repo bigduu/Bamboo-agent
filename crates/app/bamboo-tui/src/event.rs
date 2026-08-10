@@ -36,6 +36,14 @@ pub enum AppEvent {
         /// erase a newer picker/editor merely because they finish late.
         session_picker_epoch: Option<u64>,
     },
+    /// A session DELETE finished. Unlike generic actions, this retains the
+    /// deleted id so Chat state can detach atomically when the operator
+    /// deleted the session currently shown beneath either session UI.
+    SessionDeleted {
+        session_id: String,
+        result: Loaded<()>,
+        session_picker_epoch: Option<u64>,
+    },
     /// A chat turn was created + started; carries the new session id.
     ChatStarted(Loaded<String>),
     /// The `execute` POST that kicks off a run failed (server down, 4xx/5xx).

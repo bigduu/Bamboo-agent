@@ -992,6 +992,10 @@ pub struct App {
     /// session, and the actual DELETE runs off the event loop like every other
     /// mutation.
     pub pending_delete: Option<(String, String)>,
+    /// Session id whose DELETE request is currently in flight. When it is the
+    /// active Chat session, submission stays blocked until the result arrives
+    /// so a concurrent chat POST cannot recreate the session being deleted.
+    deleting_session_id: Option<String>,
     /// Capped scrollback of past status messages so errors/warnings aren't lost
     /// when the single status line is overwritten. Viewed with `Ctrl+L`.
     pub notifications: Vec<Notification>,
@@ -1115,6 +1119,7 @@ impl App {
             model_picker: None,
             session_picker: None,
             pending_delete: None,
+            deleting_session_id: None,
             notifications: Vec::new(),
             notifications_visible: false,
             unseen_alerts: 0,
@@ -1374,6 +1379,63 @@ impl App {
                     }
                     self.load_tab_data();
                 }
+            }
+            AppEvent::SessionDeleted {
+                session_id,
+                result,
+                session_picker_epoch,
+            } => {
+                if self.deleting_session_id.as_deref() == Some(session_id.as_str()) {
+                    self.deleting_session_id = None;
+                }
+                let succeeded = result.is_ok();
+                let deleted_active =
+                    succeeded && self.chat.session_id.as_deref() == Some(session_id.as_str());
+                let deleted_opening =
+                    succeeded && self.opening_session_id.as_deref() == Some(session_id.as_str());
+                if deleted_active {
+                    // Detach before another input event can be handled. This
+                    // preserves the deliberate model/Project/composer draft,
+                    // while removing every server-backed trace of the deleted
+                    // session from the Chat view. Preserve an unrelated newer
+                    // resume, but never let a queued resume of this deleted id
+                    // become authoritative again.
+                    let unrelated_opening = self
+                        .opening_session_id
+                        .take()
+                        .filter(|opening| opening != &session_id);
+                    self.new_session();
+                    self.opening_session_id = unrelated_opening;
+                } else if deleted_opening {
+                    // The resume task itself is best-effort and may already
+                    // have queued a result. Clearing its authoritative id
+                    // makes that stale SessionOpened harmless.
+                    self.opening_session_id = None;
+                }
+                match result {
+                    Ok(()) => self.notify(
+                        NoticeLevel::Info,
+                        if deleted_active {
+                            "Session deleted — started a new session"
+                        } else {
+                            "Session deleted"
+                        },
+                    ),
+                    Err(error) => {
+                        self.notify(NoticeLevel::Error, format!("Delete failed: {error}"))
+                    }
+                }
+                let reload_origin_picker = succeeded
+                    && session_picker_epoch.is_some_and(|epoch| {
+                        self.session_picker.as_ref().is_some_and(|picker| {
+                            picker.epoch == epoch
+                                && matches!(picker.mode, SessionPickerMode::Browse)
+                        })
+                    });
+                if reload_origin_picker {
+                    self.reload_session_picker();
+                }
+                self.load_tab_data();
             }
             AppEvent::ChatStarted(r) => match r {
                 Ok(session_id) => {
@@ -3107,22 +3169,42 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.pending_delete = None;
-                if let Some(tx) = self.event_tx.clone() {
-                    let client = self.client.clone();
-                    let session_picker_epoch =
-                        self.session_picker.as_ref().map(|picker| picker.epoch);
-                    tokio::spawn(async move {
-                        let outcome = match client.delete_session(&id).await {
-                            Ok(()) => Ok("Session deleted".to_string()),
-                            Err(e) => Err(format!("Delete failed: {e}")),
-                        };
-                        let _ = tx.send(AppEvent::ActionDone {
-                            outcome,
-                            reload_tab: true,
-                            session_picker_epoch,
-                        });
-                    });
+                if self.deleting_session_id.is_some() {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Wait for the current session delete to finish",
+                    );
+                    return Ok(());
                 }
+                if self.chat.streaming && self.chat.session_id.as_deref() == Some(id.as_str()) {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Stop the active run before deleting its session",
+                    );
+                    return Ok(());
+                }
+                let Some(tx) = self.event_tx.clone() else {
+                    self.notify(
+                        NoticeLevel::Error,
+                        "Session delete is not attached to an event loop",
+                    );
+                    return Ok(());
+                };
+                self.deleting_session_id = Some(id.clone());
+                self.status_message = "Deleting session...".to_string();
+                let client = self.client.clone();
+                let session_picker_epoch = self.session_picker.as_ref().map(|picker| picker.epoch);
+                tokio::spawn(async move {
+                    let result = client
+                        .delete_session(&id)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::SessionDeleted {
+                        session_id: id,
+                        result,
+                        session_picker_epoch,
+                    });
+                });
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.pending_delete = None;
@@ -3231,6 +3313,24 @@ impl App {
                 self.chat.textarea.insert_newline();
             }
             KeyCode::Enter => {
+                // Selecting a session starts an asynchronous history/summary
+                // fetch after the picker closes. Keep the existing draft
+                // editable while that fetch is in flight, but never submit it
+                // against the session still visible underneath: a concurrent
+                // `ChatStarted` and `SessionOpened` could otherwise route the
+                // turn (or its provider/model) to different sessions.
+                if self.opening_session_id.is_some() {
+                    self.status_message =
+                        "Session is still resuming — message kept as draft".to_string();
+                    return Ok(());
+                }
+                if self.chat.session_id.as_ref().is_some_and(|session_id| {
+                    self.deleting_session_id.as_deref() == Some(session_id.as_str())
+                }) {
+                    self.status_message =
+                        "Session is being deleted — message kept as draft".to_string();
+                    return Ok(());
+                }
                 let input = self.chat.textarea.lines().join("\n");
                 let input = input.trim().to_string();
                 if input.is_empty() {
@@ -3501,7 +3601,10 @@ impl App {
         self.chat.token_usage = None;
         self.chat.scroll_offset = 0;
         self.chat.auto_scroll = true;
+        self.chat.streaming = false;
         self.chat.plan_mode = false;
+        self.stream_disconnected = false;
+        self.pending_answer_run_started = false;
         self.supersede_pending_answer();
         self.pending_question = None;
         self.dismissed_question = None;
@@ -4948,9 +5051,10 @@ impl App {
             }
             KeyCode::Char('r')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.model_picker.as_ref().is_some_and(|picker| {
-                        picker.error.is_some() && picker.models.is_empty()
-                    }) =>
+                    && self
+                        .model_picker
+                        .as_ref()
+                        .is_some_and(|picker| !picker.loading && picker.visible.is_empty()) =>
             {
                 self.reload_model_catalog();
             }
@@ -6663,6 +6767,122 @@ mod question_tests {
         assert!(app.pending_delete.is_none());
     }
 
+    #[tokio::test]
+    async fn successful_delete_of_active_session_resets_server_backed_chat_state() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.chat.project_id = Some("project-1".to_string());
+        app.chat.model = "gpt-5".to_string();
+        app.chat.provider = Some("openai".to_string());
+        app.chat.messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            content: "old transcript".to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        });
+        app.chat.current_response = "partial".to_string();
+        app.chat.streaming = true;
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        app.deleting_session_id = Some("active".to_string());
+
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "active".to_string(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(app.deleting_session_id.is_none());
+        assert!(app.chat.session_id.is_none());
+        assert!(app.chat.messages.is_empty());
+        assert!(app.chat.current_response.is_empty());
+        assert!(!app.chat.streaming);
+        assert_eq!(app.chat.model, "gpt-5");
+        assert_eq!(app.chat.provider.as_deref(), Some("openai"));
+        assert_eq!(app.chat.project_id.as_deref(), Some("project-1"));
+        assert_eq!(app.chat.textarea.lines().join("\n"), "d");
+        assert_eq!(
+            app.status_message,
+            "Session deleted — started a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_delete_of_opening_non_active_session_preserves_current_chat() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.chat.messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            content: "keep transcript".to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        });
+        app.opening_session_id = Some("delete-me".to_string());
+        app.deleting_session_id = Some("delete-me".to_string());
+
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "delete-me".to_string(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(app.deleting_session_id.is_none());
+        assert!(app.opening_session_id.is_none());
+        assert_eq!(app.chat.session_id.as_deref(), Some("active"));
+        assert_eq!(app.chat.messages[0].content, "keep transcript");
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "delete-me".to_string(),
+            result: Ok(opened(vec![asst_msg("must stay stale")])),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("active"));
+        assert_eq!(app.chat.messages[0].content, "keep transcript");
+    }
+
+    #[tokio::test]
+    async fn active_session_delete_is_blocked_while_chat_is_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.chat.streaming = true;
+        app.pending_delete = Some(("active".to_string(), "Active".to_string()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+
+        app.handle_delete_confirm_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+
+        assert!(app.pending_delete.is_none());
+        assert!(app.deleting_session_id.is_none());
+        assert!(event_rx.try_recv().is_err());
+        assert!(app.status_message.contains("Stop the active run"));
+    }
+
+    #[tokio::test]
+    async fn enter_keeps_draft_while_active_session_delete_is_in_flight() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.deleting_session_id = Some("active".to_string());
+        for character in "keep me".chars() {
+            app.chat.textarea.input(key(KeyCode::Char(character)));
+        }
+
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+
+        assert_eq!(app.chat.textarea.lines().join("\n"), "keep me");
+        assert!(app.chat.messages.is_empty());
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.status_message,
+            "Session is being deleted — message kept as draft"
+        );
+    }
+
     /// F1/Ctrl+L must not stack the help/notification overlay on top of an
     /// already-open modal — `any_modal_open` gates them so the keystroke
     /// falls through to the modal's own handler instead (a no-op there,
@@ -7087,6 +7307,31 @@ mod question_tests {
         );
         assert!(app.chat.current_response.is_empty(), "scratch state wiped");
         assert!(app.chat.token_usage.is_none(), "scratch state wiped");
+    }
+
+    /// The session picker closes before its asynchronous resume finishes. A
+    /// plain Enter during that gap must keep the composer draft intact instead
+    /// of starting a chat against the previously visible session.
+    #[tokio::test]
+    async fn chat_enter_during_session_resume_preserves_draft_and_does_not_send() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-a".to_string());
+        app.opening_session_id = Some("session-b".to_string());
+        for character in "send after resume".chars() {
+            app.chat.textarea.input(key(KeyCode::Char(character)));
+        }
+
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-a"));
+        assert_eq!(app.opening_session_id.as_deref(), Some("session-b"));
+        assert_eq!(app.chat.textarea.lines().join("\n"), "send after resume");
+        assert!(app.chat.messages.is_empty());
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.status_message,
+            "Session is still resuming — message kept as draft"
+        );
     }
 
     #[tokio::test]
@@ -7822,6 +8067,9 @@ mod question_tests {
     async fn session_opened_failure_notifies_and_leaves_chat_untouched() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("old".to_string());
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
 
         app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
@@ -7836,9 +8084,19 @@ mod question_tests {
             Some("old"),
             "a failed resume must not clobber the current session"
         );
+        assert!(
+            app.opening_session_id.is_none(),
+            "the failed resume must release the send gate"
+        );
         let last = app.notifications.last().expect("failure notified");
         assert!(last.text.contains("not found"));
         assert_eq!(last.level, NoticeLevel::Error);
+        assert!(app.status_message.contains("Failed to open session"));
+
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.chat.streaming, "the retained draft can now be sent");
+        assert_eq!(app.chat.messages.last().unwrap().content, "d");
+        assert!(app.chat.textarea.lines().join("\n").is_empty());
     }
 
     #[tokio::test]
@@ -8797,6 +9055,114 @@ mod question_tests {
         assert!(text.contains("Esc cancel"));
     }
 
+    #[test]
+    fn session_rename_renders_only_the_title_input_cursor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "New title".to_string(),
+            base_title: "Old title".to_string(),
+            draft_dirty: true,
+            metadata_version: Some(1),
+            loading_version: false,
+            submitting: false,
+            error: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_session_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Title:"));
+        assert!(!text.contains("Search:"));
+        assert_eq!(text.matches('▏').count(), 1, "rename has one focused field");
+    }
+
+    #[test]
+    fn session_rename_saving_hides_cursor_and_disabled_shortcuts() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "New title".to_string(),
+            base_title: "Old title".to_string(),
+            draft_dirty: true,
+            metadata_version: Some(1),
+            loading_version: false,
+            submitting: true,
+            error: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_session_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Saving..."));
+        assert!(!text.contains('▏'));
+        assert!(!text.contains("Enter save"));
+        assert!(!text.contains("Ctrl+R"));
+        assert!(!text.contains("Esc"));
+    }
+
+    #[test]
+    fn session_pin_saving_hides_disabled_shortcuts() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Pinning {
+            session_id: "s1".to_string(),
+            target: true,
+            loading_version: false,
+            submitting: true,
+            error: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_session_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Pinning selected session..."));
+        assert!(text.contains("Saving..."));
+        assert!(!text.contains("Ctrl+R"));
+        assert!(!text.contains("Esc"));
+    }
+
     // ── Model picker ──
 
     fn catalog_model(
@@ -9121,6 +9487,69 @@ mod question_tests {
             app.model_picker.is_some(),
             "no models to apply yet — picker stays open"
         );
+    }
+
+    #[tokio::test]
+    async fn model_picker_ctrl_r_refreshes_a_nonempty_catalog_with_no_matches() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.picker_epoch = 1;
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
+        )]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.query = "no-such-model".to_string();
+            picker.refresh_filter(None);
+            assert!(picker.visible.is_empty());
+        }
+
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.epoch, 2, "Ctrl+R must dispatch a catalog reload");
+        assert!(
+            picker
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not attached")),
+            "the test has no event loop, proving reload reached load_model_catalog"
+        );
+    }
+
+    #[test]
+    fn model_picker_no_match_refreshing_hides_the_disabled_retry_shortcut() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
+        )]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.query = "no-such-model".to_string();
+            picker.refresh_filter(None);
+            picker.loading = true;
+        }
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_model_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Refreshing model catalog..."));
+        assert!(text.contains("Esc cancel"));
+        assert!(!text.contains("Ctrl+R"));
     }
 
     /// `Esc` closes the picker without touching `chat.model`.

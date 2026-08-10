@@ -743,14 +743,18 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
     let screen = f.area();
     let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
     let row_width = popup_width.saturating_sub(4);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            " Sessions",
-            Style::default()
-                .fg(colors::BRAND)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
+    let mut lines = vec![Line::from(Span::styled(
+        " Sessions",
+        Style::default()
+            .fg(colors::BRAND)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    // Search owns keyboard focus only in browse mode. Rename has its own
+    // title editor and cursor, while pinning owns all input as an action
+    // state; showing the search cursor in those modes would imply two active
+    // fields even though keystrokes can reach only one of them.
+    if matches!(&picker.mode, SessionPickerMode::Browse) {
+        lines.push(Line::from(vec![
             Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
             Span::styled(
                 format!(
@@ -759,8 +763,8 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                 ),
                 Style::default().fg(colors::BRAND),
             ),
-        ]),
-    ];
+        ]));
+    }
 
     match &picker.mode {
         SessionPickerMode::Browse => {
@@ -862,10 +866,14 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled("  Title: ", Style::default().fg(colors::SUBTLE)),
                 Span::styled(
-                    format!(
-                        "{}▏",
+                    if *submitting {
                         clip_tail_cells(draft, row_width.saturating_sub(12) as usize)
-                    ),
+                    } else {
+                        format!(
+                            "{}▏",
+                            clip_tail_cells(draft, row_width.saturating_sub(12) as usize)
+                        )
+                    },
                     Style::default().fg(colors::BRAND),
                 ),
             ]));
@@ -883,12 +891,14 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                     Style::default().fg(colors::ERROR),
                 )));
             }
-            lines.push(Line::raw(""));
-            lines.push(Line::raw(if row_width < 70 {
-                "  Enter save · Ctrl+R retry · Esc cancel"
-            } else {
-                "  Enter save · Ctrl+R refetch/retry · Esc keep old title"
-            }));
+            if !*submitting {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw(if row_width < 70 {
+                    "  Enter save · Ctrl+R retry · Esc cancel"
+                } else {
+                    "  Enter save · Ctrl+R refetch/retry · Esc keep old title"
+                }));
+            }
         }
         SessionPickerMode::Pinning {
             target,
@@ -917,8 +927,10 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                     Style::default().fg(colors::ERROR),
                 )));
             }
-            lines.push(Line::raw(""));
-            lines.push(Line::raw("  Ctrl+R refetch/retry · Esc cancel"));
+            if !*submitting {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw("  Ctrl+R refetch/retry · Esc cancel"));
+            }
         }
     }
 
@@ -974,6 +986,10 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
         body.push(Line::raw("  Loading models..."));
         body.push(Line::raw(""));
         body.push(Line::raw("  Esc cancel"));
+    } else if picker.loading && picker.visible.is_empty() {
+        body.push(Line::raw("  Refreshing model catalog..."));
+        body.push(Line::raw(""));
+        body.push(Line::raw("  Esc cancel"));
     } else if picker.visible.is_empty() {
         body.push(Line::raw(if picker.query.is_empty() {
             "  No models available"
@@ -981,7 +997,11 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             "  No models match this search"
         }));
         body.push(Line::raw(""));
-        body.push(Line::raw("  Edit search · Ctrl+R retry load · Esc cancel"));
+        body.push(Line::raw(if picker.models.is_empty() {
+            "  Edit search · Ctrl+R retry load · Esc cancel"
+        } else {
+            "  Edit search · Ctrl+U clear · Ctrl+R refresh · Esc cancel"
+        }));
     } else {
         let max_h = screen.height.min(22);
         let total = picker.visible.len();
