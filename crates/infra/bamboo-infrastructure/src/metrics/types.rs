@@ -289,6 +289,31 @@ pub struct MetricsDateFilter {
     pub end_date: Option<NaiveDate>,
 }
 
+/// Date and model filter for model-aware aggregate metrics queries.
+///
+/// This is intentionally separate from [`MetricsDateFilter`] so adding model
+/// filtering does not break downstream code that constructs the original
+/// public type with a complete struct literal.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ModelMetricsDateFilter {
+    /// Start date (inclusive)
+    pub start_date: Option<NaiveDate>,
+    /// End date (inclusive)
+    pub end_date: Option<NaiveDate>,
+    /// Filter by model name. Blank values are treated as no filter.
+    pub model: Option<String>,
+}
+
+impl From<MetricsDateFilter> for ModelMetricsDateFilter {
+    fn from(filter: MetricsDateFilter) -> Self {
+        Self {
+            start_date: filter.start_date,
+            end_date: filter.end_date,
+            model: None,
+        }
+    }
+}
+
 /// Filter for session metrics queries
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SessionMetricsFilter {
@@ -531,6 +556,17 @@ mod tests {
         let filter = MetricsDateFilter::default();
         assert!(filter.start_date.is_none());
         assert!(filter.end_date.is_none());
+    }
+
+    #[test]
+    fn model_metrics_date_filter_from_legacy_filter_defaults_to_all_models() {
+        let legacy = MetricsDateFilter {
+            start_date: None,
+            end_date: None,
+        };
+        let filter = ModelMetricsDateFilter::from(legacy);
+
+        assert!(filter.model.is_none());
     }
 
     #[test]

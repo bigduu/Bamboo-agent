@@ -91,8 +91,8 @@ use thiserror::Error;
 use crate::metrics::types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, MetricsSummary,
-    ModelMetrics, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter,
-    SessionStatus, TokenUsage, ToolCallMetrics,
+    ModelMetrics, ModelMetricsDateFilter, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics,
+    SessionMetricsFilter, SessionStatus, TokenUsage, ToolCallMetrics,
 };
 
 /// Result type for metrics storage operations.
@@ -543,6 +543,43 @@ pub trait MetricsStorage: Send + Sync {
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>>;
 
+    /// Retrieves daily forwarded-request metrics restricted to one model.
+    /// Blank model values have the same meaning as omission.
+    async fn forward_daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        if normalize_filter_value(model).is_none() {
+            self.forward_daily_metrics(days, end_date).await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered forward daily metrics are not supported by this storage"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Retrieves daily forwarded-request metrics using the same endpoint/model
+    /// semantics as the other forward metrics queries.
+    async fn forward_daily_metrics_filtered(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        endpoint: Option<String>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        if normalize_filter_value(endpoint).is_some() {
+            return Err(MetricsError::InvalidData(
+                "endpoint-filtered forward daily metrics are not supported by this storage"
+                    .to_string(),
+            ));
+        }
+        self.forward_daily_metrics_for_model(days, end_date, model)
+            .await
+    }
+
     /// Retrieves aggregated summary statistics for chat sessions.
     ///
     /// Session/status counts are filtered by session start. Token/cache/
@@ -570,6 +607,33 @@ pub trait MetricsStorage: Send + Sync {
     /// ```
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary>;
 
+    /// Retrieves aggregate chat metrics with an optional model restriction.
+    ///
+    /// The default preserves compatibility for existing storage
+    /// implementations when no model is selected. Implementations that support
+    /// model filtering should override this method.
+    async fn summary_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<MetricsSummary> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        if normalize_filter_value(model).is_none() {
+            self.summary(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered summary metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
+
     /// Retrieves metrics grouped by AI model.
     ///
     /// Session counts use the session row's model and start date. Rounds and
@@ -594,6 +658,33 @@ pub trait MetricsStorage: Send + Sync {
     /// }
     /// ```
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>>;
+
+    /// Retrieves grouped model metrics with an optional model restriction.
+    ///
+    /// The default preserves compatibility for existing storage
+    /// implementations when no model is selected. Implementations that support
+    /// model filtering should override this method.
+    async fn by_model_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<Vec<ModelMetrics>> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        if normalize_filter_value(model).is_none() {
+            self.by_model(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered grouped metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
 
     /// Retrieves session metrics with filtering and pagination.
     ///
@@ -696,6 +787,24 @@ pub trait MetricsStorage: Send + Sync {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>>;
+
+    /// Retrieves daily chat metrics restricted to one model. Session/status
+    /// dimensions use the session model, while round/cache/token dimensions
+    /// and tool calls use the owning round model. Blank values mean all models.
+    async fn daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        if normalize_filter_value(model).is_none() {
+            self.daily_metrics(days, end_date).await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered daily metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
 
     /// Deletes old round records before a cutoff date.
     ///
@@ -1629,12 +1738,43 @@ impl MetricsStorage for SqliteMetricsStorage {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>> {
+        self.forward_daily_metrics_filtered(days, end_date, None, None)
+            .await
+    }
+
+    async fn forward_daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        self.forward_daily_metrics_filtered(days, end_date, None, model)
+            .await
+    }
+
+    async fn forward_daily_metrics_filtered(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        endpoint: Option<String>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
         let end_date = end_date.unwrap_or_else(|| Utc::now().date_naive());
         let span = days.max(1) - 1;
         let start_date = end_date - chrono::Duration::days(i64::from(span));
+        let endpoint = normalize_filter_value(endpoint);
+        let model = normalize_filter_value(model);
 
         self.with_connection(move |connection| {
-            let mut stmt = connection.prepare(
+            let mut params_vec = Vec::new();
+            let where_clause = build_forward_where_clause(
+                Some(start_date),
+                Some(end_date),
+                endpoint.as_deref(),
+                model.as_deref(),
+                &mut params_vec,
+            );
+            let sql = format!(
                 r#"
                 SELECT
                     date(started_at) AS date_key,
@@ -1643,13 +1783,15 @@ impl MetricsStorage for SqliteMetricsStorage {
                     COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens
                 FROM forward_request_metrics
-                WHERE started_at >= ?1 AND started_at < ?2
+                {}
                 GROUP BY date_key
                 ORDER BY date_key ASC
                 "#,
-            )?;
+                where_clause
+            );
+            let mut stmt = connection.prepare(&sql)?;
 
-            let mut rows = stmt.query(params![start_date.to_string(), next_day_bound(end_date)])?;
+            let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
             let mut result = Vec::new();
 
             while let Some(row) = rows.next()? {
@@ -1677,15 +1819,29 @@ impl MetricsStorage for SqliteMetricsStorage {
     }
 
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary> {
+        self.summary_filtered(filter.into()).await
+    }
+
+    async fn summary_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<MetricsSummary> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        let model = normalize_filter_value(model);
         self.with_connection(move |connection| {
             // Lifecycle dimensions belong to the session start date. Do not
             // infer status/counts from rounds: a session may have no rounds, or
             // may continue producing rounds on later days.
             let mut session_params = Vec::new();
-            let session_clause = build_session_where_clause(
-                filter.start_date,
-                filter.end_date,
+            let session_clause = build_session_model_where_clause(
+                start_date,
+                end_date,
                 None,
+                model.as_deref(),
                 &mut session_params,
             );
             let session_sql = format!(
@@ -1712,10 +1868,12 @@ impl MetricsStorage for SqliteMetricsStorage {
             // the billed model turn began; nullable `completed_at` is therefore
             // intentionally not used as the attribution key.
             let mut round_params = Vec::new();
-            let round_clause = build_started_at_where_clause(
+            let round_clause = build_started_at_model_where_clause(
                 "started_at",
-                filter.start_date,
-                filter.end_date,
+                "model",
+                start_date,
+                end_date,
+                model.as_deref(),
                 &mut round_params,
             );
             let round_sql = format!(
@@ -1739,13 +1897,31 @@ impl MetricsStorage for SqliteMetricsStorage {
             )?;
 
             let mut tool_params = Vec::new();
-            let tool_clause = build_started_at_where_clause(
-                "started_at",
-                filter.start_date,
-                filter.end_date,
-                &mut tool_params,
-            );
-            let tool_sql = format!("SELECT COUNT(*) FROM tool_call_metrics {}", tool_clause);
+            let tool_clause = if model.is_some() {
+                build_started_at_model_where_clause(
+                    "tool_call_metrics.started_at",
+                    "round_metrics.model",
+                    start_date,
+                    end_date,
+                    model.as_deref(),
+                    &mut tool_params,
+                )
+            } else {
+                build_started_at_where_clause(
+                    "started_at",
+                    start_date,
+                    end_date,
+                    &mut tool_params,
+                )
+            };
+            let tool_sql = if model.is_some() {
+                format!(
+                    "SELECT COUNT(*) FROM tool_call_metrics JOIN round_metrics ON round_metrics.round_id = tool_call_metrics.round_id {}",
+                    tool_clause
+                )
+            } else {
+                format!("SELECT COUNT(*) FROM tool_call_metrics {}", tool_clause)
+            };
             let total_tool_calls = connection.query_row(
                 &tool_sql,
                 params_from_iter(tool_params.iter()),
@@ -1774,26 +1950,30 @@ impl MetricsStorage for SqliteMetricsStorage {
                 sync_mismatch_breakdown: HashMap::new(),
             };
 
-            let mut mismatch_params = Vec::new();
-            let mismatch_clause = build_execute_sync_mismatch_where_clause(
-                filter.start_date,
-                filter.end_date,
-                None,
-                &mut mismatch_params,
-            );
-            let mismatch_sql = format!(
-                "SELECT COALESCE(SUM(count), 0) FROM execute_sync_mismatch_metrics {}",
-                mismatch_clause
-            );
-            let mut mismatch_stmt = connection.prepare(&mismatch_sql)?;
-            summary.total_sync_mismatches = mismatch_stmt
-                .query_row(params_from_iter(mismatch_params.iter()), |row| row.get::<_, i64>(0))?
-                as u64;
-            summary.sync_mismatch_breakdown = load_execute_sync_mismatch_breakdown(
-                connection,
-                filter.start_date,
-                filter.end_date,
-            )?;
+            // Sync-mismatch rows currently have no model column or stable
+            // session/round key. Returning their all-model total in a filtered
+            // summary would mix populations, so filtered summaries explicitly
+            // leave this non-attributable dimension at zero.
+            if model.is_none() {
+                let mut mismatch_params = Vec::new();
+                let mismatch_clause = build_execute_sync_mismatch_where_clause(
+                    start_date,
+                    end_date,
+                    None,
+                    &mut mismatch_params,
+                );
+                let mismatch_sql = format!(
+                    "SELECT COALESCE(SUM(count), 0) FROM execute_sync_mismatch_metrics {}",
+                    mismatch_clause
+                );
+                let mut mismatch_stmt = connection.prepare(&mismatch_sql)?;
+                summary.total_sync_mismatches = mismatch_stmt
+                    .query_row(params_from_iter(mismatch_params.iter()), |row| {
+                        row.get::<_, i64>(0)
+                    })? as u64;
+                summary.sync_mismatch_breakdown =
+                    load_execute_sync_mismatch_breakdown(connection, start_date, end_date)?;
+            }
 
             Ok(summary)
         })
@@ -1801,15 +1981,29 @@ impl MetricsStorage for SqliteMetricsStorage {
     }
 
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>> {
+        self.by_model_filtered(filter.into()).await
+    }
+
+    async fn by_model_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<Vec<ModelMetrics>> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        let model = normalize_filter_value(model);
         self.with_connection(move |connection| {
             let mut models: HashMap<String, ModelMetrics> = HashMap::new();
 
             // Session counts retain the session row's model/start semantics.
             let mut session_params = Vec::new();
-            let session_clause = build_session_where_clause(
-                filter.start_date,
-                filter.end_date,
+            let session_clause = build_session_model_where_clause(
+                start_date,
+                end_date,
                 None,
+                model.as_deref(),
                 &mut session_params,
             );
             let session_sql = format!(
@@ -1831,10 +2025,12 @@ impl MetricsStorage for SqliteMetricsStorage {
             // Round count, token usage and cache values follow each round's own
             // model and occurrence date, not the session's current model.
             let mut round_params = Vec::new();
-            let round_clause = build_started_at_where_clause(
+            let round_clause = build_started_at_model_where_clause(
                 "started_at",
-                filter.start_date,
-                filter.end_date,
+                "model",
+                start_date,
+                end_date,
+                model.as_deref(),
                 &mut round_params,
             );
             let round_sql = format!(
@@ -1862,10 +2058,12 @@ impl MetricsStorage for SqliteMetricsStorage {
             // A tool call has no model column, so attribute it through its
             // owning round while retaining the tool call's own occurrence date.
             let mut tool_params = Vec::new();
-            let tool_clause = build_started_at_where_clause(
+            let tool_clause = build_started_at_model_where_clause(
                 "tool_call_metrics.started_at",
-                filter.start_date,
-                filter.end_date,
+                "round_metrics.model",
+                start_date,
+                end_date,
+                model.as_deref(),
                 &mut tool_params,
             );
             let tool_sql = format!(
@@ -1899,6 +2097,7 @@ impl MetricsStorage for SqliteMetricsStorage {
 
     async fn sessions(&self, filter: SessionMetricsFilter) -> MetricsResult<Vec<SessionMetrics>> {
         self.with_connection(move |connection| {
+            let model = normalize_filter_value(filter.model);
             let mut params_vec = Vec::new();
             let where_clause = build_session_where_clause(
                 filter.start_date,
@@ -1911,7 +2110,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             } else {
                 vec![where_clause.replacen("WHERE ", "", 1)]
             };
-            if let Some(model) = filter.model {
+            if let Some(model) = model {
                 conditions.push("model = ?".to_string());
                 params_vec.push(model);
             }
@@ -2082,21 +2281,40 @@ impl MetricsStorage for SqliteMetricsStorage {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>> {
+        self.daily_metrics_for_model(days, end_date, None).await
+    }
+
+    async fn daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
         let end_date = end_date.unwrap_or_else(|| Utc::now().date_naive());
         let span = days.max(1) - 1;
         let start_date = end_date - chrono::Duration::days(i64::from(span));
+        let model = normalize_filter_value(model);
 
         self.with_connection(move |connection| {
             let start_bound = start_date.to_string();
             let end_bound = next_day_bound(end_date);
 
             let mut sessions_by_day =
-                load_session_counts_by_day(connection, &start_bound, &end_bound)?;
-            let mut rounds_by_day =
-                load_round_aggregates_by_day(connection, &start_bound, &end_bound)?;
-            let mut model_by_day =
-                load_model_breakdown_by_day(connection, &start_bound, &end_bound)?;
-            let mut tool_by_day = load_tool_breakdown_by_day(connection, &start_bound, &end_bound)?;
+                load_session_counts_by_day(connection, &start_bound, &end_bound, model.as_deref())?;
+            let mut rounds_by_day = load_round_aggregates_by_day(
+                connection,
+                &start_bound,
+                &end_bound,
+                model.as_deref(),
+            )?;
+            let mut model_by_day = load_model_breakdown_by_day(
+                connection,
+                &start_bound,
+                &end_bound,
+                model.as_deref(),
+            )?;
+            let mut tool_by_day =
+                load_tool_breakdown_by_day(connection, &start_bound, &end_bound, model.as_deref())?;
 
             // A continuation day may have rounds or tools but no new session.
             // Build the output keyset from all three occurrence dimensions so
@@ -2356,6 +2574,12 @@ fn next_day_bound(end: NaiveDate) -> String {
     end.succ_opt().unwrap_or(end).to_string()
 }
 
+fn normalize_filter_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Builds a half-open UTC date range over an internal `started_at` column.
 ///
 /// Round attribution deliberately uses `round_metrics.started_at`: it is the
@@ -2385,6 +2609,27 @@ fn build_started_at_where_clause(
     } else {
         format!("WHERE {}", conditions.join(" AND "))
     }
+}
+
+fn build_started_at_model_where_clause(
+    started_at_column: &'static str,
+    model_column: &'static str,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    model: Option<&str>,
+    params_vec: &mut Vec<String>,
+) -> String {
+    let mut where_clause =
+        build_started_at_where_clause(started_at_column, start_date, end_date, params_vec);
+    if let Some(model) = model {
+        if where_clause.is_empty() {
+            where_clause = format!("WHERE {model_column} = ?");
+        } else {
+            where_clause.push_str(&format!(" AND {model_column} = ?"));
+        }
+        params_vec.push(model.to_string());
+    }
+    where_clause
 }
 
 fn build_session_where_clause(
@@ -2418,6 +2663,26 @@ fn build_session_where_clause(
     } else {
         format!("WHERE {}", conditions.join(" AND "))
     }
+}
+
+fn build_session_model_where_clause(
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    required_status: Option<&str>,
+    model: Option<&str>,
+    params_vec: &mut Vec<String>,
+) -> String {
+    let mut where_clause =
+        build_session_where_clause(start_date, end_date, required_status, params_vec);
+    if let Some(model) = model {
+        if where_clause.is_empty() {
+            where_clause = "WHERE model = ?".to_string();
+        } else {
+            where_clause.push_str(" AND model = ?");
+        }
+        params_vec.push(model.to_string());
+    }
+    where_clause
 }
 
 fn empty_model_metrics(model: String) -> ModelMetrics {
@@ -2954,16 +3219,28 @@ fn load_session_counts_by_day(
     connection: &Connection,
     start_bound: &str,
     end_bound: &str,
+    model: Option<&str>,
 ) -> MetricsResult<HashMap<NaiveDate, u32>> {
-    let mut stmt = connection.prepare(
+    let model_clause = if model.is_some() {
+        " AND model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
         r#"
         SELECT date(started_at) AS date_key, COUNT(*)
         FROM session_metrics
-        WHERE started_at >= ?1 AND started_at < ?2
+        WHERE started_at >= ?1 AND started_at < ?2{}
         GROUP BY date_key
         "#,
-    )?;
-    let mut rows = stmt.query(params![start_bound, end_bound])?;
+        model_clause
+    );
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
     let mut by_day = HashMap::new();
 
     while let Some(row) = rows.next()? {
@@ -2983,8 +3260,14 @@ fn load_round_aggregates_by_day(
     connection: &Connection,
     start_bound: &str,
     end_bound: &str,
+    model: Option<&str>,
 ) -> MetricsResult<HashMap<NaiveDate, DailyRoundAggregate>> {
-    let mut stmt = connection.prepare(
+    let model_clause = if model.is_some() {
+        " AND model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
         r#"
         SELECT date(started_at) AS date_key,
                COUNT(*),
@@ -2993,11 +3276,17 @@ fn load_round_aggregates_by_day(
                COALESCE(SUM(total_tokens), 0),
                COALESCE(SUM(prompt_cached_tool_outputs), 0)
         FROM round_metrics
-        WHERE started_at >= ?1 AND started_at < ?2
+        WHERE started_at >= ?1 AND started_at < ?2{}
         GROUP BY date_key
         "#,
-    )?;
-    let mut rows = stmt.query(params![start_bound, end_bound])?;
+        model_clause
+    );
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
     let mut by_day = HashMap::new();
 
     while let Some(row) = rows.next()? {
@@ -3036,8 +3325,14 @@ fn load_model_breakdown_by_day(
     connection: &Connection,
     start_bound: &str,
     end_bound: &str,
+    model: Option<&str>,
 ) -> MetricsResult<HashMap<NaiveDate, HashMap<String, TokenUsage>>> {
-    let mut stmt = connection.prepare(
+    let model_clause = if model.is_some() {
+        " AND model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
         r#"
         SELECT date(started_at) AS date_key,
                model,
@@ -3045,12 +3340,18 @@ fn load_model_breakdown_by_day(
                COALESCE(SUM(completion_tokens), 0),
                COALESCE(SUM(total_tokens), 0)
         FROM round_metrics
-        WHERE started_at >= ?1 AND started_at < ?2
+        WHERE started_at >= ?1 AND started_at < ?2{}
         GROUP BY date_key, model
         "#,
-    )?;
+        model_clause
+    );
 
-    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
     let mut by_day: HashMap<NaiveDate, HashMap<String, TokenUsage>> = HashMap::new();
 
     while let Some(row) = rows.next()? {
@@ -3084,17 +3385,30 @@ fn load_tool_breakdown_by_day(
     connection: &Connection,
     start_bound: &str,
     end_bound: &str,
+    model: Option<&str>,
 ) -> MetricsResult<HashMap<NaiveDate, HashMap<String, u32>>> {
-    let mut stmt = connection.prepare(
+    let model_clause = if model.is_some() {
+        " AND round_metrics.model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
         r#"
-        SELECT date(started_at) AS date_key, tool_name, COUNT(*)
+        SELECT date(tool_call_metrics.started_at) AS date_key, tool_call_metrics.tool_name, COUNT(*)
         FROM tool_call_metrics
-        WHERE started_at >= ?1 AND started_at < ?2
+        JOIN round_metrics ON round_metrics.round_id = tool_call_metrics.round_id
+        WHERE tool_call_metrics.started_at >= ?1 AND tool_call_metrics.started_at < ?2{}
         GROUP BY date_key, tool_name
         "#,
-    )?;
+        model_clause
+    );
 
-    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
     let mut by_day: HashMap<NaiveDate, HashMap<String, u32>> = HashMap::new();
 
     while let Some(row) = rows.next()? {
@@ -3140,8 +3454,8 @@ mod tests {
 
     use super::{MetricsStorage, SqliteMetricsStorage, ToolCallCompletion};
     use crate::metrics::types::{
-        ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, RoundStatus,
-        SessionMetricsFilter, SessionStatus, TokenUsage,
+        ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter,
+        ModelMetricsDateFilter, RoundStatus, SessionMetricsFilter, SessionStatus, TokenUsage,
     };
 
     #[test]
@@ -3817,6 +4131,206 @@ mod tests {
             row.tool_breakdown,
             HashMap::from([(String::from("write_file"), 1)])
         );
+    }
+
+    #[tokio::test]
+    async fn model_filter_scopes_summary_by_model_and_daily_across_all_dimensions() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+        let now = Utc
+            .with_ymd_and_hms(2026, 2, 10, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        for (suffix, model, tool, tokens, cached, status) in [
+            ("a", "model-a", "Read", 10, 2, SessionStatus::Completed),
+            ("b", "model-b", "Write", 20, 4, SessionStatus::Error),
+        ] {
+            let session_id = format!("filtered-session-{suffix}");
+            let round_id = format!("filtered-round-{suffix}");
+            let tool_id = format!("filtered-tool-{suffix}");
+            storage
+                .upsert_session_start(&session_id, model, now)
+                .await
+                .expect("session start");
+            storage
+                .insert_round_start(&round_id, &session_id, model, now)
+                .await
+                .expect("round start");
+            storage
+                .insert_tool_start(&tool_id, &round_id, &session_id, tool, now)
+                .await
+                .expect("tool start");
+            storage
+                .complete_round(
+                    &round_id,
+                    now,
+                    RoundStatus::Success,
+                    TokenUsage {
+                        prompt_tokens: tokens,
+                        completion_tokens: 0,
+                        total_tokens: tokens,
+                    },
+                    cached,
+                    cached,
+                    None,
+                )
+                .await
+                .expect("round completion");
+            storage
+                .record_round_compression(&round_id, now, if model == "model-a" { 3 } else { 7 })
+                .await
+                .expect("round compression");
+            storage
+                .complete_session(&session_id, status, now)
+                .await
+                .expect("session completion");
+        }
+        storage
+            .increment_execute_sync_mismatch("global-only", now)
+            .await
+            .expect("sync mismatch");
+
+        let selected = ModelMetricsDateFilter {
+            model: Some("model-a".to_string()),
+            ..ModelMetricsDateFilter::default()
+        };
+        let summary = storage
+            .summary_filtered(selected.clone())
+            .await
+            .expect("filtered summary");
+        assert_eq!(summary.total_sessions, 1);
+        assert_eq!(summary.completed_sessions, 1);
+        assert_eq!(summary.error_sessions, 0);
+        assert_eq!(summary.total_tokens.total_tokens, 10);
+        assert_eq!(summary.total_tool_calls, 1);
+        assert_eq!(summary.prompt_cached_tool_outputs, 2);
+        assert_eq!(summary.tool_context_tokens_saved, 2);
+        assert_eq!(summary.total_compression_events, 1);
+        assert_eq!(summary.total_tokens_saved, 5);
+        assert_eq!(summary.non_tool_compression_tokens_saved, 3);
+        assert_eq!(summary.total_sync_mismatches, 0);
+        assert!(summary.sync_mismatch_breakdown.is_empty());
+
+        let by_model = storage
+            .by_model_filtered(selected)
+            .await
+            .expect("filtered by-model");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].model, "model-a");
+        assert_eq!(by_model[0].sessions, 1);
+        assert_eq!(by_model[0].rounds, 1);
+        assert_eq!(by_model[0].tool_calls, 1);
+        assert_eq!(by_model[0].tokens.total_tokens, 10);
+
+        let cleared_by_model = storage
+            .by_model_filtered(ModelMetricsDateFilter {
+                model: Some("\t".to_string()),
+                ..ModelMetricsDateFilter::default()
+            })
+            .await
+            .expect("blank model restores all-model by-model metrics");
+        assert_eq!(cleared_by_model.len(), 2);
+        assert!(cleared_by_model.iter().any(|row| row.model == "model-a"));
+        assert!(cleared_by_model.iter().any(|row| row.model == "model-b"));
+
+        let daily = storage
+            .daily_metrics_for_model(1, Some(now.date_naive()), Some("model-a".to_string()))
+            .await
+            .expect("filtered daily");
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].total_sessions, 1);
+        assert_eq!(daily[0].total_rounds, 1);
+        assert_eq!(daily[0].total_tool_calls, 1);
+        assert_eq!(daily[0].total_token_usage.total_tokens, 10);
+        assert_eq!(
+            daily[0].tool_breakdown,
+            HashMap::from([("Read".to_string(), 1)])
+        );
+        assert_eq!(daily[0].model_breakdown.len(), 1);
+        assert!(daily[0].model_breakdown.contains_key("model-a"));
+
+        let cleared = storage
+            .summary_filtered(ModelMetricsDateFilter {
+                model: Some("   ".to_string()),
+                ..ModelMetricsDateFilter::default()
+            })
+            .await
+            .expect("blank model restores all-model summary");
+        assert_eq!(cleared.total_sessions, 2);
+        assert_eq!(cleared.total_tokens.total_tokens, 30);
+        assert_eq!(cleared.total_tool_calls, 2);
+        assert_eq!(cleared.total_sync_mismatches, 1);
+
+        let cleared_daily = storage
+            .daily_metrics_for_model(1, Some(now.date_naive()), Some(" ".to_string()))
+            .await
+            .expect("blank model restores all-model daily");
+        assert_eq!(cleared_daily[0].total_sessions, 2);
+        assert_eq!(cleared_daily[0].total_rounds, 2);
+        assert_eq!(cleared_daily[0].total_tool_calls, 2);
+        assert_eq!(cleared_daily[0].total_token_usage.total_tokens, 30);
+        assert_eq!(cleared_daily[0].model_breakdown.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn forward_daily_model_filter_matches_forward_summary_scope() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+        let now = Utc
+            .with_ymd_and_hms(2026, 2, 10, 13, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        for (suffix, model, tokens) in [("a", "model-a", 5), ("b", "model-b", 9)] {
+            let id = format!("forward-filtered-{suffix}");
+            storage
+                .insert_forward_start(&id, "openai.responses", model, false, now)
+                .await
+                .expect("forward start");
+            storage
+                .complete_forward(
+                    &id,
+                    now,
+                    Some(200),
+                    ForwardStatus::Success,
+                    Some(TokenUsage {
+                        prompt_tokens: tokens,
+                        completion_tokens: 0,
+                        total_tokens: tokens,
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .expect("forward completion");
+        }
+
+        let selected_summary = storage
+            .forward_summary(ForwardMetricsFilter {
+                model: Some("model-a".to_string()),
+                ..ForwardMetricsFilter::default()
+            })
+            .await
+            .expect("filtered forward summary");
+        let selected_daily = storage
+            .forward_daily_metrics_for_model(1, Some(now.date_naive()), Some("model-a".to_string()))
+            .await
+            .expect("filtered forward daily");
+        assert_eq!(selected_summary.total_requests, 1);
+        assert_eq!(selected_summary.total_tokens.total_tokens, 5);
+        assert_eq!(selected_daily.len(), 1);
+        assert_eq!(selected_daily[0].total_sessions, 1);
+        assert_eq!(selected_daily[0].total_token_usage.total_tokens, 5);
+
+        let cleared = storage
+            .forward_daily_metrics_for_model(1, Some(now.date_naive()), Some("  ".to_string()))
+            .await
+            .expect("blank forward model restores all-model daily");
+        assert_eq!(cleared[0].total_sessions, 2);
+        assert_eq!(cleared[0].total_token_usage.total_tokens, 14);
     }
 
     #[tokio::test]

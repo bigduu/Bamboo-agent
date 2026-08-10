@@ -1,9 +1,12 @@
 use chrono::NaiveDate;
 
-use super::super::{ForwardMetricsQuery, MetricsSessionsQuery};
+use super::super::{
+    ForwardMetricsQuery, MetricsDailyQuery, MetricsSessionsQuery, MetricsSummaryQuery,
+};
 use super::filters::{
-    build_forward_filter, build_forward_grouped_filter, build_sessions_filter, normalize_days,
-    resolve_timeline_granularity, TimelineGranularity,
+    build_chat_timeline_filter, build_forward_filter, build_forward_grouped_filter,
+    build_sessions_filter, build_summary_filter, normalize_days, resolve_timeline_granularity,
+    TimelineGranularity,
 };
 
 #[test]
@@ -48,6 +51,25 @@ fn build_sessions_filter_copies_query_fields() {
     assert_eq!(filter.end_date, query.end_date);
     assert_eq!(filter.model, query.model);
     assert_eq!(filter.limit, query.limit);
+}
+
+#[test]
+fn chat_summary_and_timeline_filters_trim_model_and_clear_blank_values() {
+    let summary = build_summary_filter(&MetricsSummaryQuery {
+        start_date: Some(NaiveDate::from_ymd_opt(2026, 3, 1).expect("date")),
+        end_date: Some(NaiveDate::from_ymd_opt(2026, 3, 31).expect("date")),
+        model: Some("  gpt-5  ".to_string()),
+    });
+    assert_eq!(summary.model.as_deref(), Some("gpt-5"));
+
+    let timeline = build_chat_timeline_filter(&MetricsDailyQuery {
+        days: Some(14),
+        end_date: Some(NaiveDate::from_ymd_opt(2026, 3, 31).expect("date")),
+        model: Some("   ".to_string()),
+        granularity: Some("weekly".to_string()),
+    });
+    assert_eq!(timeline.days, 14);
+    assert_eq!(timeline.model, None);
 }
 
 #[test]

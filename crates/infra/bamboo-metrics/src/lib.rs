@@ -24,7 +24,7 @@ pub use storage::{MetricsError, MetricsResult, MetricsStorage, SqliteMetricsStor
 pub use types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, MetricsSummary,
-    ModelMetrics, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter,
-    SessionStatus, TokenUsage, ToolCallMetrics,
+    ModelMetrics, ModelMetricsDateFilter, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics,
+    SessionMetricsFilter, SessionStatus, TokenUsage, ToolCallMetrics,
 };
 pub use worker::MetricsWorker;
