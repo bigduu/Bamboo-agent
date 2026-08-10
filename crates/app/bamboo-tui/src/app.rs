@@ -2016,15 +2016,27 @@ impl App {
                 // failed (server down/unreachable), the operator must regain
                 // control of the input instead of being stuck waiting for a
                 // terminal SSE event that a dead server will never send.
+                // If a Cancelled/Complete SSE won the race and already
+                // finalized this turn, do not manufacture a second terminal-
+                // only turn when the HTTP stop response arrives afterward.
                 // `finalize_streaming` resets `status_message` to "Ready"
                 // internally, so the outcome-specific message is set AFTER it
                 // (same ordering the old synchronous `stop_streaming` used to
                 // get "Stopped" to stick instead of being overwritten).
-                self.chat.current_terminal_status = Some(match &r {
-                    Ok(()) => "stopped".to_string(),
-                    Err(error) => format!("stop failed: {error}"),
-                });
-                self.finalize_streaming();
+                let has_unflushed_turn = self.chat.streaming
+                    || self.chat.current_turn_id.is_some()
+                    || !self.chat.current_response.is_empty()
+                    || !self.chat.current_tool_calls.is_empty()
+                    || !self.chat.current_reasoning.is_empty()
+                    || !self.chat.sub_agents.is_empty()
+                    || self.chat.current_terminal_status.is_some();
+                if has_unflushed_turn {
+                    self.chat.current_terminal_status = Some(match &r {
+                        Ok(()) => "stopped".to_string(),
+                        Err(error) => format!("stop failed: {error}"),
+                    });
+                    self.finalize_streaming();
+                }
                 match r {
                     Ok(()) => self.status_message = "Stopped".to_string(),
                     Err(e) => self.notify(NoticeLevel::Error, format!("Stop failed: {e}")),
@@ -9983,6 +9995,34 @@ mod question_tests {
             .unwrap();
 
         assert!(!app.chat.streaming);
+        assert_eq!(app.status_message, "Stopped");
+    }
+
+    #[tokio::test]
+    async fn cancelled_sse_before_stop_response_does_not_append_a_second_terminal_turn() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("live:assistant:stop".to_string());
+
+        app.handle_sse_event(AgentEvent::Cancelled {
+            message: Some("cancelled by operator".to_string()),
+        })
+        .unwrap();
+        assert_eq!(app.chat.messages.len(), 1);
+
+        app.handle_event(AppEvent::StopFinished(Ok(())))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            app.chat.messages.len(),
+            1,
+            "the HTTP response must not create a second terminal-only turn"
+        );
+        assert_eq!(
+            app.chat.messages[0].terminal_status.as_deref(),
+            Some("cancelled by operator")
+        );
         assert_eq!(app.status_message, "Stopped");
     }
 
