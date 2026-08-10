@@ -13,6 +13,7 @@ use ratatui::Terminal;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthChar;
 
 use crate::api::sse::{SessionSseEvent, SseStream};
 use crate::api::types::*;
@@ -89,8 +90,27 @@ pub struct ToolCallDisplay {
     pub tool_name: String,
     pub arguments: String,
     pub result: Option<String>,
+    /// Incremental output received through `ToolToken` before the terminal
+    /// result arrives. It belongs to this tool id and must never be mixed into
+    /// assistant markdown.
+    pub stream_output: String,
     pub error: Option<String>,
     pub phase: String,
+}
+
+impl ToolCallDisplay {
+    pub(crate) fn display_output(&self) -> &str {
+        if self.phase == "complete" {
+            self.result
+                .as_deref()
+                .filter(|result| !result.is_empty())
+                .unwrap_or(&self.stream_output)
+        } else if !self.stream_output.is_empty() {
+            &self.stream_output
+        } else {
+            self.result.as_deref().unwrap_or_default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,19 +119,172 @@ pub struct SubAgentDisplay {
     pub title: Option<String>,
     /// "running" | "completed" | "cancelled" | "error" | "skipped".
     pub status: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    /// Stable history message id, or a deterministic in-memory id for a live
+    /// turn. Block ids are derived from this plus tool/child ids.
+    pub id: String,
     pub role: MessageRole,
     pub content: String,
     pub tool_calls: Vec<ToolCallDisplay>,
     pub reasoning: Option<String>,
+    pub sub_agents: Vec<SubAgentDisplay>,
+    pub terminal_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationBlockUiState {
+    pub expanded: bool,
+    /// First visible detail line for bounded tool/reasoning inspectors.
+    pub scroll: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationBlockLineRange {
+    pub id: String,
+    pub start: u16,
+    pub end: u16,
+}
+
+/// Structured rendering shape shared by resumed history and live streaming.
+/// The payloads borrow the authoritative transcript state; the owned `id` is
+/// the stable key used for focus/expansion/inspector scroll state.
+#[derive(Debug)]
+pub struct ConversationBlock<'a> {
+    pub id: String,
+    pub kind: ConversationBlockKind<'a>,
+}
+
+#[derive(Debug)]
+pub enum ConversationBlockKind<'a> {
+    UserMessage(&'a str),
+    AssistantMarkdown {
+        content: &'a str,
+        streaming: bool,
+    },
+    Reasoning {
+        content: &'a str,
+        streaming: bool,
+    },
+    ToolCall {
+        tool: &'a ToolCallDisplay,
+        streaming: bool,
+    },
+    SubAgent {
+        child: &'a SubAgentDisplay,
+        streaming: bool,
+    },
+    Question {
+        question: &'a str,
+        source: Option<&'a str>,
+        submitting: bool,
+        dismissed: bool,
+    },
+    TerminalStatus(&'a str),
+}
+
+impl ConversationBlock<'_> {
+    fn expandable(&self) -> bool {
+        matches!(
+            self.kind,
+            ConversationBlockKind::Reasoning { .. }
+                | ConversationBlockKind::ToolCall { .. }
+                | ConversationBlockKind::SubAgent { .. }
+        )
+    }
+
+    fn copy_text(&self) -> String {
+        match &self.kind {
+            ConversationBlockKind::UserMessage(content)
+            | ConversationBlockKind::TerminalStatus(content) => (*content).to_string(),
+            ConversationBlockKind::AssistantMarkdown { content, .. }
+            | ConversationBlockKind::Reasoning { content, .. } => (*content).to_string(),
+            ConversationBlockKind::ToolCall { tool, .. } => {
+                let output = tool.display_output();
+                format!(
+                    "{}\nargs: {}\n{}{}",
+                    tool.tool_name,
+                    tool.arguments,
+                    output,
+                    tool.error
+                        .as_ref()
+                        .map(|error| format!("\nError: {error}"))
+                        .unwrap_or_default()
+                )
+            }
+            ConversationBlockKind::SubAgent { child, .. } => format!(
+                "{}\nstatus: {}\nid: {}{}",
+                child.title.as_deref().unwrap_or("sub-agent"),
+                child.status,
+                child.child_session_id,
+                child
+                    .error
+                    .as_ref()
+                    .map(|error| format!("\nerror: {error}"))
+                    .unwrap_or_default()
+            ),
+            ConversationBlockKind::Question { question, .. } => (*question).to_string(),
+        }
+    }
+
+    fn detail_line_count(&self, width: u16) -> usize {
+        match &self.kind {
+            ConversationBlockKind::Reasoning { content, .. } => {
+                inspector_lines(content, width.saturating_sub(1) as usize).len()
+            }
+            ConversationBlockKind::ToolCall { tool, .. } => {
+                inspector_lines(tool.display_output(), width.saturating_sub(3) as usize).len()
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// Textarea placeholder shown on an empty Chat input, kept as one constant so
 /// the initial state and the post-send reset (`handle_chat_key`) can't drift.
 const CHAT_PLACEHOLDER: &str = "Type a message... (Enter send · Alt+Enter newline)";
+pub(crate) const CONVERSATION_DETAIL_VIEWPORT: usize = 10;
+
+fn tool_block_id(turn_id: &str, tool_call_id: &str) -> String {
+    format!("{turn_id}:tool:{tool_call_id}")
+}
+
+fn subagent_block_id(turn_id: &str, child_session_id: &str) -> String {
+    format!("{turn_id}:subagent:{child_session_id}")
+}
+
+/// Split inspector payloads into terminal-width visual lines without changing
+/// their authoritative stored value (copy still uses the original text).
+/// Ratatui can wrap a single logical line into hundreds of rows, so counting
+/// only `str::lines()` would make the supposedly bounded inspector flood the
+/// transcript and leave j/k unable to reach the hidden portions.
+pub(crate) fn inspector_lines(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    for logical in value.lines() {
+        if logical.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut line = String::new();
+        let mut cells = 0usize;
+        for character in logical.chars() {
+            let character_width = character.width().unwrap_or(1);
+            if !line.is_empty() && cells.saturating_add(character_width) > width {
+                wrapped.push(std::mem::take(&mut line));
+                cells = 0;
+            }
+            line.push(character);
+            cells = cells.saturating_add(character_width);
+        }
+        wrapped.push(line);
+    }
+    wrapped
+}
 
 pub struct ChatState {
     pub session_id: Option<String>,
@@ -130,10 +303,15 @@ pub struct ChatState {
     /// number of up-presses to "catch up" before the view visibly moves.
     pub max_scroll: Cell<u16>,
     pub auto_scroll: bool,
+    /// Number of conversation updates received while auto-scroll is detached.
+    /// It is independent from notification-log alerts.
+    pub unseen_updates: usize,
     pub streaming: bool,
     pub current_response: String,
     pub current_tool_calls: Vec<ToolCallDisplay>,
     pub current_reasoning: String,
+    pub current_turn_id: Option<String>,
+    pub current_terminal_status: Option<String>,
     pub model: String,
     /// Provider paired with `model` when the selection has an authoritative
     /// catalog/session identity. Kept across Ctrl+N so a new session does not
@@ -141,11 +319,19 @@ pub struct ChatState {
     pub provider: Option<String>,
     pub token_usage: Option<TokenUsage>,
     pub plan_mode: bool,
-    /// When true, tool-call arguments and results render in full instead
-    /// of truncated. Toggled with `x` on the Chat tab.
+    /// Expansion default captured by detail blocks when they first appear.
+    /// Existing blocks keep their independent state when this changes.
     pub expand_tools: bool,
     /// Sub-agents spawned by the current run (child lifecycle).
     pub sub_agents: Vec<SubAgentDisplay>,
+    /// Per-block state means expanding or scrolling one detail never alters
+    /// any sibling. `expand_tools` is only the default captured at insertion.
+    pub block_ui: HashMap<String, ConversationBlockUiState>,
+    pub focused_block: Option<String>,
+    pub block_line_ranges: RefCell<Vec<ConversationBlockLineRange>>,
+    pub content_height: Cell<u16>,
+    pub content_width: Cell<u16>,
+    next_ui_id: u64,
 }
 
 impl ChatState {
@@ -160,17 +346,64 @@ impl ChatState {
             scroll_offset: 0,
             max_scroll: Cell::new(0),
             auto_scroll: true,
+            unseen_updates: 0,
             streaming: false,
             current_response: String::new(),
             current_tool_calls: Vec::new(),
             current_reasoning: String::new(),
+            current_turn_id: None,
+            current_terminal_status: None,
             model: String::new(),
             provider: None,
             token_usage: None,
             plan_mode: false,
             expand_tools: false,
             sub_agents: Vec::new(),
+            block_ui: HashMap::new(),
+            focused_block: None,
+            block_line_ranges: RefCell::new(Vec::new()),
+            content_height: Cell::new(0),
+            content_width: Cell::new(0),
+            next_ui_id: 0,
         }
+    }
+
+    fn allocate_ui_id(&mut self, kind: &str) -> String {
+        self.next_ui_id = self.next_ui_id.wrapping_add(1);
+        format!("live:{kind}:{}", self.next_ui_id)
+    }
+
+    fn ensure_current_turn_id(&mut self) -> String {
+        if let Some(id) = &self.current_turn_id {
+            return id.clone();
+        }
+        let id = self.allocate_ui_id("assistant");
+        self.current_turn_id = Some(id.clone());
+        id
+    }
+
+    fn register_block(&mut self, id: String) {
+        self.block_ui.entry(id).or_insert(ConversationBlockUiState {
+            expanded: self.expand_tools,
+            scroll: 0,
+        });
+    }
+
+    fn note_update(&mut self) {
+        if !self.auto_scroll {
+            self.unseen_updates = self.unseen_updates.saturating_add(1);
+        }
+    }
+
+    fn reset_conversation_ui(&mut self) {
+        self.block_ui.clear();
+        self.focused_block = None;
+        self.block_line_ranges.borrow_mut().clear();
+        self.content_height.set(0);
+        self.content_width.set(0);
+        self.unseen_updates = 0;
+        self.current_turn_id = None;
+        self.current_terminal_status = None;
     }
 }
 
@@ -758,7 +991,7 @@ impl BuiltinPaletteAction {
             Self::Help => "Show help",
             Self::Notifications => "Show notifications",
             Self::Stop => "Stop active run",
-            Self::ToggleDetails => "Toggle tool details",
+            Self::ToggleDetails => "Toggle focused details",
             Self::Config => "Open config",
             Self::Schedules => "Open schedules",
         }
@@ -772,7 +1005,7 @@ impl BuiltinPaletteAction {
             Self::Help => "Show all TUI keyboard shortcuts",
             Self::Notifications => "Review recent status, warning, and error messages",
             Self::Stop => "Request cancellation of the currently running agent",
-            Self::ToggleDetails => "Expand or collapse tool arguments and results",
+            Self::ToggleDetails => "Toggle the focused block, or the default for new details",
             Self::Config => "Switch to the configuration tab",
             Self::Schedules => "Switch to the schedules tab",
         }
@@ -1760,7 +1993,13 @@ impl App {
                     self.start_stream_and_execute(session_id);
                 }
                 Err(e) => {
-                    self.chat.streaming = false;
+                    // The optimistic user turn already reserved a matching
+                    // assistant turn id. Preserve that turn with an explicit
+                    // terminal block: otherwise the next send clears the
+                    // scratch id and the failed start disappears from the
+                    // structured transcript.
+                    self.chat.current_terminal_status = Some(format!("failed to start: {e}"));
+                    self.finalize_streaming();
                     self.notify(NoticeLevel::Error, format!("Error: {e}"));
                 }
             },
@@ -1769,6 +2008,7 @@ impl App {
                 // terminal event is ever coming — finalize here or
                 // `chat.streaming` spins forever.
                 self.notify(NoticeLevel::Error, format!("Failed to start run: {msg}"));
+                self.chat.current_terminal_status = Some(format!("failed to start: {msg}"));
                 self.finalize_streaming();
             }
             AppEvent::StopFinished(r) => {
@@ -1780,6 +2020,10 @@ impl App {
                 // internally, so the outcome-specific message is set AFTER it
                 // (same ordering the old synchronous `stop_streaming` used to
                 // get "Stopped" to stick instead of being overwritten).
+                self.chat.current_terminal_status = Some(match &r {
+                    Ok(()) => "stopped".to_string(),
+                    Err(error) => format!("stop failed: {error}"),
+                });
                 self.finalize_streaming();
                 match r {
                     Ok(()) => self.status_message = "Stopped".to_string(),
@@ -1823,6 +2067,7 @@ impl App {
                         self.chat.current_tool_calls.clear();
                         self.chat.current_reasoning.clear();
                         self.chat.sub_agents.clear();
+                        self.chat.reset_conversation_ui();
                         self.chat.token_usage = None;
                         self.chat.scroll_offset = 0;
                         self.chat.streaming = false;
@@ -1835,6 +2080,7 @@ impl App {
 
                         let shown = opened.messages.len();
                         self.chat.messages = opened.messages;
+                        self.sync_conversation_block_ui();
                         self.chat.auto_scroll = true;
                         self.tab = Tab::Chat;
                         self.status_message = "Session resumed".to_string();
@@ -1854,6 +2100,8 @@ impl App {
                         // before that HTTP response returns. Subscribe now so
                         // even an immediate resumed Token/Complete is observed.
                         if opened.is_running || opened.pending.is_some() {
+                            self.chat.current_turn_id =
+                                Some(format!("session:{session_id}:active"));
                             self.attach_stream(session_id.clone());
                             self.chat.streaming = true;
                             self.status_message = if opened.is_running {
@@ -1891,6 +2139,7 @@ impl App {
                         self.supersede_pending_answer();
                         let question = self.question_from_pending(session_id.clone(), &pending);
                         self.pending_question = Some(question);
+                        self.chat.note_update();
                         // Ctrl+Q may recover a server-side pause after the old
                         // event stream was detached. Treat it as an active run
                         // again so Ctrl+C routes to STOP (instead of quitting
@@ -1953,6 +2202,7 @@ impl App {
                             incoming.question
                         );
                         self.pending_question = Some(incoming);
+                        self.chat.note_update();
                     }
                     Ok(_) => {
                         if let Some(question) = self.pending_question.as_mut() {
@@ -2073,6 +2323,11 @@ impl App {
                         // reachable again, so reattach before waiting for the
                         // resumed run's events.
                         if matches!(status.as_str(), "started" | "already_running") {
+                            // Allocate the resumed turn before its first SSE
+                            // event. ExecutionStarted may arrive later with a
+                            // run id; changing the block id at that boundary
+                            // would invalidate focus/expansion state.
+                            self.chat.ensure_current_turn_id();
                             if !self.stream_is_ready() {
                                 self.attach_stream(identity.session_id.clone());
                             }
@@ -2710,7 +2965,10 @@ impl App {
         };
         match self.tab {
             Tab::Chat => {
-                if delta < 0 {
+                self.normalize_conversation_focus();
+                if self.chat.focused_block.is_some() {
+                    self.scroll_focused_block(delta);
+                } else if delta < 0 {
                     self.chat_scroll_up(delta.unsigned_abs() as u16);
                 } else {
                     self.chat_scroll_down(delta as u16);
@@ -2750,18 +3008,28 @@ impl App {
     /// bottom don't leave the opposite key needing an equal number of presses
     /// before the view visibly moves.
     fn chat_scroll_down(&mut self, delta: u16) {
-        self.chat.auto_scroll = false;
-        self.chat.scroll_offset = self
-            .chat
-            .scroll_offset
-            .saturating_add(delta)
-            .min(self.chat.max_scroll.get());
+        let max_scroll = self.chat.max_scroll.get();
+        let current = if self.chat.auto_scroll {
+            max_scroll
+        } else {
+            self.chat.scroll_offset.min(max_scroll)
+        };
+        self.chat.scroll_offset = current.saturating_add(delta).min(max_scroll);
+        self.chat.auto_scroll = self.chat.scroll_offset >= max_scroll;
+        if self.chat.auto_scroll {
+            self.chat.unseen_updates = 0;
+        }
     }
 
     /// Scroll the chat transcript up by `delta` lines; naturally bounded at 0.
     fn chat_scroll_up(&mut self, delta: u16) {
+        let current = if self.chat.auto_scroll {
+            self.chat.max_scroll.get()
+        } else {
+            self.chat.scroll_offset.min(self.chat.max_scroll.get())
+        };
         self.chat.auto_scroll = false;
-        self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(delta);
+        self.chat.scroll_offset = current.saturating_sub(delta);
     }
 
     /// `g`: jump to the top of the transcript.
@@ -2773,6 +3041,199 @@ impl App {
     /// `G`: jump to the bottom and resume auto-scroll.
     fn chat_scroll_bottom(&mut self) {
         self.chat.auto_scroll = true;
+        self.chat.scroll_offset = self.chat.max_scroll.get();
+        self.chat.unseen_updates = 0;
+    }
+
+    fn focus_last_conversation_block(&mut self) {
+        let len = self.conversation_blocks().len();
+        if len == 0 {
+            self.status_message = "No conversation block to focus".to_string();
+            return;
+        }
+        self.focus_conversation_block_at(len - 1);
+    }
+
+    fn focus_conversation_block_at(&mut self, index: usize) {
+        let id = self
+            .conversation_blocks()
+            .get(index)
+            .map(|block| block.id.clone());
+        let Some(id) = id else {
+            return;
+        };
+        self.chat.focused_block = Some(id.clone());
+        self.scroll_to_conversation_block(&id);
+        self.status_message =
+            "Block focused — ↑/↓ move · Enter use · y copy · Esc composer".to_string();
+    }
+
+    fn move_conversation_block_focus(&mut self, delta: i32) {
+        let ids = self
+            .conversation_blocks()
+            .into_iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            self.chat.focused_block = None;
+            return;
+        }
+        let current = self
+            .chat
+            .focused_block
+            .as_ref()
+            .and_then(|focused| ids.iter().position(|id| id == focused))
+            .unwrap_or(ids.len() - 1);
+        let next = (current as i64 + delta as i64).clamp(0, (ids.len() - 1) as i64) as usize;
+        self.chat.focused_block = Some(ids[next].clone());
+        self.scroll_to_conversation_block(&ids[next]);
+    }
+
+    fn scroll_to_conversation_block(&mut self, id: &str) {
+        let range = self
+            .chat
+            .block_line_ranges
+            .borrow()
+            .iter()
+            .find(|range| range.id == id)
+            .cloned();
+        let Some(range) = range else {
+            return;
+        };
+        let height = self.chat.content_height.get().max(1);
+        let max_scroll = self.chat.max_scroll.get();
+        let current = if self.chat.auto_scroll {
+            max_scroll
+        } else {
+            self.chat.scroll_offset.min(max_scroll)
+        };
+        self.chat.auto_scroll = false;
+        self.chat.scroll_offset = if range.start < current {
+            range.start
+        } else if range.end >= current.saturating_add(height) {
+            range.end.saturating_add(1).saturating_sub(height)
+        } else {
+            current
+        }
+        .min(max_scroll);
+    }
+
+    fn toggle_conversation_details(&mut self) {
+        let focused = self.chat.focused_block.clone();
+        if let Some(id) = focused {
+            let expandable = self
+                .conversation_blocks()
+                .into_iter()
+                .find(|block| block.id == id)
+                .is_some_and(|block| block.expandable());
+            if expandable {
+                let state = self.chat.block_ui.entry(id).or_default();
+                state.expanded = !state.expanded;
+                state.scroll = 0;
+                self.status_message = if state.expanded {
+                    "Focused block expanded".to_string()
+                } else {
+                    "Focused block collapsed".to_string()
+                };
+                return;
+            }
+            self.status_message = "Focused block has no expandable details".to_string();
+            return;
+        }
+
+        // This default is captured only when future detail blocks are
+        // inserted. Existing block state is intentionally untouched.
+        self.chat.expand_tools = !self.chat.expand_tools;
+        self.status_message = if self.chat.expand_tools {
+            "New detail blocks will start expanded".to_string()
+        } else {
+            "New detail blocks will start collapsed".to_string()
+        };
+    }
+
+    fn scroll_focused_block(&mut self, delta: i32) {
+        let Some(id) = self.chat.focused_block.clone() else {
+            return;
+        };
+        let total = self
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == id)
+            .map(|block| block.detail_line_count(self.chat.content_width.get()))
+            .unwrap_or(0);
+        let state = self.chat.block_ui.entry(id).or_default();
+        if !state.expanded || total <= CONVERSATION_DETAIL_VIEWPORT {
+            return;
+        }
+        let max_scroll = total.saturating_sub(CONVERSATION_DETAIL_VIEWPORT);
+        state.scroll = (state.scroll as i64 + delta as i64).clamp(0, max_scroll as i64) as usize;
+    }
+
+    fn activate_focused_conversation_block(&mut self) {
+        let Some(id) = self.chat.focused_block.clone() else {
+            return;
+        };
+        let child_id = self
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == id)
+            .and_then(|block| match block.kind {
+                ConversationBlockKind::SubAgent { child, .. } => {
+                    Some(child.child_session_id.clone())
+                }
+                _ => None,
+            });
+        if let Some(child_id) = child_id {
+            if self.chat.streaming {
+                self.toggle_conversation_details();
+                self.status_message = format!(
+                    "{}; child opens after the parent run completes",
+                    self.status_message
+                );
+            } else {
+                self.chat.focused_block = None;
+                self.resume_session(child_id);
+            }
+            return;
+        }
+        self.toggle_conversation_details();
+    }
+
+    fn copy_focused_conversation_block(&mut self) {
+        let Some(id) = self.chat.focused_block.clone() else {
+            return;
+        };
+        let value = self
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == id)
+            .map(|block| block.copy_text());
+        let Some(value) = value else {
+            return;
+        };
+        match copy_via_osc52(&value) {
+            Ok(()) => self.status_message = "Copied focused block".to_string(),
+            Err(error) => self.notify(
+                NoticeLevel::Error,
+                format!("Failed to copy focused block: {error}"),
+            ),
+        }
+    }
+
+    /// Drop focus when its transient block no longer exists (for example, a
+    /// question block after a successful answer). Without this guard the
+    /// invisible focus owner consumes every composer keystroke until Esc.
+    fn normalize_conversation_focus(&mut self) {
+        let Some(id) = self.chat.focused_block.clone() else {
+            return;
+        };
+        let exists = self
+            .conversation_blocks()
+            .into_iter()
+            .any(|block| block.id == id);
+        if !exists {
+            self.chat.focused_block = None;
+        }
     }
 
     /// Scroll the raw config view down by `delta` lines, clamped to
@@ -3752,43 +4213,75 @@ impl App {
     }
 
     async fn handle_chat_key(&mut self, key: KeyEvent) -> Result<()> {
-        if self.chat.streaming {
+        self.normalize_conversation_focus();
+
+        // Run control and the explicit transcript jumps remain global even
+        // while a conversation block owns the navigation keys.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('s') if self.chat.streaming => {
                     self.stop_streaming();
+                    return Ok(());
                 }
-                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.chat.expand_tools = !self.chat.expand_tools;
+                KeyCode::Char('g') | KeyCode::End => {
+                    self.chat_scroll_bottom();
+                    return Ok(());
                 }
-                KeyCode::Char('j') | KeyCode::Down => self.chat_scroll_down(3),
-                KeyCode::Char('k') | KeyCode::Up => self.chat_scroll_up(3),
-                KeyCode::PageDown => self.chat_scroll_down(10),
-                KeyCode::PageUp => self.chat_scroll_up(10),
-                KeyCode::Char('g') => self.chat_scroll_top(),
-                KeyCode::Char('G') => self.chat_scroll_bottom(),
+                KeyCode::Home => {
+                    self.chat_scroll_top();
+                    return Ok(());
+                }
                 _ => {}
             }
+        }
+
+        if self.chat.focused_block.is_some() {
+            self.handle_conversation_block_key(key);
             return Ok(());
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('b') => {
+                    self.focus_last_conversation_block();
+                    return Ok(());
+                }
+                KeyCode::Char('x') => {
+                    self.toggle_conversation_details();
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         match key.code {
             KeyCode::Char('/')
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                if !self.chat.streaming
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     && self.chat.textarea.cursor() == (0, 0) =>
             {
                 self.open_command_palette(CommandPaletteTrigger::Slash);
             }
+            KeyCode::PageDown => self.chat_scroll_down(10),
+            KeyCode::PageUp => self.chat_scroll_up(10),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => self.chat_scroll_down(3),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.chat_scroll_up(3),
             // Alt+Enter (and Shift+Enter, on the kitty-protocol terminals
-            // that report it — plain crossterm terminals mostly don't, so
-            // this arm is harmless there) inserts a newline instead of
-            // sending, since plain Enter always sends.
+            // that report it) inserts a newline during both idle and active
+            // runs. The draft remains entirely local while streaming.
             KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::ALT)
-                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                if !key.modifiers.intersects(KeyModifiers::CONTROL)
+                    && (key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::SHIFT)) =>
             {
                 self.chat.textarea.insert_newline();
+            }
+            KeyCode::Enter if self.chat.streaming => {
+                self.status_message =
+                    "Run active — draft preserved; press Enter after completion to send"
+                        .to_string();
             }
             KeyCode::Enter => {
                 // Selecting a session starts an asynchronous history/summary
@@ -3818,20 +4311,41 @@ impl App {
                 self.chat.textarea.set_placeholder_text(CHAT_PLACEHOLDER);
                 self.send_message(input);
             }
-            KeyCode::Char('j') | KeyCode::Down => self.chat_scroll_down(3),
-            KeyCode::Char('k') | KeyCode::Up => self.chat_scroll_up(3),
-            KeyCode::PageDown => self.chat_scroll_down(10),
-            KeyCode::PageUp => self.chat_scroll_up(10),
-            KeyCode::Char('g') => self.chat_scroll_top(),
-            KeyCode::Char('G') => self.chat_scroll_bottom(),
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.chat.expand_tools = !self.chat.expand_tools;
-            }
             _ => {
                 self.chat.textarea.input(key);
             }
         }
         Ok(())
+    }
+
+    fn handle_conversation_block_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b'))
+        {
+            self.chat.focused_block = None;
+            self.status_message = "Composer focused".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Up => self.move_conversation_block_focus(-1),
+            KeyCode::Down => self.move_conversation_block_focus(1),
+            KeyCode::Home => self.focus_conversation_block_at(0),
+            KeyCode::End => {
+                let len = self.conversation_blocks().len();
+                self.focus_conversation_block_at(len.saturating_sub(1));
+            }
+            KeyCode::Char('k') => self.scroll_focused_block(-1),
+            KeyCode::Char('j') => self.scroll_focused_block(1),
+            KeyCode::PageUp => self.scroll_focused_block(-(CONVERSATION_DETAIL_VIEWPORT as i32)),
+            KeyCode::PageDown => self.scroll_focused_block(CONVERSATION_DETAIL_VIEWPORT as i32),
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.toggle_conversation_details()
+            }
+            KeyCode::Enter => self.activate_focused_conversation_block(),
+            KeyCode::Char('y') => self.copy_focused_conversation_block(),
+            _ => {}
+        }
     }
 
     /// Send a chat message WITHOUT blocking the event loop: the user turn is
@@ -3849,17 +4363,26 @@ impl App {
         };
 
         // Optimistic UI: show the user's turn and switch to streaming right away.
+        let user_message_id = self.chat.allocate_ui_id("user");
+        let assistant_turn_id = self.chat.allocate_ui_id("assistant");
         self.chat.messages.push(ChatMessage {
+            id: user_message_id,
             role: MessageRole::User,
             content: message.clone(),
             tool_calls: Vec::new(),
             reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
         });
         self.chat.auto_scroll = true;
+        self.chat.unseen_updates = 0;
         self.chat.streaming = true;
         self.chat.current_response.clear();
         self.chat.current_tool_calls.clear();
         self.chat.current_reasoning.clear();
+        self.chat.sub_agents.clear();
+        self.chat.current_turn_id = Some(assistant_turn_id);
+        self.chat.current_terminal_status = None;
         self.status_message = "Sending...".to_string();
 
         let client = self.client.clone();
@@ -4077,6 +4600,7 @@ impl App {
         self.chat.current_tool_calls.clear();
         self.chat.current_reasoning.clear();
         self.chat.sub_agents.clear();
+        self.chat.reset_conversation_ui();
         self.chat.token_usage = None;
         self.chat.scroll_offset = 0;
         self.chat.auto_scroll = true;
@@ -4164,6 +4688,197 @@ impl App {
             .find(|t| t.id == tool_call_id)
     }
 
+    /// Produce the one structured rendering shape used by both history and
+    /// live state. No block-level UI state is embedded here: expansion,
+    /// inspector scroll, and focus are looked up independently by `id`.
+    pub(crate) fn conversation_blocks(&self) -> Vec<ConversationBlock<'_>> {
+        let mut blocks = Vec::new();
+        for (index, message) in self.chat.messages.iter().enumerate() {
+            let message_id = if message.id.is_empty() {
+                format!("history:{index}")
+            } else {
+                message.id.clone()
+            };
+            match message.role {
+                MessageRole::User => {
+                    if !message.content.is_empty() {
+                        blocks.push(ConversationBlock {
+                            id: format!("{message_id}:user"),
+                            kind: ConversationBlockKind::UserMessage(&message.content),
+                        });
+                    }
+                }
+                MessageRole::Assistant => {
+                    if !message.content.is_empty() {
+                        blocks.push(ConversationBlock {
+                            id: format!("{message_id}:assistant"),
+                            kind: ConversationBlockKind::AssistantMarkdown {
+                                content: &message.content,
+                                streaming: false,
+                            },
+                        });
+                    }
+                    if let Some(reasoning) = message.reasoning.as_deref() {
+                        if !reasoning.is_empty() {
+                            blocks.push(ConversationBlock {
+                                id: format!("{message_id}:reasoning"),
+                                kind: ConversationBlockKind::Reasoning {
+                                    content: reasoning,
+                                    streaming: false,
+                                },
+                            });
+                        }
+                    }
+                    for tool in &message.tool_calls {
+                        blocks.push(ConversationBlock {
+                            id: tool_block_id(&message_id, &tool.id),
+                            kind: ConversationBlockKind::ToolCall {
+                                tool,
+                                streaming: false,
+                            },
+                        });
+                    }
+                    for child in &message.sub_agents {
+                        blocks.push(ConversationBlock {
+                            id: subagent_block_id(&message_id, &child.child_session_id),
+                            kind: ConversationBlockKind::SubAgent {
+                                child,
+                                streaming: false,
+                            },
+                        });
+                    }
+                    if let Some(status) = message.terminal_status.as_deref() {
+                        blocks.push(ConversationBlock {
+                            id: format!("{message_id}:terminal"),
+                            kind: ConversationBlockKind::TerminalStatus(status),
+                        });
+                    }
+                }
+            }
+        }
+
+        let live_id = self
+            .chat
+            .current_turn_id
+            .as_deref()
+            .or(self.chat.session_id.as_deref())
+            .unwrap_or("live");
+        if !self.chat.current_response.is_empty() {
+            blocks.push(ConversationBlock {
+                id: format!("{live_id}:assistant"),
+                kind: ConversationBlockKind::AssistantMarkdown {
+                    content: &self.chat.current_response,
+                    streaming: self.chat.streaming,
+                },
+            });
+        }
+        if !self.chat.current_reasoning.is_empty() {
+            blocks.push(ConversationBlock {
+                id: format!("{live_id}:reasoning"),
+                kind: ConversationBlockKind::Reasoning {
+                    content: &self.chat.current_reasoning,
+                    streaming: self.chat.streaming,
+                },
+            });
+        }
+        for tool in &self.chat.current_tool_calls {
+            blocks.push(ConversationBlock {
+                id: tool_block_id(live_id, &tool.id),
+                kind: ConversationBlockKind::ToolCall {
+                    tool,
+                    streaming: self.chat.streaming,
+                },
+            });
+        }
+        for child in &self.chat.sub_agents {
+            blocks.push(ConversationBlock {
+                id: subagent_block_id(live_id, &child.child_session_id),
+                kind: ConversationBlockKind::SubAgent {
+                    child,
+                    streaming: self.chat.streaming,
+                },
+            });
+        }
+        let waiting_for_answer = self
+            .pending_question
+            .as_ref()
+            .is_some_and(|question| !question.submitting)
+            || self.dismissed_question.is_some();
+        if self.chat.streaming && !waiting_for_answer {
+            blocks.push(ConversationBlock {
+                id: format!("{live_id}:terminal"),
+                kind: ConversationBlockKind::TerminalStatus(if self.stream_disconnected {
+                    "stream disconnected — draft preserved"
+                } else {
+                    "running — draft sends after completion"
+                }),
+            });
+        }
+        if let Some(question) = self.pending_question.as_ref() {
+            blocks.push(ConversationBlock {
+                id: format!(
+                    "question:{}:{}",
+                    question.session_id,
+                    question.tool_call_id.as_deref().unwrap_or("pending")
+                ),
+                kind: ConversationBlockKind::Question {
+                    question: &question.question,
+                    source: question.source.as_deref(),
+                    submitting: question.submitting,
+                    dismissed: false,
+                },
+            });
+        } else if let Some(question) = self.dismissed_question.as_ref() {
+            blocks.push(ConversationBlock {
+                id: format!(
+                    "question:{}:{}",
+                    question.session_id,
+                    question.tool_call_id.as_deref().unwrap_or("pending")
+                ),
+                kind: ConversationBlockKind::Question {
+                    question: &question.question,
+                    source: question.source.as_deref(),
+                    submitting: false,
+                    dismissed: true,
+                },
+            });
+        }
+        blocks
+    }
+
+    fn sync_conversation_block_ui(&mut self) {
+        let mut ids = Vec::new();
+        for (index, message) in self.chat.messages.iter().enumerate() {
+            let message_id = if message.id.is_empty() {
+                format!("history:{index}")
+            } else {
+                message.id.clone()
+            };
+            if message
+                .reasoning
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                ids.push(format!("{message_id}:reasoning"));
+            }
+            ids.extend(
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|tool| tool_block_id(&message_id, &tool.id)),
+            );
+            ids.extend(
+                message
+                    .sub_agents
+                    .iter()
+                    .map(|child| subagent_block_id(&message_id, &child.child_session_id)),
+            );
+        }
+        for id in ids {
+            self.chat.register_block(id);
+        }
+    }
+
     fn handle_session_sse_event(&mut self, message: SessionSseEvent) -> Result<()> {
         match message {
             SessionSseEvent::Event {
@@ -4192,6 +4907,7 @@ impl App {
                 self.stream_disconnected = false;
                 if reconnecting {
                     self.status_message = "SSE reconnected — synchronizing".to_string();
+                    self.chat.note_update();
                 }
                 // Answer submission deliberately attaches a fresh stream
                 // before POST. Its watch readiness can wake the POST task
@@ -4226,6 +4942,7 @@ impl App {
                 self.detach_stream();
                 self.connected = false;
                 self.stream_disconnected = true;
+                self.chat.note_update();
                 self.notify(NoticeLevel::Error, format!("SSE disconnected: {message}"));
                 Ok(())
             }
@@ -4233,15 +4950,16 @@ impl App {
     }
 
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
-        if self.chat.auto_scroll {
-            // Any incoming event means new content; auto_scroll will reposition.
-        }
         match event {
             AgentEvent::Token { content } => {
+                self.chat.ensure_current_turn_id();
                 self.chat.current_response.push_str(&content);
-                self.chat.auto_scroll = true;
+                self.chat.note_update();
             }
-            AgentEvent::ExecutionStarted { .. } => {
+            AgentEvent::ExecutionStarted { run_id, .. } => {
+                if self.chat.current_turn_id.is_none() {
+                    self.chat.current_turn_id = Some(format!("run:{run_id}"));
+                }
                 if self
                     .pending_question
                     .as_ref()
@@ -4252,62 +4970,96 @@ impl App {
                 self.stream_disconnected = false;
             }
             AgentEvent::ReasoningToken { content } => {
+                let turn_id = self.chat.ensure_current_turn_id();
+                self.chat.register_block(format!("{turn_id}:reasoning"));
                 self.chat.current_reasoning.push_str(&content);
+                self.chat.note_update();
             }
             AgentEvent::ToolStart {
                 tool_call_id,
                 tool_name,
                 arguments,
             } => {
-                self.chat.current_tool_calls.push(ToolCallDisplay {
-                    id: tool_call_id,
-                    tool_name,
-                    arguments: serde_json::to_string(&arguments).unwrap_or_default(),
-                    result: None,
-                    error: None,
-                    phase: "running".to_string(),
-                });
+                let turn_id = self.chat.ensure_current_turn_id();
+                self.chat
+                    .register_block(tool_block_id(&turn_id, &tool_call_id));
+                let arguments = serde_json::to_string(&arguments).unwrap_or_default();
+                if let Some(tool) = self.find_tool_mut(&tool_call_id) {
+                    // A ToolToken can race ahead of ToolStart. Hydrate that
+                    // placeholder in place so its stable block id/output and
+                    // independent UI state survive the reordering.
+                    tool.tool_name = tool_name;
+                    tool.arguments = arguments;
+                    if tool.phase != "complete" && tool.phase != "error" {
+                        tool.phase = "running".to_string();
+                    }
+                } else {
+                    self.chat.current_tool_calls.push(ToolCallDisplay {
+                        id: tool_call_id,
+                        tool_name,
+                        arguments,
+                        result: None,
+                        stream_output: String::new(),
+                        error: None,
+                        phase: "running".to_string(),
+                    });
+                }
+                self.chat.note_update();
             }
             AgentEvent::ToolComplete {
                 tool_call_id,
                 result,
-            } => match self.find_tool_mut(&tool_call_id) {
-                Some(tc) => {
-                    tc.result = Some(result.result);
-                    tc.phase = "complete".to_string();
+            } => {
+                let turn_id = self.chat.ensure_current_turn_id();
+                match self.find_tool_mut(&tool_call_id) {
+                    Some(tc) => {
+                        tc.result = Some(result.result);
+                        tc.phase = "complete".to_string();
+                    }
+                    None => {
+                        // No matching ToolStart (dropped/out-of-order) — surface it
+                        // defensively instead of silently losing the result.
+                        self.chat.current_tool_calls.push(ToolCallDisplay {
+                            id: tool_call_id.clone(),
+                            tool_name: "unknown".to_string(),
+                            arguments: String::new(),
+                            result: Some(result.result),
+                            stream_output: String::new(),
+                            error: None,
+                            phase: "complete".to_string(),
+                        });
+                        self.chat
+                            .register_block(tool_block_id(&turn_id, &tool_call_id));
+                    }
                 }
-                None => {
-                    // No matching ToolStart (dropped/out-of-order) — surface it
-                    // defensively instead of silently losing the result.
-                    self.chat.current_tool_calls.push(ToolCallDisplay {
-                        id: tool_call_id,
-                        tool_name: "unknown".to_string(),
-                        arguments: String::new(),
-                        result: Some(result.result),
-                        error: None,
-                        phase: "complete".to_string(),
-                    });
-                }
-            },
+                self.chat.note_update();
+            }
             AgentEvent::ToolError {
                 tool_call_id,
                 error,
-            } => match self.find_tool_mut(&tool_call_id) {
-                Some(tc) => {
-                    tc.error = Some(error);
-                    tc.phase = "error".to_string();
+            } => {
+                let turn_id = self.chat.ensure_current_turn_id();
+                match self.find_tool_mut(&tool_call_id) {
+                    Some(tc) => {
+                        tc.error = Some(error);
+                        tc.phase = "error".to_string();
+                    }
+                    None => {
+                        self.chat.current_tool_calls.push(ToolCallDisplay {
+                            id: tool_call_id.clone(),
+                            tool_name: "unknown".to_string(),
+                            arguments: String::new(),
+                            result: None,
+                            stream_output: String::new(),
+                            error: Some(error),
+                            phase: "error".to_string(),
+                        });
+                        self.chat
+                            .register_block(tool_block_id(&turn_id, &tool_call_id));
+                    }
                 }
-                None => {
-                    self.chat.current_tool_calls.push(ToolCallDisplay {
-                        id: tool_call_id,
-                        tool_name: "unknown".to_string(),
-                        arguments: String::new(),
-                        result: None,
-                        error: Some(error),
-                        phase: "error".to_string(),
-                    });
-                }
-            },
+                self.chat.note_update();
+            }
             AgentEvent::ToolLifecycle {
                 tool_call_id,
                 phase,
@@ -4332,6 +5084,7 @@ impl App {
                         }
                     }
                 }
+                self.chat.note_update();
                 // No matching entry: a Lifecycle event with no known Start is
                 // dropped (it carries only supplementary progress info, unlike
                 // Complete/Error's definitive terminal result).
@@ -4406,6 +5159,7 @@ impl App {
                 self.status_message =
                     format!("Question: {} (answer in the dialog)", incoming.question);
                 self.pending_question = Some(incoming);
+                self.chat.note_update();
                 if needs_identity_sync {
                     self.status_message = "Synchronizing question identity...".to_string();
                     if let Some(session_id) = self.chat.session_id.clone() {
@@ -4415,10 +5169,13 @@ impl App {
             }
             AgentEvent::Complete { usage } => self.handle_complete(usage),
             AgentEvent::Cancelled { message } => {
-                self.status_message = message.unwrap_or_else(|| "Cancelled".to_string());
+                let message = message.unwrap_or_else(|| "Cancelled".to_string());
+                self.chat.current_terminal_status = Some(message.clone());
+                self.status_message = message;
                 self.finalize_streaming();
             }
             AgentEvent::Error { message } => {
+                self.chat.current_terminal_status = Some(format!("error: {message}"));
                 self.notify(NoticeLevel::Error, format!("Error: {message}"));
                 self.finalize_streaming();
             }
@@ -4436,13 +5193,27 @@ impl App {
                     format!("Run budget exceeded ({kind}: {actual}/{limit}) — stopping."),
                 );
             }
-            AgentEvent::ToolToken { content, .. } => {
-                // Deliberately not routed into the matching ToolCallDisplay by
-                // `tool_call_id`: today's rendering already prints tool output
-                // inline with the response text, and threading a per-call
-                // streaming buffer through to the UI is beyond this fix's
-                // scope. Kept as the simpler, behavior-preserving option.
-                self.chat.current_response.push_str(&content);
+            AgentEvent::ToolToken {
+                tool_call_id,
+                content,
+            } => {
+                let turn_id = self.chat.ensure_current_turn_id();
+                if let Some(tool) = self.find_tool_mut(&tool_call_id) {
+                    tool.stream_output.push_str(&content);
+                } else {
+                    self.chat.current_tool_calls.push(ToolCallDisplay {
+                        id: tool_call_id.clone(),
+                        tool_name: "unknown".to_string(),
+                        arguments: String::new(),
+                        result: None,
+                        stream_output: content,
+                        error: None,
+                        phase: "streaming".to_string(),
+                    });
+                    self.chat
+                        .register_block(tool_block_id(&turn_id, &tool_call_id));
+                }
+                self.chat.note_update();
             }
             AgentEvent::ContextCompressionStatus { phase, status } => {
                 self.status_message = format!("Compression: {} ({})", status, phase);
@@ -4472,25 +5243,35 @@ impl App {
                 child_session_id,
                 title,
             } => {
-                if !self
+                let turn_id = self.chat.ensure_current_turn_id();
+                self.chat
+                    .register_block(subagent_block_id(&turn_id, &child_session_id));
+                if let Some(existing) = self
                     .chat
                     .sub_agents
-                    .iter()
-                    .any(|s| s.child_session_id == child_session_id)
+                    .iter_mut()
+                    .find(|child| child.child_session_id == child_session_id)
                 {
+                    if title.is_some() {
+                        existing.title = title;
+                    }
+                } else {
                     self.chat.sub_agents.push(SubAgentDisplay {
                         child_session_id,
                         title,
                         status: "running".to_string(),
+                        error: None,
                     });
                 }
+                self.chat.note_update();
             }
             AgentEvent::SubAgentHeartbeat { .. } => {}
             AgentEvent::SubAgentCompleted {
                 child_session_id,
                 status,
-                ..
+                error,
             } => {
+                let turn_id = self.chat.ensure_current_turn_id();
                 if let Some(sa) = self
                     .chat
                     .sub_agents
@@ -4498,7 +5279,18 @@ impl App {
                     .find(|s| s.child_session_id == child_session_id)
                 {
                     sa.status = status;
+                    sa.error = error;
+                } else {
+                    self.chat
+                        .register_block(subagent_block_id(&turn_id, &child_session_id));
+                    self.chat.sub_agents.push(SubAgentDisplay {
+                        child_session_id,
+                        title: None,
+                        status,
+                        error,
+                    });
                 }
+                self.chat.note_update();
             }
         }
         Ok(())
@@ -4506,12 +5298,15 @@ impl App {
 
     fn finalize_streaming(&mut self) {
         self.chat.streaming = false;
+        self.chat
+            .current_terminal_status
+            .get_or_insert_with(|| "completed".to_string());
+        self.chat.note_update();
         self.flush_streaming_output();
         self.status_message = "Ready".to_string();
         self.detach_stream();
         self.stream_disconnected = false;
         self.pending_answer_run_started = false;
-        self.chat.sub_agents.clear();
         // A run that ended (completed / cancelled / stopped) can no longer accept
         // an answer, so drop any open (or dismissed-but-cached) question modal
         // to avoid answering a dead session — and invalidate any answer POST
@@ -4534,23 +5329,32 @@ impl App {
             // activation that suspended at NeedClarification. That boundary is
             // not terminal user work: preserve the exact modal/draft and keep
             // the session input-blocked.
+            self.chat.current_terminal_status = Some("paused — waiting for answer".to_string());
+            self.chat.note_update();
             self.flush_streaming_output();
             self.chat.token_usage = Some(usage);
             self.chat.streaming = true;
-            self.chat.sub_agents.clear();
             self.status_message = "Paused — waiting for your answer".to_string();
             if let Some(session_id) = self.chat.session_id.clone() {
                 self.attach_stream(session_id);
             }
             return;
         }
+        self.chat.current_terminal_status = Some("completed".to_string());
         self.finalize_streaming();
         self.chat.token_usage = Some(usage);
     }
 
     fn flush_streaming_output(&mut self) {
-        if !self.chat.current_response.is_empty() || !self.chat.current_tool_calls.is_empty() {
+        if !self.chat.current_response.is_empty()
+            || !self.chat.current_tool_calls.is_empty()
+            || !self.chat.current_reasoning.is_empty()
+            || !self.chat.sub_agents.is_empty()
+            || self.chat.current_terminal_status.is_some()
+        {
+            let id = self.chat.ensure_current_turn_id();
             self.chat.messages.push(ChatMessage {
+                id,
                 role: MessageRole::Assistant,
                 content: std::mem::take(&mut self.chat.current_response),
                 tool_calls: std::mem::take(&mut self.chat.current_tool_calls),
@@ -4559,8 +5363,11 @@ impl App {
                 } else {
                     Some(std::mem::take(&mut self.chat.current_reasoning))
                 },
+                sub_agents: std::mem::take(&mut self.chat.sub_agents),
+                terminal_status: self.chat.current_terminal_status.take(),
             });
         }
+        self.chat.current_turn_id = None;
     }
 
     /// Stop the current run WITHOUT blocking the event loop: the `stop` POST
@@ -4578,11 +5385,13 @@ impl App {
         self.supersede_pending_answer();
         let Some(sid) = self.chat.session_id.clone() else {
             // Nothing to stop server-side; still clear local streaming state.
+            self.chat.current_terminal_status = Some("stopped".to_string());
             self.finalize_streaming();
             self.status_message = "Stopped".to_string();
             return;
         };
         let Some(tx) = self.event_tx.clone() else {
+            self.chat.current_terminal_status = Some("stopped locally".to_string());
             self.finalize_streaming();
             return;
         };
@@ -5674,10 +6483,12 @@ impl App {
         entry: &CommandPaletteEntry,
     ) -> Option<&'static str> {
         match entry {
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession)
-            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::OpenSession)
-            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::SelectModel)
-                if self.chat.streaming =>
+            entry
+                if self.chat.streaming
+                    && !matches!(
+                        entry,
+                        CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop)
+                    ) =>
             {
                 Some("Unavailable while an agent run is active")
             }
@@ -5690,19 +6501,6 @@ impl App {
             }
             CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop) if !self.chat.streaming => {
                 Some("No active run to stop")
-            }
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::ToggleDetails)
-                if self.chat.current_tool_calls.is_empty()
-                    && self
-                        .chat
-                        .messages
-                        .iter()
-                        .all(|message| message.tool_calls.is_empty()) =>
-            {
-                Some("No tool details in this conversation")
-            }
-            CommandPaletteEntry::Server(_) if self.chat.streaming => {
-                Some("Composer commands are unavailable while a run is active")
             }
             CommandPaletteEntry::Server(_) if self.opening_session_id.is_some() => {
                 Some("Composer commands are unavailable while a session is resuming")
@@ -5784,15 +6582,7 @@ impl App {
                 self.unseen_alerts = 0;
             }
             BuiltinPaletteAction::Stop => self.stop_streaming(),
-            BuiltinPaletteAction::ToggleDetails => {
-                self.chat.expand_tools = !self.chat.expand_tools;
-                self.status_message = if self.chat.expand_tools {
-                    "Tool details expanded"
-                } else {
-                    "Tool details collapsed"
-                }
-                .to_string();
-            }
+            BuiltinPaletteAction::ToggleDetails => self.toggle_conversation_details(),
             BuiltinPaletteAction::Config => {
                 self.tab = Tab::Config;
                 self.load_tab_data();
@@ -8359,10 +9149,13 @@ mod question_tests {
         app.chat.model = "gpt-5".to_string();
         app.chat.provider = Some("openai".to_string());
         app.chat.messages.push(ChatMessage {
+            id: "old-assistant".to_string(),
             role: MessageRole::Assistant,
             content: "old transcript".to_string(),
             tool_calls: Vec::new(),
             reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
         });
         app.chat.current_response = "partial".to_string();
         app.chat.streaming = true;
@@ -8397,10 +9190,13 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("active".to_string());
         app.chat.messages.push(ChatMessage {
+            id: "keep-assistant".to_string(),
             role: MessageRole::Assistant,
             content: "keep transcript".to_string(),
             tool_calls: Vec::new(),
             reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
         });
         app.opening_session_id = Some("delete-me".to_string());
         app.deleting_session_id = Some("delete-me".to_string());
@@ -8498,6 +9294,7 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.tab = Tab::Chat;
         app.chat.scroll_offset = 10;
+        app.chat.auto_scroll = false;
         // Simulates a render having already established the bound (a real
         // frame always renders before the first input is handled).
         app.chat.max_scroll.set(50);
@@ -8515,12 +9312,10 @@ mod question_tests {
     }
 
     /// Scrolling down is clamped to `max_scroll` (set by the render function
-    /// each frame): spamming `j` past the bottom must not overshoot into a
-    /// dead zone that then eats several `k` presses before the view moves.
-    #[tokio::test]
-    async fn chat_scroll_down_clamps_to_max_scroll() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let k = |c| KeyEvent::new(c, KeyModifiers::empty());
+    /// each frame): repeated wheel/PageDown input past the bottom must not
+    /// overshoot into a dead zone before the view moves back up.
+    #[test]
+    fn chat_scroll_down_clamps_to_max_scroll() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.tab = Tab::Chat;
         app.chat.max_scroll.set(5);
@@ -8533,9 +9328,10 @@ mod question_tests {
             "scrolling down must clamp at max_scroll, not grow unbounded"
         );
 
-        // One `k` must immediately move the view (not be swallowed catching
-        // up from an overshot offset).
-        app.handle_key(k(KeyCode::Char('k'))).await.unwrap();
+        // One scroll-up action must immediately move the view (not be
+        // swallowed catching up from an overshot offset). Plain `k` now
+        // belongs to the always-editable composer.
+        app.chat_scroll_up(3);
         assert_eq!(app.chat.scroll_offset, 2);
     }
 
@@ -8702,6 +9498,24 @@ mod question_tests {
         })
         .unwrap();
         assert_eq!(app.chat.sub_agents[0].status, "completed");
+
+        // A replayed/out-of-order Start may carry the title that a defensive
+        // completion placeholder lacked. Hydrate it without reverting the
+        // terminal status or duplicating the row.
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "c2".into(),
+            status: "completed".into(),
+            error: None,
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "c2".into(),
+            title: Some("late title".into()),
+        })
+        .unwrap();
+        assert_eq!(app.chat.sub_agents.len(), 2);
+        assert_eq!(app.chat.sub_agents[1].title.as_deref(), Some("late title"));
+        assert_eq!(app.chat.sub_agents[1].status, "completed");
     }
 
     /// Parallel tool calls: a `ToolComplete` must land on the entry whose
@@ -8743,6 +9557,324 @@ mod question_tests {
         assert_eq!(a.phase, "complete");
         assert!(b.result.is_none(), "b's result must be untouched");
         assert_eq!(b.phase, "running", "b must still be running");
+    }
+
+    #[tokio::test]
+    async fn structured_reducer_routes_interleaved_tools_and_persists_children() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent".to_string());
+        app.chat.streaming = true;
+        app.chat.auto_scroll = false;
+        app.chat.scroll_offset = 7;
+
+        // Output may precede Start. The later Start hydrates the same stable
+        // tool block instead of creating a duplicate or leaking into markdown.
+        app.handle_sse_event(AgentEvent::ToolToken {
+            tool_call_id: "b".into(),
+            content: "b0\n".into(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "a".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({ "path": "a" }),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolToken {
+            tool_call_id: "a".into(),
+            content: "a0\n".into(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "b".into(),
+            tool_name: "Shell".into(),
+            arguments: serde_json::json!({ "cmd": "pwd" }),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolToken {
+            tool_call_id: "b".into(),
+            content: "b1".into(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ReasoningToken {
+            content: "long-lived reasoning".into(),
+        })
+        .unwrap();
+        for (id, title) in [("c1", "research"), ("c2", "review")] {
+            app.handle_sse_event(AgentEvent::SubAgentStarted {
+                child_session_id: id.into(),
+                title: Some(title.into()),
+            })
+            .unwrap();
+        }
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "c1".into(),
+            status: "completed".into(),
+            error: None,
+        })
+        .unwrap();
+
+        assert!(app.chat.current_response.is_empty());
+        assert_eq!(app.chat.current_tool_calls.len(), 2);
+        let b = app
+            .chat
+            .current_tool_calls
+            .iter()
+            .find(|tool| tool.id == "b")
+            .unwrap();
+        assert_eq!(b.tool_name, "Shell");
+        assert_eq!(b.stream_output, "b0\nb1");
+        assert_eq!(app.chat.scroll_offset, 7, "absolute anchor is retained");
+        assert!(app.chat.unseen_updates >= 9);
+
+        let live_ids = app
+            .conversation_blocks()
+            .into_iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        for suffix in [":tool:a", ":tool:b", ":subagent:c1", ":subagent:c2"] {
+            assert!(live_ids.iter().any(|actual| actual.ends_with(suffix)));
+        }
+
+        app.chat.current_terminal_status = Some("completed".to_string());
+        app.finalize_streaming();
+        let completed = app.chat.messages.last().unwrap();
+        assert_eq!(completed.tool_calls.len(), 2);
+        assert_eq!(completed.sub_agents.len(), 2);
+        assert_eq!(completed.reasoning.as_deref(), Some("long-lived reasoning"));
+        assert_eq!(completed.terminal_status.as_deref(), Some("completed"));
+        assert!(app.chat.sub_agents.is_empty());
+
+        let completed_ids = app
+            .conversation_blocks()
+            .into_iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        for live_id in live_ids
+            .iter()
+            .filter(|id| id.contains(":tool:") || id.contains(":subagent:"))
+        {
+            assert!(
+                completed_ids.iter().any(|actual| actual == live_id),
+                "live block id must survive finalization: {live_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_single_line_tool_tokens_remain_bounded_scrollable_and_lossless() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        let output = "界".repeat(120);
+        app.handle_sse_event(AgentEvent::ToolToken {
+            tool_call_id: "visual".into(),
+            content: output.clone(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "visual".into(),
+            result: ToolResult {
+                success: true,
+                result: String::new(),
+            },
+        })
+        .unwrap();
+
+        let turn_id = app.chat.current_turn_id.clone().unwrap();
+        let block_id = tool_block_id(&turn_id, "visual");
+        app.chat.block_ui.get_mut(&block_id).unwrap().expanded = true;
+        app.chat.focused_block = Some(block_id.clone());
+        app.chat.content_width.set(20);
+        let copied = app
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == block_id)
+            .unwrap()
+            .copy_text();
+        app.scroll_focused_block(1);
+
+        assert_eq!(app.chat.block_ui[&block_id].scroll, 1);
+        assert_eq!(
+            app.chat.current_tool_calls[0].display_output(),
+            output,
+            "an empty terminal result must not discard streamed tool output"
+        );
+        assert!(
+            copied.ends_with(&output),
+            "copy uses the full payload rather than the bounded viewport"
+        );
+        assert!(
+            inspector_lines(&output, 17).len() > CONVERSATION_DETAIL_VIEWPORT,
+            "a long no-newline payload must be scrollable by visual rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_composer_draft_survives_terminal_modal_tab_picker_and_reconnect() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent".to_string());
+        app.chat.streaming = true;
+        for character in ['j', 'k', 'g', 'G', ' ', '草', '稿'] {
+            app.handle_chat_key(key(KeyCode::Char(character)))
+                .await
+                .unwrap();
+        }
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+        let exact = "jkgG 草稿";
+        assert_eq!(app.chat.textarea.lines().join("\n"), exact);
+        assert!(app.chat.messages.is_empty(), "Enter must not steer mid-run");
+        assert!(app.status_message.contains("draft preserved"));
+
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Approve?".into(),
+            options: Some(vec!["yes".into(), "no".into()]),
+            tool_call_id: Some("q1".into()),
+            tool_name: Some("Shell".into()),
+            allow_custom: true,
+            source: Some("approval".into()),
+        })
+        .unwrap();
+        app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
+        assert_eq!(app.chat.textarea.lines().join("\n"), exact);
+
+        app.handle_key(key(KeyCode::Tab)).await.unwrap();
+        app.handle_key(key(KeyCode::BackTab)).await.unwrap();
+        assert_eq!(app.tab, Tab::Chat);
+        assert_eq!(app.chat.textarea.lines().join("\n"), exact);
+
+        // A transport loss keeps both the active-run gate and the draft.
+        app.handle_session_sse_event(SessionSseEvent::TransportFailed {
+            session_id: "parent".to_string(),
+            stream_epoch: app.sse_epoch,
+            message: "gone".to_string(),
+        })
+        .unwrap();
+        assert_eq!(app.chat.textarea.lines().join("\n"), exact);
+
+        app.chat.current_terminal_status = Some("cancelled".to_string());
+        app.finalize_streaming();
+        assert_eq!(app.chat.textarea.lines().join("\n"), exact);
+
+        // Idle picker round-trip also leaves the exact textarea and cursor.
+        let cursor = app.chat.textarea.cursor();
+        app.open_model_picker();
+        app.close_model_picker();
+        assert_eq!(app.chat.textarea.lines().join("\n"), exact);
+        assert_eq!(app.chat.textarea.cursor(), cursor);
+    }
+
+    #[test]
+    fn expanding_one_block_does_not_change_siblings_or_the_new_block_default() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        for id in ["a", "b"] {
+            app.handle_sse_event(AgentEvent::ToolStart {
+                tool_call_id: id.into(),
+                tool_name: "Read".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        }
+        let turn_id = app.chat.current_turn_id.clone().unwrap();
+        let tool_a = tool_block_id(&turn_id, "a");
+        let tool_b = tool_block_id(&turn_id, "b");
+        app.chat.focused_block = Some(tool_a.clone());
+        app.toggle_conversation_details();
+        assert!(app.chat.block_ui[&tool_a].expanded);
+        assert!(!app.chat.block_ui[&tool_b].expanded);
+
+        app.chat.messages.push(ChatMessage {
+            id: "user-1".to_string(),
+            role: MessageRole::User,
+            content: "plain message".to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
+        });
+        app.chat.focused_block = Some("user-1:user".to_string());
+        app.toggle_conversation_details();
+        assert!(
+            !app.chat.expand_tools,
+            "a selected non-detail block must not mutate the future default"
+        );
+
+        app.chat.focused_block = None;
+        app.toggle_conversation_details();
+        assert!(app.chat.expand_tools, "future-block default toggled");
+        assert!(!app.chat.block_ui[&tool_b].expanded);
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "c".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+        assert!(app.chat.block_ui[&tool_block_id(&turn_id, "c")].expanded);
+    }
+
+    #[test]
+    fn reasoning_only_and_subagent_only_turns_are_not_dropped() {
+        let mut reasoning = App::new(BambooClient::new("http://127.0.0.1:0"));
+        reasoning.chat.streaming = true;
+        reasoning.chat.current_reasoning = "private chain".to_string();
+        reasoning.chat.current_terminal_status = Some("completed".to_string());
+        reasoning.finalize_streaming();
+        assert_eq!(reasoning.chat.messages.len(), 1);
+        assert_eq!(
+            reasoning.chat.messages[0].reasoning.as_deref(),
+            Some("private chain")
+        );
+
+        let mut child = App::new(BambooClient::new("http://127.0.0.1:0"));
+        child.chat.streaming = true;
+        child.chat.sub_agents.push(SubAgentDisplay {
+            child_session_id: "child-only".to_string(),
+            title: Some("worker".to_string()),
+            status: "completed".to_string(),
+            error: None,
+        });
+        child.chat.current_terminal_status = Some("completed".to_string());
+        child.finalize_streaming();
+        assert_eq!(child.chat.messages.len(), 1);
+        assert_eq!(child.chat.messages[0].sub_agents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn detached_scroll_accumulates_unseen_until_one_action_jump() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.auto_scroll = false;
+        app.chat.scroll_offset = 11;
+        app.chat.max_scroll.set(40);
+        app.handle_sse_event(AgentEvent::Token {
+            content: "new markdown".into(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ReasoningToken {
+            content: "new reasoning".into(),
+        })
+        .unwrap();
+        assert_eq!(app.chat.scroll_offset, 11);
+        assert_eq!(app.chat.unseen_updates, 2);
+        app.chat.focused_block = Some("any-focused-block".to_string());
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.chat.auto_scroll);
+        assert_eq!(app.chat.unseen_updates, 0);
+        assert_eq!(app.chat.scroll_offset, 40);
+    }
+
+    #[tokio::test]
+    async fn stale_block_focus_does_not_consume_the_next_composer_key() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.focused_block = Some("removed:question".to_string());
+
+        app.handle_chat_key(key(KeyCode::Char('草'))).await.unwrap();
+
+        assert!(app.chat.focused_block.is_none());
+        assert_eq!(app.chat.textarea.lines(), &["草"]);
     }
 
     /// A `ToolComplete`/`ToolError` for an id with no matching `ToolStart` is
@@ -8792,6 +9924,27 @@ mod question_tests {
         let last = app.notifications.last().expect("notify logged an entry");
         assert!(last.text.contains("connection refused"));
         assert_eq!(last.level, NoticeLevel::Error);
+    }
+
+    #[tokio::test]
+    async fn chat_start_failure_preserves_a_terminal_block_for_the_optimistic_turn() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("live:assistant:7".to_string());
+
+        app.handle_event(AppEvent::ChatStarted(Err("server unavailable".to_string())))
+            .await
+            .unwrap();
+
+        assert!(!app.chat.streaming);
+        assert!(app.chat.current_turn_id.is_none());
+        assert_eq!(app.chat.messages.len(), 1);
+        assert_eq!(app.chat.messages[0].id, "live:assistant:7");
+        assert_eq!(
+            app.chat.messages[0].terminal_status.as_deref(),
+            Some("failed to start: server unavailable")
+        );
+        assert!(app.status_message.contains("server unavailable"));
     }
 
     /// `StopFinished(Err)` must still finalize streaming locally so the
@@ -8850,10 +10003,13 @@ mod question_tests {
 
     fn asst_msg(content: &str) -> ChatMessage {
         ChatMessage {
+            id: format!("test:{content}"),
             role: MessageRole::Assistant,
             content: content.to_string(),
             tool_calls: Vec::new(),
             reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
         }
     }
 
@@ -9050,6 +10206,21 @@ mod question_tests {
         assert!(app.pending_question.is_none());
         assert!(app.chat.streaming);
         assert!(app.sse_task.is_some(), "successful answer reattaches SSE");
+        let resumed_turn_id = app
+            .chat
+            .current_turn_id
+            .clone()
+            .expect("answer allocates a stable resumed-turn id");
+        app.handle_sse_event(AgentEvent::ExecutionStarted {
+            run_id: "server-run-9".to_string(),
+            session_id: "sess-1".to_string(),
+            started_at: "2026-08-10T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            app.chat.current_turn_id.as_deref(),
+            Some(resumed_turn_id.as_str())
+        );
         app.detach_stream();
     }
 
@@ -9132,6 +10303,19 @@ mod question_tests {
         assert_eq!(question.custom.as_deref(), Some("草稿🙂"));
         assert_eq!(app.answer_epoch, epoch);
         assert!(app.chat.streaming);
+        let terminal_rows = app
+            .conversation_blocks()
+            .into_iter()
+            .filter_map(|block| match block.kind {
+                ConversationBlockKind::TerminalStatus(status) => Some(status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal_rows,
+            vec!["paused — waiting for answer"],
+            "a clarification pause must not also claim that the run is running"
+        );
         app.detach_stream();
     }
 
@@ -11458,10 +12642,13 @@ mod auto_serve_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("sess-1".to_string());
         app.chat.messages.push(ChatMessage {
+            id: "local-user".to_string(),
             role: MessageRole::User,
             content: "hi".to_string(),
             tool_calls: Vec::new(),
             reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
         });
         let (tx, _rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
