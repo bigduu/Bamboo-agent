@@ -444,6 +444,12 @@ pub struct ChatState {
     /// generation. Historical rows are presentation state only and must never
     /// keep a later parent turn artificially open.
     active_child_ids: HashSet<String>,
+    /// Child identities attributed to the latest user turn. Unlike
+    /// `active_child_ids`, ownership survives terminal lifecycle frames: a
+    /// reconnect boundary can transiently repeat an older buffered transition,
+    /// and the following Start must still be recognized as this turn's child.
+    /// The set is cleared only when the parent generation is superseded.
+    current_turn_child_ids: HashSet<String>,
     /// A parent `ExecutionStarted` (or authoritative running-session resume)
     /// has established that unmatched child starts belong to this generation.
     /// It stays false before a fresh parent execution has actually started.
@@ -497,6 +503,7 @@ impl ChatState {
             child_start_intents: HashMap::new(),
             replay_expected_child_ids: HashSet::new(),
             active_child_ids: HashSet::new(),
+            current_turn_child_ids: HashSet::new(),
             current_execution_started: false,
             stop_requested_turn_id: None,
             parent_terminal_pending: false,
@@ -647,6 +654,25 @@ impl ChatState {
                 ChildStartIntent::Exact(_) | ChildStartIntent::Any => None,
             })
             .collect();
+        self.current_turn_child_ids = historical_start_calls
+            .iter()
+            .filter_map(|(_, intent, _)| match intent {
+                ChildStartIntent::Exact(child_id) => Some(child_id.clone()),
+                ChildStartIntent::Any => None,
+            })
+            .collect();
+        self.current_turn_child_ids
+            .extend(
+                self.messages
+                    .iter()
+                    .skip(active_turn_start)
+                    .flat_map(|message| {
+                        message
+                            .sub_agents
+                            .iter()
+                            .map(|child| child.child_session_id.clone())
+                    }),
+            );
         self.active_child_ids = self
             .messages
             .iter()
@@ -672,6 +698,8 @@ impl ChatState {
                 })
                 .cloned(),
         );
+        self.current_turn_child_ids
+            .extend(self.active_child_ids.iter().cloned());
         self.current_execution_started = true;
     }
 
@@ -707,6 +735,7 @@ impl ChatState {
         self.child_start_intents.clear();
         self.replay_expected_child_ids.clear();
         self.active_child_ids.clear();
+        self.current_turn_child_ids.clear();
         self.current_execution_started = false;
         self.stop_requested_turn_id = None;
         self.parent_terminal_pending = false;
@@ -4737,6 +4766,7 @@ impl App {
         self.chat.child_start_intents.clear();
         self.chat.replay_expected_child_ids.clear();
         self.chat.active_child_ids.clear();
+        self.chat.current_turn_child_ids.clear();
         self.chat.current_execution_started = false;
         self.chat.stop_requested_turn_id = None;
         let model = if self.chat.model.is_empty() {
@@ -5732,6 +5762,8 @@ impl App {
                     .replay_expected_child_ids
                     .contains(&child_session_id);
                 let already_active = self.chat.active_child_ids.contains(&child_session_id);
+                let owned_by_current_turn =
+                    self.chat.current_turn_child_ids.contains(&child_session_id);
                 let current_execution_started = self.chat.current_execution_started;
                 let current_row_is_running = self
                     .chat
@@ -5748,6 +5780,7 @@ impl App {
                     &child_session_id,
                     !(replay_expected
                         || already_active
+                        || owned_by_current_turn
                         || (current_row_is_running && current_execution_started)),
                 );
                 let is_current_row = self
@@ -5755,40 +5788,43 @@ impl App {
                     .sub_agents
                     .iter()
                     .any(|child| child.child_session_id == child_session_id);
-                let mut active_in_current_turn = false;
-                if let Some(existing) = self.find_subagent_mut(&child_session_id) {
-                    if title.is_some() {
-                        existing.title = title;
-                    }
-                    let terminal = matches!(
-                        existing.status.as_str(),
-                        "completed" | "error" | "cancelled" | "skipped" | "timeout"
-                    );
-                    let belongs_to_current_generation = fresh_start
-                        || replay_expected
-                        || already_active
-                        || (!terminal && is_current_row && current_execution_started);
-                    if fresh_start
-                        || replay_expected
-                        || (!terminal && belongs_to_current_generation)
-                    {
+                let active_in_current_turn =
+                    if let Some(existing) = self.find_subagent_mut(&child_session_id) {
+                        if title.is_some() {
+                            existing.title = title;
+                        }
+                        let belongs_to_current_generation = fresh_start
+                            || replay_expected
+                            || already_active
+                            || owned_by_current_turn
+                            || (is_current_row && current_execution_started);
+                        // Lifecycle frames are state transitions, not historical
+                        // hints. Server replay keeps only the latest child state,
+                        // and ordered live delivery may legitimately start a new
+                        // generation after a terminal frame, so the last frame the
+                        // reducer receives must win for presentation state.
                         existing.status = "running".to_string();
                         existing.error = None;
-                        active_in_current_turn = true;
-                    }
-                } else if fresh_start || replay_expected || current_execution_started {
-                    let turn_id = self.chat.ensure_current_turn_id();
-                    self.chat
-                        .register_block(subagent_block_id(&turn_id, &child_session_id));
-                    self.chat.sub_agents.push(SubAgentDisplay {
-                        child_session_id: child_session_id.clone(),
-                        title,
-                        status: "running".to_string(),
-                        error: None,
-                    });
-                    active_in_current_turn = true;
-                }
+                        belongs_to_current_generation
+                    } else {
+                        let turn_id = self.chat.ensure_current_turn_id();
+                        self.chat
+                            .register_block(subagent_block_id(&turn_id, &child_session_id));
+                        self.chat.sub_agents.push(SubAgentDisplay {
+                            child_session_id: child_session_id.clone(),
+                            title,
+                            status: "running".to_string(),
+                            error: None,
+                        });
+                        fresh_start
+                            || replay_expected
+                            || owned_by_current_turn
+                            || current_execution_started
+                    };
                 if active_in_current_turn {
+                    self.chat
+                        .current_turn_child_ids
+                        .insert(child_session_id.clone());
                     self.chat.active_child_ids.insert(child_session_id);
                 } else {
                     self.chat.active_child_ids.remove(&child_session_id);
@@ -10145,9 +10181,9 @@ mod question_tests {
         .unwrap();
         assert_eq!(app.chat.sub_agents[0].status, "completed");
 
-        // A replayed/out-of-order Start may carry the title that a defensive
-        // completion placeholder lacked. Hydrate it without reverting the
-        // terminal status or duplicating the row.
+        // Lifecycle events are ordered state transitions. A Start after a
+        // terminal placeholder begins the next generation, hydrates its title,
+        // and reuses the stable row.
         app.handle_sse_event(AgentEvent::SubAgentCompleted {
             child_session_id: "c2".into(),
             status: "completed".into(),
@@ -10161,7 +10197,8 @@ mod question_tests {
         .unwrap();
         assert_eq!(app.chat.sub_agents.len(), 2);
         assert_eq!(app.chat.sub_agents[1].title.as_deref(), Some("late title"));
-        assert_eq!(app.chat.sub_agents[1].status, "completed");
+        assert_eq!(app.chat.sub_agents[1].status, "running");
+        assert!(app.chat.active_child_ids.contains("c2"));
     }
 
     #[tokio::test]
@@ -10283,9 +10320,9 @@ mod question_tests {
         assert!(app.chat.replay_child_ids.contains("old-child"));
         assert!(!app.has_running_subagents());
 
-        // A late-subscriber replay can repeat the old Start on the fresh
-        // stream. It may refresh display metadata but must not reclassify that
-        // historical child as belonging to the new parent turn.
+        // An authoritative Start refreshes the historical child's displayed
+        // state, but must not reclassify it as belonging to the new parent
+        // turn.
         app.handle_sse_event(AgentEvent::SubAgentStarted {
             child_session_id: "old-child".to_string(),
             title: Some("old background work".to_string()),
@@ -10306,10 +10343,7 @@ mod question_tests {
         assert!(!app.chat.parent_terminal_pending);
         assert_eq!(app.status_message, "Ready");
         assert_eq!(app.chat.messages.last().unwrap().content, "new answer");
-        assert_eq!(
-            app.chat.messages[0].sub_agents[0].status,
-            "running_in_background"
-        );
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "running");
     }
 
     #[test]
@@ -10462,34 +10496,46 @@ mod question_tests {
         })
         .unwrap();
         app.flush_streaming_output();
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");
+        assert!(!app.has_running_subagents());
 
-        // A replayed/out-of-order Start without a corresponding SubAgent tool
-        // intent must not revive the completed generation.
+        // A later Start is itself the authoritative transition into a fresh
+        // generation, even if a reconnect no longer has its ToolStart frame.
         app.handle_sse_event(AgentEvent::SubAgentStarted {
             child_session_id: "reusable-child".to_string(),
             title: None,
         })
         .unwrap();
-        assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");
-        assert!(!app.has_running_subagents());
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "running");
+        assert!(app.has_running_subagents());
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "reusable-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
 
-        // Reconnecting rebuilds replay state from history. The completed
-        // create call must not mint a fresh authorization if the critical
-        // cache replays only its old Start (for example after eviction of the
-        // matching Completed event).
+        // Reconnecting rebuilds stable current-turn ownership from the
+        // completed create result without minting an identity-agnostic intent.
         app.chat.prepare_replay_reconciliation();
         assert!(app.chat.child_start_intents.is_empty());
         assert!(app.chat.replay_expected_child_ids.is_empty());
+        assert!(app.chat.current_turn_child_ids.contains("reusable-child"));
         app.handle_sse_event(AgentEvent::SubAgentStarted {
             child_session_id: "reusable-child".to_string(),
             title: None,
         })
         .unwrap();
-        assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");
-        assert!(!app.has_running_subagents());
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "running");
+        assert!(app.has_running_subagents());
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "reusable-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
 
-        // The supported `action=run` path authorizes exactly one new lifecycle
-        // for this stable child id.
+        // The supported `action=run` path still consumes its exact intent once.
         app.handle_sse_event(AgentEvent::ToolStart {
             tool_call_id: "rerun-call".to_string(),
             tool_name: "SubAgent".to_string(),
@@ -10499,6 +10545,10 @@ mod question_tests {
             }),
         })
         .unwrap();
+        assert_eq!(
+            app.chat.child_start_intents.get("rerun-call"),
+            Some(&ChildStartIntent::Exact("reusable-child".to_string()))
+        );
         app.handle_sse_event(AgentEvent::SubAgentStarted {
             child_session_id: "reusable-child".to_string(),
             title: Some("worker rerun".to_string()),
@@ -10511,16 +10561,12 @@ mod question_tests {
             Some("worker rerun")
         );
         assert!(app.chat.active_child_ids.contains("reusable-child"));
+        assert!(!app.chat.child_start_intents.contains_key("rerun-call"));
 
         app.handle_sse_event(AgentEvent::SubAgentCompleted {
             child_session_id: "reusable-child".to_string(),
             status: "completed".to_string(),
             error: None,
-        })
-        .unwrap();
-        app.handle_sse_event(AgentEvent::SubAgentStarted {
-            child_session_id: "reusable-child".to_string(),
-            title: None,
         })
         .unwrap();
         assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");
@@ -10610,8 +10656,7 @@ mod question_tests {
         );
         assert!(app.chat.active_child_ids.contains("reusable-child"));
 
-        // The latest terminal snapshot retires the history expectation; a
-        // subsequent uncorrelated Start cannot revive it.
+        // The latest terminal transition retires active state.
         app.handle_sse_event(AgentEvent::SubAgentCompleted {
             child_session_id: "reusable-child".to_string(),
             status: "completed".to_string(),
@@ -10620,13 +10665,7 @@ mod question_tests {
         .unwrap();
         assert!(!app.has_running_subagents());
         assert!(app.chat.replay_expected_child_ids.is_empty());
-        app.handle_sse_event(AgentEvent::SubAgentStarted {
-            child_session_id: "reusable-child".to_string(),
-            title: None,
-        })
-        .unwrap();
         assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");
-        assert!(!app.has_running_subagents());
     }
 
     #[test]
@@ -10706,16 +10745,33 @@ mod question_tests {
         assert_eq!(app.chat.messages[0].sub_agents[0].status, "running");
         assert!(app.chat.active_child_ids.contains("resident-child"));
         assert!(app.chat.child_start_intents.is_empty());
+        assert!(app.chat.current_turn_child_ids.contains("resident-child"));
 
+        // A subscribe/snapshot overlap used to be able to produce
+        // S2(snapshot), C1(buffered), S2(buffered). Current-turn ownership is
+        // stable across the transient terminal frame, so the last transition
+        // wins even though the Any intent was already consumed by the first
+        // Start.
         app.handle_sse_event(AgentEvent::SubAgentCompleted {
             child_session_id: "resident-child".to_string(),
             status: "completed".to_string(),
             error: None,
         })
         .unwrap();
+        assert!(!app.chat.active_child_ids.contains("resident-child"));
+        assert!(app.chat.current_turn_child_ids.contains("resident-child"));
         app.handle_sse_event(AgentEvent::SubAgentStarted {
             child_session_id: "resident-child".to_string(),
-            title: None,
+            title: Some("resident worker rerun".to_string()),
+        })
+        .unwrap();
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "running");
+        assert!(app.chat.active_child_ids.contains("resident-child"));
+
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "resident-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
         })
         .unwrap();
         assert_eq!(app.chat.messages[0].sub_agents[0].status, "completed");

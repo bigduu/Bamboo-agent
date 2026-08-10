@@ -708,18 +708,15 @@ async fn subscribe(
                 return;
             }
 
-            let sender = state.get_session_event_sender(&sid).await;
-            let receiver = sender.subscribe();
+            let (sender, receiver, runner_snapshot) =
+                crate::handlers::agent::events::subscribe_with_runner_snapshot(
+                    state.get_ref(),
+                    &sid,
+                )
+                .await;
             // Keep the notification relay running for this session (parity with
             // the v1 events handler).
             state.ensure_notification_relay(&sid, sender.clone());
-
-            // Snapshot the runner for critical-event + budget replay (mirrors
-            // `events/handler.rs:80-89`).
-            let runner_snapshot = {
-                let runners = state.agent_runners.read().await;
-                runners.get(&sid).cloned()
-            };
             let budget_event_to_replay = runner_snapshot
                 .as_ref()
                 .and_then(|runner| runner.last_budget_event.clone());

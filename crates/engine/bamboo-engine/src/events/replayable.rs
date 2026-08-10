@@ -39,7 +39,8 @@ use crate::app_context::AgentSessionContext;
 ///
 /// 1. `runner.push_critical_event(event.clone())` — populate the late-subscriber
 ///    replay cache while the event is still un-broadcast.
-/// 2. `sender.send(event)` — broadcast to all live subscribers.
+/// 2. `sender.send(event)` — broadcast to all live subscribers before releasing
+///    the runner lock that guards subscription snapshots.
 ///
 /// If no runner exists for `session_id` (the session has not started yet, or
 /// has already terminated), the cache step is silently skipped and the event
@@ -49,18 +50,24 @@ pub async fn publish_replayable_session_event(
     session_id: &str,
     event: AgentEvent,
 ) {
+    // Resolve the sender first so publishers and subscribers never invert the
+    // session-event and runner lock order.
+    let sender = ctx.get_session_event_sender(session_id).await;
     {
         let mut runners = ctx.agent_runners().write().await;
         if let Some(runner) = runners.get_mut(session_id) {
             runner.push_critical_event(event.clone());
         }
+
+        // Mirror onto the account-wide change feed (sequenced + journaled).
+        // The sink filters ephemeral events internally; metadata events
+        // published here (title/pinned) are durable and will be sequenced.
+        ctx.account_sink().record(Some(session_id), &event);
+
+        // Keep cache mutation and live publication inside one runner-lock
+        // boundary. Subscribers clone the cache while holding the matching
+        // read lock, so an event can appear in either their snapshot or their
+        // receiver, never both.
+        let _ = sender.send(event);
     }
-
-    // Mirror onto the account-wide change feed (sequenced + journaled). The
-    // sink filters ephemeral events internally; metadata events published here
-    // (title/pinned) are durable and will be sequenced.
-    ctx.account_sink().record(Some(session_id), &event);
-
-    let sender = ctx.get_session_event_sender(session_id).await;
-    let _ = sender.send(event);
 }
