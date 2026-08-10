@@ -917,6 +917,10 @@ impl CommandPalette {
     }
 
     fn refresh_filter(&mut self, preserve_key: Option<String>) {
+        // A pointer press is tied to the exact rendered result set. Any
+        // catalog or query change invalidates those visible indices before a
+        // later mouse-up can activate a different command in the same row.
+        self.mouse_pressed_item = None;
         self.visible = ranked_indices(&self.entries, self.search_query(), command_search_text);
         self.selected = preserve_key
             .and_then(|key| {
@@ -2125,6 +2129,7 @@ impl App {
                 };
                 self.command_palette_task = None;
                 palette.loading = false;
+                palette.mouse_pressed_item = None;
                 match result {
                     Ok(catalog) => {
                         palette.entries = merged_command_palette_entries(catalog.commands);
@@ -5500,7 +5505,6 @@ impl App {
             return;
         };
         palette.epoch = epoch;
-        palette.entries = builtin_command_palette_entries();
         palette.loading = true;
         palette.resolving = false;
         palette.resolving_key = None;
@@ -6399,6 +6403,70 @@ mod command_palette_tests {
         assert!(command_search_text(mcp).contains("read_file"));
     }
 
+    #[tokio::test]
+    async fn ctrl_r_refresh_preserves_a_server_command_selection() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Global,
+            "",
+            merged_command_palette_entries(vec![
+                command("review", "prompt", "workspace"),
+                command("summarize", "prompt", "global"),
+            ]),
+        );
+        let palette = app.command_palette.as_mut().unwrap();
+        palette.selected = palette
+            .visible
+            .iter()
+            .position(|index| {
+                palette
+                    .entries
+                    .get(*index)
+                    .is_some_and(|entry| entry.key() == "server:prompt:review")
+            })
+            .unwrap();
+        let selected_key = palette.selected_entry().unwrap().key();
+
+        app.handle_command_palette_key(modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let epoch = app.command_palette.as_ref().unwrap().epoch;
+        assert_eq!(
+            app.command_palette
+                .as_ref()
+                .unwrap()
+                .selected_entry()
+                .unwrap()
+                .key(),
+            selected_key,
+            "refresh must retain the old catalog until its replacement arrives"
+        );
+
+        app.handle_event(AppEvent::CommandCatalogLoaded {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            result: Ok(CommandListResponse {
+                commands: vec![
+                    command("summarize", "prompt", "global"),
+                    command("review", "prompt", "workspace"),
+                ],
+                total: 2,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            app.command_palette
+                .as_ref()
+                .unwrap()
+                .selected_entry()
+                .unwrap()
+                .key(),
+            selected_key
+        );
+    }
+
     #[test]
     fn active_session_rebind_reloads_scope_without_touching_draft_or_query() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
@@ -6604,6 +6672,64 @@ mod command_palette_tests {
 
         assert!(app.command_palette.is_none());
         assert!(app.help_visible);
+    }
+
+    #[tokio::test]
+    async fn catalog_change_between_mouse_down_and_up_cancels_activation() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Global,
+            "",
+            vec![CommandPaletteEntry::Builtin(BuiltinPaletteAction::Help)],
+        );
+        let epoch = app.command_palette.as_ref().unwrap().epoch;
+        app.command_palette
+            .as_ref()
+            .unwrap()
+            .hitboxes
+            .borrow_mut()
+            .push(CommandPaletteHitbox {
+                index: 0,
+                x: 10,
+                y: 5,
+                width: 20,
+                height: 2,
+            });
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 12,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            app.command_palette.as_ref().unwrap().mouse_pressed_item,
+            Some(0)
+        );
+
+        app.handle_event(AppEvent::CommandCatalogLoaded {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            result: Ok(CommandListResponse {
+                commands: vec![command("review", "prompt", "workspace")],
+                total: 1,
+            }),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.command_palette.as_ref().unwrap().mouse_pressed_item,
+            None
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+
+        assert!(app.command_palette.is_some());
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-1"));
+        assert!(!app.help_visible);
     }
 }
 

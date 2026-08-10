@@ -1194,26 +1194,30 @@ fn render_command_palette_view(
     let area = centered_rect(94, height, screen);
 
     if let Some(hitboxes) = hitboxes {
-        let width = area.width.saturating_sub(2);
-        *hitboxes.borrow_mut() = rendered
-            .item_rows
-            .iter()
-            .filter_map(|(index, row, row_height)| {
-                let y = area.y.saturating_add(1).saturating_add(*row);
-                let available = area
-                    .y
-                    .saturating_add(area.height.saturating_sub(1))
-                    .saturating_sub(y);
-                let height = (*row_height).min(available);
-                (width > 0 && height > 0).then_some(CommandPaletteHitbox {
-                    index: *index,
-                    x: area.x.saturating_add(1),
-                    y,
-                    width,
-                    height,
+        if view.resolving {
+            hitboxes.borrow_mut().clear();
+        } else {
+            let width = area.width.saturating_sub(2);
+            *hitboxes.borrow_mut() = rendered
+                .item_rows
+                .iter()
+                .filter_map(|(index, row, row_height)| {
+                    let y = area.y.saturating_add(1).saturating_add(*row);
+                    let available = area
+                        .y
+                        .saturating_add(area.height.saturating_sub(1))
+                        .saturating_sub(y);
+                    let height = (*row_height).min(available);
+                    (width > 0 && height > 0).then_some(CommandPaletteHitbox {
+                        index: *index,
+                        x: area.x.saturating_add(1),
+                        y,
+                        width,
+                        height,
+                    })
                 })
-            })
-            .collect();
+                .collect();
+        }
     }
 
     f.render_widget(Clear, area);
@@ -1248,6 +1252,12 @@ fn command_palette_lines(
         ""
     };
     let search_width = row_width.saturating_sub(10).max(1);
+    let search_cursor = if view.resolving { "" } else { "▏" };
+    let search_style = if view.resolving {
+        Style::default().fg(colors::INACTIVE)
+    } else {
+        Style::default().fg(colors::BRAND)
+    };
     let mut lines = vec![
         Line::from(Span::styled(
             title,
@@ -1259,11 +1269,12 @@ fn command_palette_lines(
             Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
             Span::styled(
                 format!(
-                    "{}{}▏",
+                    "{}{}{}",
                     query_prefix,
-                    clip_tail_cells(view.input, search_width.saturating_sub(query_prefix.len()))
+                    clip_tail_cells(view.input, search_width.saturating_sub(query_prefix.len())),
+                    search_cursor
                 ),
-                Style::default().fg(colors::BRAND),
+                search_style,
             ),
         ]),
         Line::raw(""),
@@ -1330,9 +1341,11 @@ fn command_palette_lines(
                 continue;
             };
             let first_row = lines.len() as u16;
-            let is_selected = visible_index == selected;
+            let is_selected = !view.resolving && visible_index == selected;
             let marker = if is_selected { "›" } else { " " };
-            let name_style = if is_selected {
+            let name_style = if view.resolving {
+                Style::default().fg(colors::INACTIVE)
+            } else if is_selected {
                 Style::default()
                     .fg(colors::BRAND)
                     .add_modifier(Modifier::BOLD)
@@ -1378,7 +1391,9 @@ fn command_palette_lines(
                     Style::default().fg(colors::INACTIVE)
                 },
             )));
-            item_rows.push((visible_index, first_row, 2));
+            if !view.resolving {
+                item_rows.push((visible_index, first_row, 2));
+            }
         }
         if end < total {
             lines.push(Line::from(Span::styled(
@@ -1395,7 +1410,10 @@ fn command_palette_lines(
         )));
     }
     lines.push(Line::raw(""));
-    if row_width < 70 {
+    if view.resolving {
+        lines.push(Line::raw("  Input paused while the preview resolves"));
+        lines.push(Line::raw("  Esc cancel"));
+    } else if row_width < 70 {
         lines.push(Line::raw("  ↑/↓/wheel select · Enter use · Esc cancel"));
         lines.push(Line::raw("  Ctrl+R retry/refresh · Ctrl+U clear"));
     } else {
@@ -1731,7 +1749,44 @@ mod tests {
             24,
             72,
         );
-        assert!(palette_text(&resolving.lines).contains("Resolving preview"));
+        let resolving_text = palette_text(&resolving.lines);
+        assert!(resolving_text.contains("Resolving preview"));
+        assert!(resolving_text.contains("Input paused"));
+        assert!(resolving_text.contains("Esc cancel"));
+        assert!(!resolving_text.contains('▏'));
+        assert!(!resolving_text.contains("Enter use"));
+        assert!(!resolving_text.contains("Ctrl+R"));
+        assert!(resolving.item_rows.is_empty());
+
+        let hitboxes = RefCell::new(vec![CommandPaletteHitbox {
+            index: 0,
+            x: 1,
+            y: 1,
+            width: 10,
+            height: 2,
+        }]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_command_palette_view(
+                    frame,
+                    CommandPaletteView {
+                        trigger: CommandPaletteTrigger::Global,
+                        input: "review",
+                        entries: &entries,
+                        visible: &visible,
+                        selected: 0,
+                        loading: false,
+                        resolving: true,
+                        error: None,
+                        disabled_reasons: &disabled_reasons,
+                    },
+                    Some(&hitboxes),
+                )
+            })
+            .unwrap();
+        assert!(hitboxes.borrow().is_empty());
 
         let no_commands = command_palette_lines(
             &CommandPaletteView {
