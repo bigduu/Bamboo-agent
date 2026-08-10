@@ -53,6 +53,10 @@ pub fn render(f: &mut Frame, app: &App) {
         layout::render_model_picker(f, app);
     }
 
+    if app.session_picker.is_some() {
+        layout::render_session_picker(f, app);
+    }
+
     if app.pending_delete.is_some() {
         layout::render_delete_confirm(f, app);
     }

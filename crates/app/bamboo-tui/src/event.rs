@@ -1,11 +1,11 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::api::types::{
-    ListSessionsEnvelope, McpServer, PendingQuestion, ProviderCatalog, Schedule, Skill,
-    SkillDetail, ToolInfo,
+    CatalogModel, ListSessionsEnvelope, McpServer, PendingQuestion, ProviderCatalog, Schedule,
+    Skill, SkillDetail, ToolInfo,
 };
-use crate::api::RespondFailure;
-use crate::app::{OpenedSession, QuestionIdentity};
+use crate::api::{RespondFailure, SessionMutationFailure, VersionedSession};
+use crate::app::{OpenedSession, QuestionIdentity, SessionPickerIntent};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
@@ -92,9 +92,41 @@ pub enum AppEvent {
         answer: String,
         result: Result<String, RespondFailure>,
     },
-    /// `Ctrl+O`'s provider-catalog fetch finished. Dropped by the handler if
-    /// `model_picker` was already closed (Esc) before this arrived.
-    CatalogLoaded(Loaded<ProviderCatalog>),
+    /// `Ctrl+O`'s provider-catalog fetch finished. `epoch` makes close/reopen
+    /// safe when an older HTTP response arrives after the new overlay opened.
+    CatalogLoaded {
+        epoch: u64,
+        result: Loaded<ProviderCatalog>,
+    },
+    /// Recoverable model PATCH result. The picker stays open until success so
+    /// query/selection and the chat draft survive validation/network errors.
+    ModelPatched {
+        epoch: u64,
+        model: CatalogModel,
+        result: Loaded<()>,
+    },
+    /// One lazily-loaded page for the contextual session picker. Pages are
+    /// requested serially and capped in memory; stale epochs are discarded.
+    SessionPickerPageLoaded {
+        epoch: u64,
+        offset: usize,
+        result: Loaded<ListSessionsEnvelope>,
+    },
+    /// Fresh session summary + ETag loaded before a rename/pin mutation.
+    SessionPickerVersionLoaded {
+        epoch: u64,
+        session_id: String,
+        intent: SessionPickerIntent,
+        result: Loaded<VersionedSession>,
+    },
+    /// Optimistic rename/pin PATCH completed. A 412 remains typed so the UI
+    /// can preserve the draft and offer an explicit refetch/retry action.
+    SessionPickerPatched {
+        epoch: u64,
+        session_id: String,
+        intent: SessionPickerIntent,
+        result: Result<VersionedSession, SessionMutationFailure>,
+    },
     /// The auto-serve health-poll waiter finished: `Ok(pid)` once
     /// `client.health()` succeeded (carries the spawned server's pid, for the
     /// confirmation notice); `Err(message)` if it never became healthy within

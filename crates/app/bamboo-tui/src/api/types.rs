@@ -364,6 +364,17 @@ pub struct PatchSessionModelRequest {
     pub model: String,
 }
 
+/// Canonical metadata subset used by the session picker's rename/pin actions.
+/// Both fields are optional so one PATCH can express exactly one deliberate UI
+/// mutation while the `If-Match` header protects it from stale overwrites.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct PatchSessionMetadataRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+}
+
 // ── Skills ──
 
 #[derive(Deserialize, Debug, Clone)]
@@ -684,5 +695,23 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(json, r#"{"model":"gpt-4.1"}"#);
+    }
+
+    #[test]
+    fn patch_session_metadata_omits_unrelated_fields() {
+        let rename = PatchSessionMetadataRequest {
+            title: Some("Renamed".to_string()),
+            pinned: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&rename).unwrap(),
+            r#"{"title":"Renamed"}"#
+        );
+
+        let pin = PatchSessionMetadataRequest {
+            title: None,
+            pinned: Some(true),
+        };
+        assert_eq!(serde_json::to_string(&pin).unwrap(), r#"{"pinned":true}"#);
     }
 }

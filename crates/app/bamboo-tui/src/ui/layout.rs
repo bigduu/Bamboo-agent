@@ -5,8 +5,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, NoticeLevel, QuestionOptionHitbox, Tab};
+use crate::app::{App, NoticeLevel, QuestionOptionHitbox, SessionPickerMode, Tab};
 use crate::theme::{self, colors};
+use crate::ui::sessions::{session_row_line, truncate_cells};
 
 pub struct AppLayout {
     pub content: Rect,
@@ -179,6 +180,7 @@ const HELP_LEFT: &[(&str, &str)] = &[
 const HELP_RIGHT: &[(&str, &str)] = &[
     ("Ctrl+N", "New session"),
     ("Ctrl+O", "Model picker (Chat)"),
+    ("Ctrl+P", "Session picker (Chat)"),
     ("Ctrl+Q", "Reopen pending question"),
     ("Ctrl+C", "Quit / stop streaming"),
     ("Ctrl+S", "Stop agent execution"),
@@ -731,6 +733,210 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
     );
 }
 
+/// Contextual session picker (`Ctrl+P` on Chat). It renders over the
+/// transcript rather than switching to the management tab, so dismissing it
+/// restores the exact composer draft/cursor and transcript scroll beneath it.
+pub fn render_session_picker(f: &mut Frame, app: &App) {
+    let Some(picker) = &app.session_picker else {
+        return;
+    };
+    let screen = f.area();
+    let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
+    let row_width = popup_width.saturating_sub(4);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Sessions",
+            Style::default()
+                .fg(colors::BRAND)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
+            Span::styled(
+                format!(
+                    "{}▏",
+                    clip_tail_cells(&picker.query, row_width.saturating_sub(10).max(1) as usize)
+                ),
+                Style::default().fg(colors::BRAND),
+            ),
+        ]),
+    ];
+
+    match &picker.mode {
+        SessionPickerMode::Browse => {
+            lines.push(Line::raw(""));
+            if picker.visible.is_empty() {
+                let message = if picker.loading {
+                    "  Loading sessions..."
+                } else if picker.query.is_empty() {
+                    "  No sessions found"
+                } else {
+                    "  No matches in loaded sessions"
+                };
+                lines.push(Line::raw(message));
+            } else {
+                let max_height = screen.height.min(24);
+                let budget = (max_height as usize).saturating_sub(9).max(1);
+                let total = picker.visible.len();
+                let start = if total <= budget {
+                    0
+                } else {
+                    picker
+                        .selected
+                        .saturating_sub(budget / 2)
+                        .min(total.saturating_sub(budget))
+                };
+                let end = (start + budget).min(total);
+                if start > 0 {
+                    lines.push(Line::raw(format!("  ↑ {start} more")));
+                }
+                for visible_index in start..end {
+                    if let Some(session) = picker
+                        .visible
+                        .get(visible_index)
+                        .and_then(|index| picker.sessions.get(*index))
+                    {
+                        lines.push(session_row_line(
+                            session,
+                            visible_index == picker.selected,
+                            row_width,
+                        ));
+                    }
+                }
+                if end < total {
+                    lines.push(Line::raw(format!("  ↓ {} more", total - end)));
+                }
+            }
+            if let Some(error) = &picker.error {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        clip_cells(error, row_width.saturating_sub(2) as usize)
+                    ),
+                    Style::default().fg(colors::ERROR),
+                )));
+            }
+            let cap = if picker.sessions.len() >= 1_000 && picker.sessions.len() < picker.total {
+                " · memory cap reached"
+            } else {
+                ""
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  loaded {} / {}{}{}",
+                    picker.sessions.len(),
+                    picker.total,
+                    if picker.loading { " · loading" } else { "" },
+                    cap
+                ),
+                Style::default().fg(colors::SUBTLE),
+            )));
+            if row_width < 70 {
+                lines.push(Line::raw("  ↑/↓/wheel · Enter open · F2 rename · F3 pin"));
+                lines.push(Line::raw(
+                    "  Del delete · ] more · Ctrl+R retry · Esc cancel",
+                ));
+            } else {
+                lines.push(Line::raw(
+                    "  ↑/↓/wheel select · Enter open · F2 rename · F3 pin",
+                ));
+                lines.push(Line::raw(
+                    "  Ctrl+D/Delete delete · ] load more · Ctrl+R retry · Esc cancel",
+                ));
+            }
+        }
+        SessionPickerMode::Rename {
+            draft,
+            loading_version,
+            submitting,
+            error,
+            ..
+        } => {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                " Rename session",
+                Style::default()
+                    .fg(colors::BRAND)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("  Title: ", Style::default().fg(colors::SUBTLE)),
+                Span::styled(
+                    format!(
+                        "{}▏",
+                        clip_tail_cells(draft, row_width.saturating_sub(12) as usize)
+                    ),
+                    Style::default().fg(colors::BRAND),
+                ),
+            ]));
+            if *loading_version {
+                lines.push(Line::raw("  Fetching current version..."));
+            } else if *submitting {
+                lines.push(Line::raw("  Saving..."));
+            }
+            if let Some(error) = error {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        clip_cells(error, row_width.saturating_sub(2) as usize)
+                    ),
+                    Style::default().fg(colors::ERROR),
+                )));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(if row_width < 70 {
+                "  Enter save · Ctrl+R retry · Esc cancel"
+            } else {
+                "  Enter save · Ctrl+R refetch/retry · Esc keep old title"
+            }));
+        }
+        SessionPickerMode::Pinning {
+            target,
+            loading_version,
+            submitting,
+            error,
+            ..
+        } => {
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(if *target {
+                "  Pinning selected session..."
+            } else {
+                "  Unpinning selected session..."
+            }));
+            if *loading_version {
+                lines.push(Line::raw("  Fetching current version..."));
+            } else if *submitting {
+                lines.push(Line::raw("  Saving..."));
+            }
+            if let Some(error) = error {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        clip_cells(error, row_width.saturating_sub(2) as usize)
+                    ),
+                    Style::default().fg(colors::ERROR),
+                )));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("  Ctrl+R refetch/retry · Esc cancel"));
+        }
+    }
+
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(94, height, screen);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::BRAND))
+        .title(" Session picker ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 /// Model picker modal (`Ctrl+O` on the Chat tab): pick a model from the
 /// provider catalog. Mirrors `render_question`'s option-list windowing so the
 /// selection stays visible (and the modal never overflows the screen) no
@@ -741,6 +947,8 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     };
 
     let screen = f.area();
+    let popup_width = ((screen.width as u32 * 92 / 100) as u16).max(1);
+    let row_width = popup_width.saturating_sub(4) as usize;
     let header: Vec<Line> = vec![
         Line::from(Span::styled(
             " Select a model",
@@ -748,40 +956,99 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
                 .fg(colors::BRAND)
                 .add_modifier(Modifier::BOLD),
         )),
+        Line::from(vec![
+            Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
+            Span::styled(
+                format!(
+                    "{}▏",
+                    clip_tail_cells(&picker.query, row_width.saturating_sub(10).max(1))
+                ),
+                Style::default().fg(colors::BRAND),
+            ),
+        ]),
         Line::raw(""),
     ];
 
     let mut body: Vec<Line> = Vec::new();
-    if picker.loading {
+    if picker.loading && picker.models.is_empty() {
         body.push(Line::raw("  Loading models..."));
         body.push(Line::raw(""));
         body.push(Line::raw("  Esc cancel"));
-    } else if picker.models.is_empty() {
-        // Reachable only transiently — an empty catalog closes the picker
-        // and notifies (`AppEvent::CatalogLoaded`) rather than leaving this
-        // rendered — but keep a safe fallback instead of an empty modal.
-        body.push(Line::raw("  No models available"));
+    } else if picker.visible.is_empty() {
+        body.push(Line::raw(if picker.query.is_empty() {
+            "  No models available"
+        } else {
+            "  No models match this search"
+        }));
         body.push(Line::raw(""));
-        body.push(Line::raw("  Esc cancel"));
+        body.push(Line::raw("  Edit search · Ctrl+R retry load · Esc cancel"));
     } else {
         let max_h = screen.height.min(22);
-        // rows available for models = modal height - borders(2) - header - footer(1)
-        let budget = (max_h as usize).saturating_sub(2 + header.len() + 1).max(1);
-        let total = picker.models.len();
-        let start = if total <= budget {
-            0
-        } else {
-            picker
-                .selected
-                .saturating_sub(budget / 2)
-                .min(total.saturating_sub(budget))
-        };
-        let end = (start + budget).min(total);
+        let total = picker.visible.len();
+        let groups = picker
+            .visible
+            .iter()
+            .filter_map(|index| picker.models.get(*index))
+            .map(|model| app.model_group_label(model))
+            .collect::<Vec<_>>();
+
+        // A group heading costs a terminal row too. Grow a balanced window
+        // around the selection using the actual row cost, while reserving two
+        // lines for the possible above/below indicators. This keeps the
+        // highlighted model visible even with 100 providers on a short screen.
+        let line_budget = (max_h as usize)
+            .saturating_sub(2 + header.len() + 2)
+            .saturating_sub(2)
+            .max(2);
+        let selected = picker.selected.min(total.saturating_sub(1));
+        let mut start = selected;
+        let mut end = selected + 1;
+        let mut used = 2; // first group heading + selected model row
+        loop {
+            let mut expanded = false;
+            if start > 0 {
+                let candidate = start - 1;
+                let cost = 1 + usize::from(groups[candidate] != groups[start]);
+                if used + cost <= line_budget {
+                    start = candidate;
+                    used += cost;
+                    expanded = true;
+                }
+            }
+            if end < total {
+                let cost = 1 + usize::from(groups[end] != groups[end - 1]);
+                if used + cost <= line_budget {
+                    used += cost;
+                    end += 1;
+                    expanded = true;
+                }
+            }
+            if !expanded {
+                break;
+            }
+        }
         if start > 0 {
             body.push(Line::raw(format!("  \u{2191} {start} more")));
         }
+        let mut previous_group: Option<&str> = None;
         for i in start..end {
-            let m = &picker.models[i];
+            let Some(m) = picker
+                .visible
+                .get(i)
+                .and_then(|index| picker.models.get(*index))
+            else {
+                continue;
+            };
+            let group = groups.get(i).map(String::as_str).unwrap_or("Provider");
+            if previous_group != Some(group) {
+                body.push(Line::from(Span::styled(
+                    clip_cells(&format!("  {group}"), row_width),
+                    Style::default()
+                        .fg(colors::SUBTLE)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                previous_group = Some(group);
+            }
             let selected = i == picker.selected;
             let marker = if selected { "\u{203a}" } else { " " };
             let style = if selected {
@@ -792,9 +1059,15 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
                 Style::default()
             };
             body.push(Line::from(Span::styled(
-                format!(
-                    "  {marker} {}  ({})",
-                    m.display_name, m.provider_display_name
+                truncate_cells(
+                    &format!(
+                        "  {marker} {} · {} · {}/{}",
+                        m.display_name,
+                        m.provider_display_name,
+                        m.reference.provider,
+                        m.reference.model,
+                    ),
+                    row_width,
                 ),
                 style,
             )));
@@ -803,15 +1076,23 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             body.push(Line::raw(format!("  \u{2193} {} more", total - end)));
         }
         body.push(Line::raw(""));
-        body.push(Line::raw(
-            "  \u{2191}/\u{2193} select  \u{b7}  Enter apply  \u{b7}  Esc cancel",
-        ));
+        body.push(Line::raw(if picker.applying {
+            "  Applying model..."
+        } else {
+            "  \u{2191}/\u{2193}/wheel select · Enter apply · Esc cancel"
+        }));
+    }
+    if let Some(error) = &picker.error {
+        body.push(Line::from(Span::styled(
+            clip_cells(&format!("  {error}"), row_width),
+            Style::default().fg(colors::ERROR),
+        )));
     }
 
     let mut lines = header;
     lines.extend(body);
     let height = (lines.len() as u16 + 2).min(screen.height);
-    let area = centered_rect(60, height, screen);
+    let area = centered_rect(92, height, screen);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -837,8 +1118,60 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     )
 }
 
+fn clip_cells(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > max_width {
+            while used > max_width.saturating_sub(1) {
+                let Some(removed) = output.pop() else {
+                    break;
+                };
+                used = used.saturating_sub(UnicodeWidthChar::width(removed).unwrap_or(0));
+            }
+            output.push('…');
+            return output;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    output
+}
+
+fn clip_tail_cells(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let width = value
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum::<usize>();
+    if width <= max_width {
+        return value.to_string();
+    }
+
+    let target = max_width.saturating_sub(1);
+    let mut suffix = Vec::new();
+    let mut used = 0;
+    for character in value.chars().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > target {
+            break;
+        }
+        suffix.push(character);
+        used += character_width;
+    }
+    suffix.reverse();
+    format!("…{}", suffix.into_iter().collect::<String>())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{clip_cells, clip_tail_cells};
     use crate::api::BambooClient;
     use crate::app::App;
     use ratatui::backend::TestBackend;
@@ -863,6 +1196,7 @@ mod tests {
         for needle in [
             "Ctrl+N",
             "Ctrl+O",
+            "Ctrl+P",
             "Ctrl+Q",
             "Ctrl+C",
             "Ctrl+S",
@@ -874,5 +1208,15 @@ mod tests {
         ] {
             assert!(text.contains(needle), "help overlay missing {needle:?}");
         }
+    }
+
+    #[test]
+    fn cell_clipping_handles_unicode_and_keeps_the_input_tail_visible() {
+        assert_eq!(clip_cells("abcdef", 4), "abc…");
+        assert_eq!(clip_cells("会话标题", 5), "会话…");
+        assert_eq!(clip_cells("界", 1), "…");
+        assert_eq!(clip_tail_cells("abcdef", 4), "…def");
+        assert_eq!(clip_tail_cells("会话标题", 5), "…标题");
+        assert_eq!(clip_tail_cells("界", 1), "…");
     }
 }

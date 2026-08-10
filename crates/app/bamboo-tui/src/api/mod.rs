@@ -3,8 +3,83 @@ pub mod types;
 
 use anyhow::Result;
 use reqwest::Client;
+use std::fmt;
 
 use types::*;
+
+#[derive(Debug, Clone)]
+pub struct VersionedSession {
+    pub summary: SessionSummary,
+    pub metadata_version: u64,
+}
+
+/// Recoverable failure from a session metadata PATCH. The picker keeps its
+/// query, selected row, and rename draft open for every variant; `conflict`
+/// specifically identifies a 412 so the UI can explain the refetch/retry path.
+#[derive(Debug, Clone)]
+pub struct SessionMutationFailure {
+    pub conflict: bool,
+    pub current_version: Option<u64>,
+    message: String,
+}
+
+impl SessionMutationFailure {
+    fn transport(error: reqwest::Error) -> Self {
+        Self {
+            conflict: false,
+            current_version: None,
+            message: format!("session update transport failed: {error}"),
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            conflict: false,
+            current_version: None,
+            message: message.into(),
+        }
+    }
+
+    fn rejected(status: reqwest::StatusCode, body: String, etag: Option<u64>) -> Self {
+        let body = body.trim();
+        Self {
+            conflict: status == reqwest::StatusCode::PRECONDITION_FAILED,
+            current_version: etag,
+            message: if body.is_empty() {
+                format!("session update failed ({status})")
+            } else {
+                format!("session update failed ({status}): {body}")
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_conflict(current_version: u64) -> Self {
+        Self {
+            conflict: true,
+            current_version: Some(current_version),
+            message: "version conflict".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for SessionMutationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionMutationFailure {}
+
+fn parse_etag(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::ETAG)?.to_str().ok()?.trim();
+    raw.strip_prefix("W/")
+        .unwrap_or(raw)
+        .trim()
+        .trim_matches('"')
+        .parse()
+        .ok()
+}
 
 #[derive(Debug, Clone)]
 pub struct RespondFailure {
@@ -284,6 +359,30 @@ impl BambooClient {
         Ok(envelope.session)
     }
 
+    /// Fetch a session together with its metadata ETag. Rename and pin flows
+    /// retain this version while the operator edits, then send it back via
+    /// `If-Match` so concurrent updates become a recoverable 412 instead of a
+    /// silent last-writer-wins overwrite.
+    pub async fn get_session_versioned(&self, session_id: &str) -> Result<VersionedSession> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/api/v1/sessions/{}", session_id)))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get session failed ({status}): {body}");
+        }
+        let metadata_version = parse_etag(resp.headers())
+            .ok_or_else(|| anyhow::anyhow!("get session response omitted metadata ETag"))?;
+        let envelope: GetSessionEnvelope = resp.json().await?;
+        Ok(VersionedSession {
+            summary: envelope.session,
+            metadata_version,
+        })
+    }
+
     pub async fn delete_session(&self, id: &str) -> Result<()> {
         let resp = self
             .client
@@ -296,6 +395,44 @@ impl BambooClient {
             anyhow::bail!("delete session failed ({status}): {body}");
         }
         Ok(())
+    }
+
+    pub async fn patch_session_metadata(
+        &self,
+        session_id: &str,
+        expected_version: u64,
+        patch: &PatchSessionMetadataRequest,
+    ) -> std::result::Result<VersionedSession, SessionMutationFailure> {
+        let resp = self
+            .client
+            .patch(self.url(&format!("/api/v1/sessions/{}", session_id)))
+            .header(reqwest::header::IF_MATCH, format!("\"{expected_version}\""))
+            .json(patch)
+            .send()
+            .await
+            .map_err(SessionMutationFailure::transport)?;
+        let status = resp.status();
+        let metadata_version = parse_etag(resp.headers());
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SessionMutationFailure::rejected(
+                status,
+                body,
+                metadata_version,
+            ));
+        }
+        let metadata_version = metadata_version.ok_or_else(|| {
+            SessionMutationFailure::protocol("session PATCH response omitted metadata ETag")
+        })?;
+        let envelope: GetSessionEnvelope = resp.json().await.map_err(|error| {
+            SessionMutationFailure::protocol(format!(
+                "session PATCH returned an unreadable response: {error}"
+            ))
+        })?;
+        Ok(VersionedSession {
+            summary: envelope.session,
+            metadata_version,
+        })
     }
 
     // ── Provider catalog (model picker, Ctrl+O) ──
@@ -317,11 +454,9 @@ impl BambooClient {
         Ok(catalog)
     }
 
-    /// PATCH the active session's model after the picker applies a selection.
-    /// Fire-and-forget from the caller's point of view (the model already
-    /// took effect locally via `chat.model`) — this just keeps the server's
-    /// session record from drifting, so a failure is reported via `notify`,
-    /// never treated as fatal to the model change itself.
+    /// PATCH the active session's model before the picker commits a selection
+    /// locally. The caller keeps the overlay open on failure so the visible
+    /// model badge can never drift from the persisted session record.
     pub async fn patch_session_model(&self, session_id: &str, model: &str) -> Result<()> {
         let resp = self
             .client
@@ -533,7 +668,53 @@ impl BambooClient {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_auto_resume_status;
+    use super::*;
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break request.len();
+            }
+            request.extend_from_slice(&chunk[..read]);
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    async fn respond(stream: &mut tokio::net::TcpStream, status: &str, etag: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
 
     #[test]
     fn auto_resume_status_accepts_only_server_contract_values() {
@@ -559,5 +740,90 @@ mod tests {
             let error = parse_auto_resume_status(body).unwrap_err();
             assert!(error.should_refresh_question(), "body: {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_patch_round_trips_get_etag_and_if_match() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut get_socket, _) = listener.accept().await.unwrap();
+            let get = read_request(&mut get_socket).await;
+            assert!(get.starts_with("GET /api/v1/sessions/s1 HTTP/1.1"));
+            respond(
+                &mut get_socket,
+                "200 OK",
+                "W/\"7\"",
+                r#"{"session":{"id":"s1","title":"Before"}}"#,
+            )
+            .await;
+
+            let (mut patch_socket, _) = listener.accept().await.unwrap();
+            let patch = read_request(&mut patch_socket).await;
+            assert!(patch.starts_with("PATCH /api/v1/sessions/s1 HTTP/1.1"));
+            assert!(patch.to_ascii_lowercase().contains("if-match: \"7\""));
+            assert!(patch.ends_with(r#"{"title":"After"}"#));
+            respond(
+                &mut patch_socket,
+                "200 OK",
+                "\"8\"",
+                r#"{"session":{"id":"s1","title":"After"}}"#,
+            )
+            .await;
+        });
+
+        let client = BambooClient::new(&base_url);
+        let current = client.get_session_versioned("s1").await.unwrap();
+        assert_eq!(current.metadata_version, 7);
+        assert_eq!(current.summary.title, "Before");
+
+        let updated = client
+            .patch_session_metadata(
+                "s1",
+                current.metadata_version,
+                &PatchSessionMetadataRequest {
+                    title: Some("After".to_string()),
+                    pinned: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.metadata_version, 8);
+        assert_eq!(updated.summary.title, "After");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_patch_surfaces_412_and_current_etag() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let patch = read_request(&mut socket).await;
+            assert!(patch.to_ascii_lowercase().contains("if-match: \"4\""));
+            respond(
+                &mut socket,
+                "412 Precondition Failed",
+                "\"5\"",
+                r#"{"error":"metadata changed"}"#,
+            )
+            .await;
+        });
+
+        let failure = BambooClient::new(&base_url)
+            .patch_session_metadata(
+                "s1",
+                4,
+                &PatchSessionMetadataRequest {
+                    title: None,
+                    pinned: Some(true),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.conflict);
+        assert_eq!(failure.current_version, Some(5));
+        assert!(failure.to_string().contains("metadata changed"));
+        server.await.unwrap();
     }
 }
