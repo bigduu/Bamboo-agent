@@ -122,6 +122,13 @@ pub struct SubAgentDisplay {
     pub error: Option<String>,
 }
 
+fn subagent_status_is_running(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "running" | "running_in_background" | "queued" | "starting" | "in_progress"
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     /// Stable history message id, or a deterministic in-memory id for a live
@@ -351,6 +358,10 @@ pub struct ChatState {
     /// `unknown` live blocks.
     replay_tool_ids: HashSet<String>,
     replay_child_ids: HashSet<String>,
+    /// Child sessions observed as started in the current turn/stream
+    /// generation. Historical rows are presentation state only and must never
+    /// keep a later parent turn artificially open.
+    active_child_ids: HashSet<String>,
     /// Turn whose stop request has already been dispatched. A late chat POST
     /// response for this same optimistic turn must not attach SSE and start an
     /// execution after the operator has asked to cancel it.
@@ -397,6 +408,7 @@ impl ChatState {
             inspector_cache_builds: Cell::new(0),
             replay_tool_ids: HashSet::new(),
             replay_child_ids: HashSet::new(),
+            active_child_ids: HashSet::new(),
             stop_requested_turn_id: None,
             parent_terminal_pending: false,
             next_ui_id: 0,
@@ -474,10 +486,25 @@ impl ChatState {
     }
 
     fn prepare_replay_reconciliation(&mut self) {
+        // Only the transcript suffix owned by the latest user turn can still
+        // receive lifecycle replay. Older unresolved-looking rows are display
+        // history and provider IDs may be reused by the active turn.
+        let active_turn_start = self
+            .messages
+            .iter()
+            .rposition(|message| matches!(&message.role, MessageRole::User))
+            .map_or(0, |index| index.saturating_add(1));
         self.replay_tool_ids = self
             .messages
             .iter()
-            .flat_map(|message| message.tool_calls.iter().map(|tool| tool.id.clone()))
+            .skip(active_turn_start)
+            .flat_map(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .filter(|tool| !matches!(tool.phase.as_str(), "complete" | "error"))
+                    .map(|tool| tool.id.clone())
+            })
             .collect();
         self.replay_child_ids = self
             .messages
@@ -489,11 +516,24 @@ impl ChatState {
                     .map(|child| child.child_session_id.clone())
             })
             .collect();
+        self.active_child_ids = self
+            .messages
+            .iter()
+            .skip(active_turn_start)
+            .flat_map(|message| {
+                message
+                    .sub_agents
+                    .iter()
+                    .filter(|child| subagent_status_is_running(&child.status))
+                    .map(|child| child.child_session_id.clone())
+            })
+            .collect();
     }
 
     fn clear_replay_reconciliation(&mut self) {
         self.replay_tool_ids.clear();
         self.replay_child_ids.clear();
+        self.active_child_ids.clear();
         self.stop_requested_turn_id = None;
         self.parent_terminal_pending = false;
     }
@@ -4514,6 +4554,13 @@ impl App {
             self.detach_stream();
             self.chat.parent_terminal_pending = false;
         }
+        // Tool-call IDs are provider scoped, not globally unique across turns.
+        // A fresh user turn must never reconcile against a pending row from an
+        // older generation. Child history identities remain available for late
+        // lifecycle replay, but only children started in this turn may hold its
+        // parent terminal open.
+        self.chat.replay_tool_ids.clear();
+        self.chat.active_child_ids.clear();
         self.chat.stop_requested_turn_id = None;
         let model = if self.chat.model.is_empty() {
             "default".to_string()
@@ -4860,23 +4907,25 @@ impl App {
     /// that parallel tool calls (multiple in-flight at once) each get their
     /// own Complete/Error/Lifecycle update instead of clobbering whichever
     /// entry happens to be last in the list.
-    fn find_tool_mut(&mut self, tool_call_id: &str) -> Option<&mut ToolCallDisplay> {
-        if let Some(index) = self
-            .chat
-            .current_tool_calls
-            .iter()
-            .position(|tool| tool.id == tool_call_id)
-        {
+    fn find_tool_mut(
+        &mut self,
+        tool_call_id: &str,
+        include_terminal_current: bool,
+    ) -> Option<&mut ToolCallDisplay> {
+        if let Some(index) = self.chat.current_tool_calls.iter().position(|tool| {
+            tool.id == tool_call_id
+                && (include_terminal_current
+                    || !matches!(tool.phase.as_str(), "complete" | "error"))
+        }) {
             return self.chat.current_tool_calls.get_mut(index);
         }
         if !self.chat.replay_tool_ids.contains(tool_call_id) {
             return None;
         }
         self.chat.messages.iter_mut().rev().find_map(|message| {
-            message
-                .tool_calls
-                .iter_mut()
-                .find(|tool| tool.id == tool_call_id)
+            message.tool_calls.iter_mut().find(|tool| {
+                tool.id == tool_call_id && !matches!(tool.phase.as_str(), "complete" | "error")
+            })
         })
     }
 
@@ -4901,23 +4950,7 @@ impl App {
     }
 
     fn has_running_subagents(&self) -> bool {
-        fn running(status: &str) -> bool {
-            matches!(
-                status.to_ascii_lowercase().as_str(),
-                "running" | "running_in_background" | "queued" | "starting" | "in_progress"
-            )
-        }
-
-        self.chat
-            .sub_agents
-            .iter()
-            .any(|child| running(&child.status))
-            || self.chat.messages.iter().any(|message| {
-                message
-                    .sub_agents
-                    .iter()
-                    .any(|child| running(&child.status))
-            })
+        !self.chat.active_child_ids.is_empty()
     }
 
     /// A tool-bearing assistant message is one persisted LLM round. The next
@@ -5223,7 +5256,7 @@ impl App {
                 arguments,
             } => {
                 let arguments = serde_json::to_string(&arguments).unwrap_or_default();
-                if let Some(tool) = self.find_tool_mut(&tool_call_id) {
+                if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
                     // A ToolToken can race ahead of ToolStart. Hydrate that
                     // placeholder in place so its stable block id/output and
                     // independent UI state survive the reordering.
@@ -5255,7 +5288,7 @@ impl App {
             } => {
                 let success = result.success;
                 let result = result.result;
-                match self.find_tool_mut(&tool_call_id) {
+                match self.find_tool_mut(&tool_call_id, true) {
                     Some(tc) => {
                         if success {
                             tc.result = Some(result);
@@ -5289,13 +5322,17 @@ impl App {
                             .register_block(tool_block_id(&turn_id, &tool_call_id));
                     }
                 }
+                // A replay identity is single-use for the unfinished call it
+                // represents. Providers may reuse the same id in a later LLM
+                // round, which must create a distinct current-turn block.
+                self.chat.replay_tool_ids.remove(&tool_call_id);
                 self.chat.note_update();
             }
             AgentEvent::ToolError {
                 tool_call_id,
                 error,
             } => {
-                match self.find_tool_mut(&tool_call_id) {
+                match self.find_tool_mut(&tool_call_id, true) {
                     Some(tc) => {
                         tc.error = Some(error);
                         tc.phase = "error".to_string();
@@ -5315,6 +5352,7 @@ impl App {
                             .register_block(tool_block_id(&turn_id, &tool_call_id));
                     }
                 }
+                self.chat.replay_tool_ids.remove(&tool_call_id);
                 self.chat.note_update();
             }
             AgentEvent::ToolLifecycle {
@@ -5330,7 +5368,7 @@ impl App {
                 // has set one of those, a later Lifecycle event must not
                 // overwrite it back to a non-terminal phase (the UI's ✓/✗ icon
                 // is keyed on those exact strings).
-                if let Some(tc) = self.find_tool_mut(&tool_call_id) {
+                if let Some(tc) = self.find_tool_mut(&tool_call_id, true) {
                     if tc.phase != "complete" && tc.phase != "error" {
                         tc.phase = phase;
                         if let Some(s) = summary {
@@ -5452,9 +5490,10 @@ impl App {
                 tool_call_id,
                 content,
             } => {
-                if let Some(tool) = self.find_tool_mut(&tool_call_id) {
+                if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
                     tool.stream_output.push_str(&content);
                 } else {
+                    self.begin_next_round_after_tools();
                     let turn_id = self.chat.ensure_current_turn_id();
                     self.chat.current_tool_calls.push(ToolCallDisplay {
                         id: tool_call_id.clone(),
@@ -5498,6 +5537,13 @@ impl App {
                 child_session_id,
                 title,
             } => {
+                let already_active = self.chat.active_child_ids.contains(&child_session_id);
+                let is_current_row = self
+                    .chat
+                    .sub_agents
+                    .iter()
+                    .any(|child| child.child_session_id == child_session_id);
+                let mut active_in_current_turn = false;
                 if let Some(existing) = self.find_subagent_mut(&child_session_id) {
                     if title.is_some() {
                         existing.title = title;
@@ -5508,17 +5554,28 @@ impl App {
                     ) {
                         existing.status = "running".to_string();
                         existing.error = None;
+                        // Replayed Starts may hydrate old display history. Only
+                        // a child already attributed to the resumed active turn
+                        // (or still held in live scratch state) may hold this
+                        // parent turn open.
+                        active_in_current_turn = already_active || is_current_row;
                     }
                 } else {
                     let turn_id = self.chat.ensure_current_turn_id();
                     self.chat
                         .register_block(subagent_block_id(&turn_id, &child_session_id));
                     self.chat.sub_agents.push(SubAgentDisplay {
-                        child_session_id,
+                        child_session_id: child_session_id.clone(),
                         title,
                         status: "running".to_string(),
                         error: None,
                     });
+                    active_in_current_turn = true;
+                }
+                if active_in_current_turn {
+                    self.chat.active_child_ids.insert(child_session_id);
+                } else {
+                    self.chat.active_child_ids.remove(&child_session_id);
                 }
                 self.chat.note_update();
             }
@@ -5528,6 +5585,7 @@ impl App {
                 status,
                 error,
             } => {
+                self.chat.active_child_ids.remove(&child_session_id);
                 if let Some(sa) = self.find_subagent_mut(&child_session_id) {
                     sa.status = status;
                     sa.error = error;
@@ -5632,6 +5690,7 @@ impl App {
             self.chat
                 .current_tool_calls
                 .iter()
+                .filter(|tool| !matches!(tool.phase.as_str(), "complete" | "error"))
                 .map(|tool| tool.id.clone()),
         );
         self.chat.replay_child_ids.extend(
@@ -9969,6 +10028,155 @@ mod question_tests {
         assert!(app.chat.sub_agents.is_empty());
     }
 
+    #[test]
+    fn historical_running_child_does_not_hold_a_new_parent_turn_open() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = vec![
+            ChatMessage {
+                id: "history:old-parent".to_string(),
+                role: MessageRole::Assistant,
+                content: "old answer".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: vec![SubAgentDisplay {
+                    child_session_id: "old-child".to_string(),
+                    title: Some("old background work".to_string()),
+                    status: "running_in_background".to_string(),
+                    error: None,
+                }],
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:new-user".to_string(),
+                role: MessageRole::User,
+                content: "new request".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+        ];
+        app.chat.prepare_replay_reconciliation();
+        assert!(app.chat.replay_child_ids.contains("old-child"));
+        assert!(!app.has_running_subagents());
+
+        // A late-subscriber replay can repeat the old Start on the fresh
+        // stream. It may refresh display metadata but must not reclassify that
+        // historical child as belonging to the new parent turn.
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "old-child".to_string(),
+            title: Some("old background work".to_string()),
+        })
+        .unwrap();
+        assert!(!app.has_running_subagents());
+
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn:new".to_string());
+        app.chat.current_response = "new answer".to_string();
+        app.handle_complete(TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        });
+
+        assert!(!app.chat.streaming);
+        assert!(!app.chat.parent_terminal_pending);
+        assert_eq!(app.status_message, "Ready");
+        assert_eq!(app.chat.messages.last().unwrap().content, "new answer");
+        assert_eq!(app.chat.messages[0].sub_agents[0].status, "running");
+    }
+
+    #[test]
+    fn current_turn_child_alone_holds_parent_terminal_until_completion() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn:current".to_string());
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "current-child".to_string(),
+            title: Some("current work".to_string()),
+        })
+        .unwrap();
+
+        app.handle_complete(TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        });
+        assert!(app.chat.parent_terminal_pending);
+        assert!(app.chat.active_child_ids.contains("current-child"));
+
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "current-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
+
+        assert!(!app.chat.parent_terminal_pending);
+        assert!(app.chat.active_child_ids.is_empty());
+        assert_eq!(app.status_message, "Ready");
+        let child = app
+            .chat
+            .messages
+            .iter()
+            .flat_map(|message| &message.sub_agents)
+            .find(|child| child.child_session_id == "current-child")
+            .unwrap();
+        assert_eq!(child.status, "completed");
+    }
+
+    #[test]
+    fn resumed_latest_turn_child_holds_parent_terminal_until_completion() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = vec![
+            ChatMessage {
+                id: "history:latest-user".to_string(),
+                role: MessageRole::User,
+                content: "run background work".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:active-parent".to_string(),
+                role: MessageRole::Assistant,
+                content: "parent answer".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: vec![SubAgentDisplay {
+                    child_session_id: "resumed-child".to_string(),
+                    title: Some("background work".to_string()),
+                    status: "running_in_background".to_string(),
+                    error: None,
+                }],
+                terminal_status: None,
+            },
+        ];
+        app.chat.prepare_replay_reconciliation();
+        assert!(app.chat.active_child_ids.contains("resumed-child"));
+
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("session:active".to_string());
+        app.handle_complete(TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        });
+        assert!(app.chat.parent_terminal_pending);
+
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "resumed-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
+
+        assert!(!app.chat.parent_terminal_pending);
+        assert!(app.chat.active_child_ids.is_empty());
+        assert_eq!(app.chat.messages[1].sub_agents[0].status, "completed");
+    }
+
     /// Parallel tool calls: a `ToolComplete` must land on the entry whose
     /// `tool_call_id` it names, not on whichever entry is last in the list.
     #[tokio::test]
@@ -10008,6 +10216,100 @@ mod question_tests {
         assert_eq!(a.phase, "complete");
         assert!(b.result.is_none(), "b's result must be untouched");
         assert_eq!(b.phase, "running", "b must still be running");
+    }
+
+    #[test]
+    fn completed_history_tool_id_can_be_reused_by_a_new_turn() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages.push(ChatMessage {
+            id: "history:old-tool".to_string(),
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCallDisplay {
+                id: "provider-reused-id".to_string(),
+                tool_name: "Read".to_string(),
+                arguments: "{\"path\":\"old\"}".to_string(),
+                result: Some("old result".to_string()),
+                stream_output: String::new(),
+                error: None,
+                phase: "complete".to_string(),
+            }],
+            reasoning: None,
+            sub_agents: Vec::new(),
+            terminal_status: None,
+        });
+        app.chat.prepare_replay_reconciliation();
+        assert!(!app.chat.replay_tool_ids.contains("provider-reused-id"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn:new".to_string());
+
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "provider-reused-id".to_string(),
+            tool_name: "Write".to_string(),
+            arguments: serde_json::json!({ "path": "new" }),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "provider-reused-id".to_string(),
+            result: ToolResult {
+                success: true,
+                result: "new result".to_string(),
+            },
+        })
+        .unwrap();
+
+        let old = &app.chat.messages[0].tool_calls[0];
+        assert_eq!(old.tool_name, "Read");
+        assert_eq!(old.result.as_deref(), Some("old result"));
+        let current = &app.chat.current_tool_calls[0];
+        assert_eq!(current.tool_name, "Write");
+        assert_eq!(current.result.as_deref(), Some("new result"));
+    }
+
+    #[test]
+    fn sealed_live_tool_id_can_be_reused_by_the_next_round() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn:first-round".to_string());
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "provider-reused-id".to_string(),
+            tool_name: "Read".to_string(),
+            arguments: serde_json::json!({ "path": "old" }),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "provider-reused-id".to_string(),
+            result: ToolResult {
+                success: true,
+                result: "old result".to_string(),
+            },
+        })
+        .unwrap();
+
+        // A following round can legally reuse a provider tool-call id, and its
+        // ToolToken may race ahead of ToolStart. The terminal first-round row
+        // must be sealed before the new call starts.
+        app.handle_sse_event(AgentEvent::ToolToken {
+            tool_call_id: "provider-reused-id".to_string(),
+            content: "new partial".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "provider-reused-id".to_string(),
+            tool_name: "Write".to_string(),
+            arguments: serde_json::json!({ "path": "new" }),
+        })
+        .unwrap();
+
+        assert_eq!(app.chat.messages.len(), 1);
+        let old = &app.chat.messages[0].tool_calls[0];
+        assert_eq!(old.tool_name, "Read");
+        assert_eq!(old.result.as_deref(), Some("old result"));
+        assert!(!app.chat.replay_tool_ids.contains("provider-reused-id"));
+        assert_eq!(app.chat.current_tool_calls.len(), 1);
+        assert_eq!(app.chat.current_tool_calls[0].tool_name, "Write");
+        assert_eq!(app.chat.current_tool_calls[0].phase, "running");
+        assert_eq!(app.chat.current_tool_calls[0].stream_output, "new partial");
     }
 
     #[test]
@@ -10813,6 +11115,55 @@ mod question_tests {
         assert_eq!(history.tool_calls[0].stream_output, "partial");
         assert_eq!(history.sub_agents.len(), 1);
         assert_eq!(history.sub_agents[0].status, "completed");
+    }
+
+    #[test]
+    fn replay_tool_reconciliation_is_scoped_to_the_latest_user_turn() {
+        let pending_tool = |id: &str| ToolCallDisplay {
+            id: id.to_string(),
+            tool_name: "Read".to_string(),
+            arguments: "{}".to_string(),
+            result: None,
+            stream_output: String::new(),
+            error: None,
+            phase: "pending".to_string(),
+        };
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.messages = vec![
+            ChatMessage {
+                id: "history:older-assistant".to_string(),
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_calls: vec![pending_tool("provider-reused-id")],
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:latest-user".to_string(),
+                role: MessageRole::User,
+                content: "new turn".to_string(),
+                tool_calls: Vec::new(),
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+            ChatMessage {
+                id: "history:active-assistant".to_string(),
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_calls: vec![pending_tool("active-id")],
+                reasoning: None,
+                sub_agents: Vec::new(),
+                terminal_status: None,
+            },
+        ];
+
+        app.chat.prepare_replay_reconciliation();
+
+        assert!(!app.chat.replay_tool_ids.contains("provider-reused-id"));
+        assert!(app.chat.replay_tool_ids.contains("active-id"));
+        assert_eq!(app.chat.replay_tool_ids.len(), 1);
     }
 
     /// A successful resume installs the mapped history, the model, and the
