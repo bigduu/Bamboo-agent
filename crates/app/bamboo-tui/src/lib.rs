@@ -22,6 +22,7 @@ mod app;
 mod components;
 mod event;
 mod history;
+mod search;
 mod theme;
 mod ui;
 

@@ -19,6 +19,7 @@ use crate::api::types::*;
 use crate::api::{BambooClient, RespondFailure};
 use crate::event::AppEvent;
 use crate::history::map_history;
+use crate::search::ranked_indices;
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,6 +135,10 @@ pub struct ChatState {
     pub current_tool_calls: Vec<ToolCallDisplay>,
     pub current_reasoning: String,
     pub model: String,
+    /// Provider paired with `model` when the selection has an authoritative
+    /// catalog/session identity. Kept across Ctrl+N so a new session does not
+    /// silently fall back to another provider for a same-named model.
+    pub provider: Option<String>,
     pub token_usage: Option<TokenUsage>,
     pub plan_mode: bool,
     /// When true, tool-call arguments and results render in full instead
@@ -160,6 +165,7 @@ impl ChatState {
             current_tool_calls: Vec::new(),
             current_reasoning: String::new(),
             model: String::new(),
+            provider: None,
             token_usage: None,
             plan_mode: false,
             expand_tools: false,
@@ -175,6 +181,7 @@ impl ChatState {
 pub struct OpenedSession {
     pub messages: Vec<ChatMessage>,
     pub model: String,
+    pub provider: Option<String>,
     pub project_id: Option<String>,
     pub is_running: bool,
     pub pending: Option<PendingQuestion>,
@@ -575,9 +582,222 @@ pub struct ConfigEditor {
 /// `loading: true` and an empty list; the provider-catalog fetch runs off the
 /// event loop and lands via `AppEvent::CatalogLoaded`.
 pub struct ModelPicker {
+    pub epoch: u64,
     pub models: Vec<CatalogModel>,
+    pub visible: Vec<usize>,
+    pub query: String,
     pub selected: usize,
     pub loading: bool,
+    pub applying: bool,
+    pub error: Option<String>,
+}
+
+impl ModelPicker {
+    fn selected_model(&self) -> Option<&CatalogModel> {
+        self.visible
+            .get(self.selected)
+            .and_then(|index| self.models.get(*index))
+    }
+
+    fn refresh_filter(&mut self, preserve: Option<(String, String)>) {
+        // Keep the catalog's current/recent/provider grouping stable while
+        // filtering. `ranked_indices` still supplies fuzzy subsequence
+        // matching, but visible rows retain their pre-grouped source order
+        // instead of interleaving providers by match score.
+        let ranked = ranked_indices(&self.models, &self.query, model_search_text);
+        let mut matched = vec![false; self.models.len()];
+        for index in ranked {
+            if let Some(slot) = matched.get_mut(index) {
+                *slot = true;
+            }
+        }
+        self.visible = matched
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, is_match)| is_match.then_some(index))
+            .collect();
+        self.selected = preserve
+            .and_then(|key| {
+                self.visible.iter().position(|index| {
+                    self.models
+                        .get(*index)
+                        .is_some_and(|model| model_key(model) == key)
+                })
+            })
+            .unwrap_or(0)
+            .min(self.visible.len().saturating_sub(1));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPickerIntent {
+    Rename,
+    Pin(bool),
+}
+
+#[derive(Debug)]
+pub enum SessionPickerMode {
+    Browse,
+    Rename {
+        session_id: String,
+        draft: String,
+        /// Title represented by the ETag preparation snapshot. A fresh GET
+        /// must reconcile this baseline before its version can authorize the
+        /// draft, otherwise a stale list row could silently revert a rename.
+        base_title: String,
+        draft_dirty: bool,
+        metadata_version: Option<u64>,
+        loading_version: bool,
+        submitting: bool,
+        error: Option<String>,
+    },
+    Pinning {
+        session_id: String,
+        target: bool,
+        loading_version: bool,
+        submitting: bool,
+        error: Option<String>,
+    },
+}
+
+impl SessionPickerMode {
+    fn matches(&self, session_id: &str, intent: &SessionPickerIntent) -> bool {
+        match (self, intent) {
+            (Self::Rename { session_id: id, .. }, SessionPickerIntent::Rename) => id == session_id,
+            (
+                Self::Pinning {
+                    session_id: id,
+                    target,
+                    ..
+                },
+                SessionPickerIntent::Pin(expected),
+            ) => id == session_id && target == expected,
+            _ => false,
+        }
+    }
+}
+
+pub struct SessionPicker {
+    pub epoch: u64,
+    pub sessions: Vec<SessionSummary>,
+    pub visible: Vec<usize>,
+    pub query: String,
+    pub selected: usize,
+    /// Once the operator moves or filters the cursor, later lazy pages must
+    /// preserve that choice instead of jumping back to the active session.
+    pub selection_touched: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub total: usize,
+    pub page_limit: usize,
+    pub next_offset: Option<usize>,
+    pub mode: SessionPickerMode,
+}
+
+impl SessionPicker {
+    fn selected_session(&self) -> Option<&SessionSummary> {
+        self.visible
+            .get(self.selected)
+            .and_then(|index| self.sessions.get(*index))
+    }
+
+    fn refresh_filter(&mut self, preserve_id: Option<String>) {
+        self.visible = ranked_indices(&self.sessions, &self.query, session_search_text);
+        self.selected = preserve_id
+            .and_then(|id| {
+                self.visible.iter().position(|index| {
+                    self.sessions
+                        .get(*index)
+                        .is_some_and(|session| session.id == id)
+                })
+            })
+            .unwrap_or(0)
+            .min(self.visible.len().saturating_sub(1));
+    }
+}
+
+const MAX_SESSION_PICKER_SESSIONS: usize = 1_000;
+const MAX_RECENT_MODELS: usize = 8;
+
+fn model_key(model: &CatalogModel) -> (String, String) {
+    (
+        model.reference.provider.clone(),
+        model.reference.model.clone(),
+    )
+}
+
+fn model_search_text(model: &CatalogModel) -> String {
+    format!(
+        "{} {} {} {}",
+        model.display_name,
+        model.provider_display_name,
+        model.reference.provider,
+        model.reference.model
+    )
+}
+
+fn session_search_text(session: &SessionSummary) -> String {
+    let status = if session.is_running {
+        "running"
+    } else if session.has_pending_question {
+        "question awaiting"
+    } else {
+        session.last_run_status.as_deref().unwrap_or("idle")
+    };
+    format!(
+        "{} {} {} {} {}",
+        session.title,
+        session.model,
+        session.id,
+        status,
+        if session.pinned { "pinned" } else { "" }
+    )
+}
+
+fn current_model_key(
+    models: &[CatalogModel],
+    current_provider: Option<&str>,
+    current_model: &str,
+) -> Option<(String, String)> {
+    if current_model.trim().is_empty() {
+        return None;
+    }
+    if let Some(provider) = current_provider.filter(|provider| !provider.trim().is_empty()) {
+        return Some((provider.to_string(), current_model.to_string()));
+    }
+
+    // Legacy sessions expose only a bare model id. Treat it as Current only
+    // when the catalog maps that id to exactly one provider; duplicate ids are
+    // deliberately left unmarked rather than claiming several providers are
+    // simultaneously active.
+    let mut matches = models
+        .iter()
+        .filter(|model| model.reference.model == current_model)
+        .map(model_key);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn sort_catalog_models(
+    models: &mut [CatalogModel],
+    current: Option<&(String, String)>,
+    recent: &VecDeque<(String, String)>,
+) {
+    models.sort_by_key(|model| {
+        let key = model_key(model);
+        let current_rank = usize::from(current != Some(&key));
+        let recent_rank = recent
+            .iter()
+            .position(|candidate| candidate == &key)
+            .unwrap_or(usize::MAX);
+        (
+            current_rank,
+            recent_rank,
+            model.provider_display_name.to_lowercase(),
+            model.display_name.to_lowercase(),
+            key,
+        )
+    });
 }
 
 // ── Auto-serve (local `bamboo serve` bootstrap) ──
@@ -762,12 +982,20 @@ pub struct App {
     /// In-progress model picker (`Ctrl+O`, Chat tab). When `Some`, a modal
     /// captures navigation/apply keystrokes.
     pub model_picker: Option<ModelPicker>,
+    /// In-progress contextual session picker (`Ctrl+P`, Chat tab). Unlike the
+    /// Sessions management tab, closing this overlay leaves the transcript,
+    /// composer draft/cursor, and scroll position untouched.
+    pub session_picker: Option<SessionPicker>,
     /// Pending session-delete confirmation (Sessions tab, `d`): `(id, title)`
     /// of the session awaiting `y`/Enter confirm or `n`/Esc cancel. Kept as a
     /// modal (rather than deleting immediately) so a stray `d` can't destroy a
     /// session, and the actual DELETE runs off the event loop like every other
     /// mutation.
     pub pending_delete: Option<(String, String)>,
+    /// Session id whose DELETE request is currently in flight. When it is the
+    /// active Chat session, submission stays blocked until the result arrives
+    /// so a concurrent chat POST cannot recreate the session being deleted.
+    deleting_session_id: Option<String>,
     /// Capped scrollback of past status messages so errors/warnings aren't lost
     /// when the single status line is overwritten. Viewed with `Ctrl+L`.
     pub notifications: Vec<Notification>,
@@ -798,6 +1026,12 @@ pub struct App {
     /// Latest session whose async resume result is authoritative. An older
     /// request finishing later must not switch the operator back.
     opening_session_id: Option<String>,
+    /// Shared monotonic identity for picker fetches/mutations. Closing and
+    /// reopening a picker invalidates every result from the previous overlay.
+    picker_epoch: u64,
+    model_picker_task: Option<tokio::task::JoinHandle<()>>,
+    session_picker_task: Option<tokio::task::JoinHandle<()>>,
+    recent_models: VecDeque<(String, String)>,
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -883,7 +1117,9 @@ impl App {
             schedule_form: None,
             config_editor: None,
             model_picker: None,
+            session_picker: None,
             pending_delete: None,
+            deleting_session_id: None,
             notifications: Vec::new(),
             notifications_visible: false,
             unseen_alerts: 0,
@@ -892,6 +1128,10 @@ impl App {
             question_drafts: HashMap::new(),
             question_draft_order: VecDeque::new(),
             opening_session_id: None,
+            picker_epoch: 0,
+            model_picker_task: None,
+            session_picker_task: None,
+            recent_models: VecDeque::new(),
             event_tx: None,
             sse_tx: None,
             sse_rx: None,
@@ -1119,14 +1359,83 @@ impl App {
             AppEvent::ActionDone {
                 outcome,
                 reload_tab,
+                session_picker_epoch,
             } => {
+                let succeeded = outcome.is_ok();
                 match outcome {
                     Ok(msg) => self.notify(NoticeLevel::Info, msg),
                     Err(msg) => self.notify(NoticeLevel::Error, msg),
                 }
                 if reload_tab {
+                    let reload_origin_picker = succeeded
+                        && session_picker_epoch.is_some_and(|epoch| {
+                            self.session_picker.as_ref().is_some_and(|picker| {
+                                picker.epoch == epoch
+                                    && matches!(picker.mode, SessionPickerMode::Browse)
+                            })
+                        });
+                    if reload_origin_picker {
+                        self.reload_session_picker();
+                    }
                     self.load_tab_data();
                 }
+            }
+            AppEvent::SessionDeleted {
+                session_id,
+                result,
+                session_picker_epoch,
+            } => {
+                if self.deleting_session_id.as_deref() == Some(session_id.as_str()) {
+                    self.deleting_session_id = None;
+                }
+                let succeeded = result.is_ok();
+                let deleted_active =
+                    succeeded && self.chat.session_id.as_deref() == Some(session_id.as_str());
+                let deleted_opening =
+                    succeeded && self.opening_session_id.as_deref() == Some(session_id.as_str());
+                if deleted_active {
+                    // Detach before another input event can be handled. This
+                    // preserves the deliberate model/Project/composer draft,
+                    // while removing every server-backed trace of the deleted
+                    // session from the Chat view. Preserve an unrelated newer
+                    // resume, but never let a queued resume of this deleted id
+                    // become authoritative again.
+                    let unrelated_opening = self
+                        .opening_session_id
+                        .take()
+                        .filter(|opening| opening != &session_id);
+                    self.new_session();
+                    self.opening_session_id = unrelated_opening;
+                } else if deleted_opening {
+                    // The resume task itself is best-effort and may already
+                    // have queued a result. Clearing its authoritative id
+                    // makes that stale SessionOpened harmless.
+                    self.opening_session_id = None;
+                }
+                match result {
+                    Ok(()) => self.notify(
+                        NoticeLevel::Info,
+                        if deleted_active {
+                            "Session deleted — started a new session"
+                        } else {
+                            "Session deleted"
+                        },
+                    ),
+                    Err(error) => {
+                        self.notify(NoticeLevel::Error, format!("Delete failed: {error}"))
+                    }
+                }
+                let reload_origin_picker = succeeded
+                    && session_picker_epoch.is_some_and(|epoch| {
+                        self.session_picker.as_ref().is_some_and(|picker| {
+                            picker.epoch == epoch
+                                && matches!(picker.mode, SessionPickerMode::Browse)
+                        })
+                    });
+                if reload_origin_picker {
+                    self.reload_session_picker();
+                }
+                self.load_tab_data();
             }
             AppEvent::ChatStarted(r) => match r {
                 Ok(session_id) => {
@@ -1175,6 +1484,15 @@ impl App {
                 self.opening_session_id = None;
                 match result {
                     Ok(opened) => {
+                        // Contextual pickers are bound to the chat session
+                        // visible beneath them. A concurrently completing
+                        // resume invalidates that context and any in-flight
+                        // model PATCH result before installing the new session.
+                        if self.session_picker.is_some() {
+                            self.pending_delete = None;
+                        }
+                        self.close_session_picker();
+                        self.close_model_picker();
                         // Reset every per-run scratch field `finalize_streaming`
                         // would otherwise leave behind from whatever was open
                         // before — a resumed session must not inherit stale
@@ -1182,6 +1500,7 @@ impl App {
                         self.detach_stream();
                         self.chat.session_id = Some(session_id.clone());
                         self.chat.model = opened.model;
+                        self.chat.provider = opened.provider;
                         self.chat.project_id = opened.project_id;
                         self.chat.current_response.clear();
                         self.chat.current_tool_calls.clear();
@@ -1468,29 +1787,328 @@ impl App {
                     }
                 }
             }
-            AppEvent::CatalogLoaded(r) => {
-                // The picker may already have been closed (Esc) before this
-                // fetch returned — drop the result instead of reopening it.
-                let Some(picker) = self.model_picker.as_mut() else {
+            AppEvent::CatalogLoaded { epoch, result } => {
+                let selected_key = self
+                    .model_picker
+                    .as_ref()
+                    .filter(|picker| picker.epoch == epoch)
+                    .and_then(ModelPicker::selected_model)
+                    .map(model_key);
+                let Some(picker) = self
+                    .model_picker
+                    .as_mut()
+                    .filter(|picker| picker.epoch == epoch)
+                else {
                     return Ok(());
                 };
-                match r {
-                    Ok(catalog) if catalog.models.is_empty() => {
-                        self.model_picker = None;
-                        self.notify(NoticeLevel::Warn, "No models in provider catalog");
-                    }
-                    Ok(catalog) => {
-                        picker.models = catalog.models;
-                        picker.selected = 0;
-                        picker.loading = false;
-                        self.status_message = "Ready".to_string();
-                    }
-                    Err(e) => {
-                        self.model_picker = None;
-                        self.notify(
-                            NoticeLevel::Error,
-                            format!("Failed to load provider catalog: {e}"),
+                self.model_picker_task = None;
+                picker.loading = false;
+                match result {
+                    Ok(mut catalog) => {
+                        catalog.models.retain(|model| {
+                            !model.reference.provider.trim().is_empty()
+                                && !model.reference.model.trim().is_empty()
+                        });
+                        let current = current_model_key(
+                            &catalog.models,
+                            self.chat.provider.as_deref(),
+                            &self.chat.model,
                         );
+                        sort_catalog_models(
+                            &mut catalog.models,
+                            current.as_ref(),
+                            &self.recent_models,
+                        );
+                        picker.models = catalog.models;
+                        picker.error = picker.models.is_empty().then(|| {
+                            "No models in provider catalog — press Ctrl+R to retry".to_string()
+                        });
+                        picker.refresh_filter(selected_key);
+                    }
+                    Err(error) => {
+                        picker.error = Some(format!(
+                            "Failed to load provider catalog: {error} — press Ctrl+R to retry"
+                        ));
+                    }
+                }
+            }
+            AppEvent::ModelPatched {
+                epoch,
+                session_id,
+                model,
+                result,
+            } => {
+                let Some(picker) = self
+                    .model_picker
+                    .as_mut()
+                    .filter(|picker| picker.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                self.model_picker_task = None;
+                picker.applying = false;
+                if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+                    picker.error = Some(
+                        "Active session changed while applying the model — reopen the picker"
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+                match result {
+                    Ok(()) => self.commit_model_selection(model),
+                    Err(error) => {
+                        picker.error = Some(format!(
+                            "Failed to update session model: {error} — press Enter to retry or Esc to cancel"
+                        ));
+                    }
+                }
+            }
+            AppEvent::SessionPickerPageLoaded {
+                epoch,
+                offset,
+                result,
+            } => {
+                let Some(picker) = self
+                    .session_picker
+                    .as_mut()
+                    .filter(|picker| picker.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                self.session_picker_task = None;
+                picker.loading = false;
+                let selected_before = picker.selected_session().map(|session| session.id.clone());
+                let loaded_page = result.is_ok();
+                match result {
+                    Ok(envelope) => {
+                        if offset == 0 {
+                            picker.sessions.clear();
+                        }
+                        for session in envelope.sessions {
+                            if picker.sessions.len() >= MAX_SESSION_PICKER_SESSIONS {
+                                break;
+                            }
+                            if let Some(existing) = picker
+                                .sessions
+                                .iter_mut()
+                                .find(|existing| existing.id == session.id)
+                            {
+                                *existing = session;
+                            } else {
+                                picker.sessions.push(session);
+                            }
+                        }
+                        picker.total = envelope.total;
+                        picker.page_limit = envelope.limit;
+                        picker.next_offset = (picker.sessions.len() < MAX_SESSION_PICKER_SESSIONS)
+                            .then_some(envelope.next_offset)
+                            .flatten()
+                            .filter(|next| *next > offset);
+                        picker.error = None;
+                        let preserve_id = if picker.selection_touched {
+                            selected_before
+                        } else {
+                            self.chat
+                                .session_id
+                                .clone()
+                                .filter(|active_id| {
+                                    picker
+                                        .sessions
+                                        .iter()
+                                        .any(|session| &session.id == active_id)
+                                })
+                                .or(selected_before)
+                        };
+                        picker.refresh_filter(preserve_id);
+                    }
+                    Err(error) => {
+                        picker.error = Some(format!(
+                            "Failed to load sessions: {error} — press Ctrl+R to retry"
+                        ));
+                    }
+                }
+                let should_continue = self.session_picker.as_ref().is_some_and(|picker| {
+                    loaded_page
+                        && !picker.query.is_empty()
+                        && picker.next_offset.is_some()
+                        && picker.sessions.len() < MAX_SESSION_PICKER_SESSIONS
+                });
+                if should_continue {
+                    self.load_next_session_picker_page();
+                }
+            }
+            AppEvent::SessionPickerVersionLoaded {
+                epoch,
+                session_id,
+                intent,
+                result,
+            } => {
+                let Some(picker) = self
+                    .session_picker
+                    .as_mut()
+                    .filter(|picker| picker.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                if !picker.mode.matches(&session_id, &intent) {
+                    return Ok(());
+                }
+                self.session_picker_task = None;
+                let mut patch = None;
+                match result {
+                    Ok(versioned) => {
+                        let fresh_title = versioned.summary.title.clone();
+                        let fresh_version = versioned.metadata_version;
+                        if let Some(existing) = picker
+                            .sessions
+                            .iter_mut()
+                            .find(|session| session.id == session_id)
+                        {
+                            *existing = versioned.summary;
+                        }
+                        match &mut picker.mode {
+                            SessionPickerMode::Rename {
+                                draft,
+                                base_title,
+                                draft_dirty,
+                                metadata_version,
+                                loading_version,
+                                error,
+                                ..
+                            } => {
+                                *loading_version = false;
+                                if *draft_dirty && *base_title != fresh_title {
+                                    // The user edited a title derived from a
+                                    // stale list row. Do not bind that draft to
+                                    // a newer ETag until the conflict has been
+                                    // made visible and explicitly retried.
+                                    *metadata_version = None;
+                                    *base_title = fresh_title;
+                                    *error = Some(
+                                        "Title changed on the server; draft preserved — press Ctrl+R to confirm against the latest title"
+                                            .to_string(),
+                                    );
+                                } else {
+                                    if !*draft_dirty {
+                                        *draft = fresh_title.clone();
+                                    }
+                                    *base_title = fresh_title;
+                                    *metadata_version = Some(fresh_version);
+                                    *error = None;
+                                }
+                            }
+                            SessionPickerMode::Pinning {
+                                target,
+                                loading_version,
+                                submitting,
+                                error,
+                                ..
+                            } => {
+                                *loading_version = false;
+                                *submitting = true;
+                                *error = None;
+                                patch = Some((fresh_version, *target));
+                            }
+                            SessionPickerMode::Browse => {}
+                        }
+                    }
+                    Err(error_message) => match &mut picker.mode {
+                        SessionPickerMode::Rename {
+                            loading_version,
+                            error,
+                            ..
+                        }
+                        | SessionPickerMode::Pinning {
+                            loading_version,
+                            error,
+                            ..
+                        } => {
+                            *loading_version = false;
+                            *error = Some(format!(
+                                "Failed to prepare update: {error_message} — press Ctrl+R to retry"
+                            ));
+                        }
+                        SessionPickerMode::Browse => {}
+                    },
+                }
+                if let Some((version, target)) = patch {
+                    self.spawn_session_picker_patch(
+                        epoch,
+                        session_id,
+                        version,
+                        SessionPickerIntent::Pin(target),
+                        PatchSessionMetadataRequest {
+                            title: None,
+                            pinned: Some(target),
+                        },
+                    );
+                }
+            }
+            AppEvent::SessionPickerPatched {
+                epoch,
+                session_id,
+                intent,
+                result,
+            } => {
+                let Some(picker) = self
+                    .session_picker
+                    .as_mut()
+                    .filter(|picker| picker.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                if !picker.mode.matches(&session_id, &intent) {
+                    return Ok(());
+                }
+                self.session_picker_task = None;
+                match result {
+                    Ok(versioned) => {
+                        if let Some(existing) = picker
+                            .sessions
+                            .iter_mut()
+                            .find(|session| session.id == session_id)
+                        {
+                            *existing = versioned.summary;
+                        }
+                        picker.mode = SessionPickerMode::Browse;
+                        picker.refresh_filter(Some(session_id));
+                        self.status_message = match intent {
+                            SessionPickerIntent::Rename => "Session renamed".to_string(),
+                            SessionPickerIntent::Pin(true) => "Session pinned".to_string(),
+                            SessionPickerIntent::Pin(false) => "Session unpinned".to_string(),
+                        };
+                    }
+                    Err(failure) => {
+                        let prefix = if failure.conflict {
+                            "Version conflict; refetch before retry"
+                        } else {
+                            "Session update failed"
+                        };
+                        let current = failure
+                            .current_version
+                            .map(|version| format!(" (server version {version})"))
+                            .unwrap_or_default();
+                        let message =
+                            format!("{prefix}{current}: {failure} — press Ctrl+R to retry");
+                        match &mut picker.mode {
+                            SessionPickerMode::Rename {
+                                metadata_version,
+                                submitting,
+                                error,
+                                ..
+                            } => {
+                                *metadata_version = None;
+                                *submitting = false;
+                                *error = Some(message);
+                            }
+                            SessionPickerMode::Pinning {
+                                submitting, error, ..
+                            } => {
+                                *submitting = false;
+                                *error = Some(message);
+                            }
+                            SessionPickerMode::Browse => {}
+                        }
                     }
                 }
             }
@@ -1591,6 +2209,42 @@ impl App {
             return;
         }
 
+        // Non-pointer modal owners still consume mouse input. In particular,
+        // a delete confirmation must not let the wheel move the Session row
+        // hidden behind it; cancel then returns to the exact prior selection.
+        if self.serve_offer.is_some()
+            || self.pending_delete.is_some()
+            || self.schedule_form.is_some()
+            || self.config_editor.is_some()
+        {
+            return;
+        }
+
+        if let Some(picker) = self.session_picker.as_mut() {
+            if matches!(picker.mode, SessionPickerMode::Browse) {
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp => -3,
+                    MouseEventKind::ScrollDown => 3,
+                    _ => return,
+                };
+                picker.selected = scroll_selection(picker.selected, picker.visible.len(), delta);
+                picker.selection_touched = true;
+            }
+            return;
+        }
+
+        if let Some(picker) = self.model_picker.as_mut() {
+            let delta = match mouse.kind {
+                MouseEventKind::ScrollUp => -3,
+                MouseEventKind::ScrollDown => 3,
+                _ => return,
+            };
+            if !picker.loading && !picker.applying {
+                picker.selected = scroll_selection(picker.selected, picker.visible.len(), delta);
+            }
+            return;
+        }
+
         let delta: i32 = match mouse.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
@@ -1680,11 +2334,12 @@ impl App {
 
     /// Whether an exclusive modal currently owns the keyboard. `F1`/Ctrl+`?`/
     /// Ctrl+L are gated on this so they can't stack a second overlay on top
-    /// of one of these six — see the precedence comment on `handle_key`.
+    /// of one of these seven — see the precedence comment on `handle_key`.
     fn any_modal_open(&self) -> bool {
         self.serve_offer.is_some()
             || self.pending_question.is_some()
             || self.pending_delete.is_some()
+            || self.session_picker.is_some()
             || self.model_picker.is_some()
             || self.schedule_form.is_some()
             || self.config_editor.is_some()
@@ -1699,9 +2354,10 @@ impl App {
     ///   0. `serve_offer`      — startup-only "start a local server?" offer
     ///   1. `pending_question` — agent permission/clarification gate
     ///   2. `pending_delete`   — session delete confirmation
-    ///   3. `model_picker`     — Ctrl+O provider-catalog picker
-    ///   4. `schedule_form`    — new-schedule authoring form
-    ///   5. `config_editor`    — raw config JSON editor
+    ///   3. `session_picker`   — Ctrl+P contextual session picker
+    ///   4. `model_picker`     — Ctrl+O provider-catalog picker
+    ///   5. `schedule_form`    — new-schedule authoring form
+    ///   6. `config_editor`    — raw config JSON editor
     ///
     /// Runtime modals can coexist in state because a clarification arrives
     /// asynchronously. The renderer layers them in the reverse order below,
@@ -1769,14 +2425,19 @@ impl App {
             return self.handle_delete_confirm_key(key).await;
         }
 
-        // 3. The model picker likewise captures all input (navigation/apply)
+        // 3. The contextual session picker owns search/navigation/mutations.
+        if self.session_picker.is_some() {
+            return self.handle_session_picker_key(key).await;
+        }
+
+        // 4. The model picker likewise captures all input (navigation/apply)
         // before the global bindings below — same pattern as the other
         // modals.
         if self.model_picker.is_some() {
             return self.handle_model_picker_key(key).await;
         }
 
-        // 4. The schedule-authoring modal likewise captures all input: Tab moves
+        // 5. The schedule-authoring modal likewise captures all input: Tab moves
         // between fields and digits belong in cron expressions, so it must run
         // before the global Tab/1-6 tab-switching below (which would otherwise
         // swallow those keys and never reach the form).
@@ -1785,7 +2446,7 @@ impl App {
             return Ok(());
         }
 
-        // 5. The config editor is a full multi-line text buffer, so it must claim
+        // 6. The config editor is a full multi-line text buffer, so it must claim
         // every key (digits, Tab, Enter/newlines) before the global navigation
         // below — same rationale as the schedule form.
         if self.config_editor.is_some() {
@@ -1808,6 +2469,10 @@ impl App {
                 }
                 KeyCode::Char('o') if self.tab == Tab::Chat && !self.chat.streaming => {
                     self.open_model_picker();
+                    return Ok(());
+                }
+                KeyCode::Char('p') if self.tab == Tab::Chat && !self.chat.streaming => {
+                    self.open_session_picker();
                     return Ok(());
                 }
                 _ => {}
@@ -2504,19 +3169,42 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.pending_delete = None;
-                if let Some(tx) = self.event_tx.clone() {
-                    let client = self.client.clone();
-                    tokio::spawn(async move {
-                        let outcome = match client.delete_session(&id).await {
-                            Ok(()) => Ok("Session deleted".to_string()),
-                            Err(e) => Err(format!("Delete failed: {e}")),
-                        };
-                        let _ = tx.send(AppEvent::ActionDone {
-                            outcome,
-                            reload_tab: true,
-                        });
-                    });
+                if self.deleting_session_id.is_some() {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Wait for the current session delete to finish",
+                    );
+                    return Ok(());
                 }
+                if self.chat.streaming && self.chat.session_id.as_deref() == Some(id.as_str()) {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Stop the active run before deleting its session",
+                    );
+                    return Ok(());
+                }
+                let Some(tx) = self.event_tx.clone() else {
+                    self.notify(
+                        NoticeLevel::Error,
+                        "Session delete is not attached to an event loop",
+                    );
+                    return Ok(());
+                };
+                self.deleting_session_id = Some(id.clone());
+                self.status_message = "Deleting session...".to_string();
+                let client = self.client.clone();
+                let session_picker_epoch = self.session_picker.as_ref().map(|picker| picker.epoch);
+                tokio::spawn(async move {
+                    let result = client
+                        .delete_session(&id)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::SessionDeleted {
+                        session_id: id,
+                        result,
+                        session_picker_epoch,
+                    });
+                });
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.pending_delete = None;
@@ -2625,6 +3313,24 @@ impl App {
                 self.chat.textarea.insert_newline();
             }
             KeyCode::Enter => {
+                // Selecting a session starts an asynchronous history/summary
+                // fetch after the picker closes. Keep the existing draft
+                // editable while that fetch is in flight, but never submit it
+                // against the session still visible underneath: a concurrent
+                // `ChatStarted` and `SessionOpened` could otherwise route the
+                // turn (or its provider/model) to different sessions.
+                if self.opening_session_id.is_some() {
+                    self.status_message =
+                        "Session is still resuming — message kept as draft".to_string();
+                    return Ok(());
+                }
+                if self.chat.session_id.as_ref().is_some_and(|session_id| {
+                    self.deleting_session_id.as_deref() == Some(session_id.as_str())
+                }) {
+                    self.status_message =
+                        "Session is being deleted — message kept as draft".to_string();
+                    return Ok(());
+                }
                 let input = self.chat.textarea.lines().join("\n");
                 let input = input.trim().to_string();
                 if input.is_empty() {
@@ -2681,12 +3387,14 @@ impl App {
         let client = self.client.clone();
         let existing_session = self.chat.session_id.clone();
         let project_id = self.chat.project_id.clone();
+        let provider = self.chat.provider.clone();
         tokio::spawn(async move {
             let req = ChatRequest {
                 message,
                 session_id: existing_session,
                 project_id,
                 model: Some(model),
+                provider,
             };
             let result = client
                 .chat(req)
@@ -2764,6 +3472,7 @@ impl App {
         };
         let client = self.client.clone();
         let model = self.chat.model.clone();
+        let provider = self.chat.provider.clone();
         tokio::spawn(async move {
             let model = if model.is_empty() { None } else { Some(model) };
             let ready = if *sse_ready.borrow() {
@@ -2791,7 +3500,10 @@ impl App {
             // will ever arrive for a run that never started — report it back so
             // the handler can finalize `chat.streaming` instead of spinning
             // forever waiting for events behind a run that doesn't exist.
-            if let Err(e) = client.execute(&session_id, model.as_deref()).await {
+            if let Err(e) = client
+                .execute(&session_id, model.as_deref(), provider.as_deref())
+                .await
+            {
                 let _ = tx.send(AppEvent::ExecuteFailed(e.to_string()));
             }
         });
@@ -2851,9 +3563,15 @@ impl App {
             } else {
                 None
             };
+            let provider = summary
+                .model_ref
+                .as_ref()
+                .map(|model_ref| model_ref.provider.clone())
+                .or_else(|| summary.provider.clone());
             let opened = OpenedSession {
                 messages: map_history(history.messages),
                 model: summary.model,
+                provider,
                 project_id: summary.project_id,
                 is_running: summary.is_running,
                 pending,
@@ -2883,7 +3601,10 @@ impl App {
         self.chat.token_usage = None;
         self.chat.scroll_offset = 0;
         self.chat.auto_scroll = true;
+        self.chat.streaming = false;
         self.chat.plan_mode = false;
+        self.stream_disconnected = false;
+        self.pending_answer_run_started = false;
         self.supersede_pending_answer();
         self.pending_question = None;
         self.dismissed_question = None;
@@ -3474,6 +4195,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: true,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -3532,6 +4254,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: true,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -3551,6 +4274,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: false,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -3614,6 +4338,7 @@ impl App {
                         let _ = tx.send(AppEvent::ActionDone {
                             outcome,
                             reload_tab: true,
+                            session_picker_epoch: None,
                         });
                     });
                 }
@@ -3730,6 +4455,7 @@ impl App {
                             let _ = tx.send(AppEvent::ActionDone {
                                 outcome,
                                 reload_tab: true,
+                                session_picker_epoch: None,
                             });
                         });
                     }
@@ -3746,89 +4472,680 @@ impl App {
         Ok(())
     }
 
-    /// `Ctrl+O` on the Chat tab: open the model picker and load the provider
-    /// catalog off the event loop — the modal opens immediately (`loading:
-    /// true`, empty list) and populates when `AppEvent::CatalogLoaded` lands.
-    fn open_model_picker(&mut self) {
-        self.model_picker = Some(ModelPicker {
-            models: Vec::new(),
+    // ── Contextual session picker (Ctrl+P) ──
+
+    fn open_session_picker(&mut self) {
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
+        let epoch = self.picker_epoch;
+        self.session_picker = Some(SessionPicker {
+            epoch,
+            sessions: Vec::new(),
+            visible: Vec::new(),
+            query: String::new(),
             selected: 0,
+            selection_touched: false,
             loading: true,
+            error: None,
+            total: 0,
+            page_limit: 0,
+            next_offset: None,
+            mode: SessionPickerMode::Browse,
         });
-        self.status_message = "Loading models...".to_string();
+        self.load_session_picker_page(epoch, 0);
+    }
+
+    fn close_session_picker(&mut self) {
+        if let Some(task) = self.session_picker_task.take() {
+            task.abort();
+        }
+        self.session_picker = None;
+    }
+
+    /// Give every page or mutation request its own generation. Aborting a
+    /// Tokio task is best-effort: its event may already be queued, so changing
+    /// the epoch is what prevents an old response from satisfying a later
+    /// rename or pin operation for the same session.
+    fn advance_session_picker_epoch(&mut self) -> Option<u64> {
+        if let Some(task) = self.session_picker_task.take() {
+            task.abort();
+        }
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
+        let picker = self.session_picker.as_mut()?;
+        picker.epoch = self.picker_epoch;
+        Some(self.picker_epoch)
+    }
+
+    fn reload_session_picker(&mut self) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        if let Some(task) = self.session_picker_task.take() {
+            task.abort();
+        }
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
+        picker.epoch = self.picker_epoch;
+        picker.sessions.clear();
+        picker.visible.clear();
+        picker.selected = 0;
+        picker.selection_touched = false;
+        picker.loading = true;
+        picker.error = None;
+        picker.total = 0;
+        picker.page_limit = 0;
+        picker.next_offset = None;
+        picker.mode = SessionPickerMode::Browse;
+        self.load_session_picker_page(self.picker_epoch, 0);
+    }
+
+    fn load_session_picker_page(&mut self, epoch: u64, offset: usize) {
+        let Some(tx) = self.event_tx.clone() else {
+            if let Some(picker) = self.session_picker.as_mut() {
+                picker.loading = false;
+                picker.error = Some("Session picker is not attached to an event loop".to_string());
+            }
+            return;
+        };
+        let Some(picker) = self
+            .session_picker
+            .as_mut()
+            .filter(|picker| picker.epoch == epoch)
+        else {
+            return;
+        };
+        picker.loading = true;
+        let limit = (picker.page_limit > 0).then_some(picker.page_limit);
+        let client = self.client.clone();
+        self.session_picker_task = Some(tokio::spawn(async move {
+            let result = client
+                .list_sessions(limit, (offset > 0).then_some(offset))
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SessionPickerPageLoaded {
+                epoch,
+                offset,
+                result,
+            });
+        }));
+    }
+
+    fn load_next_session_picker_page(&mut self) {
+        if self.session_picker_task.is_some() {
+            return;
+        }
+        let Some((epoch, offset)) = self
+            .session_picker
+            .as_ref()
+            .and_then(|picker| picker.next_offset.map(|offset| (picker.epoch, offset)))
+        else {
+            return;
+        };
+        self.load_session_picker_page(epoch, offset);
+    }
+
+    async fn handle_session_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let mode = self
+            .session_picker
+            .as_ref()
+            .map(|picker| match picker.mode {
+                SessionPickerMode::Browse => 0,
+                SessionPickerMode::Rename { .. } => 1,
+                SessionPickerMode::Pinning { .. } => 2,
+            });
+        match mode {
+            Some(0) => self.handle_session_picker_browse_key(key),
+            Some(1) => self.handle_session_picker_rename_key(key),
+            Some(2) => self.handle_session_picker_pinning_key(key),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_session_picker_browse_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('r') => {
+                    self.reload_session_picker();
+                    return;
+                }
+                KeyCode::Char('u') => {
+                    if let Some(picker) = self.session_picker.as_mut() {
+                        let preserve = picker.selected_session().map(|s| s.id.clone());
+                        picker.query.clear();
+                        picker.selection_touched = true;
+                        picker.refresh_filter(preserve);
+                    }
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    if let Some(session) = self
+                        .session_picker
+                        .as_ref()
+                        .and_then(SessionPicker::selected_session)
+                    {
+                        self.pending_delete = Some((session.id.clone(), session.title.clone()));
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    picker.selection_touched = true;
+                }
+            }
+            KeyCode::Down => {
+                let load_more = if let Some(picker) = self.session_picker.as_mut() {
+                    picker.selection_touched = true;
+                    if picker.selected + 1 < picker.visible.len() {
+                        picker.selected += 1;
+                        false
+                    } else {
+                        picker.next_offset.is_some()
+                    }
+                } else {
+                    false
+                };
+                if load_more {
+                    self.load_next_session_picker_page();
+                }
+            }
+            KeyCode::PageDown | KeyCode::Char(']') => self.load_next_session_picker_page(),
+            KeyCode::Enter => {
+                let session_id = self
+                    .session_picker
+                    .as_ref()
+                    .and_then(SessionPicker::selected_session)
+                    .map(|session| session.id.clone());
+                if let Some(session_id) = session_id {
+                    self.close_session_picker();
+                    self.resume_session(session_id);
+                }
+            }
+            KeyCode::F(2) => self.begin_session_rename(),
+            KeyCode::F(3) => self.begin_session_pin_toggle(),
+            KeyCode::Delete => {
+                if let Some(session) = self
+                    .session_picker
+                    .as_ref()
+                    .and_then(SessionPicker::selected_session)
+                {
+                    self.pending_delete = Some((session.id.clone(), session.title.clone()));
+                }
+            }
+            KeyCode::Esc => self.close_session_picker(),
+            KeyCode::Backspace => {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    let preserve = picker.selected_session().map(|s| s.id.clone());
+                    picker.query.pop();
+                    picker.selection_touched = true;
+                    picker.refresh_filter(preserve);
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    let preserve = picker.selected_session().map(|s| s.id.clone());
+                    picker.query.push(character);
+                    picker.selection_touched = true;
+                    picker.refresh_filter(preserve);
+                }
+                if self
+                    .session_picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.query.is_empty() && picker.next_offset.is_some())
+                {
+                    self.load_next_session_picker_page();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_session_rename(&mut self) {
+        let Some((session_id, draft)) = self.session_picker.as_ref().and_then(|picker| {
+            picker
+                .selected_session()
+                .map(|session| (session.id.clone(), session.title.clone()))
+        }) else {
+            return;
+        };
+        let Some(epoch) = self.advance_session_picker_epoch() else {
+            return;
+        };
+        if let Some(picker) = self.session_picker.as_mut() {
+            picker.mode = SessionPickerMode::Rename {
+                session_id: session_id.clone(),
+                base_title: draft.clone(),
+                draft,
+                draft_dirty: false,
+                metadata_version: None,
+                loading_version: true,
+                submitting: false,
+                error: None,
+            };
+        }
+        self.spawn_session_picker_version_load(epoch, session_id, SessionPickerIntent::Rename);
+    }
+
+    fn begin_session_pin_toggle(&mut self) {
+        let Some((session_id, target)) = self.session_picker.as_ref().and_then(|picker| {
+            picker
+                .selected_session()
+                .map(|session| (session.id.clone(), !session.pinned))
+        }) else {
+            return;
+        };
+        let Some(epoch) = self.advance_session_picker_epoch() else {
+            return;
+        };
+        if let Some(picker) = self.session_picker.as_mut() {
+            picker.mode = SessionPickerMode::Pinning {
+                session_id: session_id.clone(),
+                target,
+                loading_version: true,
+                submitting: false,
+                error: None,
+            };
+        }
+        self.spawn_session_picker_version_load(epoch, session_id, SessionPickerIntent::Pin(target));
+    }
+
+    fn handle_session_picker_rename_key(&mut self, key: KeyEvent) {
+        let mut retry = None;
+        let mut submit = None;
+        let mut cancel = false;
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        let SessionPickerMode::Rename {
+            session_id,
+            draft,
+            draft_dirty,
+            metadata_version,
+            loading_version,
+            submitting,
+            error,
+            ..
+        } = &mut picker.mode
+        else {
+            return;
+        };
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            if !*submitting {
+                *metadata_version = None;
+                *loading_version = true;
+                *error = None;
+                retry = Some((picker.epoch, session_id.clone()));
+            }
+        } else if *submitting {
+            return;
+        } else {
+            match key.code {
+                KeyCode::Enter if !draft.trim().is_empty() => {
+                    if let Some(version) = *metadata_version {
+                        *submitting = true;
+                        *error = None;
+                        submit = Some((
+                            picker.epoch,
+                            session_id.clone(),
+                            version,
+                            draft.trim().to_string(),
+                        ));
+                    } else if !*loading_version {
+                        *error = Some("No current version — press Ctrl+R to retry".to_string());
+                    }
+                }
+                KeyCode::Esc => cancel = true,
+                KeyCode::Backspace => {
+                    draft.pop();
+                    *draft_dirty = true;
+                    *error = None;
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    draft.push(character);
+                    *draft_dirty = true;
+                    *error = None;
+                }
+                _ => {}
+            }
+        }
+
+        if cancel {
+            self.advance_session_picker_epoch();
+            if let Some(picker) = self.session_picker.as_mut() {
+                picker.mode = SessionPickerMode::Browse;
+            }
+        } else if let Some((epoch, session_id)) = retry {
+            let epoch = self.advance_session_picker_epoch().unwrap_or(epoch);
+            self.spawn_session_picker_version_load(epoch, session_id, SessionPickerIntent::Rename);
+        } else if let Some((epoch, session_id, version, title)) = submit {
+            self.spawn_session_picker_patch(
+                epoch,
+                session_id,
+                version,
+                SessionPickerIntent::Rename,
+                PatchSessionMetadataRequest {
+                    title: Some(title),
+                    pinned: None,
+                },
+            );
+        }
+    }
+
+    fn handle_session_picker_pinning_key(&mut self, key: KeyEvent) {
+        let mut retry = None;
+        let mut cancel = false;
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        let SessionPickerMode::Pinning {
+            session_id,
+            target,
+            loading_version,
+            submitting,
+            error,
+        } = &mut picker.mode
+        else {
+            return;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            if !*submitting {
+                *loading_version = true;
+                *error = None;
+                retry = Some((picker.epoch, session_id.clone(), *target));
+            }
+        } else if key.code == KeyCode::Esc && !*submitting {
+            cancel = true;
+        }
+
+        if cancel {
+            self.advance_session_picker_epoch();
+            if let Some(picker) = self.session_picker.as_mut() {
+                picker.mode = SessionPickerMode::Browse;
+            }
+        } else if let Some((epoch, session_id, target)) = retry {
+            let epoch = self.advance_session_picker_epoch().unwrap_or(epoch);
+            self.spawn_session_picker_version_load(
+                epoch,
+                session_id,
+                SessionPickerIntent::Pin(target),
+            );
+        }
+    }
+
+    fn spawn_session_picker_version_load(
+        &mut self,
+        epoch: u64,
+        session_id: String,
+        intent: SessionPickerIntent,
+    ) {
+        if let Some(task) = self.session_picker_task.take() {
+            task.abort();
+        }
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
         let client = self.client.clone();
-        tokio::spawn(async move {
-            let r = client
-                .get_provider_catalog()
+        self.session_picker_task = Some(tokio::spawn(async move {
+            let result = client
+                .get_session_versioned(&session_id)
                 .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(AppEvent::CatalogLoaded(r));
-        });
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SessionPickerVersionLoaded {
+                epoch,
+                session_id,
+                intent,
+                result,
+            });
+        }));
     }
 
-    /// Drive the model picker modal: `↑/↓`/`j`/`k` move the selection, `Enter`
-    /// applies the highlighted model (a no-op while the catalog is still
-    /// loading — the list is empty, so there's nothing to apply), `Esc`
-    /// closes without changes.
-    async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn spawn_session_picker_patch(
+        &mut self,
+        epoch: u64,
+        session_id: String,
+        expected_version: u64,
+        intent: SessionPickerIntent,
+        patch: PatchSessionMetadataRequest,
+    ) {
+        if let Some(task) = self.session_picker_task.take() {
+            task.abort();
+        }
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        self.session_picker_task = Some(tokio::spawn(async move {
+            let result = client
+                .patch_session_metadata(&session_id, expected_version, &patch)
+                .await;
+            let _ = tx.send(AppEvent::SessionPickerPatched {
+                epoch,
+                session_id,
+                intent,
+                result,
+            });
+        }));
+    }
+
+    // ── Searchable model picker (Ctrl+O) ──
+
+    fn open_model_picker(&mut self) {
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
+        let epoch = self.picker_epoch;
+        self.model_picker = Some(ModelPicker {
+            epoch,
+            models: Vec::new(),
+            visible: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+            applying: false,
+            error: None,
+        });
+        self.load_model_catalog(epoch);
+    }
+
+    fn reload_model_catalog(&mut self) {
+        if let Some(task) = self.model_picker_task.take() {
+            task.abort();
+        }
+        self.picker_epoch = self.picker_epoch.wrapping_add(1);
         let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        picker.epoch = self.picker_epoch;
+        self.load_model_catalog(self.picker_epoch);
+    }
+
+    fn load_model_catalog(&mut self, epoch: u64) {
+        if let Some(task) = self.model_picker_task.take() {
+            task.abort();
+        }
+        let Some(tx) = self.event_tx.clone() else {
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.loading = false;
+                picker.error = Some("Model picker is not attached to an event loop".to_string());
+            }
+            return;
+        };
+        if let Some(picker) = self.model_picker.as_mut() {
+            picker.loading = true;
+            picker.error = None;
+        }
+        let client = self.client.clone();
+        self.model_picker_task = Some(tokio::spawn(async move {
+            let result = client
+                .get_provider_catalog()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::CatalogLoaded { epoch, result });
+        }));
+    }
+
+    fn close_model_picker(&mut self) {
+        if let Some(task) = self.model_picker_task.take() {
+            task.abort();
+        }
+        self.model_picker = None;
+    }
+
+    async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(picker) = self.model_picker.as_ref() else {
             return Ok(());
         };
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.selected = picker.selected.saturating_sub(1);
+        if picker.applying {
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            if let Some(picker) = self.model_picker.as_mut() {
+                let preserve = picker.selected_model().map(model_key);
+                picker.query.clear();
+                picker.refresh_filter(preserve);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if picker.selected + 1 < picker.models.len() {
-                    picker.selected += 1;
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    if picker.selected + 1 < picker.visible.len() {
+                        picker.selected += 1;
+                    }
                 }
             }
             KeyCode::Enter => {
-                if let Some(model) = picker.models.get(picker.selected).cloned() {
-                    self.model_picker = None;
+                let model = self
+                    .model_picker
+                    .as_ref()
+                    .and_then(ModelPicker::selected_model)
+                    .cloned();
+                if let Some(model) = model {
                     self.apply_model(model);
                 }
             }
-            KeyCode::Esc => {
-                self.model_picker = None;
-                self.status_message = "Ready".to_string();
+            KeyCode::Esc => self.close_model_picker(),
+            KeyCode::Backspace => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    let preserve = picker.selected_model().map(model_key);
+                    picker.query.pop();
+                    picker.refresh_filter(preserve);
+                }
+            }
+            KeyCode::Char('r')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self
+                        .model_picker
+                        .as_ref()
+                        .is_some_and(|picker| !picker.loading && picker.visible.is_empty()) =>
+            {
+                self.reload_model_catalog();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    let preserve = picker.selected_model().map(model_key);
+                    picker.query.push(character);
+                    picker.refresh_filter(preserve);
+                }
             }
             _ => {}
         }
         Ok(())
     }
 
-    /// Apply a model picked from the catalog. `chat.model` gets the plain
-    /// model id — the string form `ChatRequest.model` / `ExecuteRequest.model`
-    /// / `PatchSessionRequest.model` actually resolve on the server (see
-    /// `execute::types::ExecuteRequest`'s doc comment: `request.model` is a
-    /// bare id, not a `provider/model` pair; that pairing only exists via the
-    /// separate `model_ref` field, which this picker deliberately doesn't
-    /// use). If a session is already active, also fires a fire-and-forget
-    /// PATCH so the server-side session record doesn't drift from what the
-    /// next turn will actually send.
+    /// Apply only after the server accepts the active-session PATCH. This
+    /// avoids the old half-applied state where the local badge changed and the
+    /// modal closed even though persistence failed.
     fn apply_model(&mut self, model: CatalogModel) {
-        let model_id = model.reference.model.clone();
-        self.chat.model = model_id.clone();
-        self.status_message = format!("Model: {}", model.display_name);
-
-        if let (Some(session_id), Some(tx)) = (self.chat.session_id.clone(), self.event_tx.clone())
-        {
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                let outcome = match client.patch_session_model(&session_id, &model_id).await {
-                    Ok(()) => Ok("Session model updated".to_string()),
-                    Err(e) => Err(format!("Failed to update session model: {e}")),
-                };
-                let _ = tx.send(AppEvent::ActionDone {
-                    outcome,
-                    reload_tab: false,
-                });
+        let Some(session_id) = self.chat.session_id.clone() else {
+            self.commit_model_selection(model);
+            return;
+        };
+        let Some(tx) = self.event_tx.clone() else {
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.error = Some("Model update cannot run without the event loop".to_string());
+            }
+            return;
+        };
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        picker.applying = true;
+        picker.error = None;
+        let epoch = picker.epoch;
+        let model_ref = model.reference.clone();
+        let client = self.client.clone();
+        self.model_picker_task = Some(tokio::spawn(async move {
+            let result = client
+                .patch_session_model(&session_id, &model_ref)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ModelPatched {
+                epoch,
+                session_id,
+                model,
+                result,
             });
+        }));
+    }
+
+    pub(crate) fn model_group_label(&self, model: &CatalogModel) -> String {
+        let current = self.model_picker.as_ref().and_then(|picker| {
+            current_model_key(
+                &picker.models,
+                self.chat.provider.as_deref(),
+                &self.chat.model,
+            )
+        });
+        if current.as_ref() == Some(&model_key(model)) {
+            "Current".to_string()
+        } else if self.recent_models.contains(&model_key(model)) {
+            "Recent".to_string()
+        } else {
+            let provider = if model.provider_display_name.trim().is_empty() {
+                model.reference.provider.as_str()
+            } else {
+                model.provider_display_name.as_str()
+            };
+            format!("Provider: {provider}")
         }
+    }
+
+    fn commit_model_selection(&mut self, model: CatalogModel) {
+        let key = model_key(&model);
+        let provider_label = if model.provider_display_name.trim().is_empty() {
+            model.reference.provider.clone()
+        } else {
+            model.provider_display_name.clone()
+        };
+        self.recent_models.retain(|candidate| candidate != &key);
+        self.recent_models.push_front(key);
+        self.recent_models.truncate(MAX_RECENT_MODELS);
+        self.chat.model = model.reference.model.clone();
+        self.chat.provider = Some(model.reference.provider.clone());
+        self.model_picker = None;
+        self.status_message = format!("Model: {} ({provider_label})", model.display_name);
     }
 }
 
@@ -4408,6 +5725,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: None,
@@ -4423,6 +5741,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: Some(PendingQuestion {
@@ -4475,6 +5794,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: None,
@@ -4491,6 +5811,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: Some(PendingQuestion {
@@ -4528,6 +5849,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: None,
@@ -4544,6 +5866,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
+                provider: None,
                 project_id: None,
                 is_running: false,
                 pending: Some(PendingQuestion {
@@ -4626,7 +5949,7 @@ mod question_tests {
         use ratatui::Terminal;
 
         let app = app_with_question(vec!["Approve", "Deny"]);
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(60, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
 
@@ -5316,6 +6639,8 @@ mod question_tests {
             title: String::new(),
             title_generated: true,
             model: String::new(),
+            model_ref: None,
+            provider: None,
             is_running: false,
             has_pending_question: false,
             last_run_status: None,
@@ -5440,6 +6765,122 @@ mod question_tests {
         app.pending_delete = Some(("s1".to_string(), "My session".to_string()));
         app.handle_key(k(KeyCode::Char('y'))).await.unwrap();
         assert!(app.pending_delete.is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_delete_of_active_session_resets_server_backed_chat_state() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.chat.project_id = Some("project-1".to_string());
+        app.chat.model = "gpt-5".to_string();
+        app.chat.provider = Some("openai".to_string());
+        app.chat.messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            content: "old transcript".to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        });
+        app.chat.current_response = "partial".to_string();
+        app.chat.streaming = true;
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        app.deleting_session_id = Some("active".to_string());
+
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "active".to_string(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(app.deleting_session_id.is_none());
+        assert!(app.chat.session_id.is_none());
+        assert!(app.chat.messages.is_empty());
+        assert!(app.chat.current_response.is_empty());
+        assert!(!app.chat.streaming);
+        assert_eq!(app.chat.model, "gpt-5");
+        assert_eq!(app.chat.provider.as_deref(), Some("openai"));
+        assert_eq!(app.chat.project_id.as_deref(), Some("project-1"));
+        assert_eq!(app.chat.textarea.lines().join("\n"), "d");
+        assert_eq!(
+            app.status_message,
+            "Session deleted — started a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_delete_of_opening_non_active_session_preserves_current_chat() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.chat.messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            content: "keep transcript".to_string(),
+            tool_calls: Vec::new(),
+            reasoning: None,
+        });
+        app.opening_session_id = Some("delete-me".to_string());
+        app.deleting_session_id = Some("delete-me".to_string());
+
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "delete-me".to_string(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(app.deleting_session_id.is_none());
+        assert!(app.opening_session_id.is_none());
+        assert_eq!(app.chat.session_id.as_deref(), Some("active"));
+        assert_eq!(app.chat.messages[0].content, "keep transcript");
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "delete-me".to_string(),
+            result: Ok(opened(vec![asst_msg("must stay stale")])),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("active"));
+        assert_eq!(app.chat.messages[0].content, "keep transcript");
+    }
+
+    #[tokio::test]
+    async fn active_session_delete_is_blocked_while_chat_is_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.chat.streaming = true;
+        app.pending_delete = Some(("active".to_string(), "Active".to_string()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+
+        app.handle_delete_confirm_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+
+        assert!(app.pending_delete.is_none());
+        assert!(app.deleting_session_id.is_none());
+        assert!(event_rx.try_recv().is_err());
+        assert!(app.status_message.contains("Stop the active run"));
+    }
+
+    #[tokio::test]
+    async fn enter_keeps_draft_while_active_session_delete_is_in_flight() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.deleting_session_id = Some("active".to_string());
+        for character in "keep me".chars() {
+            app.chat.textarea.input(key(KeyCode::Char(character)));
+        }
+
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+
+        assert_eq!(app.chat.textarea.lines().join("\n"), "keep me");
+        assert!(app.chat.messages.is_empty());
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.status_message,
+            "Session is being deleted — message kept as draft"
+        );
     }
 
     /// F1/Ctrl+L must not stack the help/notification overlay on top of an
@@ -5814,6 +7255,7 @@ mod question_tests {
         OpenedSession {
             messages,
             model: "claude-sonnet-5".to_string(),
+            provider: None,
             project_id: None,
             is_running: false,
             pending: None,
@@ -5865,6 +7307,31 @@ mod question_tests {
         );
         assert!(app.chat.current_response.is_empty(), "scratch state wiped");
         assert!(app.chat.token_usage.is_none(), "scratch state wiped");
+    }
+
+    /// The session picker closes before its asynchronous resume finishes. A
+    /// plain Enter during that gap must keep the composer draft intact instead
+    /// of starting a chat against the previously visible session.
+    #[tokio::test]
+    async fn chat_enter_during_session_resume_preserves_draft_and_does_not_send() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-a".to_string());
+        app.opening_session_id = Some("session-b".to_string());
+        for character in "send after resume".chars() {
+            app.chat.textarea.input(key(KeyCode::Char(character)));
+        }
+
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-a"));
+        assert_eq!(app.opening_session_id.as_deref(), Some("session-b"));
+        assert_eq!(app.chat.textarea.lines().join("\n"), "send after resume");
+        assert!(app.chat.messages.is_empty());
+        assert!(!app.chat.streaming);
+        assert_eq!(
+            app.status_message,
+            "Session is still resuming — message kept as draft"
+        );
     }
 
     #[tokio::test]
@@ -6600,6 +8067,9 @@ mod question_tests {
     async fn session_opened_failure_notifies_and_leaves_chat_untouched() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("old".to_string());
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
 
         app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
@@ -6614,9 +8084,19 @@ mod question_tests {
             Some("old"),
             "a failed resume must not clobber the current session"
         );
+        assert!(
+            app.opening_session_id.is_none(),
+            "the failed resume must release the send gate"
+        );
         let last = app.notifications.last().expect("failure notified");
         assert!(last.text.contains("not found"));
         assert_eq!(last.level, NoticeLevel::Error);
+        assert!(app.status_message.contains("Failed to open session"));
+
+        app.handle_chat_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.chat.streaming, "the retained draft can now be sent");
+        assert_eq!(app.chat.messages.last().unwrap().content, "d");
+        assert!(app.chat.textarea.lines().join("\n").is_empty());
     }
 
     #[tokio::test]
@@ -6699,6 +8179,7 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("s1".to_string());
         app.chat.model = "claude-sonnet-5".to_string();
+        app.chat.provider = Some("anthropic".to_string());
         app.chat.project_id = Some("project-tui".to_string());
         app.chat.messages = vec![asst_msg("leftover")];
         app.chat.current_response = "partial".to_string();
@@ -6733,6 +8214,7 @@ mod question_tests {
             app.chat.model, "claude-sonnet-5",
             "model must survive a new session"
         );
+        assert_eq!(app.chat.provider.as_deref(), Some("anthropic"));
         assert_eq!(
             app.chat.project_id.as_deref(),
             Some("project-tui"),
@@ -7001,7 +8483,687 @@ mod question_tests {
         assert_eq!(app.sessions.selected, 1);
     }
 
-    // ── Model picker (WP5) ──
+    // ── Contextual searchable pickers (#636) ──
+
+    fn contextual_session_picker(sessions: Vec<SessionSummary>) -> SessionPicker {
+        SessionPicker {
+            epoch: 7,
+            visible: (0..sessions.len()).collect(),
+            sessions,
+            query: String::new(),
+            selected: 0,
+            selection_touched: false,
+            loading: false,
+            error: None,
+            total: 0,
+            page_limit: 2,
+            next_offset: None,
+            mode: SessionPickerMode::Browse,
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_p_opens_contextual_picker_and_escape_preserves_chat_draft() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        app.chat.textarea.input(key(KeyCode::Char('r')));
+        app.chat.scroll_offset = 11;
+        app.status_message = "Keep this exact status".to_string();
+        app.tab = Tab::Sessions;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.session_picker.is_none(), "Ctrl+P is Chat-tab only");
+
+        app.tab = Tab::Chat;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.session_picker.is_some());
+        app.handle_session_picker_key(key(KeyCode::Esc))
+            .await
+            .unwrap();
+        assert!(app.session_picker.is_none());
+        assert_eq!(app.chat.textarea.lines().join("\n"), "dr");
+        assert_eq!(app.chat.scroll_offset, 11);
+        assert_eq!(app.status_message, "Keep this exact status");
+    }
+
+    #[tokio::test]
+    async fn ctrl_p_is_ignored_while_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.chat.streaming = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.session_picker.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_picker_filters_title_model_id_and_status() {
+        let mut title_match = bare_session("alpha-12345678");
+        title_match.title = "Release investigation".to_string();
+        title_match.model = "claude-sonnet".to_string();
+        let mut model_match = bare_session("beta-87654321");
+        model_match.title = "Other".to_string();
+        model_match.model = "gpt-5.6-sol".to_string();
+        model_match.is_running = true;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![title_match, model_match]));
+        for character in "gpt".chars() {
+            app.handle_session_picker_key(key(KeyCode::Char(character)))
+                .await
+                .unwrap();
+        }
+        let picker = app.session_picker.as_ref().unwrap();
+        assert_eq!(picker.visible.len(), 1);
+        assert_eq!(picker.selected_session().unwrap().id, "beta-87654321");
+
+        for _ in 0..3 {
+            app.handle_session_picker_key(key(KeyCode::Backspace))
+                .await
+                .unwrap();
+        }
+        for character in "running".chars() {
+            app.handle_session_picker_key(key(KeyCode::Char(character)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            app.session_picker
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "beta-87654321"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_picker_pages_append_deduplicate_and_drop_stale_epochs() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![]));
+        app.handle_event(AppEvent::SessionPickerPageLoaded {
+            epoch: 7,
+            offset: 0,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("s1"), bare_session("s2")],
+                total: 3,
+                limit: 2,
+                offset: 0,
+                next_offset: Some(2),
+            }),
+        })
+        .await
+        .unwrap();
+        app.handle_event(AppEvent::SessionPickerPageLoaded {
+            epoch: 7,
+            offset: 2,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("s2"), bare_session("s3")],
+                total: 3,
+                limit: 2,
+                offset: 2,
+                next_offset: None,
+            }),
+        })
+        .await
+        .unwrap();
+        app.handle_event(AppEvent::SessionPickerPageLoaded {
+            epoch: 6,
+            offset: 0,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("stale")],
+                total: 1,
+                limit: 2,
+                offset: 0,
+                next_offset: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let picker = app.session_picker.as_ref().unwrap();
+        assert_eq!(
+            picker
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2", "s3"]
+        );
+        assert_eq!(picker.total, 3);
+    }
+
+    #[tokio::test]
+    async fn session_picker_page_failure_stops_until_explicit_retry() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut picker = contextual_session_picker(vec![bare_session("s1")]);
+        picker.query = "match".to_string();
+        picker.next_offset = Some(1);
+        picker.total = 2;
+        app.session_picker = Some(picker);
+
+        app.handle_event(AppEvent::SessionPickerPageLoaded {
+            epoch: 7,
+            offset: 1,
+            result: Err("offline".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let picker = app.session_picker.as_ref().unwrap();
+        assert_eq!(picker.next_offset, Some(1), "retry offset stays available");
+        assert!(picker.error.as_deref().unwrap().contains("offline"));
+        assert!(
+            app.session_picker_task.is_none(),
+            "an error must not immediately spawn the same page again"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_session_becomes_selected_when_a_later_page_arrives() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.session_picker = Some(contextual_session_picker(vec![]));
+        for (offset, sessions, next_offset) in [
+            (0, vec![bare_session("s1")], Some(1)),
+            (1, vec![bare_session("active")], None),
+        ] {
+            app.handle_event(AppEvent::SessionPickerPageLoaded {
+                epoch: 7,
+                offset,
+                result: Ok(ListSessionsEnvelope {
+                    sessions,
+                    total: 2,
+                    limit: 1,
+                    offset,
+                    next_offset,
+                }),
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            app.session_picker
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_page_preserves_operator_selection_after_navigation() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        let mut picker =
+            contextual_session_picker(vec![bare_session("s1"), bare_session("chosen")]);
+        picker.selected = 1;
+        picker.selection_touched = true;
+        app.session_picker = Some(picker);
+
+        app.handle_event(AppEvent::SessionPickerPageLoaded {
+            epoch: 7,
+            offset: 2,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("active")],
+                total: 3,
+                limit: 2,
+                offset: 2,
+                next_offset: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            app.session_picker
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .id,
+            "chosen"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_version_rebases_an_untouched_rename_draft() {
+        let mut original = bare_session("s1");
+        original.title = "A".to_string();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![original]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "A".to_string(),
+            base_title: "A".to_string(),
+            draft_dirty: false,
+            metadata_version: None,
+            loading_version: true,
+            submitting: false,
+            error: None,
+        };
+        let mut fresh = bare_session("s1");
+        fresh.title = "B".to_string();
+
+        app.handle_event(AppEvent::SessionPickerVersionLoaded {
+            epoch: 7,
+            session_id: "s1".to_string(),
+            intent: SessionPickerIntent::Rename,
+            result: Ok(crate::api::VersionedSession {
+                summary: fresh,
+                metadata_version: 2,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename {
+            draft,
+            base_title,
+            metadata_version,
+            error,
+            ..
+        } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("rename mode closed unexpectedly");
+        };
+        assert_eq!(draft, "B");
+        assert_eq!(base_title, "B");
+        assert_eq!(*metadata_version, Some(2));
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_changed_title_does_not_authorize_a_dirty_stale_draft() {
+        let mut original = bare_session("s1");
+        original.title = "A".to_string();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![original]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "my edit".to_string(),
+            base_title: "A".to_string(),
+            draft_dirty: true,
+            metadata_version: None,
+            loading_version: true,
+            submitting: false,
+            error: None,
+        };
+        let mut fresh = bare_session("s1");
+        fresh.title = "B".to_string();
+
+        app.handle_event(AppEvent::SessionPickerVersionLoaded {
+            epoch: 7,
+            session_id: "s1".to_string(),
+            intent: SessionPickerIntent::Rename,
+            result: Ok(crate::api::VersionedSession {
+                summary: fresh,
+                metadata_version: 2,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename {
+            draft,
+            base_title,
+            metadata_version,
+            error,
+            ..
+        } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("rename mode closed unexpectedly");
+        };
+        assert_eq!(draft, "my edit");
+        assert_eq!(base_title, "B");
+        assert!(metadata_version.is_none());
+        assert!(error.as_deref().unwrap().contains("Title changed"));
+    }
+
+    #[tokio::test]
+    async fn rename_conflict_preserves_draft_and_exposes_retry() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "keep my draft".to_string(),
+            base_title: "old title".to_string(),
+            draft_dirty: true,
+            metadata_version: Some(1),
+            loading_version: false,
+            submitting: true,
+            error: None,
+        };
+        app.handle_event(AppEvent::SessionPickerPatched {
+            epoch: 7,
+            session_id: "s1".to_string(),
+            intent: SessionPickerIntent::Rename,
+            result: Err(crate::api::SessionMutationFailure::test_conflict(2)),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename {
+            draft,
+            metadata_version,
+            submitting,
+            error,
+            ..
+        } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("rename mode must remain open");
+        };
+        assert_eq!(draft, "keep my draft");
+        assert!(metadata_version.is_none());
+        assert!(!submitting);
+        assert!(error.as_deref().unwrap().contains("Version conflict"));
+    }
+
+    #[tokio::test]
+    async fn successful_pin_updates_row_without_closing_picker() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Pinning {
+            session_id: "s1".to_string(),
+            target: true,
+            loading_version: false,
+            submitting: true,
+            error: None,
+        };
+        let mut updated = bare_session("s1");
+        updated.pinned = true;
+        app.handle_event(AppEvent::SessionPickerPatched {
+            epoch: 7,
+            session_id: "s1".to_string(),
+            intent: SessionPickerIntent::Pin(true),
+            result: Ok(crate::api::VersionedSession {
+                summary: updated,
+                metadata_version: 2,
+            }),
+        })
+        .await
+        .unwrap();
+        let picker = app.session_picker.as_ref().unwrap();
+        assert!(matches!(picker.mode, SessionPickerMode::Browse));
+        assert!(picker.sessions[0].pinned);
+    }
+
+    #[tokio::test]
+    async fn stale_mutation_response_cannot_satisfy_a_reopened_editor() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "new draft".to_string(),
+            base_title: "old title".to_string(),
+            draft_dirty: true,
+            metadata_version: None,
+            loading_version: true,
+            submitting: false,
+            error: None,
+        };
+        app.picker_epoch = 8;
+        app.session_picker.as_mut().unwrap().epoch = 8;
+
+        app.handle_event(AppEvent::SessionPickerVersionLoaded {
+            epoch: 7,
+            session_id: "s1".to_string(),
+            intent: SessionPickerIntent::Rename,
+            result: Ok(crate::api::VersionedSession {
+                summary: bare_session("s1"),
+                metadata_version: 99,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename {
+            draft,
+            metadata_version,
+            loading_version,
+            ..
+        } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("rename editor closed unexpectedly");
+        };
+        assert_eq!(draft, "new draft");
+        assert!(metadata_version.is_none());
+        assert!(*loading_version);
+    }
+
+    #[tokio::test]
+    async fn contextual_delete_confirmation_owns_input_then_returns_to_picker() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let mut session = bare_session("s1");
+        session.title = "Delete me".to_string();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![
+            session,
+            bare_session("s2"),
+            bare_session("s3"),
+            bare_session("s4"),
+        ]));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.pending_delete.as_ref().unwrap().0, "s1");
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(
+            app.session_picker.as_ref().unwrap().selected,
+            0,
+            "delete confirmation must consume the wheel"
+        );
+
+        app.handle_key(key(KeyCode::Char('n'))).await.unwrap();
+        assert!(app.pending_delete.is_none());
+        assert!(app.session_picker.is_some());
+        assert!(app.session_picker.as_ref().unwrap().query.is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_action_completion_cannot_erase_a_newer_rename_editor() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "keep this draft".to_string(),
+            base_title: "old".to_string(),
+            draft_dirty: true,
+            metadata_version: Some(1),
+            loading_version: false,
+            submitting: false,
+            error: None,
+        };
+
+        app.handle_event(AppEvent::ActionDone {
+            outcome: Ok("older delete completed".to_string()),
+            reload_tab: true,
+            session_picker_epoch: Some(7),
+        })
+        .await
+        .unwrap();
+
+        let SessionPickerMode::Rename { draft, .. } = &app.session_picker.as_ref().unwrap().mode
+        else {
+            panic!("late generic completion erased the editor");
+        };
+        assert_eq!(draft, "keep this draft");
+    }
+
+    #[test]
+    fn session_picker_mouse_wheel_moves_filtered_selection() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(
+            (0..6)
+                .map(|index| bare_session(&format!("s{index}")))
+                .collect(),
+        ));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.session_picker.as_ref().unwrap().selected, 3);
+    }
+
+    #[test]
+    fn session_picker_renders_at_sixty_columns() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut session = bare_session("session-12345678");
+        session.title = "很长的 Unicode 会话标题 for narrow terminals".to_string();
+        session.model = "claude-sonnet-5".to_string();
+        session.pinned = true;
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![session]));
+
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Session picker"));
+        assert!(text.contains("Unicode") || text.contains("很长"));
+        assert!(text.contains("★"));
+        assert!(text.contains("F2 rename"));
+        assert!(text.contains("Esc cancel"));
+    }
+
+    #[test]
+    fn session_rename_renders_only_the_title_input_cursor() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "New title".to_string(),
+            base_title: "Old title".to_string(),
+            draft_dirty: true,
+            metadata_version: Some(1),
+            loading_version: false,
+            submitting: false,
+            error: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_session_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Title:"));
+        assert!(!text.contains("Search:"));
+        assert_eq!(text.matches('▏').count(), 1, "rename has one focused field");
+    }
+
+    #[test]
+    fn session_rename_saving_hides_cursor_and_disabled_shortcuts() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Rename {
+            session_id: "s1".to_string(),
+            draft: "New title".to_string(),
+            base_title: "Old title".to_string(),
+            draft_dirty: true,
+            metadata_version: Some(1),
+            loading_version: false,
+            submitting: true,
+            error: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_session_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Saving..."));
+        assert!(!text.contains('▏'));
+        assert!(!text.contains("Enter save"));
+        assert!(!text.contains("Ctrl+R"));
+        assert!(!text.contains("Esc"));
+    }
+
+    #[test]
+    fn session_pin_saving_hides_disabled_shortcuts() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(vec![bare_session("s1")]));
+        app.session_picker.as_mut().unwrap().mode = SessionPickerMode::Pinning {
+            session_id: "s1".to_string(),
+            target: true,
+            loading_version: false,
+            submitting: true,
+            error: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_session_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Pinning selected session..."));
+        assert!(text.contains("Saving..."));
+        assert!(!text.contains("Ctrl+R"));
+        assert!(!text.contains("Esc"));
+    }
+
+    // ── Model picker ──
 
     fn catalog_model(
         provider: &str,
@@ -7019,6 +9181,19 @@ mod question_tests {
         }
     }
 
+    fn model_picker(models: Vec<CatalogModel>) -> ModelPicker {
+        ModelPicker {
+            epoch: 1,
+            visible: (0..models.len()).collect(),
+            models,
+            query: String::new(),
+            selected: 0,
+            loading: false,
+            applying: false,
+            error: None,
+        }
+    }
+
     /// `Ctrl+O` opens the picker only on the Chat tab, and only when idle —
     /// same rationale as `Ctrl+N` being a no-op while streaming.
     #[tokio::test]
@@ -7031,6 +9206,8 @@ mod question_tests {
         assert!(app.model_picker.is_none(), "Ctrl+O is Chat-tab only");
 
         app.tab = Tab::Chat;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
             .await
             .unwrap();
@@ -7050,26 +9227,220 @@ mod question_tests {
         assert!(app.model_picker.is_none());
     }
 
+    #[tokio::test]
+    async fn model_picker_filters_150_grouped_entries_with_stable_selection() {
+        let providers = ["alpha-unique", "beta-unique", "gamma-unique"];
+        let models = (0..150)
+            .map(|index| {
+                let provider = providers[index % providers.len()];
+                catalog_model(
+                    provider,
+                    &format!("model-{index}"),
+                    &format!("Display {index}"),
+                    provider,
+                )
+            })
+            .collect::<Vec<_>>();
+        let target_key = ("alpha-unique".to_string(), "model-117".to_string());
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(model_picker(models));
+        let target_index = app
+            .model_picker
+            .as_ref()
+            .unwrap()
+            .models
+            .iter()
+            .position(|model| model_key(model) == target_key)
+            .unwrap();
+        app.model_picker.as_mut().unwrap().selected = target_index;
+
+        for character in "alpha-unique".chars() {
+            app.handle_model_picker_key(key(KeyCode::Char(character)))
+                .await
+                .unwrap();
+        }
+
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.models.len(), 150);
+        assert_eq!(picker.visible.len(), 50);
+        assert_eq!(model_key(picker.selected_model().unwrap()), target_key);
+        assert!(
+            picker.visible.windows(2).all(|pair| pair[0] < pair[1]),
+            "filter must preserve grouped catalog order"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_patch_failure_preserves_query_selection_and_underlying_chat() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.model = "old-model".to_string();
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        app.model_picker = Some(model_picker(vec![
+            catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI"),
+            catalog_model(
+                "anthropic",
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                "Anthropic",
+            ),
+        ]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.query = "claude".to_string();
+            picker.refresh_filter(None);
+            picker.applying = true;
+        }
+        let selected_key = model_key(app.model_picker.as_ref().unwrap().selected_model().unwrap());
+
+        app.handle_event(AppEvent::ModelPatched {
+            epoch: 1,
+            session_id: "s1".to_string(),
+            model: catalog_model(
+                "anthropic",
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                "Anthropic",
+            ),
+            result: Err("offline".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.query, "claude");
+        assert_eq!(model_key(picker.selected_model().unwrap()), selected_key);
+        assert!(!picker.applying);
+        assert!(picker.error.as_deref().unwrap().contains("Enter to retry"));
+        assert_eq!(app.chat.model, "old-model");
+        assert_eq!(app.chat.textarea.lines().join("\n"), "d");
+    }
+
+    #[tokio::test]
+    async fn session_switch_invalidates_an_in_flight_model_patch() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-a".to_string());
+        app.chat.model = "model-a".to_string();
+        app.chat.provider = Some("provider-a".to_string());
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "provider-a",
+            "selected-for-a",
+            "Selected for A",
+            "Provider A",
+        )]));
+        app.model_picker.as_mut().unwrap().applying = true;
+        app.opening_session_id = Some("session-b".to_string());
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "session-b".to_string(),
+            result: Ok(OpenedSession {
+                model: "model-b".to_string(),
+                provider: Some("provider-b".to_string()),
+                ..opened(vec![])
+            }),
+        })
+        .await
+        .unwrap();
+        assert!(app.model_picker.is_none());
+
+        app.handle_event(AppEvent::ModelPatched {
+            epoch: 1,
+            session_id: "session-a".to_string(),
+            model: catalog_model(
+                "provider-a",
+                "selected-for-a",
+                "Selected for A",
+                "Provider A",
+            ),
+            result: Ok(()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-b"));
+        assert_eq!(app.chat.model, "model-b");
+        assert_eq!(app.chat.provider.as_deref(), Some("provider-b"));
+    }
+
+    #[test]
+    fn duplicate_model_ids_require_provider_identity_for_current_group() {
+        let models = vec![
+            catalog_model("provider-a", "shared", "Shared A", "Provider A"),
+            catalog_model("provider-b", "shared", "Shared B", "Provider B"),
+        ];
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "shared".to_string();
+        app.model_picker = Some(model_picker(models));
+
+        assert!(app
+            .model_picker
+            .as_ref()
+            .unwrap()
+            .models
+            .iter()
+            .all(|model| app.model_group_label(model) != "Current"));
+
+        app.chat.provider = Some("provider-b".to_string());
+        let labels = app
+            .model_picker
+            .as_ref()
+            .unwrap()
+            .models
+            .iter()
+            .map(|model| app.model_group_label(model))
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["Provider: Provider A", "Current"]);
+    }
+
+    #[test]
+    fn model_picker_renders_current_recent_and_provider_groups() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let current = catalog_model("openai", "current", "Current Model", "OpenAI");
+        let recent = catalog_model("anthropic", "recent", "Recent Model", "Anthropic");
+        let provider = catalog_model("local", "other", "Other Model", "Local");
+        let mut models = vec![provider, recent.clone(), current];
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "current".to_string();
+        app.recent_models.push_back(model_key(&recent));
+        let current = current_model_key(&models, app.chat.provider.as_deref(), &app.chat.model);
+        sort_catalog_models(&mut models, current.as_ref(), &app.recent_models);
+        app.model_picker = Some(model_picker(models));
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Current"));
+        assert!(text.contains("Recent"));
+        assert!(text.contains("Provider: Local"));
+    }
+
     /// `↑/↓` move the selection (clamped); `Enter` applies the highlighted
-    /// model — `chat.model` gets the plain model id (NOT `provider/model`),
-    /// matching what `ChatRequest`/`ExecuteRequest`/`PatchSessionRequest.model`
-    /// resolve on the server.
+    /// model — `chat.model` keeps the plain model id while `chat.provider`
+    /// keeps its paired provider, matching the server's separate compatibility
+    /// fields without collapsing identity into a synthetic string.
     #[tokio::test]
     async fn model_picker_navigation_and_enter_applies() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.model_picker = Some(ModelPicker {
-            models: vec![
-                catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI"),
-                catalog_model(
-                    "anthropic",
-                    "claude-sonnet-5",
-                    "Claude Sonnet 5",
-                    "Anthropic",
-                ),
-            ],
-            selected: 0,
-            loading: false,
-        });
+        app.model_picker = Some(model_picker(vec![
+            catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI"),
+            catalog_model(
+                "anthropic",
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                "Anthropic",
+            ),
+        ]));
 
         app.handle_model_picker_key(key(KeyCode::Down))
             .await
@@ -7098,7 +9469,8 @@ mod question_tests {
             app.chat.model, "claude-sonnet-5",
             "chat.model gets the plain model id, not provider/model"
         );
-        assert_eq!(app.status_message, "Model: Claude Sonnet 5");
+        assert_eq!(app.chat.provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.status_message, "Model: Claude Sonnet 5 (Anthropic)");
     }
 
     /// `Enter` while the catalog is still loading (empty list) is a no-op —
@@ -7106,11 +9478,8 @@ mod question_tests {
     #[tokio::test]
     async fn model_picker_enter_while_loading_is_noop() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.model_picker = Some(ModelPicker {
-            models: vec![],
-            selected: 0,
-            loading: true,
-        });
+        app.model_picker = Some(model_picker(vec![]));
+        app.model_picker.as_mut().unwrap().loading = true;
         app.handle_model_picker_key(key(KeyCode::Enter))
             .await
             .unwrap();
@@ -7120,16 +9489,80 @@ mod question_tests {
         );
     }
 
+    #[tokio::test]
+    async fn model_picker_ctrl_r_refreshes_a_nonempty_catalog_with_no_matches() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.picker_epoch = 1;
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
+        )]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.query = "no-such-model".to_string();
+            picker.refresh_filter(None);
+            assert!(picker.visible.is_empty());
+        }
+
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.epoch, 2, "Ctrl+R must dispatch a catalog reload");
+        assert!(
+            picker
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not attached")),
+            "the test has no event loop, proving reload reached load_model_catalog"
+        );
+    }
+
+    #[test]
+    fn model_picker_no_match_refreshing_hides_the_disabled_retry_shortcut() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
+        )]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.query = "no-such-model".to_string();
+            picker.refresh_filter(None);
+            picker.loading = true;
+        }
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::layout::render_model_picker(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("Refreshing model catalog..."));
+        assert!(text.contains("Esc cancel"));
+        assert!(!text.contains("Ctrl+R"));
+    }
+
     /// `Esc` closes the picker without touching `chat.model`.
     #[tokio::test]
     async fn model_picker_esc_leaves_model_unchanged() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.model = "old-model".to_string();
-        app.model_picker = Some(ModelPicker {
-            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
-            selected: 0,
-            loading: false,
-        });
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        app.chat.scroll_offset = 9;
+        app.status_message = "Keep model status".to_string();
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
+        )]));
 
         app.handle_model_picker_key(key(KeyCode::Esc))
             .await
@@ -7137,52 +9570,51 @@ mod question_tests {
 
         assert!(app.model_picker.is_none());
         assert_eq!(app.chat.model, "old-model", "Esc must not change the model");
+        assert_eq!(app.chat.textarea.lines().join("\n"), "d");
+        assert_eq!(app.chat.scroll_offset, 9);
+        assert_eq!(app.status_message, "Keep model status");
     }
 
-    /// `CatalogLoaded(Err(...))` notifies and closes the picker instead of
-    /// leaving it stuck on "Loading models...".
+    /// Catalog failures remain recoverable without losing the query/selection.
     #[tokio::test]
-    async fn catalog_loaded_err_notifies_and_closes_picker() {
+    async fn catalog_loaded_err_stays_open_with_retry() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.model_picker = Some(ModelPicker {
-            models: vec![],
-            selected: 0,
-            loading: true,
-        });
+        app.model_picker = Some(model_picker(vec![]));
+        app.model_picker.as_mut().unwrap().loading = true;
 
-        app.handle_event(AppEvent::CatalogLoaded(Err(
-            "connection refused".to_string()
-        )))
+        app.handle_event(AppEvent::CatalogLoaded {
+            epoch: 1,
+            result: Err("connection refused".to_string()),
+        })
         .await
         .unwrap();
 
-        assert!(app.model_picker.is_none());
-        let last = app.notifications.last().expect("notified");
-        assert!(last.text.contains("connection refused"));
-        assert_eq!(last.level, NoticeLevel::Error);
+        let picker = app.model_picker.as_ref().expect("recoverable picker");
+        assert!(!picker.loading);
+        assert!(picker
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("connection refused"));
     }
 
-    /// An empty catalog (no providers configured) notifies a warning instead
-    /// of leaving an empty modal open.
+    /// An empty catalog stays open with an explicit retry action.
     #[tokio::test]
-    async fn catalog_loaded_empty_notifies_warn_and_closes_picker() {
+    async fn catalog_loaded_empty_stays_open_with_retry() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.model_picker = Some(ModelPicker {
-            models: vec![],
-            selected: 0,
-            loading: true,
-        });
+        app.model_picker = Some(model_picker(vec![]));
+        app.model_picker.as_mut().unwrap().loading = true;
 
-        app.handle_event(AppEvent::CatalogLoaded(Ok(ProviderCatalog {
-            models: vec![],
-        })))
+        app.handle_event(AppEvent::CatalogLoaded {
+            epoch: 1,
+            result: Ok(ProviderCatalog { models: vec![] }),
+        })
         .await
         .unwrap();
 
-        assert!(app.model_picker.is_none());
-        let last = app.notifications.last().expect("notified");
-        assert_eq!(last.text, "No models in provider catalog");
-        assert_eq!(last.level, NoticeLevel::Warn);
+        let picker = app.model_picker.as_ref().expect("recoverable picker");
+        assert!(picker.models.is_empty());
+        assert!(picker.error.as_deref().unwrap().contains("No models"));
     }
 
     /// A catalog fetch that lands after the picker was already dismissed
@@ -7192,9 +9624,12 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         assert!(app.model_picker.is_none());
 
-        app.handle_event(AppEvent::CatalogLoaded(Ok(ProviderCatalog {
-            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
-        })))
+        app.handle_event(AppEvent::CatalogLoaded {
+            epoch: 1,
+            result: Ok(ProviderCatalog {
+                models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
+            }),
+        })
         .await
         .unwrap();
 
@@ -7210,11 +9645,9 @@ mod question_tests {
         use ratatui::Terminal;
 
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
-        app.model_picker = Some(ModelPicker {
-            models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
-            selected: 0,
-            loading: false,
-        });
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
+        )]));
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -7224,6 +9657,8 @@ mod question_tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("GPT-4.1"), "model display name missing");
         assert!(text.contains("OpenAI"), "provider display name missing");
+        assert!(text.contains("openai/gpt-4.1"), "provider/model id missing");
+        assert!(text.contains("Esc cancel"), "narrow footer was clipped");
     }
 }
 

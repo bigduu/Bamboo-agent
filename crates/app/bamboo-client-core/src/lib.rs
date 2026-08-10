@@ -27,6 +27,11 @@ pub struct ChatRequest {
     /// Optional model override. Omitted from the request body when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Provider paired with `model`. Supplying both preserves the catalog's
+    /// exact provider/model identity instead of falling back to whichever
+    /// provider was previously active for a same-named model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -47,9 +52,11 @@ mod chat_request_tests {
             session_id: None,
             project_id: Some("project-client".to_string()),
             model: Some("gpt-5".to_string()),
+            provider: Some("openai".to_string()),
         })
         .unwrap();
         assert_eq!(value["project_id"], "project-client");
+        assert_eq!(value["provider"], "openai");
         assert!(value.get("session_id").is_none());
     }
 }
@@ -60,6 +67,24 @@ mod chat_request_tests {
 pub struct ExecuteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+#[cfg(test)]
+mod execute_request_tests {
+    use super::ExecuteRequest;
+
+    #[test]
+    fn execute_request_keeps_provider_paired_with_model() {
+        let value = serde_json::to_value(ExecuteRequest {
+            model: Some("shared".to_string()),
+            provider: Some("provider-b".to_string()),
+        })
+        .unwrap();
+        assert_eq!(value["model"], "shared");
+        assert_eq!(value["provider"], "provider-b");
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
