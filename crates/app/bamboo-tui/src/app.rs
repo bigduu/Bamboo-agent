@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 use crate::api::sse::{SessionSseEvent, SseStream};
 use crate::api::types::*;
@@ -716,6 +716,298 @@ impl SessionPicker {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandPaletteTrigger {
+    Slash,
+    Global,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinPaletteAction {
+    NewSession,
+    OpenSession,
+    SelectModel,
+    Help,
+    Notifications,
+    Stop,
+    ToggleDetails,
+    Config,
+    Schedules,
+}
+
+impl BuiltinPaletteAction {
+    fn key(self) -> &'static str {
+        match self {
+            Self::NewSession => "new-session",
+            Self::OpenSession => "open-session",
+            Self::SelectModel => "select-model",
+            Self::Help => "help",
+            Self::Notifications => "notifications",
+            Self::Stop => "stop",
+            Self::ToggleDetails => "toggle-details",
+            Self::Config => "config",
+            Self::Schedules => "schedules",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::NewSession => "New session",
+            Self::OpenSession => "Open session",
+            Self::SelectModel => "Select model",
+            Self::Help => "Show help",
+            Self::Notifications => "Show notifications",
+            Self::Stop => "Stop active run",
+            Self::ToggleDetails => "Toggle tool details",
+            Self::Config => "Open config",
+            Self::Schedules => "Open schedules",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::NewSession => "Clear conversation state and start a fresh session",
+            Self::OpenSession => "Search and resume an existing session",
+            Self::SelectModel => "Choose a provider-qualified model",
+            Self::Help => "Show all TUI keyboard shortcuts",
+            Self::Notifications => "Review recent status, warning, and error messages",
+            Self::Stop => "Request cancellation of the currently running agent",
+            Self::ToggleDetails => "Expand or collapse tool arguments and results",
+            Self::Config => "Switch to the configuration tab",
+            Self::Schedules => "Switch to the schedules tab",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandPaletteEntry {
+    Builtin(BuiltinPaletteAction),
+    Server(CommandItem),
+}
+
+impl CommandPaletteEntry {
+    pub(crate) fn key(&self) -> String {
+        match self {
+            Self::Builtin(action) => format!("builtin:{}", action.key()),
+            Self::Server(command) => format!(
+                "server:{}:{}",
+                command.command_type.to_lowercase(),
+                command.name
+            ),
+        }
+    }
+
+    pub(crate) fn display_name(&self) -> &str {
+        match self {
+            Self::Builtin(action) => action.name(),
+            Self::Server(command) if command.display_name.trim().is_empty() => &command.name,
+            Self::Server(command) => &command.display_name,
+        }
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        match self {
+            Self::Builtin(action) => action.description(),
+            Self::Server(command) => &command.description,
+        }
+    }
+
+    pub(crate) fn type_label(&self) -> &str {
+        match self {
+            Self::Builtin(_) => "ui",
+            Self::Server(command) => &command.command_type,
+        }
+    }
+
+    pub(crate) fn source_label(&self) -> &str {
+        match self {
+            Self::Builtin(_) => "builtin",
+            Self::Server(command) => command
+                .metadata
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    command
+                        .metadata
+                        .get("serverId")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .filter(|source| !source.trim().is_empty())
+                .unwrap_or("server"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerSnapshot {
+    lines: Vec<String>,
+    cursor: (usize, usize),
+}
+
+impl ComposerSnapshot {
+    fn capture(textarea: &TextArea<'_>) -> Self {
+        Self {
+            lines: textarea.lines().to_vec(),
+            cursor: textarea.cursor(),
+        }
+    }
+
+    fn still_matches(&self, textarea: &TextArea<'_>) -> bool {
+        self.lines == textarea.lines() && self.cursor == textarea.cursor()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandPaletteHitbox {
+    pub index: usize,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl CommandPaletteHitbox {
+    fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.x
+            && column < self.x.saturating_add(self.width)
+            && row >= self.y
+            && row < self.y.saturating_add(self.height)
+    }
+}
+
+pub struct CommandPalette {
+    pub epoch: u64,
+    pub session_id: Option<String>,
+    pub trigger: CommandPaletteTrigger,
+    /// Search text without the leading slash. For slash invocation, the first
+    /// whitespace-delimited token filters commands and the remainder is kept
+    /// as command arguments.
+    pub input: String,
+    pub entries: Vec<CommandPaletteEntry>,
+    pub visible: Vec<usize>,
+    pub selected: usize,
+    pub loading: bool,
+    pub resolving: bool,
+    pub resolving_key: Option<String>,
+    pub error: Option<String>,
+    pub original_composer: ComposerSnapshot,
+    pub hitboxes: RefCell<Vec<CommandPaletteHitbox>>,
+    pub mouse_pressed_item: Option<usize>,
+}
+
+impl CommandPalette {
+    fn selected_entry(&self) -> Option<&CommandPaletteEntry> {
+        self.visible
+            .get(self.selected)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    fn search_query(&self) -> &str {
+        match self.trigger {
+            CommandPaletteTrigger::Slash => slash_input_parts(&self.input).0,
+            CommandPaletteTrigger::Global => self.input.as_str(),
+        }
+    }
+
+    fn arguments(&self) -> &str {
+        match self.trigger {
+            CommandPaletteTrigger::Slash => slash_input_parts(&self.input).1,
+            CommandPaletteTrigger::Global => "",
+        }
+    }
+
+    fn refresh_filter(&mut self, preserve_key: Option<String>) {
+        self.visible = ranked_indices(&self.entries, self.search_query(), command_search_text);
+        self.selected = preserve_key
+            .and_then(|key| {
+                self.visible.iter().position(|index| {
+                    self.entries
+                        .get(*index)
+                        .is_some_and(|entry| entry.key() == key)
+                })
+            })
+            .unwrap_or(0)
+            .min(self.visible.len().saturating_sub(1));
+    }
+}
+
+fn slash_input_parts(input: &str) -> (&str, &str) {
+    let query_end = input
+        .char_indices()
+        .find_map(|(index, character)| character.is_whitespace().then_some(index))
+        .unwrap_or(input.len());
+    let arguments = input[query_end..].trim_start_matches(char::is_whitespace);
+    (&input[..query_end], arguments)
+}
+
+fn command_search_text(entry: &CommandPaletteEntry) -> String {
+    match entry {
+        CommandPaletteEntry::Builtin(action) => format!(
+            "{} {} ui builtin {}",
+            action.name(),
+            action.description(),
+            action.key()
+        ),
+        CommandPaletteEntry::Server(command) => format!(
+            "{} {} {} {} {} {} {} {} {}",
+            command.name,
+            command.display_name,
+            command.description,
+            command.command_type,
+            command
+                .metadata
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            command
+                .metadata
+                .get("serverId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            command
+                .metadata
+                .get("originalName")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            command.category.as_deref().unwrap_or_default(),
+            command.tags.as_deref().unwrap_or_default().join(" ")
+        ),
+    }
+}
+
+fn builtin_command_palette_entries() -> Vec<CommandPaletteEntry> {
+    [
+        BuiltinPaletteAction::NewSession,
+        BuiltinPaletteAction::OpenSession,
+        BuiltinPaletteAction::SelectModel,
+        BuiltinPaletteAction::Help,
+        BuiltinPaletteAction::Notifications,
+        BuiltinPaletteAction::Stop,
+        BuiltinPaletteAction::ToggleDetails,
+        BuiltinPaletteAction::Config,
+        BuiltinPaletteAction::Schedules,
+    ]
+    .into_iter()
+    .map(CommandPaletteEntry::Builtin)
+    .collect()
+}
+
+/// Merge defensively while preserving the server's first-wins order. The
+/// server already applies workspace > Project > global > preset > catalog >
+/// MCP precedence; keeping the first `(type, name)` prevents a malformed or
+/// mixed-version response from undoing that choice in the TUI.
+fn merged_command_palette_entries(commands: Vec<CommandItem>) -> Vec<CommandPaletteEntry> {
+    let mut entries = builtin_command_palette_entries();
+    let mut seen = HashSet::new();
+    for command in commands {
+        let key = (command.command_type.to_lowercase(), command.name.clone());
+        if seen.insert(key) {
+            entries.push(CommandPaletteEntry::Server(command));
+        }
+    }
+    entries
+}
+
 const MAX_SESSION_PICKER_SESSIONS: usize = 1_000;
 const MAX_RECENT_MODELS: usize = 8;
 
@@ -986,6 +1278,11 @@ pub struct App {
     /// Sessions management tab, closing this overlay leaves the transcript,
     /// composer draft/cursor, and scroll position untouched.
     pub session_picker: Option<SessionPicker>,
+    /// Combined built-in/server command palette (`Ctrl+K` globally or `/` as
+    /// the first composer character). It never mutates the composer until a
+    /// selection succeeds, so cancellation and every async failure preserve
+    /// the exact draft and cursor beneath it.
+    pub command_palette: Option<CommandPalette>,
     /// Pending session-delete confirmation (Sessions tab, `d`): `(id, title)`
     /// of the session awaiting `y`/Enter confirm or `n`/Esc cancel. Kept as a
     /// modal (rather than deleting immediately) so a stray `d` can't destroy a
@@ -1031,6 +1328,8 @@ pub struct App {
     picker_epoch: u64,
     model_picker_task: Option<tokio::task::JoinHandle<()>>,
     session_picker_task: Option<tokio::task::JoinHandle<()>>,
+    command_palette_epoch: u64,
+    command_palette_task: Option<tokio::task::JoinHandle<()>>,
     recent_models: VecDeque<(String, String)>,
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
@@ -1084,6 +1383,15 @@ fn question_option_at(question: &ActiveQuestion, column: u16, row: u16) -> Optio
         .map(|hitbox| hitbox.index)
 }
 
+fn command_palette_item_at(palette: &CommandPalette, column: u16, row: u16) -> Option<usize> {
+    palette
+        .hitboxes
+        .borrow()
+        .iter()
+        .find(|hitbox| hitbox.contains(column, row))
+        .map(|hitbox| hitbox.index)
+}
+
 /// Copy text through the terminal-standard OSC 52 clipboard sequence. The
 /// payload is base64 encoded, so arbitrary Unicode and line breaks remain
 /// exact and never terminate the control sequence early.
@@ -1118,6 +1426,7 @@ impl App {
             config_editor: None,
             model_picker: None,
             session_picker: None,
+            command_palette: None,
             pending_delete: None,
             deleting_session_id: None,
             notifications: Vec::new(),
@@ -1131,6 +1440,8 @@ impl App {
             picker_epoch: 0,
             model_picker_task: None,
             session_picker_task: None,
+            command_palette_epoch: 0,
+            command_palette_task: None,
             recent_models: VecDeque::new(),
             event_tx: None,
             sse_tx: None,
@@ -1440,6 +1751,7 @@ impl App {
             AppEvent::ChatStarted(r) => match r {
                 Ok(session_id) => {
                     self.chat.session_id = Some(session_id.clone());
+                    self.rebind_command_palette_to_active_session();
                     self.status_message = "Streaming...".to_string();
                     self.start_stream_and_execute(session_id);
                 }
@@ -1493,6 +1805,7 @@ impl App {
                         }
                         self.close_session_picker();
                         self.close_model_picker();
+                        self.close_command_palette();
                         // Reset every per-run scratch field `finalize_streaming`
                         // would otherwise leave behind from whatever was open
                         // before — a resumed session must not inherit stale
@@ -1784,6 +2097,105 @@ impl App {
                             q.error = Some(message.clone());
                         }
                         self.notify(NoticeLevel::Error, format!("Answer rejected: {message}"));
+                    }
+                }
+            }
+            AppEvent::CommandCatalogLoaded {
+                epoch,
+                session_id,
+                result,
+            } => {
+                let current_session = self.chat.session_id.clone();
+                let selected_key = self
+                    .command_palette
+                    .as_ref()
+                    .filter(|palette| {
+                        palette.epoch == epoch
+                            && palette.session_id == session_id
+                            && current_session == session_id
+                    })
+                    .and_then(CommandPalette::selected_entry)
+                    .map(CommandPaletteEntry::key);
+                let Some(palette) = self.command_palette.as_mut().filter(|palette| {
+                    palette.epoch == epoch
+                        && palette.session_id == session_id
+                        && current_session == session_id
+                }) else {
+                    return Ok(());
+                };
+                self.command_palette_task = None;
+                palette.loading = false;
+                match result {
+                    Ok(catalog) => {
+                        palette.entries = merged_command_palette_entries(catalog.commands);
+                        palette.error = None;
+                        palette.refresh_filter(selected_key);
+                    }
+                    Err(error) => {
+                        palette.error = Some(format!(
+                            "Failed to load commands: {error} — press Ctrl+R to retry"
+                        ));
+                    }
+                }
+            }
+            AppEvent::CommandResolved {
+                epoch,
+                session_id,
+                command_key,
+                result,
+            } => {
+                let current_session = self.chat.session_id.clone();
+                let Some(palette) = self.command_palette.as_mut().filter(|palette| {
+                    palette.epoch == epoch
+                        && palette.session_id == session_id
+                        && current_session == session_id
+                        && palette.resolving_key.as_deref() == Some(command_key.as_str())
+                }) else {
+                    return Ok(());
+                };
+                self.command_palette_task = None;
+                palette.resolving = false;
+                palette.resolving_key = None;
+                match result {
+                    Ok(detail) => {
+                        if !palette.original_composer.still_matches(&self.chat.textarea) {
+                            palette.error = Some(
+                                "Composer changed while resolving; draft was not replaced"
+                                    .to_string(),
+                            );
+                            return Ok(());
+                        }
+                        let selected_type = palette
+                            .entries
+                            .iter()
+                            .find(|entry| entry.key() == command_key)
+                            .and_then(|entry| match entry {
+                                CommandPaletteEntry::Server(command) => {
+                                    Some(command.command_type.as_str())
+                                }
+                                CommandPaletteEntry::Builtin(_) => None,
+                            });
+                        let arguments = palette.arguments().to_string();
+                        let mut content = detail.content;
+                        if selected_type.is_some_and(|kind| kind.eq_ignore_ascii_case("workflow"))
+                            && !arguments.is_empty()
+                        {
+                            if !content.is_empty() {
+                                content.push_str("\n\n");
+                            }
+                            content.push_str(&arguments);
+                        }
+                        self.install_command_draft(content);
+                        self.tab = Tab::Chat;
+                        self.close_command_palette();
+                        self.status_message =
+                            "Command loaded into composer — review and press Enter to send"
+                                .to_string();
+                    }
+                    Err(error) => {
+                        palette.error = Some(format!(
+                            "Failed to resolve command: {error} — press Enter to retry"
+                        ));
                     }
                 }
             }
@@ -2245,6 +2657,47 @@ impl App {
             return;
         }
 
+        if self.command_palette.is_some() {
+            let mut activate = false;
+            {
+                let palette = self.command_palette.as_mut().unwrap();
+                if palette.resolving {
+                    return;
+                }
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                            -3
+                        } else {
+                            3
+                        };
+                        palette.selected =
+                            scroll_selection(palette.selected, palette.visible.len(), delta);
+                        palette.mouse_pressed_item = None;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        palette.mouse_pressed_item =
+                            command_palette_item_at(palette, mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let pressed = palette.mouse_pressed_item.take();
+                        if let Some(index) =
+                            command_palette_item_at(palette, mouse.column, mouse.row)
+                                .filter(|index| Some(*index) == pressed)
+                        {
+                            palette.selected = index.min(palette.visible.len().saturating_sub(1));
+                            activate = true;
+                        }
+                    }
+                    _ => palette.mouse_pressed_item = None,
+                }
+            }
+            if activate {
+                self.activate_command_palette_selection();
+            }
+            return;
+        }
+
         let delta: i32 = match mouse.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
@@ -2341,6 +2794,7 @@ impl App {
             || self.pending_delete.is_some()
             || self.session_picker.is_some()
             || self.model_picker.is_some()
+            || self.command_palette.is_some()
             || self.schedule_form.is_some()
             || self.config_editor.is_some()
     }
@@ -2356,8 +2810,9 @@ impl App {
     ///   2. `pending_delete`   — session delete confirmation
     ///   3. `session_picker`   — Ctrl+P contextual session picker
     ///   4. `model_picker`     — Ctrl+O provider-catalog picker
-    ///   5. `schedule_form`    — new-schedule authoring form
-    ///   6. `config_editor`    — raw config JSON editor
+    ///   5. `command_palette`  — Ctrl+K global or slash composer palette
+    ///   6. `schedule_form`    — new-schedule authoring form
+    ///   7. `config_editor`    — raw config JSON editor
     ///
     /// Runtime modals can coexist in state because a clarification arrives
     /// asynchronously. The renderer layers them in the reverse order below,
@@ -2437,7 +2892,13 @@ impl App {
             return self.handle_model_picker_key(key).await;
         }
 
-        // 5. The schedule-authoring modal likewise captures all input: Tab moves
+        // 5. The command palette owns query/argument editing and selection.
+        if self.command_palette.is_some() {
+            self.handle_command_palette_key(key);
+            return Ok(());
+        }
+
+        // 6. The schedule-authoring modal likewise captures all input: Tab moves
         // between fields and digits belong in cron expressions, so it must run
         // before the global Tab/1-6 tab-switching below (which would otherwise
         // swallow those keys and never reach the form).
@@ -2446,7 +2907,7 @@ impl App {
             return Ok(());
         }
 
-        // 6. The config editor is a full multi-line text buffer, so it must claim
+        // 7. The config editor is a full multi-line text buffer, so it must claim
         // every key (digits, Tab, Enter/newlines) before the global navigation
         // below — same rationale as the schedule form.
         if self.config_editor.is_some() {
@@ -2459,6 +2920,10 @@ impl App {
         // the "no modal open" requirement for Ctrl+N specifically.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('k') => {
+                    self.open_command_palette(CommandPaletteTrigger::Global);
+                    return Ok(());
+                }
                 KeyCode::Char('n') if !self.chat.streaming => {
                     self.new_session();
                     return Ok(());
@@ -3302,6 +3767,14 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('/')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.chat.textarea.cursor() == (0, 0) =>
+            {
+                self.open_command_palette(CommandPaletteTrigger::Slash);
+            }
             // Alt+Enter (and Shift+Enter, on the kitty-protocol terminals
             // that report it — plain crossterm terminals mostly don't, so
             // this arm is harmless there) inserts a newline instead of
@@ -3589,6 +4062,7 @@ impl App {
     /// membership (the operator picked both deliberately) while dropping
     /// per-session conversation state.
     fn new_session(&mut self) {
+        self.close_command_palette();
         self.stash_question_drafts();
         self.detach_stream();
         self.opening_session_id = None;
@@ -4940,6 +5414,485 @@ impl App {
         }));
     }
 
+    // ── Discoverable command palette (Ctrl+K or leading slash) ──
+
+    fn open_command_palette(&mut self, trigger: CommandPaletteTrigger) {
+        if let Some(task) = self.command_palette_task.take() {
+            task.abort();
+        }
+        self.command_palette_epoch = self.command_palette_epoch.wrapping_add(1);
+        let epoch = self.command_palette_epoch;
+        let mut palette = CommandPalette {
+            epoch,
+            session_id: self.chat.session_id.clone(),
+            trigger,
+            input: String::new(),
+            entries: builtin_command_palette_entries(),
+            visible: Vec::new(),
+            selected: 0,
+            loading: true,
+            resolving: false,
+            resolving_key: None,
+            error: None,
+            original_composer: ComposerSnapshot::capture(&self.chat.textarea),
+            hitboxes: RefCell::new(Vec::new()),
+            mouse_pressed_item: None,
+        };
+        palette.refresh_filter(None);
+        self.help_visible = false;
+        self.notifications_visible = false;
+        self.command_palette = Some(palette);
+        self.load_command_catalog(epoch);
+    }
+
+    fn load_command_catalog(&mut self, epoch: u64) {
+        if let Some(task) = self.command_palette_task.take() {
+            task.abort();
+        }
+        let Some(session_id) = self
+            .command_palette
+            .as_ref()
+            .filter(|palette| palette.epoch == epoch)
+            .map(|palette| palette.session_id.clone())
+        else {
+            return;
+        };
+        let Some(tx) = self.event_tx.clone() else {
+            if let Some(palette) = self.command_palette.as_mut() {
+                palette.loading = false;
+                palette.error = Some(
+                    "Command palette is not attached to an event loop; built-ins remain available"
+                        .to_string(),
+                );
+            }
+            return;
+        };
+        if let Some(palette) = self.command_palette.as_mut() {
+            palette.loading = true;
+            palette.error = None;
+        }
+        let client = self.client.clone();
+        self.command_palette_task = Some(tokio::spawn(async move {
+            let result = client
+                .list_commands(session_id.as_deref())
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::CommandCatalogLoaded {
+                epoch,
+                session_id,
+                result,
+            });
+        }));
+    }
+
+    fn reload_command_catalog(&mut self) {
+        if let Some(task) = self.command_palette_task.take() {
+            task.abort();
+        }
+        let preserve_key = self
+            .command_palette
+            .as_ref()
+            .and_then(CommandPalette::selected_entry)
+            .map(CommandPaletteEntry::key);
+        self.command_palette_epoch = self.command_palette_epoch.wrapping_add(1);
+        let epoch = self.command_palette_epoch;
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        palette.epoch = epoch;
+        palette.entries = builtin_command_palette_entries();
+        palette.loading = true;
+        palette.resolving = false;
+        palette.resolving_key = None;
+        palette.error = None;
+        palette.mouse_pressed_item = None;
+        palette.refresh_filter(preserve_key);
+        self.load_command_catalog(epoch);
+    }
+
+    /// A palette opened before a newly-created Session receives its id must
+    /// not install the global catalog into that Session context. Keep the
+    /// built-ins and query visible while starting a fresh scoped request.
+    fn rebind_command_palette_to_active_session(&mut self) {
+        let current_session = self.chat.session_id.clone();
+        let changed = self
+            .command_palette
+            .as_ref()
+            .is_some_and(|palette| palette.session_id != current_session);
+        if !changed {
+            return;
+        }
+        if let Some(task) = self.command_palette_task.take() {
+            task.abort();
+        }
+        let preserve_key = self
+            .command_palette
+            .as_ref()
+            .and_then(CommandPalette::selected_entry)
+            .filter(|entry| matches!(entry, CommandPaletteEntry::Builtin(_)))
+            .map(CommandPaletteEntry::key);
+        self.command_palette_epoch = self.command_palette_epoch.wrapping_add(1);
+        let epoch = self.command_palette_epoch;
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        palette.epoch = epoch;
+        palette.session_id = current_session;
+        palette.entries = builtin_command_palette_entries();
+        palette.loading = true;
+        palette.resolving = false;
+        palette.resolving_key = None;
+        palette.error = None;
+        palette.mouse_pressed_item = None;
+        palette.refresh_filter(preserve_key);
+        self.load_command_catalog(epoch);
+    }
+
+    fn close_command_palette(&mut self) {
+        if let Some(task) = self.command_palette_task.take() {
+            task.abort();
+        }
+        self.command_palette_epoch = self.command_palette_epoch.wrapping_add(1);
+        self.command_palette = None;
+    }
+
+    fn handle_command_palette_key(&mut self, key: KeyEvent) {
+        let resolving = self
+            .command_palette
+            .as_ref()
+            .is_some_and(|palette| palette.resolving);
+        if resolving {
+            if key.code == KeyCode::Esc {
+                self.close_command_palette();
+            }
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('k') => {
+                    self.close_command_palette();
+                    return;
+                }
+                KeyCode::Char('u') => {
+                    if let Some(palette) = self.command_palette.as_mut() {
+                        let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
+                        palette.input.clear();
+                        palette.error = None;
+                        palette.refresh_filter(preserve);
+                    }
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    if self
+                        .command_palette
+                        .as_ref()
+                        .is_some_and(|palette| !palette.loading)
+                    {
+                        self.reload_command_catalog();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.selected = palette.selected.saturating_sub(1);
+                    palette.error = None;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    if palette.selected + 1 < palette.visible.len() {
+                        palette.selected += 1;
+                    }
+                    palette.error = None;
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.selected = palette.selected.saturating_sub(8);
+                    palette.error = None;
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.selected = palette
+                        .selected
+                        .saturating_add(8)
+                        .min(palette.visible.len().saturating_sub(1));
+                    palette.error = None;
+                }
+            }
+            KeyCode::Home => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.selected = 0;
+                    palette.error = None;
+                }
+            }
+            KeyCode::End => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.selected = palette.visible.len().saturating_sub(1);
+                    palette.error = None;
+                }
+            }
+            KeyCode::Enter => self.activate_command_palette_selection(),
+            KeyCode::Esc => self.close_command_palette(),
+            KeyCode::Backspace => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
+                    palette.input.pop();
+                    palette.error = None;
+                    palette.refresh_filter(preserve);
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
+                    palette.input.push(character);
+                    palette.error = None;
+                    palette.refresh_filter(preserve);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn command_palette_disabled_reason(
+        &self,
+        entry: &CommandPaletteEntry,
+    ) -> Option<&'static str> {
+        match entry {
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession)
+            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::OpenSession)
+            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::SelectModel)
+                if self.chat.streaming =>
+            {
+                Some("Unavailable while an agent run is active")
+            }
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession)
+            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::OpenSession)
+            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::SelectModel)
+                if self.opening_session_id.is_some() =>
+            {
+                Some("Unavailable while a session is resuming")
+            }
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop) if !self.chat.streaming => {
+                Some("No active run to stop")
+            }
+            CommandPaletteEntry::Builtin(BuiltinPaletteAction::ToggleDetails)
+                if self.chat.current_tool_calls.is_empty()
+                    && self
+                        .chat
+                        .messages
+                        .iter()
+                        .all(|message| message.tool_calls.is_empty()) =>
+            {
+                Some("No tool details in this conversation")
+            }
+            CommandPaletteEntry::Server(_) if self.chat.streaming => {
+                Some("Composer commands are unavailable while a run is active")
+            }
+            CommandPaletteEntry::Server(_) if self.opening_session_id.is_some() => {
+                Some("Composer commands are unavailable while a session is resuming")
+            }
+            CommandPaletteEntry::Server(_)
+                if self.chat.session_id.as_ref().is_some_and(|session_id| {
+                    self.deleting_session_id.as_deref() == Some(session_id.as_str())
+                }) =>
+            {
+                Some("Composer commands are unavailable while the session is being deleted")
+            }
+            CommandPaletteEntry::Server(command)
+                if !matches!(
+                    command.command_type.to_ascii_lowercase().as_str(),
+                    "prompt" | "workflow" | "skill" | "mcp"
+                ) =>
+            {
+                Some("Unsupported server command type")
+            }
+            _ => None,
+        }
+    }
+
+    fn activate_command_palette_selection(&mut self) {
+        let Some(entry) = self
+            .command_palette
+            .as_ref()
+            .and_then(CommandPalette::selected_entry)
+            .cloned()
+        else {
+            if let Some(palette) = self.command_palette.as_mut() {
+                palette.error = Some(if palette.loading {
+                    "Commands are still loading".to_string()
+                } else {
+                    "No command matches the current query".to_string()
+                });
+            }
+            return;
+        };
+
+        if let Some(reason) = self.command_palette_disabled_reason(&entry) {
+            if let Some(palette) = self.command_palette.as_mut() {
+                palette.error = Some(reason.to_string());
+            }
+            return;
+        }
+
+        match entry {
+            CommandPaletteEntry::Builtin(action) => self.run_builtin_palette_action(action),
+            CommandPaletteEntry::Server(command) => {
+                match command.command_type.to_ascii_lowercase().as_str() {
+                    "prompt" | "workflow" => self.resolve_command_into_composer(command),
+                    "skill" | "mcp" => self.insert_slash_command(command),
+                    _ => {
+                        if let Some(palette) = self.command_palette.as_mut() {
+                            palette.error = Some("Unsupported server command type".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_builtin_palette_action(&mut self, action: BuiltinPaletteAction) {
+        self.close_command_palette();
+        match action {
+            BuiltinPaletteAction::NewSession => self.new_session(),
+            BuiltinPaletteAction::OpenSession => {
+                self.tab = Tab::Chat;
+                self.open_session_picker();
+            }
+            BuiltinPaletteAction::SelectModel => {
+                self.tab = Tab::Chat;
+                self.open_model_picker();
+            }
+            BuiltinPaletteAction::Help => self.help_visible = true,
+            BuiltinPaletteAction::Notifications => {
+                self.notifications_visible = true;
+                self.unseen_alerts = 0;
+            }
+            BuiltinPaletteAction::Stop => self.stop_streaming(),
+            BuiltinPaletteAction::ToggleDetails => {
+                self.chat.expand_tools = !self.chat.expand_tools;
+                self.status_message = if self.chat.expand_tools {
+                    "Tool details expanded"
+                } else {
+                    "Tool details collapsed"
+                }
+                .to_string();
+            }
+            BuiltinPaletteAction::Config => {
+                self.tab = Tab::Config;
+                self.load_tab_data();
+            }
+            BuiltinPaletteAction::Schedules => {
+                self.tab = Tab::Schedules;
+                self.load_tab_data();
+            }
+        }
+    }
+
+    fn resolve_command_into_composer(&mut self, command: CommandItem) {
+        let Some(tx) = self.event_tx.clone() else {
+            if let Some(palette) = self.command_palette.as_mut() {
+                palette.error = Some(
+                    "Command resolution cannot run without the event loop; draft preserved"
+                        .to_string(),
+                );
+            }
+            return;
+        };
+        if let Some(task) = self.command_palette_task.take() {
+            task.abort();
+        }
+        self.command_palette_epoch = self.command_palette_epoch.wrapping_add(1);
+        let epoch = self.command_palette_epoch;
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        let session_id = palette.session_id.clone();
+        let arguments = palette.arguments().to_string();
+        let command_key = CommandPaletteEntry::Server(command.clone()).key();
+        palette.epoch = epoch;
+        palette.resolving = true;
+        palette.resolving_key = Some(command_key.clone());
+        palette.error = None;
+        let command_type = command.command_type.clone();
+        let command_name = command.name.clone();
+        let client = self.client.clone();
+        self.command_palette_task = Some(tokio::spawn(async move {
+            let result = client
+                .get_command(
+                    &command_type,
+                    &command_name,
+                    session_id.as_deref(),
+                    (!arguments.is_empty()).then_some(arguments.as_str()),
+                )
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::CommandResolved {
+                epoch,
+                session_id,
+                command_key,
+                result,
+            });
+        }));
+    }
+
+    fn insert_slash_command(&mut self, command: CommandItem) {
+        let Some(palette) = self.command_palette.as_ref() else {
+            return;
+        };
+        if !palette.original_composer.still_matches(&self.chat.textarea) {
+            if let Some(palette) = self.command_palette.as_mut() {
+                palette.error =
+                    Some("Composer changed while selecting; draft was not replaced".to_string());
+            }
+            return;
+        }
+        let arguments = palette.arguments();
+        let mut draft = format!("/{}", command.name.trim_start_matches('/'));
+        if !arguments.is_empty() {
+            draft.push(' ');
+            draft.push_str(arguments);
+        }
+        self.install_command_draft(draft);
+        self.tab = Tab::Chat;
+        self.close_command_palette();
+        self.status_message = match command.command_type.to_ascii_lowercase().as_str() {
+            "skill" => "Skill command inserted — review and press Enter to send",
+            "mcp" => "MCP command inserted — review and press Enter to send",
+            _ => "Command inserted — review and press Enter to send",
+        }
+        .to_string();
+    }
+
+    fn install_command_draft(&mut self, content: String) {
+        let lines = if content.is_empty() {
+            vec![String::new()]
+        } else {
+            content.split('\n').map(str::to_string).collect::<Vec<_>>()
+        };
+        let row = lines.len().saturating_sub(1).min(u16::MAX as usize) as u16;
+        let column = lines
+            .last()
+            .map(|line| line.chars().count())
+            .unwrap_or_default()
+            .min(u16::MAX as usize) as u16;
+        let mut textarea = TextArea::from(lines);
+        textarea.set_placeholder_text(CHAT_PLACEHOLDER);
+        textarea.move_cursor(CursorMove::Jump(row, column));
+        self.chat.textarea = textarea;
+    }
+
     // ── Searchable model picker (Ctrl+O) ──
 
     fn open_model_picker(&mut self) {
@@ -5146,6 +6099,511 @@ impl App {
         self.chat.provider = Some(model.reference.provider.clone());
         self.model_picker = None;
         self.status_message = format!("Model: {} ({provider_label})", model.display_name);
+    }
+}
+
+#[cfg(test)]
+mod command_palette_tests {
+    use super::*;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn command(name: &str, command_type: &str, source: &str) -> CommandItem {
+        CommandItem {
+            id: format!("{command_type}-{source}-{name}"),
+            name: name.to_string(),
+            display_name: name.replace('-', " "),
+            description: format!("{source} {command_type} for {name}"),
+            command_type: command_type.to_string(),
+            category: None,
+            tags: None,
+            metadata: serde_json::json!({ "source": source }),
+        }
+    }
+
+    fn install_test_palette(
+        app: &mut App,
+        trigger: CommandPaletteTrigger,
+        input: &str,
+        entries: Vec<CommandPaletteEntry>,
+    ) {
+        app.command_palette_epoch = app.command_palette_epoch.wrapping_add(1);
+        let mut palette = CommandPalette {
+            epoch: app.command_palette_epoch,
+            session_id: app.chat.session_id.clone(),
+            trigger,
+            input: input.to_string(),
+            entries,
+            visible: Vec::new(),
+            selected: 0,
+            loading: false,
+            resolving: false,
+            resolving_key: None,
+            error: None,
+            original_composer: ComposerSnapshot::capture(&app.chat.textarea),
+            hitboxes: RefCell::new(Vec::new()),
+            mouse_pressed_item: None,
+        };
+        palette.refresh_filter(None);
+        app.command_palette = Some(palette);
+    }
+
+    #[tokio::test]
+    async fn leading_slash_opens_palette_and_escape_preserves_exact_composer() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.textarea.insert_str("draft text");
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 0));
+        let before = ComposerSnapshot::capture(&app.chat.textarea);
+
+        app.handle_chat_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert_eq!(
+            app.command_palette.as_ref().map(|palette| palette.trigger),
+            Some(CommandPaletteTrigger::Slash)
+        );
+        app.handle_command_palette_key(key(KeyCode::Char('r')));
+        app.handle_command_palette_key(key(KeyCode::Char('e')));
+        app.handle_command_palette_key(key(KeyCode::Char('v')));
+        assert_eq!(app.command_palette.as_ref().unwrap().search_query(), "rev");
+        app.handle_command_palette_key(key(KeyCode::Esc));
+
+        assert!(app.command_palette.is_none());
+        assert!(before.still_matches(&app.chat.textarea));
+
+        app.chat.textarea.move_cursor(CursorMove::End);
+        app.handle_chat_key(key(KeyCode::Char('/'))).await.unwrap();
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.chat.textarea.lines(), ["draft text/"]);
+    }
+
+    #[test]
+    fn slash_query_filters_live_while_preserving_arguments() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let entries = vec![
+            CommandPaletteEntry::Server(command("review", "prompt", "workspace")),
+            CommandPaletteEntry::Server(command("release", "workflow", "project")),
+        ];
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Slash,
+            "rv production now",
+            entries,
+        );
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.search_query(), "rv");
+        assert_eq!(palette.arguments(), "production now");
+        assert_eq!(palette.visible, [0]);
+        assert_eq!(palette.selected_entry().unwrap().display_name(), "review");
+    }
+
+    #[test]
+    fn server_source_precedence_is_first_wins_and_builtins_remain_distinct() {
+        let mut workspace = command("review", "prompt", "workspace");
+        workspace.description = "workspace winner".to_string();
+        let mut global = command("review", "prompt", "global");
+        global.description = "global duplicate".to_string();
+        let entries = merged_command_palette_entries(vec![
+            workspace,
+            global,
+            command("review", "workflow", "project"),
+        ]);
+
+        assert!(matches!(
+            entries.first(),
+            Some(CommandPaletteEntry::Builtin(_))
+        ));
+        let server = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                CommandPaletteEntry::Server(command) => Some(command),
+                CommandPaletteEntry::Builtin(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(server.len(), 2);
+        assert_eq!(server[0].description, "workspace winner");
+        assert_eq!(server[0].metadata["source"], "workspace");
+        assert_eq!(server[1].command_type, "workflow");
+    }
+
+    #[tokio::test]
+    async fn ctrl_k_is_global_and_stop_remains_available_while_streaming() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Config;
+        app.chat.streaming = true;
+
+        app.handle_key(modified_key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        let palette = app.command_palette.as_mut().unwrap();
+        let stop = palette
+            .visible
+            .iter()
+            .position(|index| {
+                matches!(
+                    palette.entries.get(*index),
+                    Some(CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop))
+                )
+            })
+            .unwrap();
+        palette.selected = stop;
+
+        app.activate_command_palette_selection();
+        assert!(!app.chat.streaming);
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.status_message, "Stopped");
+    }
+
+    #[tokio::test]
+    async fn catalog_failure_and_stale_epoch_leave_composer_and_palette_interactive() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        app.chat.textarea.insert_str("keep this draft");
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 4));
+        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Global,
+            "",
+            builtin_command_palette_entries(),
+        );
+        let epoch = app.command_palette.as_ref().unwrap().epoch;
+        app.command_palette.as_mut().unwrap().loading = true;
+
+        app.handle_event(AppEvent::CommandCatalogLoaded {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            result: Err("offline".to_string()),
+        })
+        .await
+        .unwrap();
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(!palette.loading);
+        assert!(palette
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("offline")));
+        assert!(before.still_matches(&app.chat.textarea));
+
+        app.command_palette.as_mut().unwrap().epoch = epoch.wrapping_add(1);
+        app.handle_event(AppEvent::CommandCatalogLoaded {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            result: Ok(CommandListResponse {
+                commands: vec![command("stale", "prompt", "global")],
+                total: 1,
+            }),
+        })
+        .await
+        .unwrap();
+        assert!(app
+            .command_palette
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry, CommandPaletteEntry::Server(_))));
+        assert!(before.still_matches(&app.chat.textarea));
+    }
+
+    #[tokio::test]
+    async fn catalog_result_requires_the_same_active_session() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Global,
+            "",
+            builtin_command_palette_entries(),
+        );
+        let epoch = app.command_palette.as_ref().unwrap().epoch;
+        app.command_palette.as_mut().unwrap().loading = true;
+        app.chat.session_id = Some("session-2".to_string());
+
+        app.handle_event(AppEvent::CommandCatalogLoaded {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            result: Ok(CommandListResponse {
+                commands: vec![command("wrong-session", "prompt", "workspace")],
+                total: 1,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(palette.loading);
+        assert!(palette
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry, CommandPaletteEntry::Server(_))));
+    }
+
+    #[tokio::test]
+    async fn catalog_refresh_preserves_selection_and_exposes_mcp_server_source() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Global,
+            "",
+            builtin_command_palette_entries(),
+        );
+        let palette = app.command_palette.as_mut().unwrap();
+        palette.selected = palette
+            .visible
+            .iter()
+            .position(|index| {
+                matches!(
+                    palette.entries.get(*index),
+                    Some(CommandPaletteEntry::Builtin(BuiltinPaletteAction::Config))
+                )
+            })
+            .unwrap();
+        palette.loading = true;
+        let epoch = palette.epoch;
+        let selected_key = palette.selected_entry().unwrap().key();
+        let mut mcp = command("filesystem/read", "mcp", "unused");
+        mcp.metadata = serde_json::json!({
+            "serverId": "filesystem",
+            "originalName": "read_file"
+        });
+
+        app.handle_event(AppEvent::CommandCatalogLoaded {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            result: Ok(CommandListResponse {
+                commands: vec![mcp],
+                total: 1,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_eq!(palette.selected_entry().unwrap().key(), selected_key);
+        let mcp = palette
+            .entries
+            .iter()
+            .find(|entry| matches!(entry, CommandPaletteEntry::Server(_)))
+            .unwrap();
+        assert_eq!(mcp.source_label(), "filesystem");
+        assert!(command_search_text(mcp).contains("read_file"));
+    }
+
+    #[test]
+    fn active_session_rebind_reloads_scope_without_touching_draft_or_query() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.textarea.insert_str("exact draft");
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 5));
+        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Global,
+            "config",
+            merged_command_palette_entries(vec![command("old", "prompt", "global")]),
+        );
+        let old_epoch = app.command_palette.as_ref().unwrap().epoch;
+        app.chat.session_id = Some("session-2".to_string());
+
+        app.rebind_command_palette_to_active_session();
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert_ne!(palette.epoch, old_epoch);
+        assert_eq!(palette.session_id.as_deref(), Some("session-2"));
+        assert_eq!(palette.input, "config");
+        assert!(palette
+            .entries
+            .iter()
+            .all(|entry| matches!(entry, CommandPaletteEntry::Builtin(_))));
+        assert!(before.still_matches(&app.chat.textarea));
+    }
+
+    #[tokio::test]
+    async fn workflow_resolution_populates_preview_and_never_auto_sends() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        app.chat.textarea.insert_str("original");
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 3));
+        let workflow = command("release", "workflow", "project");
+        let entry = CommandPaletteEntry::Server(workflow.clone());
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Slash,
+            "release production now",
+            vec![entry.clone()],
+        );
+        let palette = app.command_palette.as_mut().unwrap();
+        palette.resolving = true;
+        palette.resolving_key = Some(entry.key());
+        let epoch = palette.epoch;
+
+        app.handle_event(AppEvent::CommandResolved {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            command_key: entry.key(),
+            result: Ok(CommandDetail {
+                id: workflow.id,
+                name: workflow.name,
+                content: "Review the release plan".to_string(),
+                command_type: "workflow".to_string(),
+                metadata: serde_json::Value::Null,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(
+            app.chat.textarea.lines(),
+            ["Review the release plan", "", "production now"]
+        );
+        assert!(!app.chat.streaming);
+        assert!(app.chat.messages.is_empty());
+        assert!(app.status_message.contains("review and press Enter"));
+    }
+
+    #[tokio::test]
+    async fn stale_resolution_cannot_replace_draft() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        app.chat.textarea.insert_str("untouched");
+        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let prompt = command("review", "prompt", "workspace");
+        let entry = CommandPaletteEntry::Server(prompt.clone());
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Slash,
+            "review",
+            vec![entry.clone()],
+        );
+        let palette = app.command_palette.as_mut().unwrap();
+        palette.resolving = true;
+        palette.resolving_key = Some(entry.key());
+        let stale_epoch = palette.epoch;
+        palette.epoch = stale_epoch.wrapping_add(1);
+
+        app.handle_event(AppEvent::CommandResolved {
+            epoch: stale_epoch,
+            session_id: Some("session-1".to_string()),
+            command_key: entry.key(),
+            result: Ok(CommandDetail {
+                id: prompt.id,
+                name: prompt.name,
+                content: "must not land".to_string(),
+                command_type: "prompt".to_string(),
+                metadata: serde_json::Value::Null,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(before.still_matches(&app.chat.textarea));
+        assert!(app.command_palette.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolution_failure_keeps_exact_draft_and_returns_to_editing() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-1".to_string());
+        app.chat.textarea.insert_str("keep me");
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 2));
+        let before = ComposerSnapshot::capture(&app.chat.textarea);
+        let prompt = command("review", "prompt", "workspace");
+        let entry = CommandPaletteEntry::Server(prompt);
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Slash,
+            "review src",
+            vec![entry.clone()],
+        );
+        let palette = app.command_palette.as_mut().unwrap();
+        palette.resolving = true;
+        palette.resolving_key = Some(entry.key());
+        let epoch = palette.epoch;
+
+        app.handle_event(AppEvent::CommandResolved {
+            epoch,
+            session_id: Some("session-1".to_string()),
+            command_key: entry.key(),
+            result: Err("server unavailable".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let palette = app.command_palette.as_ref().unwrap();
+        assert!(!palette.resolving);
+        assert!(palette
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("server unavailable")));
+        assert!(before.still_matches(&app.chat.textarea));
+        app.handle_command_palette_key(key(KeyCode::Backspace));
+        assert_eq!(app.command_palette.as_ref().unwrap().input, "review sr");
+    }
+
+    #[test]
+    fn skill_and_mcp_selection_only_insert_existing_slash_semantics() {
+        for command_type in ["skill", "mcp"] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            let server = command("inspect", command_type, "server");
+            install_test_palette(
+                &mut app,
+                CommandPaletteTrigger::Slash,
+                "inspect src/main.rs",
+                vec![CommandPaletteEntry::Server(server)],
+            );
+
+            app.activate_command_palette_selection();
+
+            assert_eq!(app.chat.textarea.lines(), ["/inspect src/main.rs"]);
+            assert!(!app.chat.streaming);
+            assert!(app.chat.messages.is_empty());
+            assert!(app.command_palette.is_none());
+        }
+    }
+
+    #[test]
+    fn mouse_click_activates_the_same_selected_entry_as_keyboard() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        install_test_palette(
+            &mut app,
+            CommandPaletteTrigger::Global,
+            "",
+            vec![CommandPaletteEntry::Builtin(BuiltinPaletteAction::Help)],
+        );
+        app.command_palette
+            .as_ref()
+            .unwrap()
+            .hitboxes
+            .borrow_mut()
+            .push(CommandPaletteHitbox {
+                index: 0,
+                x: 10,
+                y: 5,
+                width: 20,
+                height: 2,
+            });
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: 12,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        };
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+
+        assert!(app.command_palette.is_none());
+        assert!(app.help_visible);
     }
 }
 

@@ -1,7 +1,7 @@
-//! Small, allocation-bounded fuzzy search shared by the session and model
-//! pickers. The TUI deliberately keeps this local instead of pulling in a
-//! second command-palette dependency: catalogs are small (hundreds of rows),
-//! and a deterministic subsequence score is easier to keep selection-stable.
+//! Small, allocation-bounded fuzzy search shared by the session, model, and
+//! command pickers. The TUI deliberately keeps this local instead of pulling
+//! in another palette dependency: catalogs are small (hundreds of rows), and
+//! a deterministic subsequence score is easier to keep selection-stable.
 
 /// Return ranked item indices for `query`.
 ///

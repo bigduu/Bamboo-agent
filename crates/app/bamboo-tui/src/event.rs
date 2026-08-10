@@ -1,8 +1,8 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::api::types::{
-    CatalogModel, ListSessionsEnvelope, McpServer, PendingQuestion, ProviderCatalog, Schedule,
-    Skill, SkillDetail, ToolInfo,
+    CatalogModel, CommandDetail, CommandListResponse, ListSessionsEnvelope, McpServer,
+    PendingQuestion, ProviderCatalog, Schedule, Skill, SkillDetail, ToolInfo,
 };
 use crate::api::{RespondFailure, SessionMutationFailure, VersionedSession};
 use crate::app::{OpenedSession, QuestionIdentity, SessionPickerIntent};
@@ -103,6 +103,22 @@ pub enum AppEvent {
         identity: QuestionIdentity,
         answer: String,
         result: Result<String, RespondFailure>,
+    },
+    /// Session-aware command catalog loaded for an open palette. Both the
+    /// palette epoch and Session id must still match before it can replace the
+    /// visible server entries.
+    CommandCatalogLoaded {
+        epoch: u64,
+        session_id: Option<String>,
+        result: Loaded<CommandListResponse>,
+    },
+    /// Prompt/workflow preview resolution completed. Selection never sends a
+    /// chat turn; the matching handler only fills the composer draft.
+    CommandResolved {
+        epoch: u64,
+        session_id: Option<String>,
+        command_key: String,
+        result: Loaded<CommandDetail>,
     },
     /// `Ctrl+O`'s provider-catalog fetch finished. `epoch` makes close/reopen
     /// safe when an older HTTP response arrives after the new overlay opened.
