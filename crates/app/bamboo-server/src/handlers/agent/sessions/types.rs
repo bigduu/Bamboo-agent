@@ -269,6 +269,12 @@ pub struct CreateSessionResponse {
     pub session: SessionSummary,
 }
 
+/// Response for `POST /api/v1/sessions/{session_id}/copy`.
+#[derive(Debug, Serialize)]
+pub struct CopySessionResponse {
+    pub session: SessionSummary,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionCreateOperationStatus {

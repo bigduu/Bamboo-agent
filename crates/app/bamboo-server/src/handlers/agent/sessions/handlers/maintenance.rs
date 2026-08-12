@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
-use bamboo_agent_core::Session;
+use bamboo_agent_core::{Session, Storage};
 use bamboo_engine::auto_dream::{
     run_project_auto_dream_once_for_project_with_read_roots, AutoDreamContext,
 };
@@ -17,6 +17,7 @@ pub async fn clear_session(
     path: web::Path<String>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
+    let _persistence_guard = state.persistence.acquire_lock(&session_id).await;
     let cleared = state
         .session_store
         .clear_session(&session_id)
@@ -31,6 +32,35 @@ pub async fn clear_session(
             "session_id": session_id
         })));
     }
+
+    // History/chat treat the process cache as authoritative while no runner is
+    // active. Replace it with the just-cleared durable snapshot before
+    // publishing SessionCleared; otherwise the old transcript can remain
+    // visible and a later cache-based save can write it back to disk. The
+    // persistence guard stays held across clear, reload, cache publication, and
+    // the account-feed event, preserving one process-local mutation boundary.
+    // Evict first so a rare post-clear reload failure cannot leave the stale
+    // pre-clear transcript authoritative in memory. A successful reload below
+    // immediately installs the replacement.
+    state.sessions.remove(&session_id);
+    let cleared_session = state
+        .session_store
+        .load_session(&session_id)
+        .await
+        .map_err(|error| {
+            crate::error::json_internal_server_error(format!(
+                "Failed to reload cleared session: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            crate::error::json_internal_server_error(
+                "Cleared session disappeared before cache publication",
+            )
+        })?;
+    state.sessions.insert(
+        session_id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(cleared_session)),
+    );
 
     // Publish onto the account change feed so other clients drop their cached
     // messages for this session and refetch lazily.
