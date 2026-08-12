@@ -32,7 +32,9 @@ use uuid::Uuid;
 
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
-use bamboo_domain::{ProjectId, Role, Session, SessionKind, TaskList, TokenBudgetUsage};
+use bamboo_domain::{
+    MessagePart, ProjectId, Role, Session, SessionKind, TaskList, TokenBudgetUsage,
+};
 
 use crate::search_index::{should_index_session, SessionSearchIndex};
 use bamboo_domain::AttachmentReader;
@@ -50,6 +52,11 @@ const RUNTIME_SIDECAR_FILE: &str = "runtime.json";
 const RUNTIME_TASK_TRANSACTION_DIR: &str = ".runtime-task-transactions";
 const RUNTIME_TASK_TRANSACTION_LOCK_FILE: &str = ".runtime-task-transactions.lock";
 const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 1;
+/// Private rollback markers for crash-safe session copies. A live `.json`
+/// marker means the copy has not crossed its success boundary yet, so startup
+/// must remove every target projection before exposing the store.
+const SESSION_COPY_TRANSACTION_DIR: &str = ".session-copy-transactions";
+const SESSION_COPY_TRANSACTION_VERSION: u32 = 1;
 const SESSIONS_INDEX_VERSION: u32 = 4;
 
 /// Filename of the append-only per-LLM-call token-usage log, stored alongside
@@ -81,6 +88,14 @@ struct RuntimeTaskTransactionJournal {
     second: TaskControlPlaneUndo,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionCopyTransactionJournal {
+    version: u32,
+    transaction_id: String,
+    source_id: String,
+    target_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeTaskJournalMarkerState {
     Prepared,
@@ -89,6 +104,24 @@ enum RuntimeTaskJournalMarkerState {
 }
 
 impl RuntimeTaskJournalMarkerState {
+    fn from_path(path: &Path) -> Option<Self> {
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("json") => Some(Self::Prepared),
+            Some("committing") => Some(Self::Committing),
+            Some("committed") => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionCopyJournalMarkerState {
+    Prepared,
+    Committing,
+    Committed,
+}
+
+impl SessionCopyJournalMarkerState {
     fn from_path(path: &Path) -> Option<Self> {
         match path.extension().and_then(|value| value.to_str()) {
             Some("json") => Some(Self::Prepared),
@@ -177,10 +210,8 @@ async fn lock_index_file_exclusive_at(bamboo_home_dir: &Path) -> io::Result<Sess
 }
 
 async fn persist_index_path_locked(index_path: &Path, index: &SessionsIndex) -> io::Result<()> {
-    let tmp = index_path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(index).map_err(|e| other_io_error(e.to_string()))?;
-    fs::write(&tmp, bytes).await?;
-    atomic_rename(&tmp, index_path).await
+    durable_atomic_write(index_path, &bytes).await
 }
 
 pub(crate) struct SessionLifecycleReadGuard {
@@ -203,6 +234,13 @@ impl Drop for SessionLifecycleWriteGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+/// Keeps the just-published copy isolated from cross-process storage writers
+/// while the HTTP layer mirrors it into process-local projections.
+pub struct SessionCopyProjectionGuard {
+    _lifecycle: SessionLifecycleWriteGuard,
+    _runtime_task: RuntimeTaskTransactionWriteGuard,
 }
 
 /// Build the sidecar snapshot: the full session minus its `messages` history.
@@ -449,6 +487,165 @@ pub struct SessionStoreV2 {
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
 }
 
+const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
+    "agent.runtime.state",
+    "assignment_prompt",
+    "clarification_resume_pending",
+    "conclusion_with_options_resume_pending",
+    "created_by_connect_key",
+    "created_by_schedule_id",
+    "disabled_tools",
+    "external_memory_rendered",
+    "execute.startup_handoff_at",
+    "execute.pending_turn_message_id",
+    "goal.state",
+    "gold.auto_continue_count",
+    "gold.evaluation_count",
+    "guardian.config",
+    "guardian.state",
+    "context_pressure_last_level",
+    "llm_request_render",
+    "last_run_error",
+    "last_run_status",
+    "lifecycle",
+    "pending_injected_messages",
+    "placement",
+    "project_resources_rendered",
+    "prompt_component_flags",
+    "prompt_component_lengths",
+    "prompt_composer_version",
+    "prompt_fingerprint",
+    "permission.reexecute_tool_call_id",
+    "resident_context",
+    "resident_name",
+    "responses.previous_response_id",
+    "responsibility",
+    "retry_resume_pending",
+    "retry_resume_reason",
+    "runtime.budget_exceeded_kind",
+    "runtime.completion_reason",
+    "runtime.kind",
+    "runtime.session_start_source",
+    "runtime.suspend_reason",
+    "schedule_run_id",
+    "skill.context",
+    "spawned_by",
+    "subagent_type",
+    "task_list_version",
+    "todo_list_version",
+];
+
+fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
+    let now = Utc::now();
+    let mut copy = source.clone();
+    copy.id = new_id.to_string();
+    copy.kind = SessionKind::Root;
+    copy.parent_session_id = None;
+    copy.root_session_id = new_id.to_string();
+    copy.spawn_depth = 0;
+    copy.title = format!("{} (copy)", source.title.trim_end());
+    copy.title_version = 0;
+    copy.title_generated = true;
+    copy.metadata_version = 0;
+    copy.pinned = false;
+    copy.created_at = now;
+    copy.updated_at = now;
+    copy.pending_question = None;
+    // A child budget belongs to its original tree. The independent root must
+    // resolve the current model limit on its first execution instead.
+    copy.token_budget = None;
+    copy.resolved_token_budget = None;
+    copy.agent_runtime_state = source.agent_runtime_state.as_ref().map(|state| {
+        let mut clean = bamboo_domain::AgentRuntimeState::default();
+        clean.set_permission_mode(state.effective_permission_mode());
+        clean
+    });
+    copy.force_manual_compression = None;
+    // Preserve every transcript message, but detach it from the source's
+    // provider cache/compression epoch so the first copied turn is a clean
+    // history reconstruction rather than a continuation of the source run.
+    // A trailing system-resume user message is still pending execution. It is
+    // control-plane state rather than completed conversation history, so strip
+    // only the consecutive tail. A resume message followed by an assistant
+    // response has already been consumed and remains part of the transcript.
+    while copy
+        .messages
+        .last()
+        .is_some_and(bamboo_domain::is_system_resume_message)
+    {
+        copy.messages.pop();
+    }
+    copy.clear_derived_context_state();
+    copy.model_context_state = None;
+    copy.prompt_snapshot = None;
+    for message in &mut copy.messages {
+        message.compression_level = 0;
+    }
+    // Task progress/generations belong to the source execution control plane,
+    // not to the copied conversation transcript.
+    copy.task_list = None;
+
+    for key in COPY_TRANSIENT_METADATA_KEYS {
+        copy.metadata.remove(*key);
+    }
+    for key in bamboo_domain::PERMISSION_AUDIT_METADATA_KEYS {
+        copy.metadata.remove(*key);
+    }
+    copy.metadata.retain(|key, _| {
+        let durable_workflow_config = matches!(
+            key.as_str(),
+            "workflow.selection.v1"
+                | "workflow.orchestration_opt_in"
+                | "workflow.active.v1"
+                | "workflow.active.snapshot.v1"
+        );
+        !key.starts_with("a2a.")
+            && !key.starts_with("execute.")
+            && !key.starts_with("external.")
+            && !key.starts_with("gold.last_")
+            && !key.starts_with("prefix_cache_")
+            && !key.starts_with("runtime_prompt_")
+            && !key.starts_with("skill_runtime_")
+            && (!key.starts_with("workflow.") || durable_workflow_config)
+    });
+    if let Some(runtime) = copy.runtime_metadata.as_mut() {
+        runtime.subagent_type = None;
+        runtime.last_run_status = None;
+        runtime.last_run_error = None;
+        runtime.pending_injected_messages = None;
+        runtime.task_list_version = None;
+        runtime.todo_list_version = None;
+        runtime.session_inbox_admission = None;
+        if runtime.is_empty() {
+            copy.runtime_metadata = None;
+        }
+    }
+    copy
+}
+
+fn rewrite_attachment_session_urls(session: &mut Session, source_id: &str, new_id: &str) {
+    let source_prefix = format!("bamboo-attachment://{source_id}/");
+    let target_prefix = format!("bamboo-attachment://{new_id}/");
+    for message in &mut session.messages {
+        if let Some(parts) = message.content_parts.as_mut() {
+            for part in parts {
+                if let MessagePart::ImageUrl { image_url } = part {
+                    if let Some(attachment_id) = image_url.url.strip_prefix(&source_prefix) {
+                        image_url.url = format!("{target_prefix}{attachment_id}");
+                    }
+                }
+            }
+        }
+        if let Some(results) = message.image_ocr.as_mut() {
+            for result in results {
+                if let Some(attachment_id) = result.image_url.strip_prefix(&source_prefix) {
+                    result.image_url = format!("{target_prefix}{attachment_id}");
+                }
+            }
+        }
+    }
+}
+
 impl SessionStoreV2 {
     /// Open (or create) the V2 session store rooted at `bamboo_home_dir`.
     ///
@@ -576,11 +773,21 @@ impl SessionStoreV2 {
         // initialization. Clean hot-path reads only probe it and never repeat
         // mkdir/chmod work; journal creation also revalidates it before write.
         storage.ensure_runtime_task_transaction_dir().await?;
+        storage.ensure_session_copy_transaction_dir().await?;
 
         // Constructor recovery takes the same cross-process exclusive gate as
         // a live commit. A second store can therefore recover an orphan, but
         // can never mistake another process's in-flight journal for one.
-        storage.recover_all_runtime_task_transactions().await?;
+        {
+            let _lifecycle = storage.lock_session_lifecycle_exclusive().await?;
+            let _runtime_task = storage.lock_runtime_task_transaction_exclusive().await?;
+            storage
+                .recover_all_runtime_task_transactions_locked()
+                .await?;
+            storage
+                .recover_all_session_copy_transactions_locked()
+                .await?;
+        }
 
         if needs_rebuild {
             storage.rebuild_index_from_disk().await?;
@@ -799,6 +1006,112 @@ impl SessionStoreV2 {
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         Some(session)
+    }
+
+    /// Strict operation loader: unlike rebuild recovery, copy must distinguish
+    /// a missing source from corrupt/unreadable authoritative state and must
+    /// never silently fall back to stale `session.json` control-plane data.
+    async fn load_session_from_dir_strict(
+        abs_dir: &Path,
+        id: &str,
+        expected_kind: SessionKind,
+        expected_root_id: &str,
+    ) -> io::Result<Option<Session>> {
+        let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut main: Session = serde_json::from_str(&raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid source session.json: {error}"),
+            )
+        })?;
+        let canonical_legacy_root = expected_kind == SessionKind::Root
+            && expected_root_id == id
+            && main.root_session_id.is_empty();
+        if main.id != id
+            || main.kind != expected_kind
+            || (!canonical_legacy_root && main.root_session_id != expected_root_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session identity does not match its expected canonical path",
+            ));
+        }
+        // `root_session_id` predates some on-disk root sessions and therefore
+        // deserializes to an empty string through serde(default). Only a root
+        // found at its own canonical root path may use that legacy encoding;
+        // normalize it before comparing/overlaying the runtime sidecar.
+        if canonical_legacy_root {
+            main.root_session_id = id.to_string();
+        }
+        let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
+        let sidecar = match fs::read_to_string(&runtime_path).await {
+            Ok(raw) => {
+                let mut sidecar: Session = serde_json::from_str(&raw).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid source runtime.json: {error}"),
+                    )
+                })?;
+                if expected_kind == SessionKind::Root
+                    && expected_root_id == id
+                    && sidecar.root_session_id.is_empty()
+                {
+                    sidecar.root_session_id = id.to_string();
+                }
+                if sidecar.id != id
+                    || sidecar.kind != main.kind
+                    || sidecar.root_session_id != main.root_session_id
+                    || sidecar.parent_session_id != main.parent_session_id
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source runtime sidecar identity does not match session.json",
+                    ));
+                }
+                Some(sidecar)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let mut session = overlay_runtime_sidecar(main, sidecar);
+        session.clear_stale_root_token_budget();
+        Ok(Some(session))
+    }
+
+    async fn directory_has_regular_files(path: &Path) -> io::Result<bool> {
+        let mut entries = match fs::read_dir(path).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn copy_source_identity_from_rel(
+        source_id: &str,
+        source_rel: &str,
+    ) -> io::Result<(SessionKind, String)> {
+        let parts = source_rel.split('/').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["sessions", id] if *id == source_id => Ok((SessionKind::Root, source_id.to_string())),
+            ["sessions", root_id, "children", id] if *id == source_id => {
+                validate_session_id(root_id)?;
+                Ok((SessionKind::Child, (*root_id).to_string()))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source session index path is not canonical",
+            )),
+        }
     }
 
     pub fn search_index(&self) -> &SessionSearchIndex {
@@ -1142,8 +1455,16 @@ impl SessionStoreV2 {
         self.bamboo_home_dir.join(RUNTIME_TASK_TRANSACTION_DIR)
     }
 
-    async fn ensure_runtime_task_transaction_dir(&self) -> io::Result<PathBuf> {
-        let path = self.runtime_task_transaction_dir();
+    fn session_copy_transaction_dir(&self) -> PathBuf {
+        self.bamboo_home_dir.join(SESSION_COPY_TRANSACTION_DIR)
+    }
+
+    fn session_copy_staging_dir(&self, journal: &SessionCopyTransactionJournal) -> PathBuf {
+        self.bamboo_home_dir
+            .join(format!(".session-copy-{}", journal.transaction_id))
+    }
+
+    async fn ensure_private_transaction_dir(&self, path: PathBuf) -> io::Result<PathBuf> {
         let home_existed = fs::try_exists(&self.bamboo_home_dir).await?;
         fs::create_dir_all(&self.bamboo_home_dir).await?;
         if !home_existed {
@@ -1151,20 +1472,25 @@ impl SessionStoreV2 {
         }
         let path_existed = fs::try_exists(&path).await?;
         fs::create_dir_all(&path).await?;
-        // Journals contain only Task lists/generations (never transcripts or
-        // arbitrary metadata), but Task descriptions may still be private user
-        // data. Restrict the directory even when the process umask is loose.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
         }
         if !path_existed {
-            // The journal file cannot be durable if the directory containing it
-            // can itself disappear after a power loss.
             sync_parent_directory_entry(&path).await?;
         }
         Ok(path)
+    }
+
+    async fn ensure_runtime_task_transaction_dir(&self) -> io::Result<PathBuf> {
+        self.ensure_private_transaction_dir(self.runtime_task_transaction_dir())
+            .await
+    }
+
+    async fn ensure_session_copy_transaction_dir(&self) -> io::Result<PathBuf> {
+        self.ensure_private_transaction_dir(self.session_copy_transaction_dir())
+            .await
     }
 
     fn runtime_task_recovery_error() -> io::Error {
@@ -1896,9 +2222,224 @@ impl SessionStoreV2 {
         Ok(())
     }
 
-    async fn recover_all_runtime_task_transactions(&self) -> io::Result<()> {
-        let _guard = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked().await
+    async fn session_copy_journal_paths(&self) -> io::Result<Vec<PathBuf>> {
+        let mut entries = match fs::read_dir(self.session_copy_transaction_dir()).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if entry.file_type().await?.is_file()
+                && SessionCopyJournalMarkerState::from_path(&path).is_some()
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn validate_session_copy_journal(
+        path: &Path,
+        journal: &SessionCopyTransactionJournal,
+    ) -> io::Result<()> {
+        if journal.version != SESSION_COPY_TRANSACTION_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported session copy transaction journal version {}",
+                    journal.version
+                ),
+            ));
+        }
+        let file_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid copy journal name")
+            })?;
+        Uuid::parse_str(file_id).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid session copy transaction UUID: {error}"),
+            )
+        })?;
+        if journal.transaction_id != file_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session copy transaction id does not match its filename",
+            ));
+        }
+        validate_session_id(&journal.source_id)?;
+        validate_session_id(&journal.target_id)?;
+        if journal.source_id == journal.target_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session copy transaction source and target must differ",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn read_session_copy_journal(
+        &self,
+        path: &Path,
+    ) -> io::Result<SessionCopyTransactionJournal> {
+        let raw = fs::read_to_string(path).await?;
+        let journal = serde_json::from_str(&raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid session copy transaction journal: {error}"),
+            )
+        })?;
+        Self::validate_session_copy_journal(path, &journal)?;
+        Ok(journal)
+    }
+
+    async fn write_session_copy_journal(
+        &self,
+        journal: &SessionCopyTransactionJournal,
+    ) -> io::Result<PathBuf> {
+        let dir = self.ensure_session_copy_transaction_dir().await?;
+        let path = dir.join(format!("{}.json", journal.transaction_id));
+        let bytes = serde_json::to_vec(journal)
+            .map_err(|error| other_io_error(format!("serialize session copy journal: {error}")))?;
+        durable_atomic_write(&path, &bytes).await?;
+        Ok(path)
+    }
+
+    async fn remove_session_copy_journal_family(
+        &self,
+        journal: &SessionCopyTransactionJournal,
+    ) -> io::Result<()> {
+        for extension in ["json", "committing", "committed"] {
+            let path = self
+                .session_copy_transaction_dir()
+                .join(format!("{}.{}", journal.transaction_id, extension));
+            match fs::try_exists(&path).await {
+                Ok(true) => durable_deactivate_recovery_marker(&path).await?,
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn rollback_session_copy_transaction(
+        &self,
+        journal: &SessionCopyTransactionJournal,
+    ) -> io::Result<()> {
+        // Hide the target first. If cleanup later fails, the retained marker
+        // makes startup retry before the store becomes available.
+        let mut errors = Vec::new();
+        if let Err(error) = self
+            .update_index(|index| {
+                index.sessions.remove(&journal.target_id);
+                Ok(())
+            })
+            .await
+        {
+            errors.push(format!("index cleanup: {error}"));
+            // The durable index could not be rewritten, but readers of this
+            // still-live store must not retain a target whose directory is
+            // about to be removed. The journal keeps cross-process recovery
+            // retryable; this in-memory removal closes the local visibility gap.
+            self.index.write().await.sessions.remove(&journal.target_id);
+        }
+        if let Err(error) = self.search_index.delete_session(&journal.target_id).await {
+            errors.push(format!("search index cleanup: {error}"));
+        }
+        let target_dir = self.sessions_dir.join(&journal.target_id);
+        let staging_dir = self.session_copy_staging_dir(journal);
+        for path in [&target_dir, &staging_dir] {
+            match fs::remove_dir_all(path).await {
+                Ok(()) => {
+                    if let Err(error) = sync_parent_directory_entry(path).await {
+                        errors.push(format!("sync cleanup {}: {error}", path.display()));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!("remove {}: {error}", path.display())),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(other_io_error(format!(
+                "session copy rollback incomplete: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+
+    async fn recover_session_copy_journal(
+        &self,
+        path: &Path,
+        journal: &SessionCopyTransactionJournal,
+    ) -> io::Result<()> {
+        let state = SessionCopyJournalMarkerState::from_path(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid session copy journal marker extension",
+            )
+        })?;
+        if state == SessionCopyJournalMarkerState::Committed {
+            let target_dir = self.sessions_dir.join(&journal.target_id);
+            let target = Self::load_session_from_dir_strict(
+                &target_dir,
+                &journal.target_id,
+                SessionKind::Root,
+                &journal.target_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "committed copied session target is missing",
+                )
+            })?;
+            if target.kind != SessionKind::Root || target.root_session_id != target.id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "committed copied session is not an independent root",
+                ));
+            }
+            let has_attachments =
+                Self::directory_has_regular_files(&target_dir.join("attachments")).await?;
+            self.upsert_index_from_session_inner(
+                &target,
+                Self::root_rel_path(&target.id),
+                false,
+                Some(has_attachments),
+            )
+            .await?;
+            if let Err(error) = self.search_index.upsert_session(&target).await {
+                tracing::warn!(
+                    session_id = %target.id,
+                    %error,
+                    "failed to recover copied session search index"
+                );
+            }
+        } else {
+            self.rollback_session_copy_transaction(journal).await?;
+        }
+        durable_deactivate_recovery_marker(path).await
+    }
+
+    async fn recover_all_session_copy_transactions_locked(&self) -> io::Result<()> {
+        for path in self.session_copy_journal_paths().await? {
+            let journal = self.read_session_copy_journal(&path).await?;
+            self.recover_session_copy_journal(&path, &journal).await?;
+        }
+        // A previous marker deactivation may have completed its rename to an
+        // inert tombstone but failed the directory sync. Lifecycle mutations
+        // that could remove a target must not proceed until every such visible
+        // rename is itself durable, or power loss could resurrect a committed
+        // marker after the target was deleted.
+        sync_directory(&self.session_copy_transaction_dir()).await?;
+        Ok(())
     }
 
     async fn recover_runtime_task_transaction_for_pair_locked(
@@ -2466,7 +3007,7 @@ impl SessionStoreV2 {
         session: &Session,
         rel_path: String,
     ) -> io::Result<()> {
-        self.upsert_index_from_session_inner(session, rel_path, false)
+        self.upsert_index_from_session_inner(session, rel_path, false, None)
             .await
     }
 
@@ -2475,7 +3016,7 @@ impl SessionStoreV2 {
         session: &Session,
         rel_path: String,
     ) -> io::Result<()> {
-        self.upsert_index_from_session_inner(session, rel_path, true)
+        self.upsert_index_from_session_inner(session, rel_path, true, None)
             .await
     }
 
@@ -2484,8 +3025,12 @@ impl SessionStoreV2 {
         session: &Session,
         rel_path: String,
         preserve_newer: bool,
+        known_has_attachments: Option<bool>,
     ) -> io::Result<()> {
-        let has_attachments = self.compute_has_attachments(&session.id).await;
+        let has_attachments = match known_has_attachments {
+            Some(value) => value,
+            None => self.compute_has_attachments(&session.id).await,
+        };
         // Read the well-known runtime keys via the typed accessors, which prefer
         // `runtime_metadata` and fall back to the legacy `metadata` strings.
         let last_run_status = session
@@ -2610,6 +3155,8 @@ impl SessionStoreV2 {
         raw_base64_or_data_url: &str,
         mime_hint: Option<&str>,
     ) -> io::Result<(String, String)> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let (mime, base64_data) =
             parse_data_url_base64(raw_base64_or_data_url).unwrap_or_else(|| {
                 (
@@ -2678,8 +3225,282 @@ impl SessionStoreV2 {
         Ok(None)
     }
 
+    /// Copy one session into a new, independent root session.
+    ///
+    /// The caller must serialize the source with the ordinary per-session
+    /// persistence lock before invoking this method. The lifecycle write lock
+    /// prevents a concurrent delete/rebuild from racing the source attachment
+    /// snapshot or observing the private staging directory; the exclusive
+    /// runtime/task lock also freezes cross-process writers. The fully written
+    /// directory is renamed into place before the index entry is published;
+    /// any pre-commit error removes every target artifact and index projection.
+    /// Once the durable committed marker is published, recovery completes the
+    /// successful copy instead of reverting it.
+    pub async fn copy_session(&self, source_id: &str, new_id: &str) -> io::Result<Option<Session>> {
+        Ok(self
+            .copy_session_with_projection_guard(source_id, new_id)
+            .await?
+            .map(|(session, guard)| {
+                drop(guard);
+                session
+            }))
+    }
+
+    /// Copy a session while retaining the cross-process publication boundary.
+    /// The caller must drop the returned guard only after all process-local
+    /// cache/workspace/feed projections derived from the returned snapshot are
+    /// visible.
+    pub async fn copy_session_with_projection_guard(
+        &self,
+        source_id: &str,
+        new_id: &str,
+    ) -> io::Result<Option<(Session, SessionCopyProjectionGuard)>> {
+        validate_session_id(source_id)?;
+        validate_session_id(new_id)?;
+        if source_id == new_id {
+            return Err(other_io_error("source and copied session ids must differ"));
+        }
+
+        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        // Ordinary full/runtime saves hold the shared form of this lock. The
+        // exclusive claim freezes every cross-process source writer while we
+        // read session.json/runtime.json and copy referenced attachments.
+        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_session_copy_transactions_locked().await?;
+        let Some(source_rel) = self.resolve_rel_path(source_id).await else {
+            return Ok(None);
+        };
+        let (expected_source_kind, expected_source_root) =
+            Self::copy_source_identity_from_rel(source_id, &source_rel)?;
+        if self.resolve_rel_path(new_id).await.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "copied session id already exists",
+            ));
+        }
+
+        let source_dir = self.abs_path_from_rel(&source_rel);
+        let source = Self::load_session_from_dir_strict(
+            &source_dir,
+            source_id,
+            expected_source_kind,
+            &expected_source_root,
+        )
+        .await?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "indexed source session.json is missing",
+            )
+        })?;
+        let target_rel = Self::root_rel_path(new_id);
+        let target_dir = self.abs_path_from_rel(&target_rel);
+        if fs::try_exists(&target_dir).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "copied session directory already exists",
+            ));
+        }
+        let transaction_id = Uuid::new_v4().to_string();
+        let journal = SessionCopyTransactionJournal {
+            version: SESSION_COPY_TRANSACTION_VERSION,
+            transaction_id,
+            source_id: source_id.to_string(),
+            target_id: new_id.to_string(),
+        };
+        let staging_dir = self.session_copy_staging_dir(&journal);
+        let journal_path = self.write_session_copy_journal(&journal).await?;
+
+        let mut copied = copied_session_snapshot(&source, new_id);
+        rewrite_attachment_session_urls(&mut copied, source_id, new_id);
+        let has_attachments = match self
+            .write_copied_session(&source_dir, &staging_dir, &target_dir, &copied)
+            .await
+        {
+            Ok(has_attachments) => has_attachments,
+            Err(error) => {
+                return self
+                    .fail_session_copy_with_rollback(&journal_path, &journal, error)
+                    .await
+                    .map(|()| None)
+            }
+        };
+        let committing = journal_path.with_extension("committing");
+        if let Err(error) = atomic_rename(&journal_path, &committing).await {
+            return self
+                .fail_session_copy_with_rollback(&journal_path, &journal, error)
+                .await
+                .map(|()| None);
+        }
+        if let Err(error) = sync_parent_directory_entry(&committing).await {
+            return self
+                .fail_session_copy_with_rollback(&committing, &journal, error)
+                .await
+                .map(|()| None);
+        }
+        let committed = journal_path.with_extension("committed");
+        if let Err(error) = atomic_rename(&committing, &committed).await {
+            return self
+                .fail_session_copy_with_rollback(&committing, &journal, error)
+                .await
+                .map(|()| None);
+        }
+        if let Err(error) = sync_parent_directory_entry(&committed).await {
+            // A rename is not a durable commit boundary until its containing
+            // directory is synchronized. Do not acknowledge a copy whose
+            // recovery decision could revert to `.committing` after power loss.
+            return self
+                .fail_session_copy_with_rollback(&committed, &journal, error)
+                .await
+                .map(|()| None);
+        }
+        // Only a durable committed marker may precede public index visibility.
+        // A crash from here is completed by startup recovery; while this call
+        // remains alive, any publication error is synchronously rolled back.
+        if let Err(error) = self
+            .upsert_index_from_session_inner(&copied, target_rel, false, Some(has_attachments))
+            .await
+        {
+            return self
+                .fail_session_copy_with_rollback(&committed, &journal, error)
+                .await
+                .map(|()| None);
+        }
+        if let Err(error) = self.search_index.upsert_session(&copied).await {
+            tracing::warn!(
+                session_id = %copied.id,
+                %error,
+                "failed to update copied session search index"
+            );
+        }
+        // A retained committed marker is safe: every target-removing lifecycle
+        // operation recovers committed copies before it mutates the tree. This
+        // marker cleanup is therefore retryable maintenance after the durable
+        // commit decision, not a reason to report a committed copy as failed.
+        if let Err(error) = durable_deactivate_recovery_marker(&committed).await {
+            tracing::warn!(session_id = new_id, %error, "copied session committed; journal cleanup deferred to lifecycle recovery");
+        }
+        Ok(Some((
+            copied,
+            SessionCopyProjectionGuard {
+                _lifecycle,
+                _runtime_task,
+            },
+        )))
+    }
+
+    async fn write_copied_session(
+        &self,
+        source_dir: &Path,
+        staging_dir: &Path,
+        target_dir: &Path,
+        copied: &Session,
+    ) -> io::Result<bool> {
+        fs::create_dir(staging_dir).await?;
+        fs::create_dir(staging_dir.join("children")).await?;
+        let source_attachments = source_dir.join("attachments");
+        let staging_attachments = staging_dir.join("attachments");
+        fs::create_dir(&staging_attachments).await?;
+        let mut has_attachments = false;
+        if fs::try_exists(&source_attachments).await? {
+            let mut entries = fs::read_dir(&source_attachments).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                if !entry.file_type().await?.is_file() {
+                    continue;
+                }
+                durable_copy_file(&entry.path(), &staging_attachments.join(entry.file_name()))
+                    .await?;
+                has_attachments = true;
+            }
+        }
+        // Persist copied file names after each file's contents have reached
+        // stable storage. The later staging-directory sync only persists the
+        // `attachments/` directory entry, not entries inside that directory.
+        sync_directory(&staging_attachments).await?;
+
+        let runtime_snapshot = runtime_sidecar_snapshot(copied);
+        let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        durable_atomic_write(&staging_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+        let session_json =
+            serde_json::to_vec_pretty(copied).map_err(|error| other_io_error(error.to_string()))?;
+        durable_atomic_write(&staging_dir.join("session.json"), &session_json).await?;
+        // Flush the staging directory after its children/attachments are all
+        // complete, before its name is published under `sessions/`.
+        sync_parent_directory_entry(&staging_dir.join("session.json")).await?;
+        atomic_rename(staging_dir, target_dir).await?;
+        // This rename crosses from `$BAMBOO_HOME` into `sessions/`: both
+        // directory entries must be synchronized before publishing the target.
+        sync_parent_directory_entry(staging_dir).await?;
+        sync_parent_directory_entry(target_dir).await?;
+        Ok(has_attachments)
+    }
+
+    async fn fail_session_copy_with_rollback(
+        &self,
+        marker_path: &Path,
+        journal: &SessionCopyTransactionJournal,
+        primary: io::Error,
+    ) -> io::Result<()> {
+        let primary_kind = primary.kind();
+        let primary_message = primary.to_string();
+        // A durable `.committed` marker tells startup to finish the copy. If a
+        // live caller has not acknowledged success and chooses rollback, first
+        // durably move that decision back to a rollback state. Otherwise a
+        // partial cleanup could leave a committed marker pointing at a removed
+        // target and make every subsequent startup fail closed forever.
+        if SessionCopyJournalMarkerState::from_path(marker_path)
+            == Some(SessionCopyJournalMarkerState::Committed)
+        {
+            let rollback_marker = marker_path.with_extension("committing");
+            if let Err(error) = async {
+                atomic_rename(marker_path, &rollback_marker).await?;
+                sync_parent_directory_entry(&rollback_marker).await
+            }
+            .await
+            {
+                return Err(other_io_error(format!(
+                    "session copy failed ({primary_message}); could not persist rollback decision ({error}); recovery required"
+                )));
+            }
+        }
+        match self.rollback_session_copy_transaction(journal).await {
+            Ok(()) => match self.remove_session_copy_journal_family(journal).await {
+                Ok(()) => Err(io::Error::new(
+                    primary_kind,
+                    format!("session copy failed and was rolled back: {primary_message}"),
+                )),
+                Err(cleanup_error) => Err(other_io_error(format!(
+                    "session copy failed ({primary_message}); rollback succeeded but journal cleanup failed ({cleanup_error}); recovery required"
+                ))),
+            },
+            Err(rollback_error) => Err(other_io_error(format!(
+                "session copy failed ({primary_message}); rollback failed ({rollback_error}); recovery required"
+            ))),
+        }
+    }
+
     pub async fn clear_session(&self, session_id: &str) -> io::Result<bool> {
-        let Some(mut session) = self.load_session(session_id).await? else {
+        validate_session_id(session_id)?;
+        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_session_copy_transactions_locked().await?;
+
+        let Some(entry) = self.get_index_entry(session_id).await else {
+            return Ok(false);
+        };
+        let rel_path = entry.rel_path.clone();
+        let abs_dir = self.abs_path_from_rel(&rel_path);
+        let Some(mut session) = Self::load_session_from_dir_strict(
+            &abs_dir,
+            session_id,
+            entry.kind,
+            &entry.root_session_id,
+        )
+        .await?
+        else {
             return Ok(false);
         };
 
@@ -2700,16 +3521,36 @@ impl SessionStoreV2 {
         session.updated_at = Utc::now();
 
         // Remove attachments on disk.
-        if let Ok(Some(dir)) = self.attachments_dir(session_id).await {
-            let _ = fs::remove_dir_all(&dir).await;
-            let _ = fs::create_dir_all(&dir).await;
+        let attachments_dir = abs_dir.join("attachments");
+        match fs::remove_dir_all(&attachments_dir).await {
+            Ok(()) => sync_parent_directory_entry(&attachments_dir).await?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+        fs::create_dir_all(&attachments_dir).await?;
+        sync_parent_directory_entry(&attachments_dir).await?;
 
-        self.save_session(&session).await?;
+        self.write_runtime_sidecar(&abs_dir, &session).await?;
+        let path = abs_dir.join("session.json");
+        let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
+        let bytes = serde_json::to_vec_pretty(&session)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        fs::write(&tmp, bytes).await?;
+        atomic_rename(&tmp, &path).await?;
+        self.upsert_index_from_session_inner(&session, rel_path, false, Some(false))
+            .await?;
+        if let Err(error) = self.search_index.upsert_session(&session).await {
+            tracing::warn!(session_id, %error, "failed to update cleared session search index");
+        }
         Ok(true)
     }
 
     pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
+        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_session_copy_transactions_locked().await?;
+
         // All decisions are index-only.
         let entries = {
             self.index
@@ -2800,10 +3641,10 @@ impl SessionStoreV2 {
 
         // Apply deletions (roots first; they delete children implicitly).
         for root_id in delete_root_ids.iter() {
-            let _ = self.delete_session_recursive(root_id, true).await?;
+            let _ = self.delete_session_recursive_locked(root_id, true).await?;
         }
         for child_id in delete_child_ids.iter() {
-            let _ = self.delete_session_recursive(child_id, true).await?;
+            let _ = self.delete_session_recursive_locked(child_id, true).await?;
         }
         let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
         deleted_session_ids.sort();
@@ -2820,7 +3661,9 @@ impl SessionStoreV2 {
     /// - `bamboo_home_dir/sessions.json` (rewritten to empty index)
     pub async fn dev_reset(&self) -> io::Result<()> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_session_copy_transactions_locked().await?;
 
         // Remove the sessions directory entirely.
         let _ = fs::remove_dir_all(&self.sessions_dir).await;
@@ -2845,7 +3688,9 @@ impl SessionStoreV2 {
         force: bool,
     ) -> io::Result<bool> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_session_copy_transactions_locked().await?;
         self.delete_session_recursive_locked(session_id, force)
             .await
     }
@@ -3001,27 +3846,37 @@ async fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
 /// Unix exposes directory handles through `std`; Windows does not, so Windows
 /// transaction renames use `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` above as
 /// the strongest portable completion boundary available here.
-async fn sync_parent_directory_entry(path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+async fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let parent = parent.to_path_buf();
-        tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
             .await
             .map_err(|error| other_io_error(format!("join directory sync task: {error}")))?
     }
     #[cfg(windows)]
     {
-        let _ = parent;
+        let _ = path;
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = parent;
+        let _ = path;
         Ok(())
     }
+}
+
+async fn sync_parent_directory_entry(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    sync_directory(parent).await
+}
+
+async fn durable_copy_file(source: &Path, target: &Path) -> io::Result<u64> {
+    let copied = fs::copy(source, target).await?;
+    fs::File::open(target).await?.sync_all().await?;
+    Ok(copied)
 }
 
 /// Transaction-only durable replacement. Unlike ordinary sidecar writes, the
@@ -3340,8 +4195,8 @@ impl AttachmentReader for SessionStoreV2 {
 mod tests {
     use super::*;
     use bamboo_domain::{
-        Message, SessionInboxError, SessionInboxPort, SessionMessageEnvelope, TaskItem,
-        TaskItemStatus,
+        ImageOcrResult, ImageUrlRef, Message, MessagePart, SessionInboxError, SessionInboxPort,
+        SessionMessageEnvelope, TaskItem, TaskItemStatus,
     };
     use std::io;
     use std::sync::Arc;
@@ -5538,6 +6393,555 @@ mod tests {
         let (storage, _temp_dir) = create_temp_storage().await?;
         let entry = storage.get_index_entry("nonexistent").await;
         assert!(entry.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_session_creates_independent_root_and_copies_attachments() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let root = Session::new("root-source", "model");
+        storage.save_session(&root).await?;
+        let mut source = Session::new_child("child-source", &root.id, "gpt-5", "Research");
+        source.pinned = true;
+        source.model_ref = Some(ProviderModelRef::new("openai-instance", "gpt-5"));
+        source.reasoning_effort = Some(ReasoningEffort::High);
+        source.set_project_id_meta("project-1");
+        source.set_workspace_path_meta("/workspaces/project-1");
+        source.set_provider_name("openai-instance");
+        source
+            .metadata
+            .insert("base_system_prompt".into(), "You are exact.".into());
+        source.set_pending_question(
+            "call-1".into(),
+            "Question".into(),
+            "Proceed?".into(),
+            vec![],
+            true,
+        );
+        source.set_last_run_status("running");
+        source.set_last_run_error("old failure");
+        source.set_pending_injected_messages(vec![serde_json::json!({"content":"queued"})]);
+        source
+            .metadata
+            .insert("gold_config".into(), r#"{"goal":"ship"}"#.into());
+        source
+            .metadata
+            .insert("a2a.context_id".into(), "remote-context".into());
+        source
+            .metadata
+            .insert("created_by_schedule_id".into(), "schedule-1".into());
+        source
+            .metadata
+            .insert("assignment_prompt".into(), "child-only".into());
+        source
+            .metadata
+            .insert("goal.state".into(), r#"{"status":"active"}"#.into());
+        source
+            .metadata
+            .insert("permission.audit_revision".into(), "42".into());
+        source
+            .metadata
+            .insert("runtime_prompt_snapshot".into(), "stale".into());
+        source
+            .metadata
+            .insert("workflow.run_ids.v1".into(), "[]".into());
+        source.metadata.insert(
+            "workflow.selection.v1".into(),
+            r#"{"id":"review","source":"user","revision":1,"args":{}}"#.into(),
+        );
+        source
+            .metadata
+            .insert("workflow.orchestration_opt_in".into(), "true".into());
+        source
+            .metadata
+            .insert("workflow.active.v1".into(), "stale-active".into());
+        source.metadata.insert(
+            "workflow.active.snapshot.v1".into(),
+            "durable-snapshot".into(),
+        );
+        source
+            .metadata
+            .insert("workflow.activation_event.v1".into(), "stale-event".into());
+        source.metadata.insert(
+            "skill_runtime_selected_skill_ids".into(),
+            r#"["stale"]"#.into(),
+        );
+        source
+            .metadata
+            .insert("selected_skill_ids".into(), r#"["review"]"#.into());
+        source.metadata.insert("skill_mode".into(), "code".into());
+        source
+            .metadata
+            .insert("workspace_source".into(), "project_default".into());
+        source.metadata.insert(
+            "execute.pending_turn_message_id".into(),
+            "message-old".into(),
+        );
+        source
+            .metadata
+            .insert("context_pressure_last_level".into(), "high".into());
+        source
+            .metadata
+            .insert("prefix_cache_section_state".into(), "stale".into());
+        source
+            .metadata
+            .insert("llm_request_render".into(), "stale".into());
+        source
+            .metadata
+            .insert("custom.copy_config".into(), "preserve-me".into());
+        source.task_list = Some(transaction_task_list(&source.id, "Source tasks"));
+        source.set_task_list_version_meta("7");
+        source.token_budget = Some(bamboo_domain::TokenBudget::for_model(1024));
+        source.token_usage = Some(TokenBudgetUsage {
+            system_tokens: 1,
+            summary_tokens: 2,
+            window_tokens: 3,
+            total_tokens: 6,
+            max_context_tokens: 1024,
+            budget_limit: 900,
+            truncation_occurred: false,
+            segments_removed: 0,
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+            thinking_tokens: 0,
+            cache_read_input_tokens: 0,
+        });
+        source.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("run-1"));
+        source
+            .agent_runtime_state
+            .as_mut()
+            .unwrap()
+            .set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+        storage.save_session(&source).await?;
+
+        let (attachment_id, attachment_url) = storage
+            .write_image_attachment(&source, "data:image/png;base64,aGVsbG8=", Some("image/png"))
+            .await?;
+        let mut message = Message::user_with_parts(
+            "look",
+            vec![MessagePart::ImageUrl {
+                image_url: ImageUrlRef {
+                    url: attachment_url.clone(),
+                    detail: None,
+                },
+            }],
+        );
+        message.image_ocr = Some(vec![ImageOcrResult {
+            image_url: attachment_url,
+            lines: vec![],
+            error: None,
+        }]);
+        source.add_message(message);
+        storage.save_session(&source).await?;
+        let source_before = serde_json::to_value(&source).expect("serialize source snapshot");
+
+        let copied = storage
+            .copy_session(&source.id, "copy-root")
+            .await?
+            .expect("source exists");
+        assert_eq!(copied.kind, SessionKind::Root);
+        assert_eq!(copied.id, "copy-root");
+        assert_eq!(copied.root_session_id, "copy-root");
+        assert!(copied.parent_session_id.is_none());
+        assert_eq!(copied.spawn_depth, 0);
+        assert_eq!(copied.title, "Research (copy)");
+        assert!(copied.title_generated);
+        assert!(!copied.pinned);
+        assert_eq!(copied.model_ref, source.model_ref);
+        assert_eq!(copied.project_id_meta().as_deref(), Some("project-1"));
+        assert_eq!(
+            copied.workspace_path_meta().as_deref(),
+            Some("/workspaces/project-1")
+        );
+        assert_eq!(copied.provider_name().as_deref(), Some("openai-instance"));
+        assert_eq!(copied.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            copied
+                .metadata
+                .get("base_system_prompt")
+                .map(String::as_str),
+            Some("You are exact.")
+        );
+        assert_eq!(
+            copied.metadata.get("gold_config").map(String::as_str),
+            Some(r#"{"goal":"ship"}"#)
+        );
+        assert!(!copied.has_pending_question());
+        assert!(copied.last_run_status().is_none());
+        assert!(copied.last_run_error().is_none());
+        assert!(!copied.has_pending_injected_messages());
+        assert!(!copied.metadata.contains_key("a2a.context_id"));
+        assert!(!copied.metadata.contains_key("created_by_schedule_id"));
+        assert!(!copied.metadata.contains_key("assignment_prompt"));
+        assert!(!copied.metadata.contains_key("goal.state"));
+        assert!(!copied.metadata.contains_key("permission.audit_revision"));
+        assert!(!copied.metadata.contains_key("runtime_prompt_snapshot"));
+        assert!(!copied.metadata.contains_key("workflow.run_ids.v1"));
+        assert_eq!(
+            copied.metadata.get("workflow.active.v1"),
+            Some(&"stale-active".to_string())
+        );
+        assert_eq!(
+            copied.metadata.get("workflow.active.snapshot.v1"),
+            Some(&"durable-snapshot".to_string())
+        );
+        assert!(!copied.metadata.contains_key("workflow.activation_event.v1"));
+        assert_eq!(
+            copied.metadata.get("workflow.selection.v1"),
+            source.metadata.get("workflow.selection.v1")
+        );
+        assert_eq!(
+            copied.metadata.get("workflow.orchestration_opt_in"),
+            Some(&"true".to_string())
+        );
+        assert!(!copied
+            .metadata
+            .contains_key("skill_runtime_selected_skill_ids"));
+        assert_eq!(
+            copied.metadata.get("selected_skill_ids"),
+            Some(&r#"["review"]"#.to_string())
+        );
+        assert_eq!(copied.metadata.get("skill_mode"), Some(&"code".to_string()));
+        assert_eq!(
+            copied.metadata.get("workspace_source"),
+            Some(&"project_default".to_string())
+        );
+        for key in [
+            "execute.pending_turn_message_id",
+            "context_pressure_last_level",
+            "prefix_cache_section_state",
+            "llm_request_render",
+        ] {
+            assert!(!copied.metadata.contains_key(key), "{key} must be cleared");
+        }
+        assert_eq!(
+            copied.metadata.get("custom.copy_config"),
+            Some(&"preserve-me".to_string())
+        );
+        assert!(copied.token_budget.is_none());
+        assert!(copied.token_usage.is_none());
+        assert!(copied.task_list.is_none());
+        assert!(copied.task_list_version_meta().is_none());
+        assert!(copied.prompt_snapshot.is_none());
+        assert!(copied.model_context_state.is_none());
+        assert_eq!(
+            copied
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+        assert!(copied
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .run_id
+            .is_empty());
+        let copied_url = match &copied
+            .messages
+            .last()
+            .unwrap()
+            .content_parts
+            .as_ref()
+            .unwrap()[0]
+        {
+            MessagePart::ImageUrl { image_url } => image_url.url.as_str(),
+            _ => panic!("expected image"),
+        };
+        assert_eq!(
+            copied_url,
+            format!("bamboo-attachment://copy-root/{attachment_id}")
+        );
+        assert_eq!(
+            copied.messages.last().unwrap().image_ocr.as_ref().unwrap()[0].image_url,
+            format!("bamboo-attachment://copy-root/{attachment_id}")
+        );
+        assert_eq!(
+            storage
+                .read_attachment("copy-root", &attachment_id)
+                .await?
+                .expect("copied attachment")
+                .0,
+            b"hello"
+        );
+        let source_after_copy = storage
+            .load_session(&source.id)
+            .await?
+            .expect("source remains after copy");
+        assert_eq!(
+            serde_json::to_value(source_after_copy).expect("serialize source after copy"),
+            source_before
+        );
+
+        storage.delete_session(&source.id).await?;
+        assert!(storage
+            .read_attachment("copy-root", &attachment_id)
+            .await?
+            .is_some());
+        assert!(storage.load_session("copy-root").await?.is_some());
+        let parent_after = storage
+            .load_session("root-source")
+            .await?
+            .expect("unrelated parent remains");
+        assert_eq!(parent_after.id, root.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_copy_requests_create_independent_sessions() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let storage = Arc::new(SessionStoreV2::new(bamboo_home).await?);
+        let mut source = Session::new("copy-source", "model");
+        source.add_message(Message::user("same snapshot"));
+        storage.save_session(&source).await?;
+
+        let first_store = storage.clone();
+        let second_store = storage.clone();
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                async move { first_store.copy_session("copy-source", "copy-one").await },
+                async move { second_store.copy_session("copy-source", "copy-two").await }
+            )
+        })
+        .await
+        .expect("projection guards must be released before concurrent copy returns");
+        let first = first?.expect("first copy");
+        let second = second?.expect("second copy");
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.messages.len(), source.messages.len());
+        assert_eq!(second.messages.len(), source.messages.len());
+        assert!(storage.get_index_entry(&first.id).await.is_some());
+        assert!(storage.get_index_entry(&second.id).await.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_session_missing_source_leaves_no_target() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        assert!(storage
+            .copy_session("missing", "copy-root")
+            .await?
+            .is_none());
+        assert!(storage.get_index_entry("copy-root").await.is_none());
+        assert!(!storage.sessions_root_dir().join("copy-root").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_session_rolls_back_directory_when_index_publish_fails() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let source = Session::new("copy-source", "model");
+        storage.save_session(&source).await?;
+
+        // Force the copy to fail after its fully-written staging directory has
+        // been renamed, but before a visible index entry can be committed.
+        fs::write(storage.index_path(), b"{not valid json").await?;
+        let error = storage
+            .copy_session(&source.id, "copy-root")
+            .await
+            .expect_err("corrupt index must fail publication");
+        assert!(error.to_string().contains("invalid sessions.json"));
+        assert!(storage.get_index_entry("copy-root").await.is_none());
+        assert!(!storage.sessions_root_dir().join("copy-root").exists());
+        assert_eq!(storage.session_copy_journal_paths().await?.len(), 1);
+        let mut home_entries = fs::read_dir(storage.bamboo_home_dir()).await?;
+        while let Some(entry) = home_entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".session-copy-") || name == SESSION_COPY_TRANSACTION_DIR,
+                "staging directory leaked after rollback: {name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_session_rejects_corrupt_source_main_and_runtime_sidecar() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let source = Session::new("copy-source", "model");
+        storage.save_session(&source).await?;
+        let source_dir = storage.sessions_root_dir().join(&source.id);
+
+        fs::write(source_dir.join("session.json"), b"not-json").await?;
+        let error = storage
+            .copy_session(&source.id, "copy-main-corrupt")
+            .await
+            .expect_err("corrupt authoritative source must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(storage.get_index_entry("copy-main-corrupt").await.is_none());
+
+        storage.save_session(&source).await?;
+        fs::write(source_dir.join(RUNTIME_SIDECAR_FILE), b"not-json").await?;
+        let error = storage
+            .copy_session(&source.id, "copy-sidecar-corrupt")
+            .await
+            .expect_err("corrupt source sidecar must fail instead of copying stale state");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(storage
+            .get_index_entry("copy-sidecar-corrupt")
+            .await
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_session_rejects_noncanonical_or_mismatched_index_identity() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let source = Session::new("copy-source", "model");
+        storage.save_session(&source).await?;
+
+        storage
+            .update_index(|index| {
+                index
+                    .sessions
+                    .get_mut(&source.id)
+                    .expect("source index")
+                    .rel_path = "sessions/another-root".to_string();
+                Ok(())
+            })
+            .await?;
+        let error = storage
+            .copy_session(&source.id, "copy-target")
+            .await
+            .expect_err("noncanonical indexed source path must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(storage.get_index_entry("copy-target").await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_session_accepts_legacy_root_without_root_session_id() -> io::Result<()> {
+        let (storage, _temp_dir) = create_temp_storage().await?;
+        let source = Session::new("legacy-root", "model");
+        storage.save_session(&source).await?;
+        let source_dir = storage.sessions_root_dir().join(&source.id);
+
+        for filename in ["session.json", RUNTIME_SIDECAR_FILE] {
+            let path = source_dir.join(filename);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).await?).map_err(io::Error::other)?;
+            value
+                .as_object_mut()
+                .expect("session snapshot object")
+                .remove("root_session_id");
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&value).map_err(io::Error::other)?,
+            )
+            .await?;
+        }
+
+        let copied = storage
+            .copy_session(&source.id, "legacy-root-copy")
+            .await?
+            .expect("legacy root remains copyable");
+        assert_eq!(copied.id, "legacy-root-copy");
+        assert_eq!(copied.kind, SessionKind::Root);
+        assert_eq!(copied.root_session_id, copied.id);
+        assert!(storage.get_index_entry("legacy-root-copy").await.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_rolls_back_prepared_session_copy_transaction() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+        let source = Session::new("copy-source", "model");
+        storage.save_session(&source).await?;
+        let copied = storage
+            .copy_session(&source.id, "copy-target")
+            .await?
+            .expect("copy succeeds");
+        let journal = SessionCopyTransactionJournal {
+            version: SESSION_COPY_TRANSACTION_VERSION,
+            transaction_id: Uuid::new_v4().to_string(),
+            source_id: source.id.clone(),
+            target_id: copied.id.clone(),
+        };
+        storage.write_session_copy_journal(&journal).await?;
+        drop(storage);
+
+        let reopened = SessionStoreV2::new(bamboo_home).await?;
+        assert!(reopened.get_index_entry(&copied.id).await.is_none());
+        assert!(!reopened.sessions_root_dir().join(&copied.id).exists());
+        assert!(reopened.session_copy_journal_paths().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_finishes_committed_session_copy_transaction() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+        let source = Session::new("copy-source", "model");
+        storage.save_session(&source).await?;
+        let copied = storage
+            .copy_session(&source.id, "copy-target")
+            .await?
+            .expect("copy succeeds");
+        let journal = SessionCopyTransactionJournal {
+            version: SESSION_COPY_TRANSACTION_VERSION,
+            transaction_id: Uuid::new_v4().to_string(),
+            source_id: source.id.clone(),
+            target_id: copied.id.clone(),
+        };
+        let prepared = storage.write_session_copy_journal(&journal).await?;
+        let committed = prepared.with_extension("committed");
+        atomic_rename(&prepared, &committed).await?;
+        sync_parent_directory_entry(&committed).await?;
+        storage
+            .update_index(|index| {
+                index.sessions.remove(&copied.id);
+                Ok(())
+            })
+            .await?;
+        drop(storage);
+
+        let reopened = SessionStoreV2::new(bamboo_home).await?;
+        assert!(reopened.get_index_entry(&copied.id).await.is_some());
+        assert!(reopened.load_session(&copied.id).await?.is_some());
+        assert!(reopened.session_copy_journal_paths().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_recovers_retained_committed_copy_marker_before_removal() -> io::Result<()> {
+        let temp_dir = TempDir::new().map_err(io::Error::other)?;
+        let bamboo_home = temp_dir.path().to_path_buf();
+        let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
+        let source = Session::new("copy-source", "model");
+        storage.save_session(&source).await?;
+        let copied = storage
+            .copy_session(&source.id, "copy-target")
+            .await?
+            .expect("copy succeeds");
+
+        // Model a successful copy whose post-commit marker deactivation was
+        // interrupted. Deletion must settle that marker before removing the
+        // target so restart cannot resurrect it or fail on a missing target.
+        let journal = SessionCopyTransactionJournal {
+            version: SESSION_COPY_TRANSACTION_VERSION,
+            transaction_id: Uuid::new_v4().to_string(),
+            source_id: source.id.clone(),
+            target_id: copied.id.clone(),
+        };
+        let prepared = storage.write_session_copy_journal(&journal).await?;
+        let committed = prepared.with_extension("committed");
+        atomic_rename(&prepared, &committed).await?;
+        sync_parent_directory_entry(&committed).await?;
+
+        assert!(storage.delete_session(&copied.id).await?);
+        assert!(storage.get_index_entry(&copied.id).await.is_none());
+        assert!(!storage.sessions_root_dir().join(&copied.id).exists());
+        assert!(storage.session_copy_journal_paths().await?.is_empty());
+        drop(storage);
+
+        let reopened = SessionStoreV2::new(bamboo_home).await?;
+        assert!(reopened.get_index_entry(&copied.id).await.is_none());
+        assert!(reopened.load_session(&copied.id).await?.is_none());
         Ok(())
     }
 

@@ -141,6 +141,32 @@ eventSource.onmessage = (event) => {
 
 ### Session Management
 
+#### Copy Session
+
+```http
+POST /api/v1/sessions/{session_id}/copy
+```
+
+Create an independent root session from an existing session. The copy receives
+a new id and preserves the complete transcript, durable configuration,
+permission mode, Project assignment, Workspace assignment, and attachments.
+Attachment URLs are rewritten to the copied session id. Durable workflow
+selection/activation snapshots are retained so the conversation can be
+reconstructed; workflow run ids, lifecycle outbox/cache data, and other
+transient execution, pending approval/question, child identity, schedule,
+placement, and run-status state are not copied. Copying a child session always
+produces an independent root with no parent chain.
+
+The operation is failure-atomic: storage or attachment-copy failure leaves no
+target session or index entry. Concurrent requests intentionally create
+different copies.
+
+**Response:** `201 Created` with `{ "session": SessionSummary }`, `404 Not
+Found` when the source does not exist, or `500 Internal Server Error` when the
+copy could not be committed.
+
+---
+
 #### Delete Session
 
 ```http
