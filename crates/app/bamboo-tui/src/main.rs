@@ -5,6 +5,7 @@
 use anyhow::Result;
 use bamboo_tui::{AutoServeMode, ThemePalette, TuiOptions};
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "bamboo-tui")]
@@ -30,6 +31,11 @@ struct Cli {
     /// `NO_COLOR` selects no-color when this flag is omitted.
     #[arg(long)]
     theme: Option<ThemePalette>,
+
+    /// JSON keymap override with per-context bindings, leader sequences, and
+    /// unbind support. Invalid maps fall back to safe defaults.
+    #[arg(long, value_name = "PATH")]
+    keymap: Option<PathBuf>,
 
     /// If `--server-url` is unreachable and loopback, start a local `bamboo
     /// serve` automatically instead of asking (y/n). No effect for a remote
@@ -61,6 +67,7 @@ async fn main() -> Result<()> {
         model: cli.model,
         auto_serve,
         theme: cli.theme,
+        keymap: cli.keymap,
     })
     .await
 }

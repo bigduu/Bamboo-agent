@@ -5,6 +5,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::keymap::{ActionContext, ActionId};
 use crate::theme::colors;
 use crate::ui::sessions::{truncate_cells, visible_window};
 
@@ -52,12 +53,27 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled("[r] Refresh", Style::default().fg(colors::inactive())),
-            Span::raw("  "),
-            Span::styled("[t] Tools", Style::default().fg(colors::inactive())),
+            Span::styled(
+                format!(
+                    "[{}] Refresh",
+                    app.key_hint(ActionContext::Mcp, ActionId::Refresh)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
             Span::raw("  "),
             Span::styled(
-                "[Enter] Connect/Disc",
+                format!(
+                    "[{}] Tools",
+                    app.key_hint(ActionContext::Mcp, ActionId::ShowTools)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "[{}] Connect/Disc",
+                    app.key_hint(ActionContext::Mcp, ActionId::Activate)
+                ),
                 Style::default().fg(colors::inactive()),
             ),
         ])
@@ -128,7 +144,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     } else {
         tool_lines.push(Line::from(Span::styled(
             truncate_cells(
-                " Select a server and press 't' for tools",
+                &format!(
+                    " Select a server and press {} for tools",
+                    app.key_hint(ActionContext::Mcp, ActionId::ShowTools)
+                ),
                 chunks[2].width as usize,
             ),
             Style::default().fg(colors::inactive()),
@@ -138,11 +157,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(tools, chunks[2]);
 
     // Footer
-    let footer_text = if compact {
-        " Enter connect · t tools · r refresh"
-    } else {
-        " [Enter] Connect/Disconnect · [t] Refresh Tools · [r] Refresh"
-    };
+    let footer_text = format!(
+        " {} connect · {} tools · {} refresh",
+        app.key_hint(ActionContext::Mcp, ActionId::Activate),
+        app.key_hint(ActionContext::Mcp, ActionId::ShowTools),
+        app.key_hint(ActionContext::Mcp, ActionId::Refresh),
+    );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[3]);
 }

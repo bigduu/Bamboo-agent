@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
@@ -20,6 +20,10 @@ use crate::api::types::*;
 use crate::api::{BambooClient, RespondFailure};
 use crate::event::AppEvent;
 use crate::history::map_history;
+use crate::keymap::{
+    text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
+    HelpEntry, KeyResolution, Keymap, PendingSequence,
+};
 use crate::search::ranked_indices;
 use crate::ui;
 
@@ -31,6 +35,199 @@ pub enum Tab {
     Schedules,
     Skills,
     Config,
+}
+
+#[cfg(test)]
+mod action_keymap_integration_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[tokio::test]
+    async fn remapped_global_action_drives_runtime_and_help_from_one_source() {
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"global","action":"show-help","keys":["F6"]}
+            ]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(keymap, None);
+
+        app.handle_key(press(KeyCode::F(1), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(!app.help_visible);
+
+        app.handle_key(press(KeyCode::F(6), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.help_visible);
+        let help_entries = app.help_entries();
+        assert!(help_entries
+            .iter()
+            .any(|entry| { entry.keys == "F6" && entry.description == "Global · Show help" }));
+        assert!(!help_entries
+            .iter()
+            .any(|entry| { entry.keys == "F1" && entry.description == "Global · Show help" }));
+    }
+
+    #[tokio::test]
+    async fn shared_leader_reaches_global_action_from_chat() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_key(press(KeyCode::Char('\\'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.pending_key_sequence.is_some());
+
+        app.handle_key(press(KeyCode::Char('h'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.help_visible);
+        assert!(app.pending_key_sequence.is_none());
+    }
+
+    #[tokio::test]
+    async fn global_quit_preempts_a_pending_leader_at_runtime() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_key(press(KeyCode::Char('\\'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.pending_key_sequence.is_some());
+
+        app.handle_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(!app.running);
+        assert!(app.pending_key_sequence.is_none());
+    }
+
+    #[tokio::test]
+    async fn remapped_send_feedback_uses_the_resolved_binding() {
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"chat","action":"send-message","keys":["F12"]}
+            ]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(keymap, None);
+        app.chat.streaming = true;
+        app.handle_key(press(KeyCode::F(12), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.status_message.contains("F12 sends after completion"));
+        assert!(!app.status_message.contains("Enter"));
+    }
+
+    #[tokio::test]
+    async fn rejected_printable_global_prefix_falls_back_without_swallowing_chat_text() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "bamboo-tui-printable-prefix-{}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"bindings":[
+                {"context":"global","action":"show-help","keys":["g n"]}
+            ]}"#,
+        )
+        .unwrap();
+        let (keymap, warning) = Keymap::load(Some(&path));
+        std::fs::remove_file(path).unwrap();
+        assert!(warning
+            .as_deref()
+            .is_some_and(|message| message.contains("starts with a printable key")));
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(keymap, warning);
+        app.handle_key(press(KeyCode::Char('g'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.chat.textarea.lines().join("\n"), "g");
+        assert!(app.pending_key_sequence.is_none());
+    }
+
+    #[tokio::test]
+    async fn modified_text_release_and_repeat_events_keep_focus_and_mutations_safe() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_key(press(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        app.handle_key(press(KeyCode::Char('z'), KeyModifiers::ALT))
+            .await
+            .unwrap();
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+            app.handle_key(press(KeyCode::Char('y'), modifier))
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.chat.textarea.lines().join("\n"), "");
+
+        app.help_visible = true;
+        app.help_max_scroll.set(10);
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Down,
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.help_scroll, 1, "safe navigation may auto-repeat");
+
+        app.help_visible = false;
+        app.pending_delete = Some(("s1".to_string(), "Session".to_string()));
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            app.pending_delete.is_some(),
+            "repeat must not confirm delete"
+        );
+
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        ))
+        .await
+        .unwrap();
+        assert!(app.pending_delete.is_some(), "release must be ignored");
+
+        app.handle_key(press(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(
+            app.pending_delete.is_some(),
+            "modified text must not confirm a destructive action"
+        );
+
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+            app.handle_key(press(KeyCode::Char('y'), modifier))
+                .await
+                .unwrap();
+            assert!(
+                app.pending_delete.is_some(),
+                "{modifier:?}+y must not confirm a destructive action"
+            );
+        }
+
+        app.handle_key(press(KeyCode::Char('y'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.pending_delete.is_none(), "press confirms exactly once");
+    }
 }
 
 impl Tab {
@@ -324,10 +521,15 @@ impl ConversationBlock<'_> {
     }
 }
 
-/// Textarea placeholder shown on an empty Chat input, kept as one constant so
-/// the initial state and the post-send reset (`handle_chat_key`) can't drift.
-const CHAT_PLACEHOLDER: &str = "Type a message... (Enter send · Alt+Enter newline)";
 pub(crate) const CONVERSATION_DETAIL_VIEWPORT: usize = 10;
+
+fn chat_placeholder_for(keymap: &Keymap) -> String {
+    format!(
+        "Type a message... ({} send · {} newline)",
+        keymap.hint(ActionContext::Chat, ActionId::SendMessage),
+        keymap.hint(ActionContext::Chat, ActionId::InsertNewline),
+    )
+}
 
 fn tool_block_id(turn_id: &str, tool_call_id: &str) -> String {
     format!("{turn_id}:tool:{tool_call_id}")
@@ -447,7 +649,7 @@ pub struct ChatState {
 impl ChatState {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
-        textarea.set_placeholder_text(CHAT_PLACEHOLDER);
+        textarea.set_placeholder_text(chat_placeholder_for(&Keymap::default()));
         apply_textarea_palette(&mut textarea, crate::theme::ThemePalette::TrueColor);
         Self {
             session_id: None,
@@ -1309,66 +1511,9 @@ pub enum CommandPaletteTrigger {
     Global,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuiltinPaletteAction {
-    NewSession,
-    OpenSession,
-    SelectModel,
-    Help,
-    Notifications,
-    Stop,
-    ToggleDetails,
-    Config,
-    Schedules,
-}
-
-impl BuiltinPaletteAction {
-    fn key(self) -> &'static str {
-        match self {
-            Self::NewSession => "new-session",
-            Self::OpenSession => "open-session",
-            Self::SelectModel => "select-model",
-            Self::Help => "help",
-            Self::Notifications => "notifications",
-            Self::Stop => "stop",
-            Self::ToggleDetails => "toggle-details",
-            Self::Config => "config",
-            Self::Schedules => "schedules",
-        }
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::NewSession => "New session",
-            Self::OpenSession => "Open session",
-            Self::SelectModel => "Select model",
-            Self::Help => "Show help",
-            Self::Notifications => "Show notifications",
-            Self::Stop => "Stop active run",
-            Self::ToggleDetails => "Toggle focused details",
-            Self::Config => "Open config",
-            Self::Schedules => "Open schedules",
-        }
-    }
-
-    pub(crate) fn description(self) -> &'static str {
-        match self {
-            Self::NewSession => "Clear conversation state and start a fresh session",
-            Self::OpenSession => "Search and resume an existing session",
-            Self::SelectModel => "Choose a provider-qualified model",
-            Self::Help => "Show all TUI keyboard shortcuts",
-            Self::Notifications => "Review recent status, warning, and error messages",
-            Self::Stop => "Request cancellation of the currently running agent",
-            Self::ToggleDetails => "Toggle the focused block, or the default for new details",
-            Self::Config => "Switch to the configuration tab",
-            Self::Schedules => "Switch to the schedules tab",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandPaletteEntry {
-    Builtin(BuiltinPaletteAction),
+    Builtin(ActionId),
     Server(CommandItem),
 }
 
@@ -1386,7 +1531,7 @@ impl CommandPaletteEntry {
 
     pub(crate) fn display_name(&self) -> &str {
         match self {
-            Self::Builtin(action) => action.name(),
+            Self::Builtin(action) => action.label(),
             Self::Server(command) if command.display_name.trim().is_empty() => &command.name,
             Self::Server(command) => &command.display_name,
         }
@@ -1535,7 +1680,7 @@ fn command_search_text(entry: &CommandPaletteEntry) -> String {
     match entry {
         CommandPaletteEntry::Builtin(action) => format!(
             "{} {} ui builtin {}",
-            action.name(),
+            action.label(),
             action.description(),
             action.key()
         ),
@@ -1567,20 +1712,9 @@ fn command_search_text(entry: &CommandPaletteEntry) -> String {
 }
 
 fn builtin_command_palette_entries() -> Vec<CommandPaletteEntry> {
-    [
-        BuiltinPaletteAction::NewSession,
-        BuiltinPaletteAction::OpenSession,
-        BuiltinPaletteAction::SelectModel,
-        BuiltinPaletteAction::Help,
-        BuiltinPaletteAction::Notifications,
-        BuiltinPaletteAction::Stop,
-        BuiltinPaletteAction::ToggleDetails,
-        BuiltinPaletteAction::Config,
-        BuiltinPaletteAction::Schedules,
-    ]
-    .into_iter()
-    .map(CommandPaletteEntry::Builtin)
-    .collect()
+    ActionId::palette_actions()
+        .map(CommandPaletteEntry::Builtin)
+        .collect()
 }
 
 /// Merge defensively while preserving the server's first-wins order. The
@@ -1823,6 +1957,9 @@ pub struct App {
     pub running: bool,
     pub tab: Tab,
     pub theme: crate::theme::ThemePalette,
+    pub(crate) keymap: Keymap,
+    pending_key_sequence: Option<PendingSequence>,
+    routed_action: Option<(ActionContext, ActionId)>,
     pub terminal_width: u16,
     pub terminal_height: u16,
     pub client: BambooClient,
@@ -2013,6 +2150,9 @@ impl App {
             running: true,
             tab: Tab::Chat,
             theme: crate::theme::ThemePalette::TrueColor,
+            keymap: Keymap::default(),
+            pending_key_sequence: None,
+            routed_action: None,
             terminal_width: u16::MAX,
             terminal_height: u16::MAX,
             client,
@@ -2079,6 +2219,54 @@ impl App {
         }
     }
 
+    pub(crate) fn set_keymap(&mut self, keymap: Keymap, warning: Option<String>) {
+        self.keymap = keymap;
+        self.pending_key_sequence = None;
+        let placeholder = self.chat_placeholder();
+        self.chat.textarea.set_placeholder_text(placeholder);
+        if let Some(warning) = warning {
+            self.notify(NoticeLevel::Warn, warning);
+        }
+    }
+
+    pub(crate) fn key_hint(&self, context: ActionContext, action: ActionId) -> String {
+        self.keymap.hint(context, action)
+    }
+
+    pub(crate) fn primary_key_hint(&self, context: ActionContext, action: ActionId) -> String {
+        self.key_hint(context, action)
+            .split('/')
+            .next()
+            .unwrap_or("unbound")
+            .to_string()
+    }
+
+    pub(crate) fn action_key_phrase(
+        &self,
+        context: ActionContext,
+        action: ActionId,
+        verb: &str,
+    ) -> String {
+        let hint = self.key_hint(context, action);
+        if hint == "unbound" {
+            format!("{} is unbound", action.label())
+        } else {
+            format!("{hint} {verb}")
+        }
+    }
+
+    pub(crate) fn help_entries(&self) -> Vec<HelpEntry> {
+        self.keymap.help_entries()
+    }
+
+    pub(crate) fn action_hint(&self, action: ActionId) -> Option<String> {
+        self.keymap.action_hint(action)
+    }
+
+    fn chat_placeholder(&self) -> String {
+        chat_placeholder_for(&self.keymap)
+    }
+
     pub async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -2099,10 +2287,7 @@ impl App {
             match (is_loopback_url(&url), auto_serve_mode) {
                 (true, AutoServeMode::Auto) => self.spawn_local_server(),
                 (true, AutoServeMode::Prompt) => {
-                    self.status_message = format!(
-                        "Bamboo server is not reachable at {url}. Start a local server? (y/n)"
-                    );
-                    self.serve_offer = Some(ServeOffer { url });
+                    self.open_serve_offer(url);
                 }
                 // Loopback but auto-serve explicitly disabled, or a remote URL
                 // (never auto-started regardless of flags): keep the previous
@@ -2132,7 +2317,10 @@ impl App {
             let mut reader = EventStream::new();
             while let Some(event) = reader.next().await {
                 match event {
-                    Ok(Event::Key(key)) if tx.send(AppEvent::Key(key)).is_err() => {
+                    Ok(Event::Key(key))
+                        if key.kind != KeyEventKind::Release
+                            && tx.send(AppEvent::Key(key)).is_err() =>
+                    {
                         break;
                     }
                     Ok(Event::Mouse(mouse)) if tx.send(AppEvent::Mouse(mouse)).is_err() => {
@@ -2161,6 +2349,12 @@ impl App {
             let size = terminal.size()?;
             self.terminal_width = size.width;
             self.terminal_height = size.height;
+            if let Some(message) = self
+                .keymap
+                .expire(&mut self.pending_key_sequence, std::time::Instant::now())
+            {
+                self.status_message = message;
+            }
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
             terminal.draw(|f| ui::render(f, self))?;
@@ -2193,6 +2387,16 @@ impl App {
         Ok(())
     }
 
+    fn open_serve_offer(&mut self, url: String) {
+        let confirm =
+            self.action_key_phrase(ActionContext::ServeOffer, ActionId::Confirm, "starts");
+        let reject = self.action_key_phrase(ActionContext::ServeOffer, ActionId::Reject, "skips");
+        self.status_message = format!(
+            "Bamboo server is not reachable at {url}. Start a local server? ({confirm}; {reject})"
+        );
+        self.serve_offer = Some(ServeOffer { url });
+    }
+
     fn poll_sse(&mut self) {
         let events: Vec<SessionSseEvent> = if let Some(rx) = &mut self.sse_rx {
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
@@ -2216,26 +2420,6 @@ impl App {
         let terminal_too_small = self.terminal_width < crate::ui::MIN_TERMINAL_WIDTH
             || self.terminal_height < crate::ui::MIN_TERMINAL_HEIGHT;
 
-        // Stop/quit is the one global escape hatch that must preempt Help and
-        // the full-value log just as it preempts every interactive modal. At
-        // an unsupported size the only visible contract is "Ctrl+C quits",
-        // so it must quit in one press even when a hidden run is streaming.
-        if matches!(
-            &event,
-            AppEvent::Key(key)
-                if key.modifiers == KeyModifiers::CONTROL
-                    && key.code == KeyCode::Char('c')
-        ) && !terminal_too_small
-            && (self.help_visible || self.notifications_visible)
-        {
-            if self.chat.streaming {
-                self.stop_streaming();
-            } else {
-                self.running = false;
-            }
-            return Ok(());
-        }
-
         if terminal_too_small {
             // The compact warning replaces the interactive UI, so hidden
             // keys and mouse gestures must not mutate it. Background work is
@@ -2243,67 +2427,16 @@ impl App {
             // advancing or a resize could strand the app in a stale state.
             match &event {
                 AppEvent::Key(key) => {
-                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                    if key.kind == KeyEventKind::Press
+                        && self.resolve_context_action(ActionContext::Global, *key)
+                            == Some(ActionId::QuitOrStop)
+                    {
                         self.running = false;
                     }
                     return Ok(());
                 }
                 AppEvent::Mouse(_) => return Ok(()),
                 _ => {}
-            }
-        }
-
-        if self.notifications_visible {
-            if let AppEvent::Key(key) = &event {
-                let max = self.notification_max_scroll.get();
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.notification_scroll = self.notification_scroll.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.notification_scroll =
-                            self.notification_scroll.saturating_add(1).min(max);
-                    }
-                    KeyCode::PageUp => {
-                        self.notification_scroll = self.notification_scroll.saturating_sub(10);
-                    }
-                    KeyCode::PageDown => {
-                        self.notification_scroll =
-                            self.notification_scroll.saturating_add(10).min(max);
-                    }
-                    KeyCode::Home => self.notification_scroll = 0,
-                    KeyCode::End => self.notification_scroll = max,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => {
-                        self.notifications_visible = false;
-                    }
-                    _ => {}
-                }
-                return Ok(());
-            }
-        }
-
-        if self.help_visible && !self.any_modal_open() {
-            if let AppEvent::Key(key) = &event {
-                let max = self.help_max_scroll.get();
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.help_scroll = self.help_scroll.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.help_scroll = self.help_scroll.saturating_add(1).min(max);
-                    }
-                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
-                    KeyCode::PageDown => {
-                        self.help_scroll = self.help_scroll.saturating_add(10).min(max);
-                    }
-                    KeyCode::Home => self.help_scroll = 0,
-                    KeyCode::End => self.help_scroll = max,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => {
-                        self.help_visible = false;
-                    }
-                    _ => {}
-                }
-                return Ok(());
             }
         }
 
@@ -2890,6 +3023,11 @@ impl App {
                 session_id,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::CommandPalette,
+                    ActionId::Refresh,
+                    "retries",
+                );
                 let current_session = self.chat.session_id.clone();
                 let selected_key = self
                     .command_palette
@@ -2918,9 +3056,7 @@ impl App {
                         palette.refresh_filter(selected_key);
                     }
                     Err(error) => {
-                        palette.error = Some(format!(
-                            "Failed to load commands: {error} — press Ctrl+R to retry"
-                        ));
+                        palette.error = Some(format!("Failed to load commands: {error} — {retry}"));
                     }
                 }
             }
@@ -2930,6 +3066,13 @@ impl App {
                 command_key,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::CommandPalette,
+                    ActionId::Activate,
+                    "retries",
+                );
+                let send =
+                    self.action_key_phrase(ActionContext::Chat, ActionId::SendMessage, "sends");
                 let current_session = self.chat.session_id.clone();
                 let Some(palette) = self.command_palette.as_mut().filter(|palette| {
                     palette.epoch == epoch
@@ -2975,17 +3118,20 @@ impl App {
                         self.tab = Tab::Chat;
                         self.close_command_palette();
                         self.status_message =
-                            "Command loaded into composer — review and press Enter to send"
-                                .to_string();
+                            format!("Command loaded into composer — review; {send}");
                     }
                     Err(error) => {
-                        palette.error = Some(format!(
-                            "Failed to resolve command: {error} — press Enter to retry"
-                        ));
+                        palette.error =
+                            Some(format!("Failed to resolve command: {error} — {retry}"));
                     }
                 }
             }
             AppEvent::CatalogLoaded { epoch, result } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::ModelPicker,
+                    ActionId::Refresh,
+                    "retries",
+                );
                 let selected_key = self
                     .model_picker
                     .as_ref()
@@ -3018,14 +3164,15 @@ impl App {
                             &self.recent_models,
                         );
                         picker.models = catalog.models;
-                        picker.error = picker.models.is_empty().then(|| {
-                            "No models in provider catalog — press Ctrl+R to retry".to_string()
-                        });
+                        picker.error = picker
+                            .models
+                            .is_empty()
+                            .then(|| format!("No models in provider catalog — {retry}"));
                         picker.refresh_filter(selected_key);
                     }
                     Err(error) => {
                         picker.error = Some(format!(
-                            "Failed to load provider catalog: {error} — press Ctrl+R to retry"
+                            "Failed to load provider catalog: {error} — {retry}"
                         ));
                     }
                 }
@@ -3036,6 +3183,13 @@ impl App {
                 model,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::ModelPicker,
+                    ActionId::Activate,
+                    "retries",
+                );
+                let cancel =
+                    self.action_key_phrase(ActionContext::ModelPicker, ActionId::Cancel, "cancels");
                 let Some(picker) = self
                     .model_picker
                     .as_mut()
@@ -3056,7 +3210,7 @@ impl App {
                     Ok(()) => self.commit_model_selection(model),
                     Err(error) => {
                         picker.error = Some(format!(
-                            "Failed to update session model: {error} — press Enter to retry or Esc to cancel"
+                            "Failed to update session model: {error} — {retry}; {cancel}"
                         ));
                     }
                 }
@@ -3066,6 +3220,11 @@ impl App {
                 offset,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::SessionPickerBrowse,
+                    ActionId::Refresh,
+                    "retries",
+                );
                 let Some(picker) = self
                     .session_picker
                     .as_mut()
@@ -3120,9 +3279,7 @@ impl App {
                         picker.refresh_filter(preserve_id);
                     }
                     Err(error) => {
-                        picker.error = Some(format!(
-                            "Failed to load sessions: {error} — press Ctrl+R to retry"
-                        ));
+                        picker.error = Some(format!("Failed to load sessions: {error} — {retry}"));
                     }
                 }
                 let should_continue = self.session_picker.as_ref().is_some_and(|picker| {
@@ -3141,6 +3298,11 @@ impl App {
                 intent,
                 result,
             } => {
+                let retry_context = match &intent {
+                    SessionPickerIntent::Rename => ActionContext::SessionPickerRename,
+                    SessionPickerIntent::Pin(_) => ActionContext::SessionPickerPinning,
+                };
+                let retry = self.action_key_phrase(retry_context, ActionId::Refresh, "retries");
                 let Some(picker) = self
                     .session_picker
                     .as_mut()
@@ -3182,10 +3344,9 @@ impl App {
                                     // made visible and explicitly retried.
                                     *metadata_version = None;
                                     *base_title = fresh_title;
-                                    *error = Some(
-                                        "Title changed on the server; draft preserved — press Ctrl+R to confirm against the latest title"
-                                            .to_string(),
-                                    );
+                                    *error = Some(format!(
+                                        "Title changed on the server; draft preserved — {retry} against the latest title"
+                                    ));
                                 } else {
                                     if !*draft_dirty {
                                         *draft = fresh_title.clone();
@@ -3223,7 +3384,7 @@ impl App {
                         } => {
                             *loading_version = false;
                             *error = Some(format!(
-                                "Failed to prepare update: {error_message} — press Ctrl+R to retry"
+                                "Failed to prepare update: {error_message} — {retry}"
                             ));
                         }
                         SessionPickerMode::Browse => {}
@@ -3248,6 +3409,11 @@ impl App {
                 intent,
                 result,
             } => {
+                let retry_context = match &intent {
+                    SessionPickerIntent::Rename => ActionContext::SessionPickerRename,
+                    SessionPickerIntent::Pin(_) => ActionContext::SessionPickerPinning,
+                };
+                let retry = self.action_key_phrase(retry_context, ActionId::Refresh, "retries");
                 let Some(picker) = self
                     .session_picker
                     .as_mut()
@@ -3286,8 +3452,7 @@ impl App {
                             .current_version
                             .map(|version| format!(" (server version {version})"))
                             .unwrap_or_default();
-                        let message =
-                            format!("{prefix}{current}: {failure} — press Ctrl+R to retry");
+                        let message = format!("{prefix}{current}: {failure} — {retry}");
                         match &mut picker.mode {
                             SessionPickerMode::Rename {
                                 metadata_version,
@@ -3617,8 +3782,23 @@ impl App {
         };
         self.chat.focused_block = Some(id.clone());
         self.scroll_to_conversation_block(&id);
-        self.status_message =
-            "Block focused — ↑/↓ move · Enter use · y copy · Esc composer".to_string();
+        self.status_message = format!(
+            "Block focused — {}/{} move · {} use · {} copy · {} composer",
+            self.primary_key_hint(
+                ActionContext::ConversationBlock,
+                ActionId::PreviousConversationBlock,
+            ),
+            self.primary_key_hint(
+                ActionContext::ConversationBlock,
+                ActionId::NextConversationBlock,
+            ),
+            self.primary_key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+            self.primary_key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+            self.primary_key_hint(
+                ActionContext::ConversationBlock,
+                ActionId::ExitConversationBlocks,
+            ),
+        );
     }
 
     fn move_conversation_block_focus(&mut self, delta: i32) {
@@ -3819,202 +3999,352 @@ impl App {
             || self.config_editor.is_some()
     }
 
-    /// Route one key event.
-    ///
-    /// Modal precedence (checked top to bottom, each returning early — so
-    /// exactly one visible modal owns the keyboard, and every one of them runs
-    /// before the global bindings further down: Ctrl+N/Ctrl+O/Ctrl+Q, `?`,
-    /// digit tab-switching, Tab/Shift+Tab):
-    ///   0. `serve_offer`      — startup-only "start a local server?" offer
-    ///   1. `pending_question` — agent permission/clarification gate
-    ///   2. `pending_delete`   — session delete confirmation
-    ///   3. `pending_schedule_delete` — schedule delete confirmation
-    ///   4. `session_picker`   — Ctrl+P contextual session picker
-    ///   5. `model_picker`     — Ctrl+O provider-catalog picker
-    ///   6. `command_palette`  — Ctrl+K global or slash composer palette
-    ///   7. `schedule_form`    — new-schedule authoring form
-    ///   8. `config_editor`    — raw config JSON editor
-    ///
-    /// Runtime modals can coexist in state because a clarification arrives
-    /// asynchronously. The renderer layers them in the reverse order below,
-    /// keeping this keyboard owner visible without discarding editor drafts.
-    ///
-    /// `serve_offer` can never actually coexist with 1-5 in practice — `run`
-    /// sets it (if at all) before the main loop starts driving any of the
-    /// others, and it's always cleared before the loop's first redraw — but
-    /// it is still checked first, for the same "whichever modal is open gets
-    /// first refusal at every key" reason as the rest of this list.
-    ///
-    /// Ctrl+C (stop/quit) always preempts every modal. F1/Ctrl+`?`/Ctrl+L
-    /// (help/notifications) are gated on `any_modal_open` below instead: with
-    /// a modal open they fall straight through to that modal's own handler,
-    /// so a stray F1 can't eat the keystroke the modal was waiting for or
-    /// stack the help overlay on top of it.
+    fn pending_question_context(&self) -> ActionContext {
+        match self.pending_question.as_ref() {
+            Some(question) if question.inspecting => ActionContext::QuestionInspect,
+            Some(question) if question.number_entry.is_some() => ActionContext::QuestionNumber,
+            Some(question) if question.custom.is_some() => ActionContext::QuestionCustom,
+            _ => ActionContext::QuestionOptions,
+        }
+    }
+
+    fn session_picker_context(&self) -> ActionContext {
+        match self.session_picker.as_ref().map(|picker| &picker.mode) {
+            Some(SessionPickerMode::Rename { .. }) => ActionContext::SessionPickerRename,
+            Some(SessionPickerMode::Pinning { .. }) => ActionContext::SessionPickerPinning,
+            _ => ActionContext::SessionPickerBrowse,
+        }
+    }
+
+    fn tab_context(&self) -> ActionContext {
+        match self.tab {
+            Tab::Chat if self.chat.focused_block.is_some() => ActionContext::ConversationBlock,
+            Tab::Chat => ActionContext::Chat,
+            Tab::Sessions => ActionContext::Sessions,
+            Tab::Mcp => ActionContext::Mcp,
+            Tab::Schedules => ActionContext::Schedules,
+            Tab::Skills => ActionContext::Skills,
+            Tab::Config => ActionContext::Config,
+        }
+    }
+
+    /// Build the one authoritative precedence stack used by the resolver.
+    /// The first context with a binding wins; global bindings are therefore
+    /// fallbacks behind the visible modal, overlay, or focused widget.
+    fn active_action_contexts(&self) -> Vec<ActionContext> {
+        let primary = if self.notifications_visible {
+            ActionContext::Notifications
+        } else if self.help_visible && !self.any_modal_open() {
+            ActionContext::Help
+        } else if self.serve_offer.is_some() {
+            ActionContext::ServeOffer
+        } else if self.pending_question.is_some() {
+            self.pending_question_context()
+        } else if self.pending_delete.is_some() {
+            ActionContext::SessionDeleteConfirm
+        } else if self.pending_schedule_delete.is_some() {
+            ActionContext::ScheduleDeleteConfirm
+        } else if self.session_picker.is_some() {
+            self.session_picker_context()
+        } else if self.model_picker.is_some() {
+            ActionContext::ModelPicker
+        } else if self.command_palette.is_some() {
+            ActionContext::CommandPalette
+        } else if self.schedule_form.is_some() {
+            ActionContext::ScheduleForm
+        } else if self.config_editor.is_some() {
+            ActionContext::ConfigEditor
+        } else {
+            self.tab_context()
+        };
+
+        let mut contexts = vec![primary];
+        if primary == ActionContext::ConversationBlock {
+            contexts.push(ActionContext::Chat);
+        }
+        if !self.any_modal_open()
+            && !self.help_visible
+            && !self.notifications_visible
+            && self.tab != Tab::Chat
+        {
+            contexts.push(ActionContext::Navigation);
+        }
+        contexts.push(ActionContext::Global);
+        contexts
+    }
+
+    fn resolve_context_action(
+        &mut self,
+        context: ActionContext,
+        key: KeyEvent,
+    ) -> Option<ActionId> {
+        self.resolve_action_in(&[context], key)
+            .map(|(_, action)| action)
+    }
+
+    fn resolve_action_in(
+        &mut self,
+        contexts: &[ActionContext],
+        key: KeyEvent,
+    ) -> Option<(ActionContext, ActionId)> {
+        if let Some((routed_context, action)) = self.routed_action.take() {
+            debug_assert!(contexts.contains(&routed_context));
+            return contexts
+                .contains(&routed_context)
+                .then_some((routed_context, action));
+        }
+        match self.keymap.resolve(
+            contexts,
+            &mut self.pending_key_sequence,
+            key,
+            std::time::Instant::now(),
+        ) {
+            KeyResolution::Action { context, action } => Some((context, action)),
+            KeyResolution::Pending(message) | KeyResolution::Cancelled(message) => {
+                self.status_message = message;
+                None
+            }
+            KeyResolution::NoMatch => None,
+        }
+    }
+
+    /// State-dependent availability shared by direct shortcuts and built-in
+    /// command-palette entries. Focus ownership is checked separately because
+    /// the palette itself is an exclusive modal.
+    fn action_disabled_reason(&self, action: ActionId) -> Option<&'static str> {
+        match action.availability() {
+            ActionAvailability::Always => None,
+            ActionAvailability::Idle | ActionAvailability::ChatIdle if self.chat.streaming => {
+                Some("Unavailable while an agent run is active")
+            }
+            ActionAvailability::Idle | ActionAvailability::ChatIdle
+                if self.opening_session_id.is_some() =>
+            {
+                Some("Unavailable while a session is resuming")
+            }
+            ActionAvailability::ChatIdle | ActionAvailability::Chat if self.tab != Tab::Chat => {
+                Some("Switch to Chat before using this action")
+            }
+            ActionAvailability::ActiveRun if !self.chat.streaming => Some("No active run to stop"),
+            _ => None,
+        }
+    }
+
+    fn global_focus_disabled_reason(&self, action: ActionId) -> Option<&'static str> {
+        (self.any_modal_open()
+            && !matches!(action, ActionId::QuitOrStop | ActionId::ShowNotifications))
+        .then_some("Close the active dialog before using this action")
+    }
+
+    fn surface_disabled_action(&mut self, action: ActionId, reason: &str) {
+        let message = format!("{} — {reason}", action.label());
+        if let Some(question) = self.pending_question.as_mut() {
+            question.error = Some(message.clone());
+        } else if let Some(form) = self.schedule_form.as_mut() {
+            form.error = Some(message.clone());
+        } else if let Some(editor) = self.config_editor.as_mut() {
+            editor.error = Some(message.clone());
+        } else if let Some(palette) = self.command_palette.as_mut() {
+            palette.error = Some(message.clone());
+        } else if let Some(picker) = self.model_picker.as_mut() {
+            picker.error = Some(message.clone());
+        } else if let Some(picker) = self.session_picker.as_mut() {
+            picker.error = Some(message.clone());
+        }
+        self.status_message = message;
+    }
+
+    /// Resolve and dispatch one key. Raw key semantics live only in the
+    /// keymap normalizer and focused text-widget fallbacks below.
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                if self.chat.streaming {
-                    self.stop_streaming();
-                    return Ok(());
-                }
-                self.running = false;
-                return Ok(());
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('?')) if !self.any_modal_open() => {
-                // Most terminals never deliver Ctrl+Shift+/ as Ctrl+'?' (it
-                // maps elsewhere), so this is kept only as a harmless extra —
-                // F1 below and plain `?` (further down, non-Chat tabs) are
-                // the bindings that are actually reachable.
-                self.help_visible = true;
-                return Ok(());
-            }
-            (_, KeyCode::F(1)) if !self.any_modal_open() => {
-                // F1 opens help on every tab, including Chat, regardless of
-                // modifiers — unlike `?` it never collides with typing.
-                self.help_visible = true;
-                self.help_scroll = 0;
-                return Ok(());
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
-                self.notifications_visible = true;
-                self.notification_scroll = 0;
-                self.unseen_alerts = 0;
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        // 0. The startup "start a local server?" offer captures all input
-        // (Ctrl+C above still quits) until answered — see `ServeOffer`.
-        if self.serve_offer.is_some() {
-            self.handle_serve_offer_key(key);
+        if key.kind == KeyEventKind::Release {
             return Ok(());
         }
-
-        // 1. A pending agent question captures all input (Ctrl+C above still
-        // stops the run) until it is answered or dismissed.
-        if self.pending_question.is_some() {
-            return self.handle_question_key(key).await;
-        }
-
-        // 2. The delete-confirmation modal likewise captures all input before
-        // anything else (including tab-switching digits) can reach it.
-        if self.pending_delete.is_some() {
-            return self.handle_delete_confirm_key(key).await;
-        }
-
-        // 3. Schedule deletion is also destructive and requires a second,
-        // explicit keystroke before the request can be sent.
-        if self.pending_schedule_delete.is_some() {
-            self.handle_schedule_delete_confirm_key(key);
-            return Ok(());
-        }
-
-        // 4. The contextual session picker owns search/navigation/mutations.
-        if self.session_picker.is_some() {
-            return self.handle_session_picker_key(key).await;
-        }
-
-        // 5. The model picker likewise captures all input (navigation/apply)
-        // before the global bindings below — same pattern as the other
-        // modals.
-        if self.model_picker.is_some() {
-            return self.handle_model_picker_key(key).await;
-        }
-
-        // 6. The command palette owns query/argument editing and selection.
-        if self.command_palette.is_some() {
-            self.handle_command_palette_key(key);
-            return Ok(());
-        }
-
-        // 7. The schedule-authoring modal likewise captures all input: Tab moves
-        // between fields and digits belong in cron expressions, so it must run
-        // before the global Tab/1-6 tab-switching below (which would otherwise
-        // swallow those keys and never reach the form).
-        if self.schedule_form.is_some() {
-            self.handle_schedule_form_key(key);
-            return Ok(());
-        }
-
-        // 8. The config editor is a full multi-line text buffer, so it must claim
-        // every key (digits, Tab, Enter/newlines) before the global navigation
-        // below — same rationale as the schedule form.
-        if self.config_editor.is_some() {
-            return self.handle_config_editor_key(key);
-        }
-
-        // Ctrl+N / Ctrl+Q: global, but only reachable once every modal above
-        // has had first refusal at the key (each of those branches returns
-        // early) — so getting here already means no modal is open, matching
-        // the "no modal open" requirement for Ctrl+N specifically.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('k') => {
-                    self.open_command_palette(CommandPaletteTrigger::Global);
-                    return Ok(());
-                }
-                KeyCode::Char('n') if !self.chat.streaming => {
-                    self.new_session();
-                    return Ok(());
-                }
-                KeyCode::Char('q') => {
-                    self.reopen_pending_question();
-                    return Ok(());
-                }
-                KeyCode::Char('o') if self.tab == Tab::Chat && !self.chat.streaming => {
-                    self.open_model_picker();
-                    return Ok(());
-                }
-                KeyCode::Char('p') if self.tab == Tab::Chat && !self.chat.streaming => {
-                    self.open_session_picker();
-                    return Ok(());
-                }
-                _ => {}
+        self.normalize_conversation_focus();
+        let contexts = self.active_action_contexts();
+        let primary = contexts[0];
+        let resolution = self.keymap.resolve(
+            &contexts,
+            &mut self.pending_key_sequence,
+            key,
+            std::time::Instant::now(),
+        );
+        match resolution {
+            KeyResolution::Pending(message) | KeyResolution::Cancelled(message) => {
+                self.status_message = message;
             }
-        }
-
-        // `?` opens help everywhere EXCEPT Chat, where it must type into the
-        // textarea instead (mirrors the digit rule right below: Chat's
-        // textarea wins over global single-key bindings). F1 above is the
-        // Chat-safe way to reach help.
-        if key.code == KeyCode::Char('?') && self.tab != Tab::Chat {
-            self.help_visible = true;
-            self.help_scroll = 0;
-            return Ok(());
-        }
-
-        // 1-6 switch tabs EXCEPT on Chat, where digits must type into the
-        // message instead — otherwise typing e.g. "top 3 issues" silently
-        // jumps to the Config tab on the '3'. Shift+digit (many keyboards'
-        // symbol row) never switches tabs, matching the pre-existing rule.
-        if let KeyCode::Char(c) = key.code {
-            if let Some(digit) = c.to_digit(10) {
-                if (1..=6).contains(&digit)
-                    && !key.modifiers.contains(KeyModifiers::SHIFT)
-                    && self.tab != Tab::Chat
-                {
-                    self.tab = Tab::from_index((digit - 1) as usize).unwrap_or(self.tab);
-                    self.load_tab_data();
+            KeyResolution::NoMatch => {
+                self.dispatch_context_key(primary, None, key).await?;
+            }
+            KeyResolution::Action { context, action } => {
+                if key.kind == KeyEventKind::Repeat && !action.repeatable() {
                     return Ok(());
                 }
-            }
-        }
-
-        match key.code {
-            KeyCode::Tab => {
-                self.tab = self.tab.next();
-                self.load_tab_data();
-            }
-            KeyCode::BackTab => {
-                self.tab = self.tab.prev();
-                self.load_tab_data();
-            }
-            _ => {
-                self.handle_tab_key(key).await?;
+                let disabled_reason = self.action_disabled_reason(action).or_else(|| {
+                    (context == ActionContext::Global)
+                        .then(|| self.global_focus_disabled_reason(action))
+                        .flatten()
+                });
+                if let Some(reason) = disabled_reason {
+                    self.surface_disabled_action(action, reason);
+                } else if context == ActionContext::Global {
+                    self.handle_global_action(action);
+                } else if context == ActionContext::Navigation {
+                    self.handle_navigation_action(action);
+                } else {
+                    self.dispatch_context_key(context, Some(action), key)
+                        .await?;
+                }
             }
         }
         Ok(())
+    }
+
+    fn handle_global_action(&mut self, action: ActionId) {
+        match action {
+            ActionId::QuitOrStop if self.chat.streaming => self.stop_streaming(),
+            ActionId::QuitOrStop => self.running = false,
+            ActionId::ShowHelp => {
+                self.notifications_visible = false;
+                self.help_visible = true;
+                self.help_scroll = 0;
+            }
+            ActionId::ShowNotifications => {
+                self.help_visible = false;
+                self.notifications_visible = true;
+                self.notification_scroll = 0;
+                self.unseen_alerts = 0;
+            }
+            ActionId::OpenCommandPalette => {
+                self.open_command_palette(CommandPaletteTrigger::Global)
+            }
+            ActionId::NewSession => self.new_session(),
+            ActionId::ReopenPendingQuestion => self.reopen_pending_question(),
+            ActionId::OpenModelPicker => self.open_model_picker(),
+            ActionId::OpenSessionPicker => self.open_session_picker(),
+            ActionId::StopRun => self.stop_streaming(),
+            ActionId::ToggleDetails => self.toggle_conversation_details(),
+            ActionId::OpenConfigTab => {
+                self.tab = Tab::Config;
+                self.load_tab_data();
+            }
+            ActionId::OpenSchedulesTab => {
+                self.tab = Tab::Schedules;
+                self.load_tab_data();
+            }
+            ActionId::NextTab => {
+                self.tab = self.tab.next();
+                self.load_tab_data();
+            }
+            ActionId::PreviousTab => {
+                self.tab = self.tab.prev();
+                self.load_tab_data();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_navigation_action(&mut self, action: ActionId) {
+        let index = match action {
+            ActionId::SwitchTab1 => Some(0),
+            ActionId::SwitchTab2 => Some(1),
+            ActionId::SwitchTab3 => Some(2),
+            ActionId::SwitchTab4 => Some(3),
+            ActionId::SwitchTab5 => Some(4),
+            ActionId::SwitchTab6 => Some(5),
+            ActionId::ShowHelp => {
+                self.help_visible = true;
+                self.help_scroll = 0;
+                None
+            }
+            _ => None,
+        };
+        if let Some(index) = index {
+            self.tab = Tab::from_index(index).unwrap_or(self.tab);
+            self.load_tab_data();
+        }
+    }
+
+    async fn dispatch_context_key(
+        &mut self,
+        context: ActionContext,
+        action: Option<ActionId>,
+        key: KeyEvent,
+    ) -> Result<()> {
+        self.routed_action = action.map(|action| (context, action));
+        match context {
+            ActionContext::Help => self.handle_help_key(key),
+            ActionContext::Notifications => self.handle_notifications_key(key),
+            ActionContext::ServeOffer => self.handle_serve_offer_key(key),
+            ActionContext::QuestionOptions
+            | ActionContext::QuestionCustom
+            | ActionContext::QuestionNumber
+            | ActionContext::QuestionInspect => self.handle_question_key(key).await?,
+            ActionContext::SessionDeleteConfirm => self.handle_delete_confirm_key(key).await?,
+            ActionContext::ScheduleDeleteConfirm => self.handle_schedule_delete_confirm_key(key),
+            ActionContext::SessionPickerBrowse
+            | ActionContext::SessionPickerRename
+            | ActionContext::SessionPickerPinning => self.handle_session_picker_key(key).await?,
+            ActionContext::ModelPicker => self.handle_model_picker_key(key).await?,
+            ActionContext::CommandPalette => self.handle_command_palette_key(key),
+            ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
+            ActionContext::ConfigEditor => self.handle_config_editor_key(key)?,
+            ActionContext::Chat | ActionContext::ConversationBlock => {
+                self.handle_chat_key(key).await?
+            }
+            ActionContext::Sessions => self.handle_sessions_key(key).await?,
+            ActionContext::Mcp => self.handle_mcp_key(key).await?,
+            ActionContext::Schedules => self.handle_schedules_key(key).await?,
+            ActionContext::Skills => self.handle_skills_key(key).await?,
+            ActionContext::Config => self.handle_config_key(key),
+            ActionContext::Global | ActionContext::Navigation => {}
+        }
+        self.routed_action = None;
+        Ok(())
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        let Some(action) = self.resolve_context_action(ActionContext::Help, key) else {
+            return;
+        };
+        let max = self.help_max_scroll.get();
+        match action {
+            ActionId::NavigateUp => self.help_scroll = self.help_scroll.saturating_sub(1),
+            ActionId::NavigateDown => {
+                self.help_scroll = self.help_scroll.saturating_add(1).min(max)
+            }
+            ActionId::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            ActionId::PageDown => self.help_scroll = self.help_scroll.saturating_add(10).min(max),
+            ActionId::JumpFirst => self.help_scroll = 0,
+            ActionId::JumpLast => self.help_scroll = max,
+            ActionId::Cancel => self.help_visible = false,
+            _ => {}
+        }
+    }
+
+    fn handle_notifications_key(&mut self, key: KeyEvent) {
+        let Some(action) = self.resolve_context_action(ActionContext::Notifications, key) else {
+            return;
+        };
+        let max = self.notification_max_scroll.get();
+        match action {
+            ActionId::NavigateUp => {
+                self.notification_scroll = self.notification_scroll.saturating_sub(1)
+            }
+            ActionId::NavigateDown => {
+                self.notification_scroll = self.notification_scroll.saturating_add(1).min(max)
+            }
+            ActionId::PageUp => {
+                self.notification_scroll = self.notification_scroll.saturating_sub(10)
+            }
+            ActionId::PageDown => {
+                self.notification_scroll = self.notification_scroll.saturating_add(10).min(max)
+            }
+            ActionId::JumpFirst => self.notification_scroll = 0,
+            ActionId::JumpLast => self.notification_scroll = max,
+            ActionId::Cancel => self.notifications_visible = false,
+            _ => {}
+        }
     }
 
     /// Drive the startup "start a local server?" offer (`ServeOffer`):
@@ -4023,12 +4353,15 @@ impl App {
     /// `--auto-serve` or start `bamboo serve` themselves. Every other key is
     /// swallowed — see the modal-precedence doc on `handle_key`.
     fn handle_serve_offer_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+        let Some(action) = self.resolve_context_action(ActionContext::ServeOffer, key) else {
+            return;
+        };
+        match action {
+            ActionId::Confirm => {
                 self.serve_offer = None;
                 self.spawn_local_server();
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            ActionId::Reject => {
                 self.serve_offer = None;
                 self.status_message =
                     "Not connected — restart with --auto-serve or start 'bamboo serve' yourself"
@@ -4176,6 +4509,9 @@ impl App {
             Copy(String),
         }
 
+        let context = self.pending_question_context();
+        let key_action = self.resolve_context_action(context, key);
+
         let action = {
             let Some(q) = self.pending_question.as_mut() else {
                 return Ok(());
@@ -4189,25 +4525,25 @@ impl App {
             }
 
             if q.inspecting {
-                match key.code {
-                    KeyCode::Char('v') | KeyCode::Esc => {
+                match key_action {
+                    Some(ActionId::Cancel) => {
                         q.inspecting = false;
                         q.inspect_scroll = 0;
                         QAction::None
                     }
-                    KeyCode::Tab if !q.options.is_empty() => {
+                    Some(ActionId::ToggleInspectorPane) if !q.options.is_empty() => {
                         q.inspect_option = !q.inspect_option;
                         q.inspect_scroll = 0;
                         QAction::None
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    Some(ActionId::NavigateUp) => {
                         q.inspect_scroll = q
                             .inspect_scroll
                             .min(q.inspect_max_scroll.get())
                             .saturating_sub(1);
                         QAction::None
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    Some(ActionId::NavigateDown) => {
                         q.inspect_scroll = q
                             .inspect_scroll
                             .min(q.inspect_max_scroll.get())
@@ -4215,14 +4551,14 @@ impl App {
                             .min(q.inspect_max_scroll.get());
                         QAction::None
                     }
-                    KeyCode::PageUp => {
+                    Some(ActionId::PageUp) => {
                         q.inspect_scroll = q
                             .inspect_scroll
                             .min(q.inspect_max_scroll.get())
                             .saturating_sub(5);
                         QAction::None
                     }
-                    KeyCode::PageDown => {
+                    Some(ActionId::PageDown) => {
                         q.inspect_scroll = q
                             .inspect_scroll
                             .min(q.inspect_max_scroll.get())
@@ -4230,11 +4566,15 @@ impl App {
                             .min(q.inspect_max_scroll.get());
                         QAction::None
                     }
-                    KeyCode::Home => {
+                    Some(ActionId::JumpFirst) => {
                         q.inspect_scroll = 0;
                         QAction::None
                     }
-                    KeyCode::Char('y') => {
+                    Some(ActionId::JumpLast) => {
+                        q.inspect_scroll = q.inspect_max_scroll.get();
+                        QAction::None
+                    }
+                    Some(ActionId::CopyValue) => {
                         let value = if q.inspect_option {
                             q.options.get(q.selected).cloned().unwrap_or_default()
                         } else {
@@ -4245,20 +4585,16 @@ impl App {
                     _ => QAction::None,
                 }
             } else if let Some(entry) = q.number_entry.as_mut() {
-                match key.code {
-                    KeyCode::Char(d) if d.is_ascii_digit() => {
-                        entry.push(d);
-                        QAction::None
-                    }
-                    KeyCode::Backspace => {
+                match key_action {
+                    Some(ActionId::Backspace) => {
                         entry.pop();
                         QAction::None
                     }
-                    KeyCode::Esc => {
+                    Some(ActionId::Cancel) => {
                         q.number_entry = None;
                         QAction::None
                     }
-                    KeyCode::Enter => {
+                    Some(ActionId::Activate) => {
                         let requested = entry.parse::<usize>().ok();
                         q.number_entry = None;
                         match requested.and_then(|number| number.checked_sub(1)) {
@@ -4272,19 +4608,24 @@ impl App {
                         }
                         QAction::None
                     }
-                    _ => QAction::None,
+                    _ => {
+                        if let Some(digit) = text_character(key).filter(char::is_ascii_digit) {
+                            entry.push(digit);
+                        }
+                        QAction::None
+                    }
                 }
             } else if let Some(buf) = q.custom.as_mut() {
                 // Free-text entry mode.
-                match key.code {
-                    KeyCode::Enter => {
+                match key_action {
+                    Some(ActionId::Activate) => {
                         if buf.trim().is_empty() {
                             QAction::None
                         } else {
                             QAction::Submit(buf.clone())
                         }
                     }
-                    KeyCode::Esc => {
+                    Some(ActionId::Cancel) => {
                         // Back to option-select if there were options, else dismiss.
                         if q.options.is_empty() {
                             QAction::Dismiss
@@ -4292,45 +4633,46 @@ impl App {
                             QAction::CloseCustom
                         }
                     }
-                    KeyCode::Backspace => {
+                    Some(ActionId::Backspace) => {
                         buf.pop();
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Some(ActionId::InspectValue) => {
                         q.inspecting = true;
                         q.inspect_option = false;
                         q.inspect_scroll = 0;
                         QAction::None
                     }
-                    KeyCode::Char(c) => {
-                        buf.push(c);
-                        q.error = None;
+                    _ => {
+                        if let Some(character) = text_character(key) {
+                            buf.push(character);
+                            q.error = None;
+                        }
                         QAction::None
                     }
-                    _ => QAction::None,
                 }
             } else {
                 // Option-select mode.
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
+                match key_action {
+                    Some(ActionId::NavigateUp) => {
                         q.selected = q.selected.saturating_sub(1);
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    Some(ActionId::NavigateDown) => {
                         if q.selected + 1 < q.options.len() {
                             q.selected += 1;
                         }
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::PageUp => {
+                    Some(ActionId::PageUp) => {
                         q.selected = q.selected.saturating_sub(5);
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::PageDown => {
+                    Some(ActionId::PageDown) => {
                         q.selected = q
                             .selected
                             .saturating_add(5)
@@ -4338,35 +4680,35 @@ impl App {
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::Home => {
+                    Some(ActionId::JumpFirst) => {
                         q.selected = 0;
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::End => {
+                    Some(ActionId::JumpLast) => {
                         q.selected = q.options.len().saturating_sub(1);
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::Char('c') if q.allow_custom => {
+                    Some(ActionId::CustomAnswer) if q.allow_custom => {
                         // Switch to free-text entry without discarding a draft
                         // entered before dismissal/session switching.
                         q.custom = Some(std::mem::take(&mut q.custom_draft));
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::Char('g') if !q.options.is_empty() => {
+                    Some(ActionId::NumberAnswer) if !q.options.is_empty() => {
                         q.number_entry = Some(String::new());
                         q.error = None;
                         QAction::None
                     }
-                    KeyCode::Char('v') => {
+                    Some(ActionId::InspectValue) => {
                         q.inspecting = true;
                         q.inspect_option = false;
                         q.inspect_scroll = 0;
                         QAction::None
                     }
-                    KeyCode::Char('y') => {
+                    Some(ActionId::CopyValue) => {
                         let value = q
                             .options
                             .get(q.selected)
@@ -4374,21 +4716,42 @@ impl App {
                             .unwrap_or_else(|| q.question.clone());
                         QAction::Copy(value)
                     }
-                    KeyCode::Enter => q
+                    Some(ActionId::Activate) => q
                         .options
                         .get(q.selected)
                         .cloned()
                         .map(QAction::Submit)
                         .unwrap_or(QAction::None),
-                    KeyCode::Char(d) if ('1'..='9').contains(&d) => {
-                        let idx = d as usize - '1' as usize;
+                    Some(
+                        quick @ (ActionId::QuickAnswer1
+                        | ActionId::QuickAnswer2
+                        | ActionId::QuickAnswer3
+                        | ActionId::QuickAnswer4
+                        | ActionId::QuickAnswer5
+                        | ActionId::QuickAnswer6
+                        | ActionId::QuickAnswer7
+                        | ActionId::QuickAnswer8
+                        | ActionId::QuickAnswer9),
+                    ) => {
+                        let idx = match quick {
+                            ActionId::QuickAnswer1 => 0,
+                            ActionId::QuickAnswer2 => 1,
+                            ActionId::QuickAnswer3 => 2,
+                            ActionId::QuickAnswer4 => 3,
+                            ActionId::QuickAnswer5 => 4,
+                            ActionId::QuickAnswer6 => 5,
+                            ActionId::QuickAnswer7 => 6,
+                            ActionId::QuickAnswer8 => 7,
+                            ActionId::QuickAnswer9 => 8,
+                            _ => unreachable!(),
+                        };
                         q.options
                             .get(idx)
                             .cloned()
                             .map(QAction::Submit)
                             .unwrap_or(QAction::None)
                     }
-                    KeyCode::Esc => QAction::Dismiss,
+                    Some(ActionId::Cancel) => QAction::Dismiss,
                     _ => QAction::None,
                 }
             }
@@ -4413,9 +4776,18 @@ impl App {
                 // answer — Ctrl+Q brings the modal back without a round-trip.
                 self.supersede_pending_answer();
                 self.dismissed_question = self.pending_question.take();
-                self.status_message = "Question dismissed (still pending on the server — \
-                    Ctrl+Q to reopen, Ctrl+C stops the run)"
-                    .to_string();
+                let reopen = self.action_key_phrase(
+                    ActionContext::Global,
+                    ActionId::ReopenPendingQuestion,
+                    "reopens",
+                );
+                let stop = self.action_key_phrase(
+                    ActionContext::Global,
+                    ActionId::QuitOrStop,
+                    "stops the run",
+                );
+                self.status_message =
+                    format!("Question dismissed (still pending on the server — {reopen}, {stop})");
             }
             QAction::None => {}
         }
@@ -4663,8 +5035,12 @@ impl App {
         let Some((id, _title)) = self.pending_delete.clone() else {
             return Ok(());
         };
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+        let Some(action) = self.resolve_context_action(ActionContext::SessionDeleteConfirm, key)
+        else {
+            return Ok(());
+        };
+        match action {
+            ActionId::Confirm => {
                 self.pending_delete = None;
                 if self.deleting_session_id.is_some() {
                     self.notify(
@@ -4703,7 +5079,7 @@ impl App {
                     });
                 });
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            ActionId::Reject => {
                 self.pending_delete = None;
             }
             _ => {}
@@ -4717,8 +5093,12 @@ impl App {
         let Some((id, _name)) = self.pending_schedule_delete.clone() else {
             return;
         };
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+        let Some(action) = self.resolve_context_action(ActionContext::ScheduleDeleteConfirm, key)
+        else {
+            return;
+        };
+        match action {
+            ActionId::Confirm => {
                 self.pending_schedule_delete = None;
                 if self.deleting_schedule_id.is_some() {
                     self.notify(
@@ -4748,7 +5128,7 @@ impl App {
                     });
                 });
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            ActionId::Reject => {
                 self.pending_schedule_delete = None;
             }
             _ => {}
@@ -4810,90 +5190,58 @@ impl App {
         }
     }
 
-    async fn handle_tab_key(&mut self, key: KeyEvent) -> Result<()> {
-        match self.tab {
-            Tab::Chat => self.handle_chat_key(key).await?,
-            Tab::Sessions => self.handle_sessions_key(key).await?,
-            Tab::Mcp => self.handle_mcp_key(key).await?,
-            Tab::Schedules => self.handle_schedules_key(key).await?,
-            Tab::Skills => self.handle_skills_key(key).await?,
-            Tab::Config => self.handle_config_key(key),
-        }
-        Ok(())
-    }
-
     async fn handle_chat_key(&mut self, key: KeyEvent) -> Result<()> {
         self.normalize_conversation_focus();
-
-        // Run control and the explicit transcript jumps remain global even
-        // while a conversation block owns the navigation keys.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('s') if self.chat.streaming => {
-                    self.stop_streaming();
-                    return Ok(());
-                }
-                KeyCode::Char('g') | KeyCode::End => {
-                    self.chat_scroll_bottom();
-                    return Ok(());
-                }
-                KeyCode::Home => {
-                    self.chat_scroll_top();
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-
-        if self.chat.focused_block.is_some() {
-            self.handle_conversation_block_key(key);
+        let contexts: &[ActionContext] = if self.chat.focused_block.is_some() {
+            &[
+                ActionContext::ConversationBlock,
+                ActionContext::Chat,
+                ActionContext::Global,
+            ]
+        } else {
+            &[ActionContext::Chat, ActionContext::Global]
+        };
+        let resolved = self.resolve_action_in(contexts, key);
+        if let Some((ActionContext::ConversationBlock, action)) = resolved {
+            self.handle_conversation_block_action(action);
             return Ok(());
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('b') => {
-                    self.focus_last_conversation_block();
-                    return Ok(());
-                }
-                KeyCode::Char('x') => {
-                    self.toggle_conversation_details();
-                    return Ok(());
-                }
-                _ => {}
+        match resolved.map(|(_, action)| action) {
+            Some(ActionId::QuitOrStop) if self.chat.streaming => self.stop_streaming(),
+            Some(ActionId::QuitOrStop) => self.running = false,
+            Some(ActionId::StopRun) if self.chat.streaming => self.stop_streaming(),
+            Some(ActionId::StopRun) => {
+                self.status_message = "No active run to stop".to_string();
             }
-        }
-
-        match key.code {
-            KeyCode::Char('/')
-                if !self.chat.streaming
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && self.chat.textarea.cursor() == (0, 0) =>
+            Some(ActionId::ScrollTranscriptBottom) => self.chat_scroll_bottom(),
+            Some(ActionId::ScrollTranscriptTop) => self.chat_scroll_top(),
+            Some(ActionId::FocusConversationBlocks) => self.focus_last_conversation_block(),
+            Some(ActionId::ToggleDetails) => self.toggle_conversation_details(),
+            Some(ActionId::OpenSlashPalette)
+                if !self.chat.streaming && self.chat.textarea.cursor() == (0, 0) =>
             {
                 self.open_command_palette(CommandPaletteTrigger::Slash);
             }
-            KeyCode::PageDown => self.chat_scroll_down(10),
-            KeyCode::PageUp => self.chat_scroll_up(10),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => self.chat_scroll_down(3),
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.chat_scroll_up(3),
-            // Alt+Enter (and Shift+Enter, on the kitty-protocol terminals
-            // that report it) inserts a newline during both idle and active
-            // runs. The draft remains entirely local while streaming.
-            KeyCode::Enter
-                if !key.modifiers.intersects(KeyModifiers::CONTROL)
-                    && (key.modifiers.contains(KeyModifiers::ALT)
-                        || key.modifiers.contains(KeyModifiers::SHIFT)) =>
-            {
-                self.chat.textarea.insert_newline();
+            Some(ActionId::OpenSlashPalette) => {
+                if text_widget_input_allowed(key) {
+                    self.chat.textarea.input(key);
+                }
             }
-            KeyCode::Enter if self.chat.streaming => {
-                self.status_message =
-                    "Run active — draft preserved; press Enter after completion to send"
-                        .to_string();
+            Some(ActionId::ScrollTranscriptDown) => self.chat_scroll_down(10),
+            Some(ActionId::ScrollTranscriptUp) => self.chat_scroll_up(10),
+            Some(ActionId::InsertNewline) => self.chat.textarea.insert_newline(),
+            Some(ActionId::SendMessage) if self.chat.streaming => {
+                self.status_message = format!(
+                    "Run active — draft preserved; {}",
+                    self.action_key_phrase(
+                        ActionContext::Chat,
+                        ActionId::SendMessage,
+                        "sends after completion"
+                    )
+                );
             }
-            KeyCode::Enter => {
+            Some(ActionId::SendMessage) => {
                 // Selecting a session starts an asynchronous history/summary
                 // fetch after the picker closes. Keep the existing draft
                 // editable while that fetch is in flight, but never submit it
@@ -4918,43 +5266,45 @@ impl App {
                     return Ok(());
                 }
                 self.chat.textarea = TextArea::default();
-                self.chat.textarea.set_placeholder_text(CHAT_PLACEHOLDER);
+                let placeholder = self.chat_placeholder();
+                self.chat.textarea.set_placeholder_text(placeholder);
                 apply_textarea_palette(&mut self.chat.textarea, self.theme);
                 self.send_message(input);
             }
-            _ => {
-                self.chat.textarea.input(key);
+            None => {
+                if text_widget_input_allowed(key) {
+                    self.chat.textarea.input(key);
+                }
             }
+            Some(_) => {}
         }
         Ok(())
     }
 
-    fn handle_conversation_block_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Esc
-            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b'))
-        {
-            self.chat.focused_block = None;
-            self.status_message = "Composer focused".to_string();
-            return;
-        }
-
-        match key.code {
-            KeyCode::Up => self.move_conversation_block_focus(-1),
-            KeyCode::Down => self.move_conversation_block_focus(1),
-            KeyCode::Home => self.focus_conversation_block_at(0),
-            KeyCode::End => {
+    fn handle_conversation_block_action(&mut self, action: ActionId) {
+        match action {
+            ActionId::ExitConversationBlocks => {
+                self.chat.focused_block = None;
+                self.status_message = "Composer focused".to_string();
+            }
+            ActionId::PreviousConversationBlock => self.move_conversation_block_focus(-1),
+            ActionId::NextConversationBlock => self.move_conversation_block_focus(1),
+            ActionId::JumpFirst => self.focus_conversation_block_at(0),
+            ActionId::JumpLast => {
                 let len = self.conversation_blocks().len();
                 self.focus_conversation_block_at(len.saturating_sub(1));
             }
-            KeyCode::Char('k') => self.scroll_focused_block(-1),
-            KeyCode::Char('j') => self.scroll_focused_block(1),
-            KeyCode::PageUp => self.scroll_focused_block(-(CONVERSATION_DETAIL_VIEWPORT as i32)),
-            KeyCode::PageDown => self.scroll_focused_block(CONVERSATION_DETAIL_VIEWPORT as i32),
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.toggle_conversation_details()
+            ActionId::ScrollBlockUp => self.scroll_focused_block(-1),
+            ActionId::ScrollBlockDown => self.scroll_focused_block(1),
+            ActionId::ScrollBlockPageUp => {
+                self.scroll_focused_block(-(CONVERSATION_DETAIL_VIEWPORT as i32))
             }
-            KeyCode::Enter => self.activate_focused_conversation_block(),
-            KeyCode::Char('y') => self.copy_focused_conversation_block(),
+            ActionId::ScrollBlockPageDown => {
+                self.scroll_focused_block(CONVERSATION_DETAIL_VIEWPORT as i32)
+            }
+            ActionId::ToggleDetails => self.toggle_conversation_details(),
+            ActionId::Activate => self.activate_focused_conversation_block(),
+            ActionId::CopyValue => self.copy_focused_conversation_block(),
             _ => {}
         }
     }
@@ -5864,14 +6214,18 @@ impl App {
                     }
                 }
                 if self.pending_question.is_none() {
+                    let reopen = self.action_key_phrase(
+                        ActionContext::Global,
+                        ActionId::ReopenPendingQuestion,
+                        "reopens",
+                    );
                     if let Some(dismissed) = self.dismissed_question.as_mut() {
                         if dismissed.identity() == incoming.identity() {
                             // Replayed critical events must not undo an explicit
                             // Esc dismissal. Refresh the typed contract/draft in
                             // place and keep the question cached for Ctrl+Q.
                             dismissed.refresh_contract(incoming);
-                            self.status_message =
-                                "Question remains dismissed (Ctrl+Q to reopen)".to_string();
+                            self.status_message = format!("Question remains dismissed ({reopen})");
                             if needs_identity_sync {
                                 if let Some(session_id) = self.chat.session_id.clone() {
                                     self.reconcile_pending_question_after_stream_connect(
@@ -6240,15 +6594,16 @@ impl App {
     }
 
     async fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Down if !self.sessions.sessions.is_empty() => {
+        let action = self.resolve_context_action(ActionContext::Sessions, key);
+        match action {
+            Some(ActionId::NavigateDown) if !self.sessions.sessions.is_empty() => {
                 self.sessions.selected =
                     (self.sessions.selected + 1).min(self.sessions.sessions.len() - 1);
             }
-            KeyCode::Up => {
+            Some(ActionId::NavigateUp) => {
                 self.sessions.selected = self.sessions.selected.saturating_sub(1);
             }
-            KeyCode::Enter => {
+            Some(ActionId::Activate) => {
                 // Full resume, off the event loop: history replay + live
                 // reattach (if the run is still going) + pending-question
                 // recovery, all landing in one `SessionOpened` event.
@@ -6256,7 +6611,7 @@ impl App {
                     self.resume_session(session.id.clone());
                 }
             }
-            KeyCode::Char('d') => {
+            Some(ActionId::DeleteSelection) => {
                 // Open a confirmation modal instead of deleting immediately — the
                 // actual DELETE is fired from `handle_delete_confirm_key` off the
                 // event loop, never `?`-propagated on the UI thread.
@@ -6264,17 +6619,17 @@ impl App {
                     self.pending_delete = Some((session.id.clone(), session.title.clone()));
                 }
             }
-            KeyCode::Char('r') => {
+            Some(ActionId::Refresh) => {
                 self.load_tab_data();
             }
-            KeyCode::Char(']') => {
+            Some(ActionId::NextPage) => {
                 if let Some(next) = self.sessions.next_offset {
                     self.sessions.offset = next;
                     self.sessions.selected = 0;
                     self.load_tab_data();
                 }
             }
-            KeyCode::Char('[') if self.sessions.offset > 0 => {
+            Some(ActionId::PreviousPage) if self.sessions.offset > 0 => {
                 let step = self.sessions.page_limit.max(1);
                 self.sessions.offset = self.sessions.offset.saturating_sub(step);
                 self.sessions.selected = 0;
@@ -6286,14 +6641,15 @@ impl App {
     }
 
     async fn handle_mcp_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Down if !self.mcp.servers.is_empty() => {
+        let action = self.resolve_context_action(ActionContext::Mcp, key);
+        match action {
+            Some(ActionId::NavigateDown) if !self.mcp.servers.is_empty() => {
                 self.mcp.selected = (self.mcp.selected + 1).min(self.mcp.servers.len() - 1);
             }
-            KeyCode::Up => {
+            Some(ActionId::NavigateUp) => {
                 self.mcp.selected = self.mcp.selected.saturating_sub(1);
             }
-            KeyCode::Enter => {
+            Some(ActionId::Activate) => {
                 if let (Some(server), Some(tx)) = (
                     self.mcp.servers.get(self.mcp.selected),
                     self.event_tx.clone(),
@@ -6324,7 +6680,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('t') => {
+            Some(ActionId::ShowTools) => {
                 if let (Some(server), Some(tx)) = (
                     self.mcp.servers.get(self.mcp.selected),
                     self.event_tx.clone(),
@@ -6337,7 +6693,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('r') => {
+            Some(ActionId::Refresh) => {
                 self.load_tab_data();
             }
             _ => {}
@@ -6348,18 +6704,19 @@ impl App {
     async fn handle_schedules_key(&mut self, key: KeyEvent) -> Result<()> {
         // Note: when `schedule_form` is open, `handle_key` routes every key
         // straight to `handle_schedule_form_key` before reaching here.
-        match key.code {
-            KeyCode::Char('n') => {
+        let action = self.resolve_context_action(ActionContext::Schedules, key);
+        match action {
+            Some(ActionId::NewSchedule) => {
                 self.schedule_form = Some(ScheduleForm::default());
             }
-            KeyCode::Down if !self.schedules.schedules.is_empty() => {
+            Some(ActionId::NavigateDown) if !self.schedules.schedules.is_empty() => {
                 self.schedules.selected =
                     (self.schedules.selected + 1).min(self.schedules.schedules.len() - 1);
             }
-            KeyCode::Up => {
+            Some(ActionId::NavigateUp) => {
                 self.schedules.selected = self.schedules.selected.saturating_sub(1);
             }
-            KeyCode::Char('d') => {
+            Some(ActionId::DeleteSelection) => {
                 if self.deleting_schedule_id.is_some() {
                     self.notify(
                         NoticeLevel::Warn,
@@ -6377,7 +6734,7 @@ impl App {
                     ));
                 }
             }
-            KeyCode::Char('r') => {
+            Some(ActionId::RunSchedule) => {
                 if let (Some(schedule), Some(tx)) = (
                     self.schedules.schedules.get(self.schedules.selected),
                     self.event_tx.clone(),
@@ -6405,24 +6762,25 @@ impl App {
     /// Drive the new-schedule form modal. On Enter (all fields filled) it POSTs
     /// create_schedule off the event loop and reloads the tab.
     fn handle_schedule_form_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::ScheduleForm, key);
         let Some(form) = self.schedule_form.as_mut() else {
             return;
         };
-        match key.code {
-            KeyCode::Esc => {
+        match action {
+            Some(ActionId::Cancel) => {
                 self.schedule_form = None;
             }
-            KeyCode::Tab | KeyCode::Down => {
+            Some(ActionId::NextField) => {
                 form.field = (form.field + 1) % 3;
             }
-            KeyCode::BackTab | KeyCode::Up => {
+            Some(ActionId::PreviousField) => {
                 form.field = (form.field + 2) % 3;
             }
-            KeyCode::Backspace => {
+            Some(ActionId::Backspace) => {
                 form.error = None;
                 form.current_mut().pop();
             }
-            KeyCode::Enter => {
+            Some(ActionId::Activate) => {
                 if form.name.trim().is_empty()
                     || form.cron.trim().is_empty()
                     || form.prompt.trim().is_empty()
@@ -6462,23 +6820,25 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char(c) => {
-                form.error = None;
-                form.current_mut().push(c);
+            _ => {
+                if let Some(character) = text_character(key) {
+                    form.error = None;
+                    form.current_mut().push(character);
+                }
             }
-            _ => {}
         }
     }
 
     async fn handle_skills_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Down if !self.skills.skills.is_empty() => {
+        let action = self.resolve_context_action(ActionContext::Skills, key);
+        match action {
+            Some(ActionId::NavigateDown) if !self.skills.skills.is_empty() => {
                 self.skills.selected = (self.skills.selected + 1).min(self.skills.skills.len() - 1);
             }
-            KeyCode::Up => {
+            Some(ActionId::NavigateUp) => {
                 self.skills.selected = self.skills.selected.saturating_sub(1);
             }
-            KeyCode::Enter => {
+            Some(ActionId::Activate) => {
                 // Fetch the detail off the event loop: `get_skill` used to be
                 // awaited right here on the UI thread, so a slow/unreachable
                 // server froze every keystroke until it returned.
@@ -6521,12 +6881,13 @@ impl App {
     }
 
     fn handle_config_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Down => self.config_scroll_down(1),
-            KeyCode::Up => self.config_scroll_up(1),
-            KeyCode::PageDown => self.config_scroll_down(10),
-            KeyCode::PageUp => self.config_scroll_up(10),
-            KeyCode::Char('e') => {
+        let action = self.resolve_context_action(ActionContext::Config, key);
+        match action {
+            Some(ActionId::NavigateDown) => self.config_scroll_down(1),
+            Some(ActionId::NavigateUp) => self.config_scroll_up(1),
+            Some(ActionId::PageDown) => self.config_scroll_down(10),
+            Some(ActionId::PageUp) => self.config_scroll_up(10),
+            Some(ActionId::EditConfig) => {
                 // Open the raw-JSON editor prefilled with the current config.
                 match &self.config.config {
                     Some(val) => {
@@ -6553,12 +6914,13 @@ impl App {
     /// JSON and, if valid, PATCHes it to the server off the event loop; `Esc`
     /// cancels. Every other key edits the text buffer.
     fn handle_config_editor_key(&mut self, key: KeyEvent) -> Result<()> {
-        if key.code == KeyCode::Esc {
+        let action = self.resolve_context_action(ActionContext::ConfigEditor, key);
+        if action == Some(ActionId::Cancel) {
             self.config_editor = None;
             self.status_message = "Edit cancelled".to_string();
             return Ok(());
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        if action == Some(ActionId::SaveConfig) {
             let text = self
                 .config_editor
                 .as_ref()
@@ -6591,9 +6953,13 @@ impl App {
             }
             return Ok(());
         }
-        if let Some(editor) = self.config_editor.as_mut() {
-            editor.error = None;
-            editor.textarea.input(key);
+        if action.is_none() {
+            if let Some(editor) = self.config_editor.as_mut() {
+                editor.error = None;
+                if text_widget_input_allowed(key) {
+                    editor.textarea.input(key);
+                }
+            }
         }
         Ok(())
     }
@@ -6727,43 +7093,33 @@ impl App {
     }
 
     fn handle_session_picker_browse_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('r') => {
-                    self.reload_session_picker();
-                    return;
+        let action = self.resolve_context_action(ActionContext::SessionPickerBrowse, key);
+        match action {
+            Some(ActionId::Refresh) => self.reload_session_picker(),
+            Some(ActionId::ClearInput) => {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    let preserve = picker.selected_session().map(|s| s.id.clone());
+                    picker.query.clear();
+                    picker.selection_touched = true;
+                    picker.refresh_filter(preserve);
                 }
-                KeyCode::Char('u') => {
-                    if let Some(picker) = self.session_picker.as_mut() {
-                        let preserve = picker.selected_session().map(|s| s.id.clone());
-                        picker.query.clear();
-                        picker.selection_touched = true;
-                        picker.refresh_filter(preserve);
-                    }
-                    return;
-                }
-                KeyCode::Char('d') => {
-                    if let Some(session) = self
-                        .session_picker
-                        .as_ref()
-                        .and_then(SessionPicker::selected_session)
-                    {
-                        self.pending_delete = Some((session.id.clone(), session.title.clone()));
-                    }
-                    return;
-                }
-                _ => {}
             }
-        }
-
-        match key.code {
-            KeyCode::Up => {
+            Some(ActionId::DeleteSelection) => {
+                if let Some(session) = self
+                    .session_picker
+                    .as_ref()
+                    .and_then(SessionPicker::selected_session)
+                {
+                    self.pending_delete = Some((session.id.clone(), session.title.clone()));
+                }
+            }
+            Some(ActionId::NavigateUp) => {
                 if let Some(picker) = self.session_picker.as_mut() {
                     picker.selected = picker.selected.saturating_sub(1);
                     picker.selection_touched = true;
                 }
             }
-            KeyCode::Down => {
+            Some(ActionId::NavigateDown) => {
                 let load_more = if let Some(picker) = self.session_picker.as_mut() {
                     picker.selection_touched = true;
                     if picker.selected + 1 < picker.visible.len() {
@@ -6779,8 +7135,8 @@ impl App {
                     self.load_next_session_picker_page();
                 }
             }
-            KeyCode::PageDown | KeyCode::Char(']') => self.load_next_session_picker_page(),
-            KeyCode::Enter => {
+            Some(ActionId::LoadMore) => self.load_next_session_picker_page(),
+            Some(ActionId::Activate) => {
                 let session_id = self
                     .session_picker
                     .as_ref()
@@ -6791,19 +7147,10 @@ impl App {
                     self.resume_session(session_id);
                 }
             }
-            KeyCode::F(2) => self.begin_session_rename(),
-            KeyCode::F(3) => self.begin_session_pin_toggle(),
-            KeyCode::Delete => {
-                if let Some(session) = self
-                    .session_picker
-                    .as_ref()
-                    .and_then(SessionPicker::selected_session)
-                {
-                    self.pending_delete = Some((session.id.clone(), session.title.clone()));
-                }
-            }
-            KeyCode::Esc => self.close_session_picker(),
-            KeyCode::Backspace => {
+            Some(ActionId::RenameSession) => self.begin_session_rename(),
+            Some(ActionId::ToggleSessionPin) => self.begin_session_pin_toggle(),
+            Some(ActionId::Cancel) => self.close_session_picker(),
+            Some(ActionId::Backspace) => {
                 if let Some(picker) = self.session_picker.as_mut() {
                     let preserve = picker.selected_session().map(|s| s.id.clone());
                     picker.query.pop();
@@ -6811,26 +7158,22 @@ impl App {
                     picker.refresh_filter(preserve);
                 }
             }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(picker) = self.session_picker.as_mut() {
-                    let preserve = picker.selected_session().map(|s| s.id.clone());
-                    picker.query.push(character);
-                    picker.selection_touched = true;
-                    picker.refresh_filter(preserve);
-                }
-                if self
-                    .session_picker
-                    .as_ref()
-                    .is_some_and(|picker| !picker.query.is_empty() && picker.next_offset.is_some())
-                {
-                    self.load_next_session_picker_page();
+            None => {
+                if let Some(character) = text_character(key) {
+                    if let Some(picker) = self.session_picker.as_mut() {
+                        let preserve = picker.selected_session().map(|s| s.id.clone());
+                        picker.query.push(character);
+                        picker.selection_touched = true;
+                        picker.refresh_filter(preserve);
+                    }
+                    if self.session_picker.as_ref().is_some_and(|picker| {
+                        !picker.query.is_empty() && picker.next_offset.is_some()
+                    }) {
+                        self.load_next_session_picker_page();
+                    }
                 }
             }
-            _ => {}
+            Some(_) => {}
         }
     }
 
@@ -6884,6 +7227,7 @@ impl App {
     }
 
     fn handle_session_picker_rename_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::SessionPickerRename, key);
         let mut retry = None;
         let mut submit = None;
         let mut cancel = false;
@@ -6904,7 +7248,7 @@ impl App {
             return;
         };
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+        if action == Some(ActionId::Refresh) {
             if !*submitting {
                 *metadata_version = None;
                 *loading_version = true;
@@ -6914,8 +7258,8 @@ impl App {
         } else if *submitting {
             return;
         } else {
-            match key.code {
-                KeyCode::Enter if !draft.trim().is_empty() => {
+            match action {
+                Some(ActionId::Activate) if !draft.trim().is_empty() => {
                     if let Some(version) = *metadata_version {
                         *submitting = true;
                         *error = None;
@@ -6926,23 +7270,21 @@ impl App {
                             draft.trim().to_string(),
                         ));
                     } else if !*loading_version {
-                        *error = Some("No current version — press Ctrl+R to retry".to_string());
+                        *error = Some("No current version — use Refresh to retry".to_string());
                     }
                 }
-                KeyCode::Esc => cancel = true,
-                KeyCode::Backspace => {
+                Some(ActionId::Cancel) => cancel = true,
+                Some(ActionId::Backspace) => {
                     draft.pop();
                     *draft_dirty = true;
                     *error = None;
                 }
-                KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    draft.push(character);
-                    *draft_dirty = true;
-                    *error = None;
+                None => {
+                    if let Some(character) = text_character(key) {
+                        draft.push(character);
+                        *draft_dirty = true;
+                        *error = None;
+                    }
                 }
                 _ => {}
             }
@@ -6971,6 +7313,7 @@ impl App {
     }
 
     fn handle_session_picker_pinning_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::SessionPickerPinning, key);
         let mut retry = None;
         let mut cancel = false;
         let Some(picker) = self.session_picker.as_mut() else {
@@ -6986,13 +7329,13 @@ impl App {
         else {
             return;
         };
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+        if action == Some(ActionId::Refresh) {
             if !*submitting {
                 *loading_version = true;
                 *error = None;
                 retry = Some((picker.epoch, session_id.clone(), *target));
             }
-        } else if key.code == KeyCode::Esc && !*submitting {
+        } else if action == Some(ActionId::Cancel) && !*submitting {
             cancel = true;
         }
 
@@ -7208,54 +7551,44 @@ impl App {
     }
 
     fn handle_command_palette_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::CommandPalette, key);
         let resolving = self
             .command_palette
             .as_ref()
             .is_some_and(|palette| palette.resolving);
         if resolving {
-            if key.code == KeyCode::Esc {
+            if action == Some(ActionId::Cancel) {
                 self.close_command_palette();
             }
             return;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('k') => {
-                    self.close_command_palette();
-                    return;
+        match action {
+            Some(ActionId::Cancel) => self.close_command_palette(),
+            Some(ActionId::ClearInput) => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
+                    palette.input.clear();
+                    palette.error = None;
+                    palette.refresh_filter(preserve);
                 }
-                KeyCode::Char('u') => {
-                    if let Some(palette) = self.command_palette.as_mut() {
-                        let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
-                        palette.input.clear();
-                        palette.error = None;
-                        palette.refresh_filter(preserve);
-                    }
-                    return;
-                }
-                KeyCode::Char('r') => {
-                    if self
-                        .command_palette
-                        .as_ref()
-                        .is_some_and(|palette| !palette.loading)
-                    {
-                        self.reload_command_catalog();
-                    }
-                    return;
-                }
-                _ => {}
             }
-        }
-
-        match key.code {
-            KeyCode::Up => {
+            Some(ActionId::Refresh) => {
+                if self
+                    .command_palette
+                    .as_ref()
+                    .is_some_and(|palette| !palette.loading)
+                {
+                    self.reload_command_catalog();
+                }
+            }
+            Some(ActionId::NavigateUp) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     palette.selected = palette.selected.saturating_sub(1);
                     palette.error = None;
                 }
             }
-            KeyCode::Down => {
+            Some(ActionId::NavigateDown) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     if palette.selected + 1 < palette.visible.len() {
                         palette.selected += 1;
@@ -7263,13 +7596,13 @@ impl App {
                     palette.error = None;
                 }
             }
-            KeyCode::PageUp => {
+            Some(ActionId::PageUp) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     palette.selected = palette.selected.saturating_sub(8);
                     palette.error = None;
                 }
             }
-            KeyCode::PageDown => {
+            Some(ActionId::PageDown) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     palette.selected = palette
                         .selected
@@ -7278,21 +7611,20 @@ impl App {
                     palette.error = None;
                 }
             }
-            KeyCode::Home => {
+            Some(ActionId::JumpFirst) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     palette.selected = 0;
                     palette.error = None;
                 }
             }
-            KeyCode::End => {
+            Some(ActionId::JumpLast) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     palette.selected = palette.visible.len().saturating_sub(1);
                     palette.error = None;
                 }
             }
-            KeyCode::Enter => self.activate_command_palette_selection(),
-            KeyCode::Esc => self.close_command_palette(),
-            KeyCode::Backspace => {
+            Some(ActionId::Activate) => self.activate_command_palette_selection(),
+            Some(ActionId::Backspace) => {
                 if let Some(palette) = self.command_palette.as_mut() {
                     let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
                     palette.input.pop();
@@ -7300,19 +7632,17 @@ impl App {
                     palette.refresh_filter(preserve);
                 }
             }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(palette) = self.command_palette.as_mut() {
-                    let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
-                    palette.input.push(character);
-                    palette.error = None;
-                    palette.refresh_filter(preserve);
+            None => {
+                if let Some(character) = text_character(key) {
+                    if let Some(palette) = self.command_palette.as_mut() {
+                        let preserve = palette.selected_entry().map(CommandPaletteEntry::key);
+                        palette.input.push(character);
+                        palette.error = None;
+                        palette.refresh_filter(preserve);
+                    }
                 }
             }
-            _ => {}
+            Some(_) => {}
         }
     }
 
@@ -7321,24 +7651,9 @@ impl App {
         entry: &CommandPaletteEntry,
     ) -> Option<&'static str> {
         match entry {
-            entry
-                if self.chat.streaming
-                    && !matches!(
-                        entry,
-                        CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop)
-                    ) =>
-            {
+            CommandPaletteEntry::Builtin(action) => self.action_disabled_reason(*action),
+            CommandPaletteEntry::Server(_) if self.chat.streaming => {
                 Some("Unavailable while an agent run is active")
-            }
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession)
-            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::OpenSession)
-            | CommandPaletteEntry::Builtin(BuiltinPaletteAction::SelectModel)
-                if self.opening_session_id.is_some() =>
-            {
-                Some("Unavailable while a session is resuming")
-            }
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop) if !self.chat.streaming => {
-                Some("No active run to stop")
             }
             CommandPaletteEntry::Server(_) if self.opening_session_id.is_some() => {
                 Some("Composer commands are unavailable while a session is resuming")
@@ -7402,38 +7717,9 @@ impl App {
         }
     }
 
-    fn run_builtin_palette_action(&mut self, action: BuiltinPaletteAction) {
+    fn run_builtin_palette_action(&mut self, action: ActionId) {
         self.close_command_palette();
-        match action {
-            BuiltinPaletteAction::NewSession => self.new_session(),
-            BuiltinPaletteAction::OpenSession => {
-                self.tab = Tab::Chat;
-                self.open_session_picker();
-            }
-            BuiltinPaletteAction::SelectModel => {
-                self.tab = Tab::Chat;
-                self.open_model_picker();
-            }
-            BuiltinPaletteAction::Help => {
-                self.help_visible = true;
-                self.help_scroll = 0;
-            }
-            BuiltinPaletteAction::Notifications => {
-                self.notifications_visible = true;
-                self.notification_scroll = 0;
-                self.unseen_alerts = 0;
-            }
-            BuiltinPaletteAction::Stop => self.stop_streaming(),
-            BuiltinPaletteAction::ToggleDetails => self.toggle_conversation_details(),
-            BuiltinPaletteAction::Config => {
-                self.tab = Tab::Config;
-                self.load_tab_data();
-            }
-            BuiltinPaletteAction::Schedules => {
-                self.tab = Tab::Schedules;
-                self.load_tab_data();
-            }
-        }
+        self.handle_global_action(action);
     }
 
     fn resolve_command_into_composer(&mut self, command: CommandItem) {
@@ -7503,12 +7789,13 @@ impl App {
         self.install_command_draft(draft);
         self.tab = Tab::Chat;
         self.close_command_palette();
-        self.status_message = match command.command_type.to_ascii_lowercase().as_str() {
-            "skill" => "Skill command inserted — review and press Enter to send",
-            "mcp" => "MCP command inserted — review and press Enter to send",
-            _ => "Command inserted — review and press Enter to send",
-        }
-        .to_string();
+        let kind = match command.command_type.to_ascii_lowercase().as_str() {
+            "skill" => "Skill",
+            "mcp" => "MCP",
+            _ => "Command",
+        };
+        let send = self.action_key_phrase(ActionContext::Chat, ActionId::SendMessage, "sends");
+        self.status_message = format!("{kind} command inserted — review; {send}");
     }
 
     fn install_command_draft(&mut self, content: String) {
@@ -7524,7 +7811,7 @@ impl App {
             .unwrap_or_default()
             .min(u16::MAX as usize) as u16;
         let mut textarea = TextArea::from(lines);
-        textarea.set_placeholder_text(CHAT_PLACEHOLDER);
+        textarea.set_placeholder_text(self.chat_placeholder());
         apply_textarea_palette(&mut textarea, self.theme);
         textarea.move_cursor(CursorMove::Jump(row, column));
         self.chat.textarea = textarea;
@@ -7593,13 +7880,14 @@ impl App {
     }
 
     async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let action = self.resolve_context_action(ActionContext::ModelPicker, key);
         let Some(picker) = self.model_picker.as_ref() else {
             return Ok(());
         };
         if picker.applying {
             return Ok(());
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        if action == Some(ActionId::ClearInput) {
             if let Some(picker) = self.model_picker.as_mut() {
                 let preserve = picker.selected_model().map(model_key);
                 picker.query.clear();
@@ -7608,20 +7896,43 @@ impl App {
             return Ok(());
         }
 
-        match key.code {
-            KeyCode::Up => {
+        match action {
+            Some(ActionId::NavigateUp) => {
                 if let Some(picker) = self.model_picker.as_mut() {
                     picker.selected = picker.selected.saturating_sub(1);
                 }
             }
-            KeyCode::Down => {
+            Some(ActionId::NavigateDown) => {
                 if let Some(picker) = self.model_picker.as_mut() {
                     if picker.selected + 1 < picker.visible.len() {
                         picker.selected += 1;
                     }
                 }
             }
-            KeyCode::Enter => {
+            Some(ActionId::PageUp) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected = picker.selected.saturating_sub(8);
+                }
+            }
+            Some(ActionId::PageDown) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected = picker
+                        .selected
+                        .saturating_add(8)
+                        .min(picker.visible.len().saturating_sub(1));
+                }
+            }
+            Some(ActionId::JumpFirst) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected = 0;
+                }
+            }
+            Some(ActionId::JumpLast) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.selected = picker.visible.len().saturating_sub(1);
+                }
+            }
+            Some(ActionId::Activate) => {
                 let model = self
                     .model_picker
                     .as_ref()
@@ -7631,35 +7942,32 @@ impl App {
                     self.apply_model(model);
                 }
             }
-            KeyCode::Esc => self.close_model_picker(),
-            KeyCode::Backspace => {
+            Some(ActionId::Cancel) => self.close_model_picker(),
+            Some(ActionId::Backspace) => {
                 if let Some(picker) = self.model_picker.as_mut() {
                     let preserve = picker.selected_model().map(model_key);
                     picker.query.pop();
                     picker.refresh_filter(preserve);
                 }
             }
-            KeyCode::Char('r')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self
-                        .model_picker
-                        .as_ref()
-                        .is_some_and(|picker| !picker.loading && picker.visible.is_empty()) =>
+            Some(ActionId::Refresh)
+                if self
+                    .model_picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.loading && picker.visible.is_empty()) =>
             {
                 self.reload_model_catalog();
             }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(picker) = self.model_picker.as_mut() {
-                    let preserve = picker.selected_model().map(model_key);
-                    picker.query.push(character);
-                    picker.refresh_filter(preserve);
+            None => {
+                if let Some(character) = text_character(key) {
+                    if let Some(picker) = self.model_picker.as_mut() {
+                        let preserve = picker.selected_model().map(model_key);
+                        picker.query.push(character);
+                        picker.refresh_filter(preserve);
+                    }
                 }
             }
-            _ => {}
+            Some(_) => {}
         }
         Ok(())
     }
@@ -7887,7 +8195,7 @@ mod command_palette_tests {
             .position(|index| {
                 matches!(
                     palette.entries.get(*index),
-                    Some(CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop))
+                    Some(CommandPaletteEntry::Builtin(ActionId::StopRun))
                 )
             })
             .unwrap();
@@ -7902,6 +8210,15 @@ mod command_palette_tests {
     #[tokio::test]
     async fn catalog_failure_and_stale_epoch_leave_composer_and_palette_interactive() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"command-palette","action":"refresh","keys":["F10"]}
+                ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("keep this draft");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 4));
@@ -7928,6 +8245,8 @@ mod command_palette_tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("offline")));
+        assert!(palette.error.as_deref().unwrap().contains("F10 retries"));
+        assert!(!palette.error.as_deref().unwrap().contains("Ctrl+R"));
         assert!(before.still_matches(&app.chat.textarea));
 
         app.command_palette.as_mut().unwrap().epoch = epoch.wrapping_add(1);
@@ -8001,7 +8320,7 @@ mod command_palette_tests {
             .position(|index| {
                 matches!(
                     palette.entries.get(*index),
-                    Some(CommandPaletteEntry::Builtin(BuiltinPaletteAction::Config))
+                    Some(CommandPaletteEntry::Builtin(ActionId::OpenConfigTab))
                 )
             })
             .unwrap();
@@ -8169,7 +8488,7 @@ mod command_palette_tests {
         );
         assert!(!app.chat.streaming);
         assert!(app.chat.messages.is_empty());
-        assert!(app.status_message.contains("review and press Enter"));
+        assert!(app.status_message.contains("review; Enter sends"));
     }
 
     #[tokio::test]
@@ -8279,7 +8598,7 @@ mod command_palette_tests {
             &mut app,
             CommandPaletteTrigger::Global,
             "",
-            vec![CommandPaletteEntry::Builtin(BuiltinPaletteAction::Help)],
+            vec![CommandPaletteEntry::Builtin(ActionId::ShowHelp)],
         );
         app.command_palette
             .as_ref()
@@ -8315,7 +8634,7 @@ mod command_palette_tests {
             &mut app,
             CommandPaletteTrigger::Global,
             "",
-            vec![CommandPaletteEntry::Builtin(BuiltinPaletteAction::Help)],
+            vec![CommandPaletteEntry::Builtin(ActionId::ShowHelp)],
         );
         let epoch = app.command_palette.as_ref().unwrap().epoch;
         app.command_palette
@@ -9340,17 +9659,17 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                3_754_701_473_256_146_053,
-                8_481_293_528_542_647_595,
-                12_575_992_514_826_633_301,
-                13_989_639_618_912_745_774,
-                465_778_487_439_365_817,
-                14_156_803_428_225_062_900,
-                17_914_074_169_692_835_981,
-                13_149_988_112_385_910_257,
-                5_948_328_123_032_448_941,
-                8_759_320_582_986_254_806,
-                4_446_556_145_525_268_495,
+                1_629_717_304_819_081_337,
+                2_435_904_485_675_274_227,
+                8_621_464_252_399_871_012,
+                17_724_800_445_688_683_857,
+                10_255_921_285_737_688_228,
+                13_189_008_884_911_027_983,
+                593_030_052_894_147_164,
+                11_931_795_620_947_757_325,
+                17_529_858_181_845_329_251,
+                7_545_373_857_546_054_913,
+                16_306_463_966_091_440_063,
             ],
             "minimum-size modal golden changed"
         );
@@ -10360,7 +10679,10 @@ mod question_tests {
             .collect::<String>();
         assert!(text.contains("delete session id"));
         assert!(text.contains("s1"));
-        assert!(text.contains("Esc/q close"));
+        assert!(text.contains(&format!(
+            "{} close",
+            app.key_hint(ActionContext::Notifications, ActionId::Cancel)
+        )));
 
         app.handle_event(AppEvent::Key(key(KeyCode::Esc)))
             .await
@@ -10402,6 +10724,14 @@ mod question_tests {
         app.chat.streaming = true;
         app.help_visible = true;
         app.handle_event(AppEvent::Resize(50, 15)).await.unwrap();
+        app.handle_event(AppEvent::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Repeat,
+        )))
+        .await
+        .unwrap();
+        assert!(app.running, "held-key repeat must not quit the TUI");
         app.handle_event(AppEvent::Key(KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
@@ -10620,8 +10950,14 @@ mod question_tests {
         // byte sequence.
         assert!(text.contains('计'));
         assert!(text.contains('划'));
-        assert!(text.contains("y / Enter confirm"));
-        assert!(text.contains("n / Esc cancel"));
+        assert!(text.contains(&format!(
+            "{} confirm",
+            app.key_hint(ActionContext::ScheduleDeleteConfirm, ActionId::Confirm)
+        )));
+        assert!(text.contains(&format!(
+            "{} cancel",
+            app.key_hint(ActionContext::ScheduleDeleteConfirm, ActionId::Reject)
+        )));
     }
 
     #[test]
@@ -10677,7 +11013,7 @@ mod question_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        for needle in ["CONFIG_TAIL_", "Invalid JSON", "Ctrl+S save", "Esc cancel"] {
+        for needle in ["CONFIG_TAIL_", "Invalid JSON", "F2 save", "Esc cancel"] {
             assert!(
                 text.contains(needle),
                 "config editor missing {needle:?}:\n{text}"
@@ -10793,7 +11129,13 @@ mod question_tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect();
-                assert!(text.contains("Esc/q close"), "{width}x{height}:\n{text}");
+                assert!(
+                    text.contains(&format!(
+                        "{} close",
+                        app.key_hint(ActionContext::Notifications, ActionId::Cancel)
+                    )),
+                    "{width}x{height}:\n{text}"
+                );
             }
         }
     }
@@ -13671,19 +14013,32 @@ mod question_tests {
         assert_eq!(app.chat.session_id.as_deref(), Some("s1"));
     }
 
-    /// Esc dismisses the question modal but caches it; `Ctrl+Q` brings it
-    /// straight back without a network round-trip.
+    /// Esc dismisses the question modal but caches it; the resolved reopen
+    /// binding brings it straight back without a network round-trip.
     #[tokio::test]
-    async fn esc_then_ctrl_q_restores_the_dismissed_question() {
+    async fn dismiss_status_and_reopen_use_resolved_global_bindings() {
         let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"global","action":"reopen-pending-question","keys":["F7"]},
+                    {"context":"global","action":"quit-or-stop","keys":["F8"]}
+                ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
         app.chat.session_id = Some("s1".to_string());
 
         app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
         assert!(app.pending_question.is_none());
         assert!(app.dismissed_question.is_some());
-        assert!(app.status_message.contains("Ctrl+Q"));
+        assert!(app.status_message.contains("F7 reopens"));
+        assert!(app.status_message.contains("F8 stops the run"));
+        assert!(!app.status_message.contains("Ctrl+Q"));
+        assert!(!app.status_message.contains("Ctrl+C"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        app.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::empty()))
             .await
             .unwrap();
 
@@ -13959,7 +14314,10 @@ mod question_tests {
         assert!(app.session_picker.is_none());
         assert_eq!(app.chat.textarea.lines().join("\n"), "dr");
         assert_eq!(app.chat.scroll_offset, 11);
-        assert_eq!(app.status_message, "Keep this exact status");
+        assert_eq!(
+            app.status_message,
+            "Open session — Switch to Chat before using this action"
+        );
     }
 
     #[tokio::test]
@@ -14485,7 +14843,7 @@ mod question_tests {
         assert!(text.contains("Unicode") || text.contains("很长"));
         assert!(text.contains("★"));
         assert!(text.contains("F2 rename"));
-        assert!(text.contains("Esc cancel"));
+        assert!(text.contains("Esc"));
     }
 
     #[test]
@@ -14519,13 +14877,7 @@ mod question_tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        for needle in [
-            "15 🧭",
-            "load failed",
-            "F2 rename",
-            "Del delete",
-            "Esc cancel",
-        ] {
+        for needle in ["15 🧭", "load failed", "F2 rename", "Delete del", "Esc"] {
             assert!(text.contains(needle), "missing {needle:?}:\n{text}");
         }
         assert!(text.contains("more"), "window indicators missing:\n{text}");
@@ -14787,7 +15139,7 @@ mod question_tests {
         assert_eq!(picker.query, "claude");
         assert_eq!(model_key(picker.selected_model().unwrap()), selected_key);
         assert!(!picker.applying);
-        assert!(picker.error.as_deref().unwrap().contains("Enter to retry"));
+        assert!(picker.error.as_deref().unwrap().contains("Enter retries"));
         assert_eq!(app.chat.model, "old-model");
         assert_eq!(app.chat.textarea.lines().join("\n"), "d");
     }
@@ -15297,6 +15649,27 @@ mod auto_serve_tests {
     }
 
     #[test]
+    fn serve_offer_status_uses_resolved_confirm_and_reject_bindings() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"serve-offer","action":"confirm","keys":["F7"]},
+                    {"context":"serve-offer","action":"reject","keys":["F8"]}
+                ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        app.open_serve_offer("http://127.0.0.1:9562".to_string());
+
+        assert!(app.status_message.contains("F7 starts"));
+        assert!(app.status_message.contains("F8 skips"));
+        assert!(!app.status_message.contains("(y/n)"));
+        assert!(app.serve_offer.is_some());
+    }
+
+    #[test]
     fn serve_offer_n_dismisses_without_spawning() {
         let mut app = app_with_offer();
         app.handle_serve_offer_key(key(KeyCode::Char('n')));
@@ -15327,7 +15700,7 @@ mod auto_serve_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        for needle in ["Ctrl+L inspect", "y / Enter start", "n / Esc skip"] {
+        for needle in ["Ctrl+L", "y/Enter start", "n/Esc skip"] {
             assert!(text.contains(needle), "missing {needle:?}:\n{text}");
         }
     }
@@ -15470,7 +15843,7 @@ mod auto_serve_tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("127.0.0.1:9562"), "offer URL missing");
         assert!(text.contains("Start a local"), "offer prompt missing");
-        assert!(text.contains("y / Enter start"), "start action missing");
-        assert!(text.contains("n / Esc skip"), "skip action missing");
+        assert!(text.contains("y/Enter start"), "start action missing");
+        assert!(text.contains("n/Esc skip"), "skip action missing");
     }
 }

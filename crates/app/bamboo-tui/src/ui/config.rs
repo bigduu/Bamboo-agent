@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::keymap::{ActionContext, ActionId};
 use crate::theme::colors;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
@@ -61,7 +62,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let visual_lines = lines.len();
     let block = Block::default().title(Span::styled(
-        " Config (j/k scroll · e edit)",
+        format!(
+            " Config ({}/{} scroll · {} edit)",
+            app.key_hint(ActionContext::Config, ActionId::NavigateDown),
+            app.key_hint(ActionContext::Config, ActionId::NavigateUp),
+            app.key_hint(ActionContext::Config, ActionId::EditConfig),
+        ),
         Style::default().fg(colors::brand()),
     ));
     let viewport_height = block.inner(area).height as usize;
@@ -108,7 +114,12 @@ pub fn render_editor(f: &mut Frame, app: &App) {
         );
     }
     f.render_widget(
-        Paragraph::new(" Ctrl+S save · Esc cancel").style(Style::default().fg(colors::inactive())),
+        Paragraph::new(format!(
+            " {} save · {} cancel",
+            app.primary_key_hint(ActionContext::ConfigEditor, ActionId::SaveConfig),
+            app.primary_key_hint(ActionContext::ConfigEditor, ActionId::Cancel),
+        ))
+        .style(Style::default().fg(colors::inactive())),
         chunks[2],
     );
 }

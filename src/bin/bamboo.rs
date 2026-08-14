@@ -225,6 +225,11 @@ enum Commands {
         #[arg(long)]
         theme: Option<bamboo_tui::ThemePalette>,
 
+        /// JSON keymap override with per-context bindings, leader sequences,
+        /// and unbind support. Invalid maps fall back to safe defaults.
+        #[arg(long, value_name = "PATH")]
+        keymap: Option<PathBuf>,
+
         /// If `--server-url` is unreachable and loopback, start a local
         /// `bamboo serve` automatically instead of asking (y/n). No effect for
         /// a remote (non-loopback) `--server-url` — that always just warns.
@@ -1523,6 +1528,7 @@ async fn run() {
             session_id,
             model,
             theme,
+            keymap,
             auto_serve,
             no_auto_serve,
         } => {
@@ -1542,6 +1548,7 @@ async fn run() {
                 model,
                 auto_serve,
                 theme,
+                keymap,
             })
             .await;
             if let Err(e) = result {

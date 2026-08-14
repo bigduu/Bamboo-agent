@@ -19,7 +19,7 @@ pub fn render(f: &mut Frame, app: &App) {
 
 fn render_with_palette(f: &mut Frame, app: &App) {
     if f.area().width < MIN_TERMINAL_WIDTH || f.area().height < MIN_TERMINAL_HEIGHT {
-        layout::render_terminal_too_small(f);
+        layout::render_terminal_too_small(f, app);
         return;
     }
 

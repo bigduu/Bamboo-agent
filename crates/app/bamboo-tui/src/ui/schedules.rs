@@ -5,6 +5,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::keymap::{ActionContext, ActionId};
 use crate::theme::colors;
 use crate::ui::sessions::{truncate_cells, visible_window};
 
@@ -50,11 +51,29 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled("[n] New", Style::default().fg(colors::inactive())),
+            Span::styled(
+                format!(
+                    "[{}] New",
+                    app.key_hint(ActionContext::Schedules, ActionId::NewSchedule)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
             Span::raw("  "),
-            Span::styled("[d] Delete", Style::default().fg(colors::inactive())),
+            Span::styled(
+                format!(
+                    "[{}] Delete",
+                    app.key_hint(ActionContext::Schedules, ActionId::DeleteSelection)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
             Span::raw("  "),
-            Span::styled("[r] Run now", Style::default().fg(colors::inactive())),
+            Span::styled(
+                format!(
+                    "[{}] Run now",
+                    app.key_hint(ActionContext::Schedules, ActionId::RunSchedule)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
         ])
     };
     let header = Paragraph::new(header);
@@ -102,11 +121,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(list, chunks[1]);
 
     // Footer
-    let footer_text = if compact {
-        " n new · d delete · r run now"
-    } else {
-        " [n] New · [d] Delete · [r] Run now"
-    };
+    let footer_text = format!(
+        " {} new · {} delete · {} run now",
+        app.key_hint(ActionContext::Schedules, ActionId::NewSchedule),
+        app.key_hint(ActionContext::Schedules, ActionId::DeleteSelection),
+        app.key_hint(ActionContext::Schedules, ActionId::RunSchedule),
+    );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[2]);
 }
