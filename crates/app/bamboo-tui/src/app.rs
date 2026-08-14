@@ -21,8 +21,8 @@ use crate::api::{BambooClient, RespondFailure};
 use crate::event::AppEvent;
 use crate::history::map_history;
 use crate::keymap::{
-    text_character, ActionAvailability, ActionContext, ActionId, HelpEntry, KeyResolution, Keymap,
-    PendingSequence,
+    text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
+    HelpEntry, KeyResolution, Keymap, PendingSequence,
 };
 use crate::search::ranked_indices;
 use crate::ui;
@@ -91,6 +91,71 @@ mod action_keymap_integration_tests {
     }
 
     #[tokio::test]
+    async fn global_quit_preempts_a_pending_leader_at_runtime() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_key(press(KeyCode::Char('\\'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.pending_key_sequence.is_some());
+
+        app.handle_key(press(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(!app.running);
+        assert!(app.pending_key_sequence.is_none());
+    }
+
+    #[tokio::test]
+    async fn remapped_send_feedback_uses_the_resolved_binding() {
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"chat","action":"send-message","keys":["F12"]}
+            ]}"#,
+        )
+        .unwrap();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(keymap, None);
+        app.chat.streaming = true;
+        app.handle_key(press(KeyCode::F(12), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.status_message.contains("F12 sends after completion"));
+        assert!(!app.status_message.contains("Enter"));
+    }
+
+    #[tokio::test]
+    async fn rejected_printable_global_prefix_falls_back_without_swallowing_chat_text() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "bamboo-tui-printable-prefix-{}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"bindings":[
+                {"context":"global","action":"show-help","keys":["g n"]}
+            ]}"#,
+        )
+        .unwrap();
+        let (keymap, warning) = Keymap::load(Some(&path));
+        std::fs::remove_file(path).unwrap();
+        assert!(warning
+            .as_deref()
+            .is_some_and(|message| message.contains("starts with a printable key")));
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(keymap, warning);
+        app.handle_key(press(KeyCode::Char('g'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.chat.textarea.lines().join("\n"), "g");
+        assert!(app.pending_key_sequence.is_none());
+    }
+
+    #[tokio::test]
     async fn modified_text_release_and_repeat_events_keep_focus_and_mutations_safe() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.handle_key(press(KeyCode::Char('y'), KeyModifiers::CONTROL))
@@ -99,6 +164,11 @@ mod action_keymap_integration_tests {
         app.handle_key(press(KeyCode::Char('z'), KeyModifiers::ALT))
             .await
             .unwrap();
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+            app.handle_key(press(KeyCode::Char('y'), modifier))
+                .await
+                .unwrap();
+        }
         assert_eq!(app.chat.textarea.lines().join("\n"), "");
 
         app.help_visible = true;
@@ -142,6 +212,16 @@ mod action_keymap_integration_tests {
             app.pending_delete.is_some(),
             "modified text must not confirm a destructive action"
         );
+
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+            app.handle_key(press(KeyCode::Char('y'), modifier))
+                .await
+                .unwrap();
+            assert!(
+                app.pending_delete.is_some(),
+                "{modifier:?}+y must not confirm a destructive action"
+            );
+        }
 
         app.handle_key(press(KeyCode::Char('y'), KeyModifiers::empty()))
             .await
@@ -2161,6 +2241,20 @@ impl App {
             .to_string()
     }
 
+    pub(crate) fn action_key_phrase(
+        &self,
+        context: ActionContext,
+        action: ActionId,
+        verb: &str,
+    ) -> String {
+        let hint = self.key_hint(context, action);
+        if hint == "unbound" {
+            format!("{} is unbound", action.label())
+        } else {
+            format!("{hint} {verb}")
+        }
+    }
+
     pub(crate) fn help_entries(&self) -> Vec<HelpEntry> {
         self.keymap.help_entries()
     }
@@ -2326,7 +2420,7 @@ impl App {
             // advancing or a resize could strand the app in a stale state.
             match &event {
                 AppEvent::Key(key) => {
-                    if key.kind != KeyEventKind::Release
+                    if key.kind == KeyEventKind::Press
                         && self.resolve_context_action(ActionContext::Global, *key)
                             == Some(ActionId::QuitOrStop)
                     {
@@ -2922,6 +3016,11 @@ impl App {
                 session_id,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::CommandPalette,
+                    ActionId::Refresh,
+                    "retries",
+                );
                 let current_session = self.chat.session_id.clone();
                 let selected_key = self
                     .command_palette
@@ -2950,9 +3049,7 @@ impl App {
                         palette.refresh_filter(selected_key);
                     }
                     Err(error) => {
-                        palette.error = Some(format!(
-                            "Failed to load commands: {error} — press Ctrl+R to retry"
-                        ));
+                        palette.error = Some(format!("Failed to load commands: {error} — {retry}"));
                     }
                 }
             }
@@ -2962,6 +3059,13 @@ impl App {
                 command_key,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::CommandPalette,
+                    ActionId::Activate,
+                    "retries",
+                );
+                let send =
+                    self.action_key_phrase(ActionContext::Chat, ActionId::SendMessage, "sends");
                 let current_session = self.chat.session_id.clone();
                 let Some(palette) = self.command_palette.as_mut().filter(|palette| {
                     palette.epoch == epoch
@@ -3007,17 +3111,20 @@ impl App {
                         self.tab = Tab::Chat;
                         self.close_command_palette();
                         self.status_message =
-                            "Command loaded into composer — review and press Enter to send"
-                                .to_string();
+                            format!("Command loaded into composer — review; {send}");
                     }
                     Err(error) => {
-                        palette.error = Some(format!(
-                            "Failed to resolve command: {error} — press Enter to retry"
-                        ));
+                        palette.error =
+                            Some(format!("Failed to resolve command: {error} — {retry}"));
                     }
                 }
             }
             AppEvent::CatalogLoaded { epoch, result } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::ModelPicker,
+                    ActionId::Refresh,
+                    "retries",
+                );
                 let selected_key = self
                     .model_picker
                     .as_ref()
@@ -3050,14 +3157,15 @@ impl App {
                             &self.recent_models,
                         );
                         picker.models = catalog.models;
-                        picker.error = picker.models.is_empty().then(|| {
-                            "No models in provider catalog — press Ctrl+R to retry".to_string()
-                        });
+                        picker.error = picker
+                            .models
+                            .is_empty()
+                            .then(|| format!("No models in provider catalog — {retry}"));
                         picker.refresh_filter(selected_key);
                     }
                     Err(error) => {
                         picker.error = Some(format!(
-                            "Failed to load provider catalog: {error} — press Ctrl+R to retry"
+                            "Failed to load provider catalog: {error} — {retry}"
                         ));
                     }
                 }
@@ -3068,6 +3176,13 @@ impl App {
                 model,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::ModelPicker,
+                    ActionId::Activate,
+                    "retries",
+                );
+                let cancel =
+                    self.action_key_phrase(ActionContext::ModelPicker, ActionId::Cancel, "cancels");
                 let Some(picker) = self
                     .model_picker
                     .as_mut()
@@ -3088,7 +3203,7 @@ impl App {
                     Ok(()) => self.commit_model_selection(model),
                     Err(error) => {
                         picker.error = Some(format!(
-                            "Failed to update session model: {error} — press Enter to retry or Esc to cancel"
+                            "Failed to update session model: {error} — {retry}; {cancel}"
                         ));
                     }
                 }
@@ -3098,6 +3213,11 @@ impl App {
                 offset,
                 result,
             } => {
+                let retry = self.action_key_phrase(
+                    ActionContext::SessionPickerBrowse,
+                    ActionId::Refresh,
+                    "retries",
+                );
                 let Some(picker) = self
                     .session_picker
                     .as_mut()
@@ -3152,9 +3272,7 @@ impl App {
                         picker.refresh_filter(preserve_id);
                     }
                     Err(error) => {
-                        picker.error = Some(format!(
-                            "Failed to load sessions: {error} — press Ctrl+R to retry"
-                        ));
+                        picker.error = Some(format!("Failed to load sessions: {error} — {retry}"));
                     }
                 }
                 let should_continue = self.session_picker.as_ref().is_some_and(|picker| {
@@ -3173,6 +3291,11 @@ impl App {
                 intent,
                 result,
             } => {
+                let retry_context = match &intent {
+                    SessionPickerIntent::Rename => ActionContext::SessionPickerRename,
+                    SessionPickerIntent::Pin(_) => ActionContext::SessionPickerPinning,
+                };
+                let retry = self.action_key_phrase(retry_context, ActionId::Refresh, "retries");
                 let Some(picker) = self
                     .session_picker
                     .as_mut()
@@ -3214,10 +3337,9 @@ impl App {
                                     // made visible and explicitly retried.
                                     *metadata_version = None;
                                     *base_title = fresh_title;
-                                    *error = Some(
-                                        "Title changed on the server; draft preserved — press Ctrl+R to confirm against the latest title"
-                                            .to_string(),
-                                    );
+                                    *error = Some(format!(
+                                        "Title changed on the server; draft preserved — {retry} against the latest title"
+                                    ));
                                 } else {
                                     if !*draft_dirty {
                                         *draft = fresh_title.clone();
@@ -3255,7 +3377,7 @@ impl App {
                         } => {
                             *loading_version = false;
                             *error = Some(format!(
-                                "Failed to prepare update: {error_message} — press Ctrl+R to retry"
+                                "Failed to prepare update: {error_message} — {retry}"
                             ));
                         }
                         SessionPickerMode::Browse => {}
@@ -3280,6 +3402,11 @@ impl App {
                 intent,
                 result,
             } => {
+                let retry_context = match &intent {
+                    SessionPickerIntent::Rename => ActionContext::SessionPickerRename,
+                    SessionPickerIntent::Pin(_) => ActionContext::SessionPickerPinning,
+                };
+                let retry = self.action_key_phrase(retry_context, ActionId::Refresh, "retries");
                 let Some(picker) = self
                     .session_picker
                     .as_mut()
@@ -3318,8 +3445,7 @@ impl App {
                             .current_version
                             .map(|version| format!(" (server version {version})"))
                             .unwrap_or_default();
-                        let message =
-                            format!("{prefix}{current}: {failure} — press Ctrl+R to retry");
+                        let message = format!("{prefix}{current}: {failure} — {retry}");
                         match &mut picker.mode {
                             SessionPickerMode::Rename {
                                 metadata_version,
@@ -3649,8 +3775,23 @@ impl App {
         };
         self.chat.focused_block = Some(id.clone());
         self.scroll_to_conversation_block(&id);
-        self.status_message =
-            "Block focused — ↑/↓ move · Enter use · y copy · Esc composer".to_string();
+        self.status_message = format!(
+            "Block focused — {}/{} move · {} use · {} copy · {} composer",
+            self.primary_key_hint(
+                ActionContext::ConversationBlock,
+                ActionId::PreviousConversationBlock,
+            ),
+            self.primary_key_hint(
+                ActionContext::ConversationBlock,
+                ActionId::NextConversationBlock,
+            ),
+            self.primary_key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+            self.primary_key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+            self.primary_key_hint(
+                ActionContext::ConversationBlock,
+                ActionId::ExitConversationBlocks,
+            ),
+        );
     }
 
     fn move_conversation_block_focus(&mut self, delta: i32) {
@@ -5067,15 +5208,22 @@ impl App {
                 self.open_command_palette(CommandPaletteTrigger::Slash);
             }
             Some(ActionId::OpenSlashPalette) => {
-                self.chat.textarea.input(key);
+                if text_widget_input_allowed(key) {
+                    self.chat.textarea.input(key);
+                }
             }
             Some(ActionId::ScrollTranscriptDown) => self.chat_scroll_down(10),
             Some(ActionId::ScrollTranscriptUp) => self.chat_scroll_up(10),
             Some(ActionId::InsertNewline) => self.chat.textarea.insert_newline(),
             Some(ActionId::SendMessage) if self.chat.streaming => {
-                self.status_message =
-                    "Run active — draft preserved; press Enter after completion to send"
-                        .to_string();
+                self.status_message = format!(
+                    "Run active — draft preserved; {}",
+                    self.action_key_phrase(
+                        ActionContext::Chat,
+                        ActionId::SendMessage,
+                        "sends after completion"
+                    )
+                );
             }
             Some(ActionId::SendMessage) => {
                 // Selecting a session starts an asynchronous history/summary
@@ -5108,7 +5256,9 @@ impl App {
                 self.send_message(input);
             }
             None => {
-                self.chat.textarea.input(key);
+                if text_widget_input_allowed(key) {
+                    self.chat.textarea.input(key);
+                }
             }
             Some(_) => {}
         }
@@ -6048,14 +6198,18 @@ impl App {
                     }
                 }
                 if self.pending_question.is_none() {
+                    let reopen = self.action_key_phrase(
+                        ActionContext::Global,
+                        ActionId::ReopenPendingQuestion,
+                        "reopens",
+                    );
                     if let Some(dismissed) = self.dismissed_question.as_mut() {
                         if dismissed.identity() == incoming.identity() {
                             // Replayed critical events must not undo an explicit
                             // Esc dismissal. Refresh the typed contract/draft in
                             // place and keep the question cached for Ctrl+Q.
                             dismissed.refresh_contract(incoming);
-                            self.status_message =
-                                "Question remains dismissed (Ctrl+Q to reopen)".to_string();
+                            self.status_message = format!("Question remains dismissed ({reopen})");
                             if needs_identity_sync {
                                 if let Some(session_id) = self.chat.session_id.clone() {
                                     self.reconcile_pending_question_after_stream_connect(
@@ -6786,7 +6940,9 @@ impl App {
         if action.is_none() {
             if let Some(editor) = self.config_editor.as_mut() {
                 editor.error = None;
-                editor.textarea.input(key);
+                if text_widget_input_allowed(key) {
+                    editor.textarea.input(key);
+                }
             }
         }
         Ok(())
@@ -7617,12 +7773,13 @@ impl App {
         self.install_command_draft(draft);
         self.tab = Tab::Chat;
         self.close_command_palette();
-        self.status_message = match command.command_type.to_ascii_lowercase().as_str() {
-            "skill" => "Skill command inserted — review and press Enter to send",
-            "mcp" => "MCP command inserted — review and press Enter to send",
-            _ => "Command inserted — review and press Enter to send",
-        }
-        .to_string();
+        let kind = match command.command_type.to_ascii_lowercase().as_str() {
+            "skill" => "Skill",
+            "mcp" => "MCP",
+            _ => "Command",
+        };
+        let send = self.action_key_phrase(ActionContext::Chat, ActionId::SendMessage, "sends");
+        self.status_message = format!("{kind} command inserted — review; {send}");
     }
 
     fn install_command_draft(&mut self, content: String) {
@@ -8037,6 +8194,15 @@ mod command_palette_tests {
     #[tokio::test]
     async fn catalog_failure_and_stale_epoch_leave_composer_and_palette_interactive() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"command-palette","action":"refresh","keys":["F10"]}
+                ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
         app.chat.session_id = Some("session-1".to_string());
         app.chat.textarea.insert_str("keep this draft");
         app.chat.textarea.move_cursor(CursorMove::Jump(0, 4));
@@ -8063,6 +8229,8 @@ mod command_palette_tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("offline")));
+        assert!(palette.error.as_deref().unwrap().contains("F10 retries"));
+        assert!(!palette.error.as_deref().unwrap().contains("Ctrl+R"));
         assert!(before.still_matches(&app.chat.textarea));
 
         app.command_palette.as_mut().unwrap().epoch = epoch.wrapping_add(1);
@@ -8304,7 +8472,7 @@ mod command_palette_tests {
         );
         assert!(!app.chat.streaming);
         assert!(app.chat.messages.is_empty());
-        assert!(app.status_message.contains("review and press Enter"));
+        assert!(app.status_message.contains("review; Enter sends"));
     }
 
     #[tokio::test]
@@ -10540,6 +10708,14 @@ mod question_tests {
         app.chat.streaming = true;
         app.help_visible = true;
         app.handle_event(AppEvent::Resize(50, 15)).await.unwrap();
+        app.handle_event(AppEvent::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Repeat,
+        )))
+        .await
+        .unwrap();
+        assert!(app.running, "held-key repeat must not quit the TUI");
         app.handle_event(AppEvent::Key(KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
@@ -14934,7 +15110,7 @@ mod question_tests {
         assert_eq!(picker.query, "claude");
         assert_eq!(model_key(picker.selected_model().unwrap()), selected_key);
         assert!(!picker.applying);
-        assert!(picker.error.as_deref().unwrap().contains("Enter to retry"));
+        assert!(picker.error.as_deref().unwrap().contains("Enter retries"));
         assert_eq!(app.chat.model, "old-model");
         assert_eq!(app.chat.textarea.lines().join("\n"), "d");
     }

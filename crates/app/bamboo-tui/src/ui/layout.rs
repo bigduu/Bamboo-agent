@@ -135,7 +135,14 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(colors::tool_running()),
         ));
         items.push((
-            "draft editable; Enter sends after run".to_string(),
+            format!(
+                "draft editable; {}",
+                app.action_key_phrase(
+                    ActionContext::Chat,
+                    ActionId::SendMessage,
+                    "sends after run"
+                )
+            ),
             Style::default().fg(colors::inactive()),
         ));
     } else if app.pending_question.is_some() || app.dismissed_question.is_some() {
@@ -2287,6 +2294,43 @@ mod tests {
         let last = terminal_text(&terminal);
         assert!(last.contains("Command palette"));
         assert!(last.contains("Esc/q/F1 close"));
+    }
+
+    #[test]
+    fn help_overlay_full_buffer_goldens_cover_default_and_remapped_keymaps() {
+        let mut fingerprints = Vec::new();
+        for (index, keymap) in [
+            Keymap::default(),
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"chat","action":"send-message","keys":["F12"]}
+                ]}"#,
+            )
+            .unwrap(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.set_keymap(keymap, None);
+            app.help_visible = true;
+            let mut terminal = Terminal::new(TestBackend::new(100, 36)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = terminal_text(&terminal);
+            if index == 0 {
+                assert!(text.contains("Enter"));
+            } else {
+                assert!(text.contains("F12"));
+            }
+            fingerprints.push(buffer_fingerprint(&terminal));
+        }
+        assert_eq!(
+            fingerprints,
+            [18_393_380_293_077_633_457, 11_493_634_725_320_844_945],
+            "complete help-overlay buffer golden changed"
+        );
     }
 
     #[test]

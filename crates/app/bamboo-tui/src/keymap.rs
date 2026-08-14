@@ -1152,8 +1152,10 @@ struct KeyStroke {
 
 impl KeyStroke {
     fn from_event(event: KeyEvent) -> Self {
-        let mut modifiers =
-            event.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        // Keep every modifier reported by crossterm.  SUPER/HYPER/META are not
+        // configurable today, but silently discarding them would turn e.g.
+        // Super+Y into plain `y` and could confirm a destructive dialog.
+        let mut modifiers = event.modifiers;
         let code = match event.code {
             KeyCode::BackTab => {
                 modifiers.remove(KeyModifiers::SHIFT);
@@ -1181,6 +1183,15 @@ impl KeyStroke {
         }
         if self.modifiers.contains(KeyModifiers::SHIFT) {
             parts.push("Shift".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::SUPER) {
+            parts.push("Super".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::HYPER) {
+            parts.push("Hyper".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::META) {
+            parts.push("Meta".to_string());
         }
         parts.push(match self.code {
             KeyCode::Backspace => "Backspace".to_string(),
@@ -1220,7 +1231,7 @@ impl KeyStroke {
     }
 
     fn is_plain_printable(&self) -> bool {
-        self.modifiers.is_empty() && matches!(self.code, KeyCode::Char(_))
+        (self.modifiers - KeyModifiers::SHIFT).is_empty() && matches!(self.code, KeyCode::Char(_))
     }
 
     fn is_xon_xoff_or_signal(&self) -> bool {
@@ -1494,12 +1505,15 @@ impl Keymap {
                 )));
             }
             if binding.context == ActionContext::Global
-                && binding.sequence.0.len() == 1
-                && binding.sequence.0[0].is_plain_printable()
+                && binding
+                    .sequence
+                    .0
+                    .first()
+                    .is_some_and(KeyStroke::is_plain_printable)
             {
                 return Err(KeymapError(format!(
-                    "global binding '{}' would steal ordinary Chat text",
-                    binding.sequence.display()
+                    "global binding '{}' starts with a printable key and would steal ordinary Chat text; start it with Leader, Ctrl, Alt, or a function key",
+                    binding.sequence.display(),
                 )));
             }
             for other in self.bindings.iter().skip(index + 1) {
@@ -1537,6 +1551,9 @@ impl Keymap {
             (ActionContext::QuestionOptions, ActionId::Cancel),
             (ActionContext::QuestionCustom, ActionId::Activate),
             (ActionContext::QuestionCustom, ActionId::Cancel),
+            (ActionContext::QuestionNumber, ActionId::Activate),
+            (ActionContext::QuestionNumber, ActionId::Cancel),
+            (ActionContext::QuestionInspect, ActionId::Cancel),
             (ActionContext::SessionDeleteConfirm, ActionId::Confirm),
             (ActionContext::SessionDeleteConfirm, ActionId::Reject),
             (ActionContext::ScheduleDeleteConfirm, ActionId::Confirm),
@@ -1598,6 +1615,25 @@ impl Keymap {
         now: Instant,
     ) -> KeyResolution {
         let stroke = KeyStroke::from_event(event);
+
+        // A single-stroke global quit binding is the emergency escape hatch:
+        // it must preempt an incomplete leader sequence instead of becoming a
+        // (usually invalid) continuation such as `Leader Ctrl+C`.
+        if pending.is_some()
+            && contexts.contains(&ActionContext::Global)
+            && self.bindings.iter().any(|binding| {
+                binding.context == ActionContext::Global
+                    && binding.action == ActionId::QuitOrStop
+                    && binding.sequence.0.as_slice() == std::slice::from_ref(&stroke)
+            })
+        {
+            *pending = None;
+            return KeyResolution::Action {
+                context: ActionContext::Global,
+                action: ActionId::QuitOrStop,
+            };
+        }
+
         if let Some(current) = pending.as_ref() {
             if current.focus_contexts != contexts {
                 *pending = None;
@@ -1617,18 +1653,26 @@ impl Keymap {
                     "Key sequence cancelled because focus changed".to_string(),
                 );
             }
-            if now.duration_since(current.started_at) >= self.timeout {
-                let display = current.sequence.display();
-                *pending = None;
-                return KeyResolution::Cancelled(format!("Key sequence '{display}' timed out"));
-            }
             if stroke.code == KeyCode::Esc && stroke.modifiers.is_empty() {
                 *pending = None;
                 return KeyResolution::Cancelled("Key sequence cancelled".to_string());
             }
-            let mut sequence = current.sequence.clone();
-            sequence.0.push(stroke);
-            return self.resolve_sequence(&candidate_contexts, contexts, sequence, pending, now);
+            if now.duration_since(current.started_at) < self.timeout {
+                let mut sequence = current.sequence.clone();
+                sequence.0.push(stroke);
+                return self.resolve_sequence(
+                    &candidate_contexts,
+                    contexts,
+                    sequence,
+                    pending,
+                    now,
+                );
+            }
+
+            // The timer tick normally expires pending sequences, but an input
+            // event can win the select race.  Reprocess that event as a fresh
+            // key so the first composer character after a timeout is not lost.
+            *pending = None;
         }
 
         let sequence = KeySequence(vec![stroke]);
@@ -1655,32 +1699,38 @@ impl Keymap {
         pending: &mut Option<PendingSequence>,
         now: Instant,
     ) -> KeyResolution {
+        let mut pending_contexts = Vec::new();
         for context in candidate_contexts {
             if let Some(binding) = self
                 .bindings
                 .iter()
                 .find(|binding| binding.context == *context && binding.sequence == sequence)
             {
-                *pending = None;
-                return KeyResolution::Action {
-                    context: *context,
-                    action: binding.action,
-                };
+                // An exact binding wins only when no higher-priority context
+                // still has a longer match.  This preserves modal/focused
+                // precedence without losing shared leaders whose continuations
+                // live in several contexts.
+                if pending_contexts.is_empty() {
+                    *pending = None;
+                    return KeyResolution::Action {
+                        context: *context,
+                        action: binding.action,
+                    };
+                }
+                continue;
+            }
+            if self.bindings.iter().any(|binding| {
+                binding.context == *context
+                    && sequence.is_prefix_of(&binding.sequence)
+                    && binding.sequence != sequence
+            }) {
+                pending_contexts.push(*context);
             }
         }
-        let candidate_contexts = candidate_contexts
-            .iter()
-            .copied()
-            .filter(|context| {
-                self.bindings.iter().any(|binding| {
-                    binding.context == *context && sequence.is_prefix_of(&binding.sequence)
-                })
-            })
-            .collect::<Vec<_>>();
-        if !candidate_contexts.is_empty() {
+        if !pending_contexts.is_empty() {
             let display = sequence.display();
             *pending = Some(PendingSequence {
-                contexts: candidate_contexts,
+                contexts: pending_contexts,
                 focus_contexts: focus_contexts.to_vec(),
                 sequence,
                 started_at: now,
@@ -1759,16 +1809,19 @@ impl Keymap {
 }
 
 pub(crate) fn text_character(event: KeyEvent) -> Option<char> {
-    if event
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
+    if !(event.modifiers - KeyModifiers::SHIFT).is_empty() {
         return None;
     }
     match event.code {
         KeyCode::Char(character) => Some(character),
         _ => None,
     }
+}
+
+pub(crate) fn text_widget_input_allowed(event: KeyEvent) -> bool {
+    !event
+        .modifiers
+        .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
 }
 
 fn split_binding_list(bindings: &str) -> Result<Vec<String>, KeymapError> {
@@ -2075,6 +2128,152 @@ mod tests {
     }
 
     #[test]
+    fn single_stroke_global_quit_preempts_a_pending_sequence() {
+        let keymap = Keymap::default();
+        let now = Instant::now();
+        let contexts = [ActionContext::Chat, ActionContext::Global];
+        let mut pending = None;
+        assert!(matches!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+                now,
+            ),
+            KeyResolution::Pending(_)
+        ));
+
+        assert_eq!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                now + Duration::from_millis(10),
+            ),
+            KeyResolution::Action {
+                context: ActionContext::Global,
+                action: ActionId::QuitOrStop,
+            }
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn expired_sequence_reprocesses_the_current_key() {
+        let keymap = Keymap::default();
+        let now = Instant::now();
+        let contexts = [ActionContext::Chat, ActionContext::Global];
+        let mut pending = None;
+        assert!(matches!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+                now,
+            ),
+            KeyResolution::Pending(_)
+        ));
+
+        assert_eq!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('a'), KeyModifiers::empty()),
+                now + Duration::from_millis(1_001),
+            ),
+            KeyResolution::NoMatch,
+            "the first composer character after timeout must be handled fresh"
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn cross_context_prefixes_obey_focused_precedence() {
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"chat","action":"insert-newline","keys":["F2 x"]},
+                {"context":"global","action":"show-help","keys":["F2"]}
+            ]}"#,
+        )
+        .unwrap();
+        let contexts = [ActionContext::Chat, ActionContext::Global];
+        let now = Instant::now();
+        let mut pending = None;
+        assert!(matches!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::F(2), KeyModifiers::empty()),
+                now,
+            ),
+            KeyResolution::Pending(_)
+        ));
+        assert_eq!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('x'), KeyModifiers::empty()),
+                now + Duration::from_millis(10),
+            ),
+            KeyResolution::Action {
+                context: ActionContext::Chat,
+                action: ActionId::InsertNewline,
+            }
+        );
+
+        let reverse = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"chat","action":"insert-newline","keys":["F2"]},
+                {"context":"global","action":"show-help","keys":["F2 x"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reverse.resolve(
+                &contexts,
+                &mut None,
+                key(KeyCode::F(2), KeyModifiers::empty()),
+                now,
+            ),
+            KeyResolution::Action {
+                context: ActionContext::Chat,
+                action: ActionId::InsertNewline,
+            }
+        );
+
+        let destructive = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"session-delete-confirm","action":"confirm","keys":["F3 y"]},
+                {"context":"global","action":"show-help","keys":["F3"]}
+            ]}"#,
+        )
+        .unwrap();
+        let modal_contexts = [ActionContext::SessionDeleteConfirm, ActionContext::Global];
+        let mut modal_pending = None;
+        assert!(matches!(
+            destructive.resolve(
+                &modal_contexts,
+                &mut modal_pending,
+                key(KeyCode::F(3), KeyModifiers::empty()),
+                now,
+            ),
+            KeyResolution::Pending(_)
+        ));
+        assert_eq!(
+            destructive.resolve(
+                &modal_contexts,
+                &mut modal_pending,
+                key(KeyCode::Char('y'), KeyModifiers::empty()),
+                now + Duration::from_millis(10),
+            ),
+            KeyResolution::Action {
+                context: ActionContext::SessionDeleteConfirm,
+                action: ActionId::Confirm,
+            }
+        );
+    }
+
+    #[test]
     fn focus_change_cancels_a_pending_sequence_even_when_global_remains() {
         let keymap = Keymap::default();
         let now = Instant::now();
@@ -2206,6 +2405,60 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(required.contains("required action"));
+
+        let printable_prefix = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"global","action":"show-help","keys":["g n"]}
+            ]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(printable_prefix.contains("starts with a printable key"));
+        assert!(printable_prefix.contains("ordinary Chat text"));
+
+        let shifted_printable_prefix = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"global","action":"show-help","keys":["Shift+g n"]}
+            ]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(shifted_printable_prefix.contains("starts with a printable key"));
+
+        for (context, action) in [
+            ("question-number", "activate"),
+            ("question-number", "cancel"),
+            ("question-inspect", "cancel"),
+        ] {
+            let input = format!(
+                r#"{{"bindings":[{{"context":"{context}","action":"{action}","unbind":true}}]}}"#
+            );
+            let error = Keymap::from_json(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("required action"),
+                "{context}/{action}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_modifiers_do_not_match_actions_or_text() {
+        let keymap = Keymap::default();
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+            let event = key(KeyCode::Char('y'), modifier);
+            assert_eq!(
+                keymap.resolve(
+                    &[ActionContext::SessionDeleteConfirm, ActionContext::Global,],
+                    &mut None,
+                    event,
+                    Instant::now(),
+                ),
+                KeyResolution::NoMatch,
+                "{modifier:?}+y must not confirm"
+            );
+            assert_eq!(text_character(event), None);
+            assert!(!text_widget_input_allowed(event));
+        }
     }
 
     #[test]

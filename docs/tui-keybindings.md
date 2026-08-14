@@ -50,7 +50,10 @@ items in `keys`. Key names are case-insensitive and support `Ctrl`, `Alt`,
 
 The leader timeout must be 200–5000 ms. `Esc` cancels a pending sequence, a
 focus change cancels it, and an unmatched continuation reports the exact
-sequence instead of falling through to another action.
+sequence instead of falling through to another action. If an input event wins
+the timer race after expiry, it is reprocessed as a fresh key instead of being
+discarded. A single-stroke global quit binding always preempts a pending
+sequence.
 
 ## Contexts and action IDs
 
@@ -88,8 +91,12 @@ prefixes; and unreachable required actions reject the file. The TUI reports
 the path and reason, then uses all built-in defaults—never a partially applied
 map.
 
-Global printable single keys are rejected so normal Chat text cannot trigger
-an application action. Custom `Ctrl+S`, `Ctrl+Q`, and `Ctrl+Z` bindings are
+Global sequences whose first stroke is printable are rejected so normal Chat
+text cannot be captured as the start of an application action. When bindings
+from several active contexts share a prefix, the focused/modal context has
+priority over a shorter binding from a lower context; compatible longer
+continuations remain available across the context stack. Custom `Ctrl+S`,
+`Ctrl+Q`, and `Ctrl+Z` bindings are
 rejected because terminal flow control, multiplexers, SSH, or signal handling
 can consume them. Built-in compatibility aliases for `Ctrl+S`/`Ctrl+Q` always
 have leader or function-key alternatives. `Alt+Enter` is the portable newline
