@@ -1407,6 +1407,12 @@ impl Keymap {
                 leader.display()
             )));
         }
+        if config.is_some() && leader.is_protocol_dependent() {
+            return Err(KeymapError(format!(
+                "leader '{}' depends on enhanced terminal key reporting; use Ctrl/Alt with a portable key or a function key",
+                leader.display()
+            )));
+        }
 
         let timeout_ms = config
             .as_ref()
@@ -1542,6 +1548,43 @@ impl Keymap {
             }
         }
 
+        for quit in self.bindings.iter().filter(|binding| {
+            binding.context == ActionContext::Global
+                && binding.action == ActionId::QuitOrStop
+                && binding.sequence.0.len() == 1
+        }) {
+            if let Some(binding) = self.bindings.iter().find(|binding| {
+                binding.sequence.0.len() > 1
+                    && binding
+                        .sequence
+                        .0
+                        .iter()
+                        .any(|stroke| Some(stroke) == quit.sequence.0.first())
+            }) {
+                return Err(KeymapError(format!(
+                    "unreachable binding in {}: '{}' contains single-stroke global quit '{}', which always preempts pending and focused actions",
+                    binding.context.label(),
+                    binding.sequence.display(),
+                    quit.sequence.display(),
+                )));
+            }
+        }
+
+        if let Some(binding) = self.bindings.iter().find(|binding| {
+            binding
+                .sequence
+                .0
+                .iter()
+                .skip(1)
+                .any(|stroke| stroke.code == KeyCode::Esc && stroke.modifiers.is_empty())
+        }) {
+            return Err(KeymapError(format!(
+                "unreachable binding in {}: '{}' contains Esc after the first stroke; Esc always cancels a pending sequence",
+                binding.context.label(),
+                binding.sequence.display(),
+            )));
+        }
+
         for (context, action) in [
             (ActionContext::Global, ActionId::QuitOrStop),
             (ActionContext::Global, ActionId::ShowHelp),
@@ -1616,11 +1659,11 @@ impl Keymap {
     ) -> KeyResolution {
         let stroke = KeyStroke::from_event(event);
 
-        // A single-stroke global quit binding is the emergency escape hatch:
-        // it must preempt an incomplete leader sequence instead of becoming a
-        // (usually invalid) continuation such as `Leader Ctrl+C`.
-        if pending.is_some()
-            && contexts.contains(&ActionContext::Global)
+        // A single-stroke global quit binding is the emergency escape hatch.
+        // It preempts both a higher-context prefix on its first stroke and an
+        // incomplete leader sequence instead of becoming a continuation such
+        // as `Leader Ctrl+C`.
+        if contexts.contains(&ActionContext::Global)
             && self.bindings.iter().any(|binding| {
                 binding.context == ActionContext::Global
                     && binding.action == ActionId::QuitOrStop
@@ -2159,6 +2202,45 @@ mod tests {
     }
 
     #[test]
+    fn single_stroke_global_quit_preempts_an_initial_focused_prefix() {
+        // Build a deliberately unvalidated map to verify the resolver remains
+        // safe even if a future config path bypasses startup validation.
+        let mut keymap = Keymap::default();
+        keymap.bindings.push(Binding {
+            context: ActionContext::Chat,
+            action: ActionId::InsertNewline,
+            sequence: parse_sequence("Ctrl+C x", &keymap.leader).unwrap(),
+            source: BindingSource::Custom,
+        });
+        let contexts = [ActionContext::Chat, ActionContext::Global];
+        let now = Instant::now();
+        let mut pending = None;
+        assert_eq!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                now,
+            ),
+            KeyResolution::Action {
+                context: ActionContext::Global,
+                action: ActionId::QuitOrStop,
+            }
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('x'), KeyModifiers::empty()),
+                now + Duration::from_millis(10),
+            ),
+            KeyResolution::NoMatch,
+            "the shadowed continuation must never fire after emergency quit"
+        );
+    }
+
+    #[test]
     fn expired_sequence_reprocesses_the_current_key() {
         let keymap = Keymap::default();
         let now = Instant::now();
@@ -2397,6 +2479,11 @@ mod tests {
         .to_string();
         assert!(reserved.contains("reserved"));
 
+        let protocol_leader = Keymap::from_json(r#"{"leader":"Ctrl+?"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(protocol_leader.contains("depends on enhanced terminal key reporting"));
+
         let required = Keymap::from_json(
             r#"{"bindings":[
                 {"context":"question-options","action":"activate","unbind":true}
@@ -2424,6 +2511,30 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(shifted_printable_prefix.contains("starts with a printable key"));
+
+        for (context, action) in [
+            ("chat", "insert-newline"),
+            ("session-delete-confirm", "confirm"),
+        ] {
+            for sequence in ["Ctrl+C x", "F2 Ctrl+C"] {
+                let input = format!(
+                    r#"{{"bindings":[{{"context":"{context}","action":"{action}","keys":["{sequence}"]}}]}}"#
+                );
+                let error = Keymap::from_json(&input).unwrap_err().to_string();
+                assert!(error.contains("contains single-stroke global quit"));
+                assert!(error.contains("always preempts"));
+            }
+        }
+
+        let pending_escape = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"session-delete-confirm","action":"confirm","keys":["F2 Esc"]}
+            ]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(pending_escape.contains("contains Esc after the first stroke"));
+        assert!(pending_escape.contains("always cancels a pending sequence"));
 
         for (context, action) in [
             ("question-number", "activate"),

@@ -2287,10 +2287,7 @@ impl App {
             match (is_loopback_url(&url), auto_serve_mode) {
                 (true, AutoServeMode::Auto) => self.spawn_local_server(),
                 (true, AutoServeMode::Prompt) => {
-                    self.status_message = format!(
-                        "Bamboo server is not reachable at {url}. Start a local server? (y/n)"
-                    );
-                    self.serve_offer = Some(ServeOffer { url });
+                    self.open_serve_offer(url);
                 }
                 // Loopback but auto-serve explicitly disabled, or a remote URL
                 // (never auto-started regardless of flags): keep the previous
@@ -2388,6 +2385,16 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn open_serve_offer(&mut self, url: String) {
+        let confirm =
+            self.action_key_phrase(ActionContext::ServeOffer, ActionId::Confirm, "starts");
+        let reject = self.action_key_phrase(ActionContext::ServeOffer, ActionId::Reject, "skips");
+        self.status_message = format!(
+            "Bamboo server is not reachable at {url}. Start a local server? ({confirm}; {reject})"
+        );
+        self.serve_offer = Some(ServeOffer { url });
     }
 
     fn poll_sse(&mut self) {
@@ -4769,9 +4776,18 @@ impl App {
                 // answer — Ctrl+Q brings the modal back without a round-trip.
                 self.supersede_pending_answer();
                 self.dismissed_question = self.pending_question.take();
-                self.status_message = "Question dismissed (still pending on the server — \
-                    Ctrl+Q to reopen, Ctrl+C stops the run)"
-                    .to_string();
+                let reopen = self.action_key_phrase(
+                    ActionContext::Global,
+                    ActionId::ReopenPendingQuestion,
+                    "reopens",
+                );
+                let stop = self.action_key_phrase(
+                    ActionContext::Global,
+                    ActionId::QuitOrStop,
+                    "stops the run",
+                );
+                self.status_message =
+                    format!("Question dismissed (still pending on the server — {reopen}, {stop})");
             }
             QAction::None => {}
         }
@@ -13997,19 +14013,32 @@ mod question_tests {
         assert_eq!(app.chat.session_id.as_deref(), Some("s1"));
     }
 
-    /// Esc dismisses the question modal but caches it; `Ctrl+Q` brings it
-    /// straight back without a network round-trip.
+    /// Esc dismisses the question modal but caches it; the resolved reopen
+    /// binding brings it straight back without a network round-trip.
     #[tokio::test]
-    async fn esc_then_ctrl_q_restores_the_dismissed_question() {
+    async fn dismiss_status_and_reopen_use_resolved_global_bindings() {
         let mut app = app_with_question(vec!["Approve", "Deny"]);
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"global","action":"reopen-pending-question","keys":["F7"]},
+                    {"context":"global","action":"quit-or-stop","keys":["F8"]}
+                ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
         app.chat.session_id = Some("s1".to_string());
 
         app.handle_question_key(key(KeyCode::Esc)).await.unwrap();
         assert!(app.pending_question.is_none());
         assert!(app.dismissed_question.is_some());
-        assert!(app.status_message.contains("Ctrl+Q"));
+        assert!(app.status_message.contains("F7 reopens"));
+        assert!(app.status_message.contains("F8 stops the run"));
+        assert!(!app.status_message.contains("Ctrl+Q"));
+        assert!(!app.status_message.contains("Ctrl+C"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+        app.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::empty()))
             .await
             .unwrap();
 
@@ -15617,6 +15646,27 @@ mod auto_serve_tests {
             url: "http://127.0.0.1:9562".to_string(),
         });
         app
+    }
+
+    #[test]
+    fn serve_offer_status_uses_resolved_confirm_and_reject_bindings() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.set_keymap(
+            Keymap::from_json(
+                r#"{"bindings":[
+                    {"context":"serve-offer","action":"confirm","keys":["F7"]},
+                    {"context":"serve-offer","action":"reject","keys":["F8"]}
+                ]}"#,
+            )
+            .unwrap(),
+            None,
+        );
+        app.open_serve_offer("http://127.0.0.1:9562".to_string());
+
+        assert!(app.status_message.contains("F7 starts"));
+        assert!(app.status_message.contains("F8 skips"));
+        assert!(!app.status_message.contains("(y/n)"));
+        assert!(app.serve_offer.is_some());
     }
 
     #[test]

@@ -53,7 +53,10 @@ focus change cancels it, and an unmatched continuation reports the exact
 sequence instead of falling through to another action. If an input event wins
 the timer race after expiry, it is reprocessed as a fresh key instead of being
 discarded. A single-stroke global quit binding always preempts a pending
-sequence.
+sequence or a focused-context prefix; longer bindings that contain the same
+stroke anywhere are rejected as unreachable.
+Custom leaders that depend on enhanced terminal key reporting are rejected so
+every generated leader fallback remains portable.
 
 ## Contexts and action IDs
 
