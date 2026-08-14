@@ -9,6 +9,7 @@ use crate::app::{
     ToolCallDisplay, CONVERSATION_DETAIL_VIEWPORT,
 };
 use crate::components::markdown;
+use crate::keymap::{ActionContext, ActionId};
 use crate::theme::{self, colors};
 
 const COLLAPSED_DETAIL_LINES: usize = 3;
@@ -105,7 +106,10 @@ fn push_tool_detail(
                 if state.expanded {
                     format!("   ↓ {hidden_after} later lines")
                 } else {
-                    format!("   … {hidden_after} more — focus then Enter to inspect")
+                    format!(
+                        "   … {hidden_after} more — focus then {} to inspect",
+                        app.key_hint(ActionContext::ConversationBlock, ActionId::Activate)
+                    )
                 },
                 Style::default().fg(colors::subtle()),
             )));
@@ -134,7 +138,10 @@ fn push_tool_detail(
         let extra = error_count.saturating_sub(3);
         if extra > 0 {
             lines.push(Line::from(Span::styled(
-                format!("   … {extra} more error lines · y copies exact text"),
+                format!(
+                    "   … {extra} more error lines · {} copies exact text",
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue)
+                ),
                 Style::default().fg(colors::tool_error()),
             )));
         }
@@ -142,9 +149,19 @@ fn push_tool_detail(
     if focused {
         lines.push(Line::from(Span::styled(
             if state.expanded {
-                "   Enter collapse · j/k scroll · y copy"
+                format!(
+                    "   {} collapse · {}/{} scroll · {} copy",
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::ScrollBlockUp),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::ScrollBlockDown),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                )
             } else {
-                "   Enter expand · y copy"
+                format!(
+                    "   {} expand · {} copy",
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                )
             },
             Style::default().fg(colors::subtle()),
         )));
@@ -287,16 +304,35 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                     }
                 } else {
                     lines.push(Line::from(Span::styled(
-                        format!(" {count} reasoning lines hidden — focus then Enter to show"),
+                        format!(
+                            " {count} reasoning lines hidden — focus then {} to show",
+                            app.key_hint(ActionContext::ConversationBlock, ActionId::Activate)
+                        ),
                         Style::default().fg(colors::subtle()),
                     )));
                 }
                 if focused {
                     lines.push(Line::from(Span::styled(
                         if state.expanded {
-                            " Enter hide · j/k scroll · y copy"
+                            format!(
+                                " {} hide · {}/{} scroll · {} copy",
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                                app.key_hint(
+                                    ActionContext::ConversationBlock,
+                                    ActionId::ScrollBlockUp
+                                ),
+                                app.key_hint(
+                                    ActionContext::ConversationBlock,
+                                    ActionId::ScrollBlockDown
+                                ),
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                            )
                         } else {
-                            " Enter show · y copy"
+                            format!(
+                                " {} show · {} copy",
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                            )
                         },
                         Style::default().fg(colors::subtle()),
                     )));
@@ -358,9 +394,21 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                 if focused {
                     lines.push(Line::from(Span::styled(
                         if streaming {
-                            "   Enter expand/collapse · child opens after parent run · y copy"
+                            format!(
+                                "   {} expand/collapse · child opens after parent run · {} copy",
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                            )
                         } else {
-                            "   Enter open child · Ctrl+X expand/collapse · y copy"
+                            format!(
+                                "   {} open child · {} expand/collapse · {} copy",
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                                app.key_hint(
+                                    ActionContext::ConversationBlock,
+                                    ActionId::ToggleDetails
+                                ),
+                                app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                            )
                         },
                         Style::default().fg(colors::subtle()),
                     )));
@@ -381,11 +429,14 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                     "question"
                 };
                 let status = if submitting {
-                    "submitting"
+                    "submitting".to_string()
                 } else if dismissed {
-                    "dismissed · Ctrl+Q reopen"
+                    format!(
+                        "dismissed · {} reopen",
+                        app.key_hint(ActionContext::Global, ActionId::ReopenPendingQuestion)
+                    )
                 } else {
-                    "answer in modal"
+                    "answer in modal".to_string()
                 };
                 lines.push(Line::from(Span::styled(
                     format!(
@@ -585,7 +636,14 @@ mod tests {
         assert!(!text.contains("result-15"));
         assert!(text.contains("15 later lines"));
         assert!(text.contains("research (completed) · child-123456789"));
-        assert!(text.contains("Enter collapse · j/k scroll · y copy"));
+        let expected_hint = format!(
+            "{} collapse · {}/{} scroll · {} copy",
+            app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+            app.key_hint(ActionContext::ConversationBlock, ActionId::ScrollBlockUp),
+            app.key_hint(ActionContext::ConversationBlock, ActionId::ScrollBlockDown),
+            app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+        );
+        assert!(text.contains(&expected_hint));
         assert!(rendered
             .ranges
             .iter()

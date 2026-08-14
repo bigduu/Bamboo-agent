@@ -11,6 +11,7 @@ use crate::app::{
     App, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger, NoticeLevel,
     QuestionOptionHitbox, SessionPickerMode, Tab,
 };
+use crate::keymap::{ActionContext, ActionId};
 use crate::theme::{self, colors};
 use crate::ui::sessions::{session_row_line, truncate_cells};
 
@@ -81,7 +82,7 @@ pub fn app_layout(area: Rect, app: &App) -> AppLayout {
     }
 }
 
-pub fn render_terminal_too_small(f: &mut Frame) {
+pub fn render_terminal_too_small(f: &mut Frame, app: &App) {
     let area = f.area();
     let lines = vec![
         Line::from(Span::styled(
@@ -95,7 +96,10 @@ pub fn render_terminal_too_small(f: &mut Frame) {
             crate::ui::MIN_TERMINAL_WIDTH,
             crate::ui::MIN_TERMINAL_HEIGHT
         )),
-        Line::raw("Resize the terminal to continue · Ctrl+C quits"),
+        Line::raw(format!(
+            "Resize the terminal to continue · {} quits",
+            app.key_hint(ActionContext::Global, ActionId::QuitOrStop)
+        )),
     ];
     let width = area.width.min(48);
     let height = area.height.min(5);
@@ -231,36 +235,72 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
     let full_width = Tab::ALL
         .iter()
         .enumerate()
-        .map(|(i, tab)| display_width(&format!(" [{}]{} ", i + 1, tab.title())))
+        .map(|(index, tab)| {
+            display_width(&format!(
+                " [{}]{} ",
+                app.primary_key_hint(ActionContext::Navigation, tab_switch_action(index)),
+                tab.title()
+            ))
+        })
         .sum::<usize>()
         + Tab::ALL.len().saturating_sub(1);
     let use_full = mode != LayoutMode::Compact && full_width <= area.width as usize;
     let mut spans = Vec::new();
 
     if use_full {
-        for (i, tab) in Tab::ALL.iter().enumerate() {
+        for (index, tab) in Tab::ALL.iter().enumerate() {
             let style = tab_style(*tab == app.tab);
-            spans.push(Span::styled(format!(" [{}]{} ", i + 1, tab.title()), style));
-            if i < Tab::ALL.len() - 1 {
+            spans.push(Span::styled(
+                format!(
+                    " [{}]{} ",
+                    app.primary_key_hint(ActionContext::Navigation, tab_switch_action(index)),
+                    tab.title()
+                ),
+                style,
+            ));
+            if index < Tab::ALL.len() - 1 {
                 spans.push(Span::raw(" "));
             }
         }
     } else {
         let active_index = Tab::ALL.iter().position(|tab| *tab == app.tab).unwrap_or(0);
-        let active = format!(" [{}] {} ", active_index + 1, app.tab.title());
-        let hint = " · Tab/Shift+Tab views · F1 help";
+        let active = format!(
+            " [{}] {} ",
+            app.primary_key_hint(ActionContext::Navigation, tab_switch_action(active_index)),
+            app.tab.title()
+        );
+        let hint = format!(
+            " · {}/{} views · {} help",
+            app.key_hint(ActionContext::Global, ActionId::NextTab),
+            app.key_hint(ActionContext::Global, ActionId::PreviousTab),
+            app.key_hint(ActionContext::Global, ActionId::ShowHelp),
+        );
         let active_width = display_width(&active);
         let remaining = area.width.saturating_sub(active_width as u16) as usize;
         spans.push(Span::styled(active, tab_style(true)));
         if remaining > 0 {
             spans.push(Span::styled(
-                clip_cells(hint, remaining),
+                clip_cells(&hint, remaining),
                 Style::default().fg(colors::inactive()),
             ));
         }
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn tab_switch_action(index: usize) -> ActionId {
+    [
+        ActionId::SwitchTab1,
+        ActionId::SwitchTab2,
+        ActionId::SwitchTab3,
+        ActionId::SwitchTab4,
+        ActionId::SwitchTab5,
+        ActionId::SwitchTab6,
+    ]
+    .get(index)
+    .copied()
+    .unwrap_or(ActionId::SwitchTab1)
 }
 
 fn tab_style(active: bool) -> Style {
@@ -273,57 +313,29 @@ fn tab_style(active: bool) -> Style {
     }
 }
 
-/// Every binding `App::handle_key`/the per-tab handlers respond to, paired
-/// into two side-by-side columns so the overlay stays to one screen instead
-/// of scrolling off a normal-height terminal. Keep in sync with `app.rs` —
-/// this is the single source of truth for "what can I press right now".
-const HELP_LEFT: &[(&str, &str)] = &[
-    ("1-6", "Switch tab (Chat types digits)"),
-    ("Tab / Shift+Tab", "Next / previous tab"),
-    ("Enter", "Send / select / resume session"),
-    ("Alt+Enter", "Insert newline (Chat)"),
-    ("\u{2191}/\u{2193}, Wheel", "Move selection (lists)"),
-    ("PgUp/PgDn", "Scroll transcript (Chat/Config)"),
-    ("Alt+↑/↓", "Scroll transcript (Chat)"),
-    ("Ctrl+Home/G", "Top / bottom (Chat)"),
-    ("Ctrl+B", "Focus conversation blocks"),
-    ("Block ↑/↓", "Previous / next block"),
-    ("Block Enter", "Expand / open child session"),
-    ("Block j/k/y", "Inspect scroll / copy exact block"),
-];
-const HELP_RIGHT: &[(&str, &str)] = &[
-    ("Ctrl+K", "Command palette"),
-    ("Ctrl+N", "New session"),
-    ("Ctrl+O", "Model picker (Chat)"),
-    ("Ctrl+P", "Session picker (Chat)"),
-    ("Ctrl+Q", "Reopen pending question"),
-    ("Ctrl+C", "Quit / stop streaming"),
-    ("Ctrl+S", "Stop agent execution"),
-    ("Ctrl+X", "Focused detail / new-block default"),
-    ("Ctrl+L", "Full values / notification log"),
-    ("] / [", "Next / previous page (Sessions)"),
-    ("d", "Delete, with confirm (Sessions/Schedules)"),
-    ("n / e", "New schedule / edit config"),
-    ("r / t", "Refresh / run · refresh MCP tools"),
-    ("F1 / ?", "Toggle this help (? not on Chat)"),
-];
-
 pub fn render_help(f: &mut Frame, app: &App) {
     let screen = f.area();
-    const KEY_COL: usize = 17;
+    const KEY_COL: usize = 24;
     let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
     let content_width = popup_width.saturating_sub(4) as usize;
-    let two_columns = content_width >= 96;
+    let two_columns = content_width >= 110;
+    let resolved = app.help_entries();
     let mut entries = Vec::new();
     if two_columns {
-        for i in 0..HELP_LEFT.len().max(HELP_RIGHT.len()) {
-            let (lk, ld) = HELP_LEFT.get(i).copied().unwrap_or(("", ""));
-            let (rk, rd) = HELP_RIGHT.get(i).copied().unwrap_or(("", ""));
-            entries.push(format!("  {lk:<KEY_COL$}{ld:<31}{rk:<KEY_COL$}{rd}"));
+        let midpoint = resolved.len().div_ceil(2);
+        let (left, right) = resolved.split_at(midpoint);
+        for index in 0..left.len().max(right.len()) {
+            let left = left.get(index);
+            let right = right.get(index);
+            let lk = left.map(|entry| entry.keys.as_str()).unwrap_or("");
+            let ld = left.map(|entry| entry.description.as_str()).unwrap_or("");
+            let rk = right.map(|entry| entry.keys.as_str()).unwrap_or("");
+            let rd = right.map(|entry| entry.description.as_str()).unwrap_or("");
+            entries.push(format!("  {lk:<KEY_COL$}{ld:<36}{rk:<KEY_COL$}{rd}"));
         }
     } else {
-        for (key, description) in HELP_LEFT.iter().chain(HELP_RIGHT.iter()) {
-            entries.push(format!("  {key:<KEY_COL$}{description}"));
+        for entry in resolved {
+            entries.push(format!("  {:<KEY_COL$}{}", entry.keys, entry.description));
         }
     }
 
@@ -360,7 +372,14 @@ pub fn render_help(f: &mut Frame, app: &App) {
     if end < entries.len() {
         lines.push(Line::raw(format!("  ↓ {} later", entries.len() - end)));
     }
-    lines.push(Line::raw("  ↑/↓/PgUp/PgDn · Home/End · Esc/q close"));
+    lines.push(Line::raw(format!(
+        "  {}/{} · {}/{} · {} close",
+        app.key_hint(ActionContext::Help, ActionId::NavigateUp),
+        app.key_hint(ActionContext::Help, ActionId::NavigateDown),
+        app.key_hint(ActionContext::Help, ActionId::PageUp),
+        app.key_hint(ActionContext::Help, ActionId::PageDown),
+        app.key_hint(ActionContext::Help, ActionId::Cancel),
+    )));
 
     let area = centered_rect(94, height, screen);
     f.render_widget(Clear, area);
@@ -587,7 +606,14 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
             entries.len() - end
         )));
     }
-    lines.push(Line::raw("  ↑/↓/PgUp/PgDn scroll · Home/End · Esc/q close"));
+    lines.push(Line::raw(format!(
+        "  {}/{} · {}/{} · {} close",
+        app.key_hint(ActionContext::Notifications, ActionId::NavigateUp),
+        app.key_hint(ActionContext::Notifications, ActionId::NavigateDown),
+        app.key_hint(ActionContext::Notifications, ActionId::PageUp),
+        app.key_hint(ActionContext::Notifications, ActionId::PageDown),
+        app.key_hint(ActionContext::Notifications, ActionId::Cancel),
+    )));
 
     let area = centered_rect(94, height, screen);
     f.render_widget(Clear, area);
@@ -628,12 +654,21 @@ pub fn render_serve_offer(f: &mut Frame, app: &App) {
             "  {}",
             crate::text::clip_cells(&offer.url, value_width)
         )),
-        Line::raw("  Ctrl+L inspect full URL"),
+        Line::raw(format!(
+            "  {} inspect full URL",
+            app.key_hint(ActionContext::Global, ActionId::ShowNotifications)
+        )),
         Line::raw(""),
         Line::raw("  Start a local `bamboo serve`?"),
         Line::raw(""),
-        Line::raw("  y / Enter start"),
-        Line::raw("  n / Esc skip"),
+        Line::raw(format!(
+            "  {} start",
+            app.key_hint(ActionContext::ServeOffer, ActionId::Confirm)
+        )),
+        Line::raw(format!(
+            "  {} skip",
+            app.key_hint(ActionContext::ServeOffer, ActionId::Reject)
+        )),
     ];
 
     let height = (lines.len() as u16 + 2).min(f.area().height);
@@ -744,17 +779,40 @@ pub fn render_question(f: &mut Frame, app: &App) {
             paragraph.scroll((q.inspect_scroll.min(max_scroll), 0)),
             sections[1],
         );
+        let inspect_scroll = format!(
+            " {}/{} or {}/{} scroll",
+            app.key_hint(ActionContext::QuestionInspect, ActionId::NavigateUp),
+            app.key_hint(ActionContext::QuestionInspect, ActionId::NavigateDown),
+            app.key_hint(ActionContext::QuestionInspect, ActionId::PageUp),
+            app.key_hint(ActionContext::QuestionInspect, ActionId::PageDown),
+        );
         let footer = if q.options.is_empty() {
             vec![
-                Line::raw(" ↑/↓/PgUp/PgDn scroll"),
-                Line::raw(" y copy exact"),
-                Line::raw(" v/Esc back"),
+                Line::raw(inspect_scroll),
+                Line::raw(format!(
+                    " {} copy exact",
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::CopyValue)
+                )),
+                Line::raw(format!(
+                    " {} back",
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::Cancel)
+                )),
             ]
         } else {
             vec![
-                Line::raw(" ↑/↓/PgUp/PgDn scroll"),
-                Line::raw(" Tab question/option"),
-                Line::raw(" y copy exact  ·  v/Esc back"),
+                Line::raw(inspect_scroll),
+                Line::raw(format!(
+                    " {} question/option",
+                    app.key_hint(
+                        ActionContext::QuestionInspect,
+                        ActionId::ToggleInspectorPane
+                    )
+                )),
+                Line::raw(format!(
+                    " {} copy exact · {} back",
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::CopyValue),
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::Cancel),
+                )),
             ]
         };
         f.render_widget(Paragraph::new(footer), sections[2]);
@@ -785,7 +843,10 @@ pub fn render_question(f: &mut Frame, app: &App) {
         header.push(Line::raw(format!("  {line}")));
     }
     if question_truncated {
-        header.push(Line::raw("  …  (v inspect full question)"));
+        header.push(Line::raw(format!(
+            "  …  ({} inspect full question)",
+            app.key_hint(ActionContext::QuestionOptions, ActionId::InspectValue)
+        )));
     }
     header.push(Line::raw(""));
 
@@ -794,8 +855,15 @@ pub fn render_question(f: &mut Frame, app: &App) {
     if let Some(entry) = &q.number_entry {
         body.push(Line::raw(format!("  Go to option #: {entry}▏")));
         body.push(Line::raw(""));
-        body.push(Line::raw("  digits type  ·  Enter select"));
-        body.push(Line::raw("  Backspace edit  ·  Esc cancel"));
+        body.push(Line::raw(format!(
+            "  digits type · {} select",
+            app.key_hint(ActionContext::QuestionNumber, ActionId::Activate)
+        )));
+        body.push(Line::raw(format!(
+            "  {} edit · {} cancel",
+            app.key_hint(ActionContext::QuestionNumber, ActionId::Backspace),
+            app.key_hint(ActionContext::QuestionNumber, ActionId::Cancel),
+        )));
     } else if let Some(buf) = &q.custom {
         body.push(Line::raw("  Custom answer:"));
         body.push(Line::from(Span::styled(
@@ -811,11 +879,25 @@ pub fn render_question(f: &mut Frame, app: &App) {
         } else if q.submitting {
             body.push(submitting_hint());
         } else if q.options.is_empty() {
-            body.push(Line::raw("  Enter answer  ·  Esc dismiss"));
-            body.push(Line::raw("  Ctrl+V inspect/copy question"));
+            body.push(Line::raw(format!(
+                "  {} answer · {} dismiss",
+                app.key_hint(ActionContext::QuestionCustom, ActionId::Activate),
+                app.key_hint(ActionContext::QuestionCustom, ActionId::Cancel),
+            )));
+            body.push(Line::raw(format!(
+                "  {} inspect/copy question",
+                app.key_hint(ActionContext::QuestionCustom, ActionId::InspectValue)
+            )));
         } else {
-            body.push(Line::raw("  Enter answer  ·  Esc options"));
-            body.push(Line::raw("  Ctrl+V inspect/copy question"));
+            body.push(Line::raw(format!(
+                "  {} answer · {} options",
+                app.key_hint(ActionContext::QuestionCustom, ActionId::Activate),
+                app.key_hint(ActionContext::QuestionCustom, ActionId::Cancel),
+            )));
+            body.push(Line::raw(format!(
+                "  {} inspect/copy question",
+                app.key_hint(ActionContext::QuestionCustom, ActionId::InspectValue)
+            )));
         }
     } else if q.options.is_empty() {
         body.push(Line::from(Span::styled(
@@ -823,7 +905,11 @@ pub fn render_question(f: &mut Frame, app: &App) {
             Style::default().fg(colors::warning()),
         )));
         body.push(Line::raw(""));
-        body.push(Line::raw("  v inspect/copy question  ·  Esc dismiss"));
+        body.push(Line::raw(format!(
+            "  {} inspect/copy question · {} dismiss",
+            app.key_hint(ActionContext::QuestionOptions, ActionId::InspectValue),
+            app.key_hint(ActionContext::QuestionOptions, ActionId::Cancel),
+        )));
     } else {
         let max_h = screen.height.min(24);
         let reserved =
@@ -868,11 +954,29 @@ pub fn render_question(f: &mut Frame, app: &App) {
         } else if q.submitting {
             body.push(submitting_hint());
         } else {
-            body.push(Line::raw("  click option answer  ·  ↑/↓/wheel select"));
-            body.push(Line::raw("  Enter answer  ·  Esc dismiss  ·  1-9 quick"));
-            body.push(Line::raw("  g number  ·  v inspect  ·  y copy"));
+            body.push(Line::raw(format!(
+                "  click option · {}/{} or wheel select",
+                app.key_hint(ActionContext::QuestionOptions, ActionId::NavigateUp),
+                app.key_hint(ActionContext::QuestionOptions, ActionId::NavigateDown),
+            )));
+            body.push(Line::raw(format!(
+                "  {} answer · {} dismiss · quick {}…{}",
+                app.key_hint(ActionContext::QuestionOptions, ActionId::Activate),
+                app.key_hint(ActionContext::QuestionOptions, ActionId::Cancel),
+                app.key_hint(ActionContext::QuestionOptions, ActionId::QuickAnswer1),
+                app.key_hint(ActionContext::QuestionOptions, ActionId::QuickAnswer9),
+            )));
+            body.push(Line::raw(format!(
+                "  {} number · {} inspect · {} copy",
+                app.key_hint(ActionContext::QuestionOptions, ActionId::NumberAnswer),
+                app.key_hint(ActionContext::QuestionOptions, ActionId::InspectValue),
+                app.key_hint(ActionContext::QuestionOptions, ActionId::CopyValue),
+            )));
             if q.allow_custom {
-                body.push(Line::raw("  c custom answer"));
+                body.push(Line::raw(format!(
+                    "  {} custom answer",
+                    app.key_hint(ActionContext::QuestionOptions, ActionId::CustomAnswer)
+                )));
             }
         }
     }
@@ -958,7 +1062,16 @@ pub fn render_delete_confirm(f: &mut Frame, app: &App) {
     lines.push(Line::raw(""));
     lines.push(Line::raw("  This cannot be undone."));
     lines.push(Line::raw(""));
-    lines.push(Line::raw("  y / Enter confirm  ·  n / Esc cancel"));
+    let context = if kind == "session" {
+        ActionContext::SessionDeleteConfirm
+    } else {
+        ActionContext::ScheduleDeleteConfirm
+    };
+    lines.push(Line::raw(format!(
+        "  {} confirm · {} cancel",
+        app.key_hint(context, ActionId::Confirm),
+        app.key_hint(context, ActionId::Reject),
+    )));
 
     let height = (lines.len() as u16 + 2).min(screen.height);
     let area = centered_rect(90, height, screen);
@@ -1034,9 +1147,13 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
         )));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::raw(
-        "  Tab / \u{2191}\u{2193} field  \u{b7}  Enter create  \u{b7}  Esc cancel",
-    ));
+    lines.push(Line::raw(format!(
+        "  {}/{} field · {} create · {} cancel",
+        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::NextField),
+        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::PreviousField),
+        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::Activate),
+        app.primary_key_hint(ActionContext::ScheduleForm, ActionId::Cancel),
+    )));
 
     let height = (lines.len() as u16 + 2).min(screen.height);
     let area = centered_rect(90, height, screen);
@@ -1171,19 +1288,27 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                 ),
                 Style::default().fg(colors::subtle()),
             )));
-            if row_width < 70 {
-                lines.push(Line::raw("  ↑/↓/wheel · Enter open · F2 rename · F3 pin"));
-                lines.push(Line::raw(
-                    "  Del delete · ] more · Ctrl+R retry · Esc cancel",
-                ));
-            } else {
-                lines.push(Line::raw(
-                    "  ↑/↓/wheel select · Enter open · F2 rename · F3 pin",
-                ));
-                lines.push(Line::raw(
-                    "  Ctrl+D/Delete delete · ] load more · Ctrl+R retry · Esc cancel",
-                ));
-            }
+            lines.push(Line::raw(format!(
+                "  {}/{} · {} open · {} rename · {} pin",
+                app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::NavigateUp),
+                app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::NavigateDown),
+                app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::Activate),
+                app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::RenameSession),
+                app.primary_key_hint(
+                    ActionContext::SessionPickerBrowse,
+                    ActionId::ToggleSessionPin
+                ),
+            )));
+            lines.push(Line::raw(format!(
+                "  {} del · {} more · {} retry · {}",
+                app.primary_key_hint(
+                    ActionContext::SessionPickerBrowse,
+                    ActionId::DeleteSelection
+                ),
+                app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::LoadMore),
+                app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::Refresh),
+                app.primary_key_hint(ActionContext::SessionPickerBrowse, ActionId::Cancel),
+            )));
         }
         SessionPickerMode::Rename {
             draft,
@@ -1229,11 +1354,12 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
             }
             if !*submitting {
                 lines.push(Line::raw(""));
-                lines.push(Line::raw(if row_width < 70 {
-                    "  Enter save · Ctrl+R retry · Esc cancel"
-                } else {
-                    "  Enter save · Ctrl+R refetch/retry · Esc keep old title"
-                }));
+                lines.push(Line::raw(format!(
+                    "  {} save · {} refetch/retry · {} keep old title",
+                    app.key_hint(ActionContext::SessionPickerRename, ActionId::Activate),
+                    app.key_hint(ActionContext::SessionPickerRename, ActionId::Refresh),
+                    app.key_hint(ActionContext::SessionPickerRename, ActionId::Cancel),
+                )));
             }
         }
         SessionPickerMode::Pinning {
@@ -1265,7 +1391,11 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
             }
             if !*submitting {
                 lines.push(Line::raw(""));
-                lines.push(Line::raw("  Ctrl+R refetch/retry · Esc cancel"));
+                lines.push(Line::raw(format!(
+                    "  {} refetch/retry · {} cancel",
+                    app.key_hint(ActionContext::SessionPickerPinning, ActionId::Refresh),
+                    app.key_hint(ActionContext::SessionPickerPinning, ActionId::Cancel),
+                )));
             }
         }
     }
@@ -1321,11 +1451,17 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     if picker.loading && picker.models.is_empty() {
         body.push(Line::raw("  Loading models..."));
         body.push(Line::raw(""));
-        body.push(Line::raw("  Esc cancel"));
+        body.push(Line::raw(format!(
+            "  {} cancel",
+            app.key_hint(ActionContext::ModelPicker, ActionId::Cancel)
+        )));
     } else if picker.loading && picker.visible.is_empty() {
         body.push(Line::raw("  Refreshing model catalog..."));
         body.push(Line::raw(""));
-        body.push(Line::raw("  Esc cancel"));
+        body.push(Line::raw(format!(
+            "  {} cancel",
+            app.key_hint(ActionContext::ModelPicker, ActionId::Cancel)
+        )));
     } else if picker.visible.is_empty() {
         body.push(Line::raw(if picker.query.is_empty() {
             "  No models available"
@@ -1334,16 +1470,38 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
         }));
         body.push(Line::raw(""));
         if row_width < 70 && picker.models.is_empty() {
-            body.push(Line::raw("  Edit search · Ctrl+R retry load"));
-            body.push(Line::raw("  Esc cancel"));
+            body.push(Line::raw(format!(
+                "  Edit search · {} retry load",
+                app.key_hint(ActionContext::ModelPicker, ActionId::Refresh)
+            )));
+            body.push(Line::raw(format!(
+                "  {} cancel",
+                app.key_hint(ActionContext::ModelPicker, ActionId::Cancel)
+            )));
         } else if row_width < 70 {
-            body.push(Line::raw("  Edit search · Ctrl+U clear"));
-            body.push(Line::raw("  Ctrl+R refresh · Esc cancel"));
+            body.push(Line::raw(format!(
+                "  Edit search · {} clear",
+                app.key_hint(ActionContext::ModelPicker, ActionId::ClearInput)
+            )));
+            body.push(Line::raw(format!(
+                "  {} refresh · {} cancel",
+                app.key_hint(ActionContext::ModelPicker, ActionId::Refresh),
+                app.key_hint(ActionContext::ModelPicker, ActionId::Cancel),
+            )));
         } else {
             body.push(Line::raw(if picker.models.is_empty() {
-                "  Edit search · Ctrl+R retry load · Esc cancel"
+                format!(
+                    "  Edit search · {} retry load · {} cancel",
+                    app.key_hint(ActionContext::ModelPicker, ActionId::Refresh),
+                    app.key_hint(ActionContext::ModelPicker, ActionId::Cancel),
+                )
             } else {
-                "  Edit search · Ctrl+U clear · Ctrl+R refresh · Esc cancel"
+                format!(
+                    "  Edit search · {} clear · {} refresh · {} cancel",
+                    app.key_hint(ActionContext::ModelPicker, ActionId::ClearInput),
+                    app.key_hint(ActionContext::ModelPicker, ActionId::Refresh),
+                    app.key_hint(ActionContext::ModelPicker, ActionId::Cancel),
+                )
             }));
         }
     } else {
@@ -1442,9 +1600,15 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
         }
         body.push(Line::raw(""));
         body.push(Line::raw(if picker.applying {
-            "  Applying model..."
+            "  Applying model...".to_string()
         } else {
-            "  \u{2191}/\u{2193}/wheel select · Enter apply · Esc cancel"
+            format!(
+                "  {}/{} or wheel select · {} apply · {} cancel",
+                app.key_hint(ActionContext::ModelPicker, ActionId::NavigateUp),
+                app.key_hint(ActionContext::ModelPicker, ActionId::NavigateDown),
+                app.key_hint(ActionContext::ModelPicker, ActionId::Activate),
+                app.key_hint(ActionContext::ModelPicker, ActionId::Cancel),
+            )
         }));
     }
     if let Some(error) = &picker.error {
@@ -1486,6 +1650,32 @@ pub fn render_command_palette(f: &mut Frame, app: &App) {
                 .map(str::to_string)
         })
         .collect::<Vec<_>>();
+    let binding_hints = palette
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            CommandPaletteEntry::Builtin(action) => app.action_hint(*action),
+            CommandPaletteEntry::Server(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let footer = [
+        format!(
+            "  {}/{} or wheel select · {} use · {} cancel",
+            app.key_hint(ActionContext::CommandPalette, ActionId::NavigateUp),
+            app.key_hint(ActionContext::CommandPalette, ActionId::NavigateDown),
+            app.key_hint(ActionContext::CommandPalette, ActionId::Activate),
+            app.key_hint(ActionContext::CommandPalette, ActionId::Cancel),
+        ),
+        format!(
+            "  Type to search · {} refresh · {} clear",
+            app.key_hint(ActionContext::CommandPalette, ActionId::Refresh),
+            app.key_hint(ActionContext::CommandPalette, ActionId::ClearInput),
+        ),
+        format!(
+            "  {} cancel",
+            app.key_hint(ActionContext::CommandPalette, ActionId::Cancel)
+        ),
+    ];
     let view = CommandPaletteView {
         trigger: palette.trigger,
         input: &palette.input,
@@ -1496,6 +1686,8 @@ pub fn render_command_palette(f: &mut Frame, app: &App) {
         resolving: palette.resolving,
         error: palette.error.as_deref(),
         disabled_reasons: &disabled_reasons,
+        binding_hints: &binding_hints,
+        footer: Some(&footer),
     };
     render_command_palette_view(f, view, Some(&palette.hitboxes));
 }
@@ -1510,6 +1702,8 @@ struct CommandPaletteView<'a> {
     resolving: bool,
     error: Option<&'a str>,
     disabled_reasons: &'a [Option<String>],
+    binding_hints: &'a [Option<String>],
+    footer: Option<&'a [String; 3]>,
 }
 
 struct CommandPaletteRender {
@@ -1722,6 +1916,12 @@ fn command_palette_lines(
                         description.to_string()
                     }
                 });
+            let description = view
+                .binding_hints
+                .get(*entry_index)
+                .and_then(Option::as_deref)
+                .map(|hint| format!("[{hint}] {description}"))
+                .unwrap_or(description);
             lines.push(Line::from(Span::styled(
                 clip_cells(&format!("      {description}"), row_width),
                 if disabled.is_some() {
@@ -1751,16 +1951,34 @@ fn command_palette_lines(
     lines.push(Line::raw(""));
     if view.resolving {
         lines.push(Line::raw("  Input paused while the preview resolves"));
-        lines.push(Line::raw("  Esc cancel"));
-    } else if row_width < 70 {
-        lines.push(Line::raw("  ↑/↓/wheel select · Enter use · Esc cancel"));
-        lines.push(Line::raw("  Ctrl+R retry/refresh · Ctrl+U clear"));
-    } else {
         lines.push(Line::raw(
-            "  ↑/↓/PgUp/PgDn/wheel select · Enter use · Esc cancel",
+            view.footer
+                .map(|footer| footer[2].clone())
+                .unwrap_or_else(|| "  Esc cancel".to_string()),
+        ));
+    } else if row_width < 70 {
+        lines.push(Line::raw(
+            view.footer
+                .map(|footer| footer[0].clone())
+                .unwrap_or_else(|| "  ↑/↓/wheel select · Enter use · Esc cancel".to_string()),
         ));
         lines.push(Line::raw(
-            "  Type to search · Ctrl+R refresh · Ctrl+U clear",
+            view.footer
+                .map(|footer| footer[1].clone())
+                .unwrap_or_else(|| "  Ctrl+R retry/refresh · Ctrl+U clear".to_string()),
+        ));
+    } else {
+        lines.push(Line::raw(
+            view.footer
+                .map(|footer| footer[0].clone())
+                .unwrap_or_else(|| {
+                    "  ↑/↓/PgUp/PgDn/wheel select · Enter use · Esc cancel".to_string()
+                }),
+        ));
+        lines.push(Line::raw(
+            view.footer
+                .map(|footer| footer[1].clone())
+                .unwrap_or_else(|| "  Type to search · Ctrl+R refresh · Ctrl+U clear".to_string()),
         ));
     }
 
@@ -1814,9 +2032,8 @@ mod tests {
     };
     use crate::api::types::CommandItem;
     use crate::api::BambooClient;
-    use crate::app::{
-        App, BuiltinPaletteAction, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger,
-    };
+    use crate::app::{App, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger};
+    use crate::keymap::{ActionId, Keymap};
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::text::Line;
@@ -1890,6 +2107,27 @@ mod tests {
     }
 
     #[test]
+    fn tab_bar_uses_the_resolved_navigation_binding() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"navigation","action":"switch-tab-1","keys":["F8"]}
+            ]}"#,
+        )
+        .unwrap();
+        app.set_keymap(keymap, None);
+
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::render_tab_bar(frame, frame.area(), &app))
+            .unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("[F8] Chat"), "{text}");
+        assert!(!text.contains("[1] Chat"), "{text}");
+    }
+
+    #[test]
     fn testbackend_goldens_cover_every_view_across_the_size_matrix() {
         let sizes = [(50, 15), (60, 20), (80, 24), (120, 40), (200, 60)];
         // Row-major: size, then `Tab::ALL`. Regenerate deliberately only when
@@ -1904,36 +2142,36 @@ mod tests {
                 6_299_991_410_263_413_121,
             ],
             [
-                13_961_651_686_046_235_677,
-                11_742_776_756_959_909_217,
-                12_352_841_898_830_756_966,
-                4_443_987_425_997_024_917,
-                10_477_181_847_636_759_683,
-                15_082_888_787_617_642_176,
+                4_879_774_826_948_300_008,
+                11_066_184_476_930_803_934,
+                17_031_078_274_172_910_387,
+                1_143_711_117_080_246_334,
+                7_234_780_119_466_243_444,
+                9_041_972_994_219_815_988,
             ],
             [
-                918_489_227_128_278_874,
-                12_868_650_456_892_988_142,
-                12_186_984_790_712_334_581,
-                17_105_919_049_885_996_702,
-                10_233_178_872_994_130_974,
-                10_014_260_811_141_985_839,
+                7_389_017_022_641_217_323,
+                16_952_033_003_801_489_607,
+                16_463_315_415_164_233_496,
+                5_166_663_855_769_301_145,
+                6_250_935_511_946_659_016,
+                16_254_299_977_599_291_151,
             ],
             [
-                12_989_858_624_620_429_706,
-                2_072_895_420_946_121_702,
-                13_799_275_926_493_068_613,
-                17_299_515_908_042_385_638,
-                14_066_239_811_268_707_862,
-                15_506_557_407_010_776_391,
+                15_031_301_406_181_041_675,
+                4_865_931_917_107_133_743,
+                15_642_408_912_939_561_496,
+                12_364_154_055_185_087_953,
+                8_288_241_310_337_659_808,
+                16_620_483_292_143_505_655,
             ],
             [
-                16_362_527_783_164_490_822,
-                10_339_770_751_650_844_978,
-                7_745_323_598_988_951_513,
-                12_921_833_252_336_354_826,
-                5_191_433_621_793_189_186,
-                15_064_146_538_247_429_787,
+                10_507_887_664_888_193_887,
+                7_972_046_481_146_137_035,
+                48_418_775_223_067_332,
+                9_519_166_218_506_624_621,
+                6_377_689_178_460_246_140,
+                14_361_221_358_384_919_491,
             ],
         ];
         let mut actual = [[0_u64; 6]; 5];
@@ -1963,7 +2201,7 @@ mod tests {
                         "{width}x{height} {tab:?}:\n{golden}"
                     );
                     assert!(golden.contains("ONLINE"));
-                    assert!(golden.contains("F1 help") || golden.contains("[1]Chat"));
+                    assert!(golden.contains("help") || golden.contains("[1]Chat"));
                 }
             }
         }
@@ -2015,9 +2253,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             [
-                14_548_917_146_417_123_609,
-                8_988_964_665_087_750_412,
-                13_378_690_012_755_700_490,
+                12_798_691_881_099_513_966,
+                8_738_156_666_465_401_879,
+                14_357_062_234_359_601_905,
             ],
             "full-buffer theme golden changed"
         );
@@ -2033,26 +2271,22 @@ mod tests {
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
         let first = terminal_text(&terminal);
         assert!(first.contains("Alt+Enter"));
-        assert!(first.contains("PgUp/PgDn"));
+        assert!(first.contains("PageUp"));
         assert!(app.help_max_scroll.get() > 0);
+
+        let generated = app.help_entries();
+        for needle in ["Ctrl+K", "Ctrl+P", "Ctrl+C", "Ctrl+L", "F1", "?"] {
+            assert!(
+                generated.iter().any(|entry| entry.keys.contains(needle)),
+                "generated help omitted {needle:?}"
+            );
+        }
 
         app.help_scroll = app.help_max_scroll.get();
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
         let last = terminal_text(&terminal);
-        let reachable = format!("{first}\n{last}");
-        for needle in [
-            "Ctrl+K",
-            "Ctrl+P",
-            "Ctrl+C",
-            "Ctrl+L",
-            "F1 / ?",
-            "Esc/q close",
-        ] {
-            assert!(
-                reachable.contains(needle),
-                "help overlay never exposes {needle:?}:\n{reachable}"
-            );
-        }
+        assert!(last.contains("Command palette"));
+        assert!(last.contains("Esc/q/F1 close"));
     }
 
     #[test]
@@ -2070,8 +2304,11 @@ mod tests {
                 .draw(|frame| crate::ui::render(frame, &app))
                 .unwrap();
             let text = terminal_text(&terminal);
-            assert!(text.contains("F1 / ?"), "{width}x{height}:\n{text}");
-            assert!(text.contains("Esc/q close"), "{width}x{height}:\n{text}");
+            assert!(
+                text.contains("Command palette"),
+                "{width}x{height}:\n{text}"
+            );
+            assert!(text.contains("Esc/q/F1 close"), "{width}x{height}:\n{text}");
         }
     }
 
@@ -2088,9 +2325,9 @@ mod tests {
     #[test]
     fn command_palette_render_snapshots_are_responsive_at_60_80_120() {
         let mut entries = vec![
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession),
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop),
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::ToggleDetails),
+            CommandPaletteEntry::Builtin(ActionId::NewSession),
+            CommandPaletteEntry::Builtin(ActionId::StopRun),
+            CommandPaletteEntry::Builtin(ActionId::ToggleDetails),
         ];
         entries.extend((0..12).map(|index| {
             if index == 7 {
@@ -2125,6 +2362,8 @@ mod tests {
                 resolving: false,
                 error: None,
                 disabled_reasons: &disabled_reasons,
+                binding_hints: &[],
+                footer: None,
             };
             let backend = TestBackend::new(width, 24);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -2172,6 +2411,8 @@ mod tests {
                     resolving: false,
                     error: None,
                     disabled_reasons: &disabled_reasons,
+                    binding_hints: &[],
+                    footer: None,
                 },
                 24,
                 row_width,
@@ -2200,6 +2441,8 @@ mod tests {
                 resolving: false,
                 error: Some("API unavailable — Ctrl+R to retry"),
                 disabled_reasons: &disabled_reasons,
+                binding_hints: &[],
+                footer: None,
             },
             24,
             72,
@@ -2221,6 +2464,8 @@ mod tests {
                 resolving: true,
                 error: None,
                 disabled_reasons: &disabled_reasons,
+                binding_hints: &[],
+                footer: None,
             },
             24,
             72,
@@ -2257,6 +2502,8 @@ mod tests {
                         resolving: true,
                         error: None,
                         disabled_reasons: &disabled_reasons,
+                        binding_hints: &[],
+                        footer: None,
                     },
                     Some(&hitboxes),
                 )
@@ -2275,6 +2522,8 @@ mod tests {
                 resolving: false,
                 error: None,
                 disabled_reasons: &[],
+                binding_hints: &[],
+                footer: None,
             },
             24,
             72,
@@ -2292,6 +2541,8 @@ mod tests {
                 resolving: false,
                 error: None,
                 disabled_reasons: &disabled_reasons,
+                binding_hints: &[],
+                footer: None,
             },
             24,
             72,
@@ -2302,8 +2553,8 @@ mod tests {
     #[test]
     fn disabled_reasons_match_runtime_availability_and_label_type_source() {
         let entries = vec![
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::NewSession),
-            CommandPaletteEntry::Builtin(BuiltinPaletteAction::Stop),
+            CommandPaletteEntry::Builtin(ActionId::NewSession),
+            CommandPaletteEntry::Builtin(ActionId::StopRun),
             command(
                 "Deploy production",
                 "workflow",
@@ -2328,6 +2579,8 @@ mod tests {
                 resolving: false,
                 error: None,
                 disabled_reasons: &disabled_reasons,
+                binding_hints: &[],
+                footer: None,
             },
             24,
             80,
@@ -2344,10 +2597,7 @@ mod tests {
         };
 
         assert!(description_for(0).contains("Disabled: Unavailable"));
-        assert_eq!(
-            description_for(1).trim(),
-            BuiltinPaletteAction::Stop.description()
-        );
+        assert_eq!(description_for(1).trim(), ActionId::StopRun.description());
         assert!(description_for(2).contains("Disabled: Composer commands"));
         assert!(description_for(2).contains("run is active"));
         assert!(palette_text(&rendered.lines).contains("workflow · workspace"));

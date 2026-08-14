@@ -5,6 +5,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::keymap::{ActionContext, ActionId};
 use crate::theme::colors;
 use crate::ui::sessions::{truncate_cells, visible_window};
 
@@ -119,11 +120,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 
     // Footer
-    let footer_text = if compact {
-        " Enter details"
-    } else {
-        " [Enter] View details"
-    };
+    let footer_text = format!(
+        " {} details",
+        app.key_hint(ActionContext::Skills, ActionId::Activate)
+    );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[3]);
 }

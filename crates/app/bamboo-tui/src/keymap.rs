@@ -1,0 +1,2270 @@
+use std::collections::HashSet;
+use std::fmt;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize};
+
+const DEFAULT_LEADER: &str = "Ctrl+\\";
+const DEFAULT_LEADER_TIMEOUT_MS: u64 = 1_000;
+const MIN_LEADER_TIMEOUT_MS: u64 = 200;
+const MAX_LEADER_TIMEOUT_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ActionContext {
+    Global,
+    Navigation,
+    Help,
+    Notifications,
+    ServeOffer,
+    QuestionOptions,
+    QuestionCustom,
+    QuestionNumber,
+    QuestionInspect,
+    SessionDeleteConfirm,
+    ScheduleDeleteConfirm,
+    Chat,
+    ConversationBlock,
+    Sessions,
+    Mcp,
+    Schedules,
+    ScheduleForm,
+    Skills,
+    Config,
+    ConfigEditor,
+    SessionPickerBrowse,
+    SessionPickerRename,
+    SessionPickerPinning,
+    ModelPicker,
+    CommandPalette,
+}
+
+impl ActionContext {
+    pub(crate) const ALL: [Self; 25] = [
+        Self::Chat,
+        Self::ConversationBlock,
+        Self::Global,
+        Self::Navigation,
+        Self::Help,
+        Self::Notifications,
+        Self::ServeOffer,
+        Self::QuestionOptions,
+        Self::QuestionCustom,
+        Self::QuestionNumber,
+        Self::QuestionInspect,
+        Self::SessionDeleteConfirm,
+        Self::ScheduleDeleteConfirm,
+        Self::Sessions,
+        Self::Mcp,
+        Self::Schedules,
+        Self::ScheduleForm,
+        Self::Skills,
+        Self::Config,
+        Self::ConfigEditor,
+        Self::SessionPickerBrowse,
+        Self::SessionPickerRename,
+        Self::SessionPickerPinning,
+        Self::ModelPicker,
+        Self::CommandPalette,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Global => "Global",
+            Self::Navigation => "Tabs",
+            Self::Help => "Help",
+            Self::Notifications => "Notifications",
+            Self::ServeOffer => "Server prompt",
+            Self::QuestionOptions => "Question options",
+            Self::QuestionCustom => "Question answer",
+            Self::QuestionNumber => "Question number",
+            Self::QuestionInspect => "Question inspector",
+            Self::SessionDeleteConfirm => "Session delete",
+            Self::ScheduleDeleteConfirm => "Schedule delete",
+            Self::Chat => "Chat",
+            Self::ConversationBlock => "Conversation block",
+            Self::Sessions => "Sessions",
+            Self::Mcp => "MCP",
+            Self::Schedules => "Schedules",
+            Self::ScheduleForm => "Schedule form",
+            Self::Skills => "Skills",
+            Self::Config => "Config",
+            Self::ConfigEditor => "Config editor",
+            Self::SessionPickerBrowse => "Session picker",
+            Self::SessionPickerRename => "Session rename",
+            Self::SessionPickerPinning => "Session pin",
+            Self::ModelPicker => "Model picker",
+            Self::CommandPalette => "Command palette",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ActionId {
+    QuitOrStop,
+    ShowHelp,
+    ShowNotifications,
+    OpenCommandPalette,
+    NewSession,
+    ReopenPendingQuestion,
+    OpenModelPicker,
+    OpenSessionPicker,
+    StopRun,
+    ToggleDetails,
+    OpenConfigTab,
+    OpenSchedulesTab,
+    NextTab,
+    PreviousTab,
+    #[serde(rename = "switch-tab-1")]
+    SwitchTab1,
+    #[serde(rename = "switch-tab-2")]
+    SwitchTab2,
+    #[serde(rename = "switch-tab-3")]
+    SwitchTab3,
+    #[serde(rename = "switch-tab-4")]
+    SwitchTab4,
+    #[serde(rename = "switch-tab-5")]
+    SwitchTab5,
+    #[serde(rename = "switch-tab-6")]
+    SwitchTab6,
+    NavigateUp,
+    NavigateDown,
+    PageUp,
+    PageDown,
+    JumpFirst,
+    JumpLast,
+    Activate,
+    Cancel,
+    Backspace,
+    Refresh,
+    ClearInput,
+    Confirm,
+    Reject,
+    OpenSlashPalette,
+    SendMessage,
+    InsertNewline,
+    ScrollTranscriptUp,
+    ScrollTranscriptDown,
+    ScrollTranscriptTop,
+    ScrollTranscriptBottom,
+    FocusConversationBlocks,
+    ExitConversationBlocks,
+    PreviousConversationBlock,
+    NextConversationBlock,
+    ScrollBlockUp,
+    ScrollBlockDown,
+    ScrollBlockPageUp,
+    ScrollBlockPageDown,
+    CopyValue,
+    InspectValue,
+    ToggleInspectorPane,
+    CustomAnswer,
+    NumberAnswer,
+    #[serde(rename = "quick-answer-1")]
+    QuickAnswer1,
+    #[serde(rename = "quick-answer-2")]
+    QuickAnswer2,
+    #[serde(rename = "quick-answer-3")]
+    QuickAnswer3,
+    #[serde(rename = "quick-answer-4")]
+    QuickAnswer4,
+    #[serde(rename = "quick-answer-5")]
+    QuickAnswer5,
+    #[serde(rename = "quick-answer-6")]
+    QuickAnswer6,
+    #[serde(rename = "quick-answer-7")]
+    QuickAnswer7,
+    #[serde(rename = "quick-answer-8")]
+    QuickAnswer8,
+    #[serde(rename = "quick-answer-9")]
+    QuickAnswer9,
+    DeleteSelection,
+    NextPage,
+    PreviousPage,
+    ShowTools,
+    NewSchedule,
+    RunSchedule,
+    NextField,
+    PreviousField,
+    EditConfig,
+    SaveConfig,
+    RenameSession,
+    ToggleSessionPin,
+    LoadMore,
+}
+
+#[derive(Clone, Copy)]
+struct DefaultBinding {
+    context: ActionContext,
+    keys: &'static str,
+}
+
+pub(crate) struct ActionSpec {
+    pub(crate) id: ActionId,
+    pub(crate) label: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) palette: bool,
+    availability: ActionAvailability,
+    contexts: &'static [ActionContext],
+    defaults: &'static [DefaultBinding],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActionAvailability {
+    Always,
+    Idle,
+    ChatIdle,
+    ActiveRun,
+    Chat,
+}
+
+macro_rules! spec {
+    ($id:ident, $label:literal, $description:literal, $palette:expr, $availability:ident,
+        [$($context:ident),* $(,)?],
+        [$(($default_context:ident, $keys:literal)),* $(,)?]
+    ) => {
+        ActionSpec {
+            id: ActionId::$id,
+            label: $label,
+            description: $description,
+            palette: $palette,
+            availability: ActionAvailability::$availability,
+            contexts: &[$(ActionContext::$context),*],
+            defaults: &[$(DefaultBinding {
+                context: ActionContext::$default_context,
+                keys: $keys,
+            }),*],
+        }
+    };
+    ($id:ident, $label:literal, $description:literal, $palette:expr,
+        [$($context:ident),* $(,)?],
+        [$(($default_context:ident, $keys:literal)),* $(,)?]
+    ) => {
+        spec!(
+            $id,
+            $label,
+            $description,
+            $palette,
+            Always,
+            [$($context),*],
+            [$(($default_context, $keys)),*]
+        )
+    };
+}
+
+pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
+    spec!(
+        QuitOrStop,
+        "Quit or stop",
+        "Stop an active run, otherwise quit the TUI",
+        false,
+        [Global],
+        [(Global, "Ctrl+C")]
+    ),
+    spec!(
+        ShowHelp,
+        "Show help",
+        "Open the resolved contextual keybinding reference",
+        true,
+        [Global, Navigation],
+        [(Global, "F1; Leader h"), (Navigation, "?")]
+    ),
+    spec!(
+        ShowNotifications,
+        "Show notifications",
+        "Open the full status, warning, and error log",
+        true,
+        [Global],
+        [(Global, "Ctrl+L; Leader l")]
+    ),
+    spec!(
+        OpenCommandPalette,
+        "Command palette",
+        "Search built-in and session-aware commands",
+        false,
+        [Global],
+        [(Global, "Ctrl+K; Leader k")]
+    ),
+    spec!(
+        NewSession,
+        "New session",
+        "Clear conversation state and start a fresh session",
+        true,
+        Idle,
+        [Global],
+        [(Global, "Ctrl+N; Leader n")]
+    ),
+    spec!(
+        ReopenPendingQuestion,
+        "Reopen question",
+        "Restore a dismissed pending agent question",
+        false,
+        [Global],
+        [(Global, "Ctrl+Q; Leader q")]
+    ),
+    spec!(
+        OpenModelPicker,
+        "Select model",
+        "Choose a provider-qualified model",
+        true,
+        ChatIdle,
+        [Global],
+        [(Global, "Ctrl+O; Leader m")]
+    ),
+    spec!(
+        OpenSessionPicker,
+        "Open session",
+        "Search and resume an existing session",
+        true,
+        ChatIdle,
+        [Global],
+        [(Global, "Ctrl+P; Leader p")]
+    ),
+    spec!(
+        StopRun,
+        "Stop active run",
+        "Request cancellation of the active agent run",
+        true,
+        ActiveRun,
+        [Global, Chat],
+        [(Global, "Ctrl+S; Leader s"), (Chat, "Ctrl+S; Leader s")]
+    ),
+    spec!(
+        ToggleDetails,
+        "Toggle focused details",
+        "Toggle the focused block or the default for new details",
+        true,
+        Chat,
+        [Chat, ConversationBlock],
+        [
+            (Chat, "Ctrl+X; Leader x"),
+            (ConversationBlock, "Ctrl+X; Leader x")
+        ]
+    ),
+    spec!(
+        OpenConfigTab,
+        "Open config",
+        "Switch to the configuration tab",
+        true,
+        [Global],
+        []
+    ),
+    spec!(
+        OpenSchedulesTab,
+        "Open schedules",
+        "Switch to the schedules tab",
+        true,
+        [Global],
+        []
+    ),
+    spec!(
+        NextTab,
+        "Next tab",
+        "Switch to the next top-level tab",
+        false,
+        [Global],
+        [(Global, "Tab")]
+    ),
+    spec!(
+        PreviousTab,
+        "Previous tab",
+        "Switch to the previous top-level tab",
+        false,
+        [Global],
+        [(Global, "Shift+Tab")]
+    ),
+    spec!(
+        SwitchTab1,
+        "Open Chat tab",
+        "Switch directly to Chat outside text entry",
+        false,
+        [Navigation],
+        [(Navigation, "1")]
+    ),
+    spec!(
+        SwitchTab2,
+        "Open Sessions tab",
+        "Switch directly to Sessions outside text entry",
+        false,
+        [Navigation],
+        [(Navigation, "2")]
+    ),
+    spec!(
+        SwitchTab3,
+        "Open MCP tab",
+        "Switch directly to MCP outside text entry",
+        false,
+        [Navigation],
+        [(Navigation, "3")]
+    ),
+    spec!(
+        SwitchTab4,
+        "Open Schedules tab",
+        "Switch directly to Schedules outside text entry",
+        false,
+        [Navigation],
+        [(Navigation, "4")]
+    ),
+    spec!(
+        SwitchTab5,
+        "Open Skills tab",
+        "Switch directly to Skills outside text entry",
+        false,
+        [Navigation],
+        [(Navigation, "5")]
+    ),
+    spec!(
+        SwitchTab6,
+        "Open Config tab",
+        "Switch directly to Config outside text entry",
+        false,
+        [Navigation],
+        [(Navigation, "6")]
+    ),
+    spec!(
+        NavigateUp,
+        "Move up",
+        "Move selection or scroll one row upward",
+        false,
+        [
+            Help,
+            Notifications,
+            QuestionOptions,
+            QuestionInspect,
+            Sessions,
+            Mcp,
+            Schedules,
+            Skills,
+            Config,
+            SessionPickerBrowse,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Help, "Up; k"),
+            (Notifications, "Up; k"),
+            (QuestionOptions, "Up; k"),
+            (QuestionInspect, "Up; k"),
+            (Sessions, "Up"),
+            (Mcp, "Up"),
+            (Schedules, "Up"),
+            (Skills, "Up"),
+            (Config, "Up; k"),
+            (SessionPickerBrowse, "Up"),
+            (ModelPicker, "Up"),
+            (CommandPalette, "Up")
+        ]
+    ),
+    spec!(
+        NavigateDown,
+        "Move down",
+        "Move selection or scroll one row downward",
+        false,
+        [
+            Help,
+            Notifications,
+            QuestionOptions,
+            QuestionInspect,
+            Sessions,
+            Mcp,
+            Schedules,
+            Skills,
+            Config,
+            SessionPickerBrowse,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Help, "Down; j"),
+            (Notifications, "Down; j"),
+            (QuestionOptions, "Down; j"),
+            (QuestionInspect, "Down; j"),
+            (Sessions, "Down"),
+            (Mcp, "Down"),
+            (Schedules, "Down"),
+            (Skills, "Down"),
+            (Config, "Down; j"),
+            (SessionPickerBrowse, "Down"),
+            (ModelPicker, "Down"),
+            (CommandPalette, "Down")
+        ]
+    ),
+    spec!(
+        PageUp,
+        "Page up",
+        "Move or scroll one page upward",
+        false,
+        [
+            Help,
+            Notifications,
+            QuestionOptions,
+            QuestionInspect,
+            Config,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Help, "PageUp"),
+            (Notifications, "PageUp"),
+            (QuestionOptions, "PageUp"),
+            (QuestionInspect, "PageUp"),
+            (Config, "PageUp"),
+            (ModelPicker, "PageUp"),
+            (CommandPalette, "PageUp")
+        ]
+    ),
+    spec!(
+        PageDown,
+        "Page down",
+        "Move or scroll one page downward",
+        false,
+        [
+            Help,
+            Notifications,
+            QuestionOptions,
+            QuestionInspect,
+            Config,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Help, "PageDown"),
+            (Notifications, "PageDown"),
+            (QuestionOptions, "PageDown"),
+            (QuestionInspect, "PageDown"),
+            (Config, "PageDown"),
+            (ModelPicker, "PageDown"),
+            (CommandPalette, "PageDown")
+        ]
+    ),
+    spec!(
+        JumpFirst,
+        "Jump to first",
+        "Move to the first item or row",
+        false,
+        [
+            Help,
+            Notifications,
+            QuestionOptions,
+            QuestionInspect,
+            ConversationBlock,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Help, "Home"),
+            (Notifications, "Home"),
+            (QuestionOptions, "Home"),
+            (QuestionInspect, "Home"),
+            (ConversationBlock, "Home"),
+            (ModelPicker, "Home"),
+            (CommandPalette, "Home")
+        ]
+    ),
+    spec!(
+        JumpLast,
+        "Jump to last",
+        "Move to the final item or row",
+        false,
+        [
+            Help,
+            Notifications,
+            QuestionOptions,
+            QuestionInspect,
+            ConversationBlock,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Help, "End"),
+            (Notifications, "End"),
+            (QuestionOptions, "End"),
+            (QuestionInspect, "End"),
+            (ConversationBlock, "End"),
+            (ModelPicker, "End"),
+            (CommandPalette, "End")
+        ]
+    ),
+    spec!(
+        Activate,
+        "Activate",
+        "Use, submit, open, or toggle the selected item",
+        false,
+        [
+            QuestionOptions,
+            QuestionCustom,
+            QuestionNumber,
+            ConversationBlock,
+            Sessions,
+            Mcp,
+            ScheduleForm,
+            Skills,
+            SessionPickerBrowse,
+            SessionPickerRename,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (QuestionOptions, "Enter"),
+            (QuestionCustom, "Enter"),
+            (QuestionNumber, "Enter"),
+            (ConversationBlock, "Enter"),
+            (Sessions, "Enter"),
+            (Mcp, "Enter"),
+            (ScheduleForm, "Enter"),
+            (Skills, "Enter"),
+            (SessionPickerBrowse, "Enter"),
+            (SessionPickerRename, "Enter"),
+            (ModelPicker, "Enter"),
+            (CommandPalette, "Enter")
+        ]
+    ),
+    spec!(
+        Cancel,
+        "Cancel or close",
+        "Cancel the current mode without applying changes",
+        false,
+        [
+            Help,
+            Notifications,
+            QuestionOptions,
+            QuestionCustom,
+            QuestionNumber,
+            QuestionInspect,
+            ScheduleForm,
+            ConfigEditor,
+            SessionPickerBrowse,
+            SessionPickerRename,
+            SessionPickerPinning,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Help, "Esc; q; F1"),
+            (Notifications, "Esc; q; F1"),
+            (QuestionOptions, "Esc"),
+            (QuestionCustom, "Esc"),
+            (QuestionNumber, "Esc"),
+            (QuestionInspect, "Esc; v"),
+            (ScheduleForm, "Esc"),
+            (ConfigEditor, "Esc"),
+            (SessionPickerBrowse, "Esc"),
+            (SessionPickerRename, "Esc"),
+            (SessionPickerPinning, "Esc"),
+            (ModelPicker, "Esc"),
+            (CommandPalette, "Esc; Ctrl+K")
+        ]
+    ),
+    spec!(
+        Backspace,
+        "Delete previous character",
+        "Remove the previous character from the focused input",
+        false,
+        [
+            QuestionCustom,
+            QuestionNumber,
+            ScheduleForm,
+            SessionPickerBrowse,
+            SessionPickerRename,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (QuestionCustom, "Backspace"),
+            (QuestionNumber, "Backspace"),
+            (ScheduleForm, "Backspace"),
+            (SessionPickerBrowse, "Backspace"),
+            (SessionPickerRename, "Backspace"),
+            (ModelPicker, "Backspace"),
+            (CommandPalette, "Backspace")
+        ]
+    ),
+    spec!(
+        Refresh,
+        "Refresh",
+        "Reload the current catalog or retry its last request",
+        false,
+        [
+            Sessions,
+            Mcp,
+            SessionPickerBrowse,
+            SessionPickerRename,
+            SessionPickerPinning,
+            ModelPicker,
+            CommandPalette
+        ],
+        [
+            (Sessions, "r"),
+            (Mcp, "r"),
+            (SessionPickerBrowse, "Ctrl+R"),
+            (SessionPickerRename, "Ctrl+R"),
+            (SessionPickerPinning, "Ctrl+R"),
+            (ModelPicker, "Ctrl+R"),
+            (CommandPalette, "Ctrl+R")
+        ]
+    ),
+    spec!(
+        ClearInput,
+        "Clear input",
+        "Clear the focused search query",
+        false,
+        [SessionPickerBrowse, ModelPicker, CommandPalette],
+        [
+            (SessionPickerBrowse, "Ctrl+U"),
+            (ModelPicker, "Ctrl+U"),
+            (CommandPalette, "Ctrl+U")
+        ]
+    ),
+    spec!(
+        Confirm,
+        "Confirm",
+        "Accept the pending confirmation",
+        false,
+        [ServeOffer, SessionDeleteConfirm, ScheduleDeleteConfirm],
+        [
+            (ServeOffer, "y; Enter"),
+            (SessionDeleteConfirm, "y; Enter"),
+            (ScheduleDeleteConfirm, "y; Enter")
+        ]
+    ),
+    spec!(
+        Reject,
+        "Reject",
+        "Decline or cancel the pending confirmation",
+        false,
+        [ServeOffer, SessionDeleteConfirm, ScheduleDeleteConfirm],
+        [
+            (ServeOffer, "n; Esc"),
+            (SessionDeleteConfirm, "n; Esc"),
+            (ScheduleDeleteConfirm, "n; Esc")
+        ]
+    ),
+    spec!(
+        OpenSlashPalette,
+        "Slash commands",
+        "Open command discovery from an empty Chat composer",
+        false,
+        [Chat],
+        [(Chat, "/")]
+    ),
+    spec!(
+        SendMessage,
+        "Send message",
+        "Send the current Chat composer draft",
+        false,
+        [Chat],
+        [(Chat, "Enter")]
+    ),
+    spec!(
+        InsertNewline,
+        "Insert newline",
+        "Insert a newline without sending the Chat draft",
+        false,
+        [Chat],
+        [(Chat, "Alt+Enter; Shift+Enter")]
+    ),
+    spec!(
+        ScrollTranscriptUp,
+        "Scroll transcript up",
+        "Scroll the Chat transcript upward",
+        false,
+        [Chat],
+        [(Chat, "PageUp; Alt+Up")]
+    ),
+    spec!(
+        ScrollTranscriptDown,
+        "Scroll transcript down",
+        "Scroll the Chat transcript downward",
+        false,
+        [Chat],
+        [(Chat, "PageDown; Alt+Down")]
+    ),
+    spec!(
+        ScrollTranscriptTop,
+        "Transcript top",
+        "Jump to the top of the Chat transcript",
+        false,
+        [Chat],
+        [(Chat, "Ctrl+Home")]
+    ),
+    spec!(
+        ScrollTranscriptBottom,
+        "Transcript bottom",
+        "Jump to the newest Chat output",
+        false,
+        [Chat],
+        [(Chat, "Ctrl+End; Ctrl+G")]
+    ),
+    spec!(
+        FocusConversationBlocks,
+        "Focus conversation blocks",
+        "Move keyboard focus from the composer into rendered blocks",
+        false,
+        [Chat],
+        [(Chat, "Ctrl+B")]
+    ),
+    spec!(
+        ExitConversationBlocks,
+        "Focus composer",
+        "Return keyboard focus to the Chat composer",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "Esc; Ctrl+B")]
+    ),
+    spec!(
+        PreviousConversationBlock,
+        "Previous block",
+        "Move focus to the previous conversation block",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "Up")]
+    ),
+    spec!(
+        NextConversationBlock,
+        "Next block",
+        "Move focus to the next conversation block",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "Down")]
+    ),
+    spec!(
+        ScrollBlockUp,
+        "Scroll block up",
+        "Scroll the focused detail block upward",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "k")]
+    ),
+    spec!(
+        ScrollBlockDown,
+        "Scroll block down",
+        "Scroll the focused detail block downward",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "j")]
+    ),
+    spec!(
+        ScrollBlockPageUp,
+        "Page block up",
+        "Scroll the focused detail block up by one viewport",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "PageUp")]
+    ),
+    spec!(
+        ScrollBlockPageDown,
+        "Page block down",
+        "Scroll the focused detail block down by one viewport",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "PageDown")]
+    ),
+    spec!(
+        CopyValue,
+        "Copy exact value",
+        "Copy the focused value through OSC 52",
+        false,
+        [ConversationBlock, QuestionOptions, QuestionInspect],
+        [
+            (ConversationBlock, "y"),
+            (QuestionOptions, "y"),
+            (QuestionInspect, "y")
+        ]
+    ),
+    spec!(
+        InspectValue,
+        "Inspect full value",
+        "Open the full question/value inspector",
+        false,
+        [QuestionOptions, QuestionCustom],
+        [(QuestionOptions, "v"), (QuestionCustom, "Ctrl+V")]
+    ),
+    spec!(
+        ToggleInspectorPane,
+        "Toggle inspected value",
+        "Switch between the question and selected option",
+        false,
+        [QuestionInspect],
+        [(QuestionInspect, "Tab")]
+    ),
+    spec!(
+        CustomAnswer,
+        "Custom answer",
+        "Enter a free-text answer",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "c")]
+    ),
+    spec!(
+        NumberAnswer,
+        "Option by number",
+        "Enter a multi-digit option number",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "g")]
+    ),
+    spec!(
+        QuickAnswer1,
+        "Answer option 1",
+        "Submit question option 1",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "1")]
+    ),
+    spec!(
+        QuickAnswer2,
+        "Answer option 2",
+        "Submit question option 2",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "2")]
+    ),
+    spec!(
+        QuickAnswer3,
+        "Answer option 3",
+        "Submit question option 3",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "3")]
+    ),
+    spec!(
+        QuickAnswer4,
+        "Answer option 4",
+        "Submit question option 4",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "4")]
+    ),
+    spec!(
+        QuickAnswer5,
+        "Answer option 5",
+        "Submit question option 5",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "5")]
+    ),
+    spec!(
+        QuickAnswer6,
+        "Answer option 6",
+        "Submit question option 6",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "6")]
+    ),
+    spec!(
+        QuickAnswer7,
+        "Answer option 7",
+        "Submit question option 7",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "7")]
+    ),
+    spec!(
+        QuickAnswer8,
+        "Answer option 8",
+        "Submit question option 8",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "8")]
+    ),
+    spec!(
+        QuickAnswer9,
+        "Answer option 9",
+        "Submit question option 9",
+        false,
+        [QuestionOptions],
+        [(QuestionOptions, "9")]
+    ),
+    spec!(
+        DeleteSelection,
+        "Delete selection",
+        "Open a destructive confirmation for the selected item",
+        false,
+        [Sessions, Schedules, SessionPickerBrowse],
+        [
+            (Sessions, "d"),
+            (Schedules, "d"),
+            (SessionPickerBrowse, "Delete; Ctrl+D")
+        ]
+    ),
+    spec!(
+        NextPage,
+        "Next page",
+        "Load the next page of sessions",
+        false,
+        [Sessions],
+        [(Sessions, "]")]
+    ),
+    spec!(
+        PreviousPage,
+        "Previous page",
+        "Load the previous page of sessions",
+        false,
+        [Sessions],
+        [(Sessions, "[")]
+    ),
+    spec!(
+        ShowTools,
+        "Show tools",
+        "Load tools for the selected MCP server",
+        false,
+        [Mcp],
+        [(Mcp, "t")]
+    ),
+    spec!(
+        NewSchedule,
+        "New schedule",
+        "Open the new schedule form",
+        false,
+        [Schedules],
+        [(Schedules, "n")]
+    ),
+    spec!(
+        RunSchedule,
+        "Run schedule now",
+        "Trigger the selected schedule immediately",
+        false,
+        [Schedules],
+        [(Schedules, "r")]
+    ),
+    spec!(
+        NextField,
+        "Next field",
+        "Move focus to the next form field",
+        false,
+        [ScheduleForm],
+        [(ScheduleForm, "Tab; Down")]
+    ),
+    spec!(
+        PreviousField,
+        "Previous field",
+        "Move focus to the previous form field",
+        false,
+        [ScheduleForm],
+        [(ScheduleForm, "Shift+Tab; Up")]
+    ),
+    spec!(
+        EditConfig,
+        "Edit config",
+        "Open the raw JSON configuration editor",
+        false,
+        [Config],
+        [(Config, "e")]
+    ),
+    spec!(
+        SaveConfig,
+        "Save config",
+        "Validate and save the configuration editor buffer",
+        false,
+        [ConfigEditor],
+        [(ConfigEditor, "F2; Ctrl+S; Leader s")]
+    ),
+    spec!(
+        RenameSession,
+        "Rename session",
+        "Rename the selected session",
+        false,
+        [SessionPickerBrowse],
+        [(SessionPickerBrowse, "F2")]
+    ),
+    spec!(
+        ToggleSessionPin,
+        "Pin or unpin session",
+        "Toggle the selected session's pinned state",
+        false,
+        [SessionPickerBrowse],
+        [(SessionPickerBrowse, "F3")]
+    ),
+    spec!(
+        LoadMore,
+        "Load more",
+        "Load the next session-picker page",
+        false,
+        [SessionPickerBrowse],
+        [(SessionPickerBrowse, "PageDown; ]")]
+    ),
+];
+
+impl ActionId {
+    pub(crate) fn spec(self) -> &'static ActionSpec {
+        ACTION_SPECS
+            .iter()
+            .find(|spec| spec.id == self)
+            .expect("every ActionId must have one ActionSpec")
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        self.spec().label
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        self.spec().description
+    }
+
+    pub(crate) fn key(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .expect("ActionId serialization must stay a string")
+    }
+
+    pub(crate) fn palette_actions() -> impl Iterator<Item = ActionId> {
+        ACTION_SPECS
+            .iter()
+            .filter(|spec| spec.palette)
+            .map(|spec| spec.id)
+    }
+
+    pub(crate) fn availability(self) -> ActionAvailability {
+        self.spec().availability
+    }
+
+    /// Whether holding the physical key may safely invoke this action more
+    /// than once.  Text entry is handled separately by the focused widget;
+    /// confirmations, submissions, mutations, and application lifecycle
+    /// actions deliberately remain press-only.
+    pub(crate) fn repeatable(self) -> bool {
+        matches!(
+            self,
+            Self::NavigateUp
+                | Self::NavigateDown
+                | Self::PageUp
+                | Self::PageDown
+                | Self::ScrollTranscriptUp
+                | Self::ScrollTranscriptDown
+                | Self::ScrollBlockUp
+                | Self::ScrollBlockDown
+                | Self::ScrollBlockPageUp
+                | Self::ScrollBlockPageDown
+                | Self::Backspace
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct KeyStroke {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyStroke {
+    fn from_event(event: KeyEvent) -> Self {
+        let mut modifiers =
+            event.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let code = match event.code {
+            KeyCode::BackTab => {
+                modifiers.remove(KeyModifiers::SHIFT);
+                KeyCode::BackTab
+            }
+            KeyCode::Char(character) => {
+                let character = character.to_ascii_lowercase();
+                if !character.is_ascii_alphabetic() {
+                    modifiers.remove(KeyModifiers::SHIFT);
+                }
+                KeyCode::Char(character)
+            }
+            code => code,
+        };
+        Self { code, modifiers }
+    }
+
+    fn display(&self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            parts.push("Ctrl".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            parts.push("Alt".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::SHIFT) {
+            parts.push("Shift".to_string());
+        }
+        parts.push(match self.code {
+            KeyCode::Backspace => "Backspace".to_string(),
+            KeyCode::Enter => "Enter".to_string(),
+            KeyCode::Left => "Left".to_string(),
+            KeyCode::Right => "Right".to_string(),
+            KeyCode::Up => "Up".to_string(),
+            KeyCode::Down => "Down".to_string(),
+            KeyCode::Home => "Home".to_string(),
+            KeyCode::End => "End".to_string(),
+            KeyCode::PageUp => "PageUp".to_string(),
+            KeyCode::PageDown => "PageDown".to_string(),
+            KeyCode::Tab => "Tab".to_string(),
+            KeyCode::BackTab => "Shift+Tab".to_string(),
+            KeyCode::Delete => "Delete".to_string(),
+            KeyCode::Insert => "Insert".to_string(),
+            KeyCode::F(number) => format!("F{number}"),
+            KeyCode::Char(' ') => "Space".to_string(),
+            KeyCode::Char(character)
+                if character.is_ascii_alphabetic() && !self.modifiers.is_empty() =>
+            {
+                character.to_ascii_uppercase().to_string()
+            }
+            KeyCode::Char(character) => character.to_string(),
+            KeyCode::Esc => "Esc".to_string(),
+            KeyCode::Null => "Null".to_string(),
+            KeyCode::CapsLock => "CapsLock".to_string(),
+            KeyCode::ScrollLock => "ScrollLock".to_string(),
+            KeyCode::NumLock => "NumLock".to_string(),
+            KeyCode::PrintScreen => "PrintScreen".to_string(),
+            KeyCode::Pause => "Pause".to_string(),
+            KeyCode::Menu => "Menu".to_string(),
+            KeyCode::KeypadBegin => "KeypadBegin".to_string(),
+            KeyCode::Media(_) | KeyCode::Modifier(_) => "Unsupported".to_string(),
+        });
+        parts.join("+")
+    }
+
+    fn is_plain_printable(&self) -> bool {
+        self.modifiers.is_empty() && matches!(self.code, KeyCode::Char(_))
+    }
+
+    fn is_xon_xoff_or_signal(&self) -> bool {
+        self.modifiers == KeyModifiers::CONTROL
+            && matches!(self.code, KeyCode::Char('q' | 's' | 'z'))
+    }
+
+    fn is_protocol_dependent(&self) -> bool {
+        (self.code == KeyCode::Enter && self.modifiers == KeyModifiers::SHIFT)
+            || (self.code == KeyCode::Char('?') && self.modifiers == KeyModifiers::CONTROL)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct KeySequence(Vec<KeyStroke>);
+
+impl KeySequence {
+    fn display(&self) -> String {
+        self.0
+            .iter()
+            .map(KeyStroke::display)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn is_prefix_of(&self, other: &Self) -> bool {
+        self.0.len() <= other.0.len() && other.0.starts_with(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingSource {
+    Default,
+    Custom,
+}
+
+#[derive(Clone, Debug)]
+struct Binding {
+    context: ActionContext,
+    action: ActionId,
+    sequence: KeySequence,
+    source: BindingSource,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingSequence {
+    contexts: Vec<ActionContext>,
+    focus_contexts: Vec<ActionContext>,
+    sequence: KeySequence,
+    started_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeyResolution {
+    Action {
+        context: ActionContext,
+        action: ActionId,
+    },
+    Pending(String),
+    Cancelled(String),
+    NoMatch,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HelpEntry {
+    pub(crate) keys: String,
+    pub(crate) description: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Keymap {
+    bindings: Vec<Binding>,
+    leader: KeyStroke,
+    timeout: Duration,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeymapConfig {
+    #[serde(default = "default_keymap_version")]
+    version: u32,
+    #[serde(default)]
+    leader: Option<String>,
+    #[serde(default)]
+    leader_timeout_ms: Option<u64>,
+    #[serde(default)]
+    bindings: Vec<KeymapOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeymapOverride {
+    context: ActionContext,
+    action: ActionId,
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    unbind: bool,
+}
+
+fn default_keymap_version() -> u32 {
+    1
+}
+
+#[derive(Debug)]
+pub(crate) struct KeymapError(String);
+
+impl fmt::Display for KeymapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeymapError {}
+
+impl Default for Keymap {
+    fn default() -> Self {
+        Self::build(None).expect("built-in keymap must remain valid")
+    }
+}
+
+impl Keymap {
+    pub(crate) fn load(path: Option<&Path>) -> (Self, Option<String>) {
+        let Some(path) = path else {
+            return (Self::default(), None);
+        };
+        let loaded = std::fs::read_to_string(path)
+            .map_err(|error| KeymapError(format!("cannot read {}: {error}", path.display())))
+            .and_then(|source| {
+                Self::from_json(&source)
+                    .map_err(|error| KeymapError(format!("{}: {error}", path.display())))
+            });
+        match loaded {
+            Ok(keymap) => (keymap, None),
+            Err(error) => (
+                Self::default(),
+                Some(format!(
+                    "Invalid TUI keymap ({error}); using conflict-safe defaults"
+                )),
+            ),
+        }
+    }
+
+    pub(crate) fn from_json(source: &str) -> Result<Self, KeymapError> {
+        let config: KeymapConfig = serde_json::from_str(source)
+            .map_err(|error| KeymapError(format!("JSON error: {error}")))?;
+        Self::build(Some(config))
+    }
+
+    fn build(config: Option<KeymapConfig>) -> Result<Self, KeymapError> {
+        if config.as_ref().is_some_and(|config| config.version != 1) {
+            let version = config.as_ref().map(|config| config.version).unwrap_or(1);
+            return Err(KeymapError(format!(
+                "unsupported keymap version {} (expected 1)",
+                version
+            )));
+        }
+        let leader_text = config
+            .as_ref()
+            .and_then(|config| config.leader.as_deref())
+            .unwrap_or(DEFAULT_LEADER);
+        let leader = parse_stroke(leader_text)
+            .map_err(|error| KeymapError(format!("invalid leader '{leader_text}': {error}")))?;
+        if leader.is_plain_printable() {
+            return Err(KeymapError(
+                "leader must use Ctrl/Alt or a non-printable key so Chat typing stays safe"
+                    .to_string(),
+            ));
+        }
+        if config.is_some() && leader.is_xon_xoff_or_signal() {
+            return Err(KeymapError(format!(
+                "leader '{}' is reserved by common terminal flow-control/signal handling",
+                leader.display()
+            )));
+        }
+
+        let timeout_ms = config
+            .as_ref()
+            .and_then(|config| config.leader_timeout_ms)
+            .unwrap_or(DEFAULT_LEADER_TIMEOUT_MS);
+        if !(MIN_LEADER_TIMEOUT_MS..=MAX_LEADER_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(KeymapError(format!(
+                "leader_timeout_ms must be between {MIN_LEADER_TIMEOUT_MS} and {MAX_LEADER_TIMEOUT_MS}"
+            )));
+        }
+
+        let mut bindings = Vec::new();
+        for spec in ACTION_SPECS {
+            for default in spec.defaults {
+                for sequence in split_binding_list(default.keys)? {
+                    bindings.push(Binding {
+                        context: default.context,
+                        action: spec.id,
+                        sequence: parse_sequence(&sequence, &leader)?,
+                        source: BindingSource::Default,
+                    });
+                }
+            }
+        }
+
+        if let Some(config) = config {
+            let mut overridden = HashSet::new();
+            for entry in config.bindings {
+                if !overridden.insert((entry.context, entry.action)) {
+                    return Err(KeymapError(format!(
+                        "duplicate override for {} / {}",
+                        entry.context.label(),
+                        entry.action.label()
+                    )));
+                }
+                if !entry.action.spec().contexts.contains(&entry.context) {
+                    return Err(KeymapError(format!(
+                        "action '{}' is not valid in context '{}'",
+                        entry.action.label(),
+                        entry.context.label()
+                    )));
+                }
+                if entry.unbind && !entry.keys.is_empty() {
+                    return Err(KeymapError(format!(
+                        "{} / {} cannot set both unbind=true and keys",
+                        entry.context.label(),
+                        entry.action.label()
+                    )));
+                }
+                if !entry.unbind && entry.keys.is_empty() {
+                    return Err(KeymapError(format!(
+                        "{} / {} needs at least one key or unbind=true",
+                        entry.context.label(),
+                        entry.action.label()
+                    )));
+                }
+                bindings.retain(|binding| {
+                    binding.context != entry.context || binding.action != entry.action
+                });
+                for sequence in entry.keys {
+                    let sequence = parse_sequence(&sequence, &leader)?;
+                    if sequence.0.iter().any(KeyStroke::is_xon_xoff_or_signal) {
+                        return Err(KeymapError(format!(
+                            "{} / {} uses reserved sequence '{}'; use a leader or function-key fallback",
+                            entry.context.label(),
+                            entry.action.label(),
+                            sequence.display()
+                        )));
+                    }
+                    bindings.push(Binding {
+                        context: entry.context,
+                        action: entry.action,
+                        sequence,
+                        source: BindingSource::Custom,
+                    });
+                }
+            }
+        }
+
+        let keymap = Self {
+            bindings,
+            leader,
+            timeout: Duration::from_millis(timeout_ms),
+        };
+        keymap.validate()?;
+        Ok(keymap)
+    }
+
+    fn validate(&self) -> Result<(), KeymapError> {
+        for (index, binding) in self.bindings.iter().enumerate() {
+            if !binding.action.spec().contexts.contains(&binding.context) {
+                return Err(KeymapError(format!(
+                    "{} is not valid in {}",
+                    binding.action.label(),
+                    binding.context.label()
+                )));
+            }
+            if binding.context == ActionContext::Global
+                && binding.sequence.0.len() == 1
+                && binding.sequence.0[0].is_plain_printable()
+            {
+                return Err(KeymapError(format!(
+                    "global binding '{}' would steal ordinary Chat text",
+                    binding.sequence.display()
+                )));
+            }
+            for other in self.bindings.iter().skip(index + 1) {
+                if binding.context != other.context {
+                    continue;
+                }
+                if binding.sequence == other.sequence {
+                    return Err(KeymapError(format!(
+                        "conflict in {}: '{}' binds both '{}' and '{}'",
+                        binding.context.label(),
+                        binding.sequence.display(),
+                        binding.action.label(),
+                        other.action.label()
+                    )));
+                }
+                if binding.sequence.is_prefix_of(&other.sequence)
+                    || other.sequence.is_prefix_of(&binding.sequence)
+                {
+                    return Err(KeymapError(format!(
+                        "unreachable prefix in {}: '{}' conflicts with '{}'",
+                        binding.context.label(),
+                        binding.sequence.display(),
+                        other.sequence.display()
+                    )));
+                }
+            }
+        }
+
+        for (context, action) in [
+            (ActionContext::Global, ActionId::QuitOrStop),
+            (ActionContext::Global, ActionId::ShowHelp),
+            (ActionContext::ServeOffer, ActionId::Confirm),
+            (ActionContext::ServeOffer, ActionId::Reject),
+            (ActionContext::QuestionOptions, ActionId::Activate),
+            (ActionContext::QuestionOptions, ActionId::Cancel),
+            (ActionContext::QuestionCustom, ActionId::Activate),
+            (ActionContext::QuestionCustom, ActionId::Cancel),
+            (ActionContext::SessionDeleteConfirm, ActionId::Confirm),
+            (ActionContext::SessionDeleteConfirm, ActionId::Reject),
+            (ActionContext::ScheduleDeleteConfirm, ActionId::Confirm),
+            (ActionContext::ScheduleDeleteConfirm, ActionId::Reject),
+        ] {
+            if !self
+                .bindings
+                .iter()
+                .any(|binding| binding.context == context && binding.action == action)
+            {
+                return Err(KeymapError(format!(
+                    "required action '{}' would be unreachable in {}",
+                    action.label(),
+                    context.label()
+                )));
+            }
+        }
+
+        let mut checked = HashSet::new();
+        for binding in self
+            .bindings
+            .iter()
+            .filter(|binding| binding.source == BindingSource::Custom)
+        {
+            if !checked.insert((binding.context, binding.action)) {
+                continue;
+            }
+            let group: Vec<&Binding> = self
+                .bindings
+                .iter()
+                .filter(|candidate| {
+                    candidate.context == binding.context && candidate.action == binding.action
+                })
+                .collect();
+            if !group.is_empty()
+                && group.iter().all(|candidate| {
+                    candidate
+                        .sequence
+                        .0
+                        .iter()
+                        .any(KeyStroke::is_protocol_dependent)
+                })
+            {
+                return Err(KeymapError(format!(
+                    "{} / {} relies only on terminal-protocol-dependent keys; add an Alt, leader, or function-key fallback",
+                    binding.context.label(),
+                    binding.action.label()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        contexts: &[ActionContext],
+        pending: &mut Option<PendingSequence>,
+        event: KeyEvent,
+        now: Instant,
+    ) -> KeyResolution {
+        let stroke = KeyStroke::from_event(event);
+        if let Some(current) = pending.as_ref() {
+            if current.focus_contexts != contexts {
+                *pending = None;
+                return KeyResolution::Cancelled(
+                    "Key sequence cancelled because focus changed".to_string(),
+                );
+            }
+            let candidate_contexts = current
+                .contexts
+                .iter()
+                .copied()
+                .filter(|context| contexts.contains(context))
+                .collect::<Vec<_>>();
+            if candidate_contexts.is_empty() {
+                *pending = None;
+                return KeyResolution::Cancelled(
+                    "Key sequence cancelled because focus changed".to_string(),
+                );
+            }
+            if now.duration_since(current.started_at) >= self.timeout {
+                let display = current.sequence.display();
+                *pending = None;
+                return KeyResolution::Cancelled(format!("Key sequence '{display}' timed out"));
+            }
+            if stroke.code == KeyCode::Esc && stroke.modifiers.is_empty() {
+                *pending = None;
+                return KeyResolution::Cancelled("Key sequence cancelled".to_string());
+            }
+            let mut sequence = current.sequence.clone();
+            sequence.0.push(stroke);
+            return self.resolve_sequence(&candidate_contexts, contexts, sequence, pending, now);
+        }
+
+        let sequence = KeySequence(vec![stroke]);
+        let candidate_contexts = contexts
+            .iter()
+            .copied()
+            .filter(|context| {
+                self.bindings.iter().any(|binding| {
+                    binding.context == *context && sequence.is_prefix_of(&binding.sequence)
+                })
+            })
+            .collect::<Vec<_>>();
+        if !candidate_contexts.is_empty() {
+            return self.resolve_sequence(&candidate_contexts, contexts, sequence, pending, now);
+        }
+        KeyResolution::NoMatch
+    }
+
+    fn resolve_sequence(
+        &self,
+        candidate_contexts: &[ActionContext],
+        focus_contexts: &[ActionContext],
+        sequence: KeySequence,
+        pending: &mut Option<PendingSequence>,
+        now: Instant,
+    ) -> KeyResolution {
+        for context in candidate_contexts {
+            if let Some(binding) = self
+                .bindings
+                .iter()
+                .find(|binding| binding.context == *context && binding.sequence == sequence)
+            {
+                *pending = None;
+                return KeyResolution::Action {
+                    context: *context,
+                    action: binding.action,
+                };
+            }
+        }
+        let candidate_contexts = candidate_contexts
+            .iter()
+            .copied()
+            .filter(|context| {
+                self.bindings.iter().any(|binding| {
+                    binding.context == *context && sequence.is_prefix_of(&binding.sequence)
+                })
+            })
+            .collect::<Vec<_>>();
+        if !candidate_contexts.is_empty() {
+            let display = sequence.display();
+            *pending = Some(PendingSequence {
+                contexts: candidate_contexts,
+                focus_contexts: focus_contexts.to_vec(),
+                sequence,
+                started_at: now,
+            });
+            return KeyResolution::Pending(format!(
+                "Leader {display} — waiting for next key (Esc cancels)"
+            ));
+        }
+        let display = sequence.display();
+        *pending = None;
+        KeyResolution::Cancelled(format!("No action is bound to '{display}'"))
+    }
+
+    pub(crate) fn expire(
+        &self,
+        pending: &mut Option<PendingSequence>,
+        now: Instant,
+    ) -> Option<String> {
+        let current = pending.as_ref()?;
+        if now.duration_since(current.started_at) < self.timeout {
+            return None;
+        }
+        let display = current.sequence.display();
+        *pending = None;
+        Some(format!("Key sequence '{display}' timed out"))
+    }
+
+    pub(crate) fn hint(&self, context: ActionContext, action: ActionId) -> String {
+        let labels = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.context == context && binding.action == action)
+            .map(|binding| binding.sequence.display())
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            "unbound".to_string()
+        } else {
+            labels.join("/")
+        }
+    }
+
+    pub(crate) fn action_hint(&self, action: ActionId) -> Option<String> {
+        let labels = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.action == action)
+            .map(|binding| binding.sequence.display())
+            .collect::<Vec<_>>();
+        (!labels.is_empty()).then(|| labels.join("/"))
+    }
+
+    pub(crate) fn help_entries(&self) -> Vec<HelpEntry> {
+        let mut entries = vec![HelpEntry {
+            keys: self.leader.display(),
+            description: "Global · Leader prefix for conflict-safe alternatives".to_string(),
+        }];
+        for context in ActionContext::ALL {
+            for spec in ACTION_SPECS {
+                let keys = self.hint(context, spec.id);
+                if keys == "unbound" {
+                    continue;
+                }
+                entries.push(HelpEntry {
+                    keys,
+                    description: format!("{} · {}", context.label(), spec.label),
+                });
+            }
+        }
+        entries
+    }
+
+    #[cfg(test)]
+    fn leader_label(&self) -> String {
+        self.leader.display()
+    }
+}
+
+pub(crate) fn text_character(event: KeyEvent) -> Option<char> {
+    if event
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match event.code {
+        KeyCode::Char(character) => Some(character),
+        _ => None,
+    }
+}
+
+fn split_binding_list(bindings: &str) -> Result<Vec<String>, KeymapError> {
+    let values = bindings
+        .split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Err(KeymapError("binding list is empty".to_string()))
+    } else {
+        Ok(values)
+    }
+}
+
+fn parse_sequence(value: &str, leader: &KeyStroke) -> Result<KeySequence, KeymapError> {
+    let mut strokes = Vec::new();
+    for token in value.split_whitespace() {
+        if token.eq_ignore_ascii_case("leader") {
+            strokes.push(leader.clone());
+        } else {
+            strokes.push(parse_stroke(token).map_err(|error| {
+                KeymapError(format!("invalid key sequence '{value}': {error}"))
+            })?);
+        }
+    }
+    if strokes.is_empty() {
+        return Err(KeymapError("key sequence is empty".to_string()));
+    }
+    Ok(KeySequence(strokes))
+}
+
+fn parse_stroke(value: &str) -> Result<KeyStroke, KeymapError> {
+    let parts = value.split('+').collect::<Vec<_>>();
+    let (code_name, modifier_names) = parts
+        .split_last()
+        .ok_or_else(|| KeymapError("key is empty".to_string()))?;
+    if code_name.is_empty() {
+        return Err(KeymapError("key code is empty".to_string()));
+    }
+    let mut modifiers = KeyModifiers::empty();
+    for modifier in modifier_names {
+        let flag = match modifier.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => KeyModifiers::CONTROL,
+            "alt" | "option" => KeyModifiers::ALT,
+            "shift" => KeyModifiers::SHIFT,
+            _ => {
+                return Err(KeymapError(format!(
+                    "unknown modifier '{modifier}' (use Ctrl, Alt, or Shift)"
+                )))
+            }
+        };
+        if modifiers.contains(flag) {
+            return Err(KeymapError(format!("duplicate modifier '{modifier}'")));
+        }
+        modifiers.insert(flag);
+    }
+
+    let lowered = code_name.to_ascii_lowercase();
+    let mut code = match lowered.as_str() {
+        "backspace" => KeyCode::Backspace,
+        "enter" | "return" => KeyCode::Enter,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdown" => KeyCode::PageDown,
+        "tab" if modifiers.contains(KeyModifiers::SHIFT) => {
+            modifiers.remove(KeyModifiers::SHIFT);
+            KeyCode::BackTab
+        }
+        "tab" => KeyCode::Tab,
+        "delete" | "del" => KeyCode::Delete,
+        "insert" | "ins" => KeyCode::Insert,
+        "esc" | "escape" => KeyCode::Esc,
+        "space" => KeyCode::Char(' '),
+        "plus" => KeyCode::Char('+'),
+        _ if lowered.starts_with('f') => {
+            let number = lowered[1..]
+                .parse::<u8>()
+                .map_err(|_| KeymapError(format!("unknown key code '{code_name}'")))?;
+            if !(1..=24).contains(&number) {
+                return Err(KeymapError("function key must be F1..F24".to_string()));
+            }
+            KeyCode::F(number)
+        }
+        _ => {
+            let mut characters = code_name.chars();
+            let character = characters
+                .next()
+                .filter(|_| characters.next().is_none())
+                .ok_or_else(|| KeymapError(format!("unknown key code '{code_name}'")))?;
+            KeyCode::Char(character.to_ascii_lowercase())
+        }
+    };
+    if let KeyCode::Char(character) = code {
+        if !character.is_ascii_alphabetic() {
+            modifiers.remove(KeyModifiers::SHIFT);
+        }
+        code = KeyCode::Char(character.to_ascii_lowercase());
+    }
+    Ok(KeyStroke { code, modifiers })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn every_action_has_exactly_one_registry_spec() {
+        let unique = ACTION_SPECS
+            .iter()
+            .map(|spec| spec.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), ACTION_SPECS.len());
+        for action in unique {
+            assert!(!action.label().is_empty());
+            assert!(!action.description().is_empty());
+        }
+        assert_eq!(ActionId::SwitchTab1.key(), "switch-tab-1");
+        assert_eq!(ActionId::QuickAnswer9.key(), "quick-answer-9");
+    }
+
+    #[test]
+    fn every_context_has_resolvable_default_bindings() {
+        let keymap = Keymap::default();
+        for context in ActionContext::ALL {
+            let context_bindings = keymap
+                .bindings
+                .iter()
+                .filter(|binding| binding.context == context)
+                .collect::<Vec<_>>();
+            assert!(
+                !context_bindings.is_empty(),
+                "{} has no default bindings",
+                context.label()
+            );
+            for binding in context_bindings {
+                let mut pending = None;
+                let now = Instant::now();
+                let mut resolution = KeyResolution::NoMatch;
+                for (index, stroke) in binding.sequence.0.iter().enumerate() {
+                    resolution = keymap.resolve(
+                        &[context],
+                        &mut pending,
+                        key(stroke.code, stroke.modifiers),
+                        now + Duration::from_millis(index as u64),
+                    );
+                }
+                assert_eq!(
+                    resolution,
+                    KeyResolution::Action {
+                        context,
+                        action: binding.action,
+                    },
+                    "{} did not resolve {}",
+                    binding.sequence.display(),
+                    binding.action.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conversation_block_activate_remains_reachable() {
+        let keymap = Keymap::default();
+        let mut pending = None;
+        assert_eq!(
+            keymap.resolve(
+                &[
+                    ActionContext::ConversationBlock,
+                    ActionContext::Chat,
+                    ActionContext::Global
+                ],
+                &mut pending,
+                key(KeyCode::Enter, KeyModifiers::empty()),
+                Instant::now(),
+            ),
+            KeyResolution::Action {
+                context: ActionContext::ConversationBlock,
+                action: ActionId::Activate,
+            }
+        );
+    }
+
+    #[test]
+    fn defaults_have_safe_leader_and_required_fallbacks() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.leader_label(), "Ctrl+\\");
+        assert!(keymap
+            .hint(ActionContext::Global, ActionId::ReopenPendingQuestion)
+            .contains("Ctrl+\\ q"));
+        assert!(keymap
+            .hint(ActionContext::Global, ActionId::StopRun)
+            .contains("Ctrl+\\ s"));
+        assert!(keymap
+            .hint(ActionContext::ConfigEditor, ActionId::SaveConfig)
+            .contains("F2"));
+        assert!(keymap
+            .hint(ActionContext::Chat, ActionId::InsertNewline)
+            .starts_with("Alt+Enter"));
+    }
+
+    #[test]
+    fn leader_sequence_resolves_and_escape_cancels() {
+        let keymap = Keymap::default();
+        let now = Instant::now();
+        let mut pending = None;
+        let first = keymap.resolve(
+            &[ActionContext::Global],
+            &mut pending,
+            key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            now,
+        );
+        assert!(matches!(first, KeyResolution::Pending(_)));
+        let second = keymap.resolve(
+            &[ActionContext::Global],
+            &mut pending,
+            key(KeyCode::Char('h'), KeyModifiers::empty()),
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(
+            second,
+            KeyResolution::Action {
+                context: ActionContext::Global,
+                action: ActionId::ShowHelp,
+            }
+        );
+
+        let _ = keymap.resolve(
+            &[ActionContext::Global],
+            &mut pending,
+            key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            now,
+        );
+        let cancelled = keymap.resolve(
+            &[ActionContext::Global],
+            &mut pending,
+            key(KeyCode::Esc, KeyModifiers::empty()),
+            now + Duration::from_millis(10),
+        );
+        assert!(matches!(cancelled, KeyResolution::Cancelled(_)));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn shared_leader_keeps_local_and_global_context_candidates() {
+        let keymap = Keymap::default();
+        let now = Instant::now();
+        let contexts = [ActionContext::Chat, ActionContext::Global];
+
+        let mut pending = None;
+        assert!(matches!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+                now,
+            ),
+            KeyResolution::Pending(_)
+        ));
+        assert_eq!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('h'), KeyModifiers::empty()),
+                now,
+            ),
+            KeyResolution::Action {
+                context: ActionContext::Global,
+                action: ActionId::ShowHelp,
+            }
+        );
+
+        assert!(matches!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+                now,
+            ),
+            KeyResolution::Pending(_)
+        ));
+        assert_eq!(
+            keymap.resolve(
+                &contexts,
+                &mut pending,
+                key(KeyCode::Char('x'), KeyModifiers::empty()),
+                now,
+            ),
+            KeyResolution::Action {
+                context: ActionContext::Chat,
+                action: ActionId::ToggleDetails,
+            }
+        );
+    }
+
+    #[test]
+    fn focus_change_cancels_a_pending_sequence_even_when_global_remains() {
+        let keymap = Keymap::default();
+        let now = Instant::now();
+        let mut pending = None;
+        assert!(matches!(
+            keymap.resolve(
+                &[ActionContext::Chat, ActionContext::Global],
+                &mut pending,
+                key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+                now,
+            ),
+            KeyResolution::Pending(_)
+        ));
+
+        let result = keymap.resolve(
+            &[ActionContext::QuestionOptions, ActionContext::Global],
+            &mut pending,
+            key(KeyCode::Char('h'), KeyModifiers::empty()),
+            now + Duration::from_millis(10),
+        );
+        assert!(
+            matches!(result, KeyResolution::Cancelled(message) if message.contains("focus changed"))
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn leader_timeout_is_bounded_and_reported() {
+        let keymap = Keymap::default();
+        let now = Instant::now();
+        let mut pending = None;
+        let _ = keymap.resolve(
+            &[ActionContext::Global],
+            &mut pending,
+            key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            now,
+        );
+        let message = keymap
+            .expire(&mut pending, now + Duration::from_millis(1_001))
+            .expect("sequence should expire");
+        assert!(message.contains("timed out"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn context_precedence_keeps_question_digits_out_of_navigation() {
+        let keymap = Keymap::default();
+        let mut pending = None;
+        let resolved = keymap.resolve(
+            &[
+                ActionContext::QuestionOptions,
+                ActionContext::Navigation,
+                ActionContext::Global,
+            ],
+            &mut pending,
+            key(KeyCode::Char('3'), KeyModifiers::empty()),
+            Instant::now(),
+        );
+        assert_eq!(
+            resolved,
+            KeyResolution::Action {
+                context: ActionContext::QuestionOptions,
+                action: ActionId::QuickAnswer3,
+            }
+        );
+    }
+
+    #[test]
+    fn custom_remap_and_unbind_replace_only_one_context() {
+        let keymap = Keymap::from_json(
+            r#"{
+                "leader": "Alt+Space",
+                "leader_timeout_ms": 750,
+                "bindings": [
+                    {"context":"global", "action":"show-notifications", "keys":["F8", "Leader l"]},
+                    {"context":"navigation", "action":"show-help", "unbind":true}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            keymap.hint(ActionContext::Global, ActionId::ShowNotifications),
+            "F8/Alt+Space l"
+        );
+        assert_eq!(
+            keymap.hint(ActionContext::Navigation, ActionId::ShowHelp),
+            "unbound"
+        );
+        assert!(keymap
+            .hint(ActionContext::Global, ActionId::ShowHelp)
+            .contains("F1"));
+    }
+
+    #[test]
+    fn unsupported_config_version_is_actionable() {
+        let error = Keymap::from_json(r#"{"version":2}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported keymap version 2"));
+        assert!(error.contains("expected 1"));
+    }
+
+    #[test]
+    fn invalid_maps_reject_conflicts_reserved_and_unreachable_required_actions() {
+        let conflict = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"global","action":"show-help","keys":["F8"]},
+                {"context":"global","action":"show-notifications","keys":["F8"]}
+            ]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(conflict.contains("conflict"));
+
+        let reserved = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"global","action":"show-notifications","keys":["Ctrl+S"]}
+            ]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(reserved.contains("reserved"));
+
+        let required = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"question-options","action":"activate","unbind":true}
+            ]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(required.contains("required action"));
+    }
+
+    #[test]
+    fn invalid_map_load_falls_back_without_losing_quit_or_help() {
+        let temp = std::env::temp_dir().join(format!(
+            "bamboo-tui-keymap-{}-{}.json",
+            std::process::id(),
+            UtcLikeCounter::next()
+        ));
+        std::fs::write(&temp, "{not json").unwrap();
+        let (keymap, warning) = Keymap::load(Some(&temp));
+        std::fs::remove_file(&temp).unwrap();
+        assert!(warning.unwrap().contains("using conflict-safe defaults"));
+        assert_ne!(
+            keymap.hint(ActionContext::Global, ActionId::QuitOrStop),
+            "unbound"
+        );
+        assert_ne!(
+            keymap.hint(ActionContext::Global, ActionId::ShowHelp),
+            "unbound"
+        );
+    }
+
+    struct UtcLikeCounter;
+
+    impl UtcLikeCounter {
+        fn next() -> u64 {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn shift_enter_requires_a_terminal_independent_fallback() {
+        let error = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"chat","action":"insert-newline","keys":["Shift+Enter"]}
+            ]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("terminal-protocol-dependent"));
+    }
+
+    #[test]
+    fn help_is_generated_from_resolved_custom_bindings() {
+        let keymap = Keymap::from_json(
+            r#"{"bindings":[
+                {"context":"sessions","action":"delete-selection","keys":["F9"]}
+            ]}"#,
+        )
+        .unwrap();
+        let entries = keymap.help_entries();
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.keys == "F9" && entry.description.contains("Delete selection") }));
+        assert!(!entries.iter().any(|entry| {
+            entry.keys == "d" && entry.description.contains("Sessions · Delete selection")
+        }));
+    }
+}

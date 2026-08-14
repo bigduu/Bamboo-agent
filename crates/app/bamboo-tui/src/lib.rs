@@ -16,12 +16,14 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 
 mod api;
 mod app;
 mod components;
 mod event;
 mod history;
+mod keymap;
 mod search;
 mod text;
 mod theme;
@@ -50,6 +52,9 @@ pub struct TuiOptions {
     /// Terminal colour strategy. `None` preserves true colour unless the
     /// conventional `NO_COLOR` environment variable is present.
     pub theme: Option<ThemePalette>,
+    /// Optional JSON keymap override. Invalid maps are reported inside the
+    /// TUI and fall back atomically to the conflict-safe defaults.
+    pub keymap: Option<PathBuf>,
 }
 
 impl Default for TuiOptions {
@@ -60,6 +65,7 @@ impl Default for TuiOptions {
             model: None,
             auto_serve: AutoServeMode::Prompt,
             theme: None,
+            keymap: None,
         }
     }
 }
@@ -78,6 +84,10 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
 
     let palette =
         theme::resolve_initial_palette(opts.theme, std::env::var_os("NO_COLOR").is_some());
+    let keymap_path = opts
+        .keymap
+        .or_else(|| std::env::var_os("BAMBOO_TUI_KEYMAP").map(PathBuf::from));
+    let (keymap, keymap_warning) = keymap::Keymap::load(keymap_path.as_deref());
 
     // Setup terminal.
     enable_raw_mode()?;
@@ -90,6 +100,7 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
     let client = api::BambooClient::new(&opts.server_url);
     let mut app = app::App::new(client);
     app.set_theme(palette);
+    app.set_keymap(keymap, keymap_warning);
 
     // Apply options.
     if let Some(session_id) = opts.session_id {

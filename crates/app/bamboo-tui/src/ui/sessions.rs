@@ -6,6 +6,7 @@ use ratatui::Frame;
 
 use crate::api::types::SessionSummary;
 use crate::app::App;
+use crate::keymap::{ActionContext, ActionId};
 use crate::text;
 use crate::theme::colors;
 
@@ -25,8 +26,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 
     if app.sessions.sessions.is_empty() {
-        let empty = Paragraph::new("No sessions found.\n\nPress 'r' to refresh.")
-            .style(Style::default().fg(colors::inactive()));
+        let empty = Paragraph::new(format!(
+            "No sessions found.\n\nPress {} to refresh.",
+            app.key_hint(ActionContext::Sessions, ActionId::Refresh)
+        ))
+        .style(Style::default().fg(colors::inactive()));
         f.render_widget(empty, area);
         return;
     }
@@ -58,11 +62,29 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled("[r] Refresh", Style::default().fg(colors::inactive())),
+            Span::styled(
+                format!(
+                    "[{}] Refresh",
+                    app.key_hint(ActionContext::Sessions, ActionId::Refresh)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
             Span::raw("  "),
-            Span::styled("[d] Delete", Style::default().fg(colors::inactive())),
+            Span::styled(
+                format!(
+                    "[{}] Delete",
+                    app.key_hint(ActionContext::Sessions, ActionId::DeleteSelection)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
             Span::raw("  "),
-            Span::styled("[Enter] Open", Style::default().fg(colors::inactive())),
+            Span::styled(
+                format!(
+                    "[{}] Open",
+                    app.key_hint(ActionContext::Sessions, ActionId::Activate)
+                ),
+                Style::default().fg(colors::inactive()),
+            ),
         ])
     };
     let header = Paragraph::new(header);
@@ -97,18 +119,23 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let page = app.sessions.offset / limit + 1;
     let pages = app.sessions.total.saturating_sub(1) / limit + 1;
     let page_info = Paragraph::new(format!(
-        " page {}/{} · total {} · [ ] to page",
-        page, pages, app.sessions.total
+        " page {}/{} · total {} · {}/{} to page",
+        page,
+        pages,
+        app.sessions.total,
+        app.key_hint(ActionContext::Sessions, ActionId::PreviousPage),
+        app.key_hint(ActionContext::Sessions, ActionId::NextPage),
     ))
     .style(Style::default().fg(colors::subtle()));
     f.render_widget(page_info, chunks[2]);
 
     // Footer
-    let footer_text = if area.width < 80 {
-        " Enter open · d delete · r refresh"
-    } else {
-        " [Enter] Open in Chat · [d] Delete · [r] Refresh"
-    };
+    let footer_text = format!(
+        " {} open · {} delete · {} refresh",
+        app.key_hint(ActionContext::Sessions, ActionId::Activate),
+        app.key_hint(ActionContext::Sessions, ActionId::DeleteSelection),
+        app.key_hint(ActionContext::Sessions, ActionId::Refresh),
+    );
     let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[3]);
 }
