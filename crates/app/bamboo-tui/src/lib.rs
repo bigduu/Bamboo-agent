@@ -23,10 +23,12 @@ mod components;
 mod event;
 mod history;
 mod search;
+mod text;
 mod theme;
 mod ui;
 
 pub use app::AutoServeMode;
+pub use theme::ThemePalette;
 
 /// Default `--server-url`: the concrete loopback IPv4 (not `localhost`, which
 /// resolves to `::1` first on dual-stack hosts while the server default-binds
@@ -45,6 +47,9 @@ pub struct TuiOptions {
     /// How an unreachable loopback `server_url` is handled at startup:
     /// spawn a local `bamboo serve` automatically, offer y/n, or never.
     pub auto_serve: AutoServeMode,
+    /// Terminal colour strategy. `None` preserves true colour unless the
+    /// conventional `NO_COLOR` environment variable is present.
+    pub theme: Option<ThemePalette>,
 }
 
 impl Default for TuiOptions {
@@ -54,6 +59,7 @@ impl Default for TuiOptions {
             session_id: None,
             model: None,
             auto_serve: AutoServeMode::Prompt,
+            theme: None,
         }
     }
 }
@@ -70,6 +76,9 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
         anyhow::bail!("bamboo tui requires an interactive terminal (stdin/stdout is not a TTY)");
     }
 
+    let palette =
+        theme::resolve_initial_palette(opts.theme, std::env::var_os("NO_COLOR").is_some());
+
     // Setup terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -80,6 +89,7 @@ pub async fn run(opts: TuiOptions) -> Result<()> {
     // Create client and app.
     let client = api::BambooClient::new(&opts.server_url);
     let mut app = app::App::new(client);
+    app.set_theme(palette);
 
     // Apply options.
     if let Some(session_id) = opts.session_id {

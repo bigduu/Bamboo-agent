@@ -3,7 +3,7 @@
 //! `bamboo tui` subcommand; keep the flag surfaces in lock-step.
 
 use anyhow::Result;
-use bamboo_tui::{AutoServeMode, TuiOptions};
+use bamboo_tui::{AutoServeMode, ThemePalette, TuiOptions};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -25,6 +25,11 @@ struct Cli {
     /// Model to use
     #[arg(short, long)]
     model: Option<String>,
+
+    /// Colour palette: truecolor, system (terminal ANSI colours), or no-color.
+    /// `NO_COLOR` selects no-color when this flag is omitted.
+    #[arg(long)]
+    theme: Option<ThemePalette>,
 
     /// If `--server-url` is unreachable and loopback, start a local `bamboo
     /// serve` automatically instead of asking (y/n). No effect for a remote
@@ -55,6 +60,7 @@ async fn main() -> Result<()> {
         session_id: cli.session_id,
         model: cli.model,
         auto_serve,
+        theme: cli.theme,
     })
     .await
 }

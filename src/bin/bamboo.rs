@@ -220,6 +220,11 @@ enum Commands {
         #[arg(short, long)]
         model: Option<String>,
 
+        /// Colour palette: truecolor, system (terminal ANSI colours), or
+        /// no-color. `NO_COLOR` selects no-color when omitted.
+        #[arg(long)]
+        theme: Option<bamboo_tui::ThemePalette>,
+
         /// If `--server-url` is unreachable and loopback, start a local
         /// `bamboo serve` automatically instead of asking (y/n). No effect for
         /// a remote (non-loopback) `--server-url` — that always just warns.
@@ -1517,6 +1522,7 @@ async fn run() {
             server_url,
             session_id,
             model,
+            theme,
             auto_serve,
             no_auto_serve,
         } => {
@@ -1535,6 +1541,7 @@ async fn run() {
                 session_id,
                 model,
                 auto_serve,
+                theme,
             })
             .await;
             if let Err(e) = result {
@@ -2289,6 +2296,7 @@ mod tests {
             "server_url",
             "session_id",
             "model",
+            "theme",
             "auto_serve",
             "no_auto_serve",
         ] {

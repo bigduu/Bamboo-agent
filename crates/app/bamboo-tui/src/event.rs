@@ -16,7 +16,7 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     /// Terminal resized; the next loop iteration redraws at the new size (the
     /// dimensions themselves aren't needed — ratatui re-measures on draw).
-    Resize,
+    Resize(u16, u16),
 
     // ── Non-blocking API results (posted by spawned tasks) ──
     SessionsLoaded(Loaded<ListSessionsEnvelope>),
@@ -43,6 +43,12 @@ pub enum AppEvent {
         session_id: String,
         result: Loaded<()>,
         session_picker_epoch: Option<u64>,
+    },
+    /// A schedule DELETE finished. Retaining the id prevents repeated confirm
+    /// keystrokes from issuing concurrent DELETE requests for the same row.
+    ScheduleDeleted {
+        schedule_id: String,
+        result: Loaded<()>,
     },
     /// A chat turn was created + started. The optimistic assistant turn id
     /// binds this late HTTP result to the draft that originated it.

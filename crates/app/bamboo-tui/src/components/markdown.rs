@@ -38,13 +38,13 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
         if let Some((level, content)) = heading(body) {
             let style = if level <= 1 {
                 Style::default()
-                    .fg(colors::BRAND)
+                    .fg(colors::brand())
                     .add_modifier(Modifier::BOLD)
             } else if level == 2 {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(colors::INACTIVE)
+                    .fg(colors::inactive())
                     .add_modifier(Modifier::BOLD)
             };
             let mut spans = vec![Span::styled(content.to_string(), style)];
@@ -63,7 +63,7 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
         {
             let mut spans = vec![Span::styled(
                 format!("{indent}│ "),
-                Style::default().fg(colors::THINKING),
+                Style::default().fg(colors::thinking()),
             )];
             spans.extend(parse_inline(content));
             lines.push(Line::from(spans));
@@ -74,7 +74,7 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
         if let Some((num, content)) = ordered_item(body) {
             let mut spans = vec![Span::styled(
                 format!("{indent}  {num}. "),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )];
             spans.extend(parse_inline(content));
             lines.push(Line::from(spans));
@@ -85,7 +85,7 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
         if let Some(content) = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")) {
             let mut spans = vec![Span::styled(
                 format!("{indent}  • "),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )];
             spans.extend(parse_inline(content));
             lines.push(Line::from(spans));
@@ -138,25 +138,30 @@ fn ordered_item(body: &str) -> Option<(&str, &str)> {
 
 fn render_code_block(lines: &mut Vec<Line>, code_lines: &[String], width: usize) {
     let inner_width = width.saturating_sub(4);
-    let top_border = format!("┌{}┐", "─".repeat(inner_width));
-    let bottom_border = format!("└{}┘", "─".repeat(inner_width));
+    // The content rows reserve one space on either side of the code. Keep the
+    // horizontal borders at the same terminal-cell width as those rows.
+    let border_width = inner_width.saturating_add(2);
+    let top_border = format!("┌{}┐", "─".repeat(border_width));
+    let bottom_border = format!("└{}┘", "─".repeat(border_width));
 
     lines.push(Line::from(Span::styled(
         top_border,
-        Style::default().fg(colors::CODE_BORDER),
+        Style::default().fg(colors::code_border()),
     )));
 
     for code_line in code_lines {
-        let padded = format!("│ {:<width$} │", code_line, width = inner_width);
+        let visible = crate::text::clip_cells(code_line, inner_width);
+        let padding = inner_width.saturating_sub(crate::text::display_width(&visible));
+        let padded = format!("│ {visible}{} │", " ".repeat(padding));
         lines.push(Line::from(Span::styled(
             padded,
-            Style::default().fg(colors::INACTIVE),
+            Style::default().fg(colors::inactive()),
         )));
     }
 
     lines.push(Line::from(Span::styled(
         bottom_border,
-        Style::default().fg(colors::CODE_BORDER),
+        Style::default().fg(colors::code_border()),
     )));
 }
 
@@ -183,7 +188,7 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
             spans.push(Span::styled(
                 code,
                 Style::default()
-                    .fg(colors::INACTIVE)
+                    .fg(colors::inactive())
                     .add_modifier(Modifier::REVERSED),
             ));
             continue;
@@ -196,13 +201,13 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
                 spans.push(Span::styled(
                     label,
                     Style::default()
-                        .fg(colors::BRAND)
+                        .fg(colors::brand())
                         .add_modifier(Modifier::UNDERLINED),
                 ));
                 if !url.is_empty() {
                     spans.push(Span::styled(
                         format!(" ({url})"),
-                        Style::default().fg(colors::SUBTLE),
+                        Style::default().fg(colors::subtle()),
                     ));
                 }
                 continue;
@@ -357,5 +362,16 @@ mod tests {
     fn italic_and_bold_distinct() {
         let out = render("_em_ and **strong** and `code`");
         assert_eq!(out[0], "em and strong and code");
+    }
+
+    #[test]
+    fn unicode_code_block_borders_share_one_cell_width() {
+        let rendered = render_markdown("```\n界e\u{301}👨‍👩‍👧‍👦\n```", 18);
+        let widths = rendered
+            .iter()
+            .map(|line| crate::text::display_width(&text_of(line)))
+            .collect::<Vec<_>>();
+        assert!(widths.iter().all(|width| *width == widths[0]), "{widths:?}");
+        assert_eq!(widths[0], 18);
     }
 }
