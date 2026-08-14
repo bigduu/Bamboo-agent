@@ -153,9 +153,7 @@ pub(crate) fn make_disabled_filter_resolver(
 
 pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
     if let Some(config) = args.state.permission_checker.permission_config() {
-        if let Some(workspace) = args.session.workspace.as_deref() {
-            config.register_session_workspace(args.session_id.clone(), workspace.to_string());
-        }
+        config.set_session_workspace(args.session_id.clone(), args.session.workspace.clone());
         if let Err(error) =
             record_bamboo_runtime_permission_metadata(&mut args.session, config.as_ref())
         {

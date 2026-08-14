@@ -143,6 +143,49 @@ pub enum AgentEvent {
         #[serde(default)]
         source: Option<String>,
     },
+    /// A parent-session tool was stopped at Bamboo's typed permission gate.
+    /// The authoritative request contract is fetched from the pending endpoint;
+    /// this event is an early, argument-bearing signal used to trigger that
+    /// reconciliation without interpreting clarification display text.
+    ToolApprovalRequested {
+        tool_call_id: String,
+        tool_name: String,
+        #[serde(default)]
+        parameters: serde_json::Value,
+    },
+    /// An out-of-process child agent is waiting for a checked one-shot human
+    /// decision. The child/session/request tuple is the protocol identity.
+    ChildApprovalRequested {
+        child_session_id: String,
+        request_id: String,
+        tool_name: String,
+        permission: String,
+        resource: String,
+    },
+    /// Durable lifecycle update for a child approval. Optional/default fields
+    /// keep older persisted critical-event frames replayable.
+    ChildApprovalChanged {
+        parent_session_id: String,
+        child_session_id: String,
+        #[serde(default)]
+        child_attempt: u32,
+        request_id: String,
+        #[serde(default)]
+        version: u64,
+        status: String,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        tool_name: String,
+        #[serde(default)]
+        permission: String,
+        #[serde(default)]
+        resource: String,
+        #[serde(default)]
+        created_at: String,
+        #[serde(default)]
+        resolved_at: Option<String>,
+    },
     ToolLifecycle {
         tool_call_id: String,
         tool_name: String,
@@ -287,6 +330,70 @@ mod clarification_event_tests {
                 tool_call_id: None,
                 tool_name: None,
                 source: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn approval_events_preserve_protocol_identity_and_payload() {
+        let parent: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "tool_approval_requested",
+            "tool_call_id": "call-parent",
+            "tool_name": "Bash",
+            "parameters": {"command": "git push"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            parent,
+            AgentEvent::ToolApprovalRequested {
+                tool_call_id,
+                tool_name,
+                parameters,
+            } if tool_call_id == "call-parent"
+                && tool_name == "Bash"
+                && parameters["command"] == "git push"
+        ));
+
+        let child: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "child_approval_requested",
+            "child_session_id": "child-1",
+            "request_id": "request-7",
+            "tool_name": "Write",
+            "permission": "write_file",
+            "resource": "/tmp/result.txt"
+        }))
+        .unwrap();
+        assert!(matches!(
+            child,
+            AgentEvent::ChildApprovalRequested {
+                child_session_id,
+                request_id,
+                resource,
+                ..
+            } if child_session_id == "child-1"
+                && request_id == "request-7"
+                && resource == "/tmp/result.txt"
+        ));
+    }
+
+    #[test]
+    fn older_child_approval_change_defaults_new_fields() {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "child_approval_changed",
+            "parent_session_id": "parent-1",
+            "child_session_id": "child-1",
+            "request_id": "request-7",
+            "status": "denied"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::ChildApprovalChanged {
+                child_attempt: 0,
+                version: 0,
+                reason: None,
+                resolved_at: None,
                 ..
             }
         ));

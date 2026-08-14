@@ -2,6 +2,7 @@ pub mod chat;
 pub mod config;
 pub mod layout;
 pub mod mcp;
+pub mod permissions;
 pub mod schedules;
 pub mod sessions;
 pub mod skills;
@@ -32,6 +33,9 @@ fn render_with_palette(f: &mut Frame, app: &App) {
         crate::app::Tab::Mcp => mcp::render(f, chunks.content, app),
         crate::app::Tab::Schedules => schedules::render(f, chunks.content, app),
         crate::app::Tab::Skills => skills::render(f, chunks.content, app),
+        crate::app::Tab::Config if app.config.view == crate::app::ConfigView::Permissions => {
+            permissions::render(f, chunks.content, app)
+        }
         crate::app::Tab::Config => config::render(f, chunks.content, app),
     }
 
@@ -52,6 +56,14 @@ fn render_with_palette(f: &mut Frame, app: &App) {
         config::render_editor(f, app);
     }
 
+    if app.permission_editor.is_some() {
+        permissions::render_editor(f, app);
+    }
+
+    if app.permission_rule_confirm.is_some() {
+        permissions::render_rule_confirm(f, app);
+    }
+
     if app.schedule_form.is_some() {
         layout::render_schedule_form(f, app);
     }
@@ -70,6 +82,14 @@ fn render_with_palette(f: &mut Frame, app: &App) {
 
     if app.pending_delete.is_some() || app.pending_schedule_delete.is_some() {
         layout::render_delete_confirm(f, app);
+    }
+
+    if app.permission_mode_confirm.is_some() {
+        permissions::render_mode_confirm(f, app);
+    }
+
+    if app.permission_delete.is_some() {
+        permissions::render_delete_confirm(f, app);
     }
 
     if app.pending_question.is_some() {

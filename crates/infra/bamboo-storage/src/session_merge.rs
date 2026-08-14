@@ -37,19 +37,23 @@ use std::sync::Arc;
 
 use bamboo_domain::session::types::Session;
 use bamboo_domain::storage::Storage;
-use bamboo_domain::{PermissionAuditSeed, PermissionAuditSnapshot, RuntimeSessionPersistence};
+use bamboo_domain::{
+    latest_response_occurrence, PermissionAuditSeed, PermissionAuditSnapshot, ResponseOccurrence,
+    RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
+};
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
-const CONSUMED_CLARIFICATION_IDS_KEY: &str = "clarification.consumed_tool_call_ids";
 const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     CONSUMED_CLARIFICATION_IDS_KEY,
+    CONSUMED_RESPONSE_OCCURRENCES_KEY,
     "runtime.suspend_reason",
     "clarification_resume_pending",
     "conclusion_with_options_resume_pending",
     "execute.startup_handoff_at",
     "permission.reexecute_tool_call_id",
+    "permission.reexecute_request_generation",
     "retry_resume_pending",
     "retry_resume_reason",
     "provider_name",
@@ -62,7 +66,9 @@ const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
 /// adopt the durable response control plane instead of resurrecting the ask or
 /// erasing the resume handoff. The bounded consumed-id ledger distinguishes a
 /// genuinely new pending question from an old snapshot after `pending_question`
-/// itself has been cleared.
+/// itself has been cleared. New sessions bind that ledger to the concrete
+/// tool-result message and permission generation; the id-only key is a
+/// compatibility fallback only when no occurrence ledger exists.
 fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session) -> bool {
     let Some(incoming_tool_call_id) = session
         .pending_question
@@ -71,15 +77,37 @@ fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session
     else {
         return false;
     };
-    let consumed = durable
+    let occurrence_ledger = durable
         .metadata
-        .get(CONSUMED_CLARIFICATION_IDS_KEY)
-        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default();
-    if !consumed
-        .iter()
-        .any(|tool_call_id| tool_call_id == &incoming_tool_call_id)
-    {
+        .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        .map(|value| serde_json::from_str::<Vec<ResponseOccurrence>>(value));
+    let was_consumed = match occurrence_ledger {
+        Some(Ok(consumed)) => latest_response_occurrence(session, &incoming_tool_call_id)
+            .is_some_and(|incoming| consumed.iter().any(|entry| entry == &incoming)),
+        // A present but malformed v1 ledger is never widened to the legacy
+        // id-only matcher: doing so could consume a later reused provider id.
+        Some(Err(_)) => false,
+        None => {
+            let legacy_consumed = durable
+                .metadata
+                .get(CONSUMED_CLARIFICATION_IDS_KEY)
+                .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                .unwrap_or_default()
+                .iter()
+                .any(|tool_call_id| tool_call_id == &incoming_tool_call_id);
+            // Upgrade compatibility must still bind the old id-only ledger to
+            // its concrete durable tool-result. Otherwise a provider-reused id
+            // in the next round would be mistaken for the consumed occurrence.
+            legacy_consumed
+                && latest_response_occurrence(durable, &incoming_tool_call_id).is_some_and(
+                    |durable_occurrence| {
+                        latest_response_occurrence(session, &incoming_tool_call_id)
+                            .is_some_and(|incoming| incoming == durable_occurrence)
+                    },
+                )
+        }
+    };
+    if !was_consumed {
         return false;
     }
 
@@ -1657,6 +1685,23 @@ mod tests {
         Session::new(id.to_string(), "test-model".to_string())
     }
 
+    fn typed_permission_result(
+        tool_call_id: &str,
+        message_id: &str,
+        generation: &str,
+        content: &str,
+    ) -> bamboo_domain::session::types::Message {
+        let mut message =
+            bamboo_domain::session::types::Message::tool_result(tool_call_id, content);
+        message.id = message_id.to_string();
+        message.metadata = Some(serde_json::json!({
+            "permission_request": {
+                "request_generation": generation,
+            }
+        }));
+        message
+    }
+
     fn ledger_state(state_revision: u64, marker: &str) -> bamboo_domain::ModelContextState {
         bamboo_domain::ModelContextState {
             state_revision,
@@ -1845,6 +1890,13 @@ mod tests {
         let store = LockedSessionStore::new(storage.clone());
         let session_id = "inspect-consumed-response";
         let mut stale_cached = fresh(session_id);
+        // Legacy id-only adoption is still bound to the concrete response
+        // occurrence. Real pending questions always have a paired tool-result;
+        // keep that identity in this compatibility fixture so it cannot model
+        // an unsafe id-only consume.
+        stale_cached.add_message(bamboo_domain::session::types::Message::tool_result(
+            "call-1", "waiting",
+        ));
         stale_cached.set_pending_question(
             "call-1".to_string(),
             "ConclusionWithOptions".to_string(),
@@ -2495,6 +2547,255 @@ mod tests {
         assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
         assert_eq!(saved.messages.len(), 1);
         assert_eq!(saved.messages[0].content, "Selected response: A");
+    }
+
+    #[tokio::test]
+    async fn runtime_final_save_does_not_consume_a_new_reused_permission_occurrence() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "reused-permission-final-save";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(typed_permission_result(
+            "reused-call",
+            "old-result",
+            "generation-old",
+            "Selected response: Approve",
+        ));
+        durable.metadata.insert(
+            CONSUMED_RESPONSE_OCCURRENCES_KEY.to_string(),
+            serde_json::to_string(&vec![ResponseOccurrence {
+                tool_call_id: "reused-call".to_string(),
+                tool_result_message_id: "old-result".to_string(),
+                permission_generation: Some("generation-old".to_string()),
+            }])
+            .unwrap(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut new_runner = durable;
+        new_runner.add_message(typed_permission_result(
+            "reused-call",
+            "new-result",
+            "generation-new",
+            "waiting for the new decision",
+        ));
+        new_runner.set_pending_question(
+            "reused-call".to_string(),
+            "Permission".to_string(),
+            "Approve new operation?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+        new_runner.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "awaiting_permission_approval".to_string(),
+        );
+
+        store.merge_save_runtime(&mut new_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("reused-call")
+        );
+        assert_eq!(
+            saved.messages.last().map(|message| message.id.as_str()),
+            Some("new-result")
+        );
+        assert_eq!(
+            saved.messages.last().unwrap().content,
+            "waiting for the new decision"
+        );
+        assert_eq!(
+            latest_response_occurrence(&saved, "reused-call")
+                .and_then(|occurrence| occurrence.permission_generation),
+            Some("generation-new".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_consumed_id_does_not_consume_a_new_reused_occurrence_after_upgrade() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "legacy-reused-permission-final-save";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(typed_permission_result(
+            "reused-call",
+            "old-result",
+            "generation-old",
+            "Selected response: Approve",
+        ));
+        durable.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["reused-call"]"#.to_string(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut new_runner = durable;
+        new_runner.add_message(typed_permission_result(
+            "reused-call",
+            "new-result",
+            "generation-new",
+            "waiting for the new decision",
+        ));
+        new_runner.set_pending_question(
+            "reused-call".to_string(),
+            "Permission".to_string(),
+            "Approve new operation?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+
+        store.merge_save_runtime(&mut new_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("reused-call")
+        );
+        assert_eq!(
+            saved.messages.last().map(|message| message.id.as_str()),
+            Some("new-result")
+        );
+        assert_eq!(
+            latest_response_occurrence(&saved, "reused-call")
+                .and_then(|occurrence| occurrence.permission_generation),
+            Some("generation-new".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_checkpoint_does_not_consume_a_new_reused_permission_occurrence() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "reused-permission-checkpoint";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(typed_permission_result(
+            "reused-call",
+            "old-result",
+            "generation-old",
+            "Selected response: Deny",
+        ));
+        durable.metadata.insert(
+            CONSUMED_RESPONSE_OCCURRENCES_KEY.to_string(),
+            serde_json::to_string(&vec![ResponseOccurrence {
+                tool_call_id: "reused-call".to_string(),
+                tool_result_message_id: "old-result".to_string(),
+                permission_generation: Some("generation-old".to_string()),
+            }])
+            .unwrap(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut new_runner = durable;
+        new_runner.add_message(typed_permission_result(
+            "reused-call",
+            "new-result",
+            "generation-new",
+            "waiting for the new decision",
+        ));
+        new_runner.set_pending_question(
+            "reused-call".to_string(),
+            "Permission".to_string(),
+            "Approve new operation?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+
+        store
+            .checkpoint_runtime_session(&mut new_runner)
+            .await
+            .unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("reused-call")
+        );
+        assert_eq!(
+            saved.messages.last().map(|message| message.id.as_str()),
+            Some("new-result")
+        );
+        assert_eq!(
+            latest_response_occurrence(&saved, "reused-call")
+                .and_then(|occurrence| occurrence.permission_generation),
+            Some("generation-new".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn consumed_permission_adoption_keeps_reexecute_id_and_generation_paired() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "consumed-permission-control-pair";
+
+        let mut stale_runner = fresh(session_id);
+        stale_runner.add_message(typed_permission_result(
+            "call-1",
+            "result-1",
+            "generation-1",
+            "waiting",
+        ));
+        stale_runner.set_pending_question(
+            "call-1".to_string(),
+            "Permission".to_string(),
+            "Approve?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+
+        let mut answered = stale_runner.clone();
+        answered.clear_pending_question();
+        answered.messages[0].content = "Selected response: Approve".to_string();
+        answered.metadata.insert(
+            CONSUMED_RESPONSE_OCCURRENCES_KEY.to_string(),
+            serde_json::to_string(&vec![ResponseOccurrence {
+                tool_call_id: "call-1".to_string(),
+                tool_result_message_id: "result-1".to_string(),
+                permission_generation: Some("generation-1".to_string()),
+            }])
+            .unwrap(),
+        );
+        answered.metadata.insert(
+            "permission.reexecute_tool_call_id".to_string(),
+            "call-1".to_string(),
+        );
+        answered.metadata.insert(
+            "permission.reexecute_request_generation".to_string(),
+            "generation-1".to_string(),
+        );
+        storage.save_session(&answered).await.unwrap();
+
+        store.merge_save_runtime(&mut stale_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.pending_question.is_none());
+        assert_eq!(
+            saved
+                .metadata
+                .get("permission.reexecute_tool_call_id")
+                .map(String::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            saved
+                .metadata
+                .get("permission.reexecute_request_generation")
+                .map(String::as_str),
+            Some("generation-1")
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ pub enum SessionSseEvent {
     Event {
         session_id: String,
         stream_epoch: u64,
-        event: AgentEvent,
+        event: Box<AgentEvent>,
     },
     /// An initial connection or retry reached a successful SSE response. A
     /// question may have been persisted before the server subscribed this
@@ -204,7 +204,7 @@ impl SseStream {
                         .send(SessionSseEvent::Event {
                             session_id: session_id.to_string(),
                             stream_epoch,
-                            event,
+                            event: Box::new(event),
                         })
                         .is_err()
                     {
@@ -249,8 +249,8 @@ mod tests {
             SessionSseEvent::Event {
                 session_id,
                 stream_epoch: 7,
-                event: AgentEvent::Token { .. }
-            } if session_id == "s1"
+                event,
+            } if session_id == "s1" && matches!(event.as_ref(), AgentEvent::Token { .. })
         ));
 
         // A heartbeat comment / keepalive is skipped, not terminal.
@@ -275,9 +275,9 @@ mod tests {
         assert!(matches!(
             rx.try_recv().unwrap(),
             SessionSseEvent::Event {
-                event: AgentEvent::Complete { .. },
+                event,
                 ..
-            }
+            } if matches!(event.as_ref(), AgentEvent::Complete { .. })
         ));
 
         assert!(!SseStream::parse_sse_block(
@@ -289,9 +289,9 @@ mod tests {
         assert!(matches!(
             rx.try_recv().unwrap(),
             SessionSseEvent::Event {
-                event: AgentEvent::SubAgentCompleted { .. },
+                event,
                 ..
-            }
+            } if matches!(event.as_ref(), AgentEvent::SubAgentCompleted { .. })
         ));
 
         assert!(SseStream::parse_sse_block("data: [DONE]", "s1", 7, &tx));
@@ -370,9 +370,12 @@ mod tests {
             event,
             SessionSseEvent::Event {
                 stream_epoch: 42,
-                event: AgentEvent::Token { content },
+                event,
                 ..
-            } if content == "你好🙂"
+            } if matches!(
+                event.as_ref(),
+                AgentEvent::Token { content } if content == "你好🙂"
+            )
         ));
 
         task.abort();

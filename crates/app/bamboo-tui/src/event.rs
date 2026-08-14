@@ -2,14 +2,26 @@ use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::api::types::{
     CatalogModel, CommandDetail, CommandListResponse, ListSessionsEnvelope, McpServer,
-    PendingQuestion, ProviderCatalog, Schedule, Skill, SkillDetail, ToolInfo,
+    PendingQuestion, PermissionDecisionResponse, PermissionPolicyResponse, ProviderCatalog,
+    Schedule, Skill, SkillDetail, SubagentSnapshotResponse, ToolInfo,
 };
-use crate::api::{RespondFailure, SessionMutationFailure, VersionedSession};
+use crate::api::{
+    PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
+};
 use crate::app::{OpenedSession, QuestionIdentity, SessionPickerIntent};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
 type Loaded<T> = Result<T, String>;
+
+/// Successful completion of one of the three distinct input protocols. Keeping
+/// this typed prevents display labels such as "Approve" from driving control
+/// flow or selecting an endpoint.
+pub enum AnswerSubmissionOutcome {
+    Clarification { auto_resume_status: String },
+    Permission(PermissionDecisionResponse),
+    ChildApproval,
+}
 
 pub enum AppEvent {
     Key(KeyEvent),
@@ -25,6 +37,37 @@ pub enum AppEvent {
     SchedulesLoaded(Loaded<Vec<Schedule>>),
     SkillsLoaded(Loaded<Vec<Skill>>),
     ConfigLoaded(Loaded<serde_json::Value>),
+    PermissionPolicyLoaded {
+        epoch: u64,
+        result: Loaded<PermissionPolicyResponse>,
+    },
+    PermissionRuleSaved {
+        epoch: u64,
+        result: Result<PermissionPolicyResponse, PermissionMutationFailure>,
+    },
+    PermissionRuleDeleted {
+        rule_id: String,
+        result: Result<PermissionPolicyResponse, PermissionMutationFailure>,
+    },
+    PermissionDiagnosed {
+        epoch: u64,
+        result: Loaded<serde_json::Value>,
+    },
+    PermissionModeLoaded {
+        epoch: u64,
+        session_id: String,
+        result: Loaded<VersionedSession>,
+    },
+    PermissionModePatched {
+        epoch: u64,
+        session_id: String,
+        result: Result<VersionedSession, SessionMutationFailure>,
+    },
+    ChildApprovalSnapshotLoaded {
+        epoch: u64,
+        session_id: String,
+        result: Loaded<SubagentSnapshotResponse>,
+    },
     /// A background mutation finished; the outcome is `Ok(success message)` or
     /// `Err(failure message)` so the receiver can classify it (info vs error)
     /// without sniffing the display text. `reload_tab` reloads the current tab.
@@ -123,7 +166,7 @@ pub enum AppEvent {
         epoch: u64,
         identity: QuestionIdentity,
         answer: String,
-        result: Result<String, RespondFailure>,
+        result: Result<AnswerSubmissionOutcome, RespondFailure>,
     },
     /// Session-aware command catalog loaded for an open palette. Both the
     /// palette epoch and Session id must still match before it can replace the

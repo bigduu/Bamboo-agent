@@ -7,9 +7,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
+use crate::api::types::PermissionDecisionKind;
 use crate::app::{
-    App, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger, NoticeLevel,
-    QuestionOptionHitbox, SessionPickerMode, Tab,
+    ActiveQuestion, ActiveQuestionKind, App, CommandPaletteEntry, CommandPaletteHitbox,
+    CommandPaletteTrigger, NoticeLevel, PermissionStage, QuestionOptionHitbox, SessionPickerMode,
+    Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
 use crate::theme::{self, colors};
@@ -124,6 +126,29 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let mut items: Vec<(String, Style)> = Vec::new();
+
+    // Permission posture is security-critical session state, not transient
+    // dialog metadata. Keep it first so it remains visible on narrow screens.
+    let bypass = app.chat.bypass_permissions
+        || app.chat.permission_mode == crate::api::types::SessionPermissionMode::Bypass;
+    items.push((
+        if bypass {
+            "! PERM BYPASS".to_string()
+        } else {
+            format!("PERM {}", app.chat.permission_mode.label().to_uppercase())
+        },
+        if bypass {
+            Style::default()
+                .fg(colors::error())
+                .add_modifier(Modifier::BOLD)
+        } else if app.chat.permission_mode == crate::api::types::SessionPermissionMode::Auto {
+            Style::default()
+                .fg(colors::warning())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colors::inactive())
+        },
+    ));
 
     // Urgent run/question/error state comes first. Lower-priority model,
     // tokens and session metadata are appended only while cells remain.
@@ -724,6 +749,633 @@ fn ellipsize(value: &str, width: usize) -> String {
     crate::text::clip_cells(value, width.max(1))
 }
 
+fn typed_question_footer(
+    app: &App,
+    q: &ActiveQuestion,
+    global_confirm: bool,
+) -> Vec<Line<'static>> {
+    let mut footer = Vec::new();
+    if let Some(error) = &q.error {
+        footer.push(Line::from(Span::styled(
+            format!(" Error: {}", crate::text::clip_cells(error, 72)),
+            Style::default().fg(colors::error()),
+        )));
+    }
+    if q.identity_syncing {
+        footer.push(identity_syncing_hint());
+    } else if q.submitting {
+        footer.push(submitting_hint());
+    } else if global_confirm {
+        let reviewed = matches!(
+            &q.kind,
+            ActiveQuestionKind::Permission(permission) if permission.global_scope_reviewed
+        );
+        footer.push(Line::from(Span::styled(
+            format!(
+                " {} {}",
+                app.key_hint(ActionContext::QuestionOptions, ActionId::Activate),
+                if reviewed {
+                    "CONFIRM GLOBAL"
+                } else {
+                    "REVIEW EXACT GLOBAL"
+                },
+            ),
+            Style::default()
+                .fg(colors::error())
+                .add_modifier(Modifier::BOLD),
+        )));
+        footer.push(Line::raw(format!(
+            " {} inspect exact · {} back",
+            app.key_hint(ActionContext::QuestionOptions, ActionId::InspectValue),
+            app.key_hint(ActionContext::QuestionOptions, ActionId::Cancel),
+        )));
+    } else {
+        let child_needs_review = matches!(
+            &q.kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if q.selected == 0 && !child.exact_reviewed
+        );
+        let permission_needs_review = matches!(
+            &q.kind,
+            ActiveQuestionKind::Permission(permission)
+                if matches!(permission.stage, PermissionStage::Matcher(decision)
+                    if permission.reviewed_matcher
+                        != Some((decision, permission.matcher_selected)))
+        );
+        let continue_label = if child_needs_review || permission_needs_review {
+            "REVIEW EXACT"
+        } else {
+            "continue"
+        };
+        footer.push(Line::raw(format!(
+            " {}/{} select · {} {}",
+            app.key_hint(ActionContext::QuestionOptions, ActionId::NavigateUp),
+            app.key_hint(ActionContext::QuestionOptions, ActionId::NavigateDown),
+            app.key_hint(ActionContext::QuestionOptions, ActionId::Activate),
+            continue_label,
+        )));
+        footer.push(Line::raw(format!(
+            " {} inspect exact · {} dismiss/back",
+            app.key_hint(ActionContext::QuestionOptions, ActionId::InspectValue),
+            app.key_hint(ActionContext::QuestionOptions, ActionId::Cancel),
+        )));
+    }
+    footer
+}
+
+fn labelled_preview(
+    label: &str,
+    value: &str,
+    width: usize,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let prefix = format!(" {label}: ");
+    let continuation = " ".repeat(prefix.len());
+    let value_width = width.saturating_sub(prefix.len()).max(1);
+    let mut wrapped = value
+        .lines()
+        .flat_map(|line| crate::text::hard_wrap(line, value_width))
+        .collect::<Vec<_>>();
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    let truncated = wrapped.len() > max_lines;
+    wrapped.truncate(max_lines.max(1));
+    if truncated {
+        if let Some(last) = wrapped.last_mut() {
+            *last = crate::text::clip_cells(&format!("{last}…"), value_width);
+        }
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            Line::raw(format!(
+                "{}{line}",
+                if index == 0 { &prefix } else { &continuation }
+            ))
+        })
+        .collect()
+}
+
+fn fit_typed_modal_lines(
+    mut details: Vec<Line<'static>>,
+    mut interactive: Vec<Line<'static>>,
+    footer: Vec<Line<'static>>,
+    max_inner_height: usize,
+) -> (Vec<Line<'static>>, usize) {
+    // The footer and actual decision rows outrank descriptive metadata when a
+    // terminal is exceptionally short. At the supported 60x20 minimum all
+    // typed fields and all six decisions fit together.
+    let reserved = interactive.len().saturating_add(footer.len());
+    details.truncate(max_inner_height.saturating_sub(reserved));
+    if interactive.len().saturating_add(footer.len()) > max_inner_height {
+        interactive.truncate(max_inner_height.saturating_sub(footer.len()));
+    }
+    let detail_count = details.len();
+    details.extend(interactive);
+    details.extend(footer);
+    (details, detail_count)
+}
+
+fn render_permission_inspector(
+    f: &mut Frame,
+    app: &App,
+    q: &ActiveQuestion,
+    permission: &crate::app::PermissionQuestion,
+) {
+    let screen = f.area();
+    let height = screen.height.clamp(8, 24);
+    let area = centered_rect(90, height, screen);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(colors::warning()))
+        .title(format!(" {} ", permission.inspector_title()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                " Exact server-authoritative values (read-only)",
+                Style::default()
+                    .fg(colors::warning())
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(" No clipped display text is used for submission."),
+        ]),
+        sections[0],
+    );
+    let value = permission.inspector_text();
+    let paragraph = Paragraph::new(value).wrap(Wrap { trim: false });
+    let wrapped_count = paragraph.line_count(sections[1].width);
+    let max_scroll = u16::try_from(wrapped_count.saturating_sub(sections[1].height as usize))
+        .unwrap_or(u16::MAX);
+    q.inspect_max_scroll.set(max_scroll);
+    f.render_widget(
+        paragraph.scroll((q.inspect_scroll.min(max_scroll), 0)),
+        sections[1],
+    );
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw(format!(
+                " {}/{} or {}/{} scroll",
+                app.key_hint(ActionContext::QuestionInspect, ActionId::NavigateUp),
+                app.key_hint(ActionContext::QuestionInspect, ActionId::NavigateDown),
+                app.key_hint(ActionContext::QuestionInspect, ActionId::PageUp),
+                app.key_hint(ActionContext::QuestionInspect, ActionId::PageDown),
+            )),
+            Line::raw(format!(
+                " {} copy exact · {} back{}",
+                app.key_hint(ActionContext::QuestionInspect, ActionId::CopyValue),
+                app.key_hint(ActionContext::QuestionInspect, ActionId::Cancel),
+                if matches!(
+                    permission.inspect_target,
+                    Some(crate::app::PermissionInspectTarget::GlobalScope { .. })
+                ) {
+                    " (marks exact global scope reviewed)"
+                } else {
+                    ""
+                },
+            )),
+        ]),
+        sections[2],
+    );
+}
+
+fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
+    let ActiveQuestionKind::Permission(permission) = &q.kind else {
+        return;
+    };
+    if q.inspecting {
+        render_permission_inspector(f, app, q, permission);
+        return;
+    }
+    let request = &permission.request;
+    let screen = f.area();
+    let popup_width = ((screen.width as u32 * 90 / 100) as u16).max(1);
+    let text_width = popup_width.saturating_sub(4).max(1) as usize;
+    let one_line = |label: &str, value: &str| {
+        Line::raw(format!(
+            " {label}: {}",
+            ellipsize(value, text_width.saturating_sub(label.len() + 3))
+        ))
+    };
+    let matched_rule = request
+        .matched_rule
+        .as_ref()
+        .map(|rule| rule.id.clone())
+        .unwrap_or_else(|| "none".to_string());
+    let mut details = vec![
+        one_line(
+            "request/session",
+            &format!("{} / {}", request.request_id, request.session_id),
+        ),
+        one_line(
+            "registered workspace",
+            request.workspace_path.as_deref().unwrap_or("<unavailable>"),
+        ),
+        one_line(
+            "tool/type",
+            &format!(
+                "{} / {}",
+                request.tool_name,
+                request.permission_type.label()
+            ),
+        ),
+        one_line("operation", &request.operation_summary),
+    ];
+    details.extend(labelled_preview(
+        "exact resource",
+        &request.resource,
+        text_width,
+        2,
+    ));
+    details.extend(labelled_preview(
+        if permission.tool_arguments_truncated {
+            "arguments (bounded, truncated)"
+        } else {
+            "arguments (bounded)"
+        },
+        &permission.tool_arguments_preview,
+        text_width,
+        2,
+    ));
+    details.extend([
+        one_line(
+            "risk/reason",
+            &format!(
+                "{} / {}",
+                request.risk_level.label(),
+                request.reason_code.label()
+            ),
+        ),
+        one_line(
+            "mode/bypass/auto",
+            &format!(
+                "{} / {} / {}",
+                request.effective_mode.label(),
+                request.bypass_requested,
+                request.auto_approve_requested
+            ),
+        ),
+        one_line(
+            "rule/revision",
+            &format!("{} / {}", matched_rule, request.policy_revision),
+        ),
+    ]);
+
+    let mut option_rows = Vec::new();
+    let mut interactive = Vec::new();
+    let global_confirm = matches!(permission.stage, PermissionStage::GlobalConfirm { .. });
+    match permission.stage {
+        PermissionStage::Decision => {
+            interactive.push(Line::from(Span::styled(
+                " Allowed decisions (server-authoritative):",
+                Style::default()
+                    .fg(colors::brand())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for (index, decision) in request.allowed_decisions.iter().enumerate() {
+                let selected = index == q.selected;
+                option_rows.push((interactive.len(), index));
+                interactive.push(Line::from(Span::styled(
+                    format!(" {} {}", if selected { '›' } else { ' ' }, decision.label()),
+                    if selected {
+                        Style::default()
+                            .fg(colors::brand())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                )));
+            }
+        }
+        PermissionStage::Matcher(decision) => {
+            interactive.push(Line::from(Span::styled(
+                format!(" Exact matcher for {}:", decision.label()),
+                Style::default()
+                    .fg(colors::warning())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let scope = match decision {
+                PermissionDecisionKind::AllowSession | PermissionDecisionKind::DenySession => {
+                    format!("session {}", request.session_id)
+                }
+                PermissionDecisionKind::AllowWorkspace => format!(
+                    "registered workspace {} (session {})",
+                    request.workspace_path.as_deref().unwrap_or("<unavailable>"),
+                    request.session_id
+                ),
+                PermissionDecisionKind::AllowGlobal => {
+                    "GLOBAL - every session and workspace".to_string()
+                }
+                PermissionDecisionKind::AllowOnce | PermissionDecisionKind::DenyOnce => {
+                    "request occurrence only".to_string()
+                }
+            };
+            interactive.push(one_line("remembered scope", &scope));
+            let total = request.suggested_matchers.len();
+            let selected = permission.matcher_selected.min(total.saturating_sub(1));
+            let visible = 5_usize.min(total);
+            let start = selected
+                .saturating_sub(visible / 2)
+                .min(total.saturating_sub(visible));
+            for (index, matcher) in request
+                .suggested_matchers
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+            {
+                let is_selected = index == selected;
+                option_rows.push((interactive.len(), index));
+                interactive.push(Line::from(Span::styled(
+                    format!(
+                        " {} {} = {}",
+                        if is_selected { '›' } else { ' ' },
+                        matcher.kind.label(),
+                        ellipsize(&matcher.value, text_width.saturating_sub(20))
+                    ),
+                    if is_selected {
+                        Style::default()
+                            .fg(colors::brand())
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                )));
+            }
+        }
+        PermissionStage::GlobalConfirm { matcher_index } => {
+            let matcher = request.suggested_matchers.get(matcher_index);
+            interactive.push(Line::from(Span::styled(
+                " GLOBAL AUTHORIZATION CHANGES DURABLE POLICY",
+                Style::default()
+                    .fg(colors::error())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            interactive.push(one_line(
+                "global scope",
+                "every session and workspace (origin session shown above)",
+            ));
+            interactive.push(one_line(
+                "global matcher",
+                &matcher
+                    .map(|matcher| format!("{} = {}", matcher.kind.label(), matcher.value))
+                    .unwrap_or_else(|| "missing; go back".to_string()),
+            ));
+        }
+    }
+
+    let footer = typed_question_footer(app, q, global_confirm);
+    let (lines, detail_count) = fit_typed_modal_lines(
+        details,
+        interactive,
+        footer,
+        screen.height.saturating_sub(2) as usize,
+    );
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(90, height, screen);
+    let option_bottom = area.y.saturating_add(area.height).saturating_sub(1);
+    *q.option_hitboxes.borrow_mut() = option_rows
+        .into_iter()
+        .filter_map(|(interactive_row, index)| {
+            let y = area
+                .y
+                .saturating_add(1)
+                .saturating_add(detail_count as u16)
+                .saturating_add(interactive_row as u16);
+            (y < option_bottom).then_some(QuestionOptionHitbox {
+                x: area.x.saturating_add(1),
+                y,
+                width: area.width.saturating_sub(2),
+                index,
+            })
+        })
+        .collect();
+    f.render_widget(Clear, area);
+    let dangerous = request.bypass_requested
+        || request.risk_level == crate::api::types::RiskLevel::High
+        || global_confirm;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if dangerous {
+            colors::error()
+        } else {
+            colors::warning()
+        }))
+        .title(" Typed permission decision ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_child_approval_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
+    let ActiveQuestionKind::ChildApproval(child) = &q.kind else {
+        return;
+    };
+    if q.inspecting {
+        let screen = f.area();
+        let height = screen.height.clamp(8, 24);
+        let area = centered_rect(90, height, screen);
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::warning()))
+            .title(" Child approval inspector ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(3),
+            ])
+            .split(inner);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " Exact durable child identity and resource (read-only)",
+                    Style::default()
+                        .fg(colors::warning())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::raw(" Approval remains disabled until this inspector is closed."),
+            ]),
+            sections[0],
+        );
+        let value = child.inspector_text();
+        let paragraph = Paragraph::new(value).wrap(Wrap { trim: false });
+        let wrapped_count = paragraph.line_count(sections[1].width);
+        let max_scroll = u16::try_from(wrapped_count.saturating_sub(sections[1].height as usize))
+            .unwrap_or(u16::MAX);
+        q.inspect_max_scroll.set(max_scroll);
+        f.render_widget(
+            paragraph.scroll((q.inspect_scroll.min(max_scroll), 0)),
+            sections[1],
+        );
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(format!(
+                    " {}/{} or {}/{} scroll",
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::NavigateUp),
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::NavigateDown),
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::PageUp),
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::PageDown),
+                )),
+                Line::raw(format!(
+                    " {} copy exact · {} back (marks exact child request reviewed)",
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::CopyValue),
+                    app.key_hint(ActionContext::QuestionInspect, ActionId::Cancel),
+                )),
+            ]),
+            sections[2],
+        );
+        return;
+    }
+    let screen = f.area();
+    let popup_width = ((screen.width as u32 * 90 / 100) as u16).max(1);
+    let text_width = popup_width.saturating_sub(4).max(1) as usize;
+    let line = |label: &str, value: &str| {
+        Line::raw(format!(
+            " {label}: {}",
+            ellipsize(value, text_width.saturating_sub(label.len() + 3))
+        ))
+    };
+    let details = vec![
+        line("origin parent", &child.parent_session_id),
+        line("origin child", &child.child_session_id),
+        line(
+            "attempt/version",
+            &format!("{} / {}", child.child_attempt, child.version),
+        ),
+        line("request", &child.request_id),
+        line("tool", &child.tool_name),
+        line("permission", &child.permission),
+        line("exact resource", &child.resource),
+    ];
+    let mut interactive = vec![Line::from(Span::styled(
+        " Allowed child decisions:",
+        Style::default()
+            .fg(colors::warning())
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let mut option_rows = Vec::new();
+    for (index, label) in ["Approve child action", "Deny child action"]
+        .into_iter()
+        .enumerate()
+    {
+        option_rows.push((interactive.len(), index));
+        interactive.push(Line::from(Span::styled(
+            format!(" {} {label}", if index == q.selected { '›' } else { ' ' }),
+            if index == q.selected {
+                Style::default()
+                    .fg(colors::brand())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        )));
+    }
+    let footer = typed_question_footer(app, q, false);
+    let (lines, detail_count) = fit_typed_modal_lines(
+        details,
+        interactive,
+        footer,
+        screen.height.saturating_sub(2) as usize,
+    );
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(90, height, screen);
+    let option_bottom = area.y.saturating_add(area.height).saturating_sub(1);
+    *q.option_hitboxes.borrow_mut() = option_rows
+        .into_iter()
+        .filter_map(|(interactive_row, index)| {
+            let y = area
+                .y
+                .saturating_add(1)
+                .saturating_add(detail_count as u16)
+                .saturating_add(interactive_row as u16);
+            (y < option_bottom).then_some(QuestionOptionHitbox {
+                x: area.x.saturating_add(1),
+                y,
+                width: area.width.saturating_sub(2),
+                index,
+            })
+        })
+        .collect();
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::warning()))
+                .title(" Child approval request "),
+        ),
+        area,
+    );
+}
+
+fn render_unavailable_permission(f: &mut Frame, app: &App, q: &ActiveQuestion) {
+    let ActiveQuestionKind::PermissionUnavailable { reason } = &q.kind else {
+        return;
+    };
+    let screen = f.area();
+    let popup_width = ((screen.width as u32 * 90 / 100) as u16).max(1);
+    let text_width = popup_width.saturating_sub(4).max(1) as usize;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Typed permission contract unavailable — action blocked",
+            Style::default()
+                .fg(colors::error())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(format!(
+            " session/request: {} / {}",
+            ellipsize(&q.session_id, text_width / 2),
+            ellipsize(
+                q.tool_call_id.as_deref().unwrap_or("unknown"),
+                text_width / 2
+            )
+        )),
+        Line::raw(format!(
+            " tool/source: {} / {}",
+            q.tool_name.as_deref().unwrap_or("unknown"),
+            q.source.as_deref().unwrap_or("unknown")
+        )),
+    ];
+    lines.extend(
+        crate::text::hard_wrap(reason, text_width)
+            .into_iter()
+            .take(screen.height.saturating_sub(8) as usize)
+            .map(|line| Line::raw(format!(" {line}"))),
+    );
+    lines.push(Line::raw(format!(
+        " {} retry sync · {} dismiss (no legacy answer)",
+        app.key_hint(ActionContext::QuestionOptions, ActionId::Activate),
+        app.key_hint(ActionContext::QuestionOptions, ActionId::Cancel),
+    )));
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(90, height, screen);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::error()))
+                .title(" Permission blocked "),
+        ),
+        area,
+    );
+}
+
 /// Typed clarification modal. The compact view never changes an option's
 /// underlying value; `v` opens a scrollable full-text inspector for the exact
 /// question or selected option, including on narrow terminals.
@@ -733,6 +1385,22 @@ pub fn render_question(f: &mut Frame, app: &App) {
     };
     q.option_hitboxes.borrow_mut().clear();
     let screen = f.area();
+
+    match &q.kind {
+        ActiveQuestionKind::Permission(_) => {
+            render_permission_question(f, app, q);
+            return;
+        }
+        ActiveQuestionKind::PermissionUnavailable { .. } => {
+            render_unavailable_permission(f, app, q);
+            return;
+        }
+        ActiveQuestionKind::ChildApproval(_) => {
+            render_child_approval_question(f, app, q);
+            return;
+        }
+        ActiveQuestionKind::Clarification => {}
+    }
 
     if q.inspecting {
         let height = screen.height.clamp(6, 24);
@@ -2149,36 +2817,36 @@ mod tests {
                 6_299_991_410_263_413_121,
             ],
             [
-                4_879_774_826_948_300_008,
-                11_066_184_476_930_803_934,
-                17_031_078_274_172_910_387,
-                1_143_711_117_080_246_334,
-                7_234_780_119_466_243_444,
-                9_041_972_994_219_815_988,
+                4_770_761_534_398_976_274,
+                6_453_233_658_533_265_880,
+                9_926_554_654_485_580_947,
+                13_088_776_314_879_203_646,
+                575_161_460_045_649_318,
+                3_944_301_344_853_503_540,
             ],
             [
-                7_389_017_022_641_217_323,
-                16_952_033_003_801_489_607,
-                16_463_315_415_164_233_496,
-                5_166_663_855_769_301_145,
-                6_250_935_511_946_659_016,
-                16_254_299_977_599_291_151,
+                8_172_607_251_902_550_761,
+                4_949_655_866_133_198_277,
+                10_134_078_088_138_427_242,
+                11_816_528_128_860_418_159,
+                5_878_254_985_531_855_646,
+                12_446_404_274_958_450_273,
             ],
             [
-                15_031_301_406_181_041_675,
-                4_865_931_917_107_133_743,
-                15_642_408_912_939_561_496,
-                12_364_154_055_185_087_953,
-                8_288_241_310_337_659_808,
-                16_620_483_292_143_505_655,
+                14_040_822_986_534_502_348,
+                15_455_926_307_789_286_752,
+                15_067_376_218_731_150_667,
+                3_277_314_811_073_656_778,
+                14_631_367_563_638_541_673,
+                11_436_591_821_112_263_934,
             ],
             [
-                10_507_887_664_888_193_887,
-                7_972_046_481_146_137_035,
-                48_418_775_223_067_332,
-                9_519_166_218_506_624_621,
-                6_377_689_178_460_246_140,
-                14_361_221_358_384_919_491,
+                4_354_590_130_364_386_112,
+                18_322_932_115_686_371_420,
+                13_335_556_050_296_598_231,
+                15_586_733_975_648_698_454,
+                14_233_158_507_239_728_005,
+                1_559_304_031_034_526_378,
             ],
         ];
         let mut actual = [[0_u64; 6]; 5];
@@ -2260,9 +2928,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             [
-                12_798_691_881_099_513_966,
-                8_738_156_666_465_401_879,
-                14_357_062_234_359_601_905,
+                7_698_068_719_230_116_139,
+                1_749_609_507_150_741_583,
+                5_610_873_700_364_300_705,
             ],
             "full-buffer theme golden changed"
         );
@@ -2328,7 +2996,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [18_393_380_293_077_633_457, 11_493_634_725_320_844_945],
+            [132_796_132_005_702_974, 2_553_641_780_655_268_506],
             "complete help-overlay buffer golden changed"
         );
     }

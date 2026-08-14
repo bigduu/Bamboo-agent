@@ -1305,6 +1305,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
  "url",
+ "uuid",
 ]
 
 [[package]]

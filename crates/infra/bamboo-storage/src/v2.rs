@@ -515,6 +515,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "prompt_component_lengths",
     "prompt_composer_version",
     "prompt_fingerprint",
+    "permission.reexecute_request_generation",
     "permission.reexecute_tool_call_id",
     "resident_context",
     "resident_name",
@@ -6482,6 +6483,13 @@ mod tests {
             .insert("context_pressure_last_level".into(), "high".into());
         source
             .metadata
+            .insert("permission.reexecute_tool_call_id".into(), "call-1".into());
+        source.metadata.insert(
+            "permission.reexecute_request_generation".into(),
+            "generation-call-1".into(),
+        );
+        source
+            .metadata
             .insert("prefix_cache_section_state".into(), "stale".into());
         source
             .metadata
@@ -6609,6 +6617,8 @@ mod tests {
         for key in [
             "execute.pending_turn_message_id",
             "context_pressure_last_level",
+            "permission.reexecute_tool_call_id",
+            "permission.reexecute_request_generation",
             "prefix_cache_section_state",
             "llm_request_render",
         ] {

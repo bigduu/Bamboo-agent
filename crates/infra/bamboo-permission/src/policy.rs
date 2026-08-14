@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::canonicalize_path_for_matching;
 use crate::{PermissionMode, PermissionType, RiskLevel};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecisionKind {
     AllowOnce,
@@ -47,7 +47,7 @@ pub enum PermissionReasonCode {
     RiskThreshold,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMatcherKind {
     ExactResource,
@@ -148,6 +148,12 @@ impl PermissionMatcher {
                 .zip(canonicalize_path_for_matching(resource))
                 .is_some_and(|(root, actual)| path_is_within(&root, &actual)),
             PermissionMatcherKind::CommandPrefix => {
+                // A remembered prefix authorizes one command argv prefix, not
+                // a shell program that merely begins with it. Reject chaining,
+                // substitution, redirection, and multiline candidates first.
+                if contains_shell_operator(resource) {
+                    return false;
+                }
                 let expected: Vec<&str> = self.value.split_whitespace().collect();
                 let actual: Vec<&str> = resource.split_whitespace().collect();
                 !expected.is_empty()
@@ -168,7 +174,7 @@ impl PermissionMatcher {
 }
 
 fn contains_shell_operator(value: &str) -> bool {
-    ["&&", "||", ";", "|", "`", "$(", "${", "\n", "\r", ">", "<"]
+    ["&", "||", ";", "|", "`", "$(", "${", "\n", "\r", ">", "<"]
         .iter()
         .any(|operator| value.contains(operator))
 }
@@ -386,6 +392,11 @@ pub struct PermissionEvaluation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     pub request_id: String,
+    /// Server-issued generation for this specific parked operation. Provider
+    /// tool-call ids may be reused in later rounds, so `request_id` alone is
+    /// never a replay or authorization identity.
+    #[serde(default)]
+    pub request_generation: String,
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
@@ -409,6 +420,7 @@ pub struct PermissionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionDecision {
     pub request_id: String,
+    pub request_generation: String,
     pub decision: PermissionDecisionKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher_id: Option<String>,
@@ -428,6 +440,10 @@ pub struct PermissionDecisionReceipt {
 }
 
 impl PermissionRequest {
+    pub fn fresh_generation() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
     pub fn forced_decisions() -> Vec<PermissionDecisionKind> {
         vec![
             PermissionDecisionKind::AllowOnce,
@@ -534,6 +550,7 @@ mod tests {
     fn decision_wire_uses_typed_ids_and_global_confirmation() {
         let value = serde_json::to_value(PermissionDecision {
             request_id: "req-1".into(),
+            request_generation: "generation-1".into(),
             decision: PermissionDecisionKind::AllowWorkspace,
             matcher_id: Some("path-subtree-1".into()),
             expected_policy_revision: Some(7),
@@ -541,6 +558,7 @@ mod tests {
         })
         .expect("serialize");
         assert_eq!(value["decision"], "allow_workspace");
+        assert_eq!(value["request_generation"], "generation-1");
         assert_eq!(value["matcher_id"], "path-subtree-1");
     }
 
@@ -564,5 +582,34 @@ mod tests {
         );
         assert_eq!(matchers.len(), 1);
         assert_eq!(matchers[0].kind, PermissionMatcherKind::ExactResource);
+    }
+
+    #[test]
+    fn command_prefix_rejects_shell_program_suffixes() {
+        let matcher = PermissionMatcher {
+            id: "command_prefix".into(),
+            kind: PermissionMatcherKind::CommandPrefix,
+            value: "git status".into(),
+        };
+        assert!(matcher.matches(PermissionType::ExecuteCommand, "git status --short"));
+        for candidate in [
+            "git status ; rm -rf /",
+            "git status && rm -rf /",
+            "git status & rm -rf /",
+            "git status || rm -rf /",
+            "git status | sh",
+            "git status > /tmp/out",
+            "git status < /tmp/in",
+            "git status `whoami`",
+            "git status $(whoami)",
+            "git status ${HOME}",
+            "git status\nrm -rf /",
+            "git status\rrm -rf /",
+        ] {
+            assert!(
+                !matcher.matches(PermissionType::ExecuteCommand, candidate),
+                "shell program suffix must not match remembered prefix: {candidate:?}"
+            );
+        }
     }
 }

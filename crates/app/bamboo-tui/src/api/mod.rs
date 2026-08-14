@@ -71,6 +71,59 @@ impl fmt::Display for SessionMutationFailure {
 
 impl std::error::Error for SessionMutationFailure {}
 
+/// Recoverable failure from a revisioned permission-policy mutation. A 409 is
+/// kept typed so the editor can retain its draft, refresh the authoritative
+/// revision, and require an explicit retry instead of replaying blindly.
+#[derive(Debug, Clone)]
+pub struct PermissionMutationFailure {
+    pub conflict: bool,
+    message: String,
+}
+
+impl PermissionMutationFailure {
+    fn transport(error: reqwest::Error) -> Self {
+        Self {
+            conflict: false,
+            message: format!("permission policy transport failed: {error}"),
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            conflict: false,
+            message: message.into(),
+        }
+    }
+
+    fn rejected(status: reqwest::StatusCode, body: String) -> Self {
+        let body = body.trim();
+        Self {
+            conflict: status == reqwest::StatusCode::CONFLICT,
+            message: if body.is_empty() {
+                format!("permission policy update failed ({status})")
+            } else {
+                format!("permission policy update failed ({status}): {body}")
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_conflict() -> Self {
+        Self {
+            conflict: true,
+            message: "revision conflict".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for PermissionMutationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PermissionMutationFailure {}
+
 fn parse_etag(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let raw = headers.get(reqwest::header::ETAG)?.to_str().ok()?.trim();
     raw.strip_prefix("W/")
@@ -110,6 +163,8 @@ impl RespondFailure {
 
     pub(crate) fn rejected(status: reqwest::StatusCode, body: String) -> Self {
         let refresh_question = status == reqwest::StatusCode::CONFLICT
+            || status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::GONE
             || (status == reqwest::StatusCode::BAD_REQUEST && body.contains("No pending question"));
         Self {
             refresh_question,
@@ -330,6 +385,92 @@ impl BambooClient {
         parse_auto_resume_status(&body)
     }
 
+    /// Submit one machine-readable decision to the typed permission endpoint.
+    /// Request id, allowed scope, matcher, policy revision, and global
+    /// confirmation remain structured all the way to the server.
+    pub async fn submit_permission_decision(
+        &self,
+        session_id: &str,
+        decision: &PermissionDecision,
+    ) -> std::result::Result<PermissionDecisionResponse, RespondFailure> {
+        let resp = self
+            .client
+            .post(self.url(&format!(
+                "/api/v1/sessions/{session_id}/permission-decisions"
+            )))
+            .json(decision)
+            .send()
+            .await
+            .map_err(RespondFailure::transport)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            RespondFailure::protocol(format!(
+                "failed to read permission decision response: {error}"
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(RespondFailure::rejected(status, body));
+        }
+        let response: PermissionDecisionResponse =
+            serde_json::from_str(&body).map_err(|error| {
+                RespondFailure::protocol(format!(
+                    "invalid permission decision response JSON: {error}"
+                ))
+            })?;
+        if !response.success {
+            return Err(RespondFailure::protocol(
+                "permission decision response did not confirm success",
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Deliver a checked, one-shot decision to a blocked child agent. The route
+    /// consumes the exact child/request tuple; a replay is a safe 404.
+    pub async fn submit_child_approval(
+        &self,
+        child_session_id: &str,
+        decision: &ChildApprovalDecision,
+    ) -> std::result::Result<ChildApprovalResponse, RespondFailure> {
+        let resp = self
+            .client
+            .post(self.url(&format!(
+                "/api/v1/sessions/{child_session_id}/child-approval"
+            )))
+            .json(decision)
+            .send()
+            .await
+            .map_err(RespondFailure::transport)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            RespondFailure::protocol(format!("failed to read child approval response: {error}"))
+        })?;
+        if !status.is_success() {
+            return Err(RespondFailure::rejected(status, body));
+        }
+        let response: ChildApprovalResponse = serde_json::from_str(&body).map_err(|error| {
+            RespondFailure::protocol(format!("invalid child approval response JSON: {error}"))
+        })?;
+        if !response.delivered {
+            return Err(RespondFailure::protocol("child approval was not delivered"));
+        }
+        Ok(response)
+    }
+
+    pub async fn get_subagent_snapshot(&self) -> Result<SubagentSnapshotResponse> {
+        let resp = self
+            .client
+            .get(self.url("/api/v1/subagents/snapshot"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("sub-agent snapshot failed ({status}): {}", body.trim());
+        }
+        Ok(resp.json().await?)
+    }
+
     // ── Session resume ──
 
     /// `GET /api/v1/history/{session_id}` — full message history, used to
@@ -469,6 +610,47 @@ impl BambooClient {
             .patch(self.url(&format!("/api/v1/sessions/{}", session_id)))
             .header(reqwest::header::IF_MATCH, format!("\"{expected_version}\""))
             .json(patch)
+            .send()
+            .await
+            .map_err(SessionMutationFailure::transport)?;
+        let status = resp.status();
+        let metadata_version = parse_etag(resp.headers());
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SessionMutationFailure::rejected(
+                status,
+                body,
+                metadata_version,
+            ));
+        }
+        let metadata_version = metadata_version.ok_or_else(|| {
+            SessionMutationFailure::protocol("session PATCH response omitted metadata ETag")
+        })?;
+        let envelope: GetSessionEnvelope = resp.json().await.map_err(|error| {
+            SessionMutationFailure::protocol(format!(
+                "session PATCH returned an unreadable response: {error}"
+            ))
+        })?;
+        Ok(VersionedSession {
+            summary: envelope.session,
+            metadata_version,
+        })
+    }
+
+    /// Change the per-session permission posture with the same metadata CAS as
+    /// rename/pin. The TUI always fetches the current ETag before opening its
+    /// conspicuous confirmation dialog.
+    pub async fn patch_session_permission_mode(
+        &self,
+        session_id: &str,
+        expected_version: u64,
+        permission_mode: SessionPermissionMode,
+    ) -> std::result::Result<VersionedSession, SessionMutationFailure> {
+        let resp = self
+            .client
+            .patch(self.url(&format!("/api/v1/sessions/{session_id}")))
+            .header(reqwest::header::IF_MATCH, format!("\"{expected_version}\""))
+            .json(&PatchSessionPermissionModeRequest { permission_mode })
             .send()
             .await
             .map_err(SessionMutationFailure::transport)?;
@@ -724,6 +906,146 @@ impl BambooClient {
         Ok(())
     }
 
+    // ── Permission policy ──
+
+    pub async fn get_permission_policy(&self) -> Result<PermissionPolicyResponse> {
+        let resp = self
+            .client
+            .get(self.url("/v1/bamboo/permission/policy"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get permission policy failed ({status}): {}", body.trim());
+        }
+        Ok(resp.json().await?)
+    }
+
+    pub async fn create_permission_rule(
+        &self,
+        expected_revision: u64,
+        rule: &DurablePermissionRule,
+    ) -> std::result::Result<PermissionPolicyResponse, PermissionMutationFailure> {
+        self.mutate_permission_rule(
+            reqwest::Method::POST,
+            "/v1/bamboo/permission/rules".to_string(),
+            expected_revision,
+            rule,
+        )
+        .await
+    }
+
+    pub async fn update_permission_rule(
+        &self,
+        expected_revision: u64,
+        rule: &DurablePermissionRule,
+    ) -> std::result::Result<PermissionPolicyResponse, PermissionMutationFailure> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|error| PermissionMutationFailure::protocol(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| PermissionMutationFailure::protocol("invalid Bamboo base URL"))?
+            .pop_if_empty()
+            .extend(["v1", "bamboo", "permission", "rules", rule.id.as_str()]);
+        self.mutate_permission_rule(
+            reqwest::Method::PUT,
+            url.to_string(),
+            expected_revision,
+            rule,
+        )
+        .await
+    }
+
+    async fn mutate_permission_rule(
+        &self,
+        method: reqwest::Method,
+        url_or_path: String,
+        expected_revision: u64,
+        rule: &DurablePermissionRule,
+    ) -> std::result::Result<PermissionPolicyResponse, PermissionMutationFailure> {
+        let url = if url_or_path.starts_with('/') {
+            self.url(&url_or_path)
+        } else {
+            url_or_path
+        };
+        let resp = self
+            .client
+            .request(method, url)
+            .json(&PutPermissionRuleRequest {
+                expected_revision,
+                rule: rule.clone(),
+            })
+            .send()
+            .await
+            .map_err(PermissionMutationFailure::transport)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            PermissionMutationFailure::protocol(format!(
+                "failed to read permission policy response: {error}"
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(PermissionMutationFailure::rejected(status, body));
+        }
+        serde_json::from_str(&body).map_err(|error| {
+            PermissionMutationFailure::protocol(format!(
+                "invalid permission policy response JSON: {error}"
+            ))
+        })
+    }
+
+    pub async fn delete_permission_rule(
+        &self,
+        rule_id: &str,
+        expected_revision: u64,
+    ) -> std::result::Result<PermissionPolicyResponse, PermissionMutationFailure> {
+        let mut url = reqwest::Url::parse(&self.base_url)
+            .map_err(|error| PermissionMutationFailure::protocol(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| PermissionMutationFailure::protocol("invalid Bamboo base URL"))?
+            .pop_if_empty()
+            .extend(["v1", "bamboo", "permission", "rules", rule_id]);
+        let resp = self
+            .client
+            .delete(url)
+            .query(&[("expected_revision", expected_revision)])
+            .send()
+            .await
+            .map_err(PermissionMutationFailure::transport)?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            PermissionMutationFailure::protocol(format!(
+                "failed to read permission policy response: {error}"
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(PermissionMutationFailure::rejected(status, body));
+        }
+        serde_json::from_str(&body).map_err(|error| {
+            PermissionMutationFailure::protocol(format!(
+                "invalid permission policy response JSON: {error}"
+            ))
+        })
+    }
+
+    pub async fn diagnose_permission(
+        &self,
+        request: &DiagnosePermissionRequest,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(self.url("/v1/bamboo/permission/diagnose"))
+            .json(request)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("permission diagnosis failed ({status}): {}", body.trim());
+        }
+        Ok(serde_json::from_str(&body)?)
+    }
+
     // ── Health ──
 
     pub async fn health(&self) -> Result<bool> {
@@ -782,6 +1104,36 @@ mod tests {
         stream.shutdown().await.unwrap();
     }
 
+    fn request_json(request: &str) -> serde_json::Value {
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .expect("HTTP request must contain a header terminator");
+        serde_json::from_str(body).expect("request body must be JSON")
+    }
+
+    fn sample_permission_rule() -> DurablePermissionRule {
+        DurablePermissionRule {
+            id: "rule-1".to_string(),
+            permission_type: PermissionType::ExecuteCommand,
+            effect: PermissionRuleEffect::Allow,
+            scope: PermissionRuleScope::Global,
+            workspace_path: None,
+            matcher: PermissionMatcher {
+                id: "command_prefix".to_string(),
+                kind: PermissionMatcherKind::CommandPrefix,
+                value: "cargo test".to_string(),
+            },
+            source: PermissionRuleSource::User,
+            expires_at: None,
+        }
+    }
+
+    fn permission_policy_json(revision: u64) -> String {
+        format!(
+            r#"{{"revision":{revision},"policy":{{"enabled":true,"durable_rules":[]}},"temporary_grants":[]}}"#
+        )
+    }
+
     #[test]
     fn auto_resume_status_accepts_only_server_contract_values() {
         for status in [
@@ -806,6 +1158,196 @@ mod tests {
             let error = parse_auto_resume_status(body).unwrap_err();
             assert!(error.should_refresh_question(), "body: {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn typed_permission_decision_uses_canonical_path_and_structured_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request
+                .starts_with("POST /api/v1/sessions/session-1/permission-decisions HTTP/1.1"));
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({
+                    "request_id": "request-7",
+                    "request_generation": "generation-7",
+                    "decision": "allow_global",
+                    "matcher_id": "command_prefix",
+                    "expected_policy_revision": 23,
+                    "confirm_global": true
+                })
+            );
+            respond(
+                &mut socket,
+                "200 OK",
+                "\"1\"",
+                r#"{"success":true,"replayed":false,"auto_resume_status":"started"}"#,
+            )
+            .await;
+        });
+
+        let response = BambooClient::new(&base_url)
+            .submit_permission_decision(
+                "session-1",
+                &PermissionDecision {
+                    request_id: "request-7".to_string(),
+                    request_generation: "generation-7".to_string(),
+                    decision: PermissionDecisionKind::AllowGlobal,
+                    matcher_id: Some("command_prefix".to_string()),
+                    expected_policy_revision: Some(23),
+                    confirm_global: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(response.success);
+        assert!(!response.replayed);
+        assert_eq!(response.auto_resume_status.as_deref(), Some("started"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_permission_decision_409_requires_pending_reconciliation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request
+                .starts_with("POST /api/v1/sessions/session-1/permission-decisions HTTP/1.1"));
+            respond(
+                &mut socket,
+                "409 Conflict",
+                "\"1\"",
+                r#"{"error":{"type":"config_revision_conflict","message":"policy changed"}}"#,
+            )
+            .await;
+        });
+
+        let error = BambooClient::new(&base_url)
+            .submit_permission_decision(
+                "session-1",
+                &PermissionDecision {
+                    request_id: "request-7".to_string(),
+                    request_generation: "generation-7".to_string(),
+                    decision: PermissionDecisionKind::AllowWorkspace,
+                    matcher_id: Some("path_subtree".to_string()),
+                    expected_policy_revision: Some(22),
+                    confirm_global: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.should_refresh_question());
+        assert!(error.to_string().contains("policy changed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_approval_uses_child_scoped_path_and_request_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("POST /api/v1/sessions/child-3/child-approval HTTP/1.1"));
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({
+                    "parent_session_id": "parent-1",
+                    "child_attempt": 3,
+                    "request_id": "child-request-5",
+                    "expected_version": 7,
+                    "approved": false
+                })
+            );
+            respond(&mut socket, "200 OK", "\"1\"", r#"{"delivered":true}"#).await;
+        });
+
+        let response = BambooClient::new(&base_url)
+            .submit_child_approval(
+                "child-3",
+                &ChildApprovalDecision {
+                    parent_session_id: "parent-1".to_string(),
+                    child_attempt: 3,
+                    request_id: "child-request-5".to_string(),
+                    expected_version: 7,
+                    approved: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(response.delivered);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_approval_404_requires_authoritative_reconciliation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("POST /api/v1/sessions/child-3/child-approval HTTP/1.1"));
+            respond(
+                &mut socket,
+                "404 Not Found",
+                "\"2\"",
+                r#"{"delivered":false}"#,
+            )
+            .await;
+        });
+
+        let failure = BambooClient::new(&base_url)
+            .submit_child_approval(
+                "child-3",
+                &ChildApprovalDecision {
+                    parent_session_id: "parent-1".to_string(),
+                    child_attempt: 3,
+                    request_id: "already-consumed".to_string(),
+                    expected_version: 7,
+                    approved: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.should_refresh_question());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subagent_snapshot_preserves_child_attempt_version_and_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("GET /api/v1/subagents/snapshot HTTP/1.1"));
+            respond(
+                &mut socket,
+                "200 OK",
+                "\"7\"",
+                r#"{"schema_version":1,"snapshot_seq":42,"approvals_revision":7,"generated_at":"2026-08-14T00:00:00Z","approvals":[{"parent_session_id":"parent-1","child_session_id":"child-3","child_attempt":4,"request_id":"request-9","tool_name":"Write","permission":"write_file","resource":"/workspace/file","created_at":"2026-08-14T00:00:00Z","updated_at":"2026-08-14T00:00:01Z","version":6,"state":"decision_recorded","approved":false}],"children":[]}"#,
+            )
+            .await;
+        });
+
+        let snapshot = BambooClient::new(&base_url)
+            .get_subagent_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.snapshot_seq, 42);
+        assert_eq!(snapshot.approvals_revision, 7);
+        assert_eq!(snapshot.approvals.len(), 1);
+        let approval = &snapshot.approvals[0];
+        assert_eq!(approval.child_attempt, 4);
+        assert_eq!(approval.version, 6);
+        assert_eq!(approval.state, ChildApprovalState::DecisionRecorded);
+        assert_eq!(approval.approved, Some(false));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -956,6 +1498,210 @@ mod tests {
         assert!(failure.conflict);
         assert_eq!(failure.current_version, Some(5));
         assert!(failure.to_string().contains("metadata changed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permission_mode_patch_sends_if_match_and_typed_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("PATCH /api/v1/sessions/session-1 HTTP/1.1"));
+            assert!(request.to_ascii_lowercase().contains("if-match: \"11\""));
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"permission_mode": "bypass"})
+            );
+            respond(
+                &mut socket,
+                "200 OK",
+                "W/\"12\"",
+                r#"{"session":{"id":"session-1","permission_mode":"bypass","bypass_permissions":true}}"#,
+            )
+            .await;
+        });
+
+        let updated = BambooClient::new(&base_url)
+            .patch_session_permission_mode("session-1", 11, SessionPermissionMode::Bypass)
+            .await
+            .unwrap();
+        assert_eq!(updated.metadata_version, 12);
+        assert_eq!(
+            updated.summary.permission_mode,
+            SessionPermissionMode::Bypass
+        );
+        assert!(updated.summary.bypass_permissions);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permission_mode_patch_surfaces_412_and_current_etag() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.to_ascii_lowercase().contains("if-match: \"11\""));
+            assert_eq!(
+                request_json(&request),
+                serde_json::json!({"permission_mode": "auto"})
+            );
+            respond(
+                &mut socket,
+                "412 Precondition Failed",
+                "\"13\"",
+                r#"{"error":{"message":"session changed"}}"#,
+            )
+            .await;
+        });
+
+        let error = BambooClient::new(&base_url)
+            .patch_session_permission_mode("session-1", 11, SessionPermissionMode::Auto)
+            .await
+            .unwrap_err();
+        assert!(error.conflict);
+        assert_eq!(error.current_version, Some(13));
+        assert!(error.to_string().contains("session changed"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permission_policy_crud_and_diagnose_use_revisioned_contracts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut create_socket, _) = listener.accept().await.unwrap();
+            let create = read_request(&mut create_socket).await;
+            assert!(create.starts_with("POST /v1/bamboo/permission/rules HTTP/1.1"));
+            assert_eq!(request_json(&create)["expected_revision"], 7);
+            assert_eq!(request_json(&create)["rule"]["id"], "rule-1");
+            assert_eq!(
+                request_json(&create)["rule"]["matcher"],
+                serde_json::json!({
+                    "id": "command_prefix",
+                    "kind": "command_prefix",
+                    "value": "cargo test"
+                })
+            );
+            let create_body = permission_policy_json(8);
+            respond(&mut create_socket, "201 Created", "\"8\"", &create_body).await;
+
+            let (mut update_socket, _) = listener.accept().await.unwrap();
+            let update = read_request(&mut update_socket).await;
+            assert!(update.starts_with("PUT /v1/bamboo/permission/rules/rule-1 HTTP/1.1"));
+            assert_eq!(request_json(&update)["expected_revision"], 8);
+            assert_eq!(request_json(&update)["rule"]["id"], "rule-1");
+            let update_body = permission_policy_json(9);
+            respond(&mut update_socket, "200 OK", "\"9\"", &update_body).await;
+
+            let (mut delete_socket, _) = listener.accept().await.unwrap();
+            let delete = read_request(&mut delete_socket).await;
+            assert!(delete.starts_with(
+                "DELETE /v1/bamboo/permission/rules/rule-1?expected_revision=9 HTTP/1.1"
+            ));
+            assert_eq!(delete.split_once("\r\n\r\n").unwrap().1, "");
+            let delete_body = permission_policy_json(10);
+            respond(&mut delete_socket, "200 OK", "\"10\"", &delete_body).await;
+
+            let (mut diagnose_socket, _) = listener.accept().await.unwrap();
+            let diagnose = read_request(&mut diagnose_socket).await;
+            assert!(diagnose.starts_with("POST /v1/bamboo/permission/diagnose HTTP/1.1"));
+            assert_eq!(
+                request_json(&diagnose),
+                serde_json::json!({
+                    "request_id": "diagnose-1",
+                    "session_id": "session-1",
+                    "workspace_path": "/workspace/repo",
+                    "tool_name": "Bash",
+                    "tool_args": {"command": "cargo test"},
+                    "permission_type": "execute_command",
+                    "resource": "cargo test",
+                    "operation_summary": "Run tests",
+                    "bypass_requested": false,
+                    "auto_approve_requested": false
+                })
+            );
+            respond(
+                &mut diagnose_socket,
+                "200 OK",
+                "\"10\"",
+                r#"{"outcome":"deny","reason":{"code":"risk_threshold"}}"#,
+            )
+            .await;
+        });
+
+        let client = BambooClient::new(&base_url);
+        let rule = sample_permission_rule();
+        assert_eq!(
+            client
+                .create_permission_rule(7, &rule)
+                .await
+                .unwrap()
+                .revision,
+            8
+        );
+        assert_eq!(
+            client
+                .update_permission_rule(8, &rule)
+                .await
+                .unwrap()
+                .revision,
+            9
+        );
+        assert_eq!(
+            client
+                .delete_permission_rule("rule-1", 9)
+                .await
+                .unwrap()
+                .revision,
+            10
+        );
+        let diagnosis = client
+            .diagnose_permission(&DiagnosePermissionRequest {
+                request_id: "diagnose-1".to_string(),
+                session_id: "session-1".to_string(),
+                workspace_path: Some("/workspace/repo".to_string()),
+                tool_name: "Bash".to_string(),
+                tool_args: serde_json::json!({"command": "cargo test"}),
+                permission_type: PermissionType::ExecuteCommand,
+                resource: "cargo test".to_string(),
+                operation_summary: "Run tests".to_string(),
+                bypass_requested: false,
+                auto_approve_requested: false,
+                platform_hard_deny: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(diagnosis["outcome"], "deny");
+        assert_eq!(diagnosis["reason"]["code"], "risk_threshold");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permission_policy_409_is_a_typed_revision_conflict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("POST /v1/bamboo/permission/rules HTTP/1.1"));
+            respond(
+                &mut socket,
+                "409 Conflict",
+                "\"9\"",
+                r#"{"error":{"type":"config_revision_conflict","message":"expected 7, actual 9"}}"#,
+            )
+            .await;
+        });
+
+        let error = BambooClient::new(&base_url)
+            .create_permission_rule(7, &sample_permission_rule())
+            .await
+            .unwrap_err();
+        assert!(error.conflict);
+        assert!(error.to_string().contains("expected 7, actual 9"));
         server.await.unwrap();
     }
 

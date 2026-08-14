@@ -399,6 +399,8 @@ impl ToolExecutor for BuiltinToolExecutor {
         if let Some(contexts) =
             check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
         {
+            let proactive_permission_request =
+                tool_name.eq_ignore_ascii_case("request_permissions");
             for context in contexts {
                 let resource = context.resource.clone();
                 let operation_summary = context.operation_description.clone();
@@ -408,23 +410,36 @@ impl ToolExecutor for BuiltinToolExecutor {
                 let config = permission_checker.permission_config();
                 let proxy = crate::approval::current_approval_proxy();
                 let request = if let Some(config) = config.as_ref() {
+                    if proactive_permission_request && proxy.is_some() {
+                        return Err(ToolError::Execution(
+                            "request_permissions requires the local typed decision protocol; a boolean approval relay cannot create remembered authority"
+                                .to_string(),
+                        ));
+                    }
                     // A boolean approval relay can only honor one-shot choices.
                     // Interactive local sessions support all typed scopes; the
                     // evaluator omits workspace when no stable identity is known.
-                    let supported_decisions = if proxy.is_some() {
+                    let mut supported_decisions = if proxy.is_some() {
                         crate::permission::PermissionRequest::forced_decisions()
                     } else {
                         crate::permission::PermissionRequest::ordinary_decisions(true)
                     };
-                    let workspace_path = args
-                        .get("workspace_path")
-                        .or_else(|| args.get("cwd"))
-                        .and_then(|value| value.as_str())
-                        .map(ToOwned::to_owned)
-                        .or_else(|| {
-                            ctx.session_id
-                                .and_then(|session_id| config.session_workspace(session_id))
+                    if proactive_permission_request {
+                        // AllowOnce is bound to the request_permissions call,
+                        // not the later target operation, so offering it would
+                        // falsely claim authority was granted. Remembered
+                        // scopes remain exact matcher-bound and are replay-safe.
+                        supported_decisions.retain(|decision| {
+                            *decision != crate::permission::PermissionDecisionKind::AllowOnce
                         });
+                    }
+                    // Workspace-scoped policy is an authority boundary. Tool
+                    // arguments are model-controlled resources and must never
+                    // choose that scope identity; only the workspace registered
+                    // for this stable session may enable AllowWorkspace.
+                    let workspace_path = ctx
+                        .session_id
+                        .and_then(|session_id| config.session_workspace(session_id));
                     match config.evaluate(crate::permission::PermissionEvaluation {
                         request_id: call.id.clone(),
                         session_id: ctx.session_id.unwrap_or_default().to_string(),
@@ -449,14 +464,21 @@ impl ToolExecutor for BuiltinToolExecutor {
                             if matches!(
                                 hook_permission_override,
                                 Some(crate::HookPermissionOverride::Allow)
-                            ) && request.reason_code
-                                != crate::permission::PermissionReasonCode::HardDangerous =>
+                            ) && !proactive_permission_request
+                                && request.reason_code
+                                    != crate::permission::PermissionReasonCode::HardDangerous =>
                         {
                             continue;
                         }
                         crate::permission::PermissionOutcome::Ask(request) => request,
                     }
                 } else {
+                    if proactive_permission_request {
+                        return Err(ToolError::Execution(
+                            "request_permissions requires a typed PermissionConfig and cannot fall back to a display-string approval"
+                                .to_string(),
+                        ));
+                    }
                     // Compatibility path for custom checkers that do not expose a
                     // typed config. It remains one-shot only and fail-closed.
                     if let Some(reason) = platform_hard_deny {
@@ -493,6 +515,8 @@ impl ToolExecutor for BuiltinToolExecutor {
                         Err(PermissionError::ConfirmationRequired { .. }) => {
                             crate::permission::PermissionRequest {
                                 request_id: call.id.clone(),
+                                request_generation:
+                                    crate::permission::PermissionRequest::fresh_generation(),
                                 session_id: ctx.session_id.unwrap_or_default().to_string(),
                                 workspace_path: None,
                                 tool_name: tool_name.clone(),
@@ -774,6 +798,32 @@ mod tests {
         };
 
         builder.build()
+    }
+
+    async fn permission_request_payload(
+        executor: &BuiltinToolExecutor,
+        session_id: &str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let call = make_tool_call("Write", args);
+        let ctx = ToolExecutionContext {
+            session_id: Some(session_id),
+            tool_call_id: &call.id,
+            event_tx: Some(&event_tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+        let result = executor
+            .execute_with_context(&call, ctx)
+            .await
+            .expect("interactive permission gate should pause");
+        serde_json::from_str(&result.result).expect("typed permission payload")
     }
 
     struct RecordingApprovalProxy {
@@ -1788,6 +1838,227 @@ mod tests {
         assert!(
             matches!(ev, AgentEvent::ToolApprovalRequested { tool_name, .. } if tool_name == "Write")
         );
+    }
+
+    #[tokio::test]
+    async fn proactive_permission_batch_uses_typed_remembered_scopes_then_completes() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_session_workspace("proactive-session", Some("/workspace/project".to_string()));
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(
+            config.clone(),
+        ));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(crate::tools::RequestPermissionsTool::new())
+            .expect("register request_permissions")
+            .with_permission_checker(checker)
+            .build();
+        let call = make_tool_call(
+            "request_permissions",
+            json!({
+                "reason": "Deploy the service",
+                "permissions": [
+                    {
+                        "type": "execute_command",
+                        "resource": "docker compose up -d"
+                    },
+                    {
+                        "type": "http_request",
+                        "resource": "registry.example.com"
+                    }
+                ]
+            }),
+        );
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        let first = executor
+            .execute_with_context(
+                &call,
+                ToolExecutionContext {
+                    session_id: Some("proactive-session"),
+                    tool_call_id: &call.id,
+                    event_tx: Some(&event_tx),
+                    available_tool_schemas: None,
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                },
+            )
+            .await
+            .expect("first batch context pauses");
+        let first_payload: serde_json::Value = serde_json::from_str(&first.result).unwrap();
+        let first_request = &first_payload["permission_request"];
+        assert_eq!(first_request["resource"], "docker compose up -d");
+        assert!(!first_request["allowed_decisions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("allow_once")));
+        assert!(first_request["allowed_decisions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("allow_session")));
+        let first_matcher: crate::permission::PermissionMatcher =
+            serde_json::from_value(first_request["suggested_matchers"][0].clone()).unwrap();
+        config
+            .grant_typed_scoped_session_permission(
+                "proactive-session",
+                crate::permission::PermissionType::ExecuteCommand,
+                first_matcher,
+            )
+            .unwrap();
+
+        let second = executor
+            .execute_with_context(
+                &call,
+                ToolExecutionContext {
+                    session_id: Some("proactive-session"),
+                    tool_call_id: &call.id,
+                    event_tx: Some(&event_tx),
+                    available_tool_schemas: None,
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                },
+            )
+            .await
+            .expect("second batch context pauses");
+        let second_payload: serde_json::Value = serde_json::from_str(&second.result).unwrap();
+        let second_request = &second_payload["permission_request"];
+        assert_eq!(second_request["resource"], "registry.example.com");
+        let second_matcher: crate::permission::PermissionMatcher =
+            serde_json::from_value(second_request["suggested_matchers"][0].clone()).unwrap();
+        config
+            .grant_typed_scoped_session_permission(
+                "proactive-session",
+                crate::permission::PermissionType::HttpRequest,
+                second_matcher,
+            )
+            .unwrap();
+
+        let completed = executor
+            .execute_with_context(
+                &call,
+                ToolExecutionContext {
+                    session_id: Some("proactive-session"),
+                    tool_call_id: &call.id,
+                    event_tx: Some(&event_tx),
+                    available_tool_schemas: None,
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                },
+            )
+            .await
+            .expect("all authorized contexts complete the tool");
+        assert!(completed.display_preference.is_none());
+        let completed_payload: serde_json::Value = serde_json::from_str(&completed.result).unwrap();
+        assert_eq!(completed_payload["status"], "permissions_authorized");
+        assert_eq!(
+            completed_payload["permissions"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_permission_scope_uses_only_registered_session_identity() {
+        let registered = Arc::new(crate::permission::PermissionConfig::new());
+        registered.register_session_workspace("registered", "/workspace/authoritative");
+        let registered_executor = make_executor(Some(Arc::new(
+            crate::permission::ConfigPermissionChecker::new(registered.clone()),
+        )));
+
+        let first = permission_request_payload(
+            &registered_executor,
+            "registered",
+            json!({
+                "file_path": "/tmp/first.txt",
+                "content": "x",
+                "cwd": "/model/chosen-a",
+                "workspace_path": "/model/chosen-b"
+            }),
+        )
+        .await;
+        let second = permission_request_payload(
+            &registered_executor,
+            "registered",
+            json!({
+                "file_path": "/tmp/second.txt",
+                "content": "x",
+                "cwd": "/model/chosen-c"
+            }),
+        )
+        .await;
+        for payload in [&first, &second] {
+            let request = &payload["permission_request"];
+            assert_eq!(request["workspace_path"], "/workspace/authoritative");
+            assert!(request["allowed_decisions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("allow_workspace")));
+        }
+
+        registered.set_session_workspace("registered", None);
+        let unbound = permission_request_payload(
+            &registered_executor,
+            "registered",
+            json!({
+                "file_path": "/tmp/unbound.txt",
+                "content": "x",
+                "cwd": "/workspace/authoritative"
+            }),
+        )
+        .await;
+        assert!(unbound["permission_request"]["workspace_path"].is_null());
+        assert!(!unbound["permission_request"]["allowed_decisions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("allow_workspace")));
+
+        registered.set_session_workspace("registered", Some("/workspace/rebound".to_string()));
+        let rebound = permission_request_payload(
+            &registered_executor,
+            "registered",
+            json!({
+                "file_path": "/tmp/rebound.txt",
+                "content": "x",
+                "workspace_path": "/workspace/authoritative"
+            }),
+        )
+        .await;
+        assert_eq!(
+            rebound["permission_request"]["workspace_path"],
+            "/workspace/rebound"
+        );
+
+        let unregistered = Arc::new(crate::permission::PermissionConfig::new());
+        let unregistered_executor = make_executor(Some(Arc::new(
+            crate::permission::ConfigPermissionChecker::new(unregistered),
+        )));
+        let payload = permission_request_payload(
+            &unregistered_executor,
+            "unregistered",
+            json!({
+                "file_path": "/tmp/unregistered.txt",
+                "content": "x",
+                "cwd": "/model/chosen",
+                "workspace_path": "/also/model/chosen"
+            }),
+        )
+        .await;
+        let request = &payload["permission_request"];
+        assert!(request["workspace_path"].is_null());
+        assert!(!request["allowed_decisions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("allow_workspace")));
     }
 
     #[tokio::test]
